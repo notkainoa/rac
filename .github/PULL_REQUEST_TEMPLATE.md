@@ -1,14 +1,31 @@
-For your pull request to not get closed without review, please confirm that:
+## Problem
 
-- [ ] An issue exists where the maintainers agreed that this should be implemented.
-      If such issue did not exist before, I opened one.
-- [ ] I tested that my contribution works locally, and does not break anything,
-      otherwise I have marked my PR as draft.
-- [ ] If my contribution is non-trivial, I did not use AI to write most of it.
-- [x] I understand that I will be permanently banned from interacting with this
-      organization if I lied by checking any of these checkboxes.
-- [ ] The pull request contents are only relevant to the macOS platform, and can in
-      no way be applied to other platforms.
----
+<!-- What's wrong or missing, in a sentence or two. Link the issue if
+there is one. -->
 
-[short description of your PR goes here]
+## Change
+
+<!-- How this fixes it. If it touches several patches or areas, explain why
+they belong in the same PR. Unrelated fixes go in separate PRs. -->
+
+## Verification
+
+<!-- How you tested this in a real rac build, and what you saw. Say what you
+couldn't check. "It builds" alone isn't enough.
+
+UI changes: before and after screenshots.
+Motion, timing, or interaction: a short video.
+Attach these here; don't commit them to the repo. -->
+
+## Checklist
+
+- [ ] I built rac with this change and tested the changed behavior myself.
+- [ ] This PR solves one problem.
+- [ ] Changes are in `patches/rac/` (or rac-owned files). Nothing in
+      `helium-chromium/` or Helium's patches was edited.
+- [ ] I went through the [cover every surface](../AGENTS.md#cover-every-surface)
+      checklist, if this changes UI.
+- [ ] Docs are updated, if this makes them wrong.
+
+<!-- If you used AI, end with the model and tool, for example:
+"Written with Claude Opus 5.5 in Claude Code." -->
