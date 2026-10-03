@@ -25,3 +25,5 @@ them, and traps that are hard to spot from the source.
 
 - [Syncing with Helium](operations/upstream-sync.md): pulling in new Helium
   and Chromium releases
+- [Feature worktrees](operations/worktrees.md): working on several features
+  at once, each with its own build tree

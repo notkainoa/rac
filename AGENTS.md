@@ -58,11 +58,17 @@ separate Arc-style feature.
 3. **Touching the maintainer's real browser data.** rac is the maintainer's
    daily driver. Never point a build at a real profile folder in
    `~/Library/Application Support/`, such as `net.imput.helium` or rac's own
-   once it exists. Use `he run`, which launches with a separate dev folder
-   (`net.imput.helium.dev`).
+   once it exists. In the main checkout, use `he run`, which launches with a
+   separate dev folder (`net.imput.helium.dev`). In a feature worktree, use
+   `devutils/rac/worktree.sh run`, which gives the worktree its own profile.
 4. **Destroying the build tree.** `build/src` is a full Chromium checkout,
    roughly 100 GB that takes hours to recreate. Don't run `he reset`, delete
-   `build/`, or start a full build without the maintainer's approval.
+   `build/`, or start a full build without the maintainer's approval. The
+   main checkout's tree is also the base that every feature worktree clones,
+   so do feature work in a worktree
+   ([docs/operations/worktrees.md](docs/operations/worktrees.md)). In a
+   worktree, `he build` should take minutes. If it shows tens of thousands of
+   steps, stop it and tell the maintainer.
 5. **Moving the submodule by hand.** Don't use `he pull` or
    `git submodule update --remote`. The Helium core version only changes
    when a helium-macos release is merged. See
@@ -118,7 +124,8 @@ done, go through this list and say which items applied:
 ## Verifying
 
 - Prove the change works with the smallest check that shows it: build and
-  run with `he build && he run`, then exercise the changed behavior.
+  run with `he build && he run` (`devutils/rac/worktree.sh run` in a
+  worktree), then exercise the changed behavior.
 - For UI changes, capture before and after screenshots. For motion, timing,
   or interaction, capture a short video.
 - Run `he validate series` after changing `patches/series`.
