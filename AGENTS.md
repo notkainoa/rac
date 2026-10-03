@@ -64,11 +64,10 @@ separate Arc-style feature.
 4. **Destroying the build tree.** `build/src` is a full Chromium checkout,
    roughly 100 GB that takes hours to recreate. Don't run `he reset`, delete
    `build/`, or start a full build without the maintainer's approval. The
-   main checkout's tree is also the base that every feature worktree clones,
-   so do feature work in a worktree
-   ([docs/operations/worktrees.md](docs/operations/worktrees.md)). In a
-   worktree, `he build` should take minutes. If it shows tens of thousands of
-   steps, stop it and tell the maintainer.
+   main checkout's tree is also the base that every feature worktree clones
+   (see [Worktrees](#worktrees)). In a worktree, `he build` should take
+   minutes. If it shows tens of thousands of steps, stop it and tell the
+   maintainer.
 5. **Moving the submodule by hand.** Don't use `he pull` or
    `git submodule update --remote`. The Helium core version only changes
    when a helium-macos release is merged. See
@@ -85,6 +84,33 @@ separate Arc-style feature.
 
 How patches are applied, and the quilt workflow for making one, are in
 [docs/internals/overview.md](docs/internals/overview.md).
+
+## Worktrees
+
+Features are built in git worktrees, each with its own Chromium build tree.
+The full procedure is in
+[docs/operations/worktrees.md](docs/operations/worktrees.md). Explain it to
+the maintainer when they ask how to work on features in parallel.
+
+- **The main checkout is the base.** New worktrees clone its built
+  `build/src`, so don't do feature work there.
+- **Creating one.** In the Factory App, create a worktree with the
+  **rac feature tree** setup profile. Without Factory, run
+  `git worktree add -b feat/<name> <path> main`, then
+  `devutils/rac/worktree.sh setup` from the new worktree. Setup takes
+  about 30 seconds.
+- **Building and running.** Build with `source dev.sh && he build` and run
+  with `devutils/rac/worktree.sh run`. Never use `he run` in a worktree.
+  It shares one profile with every other build, so the second browser only
+  opens a window in the first.
+- **Committing.** Run `he unmerge`, commit the patch with its
+  `patches/series` change, then run `he merge` to keep working.
+- **After a rebase or pull.** Run `devutils/rac/worktree.sh sync`, then
+  `he build`.
+- **Removing one.** Factory runs the cleanup script when it deletes the
+  worktree. Without Factory, run `devutils/rac/worktree.sh cleanup`, then
+  `git worktree remove --force <path>`. Only remove a worktree when the
+  maintainer asks.
 
 Patch rules:
 
@@ -132,6 +158,44 @@ done, go through this list and say which items applied:
 - Don't run Chromium's full test suites. If a change has focused unit tests,
   run only those.
 - Ask before driving the browser with computer-use or automation tools.
+
+## Handing off for testing
+
+When a feature is done, or you want the maintainer to try something, make it
+one command away. Build first, so the maintainer only has to run it, and
+quit any browser you launched. Then send a message like this:
+
+```md
+**Ready to test: <feature>**
+
+Worktree: `<absolute path>` (branch `<branch>`)
+
+    cd <absolute path>
+    devutils/rac/worktree.sh run
+
+**What changed:** <what a user will notice, in plain words>
+
+**Try this:**
+1. <a concrete step, such as "Press Cmd+S twice">
+2. <...>
+
+**You should see:** <the expected result for each step, and what looks
+different from rac today>
+
+**Not done yet:** <known gaps, surfaces you couldn't check, rough edges>
+```
+
+- Give the exact commands with the real path, ready to paste. If the
+  maintainer needs to rebuild, include `source dev.sh && he build` first.
+- Write the steps for someone who hasn't read the code. Name the menus,
+  shortcuts, and settings to use.
+- Cover the surfaces from [Cover every surface](#cover-every-surface) that
+  apply, such as sidebar states, dark mode, and multiple windows.
+- Each worktree's browser starts with an empty profile in `build/profile`
+  that persists between runs. Say so if testing needs setup first, such as
+  opening several tabs or creating a second space.
+- To compare with rac today, the maintainer can run `he run` in the main
+  checkout at the same time.
 
 ## Commits and pull requests
 
