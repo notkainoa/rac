@@ -77,10 +77,28 @@ once that part of Spaces is merged.
 | Feature | Covers | Code it touches |
 | --- | --- | --- |
 | **Spaces** | Spaces inside each profile window, each with its own tabs; the switcher dots at the bottom of the sidebar; saved across restarts | Tab model, vertical sidebar |
-| Pinned tabs and favorites | Arc-style pinned tabs that stay in one space's sidebar, and favorites (Helium's pinned tabs) as icons at the top of the sidebar, shared by every space in a profile. One feature, because both reshape the top of the tab list | Tab list |
-| Sidebar hide and reveal | Cmd+S fully hides and shows the sidebar by default, a setting switches back to compact mode (Helium's behavior), and polished edge reveal for the hidden sidebar and toolbar | Helium's layout (compact and zen mode) |
+| Pinned tabs and favorites | Arc-style pinned tabs that stay in one space's sidebar, loose or in folders, each remembering the page it was pinned on with a way to reset back to it; and favorites (Helium's pinned tabs) as icons at the top of the sidebar, shared by every space in a profile. One feature, because both reshape the top of the tab list | Tab list |
+| Sidebar hide and reveal | Cmd+S and the sidebar button fully hide and show the sidebar by default, and a setting switches back to compact mode (Helium's behavior). In both hidden and compact, moving the mouse to the left edge shows the full sidebar over the page. Polished edge reveal for the hidden toolbar too | Helium's layout (compact and zen mode) |
 | Address bar in the sidebar | An appearance setting that moves the address bar into the sidebar | Sidebar header, location bar |
 | Auto picture-in-picture | Video pops out when you leave a tab where it's playing | Media and picture-in-picture |
+
+Unmerged Helium pull requests worth reading first. They're ideas to learn
+from, not code to copy as-is; none were merged, and some were closed for
+being too large.
+
+- Pinned tabs: [helium#1578](https://github.com/imputnet/helium/pull/1578)
+  ("anchored tabs"). Its per-tab behavior is what rac wants. rac's section
+  differs: it holds loose tabs as well as folders.
+- Sidebar hide and reveal:
+  [helium#1035](https://github.com/imputnet/helium/pull/1035) (expand the
+  compact sidebar on hover). Chromium also has its own expand-on-hover for
+  vertical tabs, behind a disabled feature flag.
+- Address bar in the sidebar:
+  [helium#2367](https://github.com/imputnet/helium/pull/2367). The look is
+  right; the approach needs a fresh review.
+- Auto picture-in-picture:
+  [helium#1765](https://github.com/imputnet/helium/pull/1765). Chromium has
+  related flags, such as `auto-picture-in-picture-on-window-occluded`.
 
 ## Phase 3: Themes and tools
 

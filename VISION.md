@@ -70,6 +70,8 @@ and improved continuously. Everyone else is welcome, especially:
   every space in a profile. Helium calls these "pinned" today.
 - **Pinned tabs** are Arc-style. They live in the sidebar of one space, stay
   there permanently, and are separate from that space's regular open tabs.
+  They can sit loose or inside folders. Each pinned tab remembers the page
+  it was pinned on, so you can browse away and then reset it back.
 
 ### The sidebar
 
@@ -77,9 +79,10 @@ and improved continuously. Everyone else is welcome, especially:
 - **Cmd+S fully hides and shows the sidebar** by default. A setting switches
   Cmd+S back to Helium's behavior, which collapses the sidebar to a compact
   strip of site icons.
-- Moving the mouse to the left or top edge of the screen reveals the hidden
-  sidebar or toolbar. This builds on Helium's existing behavior and makes it
-  feel polished.
+- Moving the mouse to the left edge of the screen shows the full sidebar
+  over the page, whether it's hidden or compact. Moving it to the top edge
+  reveals the hidden toolbar. This builds on Helium's existing behavior and
+  makes it feel polished.
 - An appearance setting moves the address bar into the sidebar.
 
 ### Everything else

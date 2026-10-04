@@ -21,16 +21,18 @@ Use these words consistently in code, docs, issues, and PRs.
 - **Favorites**: site icons at the top of the sidebar, shared by every space
   in a profile. Helium calls these "pinned." In rac, they're "favorites."
 - **Pinned tabs**: Arc-style tabs that belong to one space and stay in its
-  sidebar permanently, above that space's open tabs. They are not
-  favorites.
+  sidebar permanently, above that space's open tabs. They can be loose or
+  inside folders. Each one remembers the page it was pinned on and can be
+  reset back to it. They are not favorites.
 - **Open tabs**: the regular, unpinned tabs in a space.
 - **Sidebar**: the vertical panel on the left with favorites, pinned tabs,
   open tabs, and the space switcher. It has three states:
   - **full**: shows titles and icons
   - **compact**: shows icons only (Helium's "collapsed")
   - **hidden**: not shown at all
-- **Edge reveal**: moving the mouse to the left or top edge of the screen to
-  temporarily show the hidden sidebar or toolbar.
+- **Edge reveal**: moving the mouse to the left edge of the screen to
+  temporarily show the full sidebar over the page (from hidden or compact),
+  or to the top edge to show the hidden toolbar.
 - **Command bar**: the quick launcher for tabs, history, and actions. Users
   can choose it in place of the new tab page.
 - **New tab page**: the page that opens in a new tab.
