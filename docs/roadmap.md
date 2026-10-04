@@ -3,8 +3,10 @@
 The order in which rac gets built. This page lists what each phase covers.
 Track active work in GitHub issues, not here.
 
-Status: **phase 1**. rac has its own name, bundle ID, and data directory,
-with Helium's icons and services.
+Status: **phase 2**. rac has its own name, bundle ID, data directory,
+version, and updater, with Helium's icons and services. Phase 1's icons,
+DMG art, onboarding, and release setup are put off until later; they're
+still needed before sharing builds.
 
 ## How the phases work
 
@@ -66,30 +68,30 @@ Still needed before sharing builds:
 
 ## Phase 2: Foundations
 
-Large, independent pieces in separate areas of the code. All of them can
-be built in parallel. Spaces is the foundation for phase 3; build it as an
-ordered chain in one worktree (data model, switching, dots, saving).
+Spaces is the foundation; build it as an ordered chain in one worktree (data
+model, switching, dots, saving). Sidebar hide and reveal, the address bar in
+the sidebar, and auto picture-in-picture are independent and can start right
+away. Pinned tabs and favorites need the spaces data model, so start them
+once that part of Spaces is merged.
 
 | Feature | Covers | Code it touches |
 | --- | --- | --- |
 | **Spaces** | Spaces inside each profile window, each with its own tabs; the switcher dots at the bottom of the sidebar; saved across restarts | Tab model, vertical sidebar |
+| Pinned tabs and favorites | Arc-style pinned tabs that stay in one space's sidebar, and favorites (Helium's pinned tabs) as icons at the top of the sidebar, shared by every space in a profile. One feature, because both reshape the top of the tab list | Tab list |
 | Sidebar hide and reveal | Cmd+S fully hides and shows the sidebar by default, a setting switches back to compact mode (Helium's behavior), and polished edge reveal for the hidden sidebar and toolbar | Helium's layout (compact and zen mode) |
-| Command bar | A quick launcher for tabs, history, and actions, available in place of the new tab page | New rac page, new tab page hook |
-| Boosts | Custom CSS and JavaScript for each site, with an editor | Content script injection, new rac page |
+| Address bar in the sidebar | An appearance setting that moves the address bar into the sidebar | Sidebar header, location bar |
 | Auto picture-in-picture | Video pops out when you leave a tab where it's playing | Media and picture-in-picture |
 
-## Phase 3: Built on spaces
+## Phase 3: Themes and tools
 
-Needs Spaces from phase 2. Pinned tabs and favorites both change the tab
-list, so expect small conflicts between them. Merge whichever finishes
-first, then sync the other.
+Space themes needs Spaces from phase 2. The rest are independent of each
+other and can be built in parallel.
 
 | Feature | Covers | Code it touches |
 | --- | --- | --- |
 | Space themes | A color, gradient, and icon for each space | Themes and colors |
-| Pinned tabs | Arc-style pinned tabs that stay in one space's sidebar | Tab list |
-| Favorites | Helium's pinned tabs as icons at the top of the sidebar, shared by every space in a profile | Top of the tab list |
-| Address bar in the sidebar | An appearance setting that moves the address bar into the sidebar | Sidebar header, location bar |
+| Command bar | A quick launcher for tabs, history, and actions, available in place of the new tab page | New rac page, new tab page hook |
+| Boosts | Custom CSS and JavaScript for each site, with an editor | Content script injection, new rac page |
 | Media controls in the sidebar | Built on Chromium's media controls | Bottom of the sidebar |
 
 ## Phase 4: Polish

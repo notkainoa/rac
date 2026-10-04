@@ -47,7 +47,7 @@ label. Rethink how bangs look and behave in the address bar as a whole.
   already add, edit, and delete shortcuts, or be its own page?
 - What should the address bar show at each moment: while typing a bang, with
   the bang at the start versus the end, and when the bang doesn't exist?
-- How should bangs relate to the command bar (phase 2) and to Chromium's
+- How should bangs relate to the command bar (phase 3) and to Chromium's
   keyword search, which also uses the address bar?
 - What happens with Helium services off: are the user's own bangs still
   available? (They should be; they don't need the network.)
