@@ -69,16 +69,18 @@ Still needed before sharing builds:
 ## Phase 2: Foundations
 
 Spaces is the foundation; build it as an ordered chain in one worktree (data
-model, switching, dots, saving). Sidebar hide and reveal, the address bar in
-the sidebar, and auto picture-in-picture are independent and can start right
-away. Pinned tabs and favorites need the spaces data model, so start them
-once that part of Spaces is merged.
+model, switching, dots, saving). The address bar in the sidebar and auto
+picture-in-picture are independent and can start right away. Pinned tabs and
+favorites can start too, treating each window as one space, and get
+connected to spaces once the data model is merged. Sidebar hide and reveal
+starts after the address bar in the sidebar is merged, because both change
+how frameless mode lays out the window.
 
 | Feature | Covers | Code it touches |
 | --- | --- | --- |
 | **Spaces** | Spaces inside each profile window, each with its own tabs; the switcher dots at the bottom of the sidebar; saved across restarts | Tab model, vertical sidebar |
 | Pinned tabs and favorites | Arc-style pinned tabs that stay in one space's sidebar, loose or in folders, each remembering the page it was pinned on with a way to reset back to it; and favorites (Helium's pinned tabs) as icons at the top of the sidebar, shared by every space in a profile. One feature, because both reshape the top of the tab list | Tab list |
-| Sidebar hide and reveal | Cmd+S and the sidebar button fully hide and show the sidebar by default, and a setting switches back to compact mode (Helium's behavior). In both hidden and compact, moving the mouse to the left edge shows the full sidebar over the page. Polished edge reveal for the hidden toolbar too | Helium's layout (compact and zen mode) |
+| Sidebar hide and reveal | Cmd+S and the sidebar button fully hide and show the sidebar by default, and a setting switches back to compact mode (Helium's behavior). In both hidden and compact, moving the mouse to the left edge shows the full sidebar over the page. Polished edge reveal for the hidden toolbar too. Mostly a set of changes to Helium's frameless mode, which already hides the sidebar and top bar until you hover the window edge | Helium's frameless mode (zen mode in code), compact mode |
 | Address bar in the sidebar | An appearance setting that moves the address bar into the sidebar | Sidebar header, location bar |
 | Auto picture-in-picture | Video pops out when you leave a tab where it's playing | Media and picture-in-picture |
 
@@ -92,10 +94,12 @@ being too large.
 - Sidebar hide and reveal:
   [helium#1035](https://github.com/imputnet/helium/pull/1035) (expand the
   compact sidebar on hover). Chromium also has its own expand-on-hover for
-  vertical tabs, behind a disabled feature flag.
+  vertical tabs, behind a disabled feature flag. Start from frameless mode,
+  though, since it already does most of the hiding and revealing.
 - Address bar in the sidebar:
   [helium#2367](https://github.com/imputnet/helium/pull/2367). The look is
-  right; the approach needs a fresh review.
+  right; the approach needs a fresh review. It works through frameless
+  mode, like sidebar hide and reveal will.
 - Auto picture-in-picture:
   [helium#1765](https://github.com/imputnet/helium/pull/1765). Chromium has
   related flags, such as `auto-picture-in-picture-on-window-occluded`.
