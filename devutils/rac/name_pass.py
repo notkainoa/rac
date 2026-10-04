@@ -94,9 +94,14 @@ def read_xml(path):
     return original, original.replace(DOLLAR_LITERAL, DOLLAR_PLACEHOLDER)
 
 
-def write_xml(path, tree):
-    """Writes a GRIT file, restoring literal dollar signs."""
-    text = xml.tostring(tree, encoding='unicode', xml_declaration=True)
+def write_xml(path, tree, original):
+    """
+    Writes a GRIT file, restoring literal dollar signs. Keeps the XML
+    declaration only if the file had one, since some generators that read
+    .grdp files fail on it.
+    """
+    declaration = original.lstrip().startswith('<?xml')
+    text = xml.tostring(tree, encoding='unicode', xml_declaration=declaration)
     with open(path, 'w', encoding='utf-8') as file:
         file.write(text.replace(DOLLAR_PLACEHOLDER, DOLLAR_LITERAL))
 
@@ -130,7 +135,7 @@ def substitute_grit_file(args):
     arcname = str(path.relative_to(tree))
     print(f'Replaced strings in {arcname}')
     if not dry_run:
-        write_xml(path, root)
+        write_xml(path, root, original)
     return arcname, original, fp_map
 
 
@@ -164,7 +169,7 @@ def substitute_xtb_file(args):
 
     arcname = str(path.relative_to(tree))
     if not dry_run:
-        write_xml(path, root)
+        write_xml(path, root, original)
     return arcname, original
 
 

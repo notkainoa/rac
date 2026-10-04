@@ -87,7 +87,10 @@ installed side by side:
   `~/Library/Application Support/me.kainoa.rac`, and keychain item
   `rac Storage Key`. The bundle ID and data directory are permanent once
   people install rac. Changing them strands everyone's profile.
-- Internal pages use `rac://` instead of `helium://`.
+- Internal pages use `rac://` instead of `helium://`. The address bar turns
+  `rac://` into `chrome://`, which is what the browser actually loads.
+  Automation that navigates directly, such as DevTools, must use
+  `chrome://`.
 - The Apple team ID is empty until rac has its own developer account.
 - The icons are still Helium's.
 
@@ -98,9 +101,26 @@ Phrases about things Helium runs, such as "Helium services" and "Helium
 Partner", stay as they are. Translations of those strings keep their text,
 because the phrase can't be found reliably in every language.
 
-Dev builds (`he build`) skip both name passes, as in Helium. Dev builds show
-"Chromium" and Helium's own wording in the UI. That's expected. Check wording
-in a release build.
+Dev trees get the same wording. `devutils/rac/dev_names.py sub` runs both
+passes on `build/src` and saves the files it changes in
+`build/src/.rac_names/`, so `dev_names.py unsub` can put them back.
+`devutils/rac/worktree.sh sync` keeps this up to date: it reverts the names
+before quilt pops or pushes patches, then applies them again. Applying them
+takes about a minute, and the next build redoes the string packs (about 500
+steps). Dev trees skip Helium's translations of its own strings, so those
+show in English in other languages.
+
+While the names are applied, string files (`.grd`, `.grdp`, `.xtb`) in
+`build/src` don't match what the patches expect:
+
+- **Before a patch edits a string file**, run `devutils/rac/dev_names.py
+  unsub`. Otherwise `quilt refresh` saves rac's wording into the patch, and
+  the patch won't apply in release builds. Run `devutils/rac/worktree.sh
+  sync` after refreshing to apply the names again.
+- **Don't pop or push patches with plain quilt** while the names are
+  applied. Use `worktree.sh sync`, or run `unsub` first.
+- **Don't use `he sub` or `he namesub`.** They run only Helium's pass, with
+  separate backups.
 
 What still connects to Helium's servers:
 

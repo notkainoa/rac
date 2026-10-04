@@ -40,6 +40,11 @@ pids_matching() {
   ps -axo pid=,command= | P="$1" SELF="$$" awk 'index($0, ENVIRON["P"]) && $1 != ENVIRON["SELF"] { print $1 }'
 }
 
+dev_names() {
+  python3 "$root/devutils/rac/dev_names.py" "$1" -t "$src" >&2 \
+    || die "dev_names.py $1 failed"
+}
+
 clone_tree() {
   python3 - "$1" "$2" <<'EOF'
 import ctypes, os, sys
@@ -54,11 +59,12 @@ EOF
 # patch, so sync can tell which patch files changed since they were applied.
 #
 #   stack record <patches dir>  write the record, hashing files in that dir
-#   stack compare               print "<keep> <applied> <top_unchanged>": how
-#                               many applied patches still match the series
-#                               and the record, how many are applied, and
-#                               whether the top patch is still in the series
-#                               with an unchanged file
+#   stack compare               print "<keep> <applied> <wanted>
+#                               <top_unchanged>": how many applied patches
+#                               still match the series and the record, how
+#                               many are applied, how many the series lists,
+#                               and whether the top patch is still in the
+#                               series with an unchanged file
 #   stack matches               exit 0 if the applied stack equals the series
 stack() {
   python3 - "$root/patches" "$src/.pc/applied-patches" "$record" "$@" <<'EOF'
@@ -94,7 +100,7 @@ elif mode == "compare":
             break
         keep = i + 1
     top_unchanged = int(bool(applied) and applied[-1] in wanted and unchanged(applied[-1]))
-    print(keep, len(applied), top_unchanged)
+    print(keep, len(applied), len(wanted), top_unchanged)
 EOF
 }
 
@@ -105,8 +111,15 @@ cmd_sync() {
   [ -f "$root/patches/series.merged" ] || die "patches are not merged; run: source dev.sh && he merge"
   [ -f "$record" ] || stack record "$root/patches"
 
-  local keep applied top_unchanged
-  read -r keep applied top_unchanged < <(stack compare)
+  local keep applied wanted top_unchanged
+  read -r keep applied wanted top_unchanged < <(stack compare)
+
+  # quilt can't pop or push patches on string files that the name passes
+  # changed (pop -f would even restore stale copies), so revert the names
+  # first. The end of sync applies them again.
+  if [ "$keep" -lt "$applied" ] || [ "$applied" -lt "$wanted" ]; then
+    dev_names unsub
+  fi
 
   # Popping with -f throws away edits that haven't been saved into a patch.
   # They can only be detected when the top patch's file is unchanged, because
@@ -132,6 +145,7 @@ cmd_sync() {
   fi
 
   stack record "$root/patches"
+  dev_names sub
   log "patch stack is in sync ($(wc -l < "$src/.pc/applied-patches" | tr -d ' ') applied)"
 }
 

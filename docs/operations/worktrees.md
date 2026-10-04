@@ -31,7 +31,9 @@ devutils/rac/worktree.sh setup
 
 Setup checks out the Helium submodule from the main checkout, merges the
 patches, clones the build tree, points it at the new worktree, and applies
-any patches that differ from the main checkout's.
+any patches that differ from the main checkout's. Like every `sync`, it also
+applies rac's names to the dev tree (see
+[Branding](../internals/overview.md#branding-and-helium-services)).
 
 ## Working in a worktree
 

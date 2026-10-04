@@ -107,6 +107,11 @@ the maintainer when they ask how to work on features in parallel.
   `patches/series` change, then run `he merge` to keep working.
 - **After a rebase or pull.** Run `devutils/rac/worktree.sh sync`, then
   `he build`.
+- **String files.** Dev trees show rac's names, which changes the `.grd`,
+  `.grdp`, and `.xtb` files in `build/src`. Run
+  `devutils/rac/dev_names.py unsub` before a patch edits one, and
+  `worktree.sh sync` after `quilt refresh`. See
+  [docs/internals/overview.md](docs/internals/overview.md#branding-and-helium-services).
 - **Removing one.** Factory runs the cleanup script when it deletes the
   worktree. Without Factory, run `devutils/rac/worktree.sh cleanup`, then
   `git worktree remove --force <path>`. Only remove a worktree when the
