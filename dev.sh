@@ -128,8 +128,8 @@ ___helium_build() {
 }
 
 ___helium_run() {
-    "$_out_dir/Helium.app/Contents/MacOS/Helium" \
-    --user-data-dir="$HOME/Library/Application Support/net.imput.helium.dev" \
+    "$_out_dir/rac.app/Contents/MacOS/rac" \
+    --user-data-dir="$HOME/Library/Application Support/me.kainoa.rac.dev" \
     --enable-ui-devtools \
     --use-mock-keychain \
     --disable-features=DialMediaRouteProvider

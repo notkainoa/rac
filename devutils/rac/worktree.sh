@@ -181,7 +181,7 @@ cmd_setup() {
 
 cmd_run() {
   [ "$root" != "$base" ] || die "in the main checkout, use he run"
-  local app="$out/Helium.app/Contents/MacOS/Helium"
+  local app="$out/rac.app/Contents/MacOS/rac"
   [ -x "$app" ] || die "no build at $out; run: source dev.sh && he build"
   exec "$app" \
     --user-data-dir="$root/build/profile" \
