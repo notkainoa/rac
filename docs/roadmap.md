@@ -125,8 +125,8 @@ features.
 
 No order and no promises:
 
-- rac's own crash reports, if they can fit the privacy rule (see
-  [internals/overview.md](internals/overview.md#crash-reports))
+- rac's own crash reports, sent only when the user says yes after each
+  crash (see [internals/overview.md](internals/overview.md#crash-reports))
 - Hosting rac's own copy of Helium's services
 - Automations on a schedule or trigger
 - 1Password integration and a wallet

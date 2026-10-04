@@ -142,12 +142,17 @@ Send automatically" choice exist. Turning them back on means replacing
 restores the setting. Helium's crash server (`minidumpster` in
 `imputnet/helium-services`) is open source and could be hosted for rac.
 
-A crash report can contain parts of the browser's memory, including pages
-the user had open. A rac crash server is a rac server holding user data,
-which the [vision](../../VISION.md) rules out today. It needs the
-maintainer's sign-off on how it fits: at least off or ask-every-time by
-default, never automatic without the user choosing it, and reports deleted
-from the server quickly.
+How it should work, as the maintainer decided:
+
+- Crash reporting is on by default, and "on" means rac asks. After every
+  crash, rac asks whether to send that report. Nothing is ever sent without
+  a yes for that crash. There's no "send automatically" choice.
+- The onboarding and settings both let users turn it on or off.
+
+How to build this (the prompt, the server, how long reports are kept) is
+for when it's implemented. A crash report can contain parts of the
+browser's memory, including pages the user had open, so the server should
+keep reports only as long as needed to fix the crash.
 
 ## Versions and updates
 

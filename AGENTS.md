@@ -16,7 +16,8 @@ what rac is, what it never compromises on, and what it deliberately won't do.
 The full reasoning is in the vision. In short:
 
 1. **Private.** No data collection, no rac accounts, no ads, nothing that
-   phones home to rac.
+   phones home to rac. The only planned exception is crash reports, sent
+   only when the user says yes after each crash.
 2. **Never slower than Helium.** A feature that's turned off does no work.
    Watch startup, tab switching, scrolling, and typing for regressions.
 3. **Beautiful and calm.** Arc's personality with Dia's simplicity. Tasteful

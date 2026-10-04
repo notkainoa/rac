@@ -38,7 +38,9 @@ and improved continuously. Everyone else is welcome, especially:
 1. **Private.** rac never sees, keeps, or sells your data. There are no rac
    accounts, no rac servers holding your browsing, no ads, and no sponsored
    content. When you use AI, your chosen provider's terms apply between you
-   and that provider. rac itself never sees your conversations.
+   and that provider. rac itself never sees your conversations. The one
+   thing rac may ever receive is a crash report, and only when you say yes
+   after that crash.
 2. **Never slower than Helium.** Every feature has to earn its place without
    slowing startup, tab switching, scrolling, or typing. Features that are
    turned off cost nothing: no background work, no network calls, no
