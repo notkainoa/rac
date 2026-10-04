@@ -67,6 +67,13 @@ sense for rac:
 - `.github/PULL_REQUEST_TEMPLATE.md`
 - `.github/ISSUE_TEMPLATE/`
 
+rac also changes a few lines in Helium's release files: the `.github/`
+release scripts, `.github/workflows/build.yml`,
+`devutils/generate_sparkle_deltas.py`, and `sign_and_package_app.sh`. If one
+conflicts, take Helium's change and keep rac's file names (`rac_<version>`,
+`rac.app`), rac's version from `rac_version.txt`, and the update feed steps
+(see [Releases](releases.md)).
+
 Every other helium-macos file stays Helium's. rac-only files (`AGENTS.md`,
 `CLAUDE.md`, `VISION.md`, `CONTRIBUTING.md`, `.github/SECURITY.md`,
 `docs/README.md`, `docs/roadmap.md`, `docs/internals/`, `docs/operations/`,

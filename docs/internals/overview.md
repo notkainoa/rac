@@ -23,7 +23,7 @@ Chromium source tarball          (downloaded during setup into build/src)
 | `dev.sh`, `devutils/`, `env.sh` | Helium | Development tooling (the `he` command) and shared paths. |
 | `resources/` | Shared | macOS app icons, assets, and DMG layout. Mapped into the source tree by `resources/platform_resources.txt`. |
 | `flags.macos.gn`, `downloads.ini` | Helium | macOS build flags and extra downloads. |
-| `.github/` | Helium | Helium's CI and release workflows. Not yet adapted for rac. |
+| `.github/` | Helium | Helium's CI and release workflows, changed to use rac's file names, version, and update feeds. See [Releases](../operations/releases.md). |
 | `build/` | Local | Gitignored working area: download cache, the patched source tree (`build/src`), and build output. |
 
 ## How patches are applied
@@ -126,8 +126,46 @@ What still connects to Helium's servers:
 
 | What | Status |
 | --- | --- |
-| Browser updates (`updates.helium.computer`) | Off. `rac/updates/disable-browser-updates.patch` never returns Helium's feed, and Sparkle is only built when CI has a signing key. Helium's feed would replace rac with Helium. |
+| Browser updates (`updates.helium.computer`) | Never. rac checks its own feed on GitHub instead (see [Versions and updates](#versions-and-updates)). Helium's feed would replace rac with Helium. |
 | Crash reports (`crash.helium.computer`) | Off. `rac/privacy/disable-crash-uploads.patch` removes the upload URL and the setting. |
 | Helium services (extension downloads, uBlock lists, spell check, bangs, component updates) | Kept, behind Helium's consent screen and labeled as Helium's. Decide whether to keep them, go direct, or host rac's own before public releases. The onboarding also links to Helium's privacy policy and terms for them. |
 
 The [roadmap](../roadmap.md) tracks the rest of this work in phase 1.
+
+## Versions and updates
+
+rac has its own version, `MAJOR.MINOR.PATCH`, in `rac_version.txt`. It's
+separate from Helium's version (four parts, such as `0.18.2.1`) and from
+Chromium's. `devutils/rac/rac_version.py` writes it into `chrome/VERSION`
+during `prepare_sources` and `worktree.sh sync`, and
+`rac/updates/version.patch` puts it in the app bundle, `--version`, About
+rac, and `rac://version`, next to the Helium and Chromium versions.
+
+The version may only go up. Sparkle installs an update only when the feed's
+version is higher than the bundle's, so a release that reuses or lowers a
+version is never offered to anyone. The release workflow refuses to run in
+that case.
+
+Updates use Helium's Sparkle integration, pointed at rac's own feed:
+
+- **The feed is a GitHub release asset.** Each release uploads
+  `appcast-arm64.xml` and `appcast-x86_64.xml`, and rac reads
+  `releases/latest/download/appcast-<arch>.xml` from this repo. GitHub's
+  `latest` skips prereleases, so releases must not be marked as
+  prereleases. rac runs no update server.
+- **It doesn't depend on Helium services.** `rac/updates/update-feed.patch`
+  replaces Helium's consent check with rac's own setting,
+  `rac.browser_updates` (on by default), shown as "Update rac automatically"
+  on the About rac page. Helium's services toggle now covers only component
+  updates.
+- **Updates are signed with rac's EdDSA key.** Builds embed the public key,
+  and `devutils/rac/sparkle.py` signs each disk image and delta with the
+  private key. Both live only in GitHub secrets. Losing the private key
+  means installed copies can't verify any future update, so keep a backup.
+- **Dev builds have no updater.** Sparkle is only built when
+  `PROD_MACOS_SPARKLE_ED_PUB_KEY` is set, which only CI does. To test the
+  updater locally, follow [Releases](../operations/releases.md#testing-an-update-locally).
+- **Chromium compares the wrong versions.** Its upgrade detector compares
+  the bundle's version with Chromium's, which would always look like an
+  update and nag about relaunching. `version.patch` makes it compare with
+  rac's version on macOS.

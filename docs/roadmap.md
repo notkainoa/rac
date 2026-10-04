@@ -39,7 +39,7 @@ branching the rest.
 | --- | --- | --- |
 | **Identity** (first) | App name, bundle ID, data directory, keychain name, Apple team ID. rac and Helium must be installable side by side. | Branding, product directory, keychain |
 | Cut Helium services | Crash reporting off; decide what replaces extension downloads, uBlock lists, and anything sync uses on Helium's servers | Service prefs and URLs |
-| Updater | Sparkle off until rac has releases, then rac's own feed and signing key | `macos/updater/` |
+| Updater | rac's own version, feed on GitHub releases, and signing key, independent of Helium services | `rac/updates/`, release scripts |
 | Icons and DMG art | App icon, logos, DMG background | `resources/` only |
 | Name pass | A substitution step after Helium's that turns "Helium" into "rac" in user-facing text | New substitution step |
 | Onboarding | rac's own first-run flow, using Helium's existing Arc importer | Onboarding page |
@@ -51,7 +51,8 @@ What's done and what still talks to Helium is in
 Decided:
 
 - The bundle ID is `me.kainoa.rac`.
-- Updates stay off until there are public releases.
+- rac has its own version number and checks only its own GitHub releases
+  for updates, with its own setting on the About rac page.
 - Helium's services stay, labeled as Helium's and behind its consent screen,
   until public releases.
 - Helium's icon stays until rac's is designed.
@@ -59,6 +60,8 @@ Decided:
 Still needed before sharing builds:
 
 - An Apple Developer account for signing and notarization.
+- The update signing key in GitHub secrets (see
+  [Releases](operations/releases.md#one-time-setup)).
 - A decision on Helium's services: keep them, go direct, or host rac's own.
 
 ## Phase 2: Foundations

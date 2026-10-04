@@ -72,6 +72,11 @@ separate Arc-style feature.
    `git submodule update --remote`. The Helium core version only changes
    when a helium-macos release is merged. See
    [docs/operations/upstream-sync.md](docs/operations/upstream-sync.md).
+6. **Breaking updates for everyone.** The version in `rac_version.txt` only
+   goes up, the update signing key never changes, and the feed URL in
+   `rac/updates/update-feed.patch` never moves. Any of these strands every
+   installed copy on its current version. See
+   [docs/operations/releases.md](docs/operations/releases.md).
 
 ## Where changes go
 

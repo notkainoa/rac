@@ -27,3 +27,5 @@ them, and traps that are hard to spot from the source.
   and Chromium releases
 - [Feature worktrees](operations/worktrees.md): working on several features
   at once, each with its own build tree
+- [Releases](operations/releases.md): the signing key, publishing a version,
+  and testing updates
