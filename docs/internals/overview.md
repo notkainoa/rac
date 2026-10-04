@@ -16,7 +16,7 @@ Chromium source tarball          (downloaded during setup into build/src)
 | Path | Owner | What it is |
 | --- | --- | --- |
 | `helium-chromium/` | Helium | Submodule of `imputnet/helium`, the platform-independent core: core patch series, build utilities, translations, and resources. Do not edit. |
-| `patches/series` | Shared | Ordered list of macOS-layer patches. Helium's entries come first. rac's entries go last, under `# rac`. |
+| `patches/series` | Shared | Ordered list of macOS-layer patches. Helium's entries come first. rac's `rac/` entries go last, after a blank line. Don't add `#` comments: Helium's lint, which CI runs, reads them as patch names. |
 | `patches/helium/`, `patches/rebel/`, `patches/ungoogled-chromium/` | Helium | Helium's macOS patches. Do not edit. |
 | `patches/rac/` | rac | rac's patches. |
 | `build.sh` | Helium | Full release build: downloads sources, applies all patches, builds, signs, and packages a `.dmg`. |
@@ -30,9 +30,14 @@ Chromium source tarball          (downloaded during setup into build/src)
 
 `devutils/shared.sh` runs `helium-chromium/utils/patches.py apply`, passing
 `helium-chromium/patches` first and then this repo's `patches/`. Each
-directory's `series` file sets the order. Blank lines and lines starting with
-`#` are ignored. After patching, Helium runs name and domain substitution and
-copies resources into the tree.
+directory's `series` file sets the order. Blank lines are ignored. Lines
+starting with `#` are skipped when patches are applied, but Helium's lint
+fails on them, so rac's series has none.
+
+After patching, Helium runs name and domain substitution and applies its
+translations. Then rac's name pass runs (see
+[Branding](#branding-and-helium-services)), and resources are copied into the
+tree.
 
 For development, `he merge` combines both series into
 `patches/series.merged` so quilt can manage the whole stack from `build/src`.
@@ -51,10 +56,9 @@ Install the requirements in [building.md](../building.md) first.
    files, run `quilt add` before creating them.
 5. Edit, then test with `he build && he run`.
 6. Save the patch: `quilt refresh`. Format it with `he format`.
-7. Run `he unmerge`, check that the new entry sits under `# rac` at the end
-   of `patches/series`, then commit the patch together with the series change.
-   The `# rac` comment doesn't exist until the first rac patch. Add it on the
-   line directly above that patch's entry.
+7. Run `he unmerge`, check that the new entry sits with the other `rac/`
+   entries at the end of `patches/series`, then commit the patch together
+   with the series change.
 
 ### Patch design for low-maintenance updates
 
@@ -76,20 +80,34 @@ To keep that cheap:
 
 ## Branding and Helium services
 
-rac currently still builds and identifies itself as Helium. This includes the
-app name, bundle ID (`net.imput.helium`), keychain name, data directory, and
-icons. Rebranding is planned as its own `rac/branding/` patch group plus rac
-icons in `resources/`. It must give rac a separate bundle ID and data directory
-so rac and Helium can be installed side by side.
+`patches/rac/branding/` gives rac its own identity, so rac and Helium can be
+installed side by side:
 
-The build also still talks to Helium's servers. Until rac patches change this,
-treat it as a blocker for sharing builds with anyone:
+- `rac.app`, bundle ID `me.kainoa.rac`, data directory
+  `~/Library/Application Support/me.kainoa.rac`, and keychain item
+  `rac Storage Key`. The bundle ID and data directory are permanent once
+  people install rac. Changing them strands everyone's profile.
+- Internal pages use `rac://` instead of `helium://`.
+- The Apple team ID is empty until rac has its own developer account.
+- The icons are still Helium's.
 
-| What | Where it's set | Why it matters |
-| --- | --- | --- |
-| Update checks (`updates.helium.computer`) and Sparkle | `helium-chromium/patches/helium/core/add-updater-preference.patch`, `patches/helium/macos/updater/` | A rac install could update itself into Helium. |
-| Crash reports (`crash.helium.computer`) | `helium-chromium/patches/helium/core/crash-reporting-prefs.patch` | rac crashes would go to Helium. |
-| Helium services (`services.helium.imput.net`) | `helium-chromium/patches/helium/core/services-prefs.patch` | Extension downloads and other features use Helium's infrastructure. |
-| Apple team ID and signing identity | `helium-chromium/patches/helium/core/change-chromium-branding.patch`, `sign_and_package_app.sh` | Builds are configured for imput's Apple account. |
+`devutils/rac/name_pass.py` turns "Helium" into "rac" in user-facing
+strings and translations. It runs in release builds after Helium's own pass
+(which turns "Chrome" into "Helium"), so it only ever sees Helium's wording.
+Phrases about things Helium runs, such as "Helium services" and "Helium
+Partner", stay as they are. Translations of those strings keep their text,
+because the phrase can't be found reliably in every language.
 
-The [roadmap](../roadmap.md) tracks this work in phase 1.
+Dev builds (`he build`) skip both name passes, as in Helium. Dev builds show
+"Chromium" and Helium's own wording in the UI. That's expected. Check wording
+in a release build.
+
+What still connects to Helium's servers:
+
+| What | Status |
+| --- | --- |
+| Browser updates (`updates.helium.computer`) | Off. `rac/updates/disable-browser-updates.patch` never returns Helium's feed, and Sparkle is only built when CI has a signing key. Helium's feed would replace rac with Helium. |
+| Crash reports (`crash.helium.computer`) | Off. `rac/privacy/disable-crash-uploads.patch` removes the upload URL and the setting. |
+| Helium services (extension downloads, uBlock lists, spell check, bangs, component updates) | Kept, behind Helium's consent screen and labeled as Helium's. Decide whether to keep them, go direct, or host rac's own before public releases. The onboarding also links to Helium's privacy policy and terms for them. |
+
+The [roadmap](../roadmap.md) tracks the rest of this work in phase 1.

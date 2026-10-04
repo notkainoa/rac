@@ -3,7 +3,8 @@
 The order in which rac gets built. This page lists what each phase covers.
 Track active work in GitHub issues, not here.
 
-Status: **phase 1**. rac builds and runs, but it's still stock Helium.
+Status: **phase 1**. rac has its own name, bundle ID, and data directory,
+with Helium's icons and services.
 
 ## How the phases work
 
@@ -44,19 +45,21 @@ branching the rest.
 | Onboarding | rac's own first-run flow, using Helium's existing Arc importer | Onboarding page |
 | CI and releases | Replace Helium's workflows (especially `bump.yml`), signing, notarization, packaging | `.github/`, signing scripts |
 
-Helium's servers and branding are listed in
+What's done and what still talks to Helium is in
 [internals/overview.md](internals/overview.md#branding-and-helium-services).
-When Identity renames `Helium.app`, update `he run` and
-`devutils/rac/worktree.sh run` to match.
 
-Decisions needed before this phase can finish:
+Decided:
 
-- The bundle ID. It's hard to change after people install rac.
-- Whether to keep using Helium's services for extension downloads and
-  uBlock lists, go direct, or host rac's own.
-- Whether updates stay off until there are public releases.
-- An Apple Developer account for signing and notarization, needed before
-  sharing builds.
+- The bundle ID is `me.kainoa.rac`.
+- Updates stay off until there are public releases.
+- Helium's services stay, labeled as Helium's and behind its consent screen,
+  until public releases.
+- Helium's icon stays until rac's is designed.
+
+Still needed before sharing builds:
+
+- An Apple Developer account for signing and notarization.
+- A decision on Helium's services: keep them, go direct, or host rac's own.
 
 ## Phase 2: Foundations
 

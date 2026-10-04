@@ -58,8 +58,8 @@ separate Arc-style feature.
 3. **Touching the maintainer's real browser data.** rac is the maintainer's
    daily driver. Never point a build at a real profile folder in
    `~/Library/Application Support/`, such as `net.imput.helium` or rac's own
-   once it exists. In the main checkout, use `he run`, which launches with a
-   separate dev folder (`net.imput.helium.dev`). In a feature worktree, use
+   `me.kainoa.rac`. In the main checkout, use `he run`, which launches with a
+   separate dev folder (`me.kainoa.rac.dev`). In a feature worktree, use
    `devutils/rac/worktree.sh run`, which gives the worktree its own profile.
 4. **Destroying the build tree.** `build/src` is a full Chromium checkout,
    roughly 100 GB that takes hours to recreate. Don't run `he reset`, delete
@@ -77,7 +77,7 @@ separate Arc-style feature.
 
 | Change | Location |
 | --- | --- |
-| Chromium or Helium behavior | `patches/rac/<area>/<name>.patch`, listed at the end of `patches/series` under `# rac` |
+| Chromium or Helium behavior | `patches/rac/<area>/<name>.patch`, listed at the end of `patches/series`, after Helium's entries |
 | Icons, logos, other assets | rac-owned files in `resources/`, wired in through the resource lists |
 | Docs | `VISION.md`, `CONTRIBUTING.md`, `docs/` (see [Documentation](#documentation)) |
 | Build or CI | Only when necessary; keep it small and isolated |

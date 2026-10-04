@@ -30,7 +30,7 @@ git remote set-url --push upstream no_push
    git submodule update --init --recursive
    ```
    Merge conflicts should be rare and mostly in `patches/series`. Keep all of
-   Helium's new entries, and keep the `# rac` section at the end.
+   Helium's new entries, and keep the `rac/` entries at the end.
 3. If the Chromium version changed, rebuild the source tree. Run
    `he reset`, then `he presetup` and `he merge`. Otherwise, just run
    `he merge`.
