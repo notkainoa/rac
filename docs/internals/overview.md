@@ -144,10 +144,11 @@ restores the setting. Helium's crash server (`minidumpster` in
 
 How it should work, as the maintainer decided:
 
-- Crash reporting is on by default, and "on" means rac asks. After every
-  crash, rac asks whether to send that report. Nothing is ever sent without
-  a yes for that crash. There's no "send automatically" choice.
-- The onboarding and settings both let users turn it on or off.
+- Crash reporting is off by default. Users can turn it on in the
+  onboarding, and turn it on or off later in settings.
+- When it's on, rac asks after every crash whether to send that report.
+  Nothing is ever sent without a yes for that crash. There's no "send
+  automatically" choice.
 
 How to build this (the prompt, the server, how long reports are kept) is
 for when it's implemented. A crash report can contain parts of the
