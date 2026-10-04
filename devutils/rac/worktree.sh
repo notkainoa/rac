@@ -146,6 +146,7 @@ cmd_sync() {
 
   stack record "$root/patches"
   dev_names sub
+  python3 "$root/devutils/rac/rac_version.py" -t "$src" || die "rac_version.py failed"
   log "patch stack is in sync ($(wc -l < "$src/.pc/applied-patches" | tr -d ' ') applied)"
 }
 

@@ -39,6 +39,7 @@ prepare_sources() {
   python3 "$_root_dir/devutils/rac/name_pass.py" --sub -t "$_src_dir"
   python3 "$_main_repo/utils/helium_version.py" \
     --tree "$_main_repo" --platform-tree "$_root_dir" --chromium-tree "$_src_dir"
+  python3 "$_root_dir/devutils/rac/rac_version.py" -t "$_src_dir"
 
   helium_resources
 }
