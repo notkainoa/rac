@@ -127,10 +127,27 @@ What still connects to Helium's servers:
 | What | Status |
 | --- | --- |
 | Browser updates (`updates.helium.computer`) | Never. rac checks its own feed on GitHub instead (see [Versions and updates](#versions-and-updates)). Helium's feed would replace rac with Helium. |
-| Crash reports (`crash.helium.computer`) | Off. `rac/privacy/disable-crash-uploads.patch` removes the upload URL and the setting. |
-| Helium services (extension downloads, uBlock lists, spell check, bangs, component updates) | Kept, behind Helium's consent screen and labeled as Helium's. Decide whether to keep them, go direct, or host rac's own before public releases. The onboarding also links to Helium's privacy policy and terms for them. |
+| Crash reports (`crash.helium.computer`) | Off, but not removed. `rac/privacy/disable-crash-uploads.patch` only empties the upload URL, makes the mode always "disabled" (so reports are deleted, never offered or sent), and hides the setting. Helium's crash reporting code is untouched, so rac can add its own later (see [Crash reports](#crash-reports)). |
+| Helium services (extension downloads, uBlock lists, spell check, bangs, component updates) | Kept as they are, behind Helium's consent screen and labeled as Helium's. The onboarding links to Helium's privacy policy and terms for them. rac may host its own copy later; Helium's server code is open source (`imputnet/helium-services`). |
 
 The [roadmap](../roadmap.md) tracks the rest of this work in phase 1.
+
+### Crash reports
+
+rac may get its own crash reports later. Helium's pieces are all still
+there: Crashpad writes the reports, the browser can ask after a crash, and
+the settings handler and strings for the "Disabled / Ask after a crash /
+Send automatically" choice exist. Turning them back on means replacing
+`disable-crash-uploads.patch` with one that returns rac's upload URL and
+restores the setting. Helium's crash server (`minidumpster` in
+`imputnet/helium-services`) is open source and could be hosted for rac.
+
+A crash report can contain parts of the browser's memory, including pages
+the user had open. A rac crash server is a rac server holding user data,
+which the [vision](../../VISION.md) rules out today. It needs the
+maintainer's sign-off on how it fits: at least off or ask-every-time by
+default, never automatic without the user choosing it, and reports deleted
+from the server quickly.
 
 ## Versions and updates
 

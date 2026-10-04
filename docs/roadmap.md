@@ -38,7 +38,7 @@ branching the rest.
 | Feature | Covers | Code it touches |
 | --- | --- | --- |
 | **Identity** (first) | App name, bundle ID, data directory, keychain name, Apple team ID. rac and Helium must be installable side by side. | Branding, product directory, keychain |
-| Cut Helium services | Crash reporting off; decide what replaces extension downloads, uBlock lists, and anything sync uses on Helium's servers | Service prefs and URLs |
+| Cut Helium services | Crash reporting off; Helium's other services stay | Service prefs and URLs |
 | Updater | rac's own version, feed on GitHub releases, and signing key, independent of Helium services | `rac/updates/`, release scripts |
 | Icons and DMG art | App icon, logos, DMG background | `resources/` only |
 | Name pass | A substitution step after Helium's that turns "Helium" into "rac" in user-facing text | New substitution step |
@@ -53,8 +53,9 @@ Decided:
 - The bundle ID is `me.kainoa.rac`.
 - rac has its own version number and checks only its own GitHub releases
   for updates, with its own setting on the About rac page.
-- Helium's services stay, labeled as Helium's and behind its consent screen,
-  until public releases.
+- Helium's services (extensions, bangs, spell check, uBlock lists,
+  component updates) stay as they are, labeled as Helium's and behind its
+  consent screen. rac may host its own copy later.
 - Helium's icon stays until rac's is designed.
 
 Still needed before sharing builds:
@@ -62,7 +63,6 @@ Still needed before sharing builds:
 - An Apple Developer account for signing and notarization.
 - The update signing key in GitHub secrets (see
   [Releases](operations/releases.md#one-time-setup)).
-- A decision on Helium's services: keep them, go direct, or host rac's own.
 
 ## Phase 2: Foundations
 
@@ -98,6 +98,7 @@ first, then sync the other.
 | --- | --- |
 | Arc import | Bring Arc's spaces, pinned tabs, and favorites into rac's |
 | Onboarding update | Space themes, import, and sidebar layout choices in the first run |
+| Bangs | A settings page to view, edit, delete, and add bangs, with edits that survive list updates, and a rethought address bar experience for bangs. Design first; see [internals/bangs.md](internals/bangs.md) |
 | Performance check | Startup, tab switching, scrolling, and typing compared with Helium, with each feature on and off |
 | Micro-interactions | Tasteful motion, one worktree per area (sidebar, spaces, command bar) |
 
@@ -124,6 +125,9 @@ features.
 
 No order and no promises:
 
+- rac's own crash reports, if they can fit the privacy rule (see
+  [internals/overview.md](internals/overview.md#crash-reports))
+- Hosting rac's own copy of Helium's services
 - Automations on a schedule or trigger
 - 1Password integration and a wallet
 - Letting outside agents use rac's browser tools through MCP

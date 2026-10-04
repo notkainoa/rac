@@ -20,6 +20,8 @@ them, and traps that are hard to spot from the source.
 - [Glossary](internals/glossary.md): the words rac uses for things
 - [AI (work in progress)](internals/ai.md): ideas collected so far; nothing
   decided
+- [Bangs (work in progress)](internals/bangs.md): editable bangs and a
+  better address bar experience; nothing designed yet
 
 ## Operations
 
