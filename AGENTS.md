@@ -133,8 +133,8 @@ Patch rules:
 - When removing code, delete the lines instead of commenting them out or
   wrapping them in `#if 0`. This keeps `quilt refresh` reliable.
 - Follow Chromium's style. Run `he format` on the topmost patch.
-- Build on what Helium already has (vertical layout, compact mode, split
-  view, side panels, zen mode, the keyboard shortcut system) instead of
+- Build on what Helium already has (vertical layout, split view, side panels,
+  frameless mode, the keyboard shortcut system) instead of
   replacing it.
 
 ## Cover every surface
@@ -146,7 +146,8 @@ done, go through this list and say which items applied:
 - **Ways in.** Sidebar, command bar, menu bar, keyboard shortcut, context
   menu, and settings. If a feature can be reached from one, check whether it
   should be reachable from the others.
-- **Sidebar states.** Full, compact, and hidden, plus edge reveal.
+- **Sidebar states.** Full and hidden, plus edge reveal. There is no compact,
+  icons-only sidebar.
 - **Windows.** Multiple profile windows, multiple spaces, incognito, and
   split view.
 - **Appearance.** Light and dark mode, every space theme, and the address

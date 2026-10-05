@@ -80,7 +80,7 @@ how frameless mode lays out the window.
 | --- | --- | --- |
 | **Spaces** | Spaces inside each profile window, each with its own tabs; the switcher dots at the bottom of the sidebar; saved across restarts | Tab model, vertical sidebar |
 | Pinned tabs and favorites | Arc-style pinned tabs that stay in one space's sidebar, loose or in folders, each remembering the page it was pinned on with a way to reset back to it; and favorites (Helium's pinned tabs) as icons at the top of the sidebar, shared by every space in a profile. One feature, because both reshape the top of the tab list | Tab list |
-| Sidebar hide and reveal | Cmd+S and the sidebar button fully hide and show the sidebar by default, and a setting switches back to compact mode (Helium's behavior). In both hidden and compact, moving the mouse to the left edge shows the full sidebar over the page. Polished edge reveal for the hidden toolbar too. Mostly a set of changes to Helium's frameless mode, which already hides the sidebar and top bar until you hover the window edge | Helium's frameless mode (zen mode in code), compact mode |
+| Sidebar hide and reveal | Cmd+S and the sidebar button toggle Frameless mode itself; no compact, icons-only sidebar. Moving the mouse to the left edge shows the full hidden sidebar over the page. Polished edge reveal for the hidden toolbar too. Builds on Helium's frameless mode, which already hides the sidebar and top bar until you hover the window edge | Helium's frameless mode (zen mode in code), vertical sidebar |
 | Address bar in the sidebar | An appearance setting that moves the address bar into the sidebar | Sidebar header, location bar |
 | Auto picture-in-picture | Video pops out when you leave a tab where it's playing | Media and picture-in-picture |
 
@@ -91,11 +91,6 @@ being too large.
 - Pinned tabs: [helium#1578](https://github.com/imputnet/helium/pull/1578)
   ("anchored tabs"). Its per-tab behavior is what rac wants. rac's section
   differs: it holds loose tabs as well as folders.
-- Sidebar hide and reveal:
-  [helium#1035](https://github.com/imputnet/helium/pull/1035) (expand the
-  compact sidebar on hover). Chromium also has its own expand-on-hover for
-  vertical tabs, behind a disabled feature flag. Start from frameless mode,
-  though, since it already does most of the hiding and revealing.
 - Address bar in the sidebar:
   [helium#2367](https://github.com/imputnet/helium/pull/2367). The look is
   right; the approach needs a fresh review. It works through frameless
