@@ -1,0 +1,2408 @@
+--- a/chrome/browser/global_keyboard_shortcuts_mac.mm
++++ b/chrome/browser/global_keyboard_shortcuts_mac.mm
+@@ -118,8 +118,17 @@
+       {true,  true,  false, false, kVK_ANSI_LeftBracket,  IDC_SELECT_PREVIOUS_TAB},
+       {false, false, true,  false, kVK_PageDown,          IDC_SELECT_NEXT_TAB},
+       {false, false, true,  false, kVK_PageUp,            IDC_SELECT_PREVIOUS_TAB},
+-      {true,  false, false, true,  kVK_RightArrow,        IDC_SELECT_NEXT_TAB},
+-      {true,  false, false, true,  kVK_LeftArrow,         IDC_SELECT_PREVIOUS_TAB},
++      {true,  false, false, true,  kVK_RightArrow,        IDC_RAC_NEXT_SPACE},
++      {true,  false, false, true,  kVK_LeftArrow,         IDC_RAC_PREVIOUS_SPACE},
++      {false, false, true,  false, kVK_ANSI_1,           IDC_RAC_SHOW_SPACE_0},
++      {false, false, true,  false, kVK_ANSI_2,           IDC_RAC_SHOW_SPACE_1},
++      {false, false, true,  false, kVK_ANSI_3,           IDC_RAC_SHOW_SPACE_2},
++      {false, false, true,  false, kVK_ANSI_4,           IDC_RAC_SHOW_SPACE_3},
++      {false, false, true,  false, kVK_ANSI_5,           IDC_RAC_SHOW_SPACE_4},
++      {false, false, true,  false, kVK_ANSI_6,           IDC_RAC_SHOW_SPACE_5},
++      {false, false, true,  false, kVK_ANSI_7,           IDC_RAC_SHOW_SPACE_6},
++      {false, false, true,  false, kVK_ANSI_8,           IDC_RAC_SHOW_SPACE_7},
++      {false, false, true,  false, kVK_ANSI_9,           IDC_RAC_SHOW_SPACE_8},
+       {false, true,  true,  false, kVK_PageDown,          IDC_MOVE_TAB_NEXT},
+       {false, true,  true,  false, kVK_PageUp,            IDC_MOVE_TAB_PREVIOUS},
+ 
+--- a/chrome/browser/rac/spaces/BUILD.gn
++++ b/chrome/browser/rac/spaces/BUILD.gn
+@@ -29,15 +29,26 @@
+ }
+ 
+ # The parts that need a profile or a WebContents.
+-source_set("browser") {
++source_set("tab_state") {
+   sources = [
+     "space_tab_tag.cc",
+     "space_tab_tag.h",
++  ]
++  public_deps = [
++    "//base",
++    "//content/public/browser",
++  ]
++  deps = [ "//components/tabs:public" ]
++}
++
++source_set("browser") {
++  sources = [
+     "spaces_service_factory.cc",
+     "spaces_service_factory.h",
+   ]
+   public_deps = [
+     ":spaces",
++    ":tab_state",
+     "//chrome/browser/profiles:profile",
+     "//content/public/browser",
+   ]
+--- a/chrome/browser/rac/spaces/space_tab_tag.cc
++++ b/chrome/browser/rac/spaces/space_tab_tag.cc
+@@ -7,6 +7,7 @@
+ #include <utility>
+ 
+ #include "base/check.h"
++#include "components/tabs/public/tab_interface.h"
+ 
+ namespace rac {
+ 
+@@ -39,4 +40,26 @@
+ 
+ WEB_CONTENTS_USER_DATA_KEY_IMPL(SpaceTabTag);
+ 
++bool SpaceTabTag::IsVisible(const tabs::TabInterface* tab) {
++  if (!tab) {
++    return false;
++  }
++  const auto* tag = FromWebContents(tab->GetContents());
++  return tab->IsPinned() || !tag || !tag->hidden_;
++}
++
++void SpaceTabTag::SetHidden(content::WebContents* contents, bool hidden) {
++  if (auto* tag = FromWebContents(contents)) {
++    tag->hidden_ = hidden;
++  }
++}
++
++void SpaceTabTag::Copy(const content::WebContents* from,
++                       content::WebContents* to) {
++  if (const auto* tag = FromWebContents(from)) {
++    Set(to, tag->space_id_);
++    FromWebContents(to)->hidden_ = tag->hidden_;
++  }
++}
++
+ }  // namespace rac
+--- a/chrome/browser/rac/spaces/space_tab_tag.h
++++ b/chrome/browser/rac/spaces/space_tab_tag.h
+@@ -10,8 +10,14 @@
+ #include "base/uuid.h"
+ #include "content/public/browser/web_contents_user_data.h"
+ 
++namespace tabs {
++class TabInterface;
++}
++
+ namespace rac {
+ 
++inline constexpr char kTabSpaceExtraDataKey[] = "rac.space";
++
+ // Which space a tab belongs to. It lives on the tab's WebContents, so it
+ // follows the tab between windows and survives discarding, which keeps the
+ // WebContents. An untagged tab hasn't been placed yet; resolve its space with
+@@ -24,6 +30,11 @@
+ 
+   static std::optional<base::Uuid> Get(const content::WebContents* contents);
+   static void Set(content::WebContents* contents, const base::Uuid& space_id);
++  // Shared by the tab strip's layout, selection, and bulk commands. Favorites
++  // remain visible. Untagged tabs (including incognito) retain native behavior.
++  static bool IsVisible(const tabs::TabInterface* tab);
++  static void SetHidden(content::WebContents* contents, bool hidden);
++  static void Copy(const content::WebContents* from, content::WebContents* to);
+ 
+  private:
+   friend class content::WebContentsUserData<SpaceTabTag>;
+@@ -31,6 +42,7 @@
+   SpaceTabTag(content::WebContents* contents, base::Uuid space_id);
+ 
+   base::Uuid space_id_;
++  bool hidden_ = false;
+ 
+   WEB_CONTENTS_USER_DATA_KEY_DECL();
+ };
+--- a/chrome/browser/rac/spaces/spaces_store.cc
++++ b/chrome/browser/rac/spaces/spaces_store.cc
+@@ -216,10 +216,40 @@
+   }
+ }
+ 
++struct SpacesStore::LoadedData {
++  int version = kVersion;
++  base::DictValue unknown_fields;
++  std::map<base::Uuid, StoredSpace> spaces;
++};
++
+ void SpacesStore::Load() {
++  DidLoad(base::OnceClosure(), ReadData(dir_));
++}
++
++void SpacesStore::LoadAsync(base::OnceClosure ready) {
++  CHECK(!loading_ && !write_pending_ && spaces_.empty());
++  loading_ = true;
++  write_task_runner_->PostTaskAndReplyWithResult(
++      FROM_HERE, base::BindOnce(&SpacesStore::ReadData, dir_),
++      base::BindOnce(&SpacesStore::DidLoad, weak_factory_.GetWeakPtr(),
++                     std::move(ready)));
++}
++
++void SpacesStore::DidLoad(base::OnceClosure ready, LoadedData data) {
++  version_ = data.version;
++  unknown_fields_ = std::move(data.unknown_fields);
++  spaces_ = std::move(data.spaces);
++  loading_ = false;
++  if (ready) {
++    std::move(ready).Run();
++  }
++}
++
++SpacesStore::LoadedData SpacesStore::ReadData(const base::FilePath& dir) {
++  LoadedData loaded;
+   for (const char* suffix : {"", ".bak"}) {
+     const base::FilePath path =
+-        dir_.AppendASCII("rac spaces" + std::string(suffix));
++        dir.AppendASCII("rac spaces" + std::string(suffix));
+     std::string content;
+     if (!base::ReadFileToString(path, &content) || content.empty()) {
+       continue;
+@@ -230,10 +260,11 @@
+       continue;
+     }
+     const base::DictValue& dict = parsed->GetDict();
+-    version_ = std::max(dict.FindInt(kVersionKey).value_or(kVersion), kVersion);
+-    unknown_fields_ = dict.Clone();
+-    unknown_fields_.Remove(kVersionKey);
+-    unknown_fields_.Remove(kSpacesKey);
++    loaded.version =
++        std::max(dict.FindInt(kVersionKey).value_or(kVersion), kVersion);
++    loaded.unknown_fields = dict.Clone();
++    loaded.unknown_fields.Remove(kVersionKey);
++    loaded.unknown_fields.Remove(kSpacesKey);
+     if (const base::DictValue* spaces = dict.FindDict(kSpacesKey)) {
+       for (const auto [key, value] : *spaces) {
+         base::Uuid id = base::Uuid::ParseCaseInsensitive(key);
+@@ -244,12 +275,13 @@
+         std::optional<StoredSpace> space = StoredSpace::FromDict(*space_dict);
+         if (space) {
+           space->space = id;
+-          spaces_[id] = std::move(*space);
++          loaded.spaces[id] = std::move(*space);
+         }
+       }
+     }
+-    return;
++    break;
+   }
++  return loaded;
+ }
+ 
+ const StoredSpace* SpacesStore::Find(const base::Uuid& space) const {
+@@ -258,6 +290,7 @@
+ }
+ 
+ void SpacesStore::Put(StoredSpace space) {
++  CHECK(!loading_);
+   const base::Uuid id = space.space;
+   spaces_[id] = std::move(space);
+   write_pending_ = true;
+@@ -267,6 +300,7 @@
+ }
+ 
+ void SpacesStore::Remove(const base::Uuid& space) {
++  CHECK(!loading_);
+   if (spaces_.erase(space) > 0) {
+     write_pending_ = true;
+     save_timer_.Start(
+--- a/chrome/browser/rac/spaces/spaces_store.h
++++ b/chrome/browser/rac/spaces/spaces_store.h
+@@ -11,7 +11,9 @@
+ #include <vector>
+ 
+ #include "base/files/file_path.h"
++#include "base/functional/callback.h"
+ #include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/time/time.h"
+ #include "base/timer/timer.h"
+@@ -76,6 +78,9 @@
+ 
+   // Reads the file. Call once, early.
+   void Load();
++  // Reads and decodes on the storage sequence. Do not mutate the store until
++  // `ready` runs. Destroying the store safely cancels the reply.
++  void LoadAsync(base::OnceClosure ready);
+ 
+   // The stored space, or null. Doesn't remove it; call Remove once the tabs
+   // are live again.
+@@ -90,6 +95,9 @@
+   void SaveNow();
+ 
+  private:
++  struct LoadedData;
++  static LoadedData ReadData(const base::FilePath& dir);
++  void DidLoad(base::OnceClosure ready, LoadedData data);
+   base::DictValue ToDict() const;
+ 
+   const base::FilePath dir_;
+@@ -102,6 +110,8 @@
+ 
+   base::OneShotTimer save_timer_;
+   bool write_pending_ = false;
++  bool loading_ = false;
++  base::WeakPtrFactory<SpacesStore> weak_factory_{this};
+ };
+ 
+ }  // namespace rac
+--- a/chrome/browser/rac/spaces/spaces_store_unittest.cc
++++ b/chrome/browser/rac/spaces/spaces_store_unittest.cc
+@@ -11,6 +11,7 @@
+ #include "base/files/file_util.h"
+ #include "base/files/scoped_temp_dir.h"
+ #include "base/test/task_environment.h"
++#include "base/test/test_future.h"
+ #include "base/threading/thread_restrictions.h"
+ #include "base/time/time.h"
+ #include "base/uuid.h"
+@@ -178,5 +179,63 @@
+   EXPECT_EQ(*reloaded.Find(id)->unknown_fields.FindString("marker"), "first");
+ }
+ 
++TEST_F(SpacesStoreTest, AsyncLoadDoesNotBlockUIThread) {
++  const auto id = base::Uuid::GenerateRandomV4();
++  {
++    SpacesStore initial(dir_.GetPath());
++    initial.Put(MakeSpace(id, "retained"));
++  }
++  task_environment_.RunUntilIdle();
++
++  SpacesStore store(dir_.GetPath());
++  base::test::TestFuture<void> ready;
++  {
++    base::ScopedDisallowBlocking disallow_blocking;
++    store.LoadAsync(ready.GetCallback());
++    EXPECT_FALSE(ready.IsReady());
++    task_environment_.RunUntilIdle();
++  }
++  ASSERT_TRUE(ready.IsReady());
++  ASSERT_TRUE(store.Find(id));
++  EXPECT_EQ(*store.Find(id)->unknown_fields.FindString("marker"), "retained");
++  EXPECT_FALSE(store.HasPendingWrite());
++}
++
++TEST_F(SpacesStoreTest, AsyncLoadCanOutliveStoreWithoutCallingClient) {
++  base::test::TestFuture<void> ready;
++  {
++    auto store = std::make_unique<SpacesStore>(dir_.GetPath());
++    base::ScopedDisallowBlocking disallow_blocking;
++    store->LoadAsync(ready.GetCallback());
++    store.reset();
++  }
++  task_environment_.RunUntilIdle();
++  EXPECT_FALSE(ready.IsReady());
++  EXPECT_FALSE(base::PathExists(dir_.GetPath().AppendASCII("rac spaces")));
++}
++
++TEST_F(SpacesStoreTest, AsyncLoadThenSaveRetainsOtherSpaces) {
++  const auto first = base::Uuid::GenerateRandomV4();
++  const auto second = base::Uuid::GenerateRandomV4();
++  {
++    SpacesStore initial(dir_.GetPath());
++    initial.Put(MakeSpace(first, "original"));
++  }
++  task_environment_.RunUntilIdle();
++  {
++    SpacesStore store(dir_.GetPath());
++    base::test::TestFuture<void> ready;
++    store.LoadAsync(ready.GetCallback());
++    task_environment_.RunUntilIdle();
++    ASSERT_TRUE(ready.IsReady());
++    store.Put(MakeSpace(second, "new"));
++  }
++  task_environment_.RunUntilIdle();
++  SpacesStore reloaded(dir_.GetPath());
++  reloaded.Load();
++  ASSERT_TRUE(reloaded.Find(first));
++  ASSERT_TRUE(reloaded.Find(second));
++}
++
+ }  // namespace
+ }  // namespace rac
+--- a/chrome/browser/sessions/session_service_base.cc
++++ b/chrome/browser/sessions/session_service_base.cc
+@@ -22,6 +22,7 @@
+ #include "chrome/browser/apps/app_service/web_contents_app_id_utils.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/spaces/space_tab_tag.h"
+ #include "chrome/browser/sessions/session_service_base_observer.h"
+ #include "chrome/browser/sessions/session_service_log.h"
+ #include "chrome/browser/sessions/session_service_utils.h"
+@@ -614,6 +615,12 @@
+   sessions::SessionTabHelper* session_tab_helper =
+       sessions::SessionTabHelper::FromWebContents(tab);
+   const SessionID session_id(session_tab_helper->session_id());
++  if (auto space = rac::SpaceTabTag::Get(tab)) {
++    command_storage_manager()->AppendRebuildCommand(
++        sessions::CreateAddTabExtraDataCommand(session_id,
++                                               rac::kTabSpaceExtraDataKey,
++                                               space->AsLowercaseString()));
++  }
+   command_storage_manager()->AppendRebuildCommand(
+       sessions::CreateSetTabWindowCommand(window_id, session_id));
+ 
+--- a/chrome/browser/ui/accelerator_table.cc
++++ b/chrome/browser/ui/accelerator_table.cc
+@@ -55,6 +55,17 @@
+ #endif
+     {ui::VKEY_ESCAPE, ui::EF_NONE, IDC_CLOSE_FIND_OR_STOP},
+ 
++    // rac: switch spaces with Ctrl+1-9, including on macOS.
++    {ui::VKEY_1, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_0},
++    {ui::VKEY_2, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_1},
++    {ui::VKEY_3, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_2},
++    {ui::VKEY_4, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_3},
++    {ui::VKEY_5, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_4},
++    {ui::VKEY_6, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_5},
++    {ui::VKEY_7, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_6},
++    {ui::VKEY_8, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_7},
++    {ui::VKEY_9, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_8},
++
+ #if !BUILDFLAG(IS_MAC)
+     {ui::VKEY_D, ui::EF_PLATFORM_ACCELERATOR, IDC_BOOKMARK_THIS_TAB},
+     {ui::VKEY_D, ui::EF_SHIFT_DOWN | ui::EF_PLATFORM_ACCELERATOR,
+@@ -112,16 +123,6 @@
+     {ui::VKEY_8, ui::EF_PLATFORM_ACCELERATOR, IDC_SELECT_TAB_7},
+     {ui::VKEY_NUMPAD8, ui::EF_PLATFORM_ACCELERATOR, IDC_SELECT_TAB_7},
+ 
+-    // rac: switch spaces with Ctrl+1-9.
+-    {ui::VKEY_1, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_0},
+-    {ui::VKEY_2, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_1},
+-    {ui::VKEY_3, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_2},
+-    {ui::VKEY_4, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_3},
+-    {ui::VKEY_5, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_4},
+-    {ui::VKEY_6, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_5},
+-    {ui::VKEY_7, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_6},
+-    {ui::VKEY_8, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_7},
+-    {ui::VKEY_9, ui::EF_CONTROL_DOWN, IDC_RAC_SHOW_SPACE_8},
+ #if BUILDFLAG(IS_LINUX)
+     {ui::VKEY_1, ui::EF_ALT_DOWN, IDC_SELECT_TAB_0},
+     {ui::VKEY_NUMPAD1, ui::EF_ALT_DOWN, IDC_SELECT_TAB_0},
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -46,6 +46,7 @@
+ #include "chrome/browser/media/router/media_router_feature.h"
+ #include "chrome/browser/prefs/incognito_mode_prefs.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/spaces/space_tab_tag.h"
+ #include "chrome/browser/reading_list/reading_list_model_factory.h"
+ #include "chrome/browser/resource_coordinator/tab_lifecycle_unit_external.h"
+ #include "chrome/browser/search/search.h"
+@@ -1617,7 +1618,8 @@
+       model->GetFocusedGroup();
+   int visible_count = 0;
+   for (tabs::TabInterface* tab : *model) {
+-    if (!IsTabSelectable(model, tab, focused_group)) {
++    if (!rac::SpaceTabTag::IsVisible(tab) ||
++        !IsTabSelectable(model, tab, focused_group)) {
+       continue;
+     }
+ 
+@@ -1636,7 +1638,8 @@
+   std::optional<tab_groups::TabGroupId> focused_group =
+       model->GetFocusedGroup();
+   for (tabs::TabInterface* tab : base::Reversed(*model)) {
+-    if (!IsTabSelectable(model, tab, focused_group)) {
++    if (!rac::SpaceTabTag::IsVisible(tab) ||
++        !IsTabSelectable(model, tab, focused_group)) {
+       continue;
+     }
+ 
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -17,6 +17,7 @@
+ #include "chrome/browser/glic/glic_tab_restore_helper.h"
+ #include "chrome/browser/performance_manager/public/background_tab_loading_policy.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/spaces/space_tab_tag.h"
+ #include "chrome/browser/sessions/session_service_utils.h"
+ #include "chrome/browser/sessions/tab_restore_service_factory.h"
+ #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
+@@ -176,6 +177,10 @@
+ std::map<std::string, std::string> BrowserLiveTabContext::GetExtraDataForTab(
+     int index) const {
+   std::map<std::string, std::string> extra_data;
++  if (auto space =
++          rac::SpaceTabTag::Get(tab_strip_model_->GetWebContentsAt(index))) {
++    extra_data[rac::kTabSpaceExtraDataKey] = space->AsLowercaseString();
++  }
+ 
+   glic::PopulateGlicExtraData(tab_strip_model_->GetTabAtIndex(index),
+                               &extra_data);
+--- a/chrome/browser/ui/browser_tabrestore.cc
++++ b/chrome/browser/ui/browser_tabrestore.cc
+@@ -13,6 +13,7 @@
+ #include "chrome/browser/apps/app_service/web_contents_app_id_utils.h"
+ #include "chrome/browser/glic/glic_tab_restore_helper.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/spaces/space_tab_tag.h"
+ #include "chrome/browser/sessions/session_restore.h"
+ #include "chrome/browser/sessions/session_service_base.h"
+ #include "chrome/browser/sessions/session_service_lookup.h"
+@@ -83,6 +84,13 @@
+   apps::SetAppIdForWebContents(browser->GetProfile(), web_contents.get(),
+                                extension_app_id);
+ 
++  if (auto it = extra_data.find(rac::kTabSpaceExtraDataKey);
++      it != extra_data.end() && !browser->GetProfile()->IsOffTheRecord()) {
++    auto space = base::Uuid::ParseCaseInsensitive(it->second);
++    if (space.is_valid()) {
++      rac::SpaceTabTag::Set(web_contents.get(), space);
++    }
++  }
+   glic::RestoreGlicStateFromExtraData(web_contents.get(), extra_data);
+   send_tab_to_self::SendTabToSelfActivationTracker::RestoreFromExtraData(
+       web_contents.get(), extra_data);
+--- a/chrome/browser/ui/rac/spaces/hidden_space.cc
++++ b/chrome/browser/ui/rac/spaces/hidden_space.cc
+@@ -14,127 +14,28 @@
+ 
+ namespace rac {
+ 
+-namespace {
+-
+-std::vector<tabs::TabInterface*> GetCollectionTabs(
+-    const DetachedTabCollection& collection) {
+-  if (std::holds_alternative<std::unique_ptr<tabs::TabGroupTabCollection>>(
+-          collection.collection_)) {
+-    return std::get<std::unique_ptr<tabs::TabGroupTabCollection>>(
+-               collection.collection_)
+-        ->GetTabsRecursive();
+-  }
+-  return std::get<std::unique_ptr<tabs::SplitTabCollection>>(
+-             collection.collection_)
+-      ->GetTabsRecursive();
+-}
+-
+-bool IsGroup(const DetachedTabCollection& collection) {
+-  return std::holds_alternative<std::unique_ptr<tabs::TabGroupTabCollection>>(
+-      collection.collection_);
+-}
+-
+-}  // namespace
+-
+-HiddenSpace::HiddenSpace() = default;
+-HiddenSpace::HiddenSpace(HiddenSpace&&) = default;
+-HiddenSpace& HiddenSpace::operator=(HiddenSpace&&) = default;
+-
+-HiddenSpace::~HiddenSpace() {
+-  Clear();
+-}
+-
+-// static
+-HiddenSpace HiddenSpace::Detach(TabStripModel* model,
+-                                const std::vector<int>& indices) {
+-  HiddenSpace space;
+-  space.hidden_at_ = base::TimeTicks::Now();
+-  if (indices.empty()) {
+-    return space;
+-  }
+-  tabs::TabInterface* const active = model->GetActiveTab();
+-  for (auto& detached : model->DetachTabsAndCollectionsForInsertion(indices)) {
++void TransferSpaceTabs(TabStripModel* source,
++                       TabStripModel* destination,
++                       const std::vector<int>& indices) {
++  CHECK_NE(source, destination);
++  CHECK_LT(indices.size(), static_cast<size_t>(source->count()));
++  for (auto& detached : source->DetachTabsAndCollectionsForInsertion(indices)) {
+     if (auto* tab = std::get_if<std::unique_ptr<DetachedTab>>(&detached)) {
+-      space.items_.emplace_back(std::move((*tab)->tab));
+-    } else {
+-      space.items_.emplace_back(std::move(
+-          std::get<std::unique_ptr<DetachedTabCollection>>(detached)));
+-    }
+-  }
+-  for (tabs::TabInterface* tab : space.GetTabs()) {
+-    if (tab == active) {
+-      space.active_tab_ = tab;
+-    }
+-  }
+-  return space;
+-}
+-
+-void HiddenSpace::Append(HiddenSpace other) {
+-  if (!active_tab_) {
+-    active_tab_ = other.active_tab_;
+-  }
+-  // A space that was empty (newly revealed, then re-hidden) takes the
+-  // incoming tabs' hide time; otherwise the older time stands, so tabs
+-  // hidden long ago unload on schedule even if new tabs join them.
+-  if (hidden_at_.is_null()) {
+-    hidden_at_ = other.hidden_at_;
+-  }
+-  other.active_tab_ = nullptr;
+-  for (Item& item : other.items_) {
+-    items_.push_back(std::move(item));
+-  }
+-  other.items_.clear();
+-}
+-
+-tabs::TabInterface* HiddenSpace::InsertInto(TabStripModel* model) {
+-  tabs::TabInterface* const active = active_tab_;
+-  active_tab_ = nullptr;
+-  tabs::TabInterface* first = nullptr;
+-  for (Item& item : items_) {
+-    if (auto* tab = std::get_if<std::unique_ptr<tabs::TabModel>>(&item)) {
+-      tabs::TabInterface* raw = tab->get();
+-      model->InsertDetachedTabAt(model->count(), std::move(*tab),
+-                                 AddTabTypes::ADD_NONE);
+-      first = first ? first : raw;
++      destination->InsertDetachedTabAt(
++          destination->count(), std::move((*tab)->tab), AddTabTypes::ADD_NONE);
+       continue;
+     }
+-    auto& collection = std::get<std::unique_ptr<DetachedTabCollection>>(item);
+-    if (!first) {
+-      std::vector<tabs::TabInterface*> collection_tabs =
+-          GetCollectionTabs(*collection);
+-      if (!collection_tabs.empty()) {
+-        first = collection_tabs.front();
+-      }
+-    }
+-    if (IsGroup(*collection)) {
+-      model->InsertDetachedTabGroupAt(std::move(collection), model->count());
++    auto& collection =
++        std::get<std::unique_ptr<DetachedTabCollection>>(detached);
++    if (std::holds_alternative<std::unique_ptr<tabs::TabGroupTabCollection>>(
++            collection->collection_)) {
++      destination->InsertDetachedTabGroupAt(std::move(collection),
++                                            destination->count());
+     } else {
+-      model->InsertDetachedSplitTabAt(std::move(collection), model->count(),
+-                                      /*pinned=*/false);
++      destination->InsertDetachedSplitTabAt(
++          std::move(collection), destination->count(), /*pinned=*/false);
+     }
+   }
+-  items_.clear();
+-  return active ? active : first;
+-}
+-
+-std::vector<tabs::TabInterface*> HiddenSpace::GetTabs() const {
+-  std::vector<tabs::TabInterface*> result;
+-  for (const Item& item : items_) {
+-    if (const auto* tab = std::get_if<std::unique_ptr<tabs::TabModel>>(&item)) {
+-      result.push_back(tab->get());
+-    } else {
+-      for (tabs::TabInterface* collection_tab : GetCollectionTabs(
+-               *std::get<std::unique_ptr<DetachedTabCollection>>(item))) {
+-        result.push_back(collection_tab);
+-      }
+-    }
+-  }
+-  return result;
+-}
+-
+-void HiddenSpace::Clear() {
+-  active_tab_ = nullptr;
+-  items_.clear();
+ }
+ 
+ }  // namespace rac
+--- a/chrome/browser/ui/rac/spaces/hidden_space.h
++++ b/chrome/browser/ui/rac/spaces/hidden_space.h
+@@ -5,73 +5,18 @@
+ #ifndef CHROME_BROWSER_UI_RAC_SPACES_HIDDEN_SPACE_H_
+ #define CHROME_BROWSER_UI_RAC_SPACES_HIDDEN_SPACE_H_
+ 
+-#include <memory>
+-#include <variant>
+ #include <vector>
+ 
+-#include "base/memory/raw_ptr.h"
+-#include "base/time/time.h"
+-
+ class TabStripModel;
+-struct DetachedTabCollection;
+-
+-namespace tabs {
+-class TabInterface;
+-class TabModel;
+-}  // namespace tabs
+ 
+ namespace rac {
+ 
+-// The tabs of a space that no window shows. They're detached from every
+-// window but stay alive, with their pages, groups, and splits, until a window
+-// shows the space again.
+-class HiddenSpace {
+- public:
+-  // A single tab, or a tab group or split view with its tabs.
+-  using Item = std::variant<std::unique_ptr<tabs::TabModel>,
+-                            std::unique_ptr<DetachedTabCollection>>;
+-
+-  HiddenSpace();
+-  HiddenSpace(const HiddenSpace&) = delete;
+-  HiddenSpace& operator=(const HiddenSpace&) = delete;
+-  HiddenSpace(HiddenSpace&&);
+-  HiddenSpace& operator=(HiddenSpace&&);
+-  ~HiddenSpace();
+-
+-  // Detaches the tabs at `indices` from `model`, keeping their order, groups,
+-  // and splits. Whole groups move only when all their tabs are in `indices`.
+-  // The model must keep at least one tab, or its window closes.
+-  static HiddenSpace Detach(TabStripModel* model,
+-                            const std::vector<int>& indices);
+-
+-  // Moves the tabs of `other` to the end of this space.
+-  void Append(HiddenSpace other);
+-
+-  // Inserts the tabs at the end of `model` without activating any, and empties
+-  // this space. Returns the tab that was active when the space was hidden, or
+-  // the first tab inserted if that's gone. Null if there were no tabs.
+-  tabs::TabInterface* InsertInto(TabStripModel* model);
+-
+-  bool empty() const { return items_.empty(); }
+-  std::vector<tabs::TabInterface*> GetTabs() const;
+-  // The tabs, groups, and splits in order, for snapshotting.
+-  const std::vector<Item>& items() const { return items_; }
+-
+-  tabs::TabInterface* active_tab() const { return active_tab_; }
+-  void set_active_tab(tabs::TabInterface* tab) { active_tab_ = tab; }
+-
+-  base::TimeTicks hidden_at() const { return hidden_at_; }
+-
+-  // Destroys every tab. Callers record them for reopening first.
+-  void Clear();
+-
+- private:
+-  std::vector<Item> items_;
+-  // One of the tabs in `items_`, or null. Declared after `items_` so it's
+-  // cleared before the tabs are destroyed.
+-  raw_ptr<tabs::TabInterface> active_tab_ = nullptr;
+-  base::TimeTicks hidden_at_;
+-};
++// Moves tabs between real windows synchronously, retaining whole groups and
++// splits. The source must keep at least one tab. Detached tabs never escape
++// this call or survive across a task; normal space switching needs no transfer.
++void TransferSpaceTabs(TabStripModel* source,
++                       TabStripModel* destination,
++                       const std::vector<int>& indices);
+ 
+ }  // namespace rac
+ 
+--- a/chrome/browser/ui/rac/spaces/space_dialogs.cc
++++ b/chrome/browser/ui/rac/spaces/space_dialogs.cc
+@@ -89,14 +89,13 @@
+ 
+   auto host = std::make_unique<views::BubbleDialogModelHost>(
+       std::move(model), anchor, views::BubbleBorder::TOP_CENTER);
+-  auto widget =
+-      views::BubbleDialogDelegate::CreateBubble(host.release());
++  auto widget = views::BubbleDialogDelegate::CreateBubble(host.release());
+   // The bubble deletes itself once closed.
+-  widget->MakeCloseSynchronous(base::BindOnce(
+-      [](std::unique_ptr<views::Widget> closed,
+-         views::Widget::ClosedReason) {},
++  auto* widget_ptr = widget.get();
++  widget_ptr->MakeCloseSynchronous(base::BindOnce(
++      [](std::unique_ptr<views::Widget> closed, views::Widget::ClosedReason) {},
+       std::move(widget)));
+-  widget->Show();
++  widget_ptr->Show();
+ }
+ 
+ void ShowDeleteSpaceBubble(views::View* anchor,
+@@ -124,14 +123,13 @@
+ 
+   auto host = std::make_unique<views::BubbleDialogModelHost>(
+       std::move(model), anchor, views::BubbleBorder::TOP_CENTER);
+-  auto widget =
+-      views::BubbleDialogDelegate::CreateBubble(host.release());
++  auto widget = views::BubbleDialogDelegate::CreateBubble(host.release());
+   // The bubble deletes itself once closed.
+-  widget->MakeCloseSynchronous(base::BindOnce(
+-      [](std::unique_ptr<views::Widget> closed,
+-         views::Widget::ClosedReason) {},
++  auto* widget_ptr = widget.get();
++  widget_ptr->MakeCloseSynchronous(base::BindOnce(
++      [](std::unique_ptr<views::Widget> closed, views::Widget::ClosedReason) {},
+       std::move(widget)));
+-  widget->Show();
++  widget_ptr->Show();
+ }
+ 
+ }  // namespace rac
+--- a/chrome/browser/ui/rac/spaces/space_switcher_view.cc
++++ b/chrome/browser/ui/rac/spaces/space_switcher_view.cc
+@@ -156,6 +156,9 @@
+ }
+ 
+ void SpaceSwitcherView::Rebuild() {
++  if (menu_runner_ && menu_runner_->IsRunning()) {
++    menu_runner_->Cancel();
++  }
+   RemoveAllChildViews();
+   if (!manager_) {
+     return;
+@@ -202,6 +205,9 @@
+   }
+   SpacesService* spaces = manager_->spaces();
+   const std::optional<size_t> index = spaces->GetIndex(*menu_space_);
++  if (!index) {
++    return false;
++  }
+   switch (command_id) {
+     case kMoveLeftCommand:
+       return index && *index > 0;
+@@ -257,7 +263,9 @@
+     return;
+   }
+   menu_space_ = dot->space();
+-  menu_anchor_ = dot;
++  // Dots are rebuilt on space changes. The switcher itself is a stable bubble
++  // anchor, even when Rename or Delete rebuilds its children.
++  menu_anchor_ = this;
+ 
+   menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
+   menu_model_->AddItemWithStringId(kRenameCommand, IDS_RAC_SPACES_RENAME);
+--- a/chrome/browser/ui/rac/spaces/spaces_snapshot.cc
++++ b/chrome/browser/ui/rac/spaces/spaces_snapshot.cc
+@@ -4,23 +4,24 @@
+ 
+ #include "chrome/browser/ui/rac/spaces/spaces_snapshot.h"
+ 
++#include <algorithm>
+ #include <map>
+ #include <utility>
+ 
++#include "chrome/browser/rac/spaces/space_tab_tag.h"
+ #include "chrome/browser/ui/browser_tabrestore.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+-#include "chrome/browser/ui/rac/spaces/hidden_space.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "components/sessions/content/content_live_tab.h"
+ #include "components/sessions/core/live_tab.h"
+ #include "components/sessions/core/serialized_user_agent_override.h"
++#include "components/split_tabs/split_tab_visual_data.h"
+ #include "components/tab_groups/tab_group_color.h"
+ #include "components/tab_groups/tab_group_visual_data.h"
+-#include "components/tabs/public/split_tab_collection.h"
+-#include "components/tabs/public/tab_collection.h"
++#include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_group.h"
+-#include "components/tabs/public/tab_group_tab_collection.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/web_contents.h"
+ 
+ namespace rac {
+@@ -51,64 +52,55 @@
+ 
+ }  // namespace
+ 
+-StoredSpace SnapshotHiddenSpace(const base::Uuid& space,
+-                                const HiddenSpace& hidden) {
++StoredSpace SnapshotSpaceTabs(const base::Uuid& space,
++                              base::span<tabs::TabInterface* const> tabs,
++                              tabs::TabInterface* active) {
+   StoredSpace stored;
+   stored.space = space;
+-  for (const HiddenSpace::Item& item : hidden.items()) {
+-    if (const auto* tab = std::get_if<std::unique_ptr<tabs::TabModel>>(&item)) {
+-      StoredTab stored_tab = SnapshotTab(tab->get());
+-      if (!stored_tab.navigations.empty()) {
+-        if (tab->get() == hidden.active_tab()) {
+-          stored.active_tab = static_cast<int>(stored.tabs.size());
+-        }
+-        stored.tabs.push_back(std::move(stored_tab));
+-      }
++  std::map<tab_groups::TabGroupId, StoredGroup> groups;
++  base::DictValue splits;
++  for (auto* tab : tabs) {
++    StoredTab snapshot = SnapshotTab(tab);
++    if (snapshot.navigations.empty()) {
+       continue;
+     }
+-    const auto& collection =
+-        std::get<std::unique_ptr<DetachedTabCollection>>(item);
+-    if (!std::holds_alternative<std::unique_ptr<tabs::TabGroupTabCollection>>(
+-            collection->collection_)) {
+-      // A split view: its tabs become plain tabs.
+-      for (tabs::TabInterface* split_tab :
+-           std::get<std::unique_ptr<tabs::SplitTabCollection>>(
+-               collection->collection_)
+-               ->GetTabsRecursive()) {
+-        StoredTab stored_tab = SnapshotTab(split_tab);
+-        if (!stored_tab.navigations.empty()) {
+-          if (split_tab == hidden.active_tab()) {
+-            stored.active_tab = static_cast<int>(stored.tabs.size());
+-          }
+-          stored.tabs.push_back(std::move(stored_tab));
+-        }
+-      }
+-      continue;
++    if (tab == active) {
++      stored.active_tab = stored.tabs.size();
+     }
+-    const auto& group_collection =
+-        std::get<std::unique_ptr<tabs::TabGroupTabCollection>>(
+-            collection->collection_);
+-    const TabGroup* group = group_collection->GetTabGroup();
+-    StoredGroup stored_group;
+-    stored_group.id = group_collection->GetTabGroupId();
+-    if (const tab_groups::TabGroupVisualData* visuals = group->visual_data()) {
+-      stored_group.title = visuals->title();
+-      stored_group.color = static_cast<int>(visuals->color());
+-      stored_group.collapsed = visuals->is_collapsed();
+-    }
+-    stored.groups.push_back(stored_group);
+-    for (tabs::TabInterface* group_tab : group_collection->GetTabsRecursive()) {
+-      StoredTab stored_tab = SnapshotTab(group_tab);
+-      if (stored_tab.navigations.empty()) {
+-        continue;
++    if (auto split = tab->GetSplit()) {
++      auto* saved = splits.FindDict(split->ToString());
++      if (!saved) {
++        const auto* visuals = tab->GetBrowserWindowInterface()
++                                  ->GetTabStripModel()
++                                  ->GetSplitData(*split)
++                                  ->visual_data();
++        base::DictValue data;
++        data.Set("tabs", base::ListValue());
++        data.Set("layout", static_cast<int>(visuals->split_layout()));
++        data.Set("ratio", visuals->split_ratio());
++        saved = splits.Set(split->ToString(), std::move(data))->GetIfDict();
+       }
+-      stored_tab.group = stored_group.id;
+-      if (group_tab == hidden.active_tab()) {
+-        stored.active_tab = static_cast<int>(stored.tabs.size());
+-      }
+-      stored.tabs.push_back(std::move(stored_tab));
++      saved->FindList("tabs")->Append(static_cast<int>(stored.tabs.size()));
++    }
++    snapshot.group = tab->GetGroup();
++    if (snapshot.group && !groups.contains(*snapshot.group)) {
++      const auto* group = tab->GetBrowserWindowInterface()
++                              ->GetTabStripModel()
++                              ->group_model()
++                              ->GetTabGroup(*snapshot.group);
++      StoredGroup data;
++      data.id = *snapshot.group;
++      data.title = group->visual_data()->title();
++      data.color = static_cast<int>(group->visual_data()->color());
++      data.collapsed = group->visual_data()->is_collapsed();
++      groups.emplace(data.id, std::move(data));
+     }
++    stored.tabs.push_back(std::move(snapshot));
+   }
++  for (auto& [id, group] : groups) {
++    stored.groups.push_back(std::move(group));
++  }
++  stored.unknown_fields.Set("splits", std::move(splits));
+   return stored;
+ }
+ 
+@@ -129,7 +121,8 @@
+         std::string(), tab.group, /*select=*/false, /*pin=*/false,
+         last_active_ticks, tab.last_active, /*session_storage_namespace=*/
+         nullptr, sessions::SerializedUserAgentOverride(),
+-        /*extra_data=*/{},
++        /*extra_data=*/
++        {{kTabSpaceExtraDataKey, stored.space.AsLowercaseString()}},
+         /*from_session_restore=*/true,
+         /*is_active_browser=*/std::nullopt,
+         chrome::RestoredTabLoadPolicy::kDeferUntilActivation);
+@@ -150,6 +143,36 @@
+           /*is_customized=*/true);
+     }
+   }
++  if (const auto* splits = stored.unknown_fields.FindDict("splits")) {
++    for (const auto [id, value] : *splits) {
++      const auto* data = value.GetIfDict();
++      const auto* members = data ? data->FindList("tabs") : nullptr;
++      if (!members || members->size() != 2) {
++        continue;
++      }
++      std::vector<int> indices;
++      for (const auto& member : *members) {
++        auto index = member.GetIfInt();
++        if (index && added.contains(*index)) {
++          indices.push_back(model->GetIndexOfTab(added.at(*index)));
++        }
++      }
++      const int layout = data->FindInt("layout").value_or(0);
++      const double ratio = data->FindDouble("ratio").value_or(0.5);
++      std::ranges::sort(indices);
++      if (indices.size() == 2 && indices[0] != indices[1] && layout >= 0 &&
++          layout <= 1 && ratio > 0 && ratio < 1 &&
++          model->GetTabGroupForTab(indices[0]) ==
++              model->GetTabGroupForTab(indices[1]) &&
++          !model->GetSplitForTab(indices[0]) &&
++          !model->GetSplitForTab(indices[1])) {
++        model->RestoreSplit(
++            split_tabs::SplitTabId::GenerateNew(), indices,
++            split_tabs::SplitTabVisualData(
++                static_cast<split_tabs::SplitTabLayout>(layout), ratio));
++      }
++    }
++  }
+   auto it = added.find(stored.active_tab);
+   if (it != added.end()) {
+     return it->second;
+--- a/chrome/browser/ui/rac/spaces/spaces_snapshot.h
++++ b/chrome/browser/ui/rac/spaces/spaces_snapshot.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_RAC_SPACES_SPACES_SNAPSHOT_H_
+ #define CHROME_BROWSER_UI_RAC_SPACES_SPACES_SNAPSHOT_H_
+ 
++#include "base/containers/span.h"
+ #include "base/uuid.h"
+ #include "chrome/browser/rac/spaces/spaces_store.h"
+ 
+@@ -16,12 +17,11 @@
+ 
+ namespace rac {
+ 
+-class HiddenSpace;
+-
+-// Copies the tabs of a hidden space into a stored form. Groups keep their
+-// IDs and looks; split views are flattened into plain tabs.
+-StoredSpace SnapshotHiddenSpace(const base::Uuid& space,
+-                                const HiddenSpace& hidden);
++// Copies attached tabs without disturbing native ownership or selection.
++// Groups and splits retain their structure and visual data.
++StoredSpace SnapshotSpaceTabs(const base::Uuid& space,
++                              base::span<tabs::TabInterface* const> tabs,
++                              tabs::TabInterface* active);
+ 
+ // Adds the stored tabs to the window's tab strip, deferred until activated,
+ // and applies the groups' looks. Returns the tab that was active, or null if
+--- a/chrome/browser/ui/rac/spaces/spaces_window_manager.cc
++++ b/chrome/browser/ui/rac/spaces/spaces_window_manager.cc
+@@ -7,11 +7,15 @@
+ #include <algorithm>
+ #include <utility>
+ 
++#include "base/auto_reset.h"
+ #include "base/check.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
++#include "base/task/single_thread_task_runner.h"
+ #include "chrome/browser/lifetime/browser_shutdown.h"
++#include "chrome/browser/performance_manager/policies/page_discarding_helper.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/spaces/space_tab_tag.h"
+ #include "chrome/browser/search/search.h"
+ #include "chrome/browser/sessions/session_service.h"
+ #include "chrome/browser/sessions/session_service_factory.h"
+@@ -21,6 +25,7 @@
+ #include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
++#include "chrome/browser/ui/rac/spaces/hidden_space.h"
+ #include "chrome/browser/ui/rac/spaces/space_elsewhere_dialog.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_snapshot.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager_factory.h"
+@@ -28,8 +33,10 @@
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/performance_manager/public/performance_manager.h"
+ #include "components/saved_tab_groups/public/tab_group_sync_service.h"
+ #include "components/sessions/content/content_live_tab.h"
++#include "components/sessions/content/session_tab_helper.h"
+ #include "components/sessions/core/tab_restore_service.h"
+ #include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_interface.h"
+@@ -62,6 +69,12 @@
+   // Set while we close the dialog ourselves, so its close callback doesn't
+   // treat that as the user dismissing the screen.
+   bool closing_elsewhere_dialog = false;
++  bool changing_space = false;
++  bool claiming_space = false;
++  bool closing = false;
++  bool reconcile_pending = false;
++  bool membership_dirty = true;
++  std::optional<base::Uuid> requested_space;
+ };
+ 
+ namespace {
+@@ -80,15 +93,6 @@
+          search::IsNTPOrRelatedURL(contents->GetVisibleURL(), profile);
+ }
+ 
+-// Unloading leaves alone the tabs a user is likely to notice stopping:
+-// sound, picture-in-picture, and tabs still loading.
+-bool CanUnload(tabs::TabInterface* tab) {
+-  content::WebContents* contents = tab->GetContents();
+-  return !contents->WasDiscarded() && !contents->IsLoading() &&
+-         !contents->IsCurrentlyAudible() &&
+-         !contents->HasPictureInPictureVideo();
+-}
+-
+ }  // namespace
+ 
+ SpacesWindowManager::SpacesWindowManager(Profile* profile,
+@@ -96,7 +100,8 @@
+     : profile_(profile), spaces_(spaces), store_(profile_->GetPath()) {
+   CHECK(profile_);
+   CHECK(spaces_);
+-  store_.Load();
++  store_.LoadAsync(base::BindOnce(&SpacesWindowManager::OnStoreReady,
++                                  weak_ptr_factory_.GetWeakPtr()));
+   ProfileBrowserCollection* collection =
+       ProfileBrowserCollection::GetForProfile(profile_);
+   browser_collection_observation_.Observe(collection);
+@@ -114,7 +119,7 @@
+ // static
+ SpacesWindowManager* SpacesWindowManager::From(
+     BrowserWindowInterface* browser) {
+-  if (!browser || browser->GetProfile()->IsOffTheRecord()) {
++  if (!browser || !IsSupportedBrowser(browser)) {
+     return nullptr;
+   }
+   return SpacesWindowManagerFactory::GetForProfile(
+@@ -143,7 +148,7 @@
+ BrowserWindowInterface* SpacesWindowManager::GetWindowHoldingSpace(
+     const base::Uuid& space) const {
+   for (const auto& [browser, state] : windows_) {
+-    if (state->space == space && !state->showing_elsewhere) {
++    if (!state->closing && state->space == space && !state->showing_elsewhere) {
+       return const_cast<BrowserWindowInterface*>(browser);
+     }
+   }
+@@ -151,15 +156,28 @@
+ }
+ 
+ void SpacesWindowManager::ShowSpace(BrowserWindowInterface* browser,
+-                                    const base::Uuid& space) {
++                                    base::Uuid space) {
+   WindowState* state = FindState(browser);
+-  if (!state || !spaces_->FindSpace(space)) {
++  if (!state || state->closing || state->changing_space ||
++      !spaces_->FindSpace(space)) {
+     return;
+   }
+-  if (state->space == space && !state->showing_elsewhere) {
++  if (!store_ready_) {
++    state->requested_space = space;
+     return;
+   }
+-
++  // A user can switch before the first posted reconciliation runs. Assign
++  // the window's existing tabs first; otherwise they join the requested new
++  // space instead of the original one.
++  if (!state->space && !state->claiming_space) {
++    ClaimInitialSpace(browser);
++  }
++  if (state->space == space && !state->showing_elsewhere &&
++      !GetSpaceTabs(space).empty()) {
++    RefreshVisibility(*state);
++    return;
++  }
++  base::AutoReset<bool> changing(&state->changing_space, true);
+   TabStripModel* model = browser->GetTabStripModel();
+   tab_groups::TabGroupSyncService* tab_group_service =
+       tab_groups::TabGroupSyncServiceFactory::GetForProfile(profile_);
+@@ -170,64 +188,74 @@
+     observation_pauser = tab_group_service->CreateScopedLocalObserverPauser();
+   }
+ 
+-  const bool was_elsewhere = state->showing_elsewhere;
+-  // A window with no space yet (a new window claiming one) adopts the tabs it
+-  // has; otherwise the old space's tabs are hidden below.
+   const bool claiming = !state->space.has_value();
+-  const bool will_hide_old =
+-      !claiming && !was_elsewhere && *state->space != space;
+-
+-  // Snapshot before inserting, so the incoming tabs aren't mistaken for the
+-  // old space's.
+-  std::vector<tabs::TabInterface*> old_tabs = GetSpaceTabs(*state);
+-
++  const tabs::TabHandle initially_active =
++      claiming && model->GetActiveTab() ? model->GetActiveTab()->GetHandle()
++                                        : tabs::TabHandle();
++  if (state->space && !state->showing_elsewhere) {
++    if (auto* active = model->GetActiveTab(); active && !active->IsPinned()) {
++      last_active_tabs_[*state->space] = active->GetHandle();
++    }
++    hidden_since_.try_emplace(*state->space, base::TimeTicks::Now());
++  }
+   BrowserWindowInterface* holder = GetWindowHoldingSpace(space);
+   const bool elsewhere = holder && holder != browser;
++  state->space = space;
++  state->showing_elsewhere = elsewhere;
++  model->StopMRUCycling();
++  if (model->GetFocusedGroup()) {
++    model->SetFocusedGroup(std::nullopt);
++  }
+ 
+   tabs::TabInterface* activate = nullptr;
+   if (elsewhere) {
+     EnsurePlaceholder(*state);
+   } else {
+-    tabs::TabInterface* initial_tab =
+-        (claiming && old_tabs.size() == 1 &&
+-         IsUnusedInitialTab(old_tabs.front(), profile_))
+-            ? old_tabs.front()
+-            : nullptr;
++    tabs::TabHandle initial;
++    if (claiming && model->count() == 1 &&
++        !SpaceTabTag::Get(model->GetWebContentsAt(0)) &&
++        IsUnusedInitialTab(model->GetTabAtIndex(0), profile_)) {
++      initial = model->GetTabAtIndex(0)->GetHandle();
++    }
+     activate = RevealSpace(*state, space);
+-    if (initial_tab && activate) {
+-      // The claimed space has tabs of its own; drop the starting page.
+-      model->CloseWebContents(initial_tab->GetContents(), CLOSE_NONE);
+-      old_tabs.clear();
+-      initial_tab = nullptr;
+-    }
+-    const bool keeping_old = !will_hide_old && !old_tabs.empty();
+-    if (!activate && !keeping_old) {
+-      // An empty space shows a new tab.
++    if (initial.Get() && activate && initial.Get() != activate) {
++      model->CloseWebContents(initial.Get()->GetContents(), CLOSE_NONE);
++    }
++    // Adopt new-window tabs only once. Restored tabs keep their own space IDs.
++    for (auto* tab : *model) {
++      if (tab != state->placeholder_tab &&
++          (!SpaceTabTag::Get(tab->GetContents()) ||
++           !spaces_->FindSpace(*SpaceTabTag::Get(tab->GetContents())))) {
++        TagTab(tab, space);
++        if ((!activate || tab == initially_active.Get()) && !tab->IsPinned()) {
++          activate = tab;
++        }
++      }
++    }
++    if (!activate) {
+       chrome::AddTabAt(browser, GURL(), -1, /*foreground=*/false);
+       activate = model->GetTabAtIndex(model->count() - 1);
++      TagTab(activate, space);
+     }
+-    if (was_elsewhere) {
+-      ClosePlaceholder(*state);
+-    }
+-  }
+-
+-  // Detach the old space's tabs only after the window has other tabs, so the
+-  // strip never becomes empty.
+-  if (will_hide_old && !old_tabs.empty()) {
+-    HideTabs(*state, *state->space, old_tabs);
++    if (auto it = last_active_tabs_.find(space);
++        it != last_active_tabs_.end() && it->second.Get() &&
++        SpaceTabTag::Get(it->second.Get()->GetContents()) == space &&
++        model->GetIndexOfTab(it->second.Get()) != TabStripModel::kNoTab) {
++      activate = it->second.Get();
++    }
++    hidden_since_.erase(space);
++    RefreshVisibility(*state);
++    model->ActivateTab(activate);
++    ClosePlaceholder(*state);
++    spaces_->MarkSpaceActive(space);
+   }
+ 
+-  state->space = space;
+-  state->showing_elsewhere = elsewhere;
++  RefreshVisibility(*state);
+   SaveWindowSpaceToSession(*state);
+   if (elsewhere) {
+     UpdateElsewhereDialog(*state);
+-  } else {
+-    if (activate && model->GetIndexOfTab(activate) != TabStripModel::kNoTab) {
+-      model->ActivateTab(activate);
+-    }
+-    spaces_->MarkSpaceActive(space);
+   }
++  UpdateUnloadTimer();
+   NotifyWindowSpaceChanged(browser);
+ }
+ 
+@@ -271,9 +299,9 @@
+     // The holder gets the screen first, so its strip keeps a tab while its
+     // space's tabs move over.
+     EnsurePlaceholder(*holder_state);
+-    HideTabs(*holder_state, space, GetSpaceTabs(*holder_state));
+     holder_state->space = space;
+     holder_state->showing_elsewhere = true;
++    RefreshVisibility(*holder_state);
+     UpdateElsewhereDialog(*holder_state);
+     NotifyWindowSpaceChanged(holder);
+   }
+@@ -325,37 +353,72 @@
+         continue;
+       }
+     }
+-    tabs.push_back(tab);
++    if (auto split = tab->GetSplit()) {
++      for (auto* member : model->GetSplitData(*split)->ListTabs()) {
++        if (!std::ranges::contains(tabs, member)) {
++          tabs.push_back(member);
++        }
++      }
++    } else {
++      tabs.push_back(tab);
++    }
+   }
+   if (tabs.empty()) {
+     return;
+   }
+ 
+-  if (static_cast<int>(tabs.size()) == model->count()) {
+-    // Moving every tab would close the window. Leave a new tab behind; it's
+-    // what an empty space shows anyway.
++  base::AutoReset<bool> changing(&state->changing_space, true);
++  if (std::ranges::contains(tabs, model->GetActiveTab())) {
+     chrome::AddTabAt(browser, GURL(), -1, /*foreground=*/true);
++    TagTab(model->GetActiveTab(), *state->space);
+   }
+ 
+-  std::vector<int> detach_indices;
++  std::vector<int> indices_to_ungroup;
+   for (tabs::TabInterface* tab : tabs) {
+-    const int index = model->GetIndexOfTab(tab);
+-    if (index != TabStripModel::kNoTab) {
+-      detach_indices.push_back(index);
++    if (auto group = tab->GetGroup()) {
++      bool whole_group = true;
++      for (auto* candidate : *model) {
++        if (candidate->GetGroup() == group &&
++            !std::ranges::contains(tabs, candidate)) {
++          whole_group = false;
++          break;
++        }
++      }
++      if (!whole_group) {
++        indices_to_ungroup.push_back(model->GetIndexOfTab(tab));
++      }
+     }
+   }
+-  HiddenSpace moved = HiddenSpace::Detach(model, detach_indices);
+-  if (BrowserWindowInterface* holder = GetWindowHoldingSpace(space)) {
+-    moved.InsertInto(holder->GetTabStripModel());
+-  } else {
+-    hidden_[space].Append(std::move(moved));
+-    store_.Put(SnapshotHiddenSpace(space, hidden_[space]));
++  if (!indices_to_ungroup.empty()) {
++    model->RemoveFromGroup(indices_to_ungroup);
++  }
++  BrowserWindowInterface* owner = GetWindowHoldingSpace(space);
++  auto existing = GetSpaceTabs(space);
++  if (!owner && !existing.empty()) {
++    owner = existing.front()->GetBrowserWindowInterface();
++  }
++  for (auto* tab : tabs) {
++    TagTab(tab, space);
++  }
++  if (owner && owner != browser) {
++    std::vector<int> indices_to_move;
++    for (auto* tab : tabs) {
++      indices_to_move.push_back(model->GetIndexOfTab(tab));
++    }
++    TransferSpaceTabs(model, owner->GetTabStripModel(), indices_to_move);
++    RefreshVisibility(*FindState(owner));
+   }
++  if (!GetWindowHoldingSpace(space)) {
++    hidden_since_.try_emplace(space, base::TimeTicks::Now());
++  }
++  RefreshVisibility(*state);
+   UpdateUnloadTimer();
++  NotifyWindowSpaceChanged(browser);
+ }
+ 
+ void SpacesWindowManager::DeleteSpace(const base::Uuid& space) {
+-  if (spaces_->spaces().size() <= 1 || !spaces_->FindSpace(space)) {
++  if (!store_ready_ || spaces_->spaces().size() <= 1 ||
++      !spaces_->FindSpace(space)) {
+     return;
+   }
+   const Space& first = spaces_->spaces().front();
+@@ -368,15 +431,23 @@
+       showing.push_back(const_cast<BrowserWindowInterface*>(browser));
+     }
+   }
+-  // Switching moves the space's tabs into `hidden_`, below.
+   for (BrowserWindowInterface* browser : showing) {
+     ShowSpace(browser, fallback);
+   }
+-
+-  if (auto it = hidden_.find(space); it != hidden_.end()) {
+-    RecordInHistory(it->second);
+-    it->second.Clear();
+-    hidden_.erase(it);
++  // Use normal close handling, including beforeunload and tab history. If a
++  // page refuses to close, retain the space rather than orphaning its tabs.
++  std::vector<tabs::TabHandle> handles;
++  for (auto* tab : GetSpaceTabs(space)) {
++    handles.push_back(tab->GetHandle());
++  }
++  for (auto handle : handles) {
++    if (auto* tab = handle.Get()) {
++      auto* model = tab->GetBrowserWindowInterface()->GetTabStripModel();
++      model->CloseWebContents(tab->GetContents(), CLOSE_CREATE_HISTORICAL_TAB);
++    }
++  }
++  if (!GetSpaceTabs(space).empty()) {
++    return;
+   }
+   store_.Remove(space);
+   UpdateUnloadTimer();
+@@ -384,23 +455,42 @@
+ }
+ 
+ void SpacesWindowManager::UnloadSpace(const base::Uuid& space) {
+-  auto it = hidden_.find(space);
+-  if (it == hidden_.end()) {
++  if (GetWindowHoldingSpace(space)) {
++    return;
++  }
++  using performance_manager::PerformanceManager;
++  auto* graph = PerformanceManager::GetGraph();
++  if (!graph) {
+     return;
+   }
+-  for (tabs::TabInterface* tab : it->second.GetTabs()) {
+-    if (CanUnload(tab)) {
+-      tab->GetContents()->Discard(base::DoNothing());
++  auto* helper =
++      performance_manager::policies::PageDiscardingHelper::GetFromGraph(graph);
++  if (!helper) {
++    return;
++  }
++  std::vector<const performance_manager::PageNode*> pages;
++  for (auto* tab : GetSpaceTabs(space)) {
++    if (!tab->GetContents()->IsLoading()) {
++      if (auto page = PerformanceManager::GetPrimaryPageNodeForWebContents(
++              tab->GetContents())) {
++        pages.push_back(page.get());
++      }
+     }
+   }
++  // PROACTIVE honors Chromium's protection for forms, media, capture, pinned
++  // tabs and opt-outs. EXTERNAL would bypass those protections.
++  helper->ImmediatelyDiscardMultiplePages(
++      pages, performance_manager::policies::DiscardEligibilityPolicy::
++                 DiscardReason::PROACTIVE);
+ }
+ 
+ bool SpacesWindowManager::IsSpaceUnloaded(const base::Uuid& space) const {
+-  auto it = hidden_.find(space);
+-  if (it == hidden_.end() || it->second.empty()) {
+-    return false;
++  auto tabs = GetSpaceTabs(space);
++  if (tabs.empty()) {
++    const auto* saved = store_.Find(space);
++    return saved && !saved->tabs.empty();
+   }
+-  for (tabs::TabInterface* tab : it->second.GetTabs()) {
++  for (tabs::TabInterface* tab : tabs) {
+     if (!tab->GetContents()->WasDiscarded()) {
+       return false;
+     }
+@@ -410,31 +500,43 @@
+ 
+ void SpacesWindowManager::UnloadStaleHiddenSpaces() {
+   const base::TimeTicks now = base::TimeTicks::Now();
+-  for (const auto& [space, hidden] : hidden_) {
+-    if (now - hidden.hidden_at() >= kHiddenUnloadDelay) {
+-      UnloadSpace(space);
++  std::vector<base::Uuid> due;
++  for (const auto& [space, since] : hidden_since_) {
++    if (now - since >= kHiddenUnloadDelay) {
++      due.push_back(space);
++    }
++  }
++  for (const auto& space : due) {
++    hidden_since_.erase(space);
++    UnloadSpace(space);
++    // Protection can be temporary (loading, audio, capture). Retry on the
++    // next idle interval, without a per-minute polling timer.
++    if (!GetWindowHoldingSpace(space) && !GetSpaceTabs(space).empty() &&
++        !IsSpaceUnloaded(space)) {
++      hidden_since_[space] = now;
+     }
+   }
+   UpdateUnloadTimer();
+ }
+ 
+ void SpacesWindowManager::UpdateUnloadTimer() {
+-  if (hidden_.empty()) {
+-    unload_timer_.Stop();
++  unload_timer_.Stop();
++  if (hidden_since_.empty()) {
+     return;
+   }
+-  if (!unload_timer_.IsRunning()) {
+-    unload_timer_.Start(FROM_HERE, base::Minutes(1), this,
+-                        &SpacesWindowManager::UnloadStaleHiddenSpaces);
+-  }
++  const auto next = std::ranges::min_element(
++      hidden_since_, {}, [](const auto& entry) { return entry.second; });
++  unload_timer_.Start(
++      FROM_HERE,
++      std::max(base::TimeDelta(),
++               next->second + kHiddenUnloadDelay - base::TimeTicks::Now()),
++      this, &SpacesWindowManager::UnloadStaleHiddenSpaces);
+ }
+ 
+ size_t SpacesWindowManager::GetTabCount(const base::Uuid& space) const {
+-  if (auto it = hidden_.find(space); it != hidden_.end()) {
+-    return it->second.GetTabs().size();
+-  }
+-  if (BrowserWindowInterface* holder = GetWindowHoldingSpace(space)) {
+-    return GetSpaceTabs(*FindState(holder)).size();
++  auto tabs = GetSpaceTabs(space);
++  if (!tabs.empty()) {
++    return tabs.size();
+   }
+   if (const StoredSpace* stored = store_.Find(space)) {
+     return stored->tabs.size();
+@@ -460,7 +562,8 @@
+     CloseElsewhereDialog(*state);
+   }
+   windows_.clear();
+-  hidden_.clear();
++  unload_timer_.Stop();
++  hidden_since_.clear();
+ }
+ 
+ SpacesWindowManager::WindowState* SpacesWindowManager::FindState(
+@@ -481,9 +584,10 @@
+ 
+ void SpacesWindowManager::ClaimInitialSpace(BrowserWindowInterface* browser) {
+   WindowState* state = FindState(browser);
+-  if (!state || state->space) {
++  if (!store_ready_ || !state || state->space) {
+     return;
+   }
++  base::AutoReset<bool> claiming(&state->claiming_space, true);
+   // A session-restored window goes back to the space it showed. The
+   // session brings the space's tabs, so the space is assigned directly
+   // rather than through ShowSpace's reveal.
+@@ -500,10 +604,17 @@
+           return;
+         }
+         state->space = restored;
++        for (auto* tab : *browser->GetTabStripModel()) {
++          if (auto tagged = SpaceTabTag::Get(tab->GetContents());
++              !tagged || !spaces_->FindSpace(*tagged)) {
++            TagTab(tab, restored);
++          }
++        }
+         spaces_->MarkSpaceActive(restored);
+         SaveWindowSpaceToSession(*state);
+         // The session's tabs are the live copy now.
+         store_.Remove(restored);
++        RefreshVisibility(*state);
+         NotifyWindowSpaceChanged(browser);
+         return;
+       }
+@@ -526,54 +637,144 @@
+ }
+ 
+ std::vector<tabs::TabInterface*> SpacesWindowManager::GetSpaceTabs(
+-    const WindowState& state) const {
++    const base::Uuid& space) const {
+   std::vector<tabs::TabInterface*> tabs;
+-  TabStripModel* model = state.browser->GetTabStripModel();
+-  for (int i = 0; i < model->count(); ++i) {
+-    if (model->IsTabPinned(i)) {
++  for (const auto& [browser, state] : windows_) {
++    if (state->closing) {
+       continue;
+     }
+-    tabs::TabInterface* tab = model->GetTabAtIndex(i);
+-    if (tab != state.placeholder_tab) {
+-      tabs.push_back(tab);
++    for (auto* tab : *browser->GetTabStripModel()) {
++      if (!tab->IsPinned() && tab != state->placeholder_tab &&
++          SpaceTabTag::Get(tab->GetContents()) == space) {
++        tabs.push_back(tab);
++      }
+     }
+   }
+   return tabs;
+ }
+ 
+-void SpacesWindowManager::HideTabs(
+-    WindowState& state,
+-    const base::Uuid& space,
+-    const std::vector<tabs::TabInterface*>& tabs) {
+-  if (tabs.empty()) {
+-    return;
++void SpacesWindowManager::TagTab(tabs::TabInterface* tab,
++                                 const base::Uuid& space) {
++  SpaceTabTag::Set(tab->GetContents(), space);
++  auto* browser = tab->GetBrowserWindowInterface();
++  if (browser) {
++    if (auto* session =
++            SessionServiceFactory::GetForProfileIfExisting(profile_)) {
++      session->AddTabExtraData(
++          browser->GetSessionID(),
++          sessions::SessionTabHelper::IdForTab(tab->GetContents()),
++          kTabSpaceExtraDataKey, space.AsLowercaseString());
++    }
+   }
+-  TabStripModel* model = state.browser->GetTabStripModel();
+-  std::vector<int> indices;
+-  for (tabs::TabInterface* tab : tabs) {
+-    const int index = model->GetIndexOfTab(tab);
+-    if (index != TabStripModel::kNoTab) {
+-      indices.push_back(index);
++}
++
++void SpacesWindowManager::RefreshVisibility(WindowState& state) {
++  auto* model = state.browser->GetTabStripModel();
++  for (auto* tab : *model) {
++    const auto space = SpaceTabTag::Get(tab->GetContents());
++    const bool hidden = tab != state.placeholder_tab && space &&
++                        (state.showing_elsewhere || space != state.space);
++    SpaceTabTag::SetHidden(tab->GetContents(), hidden);
++    if (hidden && !tab->GetContents()->WasDiscarded() &&
++        !GetWindowHoldingSpace(*space)) {
++      hidden_since_.try_emplace(*space, base::TimeTicks::Now());
+     }
+   }
+-  // This may empty the strip when the window is closing; that's the one case
+-  // where an empty strip is expected.
+-  hidden_[space].Append(HiddenSpace::Detach(model, indices));
+-  store_.Put(SnapshotHiddenSpace(space, hidden_[space]));
++  model->NotifySpaceVisibilityChanged();
+   UpdateUnloadTimer();
+ }
+ 
++void SpacesWindowManager::ScheduleReconcile(WindowState& state) {
++  if (state.closing || state.reconcile_pending) {
++    return;
++  }
++  state.reconcile_pending = true;
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&SpacesWindowManager::ReconcileWindow,
++                                weak_ptr_factory_.GetWeakPtr(), state.browser));
++}
++
++void SpacesWindowManager::OnStoreReady() {
++  store_ready_ = true;
++  for (auto& [browser, state] : windows_) {
++    ScheduleReconcile(*state);
++  }
++}
++
++void SpacesWindowManager::ReconcileWindow(BrowserWindowInterface* browser) {
++  auto* state = FindState(browser);
++  if (!state || state->closing) {
++    return;
++  }
++  state->reconcile_pending = false;
++  if (!store_ready_) {
++    return;
++  }
++  auto* model = browser->GetTabStripModel();
++  if (model->closing_all() || model->empty()) {
++    return;
++  }
++  if (!state->space) {
++    ClaimInitialSpace(browser);
++    if (state->requested_space) {
++      auto requested = std::exchange(state->requested_space, std::nullopt);
++      ShowSpace(browser, *requested);
++    }
++    return;
++  }
++  // An extension, tab search, or normal close selection can activate a tab
++  // from another space. Reveal that space instead of leaving an invisible
++  // active tab. Never mutate TabStripModel inside one of its notifications.
++  auto* active = model->GetActiveTab();
++  if (active && active != state->placeholder_tab && !active->IsPinned()) {
++    if (auto space = SpaceTabTag::Get(active->GetContents());
++        space && *space != *state->space && spaces_->FindSpace(*space)) {
++      ShowSpace(browser, *space);
++      return;
++    }
++  }
++  if (!std::exchange(state->membership_dirty, false)) {
++    return;
++  }
++  RefreshVisibility(*state);
++}
++
+ tabs::TabInterface* SpacesWindowManager::RevealSpace(WindowState& state,
+                                                      const base::Uuid& space) {
+-  auto it = hidden_.find(space);
+-  if (it != hidden_.end() && !it->second.empty()) {
+-    HiddenSpace hidden = std::move(it->second);
+-    hidden_.erase(it);
+-    UpdateUnloadTimer();
+-    return hidden.InsertInto(state.browser->GetTabStripModel());
++  auto tabs = GetSpaceTabs(space);
++  if (!tabs.empty()) {
++    auto* destination = state.browser->GetTabStripModel();
++    for (auto& [browser, source_state] : windows_) {
++      if (browser == state.browser || source_state->closing) {
++        continue;
++      }
++      auto* source =
++          const_cast<BrowserWindowInterface*>(browser)->GetTabStripModel();
++      std::vector<int> indices;
++      for (auto* tab : tabs) {
++        int index = source->GetIndexOfTab(tab);
++        if (index != TabStripModel::kNoTab) {
++          indices.push_back(index);
++        }
++      }
++      if (!indices.empty()) {
++        base::AutoReset<bool> changing(&source_state->changing_space, true);
++        if (static_cast<int>(indices.size()) == source->count()) {
++          EnsurePlaceholder(*source_state);
++        }
++        // Detached ownership is restricted to this stack expression. Both
++        // ends are real windows; no timer can run with a windowless tab.
++        TransferSpaceTabs(source, destination, indices);
++        RefreshVisibility(*source_state);
++      }
++    }
++    store_.Remove(space);
++    // Chromium persists these timestamps, so the last selected tab in each
++    // space also survives restart without another parallel session format.
++    return std::ranges::max(tabs, {}, [](tabs::TabInterface* tab) {
++      return tab->GetContents()->GetLastActiveTimeTicks();
++    });
+   }
+-  // No live tabs. The store may still have them, after a crash or if the
+-  // space was hidden when the browser quit without its windows.
+   if (const StoredSpace* stored = store_.Find(space)) {
+     tabs::TabInterface* active = RestoreStoredSpace(state.browser, *stored);
+     store_.Remove(space);
+@@ -674,31 +875,33 @@
+ 
+ void SpacesWindowManager::HandleWindowClosing(BrowserWindowInterface* browser) {
+   WindowState* state = FindState(browser);
+-  if (!state || browser_shutdown::IsTryingToQuit()) {
++  if (!state || state->closing) {
+     return;
+   }
+-  const std::optional<base::Uuid> space = state->space;
+-  const bool was_elsewhere = state->showing_elsewhere;
+-
+-  if (!was_elsewhere && space) {
+-    // Take the space's tabs out before the session service records the
+-    // closing window.
+-    HideTabs(*state, *space, GetSpaceTabs(*state));
+-  }
+-
+-  // Windows pointing at this space can have it now.
+-  if (space) {
+-    std::vector<BrowserWindowInterface*> waiting;
+-    for (const auto& [other, other_state] : windows_) {
+-      if (other != browser && other_state->space == space &&
+-          other_state->showing_elsewhere) {
+-        waiting.push_back(const_cast<BrowserWindowInterface*>(other));
++  // Normal session restore owns live windows on quit. The small spaces file
++  // is needed for explicitly closed windows, whose tabs otherwise disappear.
++  if (store_ready_ && !browser_shutdown::IsTryingToQuit()) {
++    std::map<base::Uuid, std::vector<tabs::TabInterface*>> by_space;
++    for (auto* tab : *browser->GetTabStripModel()) {
++      if (tab->IsPinned() || tab == state->placeholder_tab) {
++        continue;
++      }
++      if (auto space = SpaceTabTag::Get(tab->GetContents())) {
++        by_space[*space].push_back(tab);
+       }
+     }
+-    for (BrowserWindowInterface* other : waiting) {
+-      ShowSpace(other, *space);
++    for (const auto& [space, tabs] : by_space) {
++      auto* active = browser->GetTabStripModel()->GetActiveTab();
++      if (state->space != space) {
++        auto it = last_active_tabs_.find(space);
++        active = it != last_active_tabs_.end() ? it->second.Get() : nullptr;
++      }
++      store_.Put(SnapshotSpaceTabs(space, tabs, active));
+     }
++    store_.SaveNow();
+   }
++  state->closing = true;
++  CloseElsewhereDialog(*state);
+ }
+ 
+ void SpacesWindowManager::SaveWindowSpaceToSession(const WindowState& state) {
+@@ -713,19 +916,6 @@
+   }
+ }
+ 
+-void SpacesWindowManager::RecordInHistory(HiddenSpace& space) {
+-  sessions::TabRestoreService* service =
+-      TabRestoreServiceFactory::GetForProfile(profile_);
+-  if (!service) {
+-    return;
+-  }
+-  for (tabs::TabInterface* tab : space.GetTabs()) {
+-    service->CreateHistoricalTab(
+-        sessions::ContentLiveTab::GetOrCreateForWebContents(tab->GetContents()),
+-        -1);
+-  }
+-}
+-
+ void SpacesWindowManager::NotifyWindowSpaceChanged(
+     BrowserWindowInterface* browser) {
+   for (Observer& observer : observers_) {
+@@ -739,7 +929,6 @@
+   }
+   auto state = std::make_unique<WindowState>();
+   state->browser = browser;
+-  WindowState* raw_state = state.get();
+   windows_[browser] = std::move(state);
+   browser->GetTabStripModel()->AddObserver(this);
+   // Session restore assigns the space itself once the window is built.
+@@ -748,7 +937,7 @@
+     return;
+   }
+   if (browser->GetTabStripModel()->count() > 0) {
+-    ClaimInitialSpace(browser);
++    ScheduleReconcile(*windows_[browser]);
+   }
+ }
+ 
+@@ -759,6 +948,18 @@
+   }
+   browser->GetTabStripModel()->RemoveObserver(this);
+   windows_.erase(it);
++  for (auto& [other, state] : windows_) {
++    if (state->showing_elsewhere && state->space &&
++        !GetWindowHoldingSpace(*state->space)) {
++      auto space = *state->space;
++      // Post rather than reopen while the closing browser is being torn down.
++      base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE,
++          base::BindOnce(&SpacesWindowManager::ShowSpace,
++                         weak_ptr_factory_.GetWeakPtr(),
++                         const_cast<BrowserWindowInterface*>(other), space));
++    }
++  }
+ }
+ 
+ void SpacesWindowManager::OnBrowserActivated(BrowserWindowInterface* browser) {
+@@ -776,36 +977,73 @@
+   if (!state) {
+     return;
+   }
++  if (change.type() != TabStripModelChange::kSelectionOnly) {
++    state->membership_dirty = true;
++  }
+   if (change.type() == TabStripModelChange::kRemoved) {
+     for (const auto& removed : change.GetRemove()->contents) {
+       if (removed.tab == state->placeholder_tab) {
+         state->placeholder_tab = nullptr;
+       }
+     }
+-    // The user closed the screen's tab; put the screen back.
+-    if (state->showing_elsewhere && !state->placeholder_tab &&
+-        !tab_strip_model->closing_all()) {
+-      EnsurePlaceholder(*state);
+-    }
+-    return;
+   }
+-  if (change.type() == TabStripModelChange::kInserted && !state->space) {
+-    BrowserWindowInterface* browser = nullptr;
+-    for (const auto& [candidate, window_state] : windows_) {
+-      if (window_state.get() == state) {
+-        browser = const_cast<BrowserWindowInterface*>(candidate);
+-        break;
++  if (change.type() == TabStripModelChange::kInserted && state->space) {
++    for (const auto& inserted : change.GetInsert()->contents) {
++      auto* tab = inserted.tab.get();
++      if (auto tagged = SpaceTabTag::Get(tab->GetContents());
++          !tagged || !spaces_->FindSpace(*tagged)) {
++        TagTab(tab, *state->space);
+       }
+     }
+-    if (browser) {
+-      ClaimInitialSpace(browser);
+-    }
++  }
++  if (!state->changing_space) {
++    ScheduleReconcile(*state);
+   }
+ }
+ 
+ void SpacesWindowManager::OnTabChangedAt(tabs::TabInterface* tab,
+                                          TabChangeType change_type) {}
+ 
++void SpacesWindowManager::OnTabPinnedStateChanged(tabs::TabInterface* tab,
++                                                  int index) {
++  auto* state = FindState(tab->GetBrowserWindowInterface());
++  if (!state || !state->space) {
++    return;
++  }
++  // Unpinning a shared favorite places it in the space being shown.
++  if (!tab->IsPinned()) {
++    TagTab(tab, *state->space);
++  }
++  state->membership_dirty = true;
++  ScheduleReconcile(*state);
++}
++
++void SpacesWindowManager::TabGroupedStateChanged(
++    TabStripModel* model,
++    std::optional<tab_groups::TabGroupId> old_group,
++    std::optional<tab_groups::TabGroupId> new_group,
++    tabs::TabInterface* tab,
++    int index) {
++  auto* state = FindState(model);
++  if (!state || state->changing_space) {
++    return;
++  }
++  // Groups belong to one space. Adding a tab to an existing group (including
++  // via an extension) gives it the group's space, not a mixed hidden group.
++  if (new_group) {
++    for (auto* member : *model) {
++      if (member != tab && member->GetGroup() == new_group) {
++        if (auto space = SpaceTabTag::Get(member->GetContents())) {
++          TagTab(tab, *space);
++          break;
++        }
++      }
++    }
++  }
++  state->membership_dirty = true;
++  ScheduleReconcile(*state);
++}
++
+ void SpacesWindowManager::OnSpaceAdded(const base::Uuid& id) {
+   for (Observer& observer : observers_) {
+     observer.OnSpacesChanged();
+@@ -819,11 +1057,11 @@
+ }
+ 
+ void SpacesWindowManager::OnSpaceRemoved(const base::Uuid& id) {
+-  if (auto it = hidden_.find(id); it != hidden_.end()) {
+-    it->second.Clear();
+-    hidden_.erase(it);
++  hidden_since_.erase(id);
++  last_active_tabs_.erase(id);
++  if (store_ready_) {
++    store_.Remove(id);
+   }
+-  store_.Remove(id);
+   UpdateUnloadTimer();
+   const base::Uuid fallback = spaces_->spaces().front().id;
+   for (const auto& [browser, state] : windows_) {
+--- a/chrome/browser/ui/rac/spaces/spaces_window_manager.h
++++ b/chrome/browser/ui/rac/spaces/spaces_window_manager.h
+@@ -21,9 +21,9 @@
+ #include "chrome/browser/rac/spaces/spaces_store.h"
+ #include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+-#include "chrome/browser/ui/rac/spaces/hidden_space.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "components/keyed_service/core/keyed_service.h"
++#include "components/tabs/public/tab_interface.h"
+ 
+ class BrowserWindowInterface;
+ class Profile;
+@@ -41,8 +41,8 @@
+ // The session's window extra data key holding the space a window shows.
+ inline constexpr char kWindowSpaceExtraDataKey[] = "rac.space";
+ 
+-// Decides which space each window shows, and holds the tabs of spaces no
+-// window shows.
++// Decides which space each window shows. All live tabs stay owned by a normal
++// TabStripModel, including tabs of spaces not currently shown.
+ //
+ // A window shows one space at a time, and a space is open in at most one
+ // window. A window can also point at a space another window holds; it then
+@@ -50,7 +50,7 @@
+ // lives in a hidden placeholder tab, so the window always has a tab.
+ //
+ // Pinned tabs (rac's favorites) belong to the window and stay when the window
+-// switches spaces. Every other tab belongs to the window's space.
++// switches spaces. Every other tab is tagged with its own space.
+ class SpacesWindowManager : public KeyedService,
+                             public BrowserCollectionObserver,
+                             public TabStripModelObserver,
+@@ -77,9 +77,8 @@
+   // Null for windows without spaces: incognito, guest, apps, and popups.
+   static SpacesWindowManager* From(BrowserWindowInterface* browser);
+ 
+-  // Called when the user closes `browser`, before its tabs close. Takes the
+-  // window's space out so its tabs survive. Does nothing when quitting, since
+-  // session restore saves the window as it is.
++  // Saves the closing window's spaces before normal tab teardown. No live tab
++  // survives without a real browser window.
+   static void OnWindowClosing(BrowserWindowInterface* browser);
+ 
+   SpacesService* spaces() { return spaces_; }
+@@ -90,11 +89,12 @@
+       const BrowserWindowInterface* browser) const;
+   bool IsShowingElsewhereScreen(const BrowserWindowInterface* browser) const;
+ 
+-  // The window holding the tabs of `space`, or null if no window does.
++  // The window showing `space`, or null. Hidden tabs still belong to a real
++  // window, but don't reserve the space for that window.
+   BrowserWindowInterface* GetWindowHoldingSpace(const base::Uuid& space) const;
+ 
+   // Switching. These do nothing for windows without spaces.
+-  void ShowSpace(BrowserWindowInterface* browser, const base::Uuid& space);
++  void ShowSpace(BrowserWindowInterface* browser, base::Uuid space);
+   void ShowSpaceAt(BrowserWindowInterface* browser, size_t index);
+   // Doesn't wrap around at either end.
+   void ShowAdjacentSpace(BrowserWindowInterface* browser, int offset);
+@@ -142,17 +142,14 @@
+   // The most recently shown space no window holds, or a new space.
+   base::Uuid PickFreeSpace(const std::optional<base::Uuid>& excluding);
+ 
+-  // The window's tabs that belong to its space: unpinned, and not the
+-  // placeholder.
+-  std::vector<tabs::TabInterface*> GetSpaceTabs(const WindowState& state) const;
+-
+-  // Moves `tabs` out of the window into the hidden tabs of `space`. The window
+-  // must keep another tab.
+-  void HideTabs(WindowState& state,
+-                const base::Uuid& space,
+-                const std::vector<tabs::TabInterface*>& tabs);
+-  // Inserts the hidden tabs of `space`, or a new tab if it has none. Returns
+-  // the tab to activate.
++  std::vector<tabs::TabInterface*> GetSpaceTabs(const base::Uuid& space) const;
++  void TagTab(tabs::TabInterface* tab, const base::Uuid& space);
++  void RefreshVisibility(WindowState& state);
++  void ScheduleReconcile(WindowState& state);
++  void ReconcileWindow(BrowserWindowInterface* browser);
++  void OnStoreReady();
++  // Transfers from another real window in a single synchronous operation, or
++  // lazily restores saved tabs. Never retains detached tabs across tasks.
+   tabs::TabInterface* RevealSpace(WindowState& state, const base::Uuid& space);
+ 
+   void EnsurePlaceholder(WindowState& state);
+@@ -165,7 +162,6 @@
+   void LeaveElsewhereScreen(WindowState& state);
+ 
+   void HandleWindowClosing(BrowserWindowInterface* browser);
+-  void RecordInHistory(HiddenSpace& space);
+   void NotifyWindowSpaceChanged(BrowserWindowInterface* browser);
+ 
+   // Records the window's space in the session service, so the window
+@@ -189,6 +185,12 @@
+       const TabStripSelectionChange& selection) override;
+   void OnTabChangedAt(tabs::TabInterface* tab,
+                       TabChangeType change_type) override;
++  void OnTabPinnedStateChanged(tabs::TabInterface* tab, int index) override;
++  void TabGroupedStateChanged(TabStripModel* model,
++                              std::optional<tab_groups::TabGroupId> old_group,
++                              std::optional<tab_groups::TabGroupId> new_group,
++                              tabs::TabInterface* tab,
++                              int index) override;
+ 
+   // SpacesService::Observer:
+   void OnSpaceAdded(const base::Uuid& id) override;
+@@ -203,16 +205,18 @@
+   const raw_ptr<Profile> profile_;
+   const raw_ptr<SpacesService> spaces_;
+ 
+-  // The hidden spaces' tabs on disk, so a crash or a quit doesn't lose
+-  // them. Loaded eagerly: it's a small file.
++  // Snapshots from explicitly closed windows. Live windows use Chromium's
++  // session persistence. Loaded off the UI thread before claiming a space.
+   SpacesStore store_;
++  bool store_ready_ = false;
+ 
+   std::map<const BrowserWindowInterface*, std::unique_ptr<WindowState>>
+       windows_;
+-  std::map<base::Uuid, HiddenSpace> hidden_;
++  std::map<base::Uuid, base::TimeTicks> hidden_since_;
++  std::map<base::Uuid, tabs::TabHandle> last_active_tabs_;
+ 
+   base::ObserverList<Observer> observers_;
+-  base::RepeatingTimer unload_timer_;
++  base::OneShotTimer unload_timer_;
+   base::ScopedObservation<ProfileBrowserCollection, BrowserCollectionObserver>
+       browser_collection_observation_{this};
+   base::ScopedObservation<SpacesService, SpacesService::Observer>
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -376,7 +376,10 @@
+       "//chrome/browser/extensions",
+       "//chrome/browser/glic",
+       "//chrome/browser/lifetime",
++      "//chrome/browser/performance_manager",
++      "//chrome/browser/performance_manager/public/user_tuning",
+       "//chrome/browser/profiles:profile",
++      "//chrome/browser/rac/spaces:tab_state",
+       "//chrome/browser/reading_list",
+       "//chrome/browser/resource_coordinator",
+       "//chrome/browser/ui:browser_tab_strip",
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -48,6 +48,7 @@
+ #include "chrome/browser/performance_manager/policies/discard_eligibility_policy.h"
+ #include "chrome/browser/performance_manager/public/user_tuning/user_tuning_utils.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/spaces/space_tab_tag.h"
+ #include "chrome/browser/reading_list/reading_list_model_factory.h"
+ #include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom.h"
+ #include "chrome/browser/resource_coordinator/tab_helper.h"
+@@ -531,6 +532,7 @@
+   ReentrancyCheck reentrancy_check(&reentrancy_guard_);
+ 
+   delegate()->WillAddWebContents(new_contents.get());
++  rac::SpaceTabTag::Copy(contents, new_contents.get());
+ 
+   int index = GetIndexOfWebContents(contents);
+   CHECK_NE(index, kNoTab);
+@@ -2004,6 +2006,12 @@
+                           /*delete_groups=*/true);
+ }
+ 
++void TabStripModel::NotifySpaceVisibilityChanged() {
++  for (auto& observer : observers_) {
++    observer.OnSpaceVisibilityChanged();
++  }
++}
++
+ void TabStripModel::SelectNextTab(TabStripUserGestureDetails detail) {
+   SelectRelativeTabCycle(TabRelativeDirection::kNext, detail);
+ }
+@@ -2013,8 +2021,11 @@
+ }
+ 
+ void TabStripModel::SelectLastTab(TabStripUserGestureDetails detail) {
+-  if (!empty()) {
+-    ActivateTab(*rbegin(), detail);
++  for (auto it = rbegin(); it != rend(); ++it) {
++    if (rac::SpaceTabTag::IsVisible(*it)) {
++      ActivateTab(*it, detail);
++      return;
++    }
+   }
+ }
+ 
+@@ -2742,6 +2753,9 @@
+     case CommandMoveToExistingWindow:
+       return true;
+ 
++    case CommandMoveTabToSpace:
++      return !IsTabPinned(context_index);
++
+     case CommandMoveTabsToNewWindow: {
+       std::vector<int> indices = GetIndicesForCommand(context_index);
+       const bool would_leave_strip_empty =
+@@ -3096,6 +3110,9 @@
+       // ExecuteAddToExistingWindowCommand with the correct window later.
+       break;
+     }
++    case CommandMoveTabToSpace:
++      // The space submenu dispatches the selected destination itself.
++      break;
+ 
+     case CommandMoveTabsToNewWindow: {
+       base::UmaHistogramCounts1000(
+@@ -3792,6 +3809,9 @@
+   // NOTE: callers expect the vector to be sorted in descending order.
+   std::optional<tab_groups::TabGroupId> focused_group = GetFocusedGroup();
+   for (int i = count() - 1; i > last_unclosed_tab; --i) {
++    if (!rac::SpaceTabTag::IsVisible(GetTabAtIndex(i))) {
++      continue;
++    }
+     if (id == CommandCloseTabsToLeft && i >= first_unclosed_tab) {
+       continue;
+     }
+@@ -3833,6 +3853,9 @@
+   for (auto it = start_it; it != end(); ++it) {
+     tabs::TabInterface* tab = *it;
+ 
++    if (!rac::SpaceTabTag::IsVisible(tab)) {
++      continue;
++    }
+     // Skip tabs unless they are part of the focused group.
+     if (focused_group.has_value() && tab->GetGroup() != focused_group) {
+       continue;
+@@ -4077,7 +4100,13 @@
+   auto start = tabs::TabCollection::TabIterator(left);
+   auto end = ++tabs::TabCollection::TabIterator(right);
+ 
+-  return {start, end};
++  std::vector<tabs::TabInterface*> result;
++  for (auto it = start; it != end; ++it) {
++    if (rac::SpaceTabTag::IsVisible(*it)) {
++      result.push_back(*it);
++    }
++  }
++  return result;
+ }
+ 
+ tabs::TabInterface* TabStripModel::GetFirstSelectedTab() const {
+@@ -4345,7 +4374,9 @@
+     }
+ 
+     for (int i = 0; i < count(); ++i) {
+-      mru_cycle_list_.push_back(i);
++      if (rac::SpaceTabTag::IsVisible(GetTabAtIndex(i))) {
++        mru_cycle_list_.push_back(i);
++      }
+     }
+ 
+     std::sort(mru_cycle_list_.begin(), mru_cycle_list_.end(),
+@@ -4360,6 +4391,9 @@
+     }
+   }
+ 
++  if (mru_cycle_list_.empty()) {
++    return;
++  }
+   if (direction == TabRelativeDirection::kNext) {
+     std::rotate(mru_cycle_list_.begin(), mru_cycle_list_.begin() + 1,
+                 mru_cycle_list_.end());
+@@ -4397,7 +4431,7 @@
+ 
+   auto is_tab_invalid = [this, &focused_group](int i) {
+     // Do not select the tab if it is in a collapsed group.
+-    if (IsTabCollapsed(i)) {
++    if (IsTabCollapsed(i) || !rac::SpaceTabTag::IsVisible(GetTabAtIndex(i))) {
+       return true;
+     }
+ 
+@@ -5956,6 +5990,21 @@
+ 
+   gfx::Range block_tabs = gfx::Range(start_index, start_index + block_size);
+ 
++  // Prefer a remaining visible tab before any hidden space. If the current
++  // space is empty, normal selection may reveal another space.
++  const auto space =
++      rac::SpaceTabTag::Get(GetTabAtIndex(start_index)->GetContents());
++  if (space) {
++    for (int offset = 0; offset < count(); ++offset) {
++      int candidate = (start_index + block_size + offset) % count();
++      if (!block_tabs.Contains(gfx::Range(candidate, candidate + 1)) &&
++          rac::SpaceTabTag::IsVisible(GetTabAtIndex(candidate)) &&
++          !IsTabCollapsed(candidate)) {
++        return GetTabIndexAfterClosing(candidate, block_tabs);
++      }
++    }
++  }
++
+   // First preference is a tab the block opened.
+   int new_selected_index = GetIndexOfNextWebContentsOpenedBy(block_tabs);
+   if (new_selected_index != TabStripModel::kNoTab &&
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -231,6 +231,7 @@
+   // Add and remove observers to changes within this TabStripModel.
+   void AddObserver(TabStripModelObserver* observer);
+   void RemoveObserver(TabStripModelObserver* observer);
++  void NotifySpaceVisibilityChanged();
+ 
+   // Retrieve the number of WebContentses/emptiness of the TabStripModel.
+   int count() const;
+--- a/chrome/browser/ui/tabs/tab_strip_model_observer.h
++++ b/chrome/browser/ui/tabs/tab_strip_model_observer.h
+@@ -545,6 +545,8 @@
+   // See tab_change_type.h for a description of `change_type`.
+   virtual void OnTabChangedAt(tabs::TabInterface* tab,
+                               TabChangeType change_type);
++  // The tabs are still owned by this model; only the space shown has changed.
++  virtual void OnSpaceVisibilityChanged() {}
+ 
+   // Invoked when the pinned state of a tab changes.
+   virtual void OnTabPinnedStateChanged(tabs::TabInterface* tab, int index);
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -5298,8 +5298,7 @@
+     return views::CloseRequestResult::kCannotClose;
+   }
+ 
+-  // rac: take the window's space out before the tabs close, so the space
+-  // keeps its tabs.
++  // rac: snapshot the window's spaces before normal tab teardown.
+   rac::SpacesWindowManager::OnWindowClosing(browser_);
+ 
+   views::CloseRequestResult result = views::CloseRequestResult::kCanClose;
+--- a/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
++++ b/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
+@@ -17,6 +17,7 @@
+ #include "base/metrics/user_metrics.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/favicon/favicon_utils.h"
++#include "chrome/browser/rac/spaces/space_tab_tag.h"
+ #include "chrome/browser/resource_coordinator/tab_lifecycle_unit_external.h"
+ #include "chrome/browser/resource_coordinator/tab_lifecycle_unit_source.h"
+ #include "chrome/browser/search/search.h"
+@@ -789,6 +790,24 @@
+   }
+ }
+ 
++void BrowserTabStripController::OnSpaceVisibilityChanged() {
++  if (!tabstrip_) {
++    return;
++  }
++  for (int i = 0; i < model_->count(); ++i) {
++    tabstrip_->tab_at(i)->set_hidden_by_space(
++        !rac::SpaceTabTag::IsVisible(model_->GetTabAtIndex(i)));
++  }
++  if (model_->group_model()) {
++    for (auto group : model_->group_model()->ListTabGroups()) {
++      tabstrip_->group_header(group)->set_hidden_by_space(
++          !rac::SpaceTabTag::IsVisible(
++              model_->group_model()->GetTabGroup(group)->GetFirstTab()));
++    }
++  }
++  tabstrip_->StopAnimating();
++}
++
+ void BrowserTabStripController::OnTabGroupFocusChanged(
+     std::optional<tab_groups::TabGroupId> new_group_id,
+     std::optional<tab_groups::TabGroupId> old_group_id) {
+--- a/chrome/browser/ui/views/tabs/browser_tab_strip_controller.h
++++ b/chrome/browser/ui/views/tabs/browser_tab_strip_controller.h
+@@ -134,6 +134,7 @@
+   void OnTabGroupFocusChanged(
+       std::optional<tab_groups::TabGroupId> new_focused_group_id,
+       std::optional<tab_groups::TabGroupId> old_focused_group_id) override;
++  void OnSpaceVisibilityChanged() override;
+ 
+   // Updates the browser theme when focus mode is active for a tab group.
+   // Triggered when tab group focus changes or when the color of the currently
+--- a/chrome/browser/ui/views/tabs/common/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/common/BUILD.gn
+@@ -84,6 +84,7 @@
+     "//chrome/browser/glic",
+     "//chrome/browser/glic/browser_ui:glow",
+     "//chrome/browser/glic/browser_ui:glow_controller",
++    "//chrome/browser/rac/spaces:tab_state",
+     "//chrome/browser/tab_group_sync:factories",
+     "//chrome/browser/themes",
+     "//chrome/browser/ui:browser_element_identifiers",
+--- a/chrome/browser/ui/views/tabs/common/root_tab_collection_node.cc
++++ b/chrome/browser/ui/views/tabs/common/root_tab_collection_node.cc
+@@ -218,6 +218,12 @@
+   GetController()->GetDragHandler().OnTabWillBeAdded();
+ }
+ 
++void RootTabCollectionNode::OnSpaceVisibilityChanged() {
++  if (auto* unpinned = GetChildNodeOfType(Type::UNPINNED)) {
++    unpinned->view()->InvalidateLayout();
++  }
++}
++
+ void RootTabCollectionNode::OnTabWillBeRemoved(tabs::TabInterface* tab,
+                                                int index) {
+   GetController()->GetDragHandler().OnTabWillBeRemoved(tab->GetContents());
+--- a/chrome/browser/ui/views/tabs/common/root_tab_collection_node.h
++++ b/chrome/browser/ui/views/tabs/common/root_tab_collection_node.h
+@@ -71,6 +71,7 @@
+       const TabStripModelChange& change,
+       const TabStripSelectionChange& selection) override;
+   void OnTabWillBeAdded() override;
++  void OnSpaceVisibilityChanged() override;
+   void OnTabWillBeRemoved(tabs::TabInterface* tab, int index) override;
+   void OnTabGroupChanged(const TabGroupChange& change) override;
+   void OnTabGroupFocusChanged(
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
+@@ -8,12 +8,15 @@
+ #include <vector>
+ 
+ #include "base/numerics/safe_conversions.h"
++#include "chrome/browser/rac/spaces/space_tab_tag.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
++#include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_layout_utils.h"
++#include "chrome/browser/ui/views/tabs/common/tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
+ #include "chrome/browser/ui/views/tabs/horizontal/horizontal_tab_closing_helper.h"
+ #include "components/tabs/public/tab_group.h"
+@@ -343,6 +346,24 @@
+   if (!CanBeVisible(child)) {
+     return false;
+   }
++  const tabs::TabInterface* tab = nullptr;
++  if (const auto* view = views::AsViewClass<TabView>(child)) {
++    tab = view->GetTabInterface();
++  } else if (const auto* group = views::AsViewClass<TabGroupView>(child)) {
++    tab = group->GetTabGroup().GetFirstTab();
++  } else if (const auto* split = views::AsViewClass<SplitTabView>(child);
++             split && split->collection_node()) {
++    const auto* collection =
++        std::get<tabs::ConstDanglingUntriagedTabCollection>(
++            split->collection_node()->GetNodeData())
++            .get();
++    if (collection->TabCountRecursive()) {
++      tab = collection->GetTabAtIndexRecursive(0);
++    }
++  }
++  if (tab && !rac::SpaceTabTag::IsVisible(tab)) {
++    return false;
++  }
+   auto drag_data = tab_container_view->GetVisualDataForDraggedView(*child);
+   if (drag_data && drag_data->should_hide) {
+     return false;
+--- a/chrome/browser/ui/views/tabs/tab_container_impl.cc
++++ b/chrome/browser/ui/views/tabs/tab_container_impl.cc
+@@ -751,6 +751,9 @@
+       // If we change the visibility of a group header, we must recalculate that
+       // group's underline bounds.
+       bool should_header_be_visible = last_tab_visible;
++      if (group_view->header()->hidden_by_space()) {
++        should_header_be_visible = false;
++      }
+       if (focused_group.has_value() && last_tab_group != focused_group) {
+         should_header_be_visible = false;
+       }
+@@ -795,7 +798,8 @@
+     const bool is_collapsed =
+         (is_collapsed_by_group || is_collapsed_by_focus_mode) &&
+         (tab->bounds().width() <= tab->tab_style()->GetTabOverlap());
+-    const bool should_be_visible = is_collapsed ? false : last_tab_visible;
++    const bool should_be_visible =
++        !tab->hidden_by_space() && !is_collapsed && last_tab_visible;
+ 
+     // If we change the visibility of a tab in a group, we must recalculate that
+     // group's underline bounds.
+@@ -1410,6 +1414,9 @@
+ }
+ 
+ bool TabContainerImpl::IsTabVisible(const Tab* tab) const {
++  if (tab->hidden_by_space()) {
++    return false;
++  }
+   if (!tab) {
+     return false;
+   }
+--- a/chrome/browser/ui/views/tabs/tab_slot_view.h
++++ b/chrome/browser/ui/views/tabs/tab_slot_view.h
+@@ -47,6 +47,8 @@
+   // view should be invisibly closed.  This is irreversible.
+   void set_detached() { detached_ = true; }
+   bool detached() const { return detached_; }
++  void set_hidden_by_space(bool hidden) { hidden_by_space_ = hidden; }
++  bool hidden_by_space() const { return hidden_by_space_; }
+ 
+   // Used to mark the view as being dragged.
+   void set_dragging(bool dragging) { dragging_ = dragging; }
+@@ -63,6 +65,7 @@
+ 
+   // True if the view has been detached.
+   bool detached_ = false;
++  bool hidden_by_space_ = false;
+ 
+   // True if the tab is being dragged.
+   bool dragging_ = false;
+--- a/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
++++ b/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
+@@ -415,6 +415,9 @@
+ }
+ 
+ bool TabStripLayoutHelper::SlotIsCollapsedTab(int i) const {
++  if (slots_[i].view->hidden_by_space()) {
++    return true;
++  }
+   const std::optional<tab_groups::TabGroupId> focused_group =
+       controller_->GetFocusedGroup();
+ 
