@@ -13,6 +13,7 @@ are in `patches/rac/pinned-tabs/`, in this order:
 | `close-and-navigate.patch` | Closing resets in place; the reset button; typed addresses open a new tab |
 | `drag.patch` | Dragging between favorites, pinned tabs, folders, and open tabs |
 | `motion.patch` | How favorites, folder rows, and the divider open, close, and move |
+| `snap.patch` | Dragged tabs snap toward the slot they'd drop into |
 
 ## Items are the source of truth, tabs follow
 
@@ -77,3 +78,12 @@ its new ones. A row that's hidden still has bounds, so lay it out where it
 will appear. That's why, with no pinned tabs, the divider waits closed above
 the first open tab. It opens only when a drag reaches the top of the open
 tabs, so other drags don't shift the open tabs under the pointer.
+
+A dragged tab is drawn pulled toward the slot it would drop into
+(`drag_snap.cc`): favorites stay near their cell and glide to the next one,
+and rows follow the pointer most of the way. Only the pointer picks the drop
+slot. The layouts record each dragged view's slot while they're
+calculated. A slot is a drag offset, not bounds, because Chromium lays out a
+dragged view at the origin and moves it with a transform. The favorites grid
+records slots only when laid out at its real width, since preferred-size
+passes use other widths and would record wrong cells.
