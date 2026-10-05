@@ -13,11 +13,16 @@ own, so `patches/rac/pip/` mostly changes defaults.
   almost none do. `auto-pip-defaults.patch` marks Chromium's
   `BrowserInitiatedAutomaticPictureInPicture` feature stable, so the browser
   opens PiP for any page with a single playing video.
-- **Leaving includes covering the window.** The same patch turns on
-  `kAutoPictureInPictureOnWindowOccluded`. PiP also opens when macOS reports
-  the window as fully covered, which includes switching to another macOS
-  desktop. A partly covered window doesn't count, because the video is still
-  visible.
+- **Leaving includes switching apps.** `auto-pip-on-app-switch.patch` opens
+  PiP when another regular app (one with a Dock icon) takes focus from rac,
+  and closes it when rac is in front again. Menu bar apps and launchers
+  (Spotlight, Raycast, 1Password's quick access) don't count, because they
+  open briefly over the video. The check lives in `rac::AppFocusObserver` and
+  only runs while a tab has a video that could open PiP.
+- **Leaving includes hiding the window.** `auto-pip-defaults.patch` turns on
+  `kAutoPictureInPictureOnWindowOccluded`, so PiP also opens when macOS
+  reports the window as hidden, for example on another desktop or behind a
+  full-screen app.
 - **Allowed by default.** The "Automatic picture-in-picture" site setting
   defaults to Allow instead of Ask, and the settings page offers Allow and
   Block. Under Ask, Chromium shows a prompt inside the first PiP window and
@@ -43,17 +48,19 @@ own.
 ## Traps
 
 - **Spaces must change the active tab.** The tab helper fires on two signals:
-  the tab stops being the active tab in its window's `TabStripModel`, or its
-  `WebContents` becomes occluded. If switching rac spaces hides tabs some
-  other way, auto-PiP won't fire on a space switch.
-- **Don't trigger on focus loss.** Helium's unmerged
-  [helium#1765](https://github.com/imputnet/helium/pull/1765) opens PiP
-  whenever the window loses focus. That fires while the video is still on
-  screen, for example when clicking into an app beside rac, and needs
-  guesswork about displays to undo. Occlusion is the signal that matches
-  "you can't see the video anymore".
-- **Stage Manager never covers the window.** With Stage Manager on,
-  switching to another app shrinks rac's window into the strip instead of
-  covering it. macOS still reports it as visible, so PiP doesn't open. That's
-  expected, not a bug. Switching to a full-screen app or another desktop
-  still opens PiP.
+  the tab stops being the active tab in its window's `TabStripModel`, or the
+  occlusion helper reports the window as occluded (hidden by macOS, or
+  another app in front). If switching rac spaces hides tabs some other way,
+  auto-PiP won't fire on a space switch.
+- **macOS almost never reports a window as covered.** macOS counts a
+  window's shadow, so another window has to extend roughly 60 pt past rac on
+  every side before rac counts as occluded. Chromium's own frame check is
+  off on macOS 26 and only looked at Chromium windows. With Stage Manager,
+  other apps never cover rac at all; its window shrinks into the strip and
+  stays "visible". App focus is the signal that works, which is why the
+  app-switch patch exists.
+- **App focus is an approximation.** PiP opens when another app is in front
+  even if rac's video is still on screen, such as on a second display or
+  grouped in the same Stage Manager stage. Clicking the PiP window doesn't
+  bring rac forward (`pip-over-fullscreen-apps.patch` makes it
+  non-activating), so it doesn't close PiP.
