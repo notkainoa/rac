@@ -1,0 +1,240 @@
+--- a/chrome/browser/ui/views/rac/sidebar/pinned_section.cc
++++ b/chrome/browser/ui/views/rac/sidebar/pinned_section.cc
+@@ -24,6 +24,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_drag_handler.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
+@@ -249,7 +250,10 @@ class FolderHeaderView : public views::B
+     const gfx::Insets insets = gfx::Insets::VH(
+         GetLayoutConstant(LayoutConstant::kTabVerticalPadding),
+         GetLayoutConstant(LayoutConstant::kTabHorizontalPadding));
+-    gfx::Rect content = GetLocalBounds();
++    // Laid out at full height even while the row opens or closes, so its
++    // edge reveals the contents instead of sliding them.
++    gfx::Rect content(width(),
++                      GetLayoutConstant(LayoutConstant::kVerticalTabHeight));
+     content.Inset(insets);
+     const bool show_title = width() >= kMinWidthForTitle;
+     const int icon_x = show_title
+@@ -318,9 +322,9 @@ class SectionDividerView : public views:
+ 
+   void OnPaint(gfx::Canvas* canvas) override {
+     const int inset = width() > kMinWidthForTitle ? kDividerInset : 4;
+-    canvas->FillRect(
+-        gfx::Rect(inset, height() / 2, std::max(0, width() - inset * 2), 1),
+-        GetColorProvider()->GetColor(kColorTabDividerFrameActive));
++    canvas->FillRect(gfx::Rect(inset, kDividerHeight / 2,
++                               std::max(0, width() - inset * 2), 1),
++                     GetColorProvider()->GetColor(kColorTabDividerFrameActive));
+   }
+ };
+ 
+@@ -366,6 +370,11 @@ void PinnedSectionLayout::LayoutRows(
+     if (row_width.is_bounded()) {
+       bounds.set_width(row_width.value());
+     }
++    if (row == collapsed_divider_) {
++      bounds.set_height(0);
++      layouts.child_layouts.emplace_back(row, false, bounds);
++      continue;
++    }
+     layouts.child_layouts.emplace_back(row, true, bounds);
+     y += bounds.height() + vertical_padding;
+     width = std::max(width, bounds.right());
+@@ -398,6 +407,12 @@ const PinnedSection* PinnedSection::Get(
+   return container->GetProperty(kPinnedSectionKey);
+ }
+ 
++// static
++bool PinnedSection::IsRow(const views::View& view) {
++  return views::IsViewClass<FolderHeaderView>(&view) ||
++         views::IsViewClass<SectionDividerView>(&view);
++}
++
+ PinnedSection::PinnedSection(views::View* container) : container_(container) {
+   container_observation_.Observe(container);
+ }
+@@ -421,9 +436,10 @@ PinnedSectionLayout PinnedSection::Compu
+ 
+   std::vector<raw_ptr<views::View>> pending_rows;
+   base::flat_map<const tabs::TabInterface*, views::View*> tab_views;
+-  // While a tab is dragged, the divider shows even with no pinned tabs, to
+-  // mark where they go.
+-  if (sync && (!list.entries.empty() || (drag && drag->can_pin))) {
++  // With no pinned tabs, the divider shows only once a drag reaches the top
++  // of the open tabs, which puts a stand-in for the dragged tabs in `list`.
++  // Showing it for every drag would shift the open tabs under the pointer.
++  if (sync && !list.entries.empty()) {
+     for (views::View* child : children) {
+       if (const auto* tab_view = views::AsViewClass<TabView>(child)) {
+         tab_views.emplace(tab_view->GetTabInterface(), child);
+@@ -488,6 +504,10 @@ PinnedSectionLayout PinnedSection::Compu
+     }
+     layout.trailing_rows_ = std::move(pending_rows);
+   }
++  if (sync && divider_ && list.entries.empty() && !children.empty()) {
++    layout.children_[children.front()].rows_before.push_back(divider_.get());
++    layout.collapsed_divider_ = divider_;
++  }
+ 
+   auto contains = [](const std::vector<raw_ptr<views::View>>& rows,
+                      const views::View* row) {
+@@ -575,7 +595,12 @@ bool PinnedSection::HandleTabDrag(TabDra
+   const int dragged_height = dragged_bounds.height();
+   bool after_dragged = false;
+   for (const views::ChildLayout& child : layout.child_layouts) {
+-    if (!child.visible) {
++    // With no pinned tabs, the closed divider at the top of the open tabs is
++    // where a drag starts pinning. Once open, its middle is a little lower,
++    // so the divider doesn't flicker open and closed at the edge.
++    const bool closed_divider =
++        child.child_view == divider_ && !child.visible && base.entries.empty();
++    if (!child.visible && !closed_divider) {
+       continue;
+     }
+     if (handler.IsViewDragging(*child.child_view)) {
+@@ -759,10 +784,14 @@ void PinnedSection::UpdateRows() {
+     header->SetFolder(*folder);
+     folder_headers_.emplace(folder->id, header);
+   }
++  // Every container with a section lays out with Chromium's animating layout
++  // manager, which closes a removed header before deleting it.
++  auto* layout_manager = static_cast<TabCollectionAnimatingLayoutManager*>(
++      container_->GetLayoutManager());
+   for (auto& [id, header] : old_headers) {
+     FolderHeaderView* view = header;
+     header = nullptr;
+-    container_->RemoveChildViewT(view);
++    layout_manager->AnimateAndDestroyChildView(view);
+   }
+   container_->InvalidateLayout();
+ }
+--- a/chrome/browser/ui/views/rac/sidebar/pinned_section.h
++++ b/chrome/browser/ui/views/rac/sidebar/pinned_section.h
+@@ -94,6 +94,10 @@ class PinnedSectionLayout {
+   base::flat_map<const views::View*, Child> children_;
+   std::vector<raw_ptr<views::View>> trailing_rows_;
+   std::vector<raw_ptr<views::View>> unused_rows_;
++  // The divider, hidden and zero height where it will open, while there are
++  // no pinned tabs. Chromium animates a row from its previous bounds, so
++  // this keeps it from flying in from elsewhere when it appears.
++  raw_ptr<const views::View> collapsed_divider_ = nullptr;
+ };
+ 
+ // Draws a window's pinned tabs as a section at the top of the open tabs:
+@@ -108,6 +112,9 @@ class PinnedSection : public views::View
+   static void Attach(views::View* container);
+   // Returns null for containers without one.
+   static const PinnedSection* Get(const views::View* container);
++  // True for the folder headers and the divider the section adds to the
++  // container.
++  static bool IsRow(const views::View& view);
+ 
+   explicit PinnedSection(views::View* container);
+   PinnedSection(const PinnedSection&) = delete;
+--- a/chrome/browser/ui/views/rac/sidebar/sidebar_drag.cc
++++ b/chrome/browser/ui/views/rac/sidebar/sidebar_drag.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/views/rac/sidebar/sidebar_drag.h"
+ 
+ #include <algorithm>
++#include <memory>
+ #include <vector>
+ 
+ #include "base/memory/raw_ptr.h"
+@@ -15,9 +16,11 @@
+ #include "chrome/browser/ui/views/tabs/dragging/drag_session_data.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_context.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "ui/compositor/layer.h"
+ #include "ui/gfx/geometry/point.h"
+ #include "ui/views/controls/scroll_view.h"
+ #include "ui/views/view.h"
++#include "ui/views/view_tracker.h"
+ 
+ namespace rac {
+ 
+@@ -112,7 +115,10 @@ std::vector<RecreatedDragView> MatchDrag
+ 
+   // Changing a tab's pin state destroys its view and slot view, and the
+   // layouts it triggers ask which views are dragging.
++  std::vector<std::unique_ptr<views::ViewTracker>> old_views;
+   for (Change& change : changes) {
++    old_views.push_back(std::make_unique<views::ViewTracker>(
++        handler.ViewFromTabSlot(change.data->attached_view)));
+     change.data->attached_view = nullptr;
+   }
+   // Pinning moves a tab to the end of the favorites, and unpinning moves it
+@@ -127,16 +133,33 @@ std::vector<RecreatedDragView> MatchDrag
+     }
+   }
+ 
+-  std::vector<RecreatedDragView> views;
++  std::vector<RecreatedDragView> recreated_views;
+   for (Change& change : changes) {
+     change.data->pinned = change.tab->IsPinned();
+     change.data->attached_view =
+         context->GetTabForContents(change.data->contents);
+     if (change.data->attached_view) {
+-      views.push_back({change.data->attached_view, change.offset});
++      recreated_views.push_back({change.data->attached_view, change.offset});
+     }
+   }
+-  return views;
++
++  // The old views animate out where the drag left them, which is under the
++  // new ones. Chromium's layout animation drives their opacity but not their
++  // layer's visibility, so hiding the layer keeps one copy under the pointer.
++  for (const auto& tracker : old_views) {
++    views::View* old_view = tracker->view();
++    if (!old_view ||
++        std::ranges::any_of(recreated_views, [&](const auto& recreated) {
++          return handler.ViewFromTabSlot(recreated.slot_view) == old_view;
++        })) {
++      continue;
++    }
++    if (!old_view->layer()) {
++      old_view->SetPaintToLayer();
++    }
++    old_view->layer()->SetVisible(false);
++  }
++  return recreated_views;
+ }
+ 
+ }  // namespace rac
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
+@@ -51,8 +51,13 @@ PinnedTabContainerView::PinnedTabContain
+           collection_node && collection_node->orientation() ==
+                                  TabStripOrientation::kHorizontal
+               ? TabCollectionAnimatingLayoutManager::AnimationAxis::kHorizontal
+-              : TabCollectionAnimatingLayoutManager::AnimationAxis::
+-                    kHorizontalWrappingVertically))) {
++              // rac: favorites open and close vertically, like tab rows, and
++              // the container's height follows, so a new or removed row of
++              // favorites slides the open tabs instead of jumping them.
++              : TabCollectionAnimatingLayoutManager::AnimationAxis::kVertical,
++          /*animate_host_size=*/collection_node &&
++              collection_node->orientation() ==
++                  TabStripOrientation::kVertical))) {
+   collection_node->set_remove_child_from_node(base::BindRepeating(
+       &TabCollectionAnimatingLayoutManager::AnimateAndDestroyChildView,
+       base::Unretained(base::to_address(layout_manager_))));
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
+@@ -210,8 +210,9 @@ bool UnpinnedTabContainerView::ShouldAni
+       collection_node_->orientation() == TabStripOrientation::kHorizontal) {
+     return false;
+   }
+-  // Only animate opacity for tab views.
+-  return views::IsViewClass<TabView>(&child_view);
++  // Only animate opacity for tab views and rac's pinned section rows.
++  return views::IsViewClass<TabView>(&child_view) ||
++         rac::PinnedSection::IsRow(child_view);
+ }
+ 
+ bool UnpinnedTabContainerView::ShouldSnapToTarget(

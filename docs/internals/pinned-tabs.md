@@ -12,6 +12,7 @@ are in `patches/rac/pinned-tabs/`, in this order:
 | `menus.patch` | Context menus, the folder menu, renaming, and the Tab menu |
 | `close-and-navigate.patch` | Closing resets in place; the reset button; typed addresses open a new tab |
 | `drag.patch` | Dragging between favorites, pinned tabs, folders, and open tabs |
+| `motion.patch` | How favorites, folder rows, and the divider open, close, and move |
 
 ## Items are the source of truth, tabs follow
 
@@ -65,3 +66,14 @@ unpinned containers during a drag. rac does, and that breaks assumptions:
   with items. Otherwise that window would stay open after the tabs move on.
 - The pointer, not the tab, picks the container: above the open tabs'
   scroll view means favorites.
+- **The old views must not show.** After a pin change mid-drag, Chromium
+  animates the old view out right under the new one. Its layer is hidden,
+  since the animation keeps resetting its opacity.
+
+## Motion
+
+Chromium's animating layout manager moves every row from its last bounds to
+its new ones. A row that's hidden still has bounds, so lay it out where it
+will appear. That's why, with no pinned tabs, the divider waits closed above
+the first open tab. It opens only when a drag reaches the top of the open
+tabs, so other drags don't shift the open tabs under the pointer.
