@@ -1,0 +1,763 @@
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar/pinned_section.cc
+@@ -0,0 +1,448 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/sidebar/pinned_section.h"
++
++#include <algorithm>
++#include <memory>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "cc/paint/paint_flags.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/rac/sidebar/pinned_tabs_space.h"
++#include "chrome/browser/ui/rac/sidebar/sidebar_window_sync.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_view.h"
++#include "components/tabs/public/tab_interface.h"
++#include "components/vector_icons/vector_icons.h"
++#include "ui/accessibility/ax_enums.mojom.h"
++#include "ui/base/class_property.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/text_constants.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/controls/button/button.h"
++#include "ui/views/controls/image_view.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/view.h"
++#include "ui/views/view_utils.h"
++#include "ui/views/widget/widget.h"
++
++DEFINE_UI_CLASS_PROPERTY_TYPE(rac::PinnedSection*)
++
++namespace rac {
++
++namespace {
++
++DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(PinnedSection, kPinnedSectionKey)
++
++// Matches a tab's favicon and title placement so folder rows line up with
++// the tabs around them.
++constexpr int kIconSize = 16;
++constexpr int kTitleGap = 7;
++// Below this width only the folder icon fits, as in the compact sidebar.
++constexpr int kMinWidthForTitle = 72;
++constexpr int kFolderIndent = 12;
++constexpr int kDividerHeight = 9;
++constexpr int kDividerInset = 8;
++
++}  // namespace
++
++// A folder's row. Pressing it opens or closes the folder.
++class FolderHeaderView : public views::Button {
++  METADATA_HEADER(FolderHeaderView, views::Button)
++
++ public:
++  explicit FolderHeaderView(PressedCallback callback)
++      : views::Button(std::move(callback)) {
++    icon_ = AddChildView(std::make_unique<views::ImageView>());
++    icon_->SetCanProcessEventsWithinSubtree(false);
++    title_ = AddChildView(std::make_unique<views::Label>());
++    title_->SetHorizontalAlignment(gfx::ALIGN_TO_HEAD);
++    title_->SetElideBehavior(gfx::FADE_TAIL);
++    title_->SetAutoColorReadabilityEnabled(false);
++    title_->SetBackgroundColor(SK_ColorTRANSPARENT);
++    title_->SetSkipSubpixelRenderingOpacityCheck(true);
++    title_->SetCanProcessEventsWithinSubtree(false);
++    title_->SetEnabledColor(kColorTabForegroundInactiveFrameActive);
++    SetFocusBehavior(FocusBehavior::ACCESSIBLE_ONLY);
++  }
++  FolderHeaderView(const FolderHeaderView&) = delete;
++  FolderHeaderView& operator=(const FolderHeaderView&) = delete;
++  ~FolderHeaderView() override = default;
++
++  void SetFolder(const SidebarFolder& folder) {
++    title_->SetText(folder.title);
++    GetViewAccessibility().SetName(folder.title);
++    if (folder.collapsed) {
++      GetViewAccessibility().SetIsCollapsed();
++    } else {
++      GetViewAccessibility().SetIsExpanded();
++    }
++    icon_->SetImage(ui::ImageModel::FromVectorIcon(
++        folder.collapsed ? vector_icons::kFolderFlippableIcon
++                         : vector_icons::kFolderOpenIcon,
++        kColorTabForegroundInactiveFrameActive, kIconSize));
++  }
++
++  // views::Button:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override {
++    return gfx::Size(available_size.width().value_or(kMinWidthForTitle),
++                     GetLayoutConstant(LayoutConstant::kVerticalTabHeight));
++  }
++
++  void Layout(PassKey) override {
++    const gfx::Insets insets = gfx::Insets::VH(
++        GetLayoutConstant(LayoutConstant::kTabVerticalPadding),
++        GetLayoutConstant(LayoutConstant::kTabHorizontalPadding));
++    gfx::Rect content = GetLocalBounds();
++    content.Inset(insets);
++    const bool show_title = width() >= kMinWidthForTitle;
++    const int icon_x = show_title
++                           ? content.x()
++                           : content.x() + (content.width() - kIconSize) / 2;
++    icon_->SetBounds(icon_x, content.y() + (content.height() - kIconSize) / 2,
++                     kIconSize, kIconSize);
++    title_->SetVisible(show_title);
++    if (show_title) {
++      const int title_x = icon_->bounds().right() + kTitleGap;
++      const int line_height = title_->GetLineHeight();
++      title_->SetBounds(title_x,
++                        content.y() + (content.height() - line_height) / 2,
++                        std::max(0, content.right() - title_x), line_height);
++    }
++  }
++
++  void PaintButtonContents(gfx::Canvas* canvas) override {
++    if (GetState() != STATE_HOVERED && GetState() != STATE_PRESSED) {
++      return;
++    }
++    cc::PaintFlags flags;
++    flags.setAntiAlias(true);
++    flags.setColor(GetColorProvider()->GetColor(
++        kColorTabBackgroundInactiveHoverFrameActive));
++    canvas->DrawRoundRect(
++        GetLocalBounds(),
++        GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius), flags);
++  }
++
++ private:
++  raw_ptr<views::ImageView> icon_ = nullptr;
++  raw_ptr<views::Label> title_ = nullptr;
++};
++
++BEGIN_METADATA(FolderHeaderView)
++END_METADATA
++
++namespace {
++
++// The line between the pinned tabs and the open tabs.
++class SectionDividerView : public views::View {
++  METADATA_HEADER(SectionDividerView, views::View)
++
++ public:
++  SectionDividerView() { SetCanProcessEventsWithinSubtree(false); }
++  SectionDividerView(const SectionDividerView&) = delete;
++  SectionDividerView& operator=(const SectionDividerView&) = delete;
++  ~SectionDividerView() override = default;
++
++  // views::View:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override {
++    return gfx::Size(available_size.width().value_or(kDividerInset * 2),
++                     kDividerHeight);
++  }
++
++  void OnPaint(gfx::Canvas* canvas) override {
++    const int inset = width() > kMinWidthForTitle ? kDividerInset : 4;
++    canvas->FillRect(
++        gfx::Rect(inset, height() / 2, std::max(0, width() - inset * 2), 1),
++        GetColorProvider()->GetColor(kColorTabDividerFrameActive));
++  }
++};
++
++BEGIN_METADATA(SectionDividerView)
++END_METADATA
++
++}  // namespace
++
++PinnedSectionLayout::Child::Child() = default;
++PinnedSectionLayout::Child::Child(Child&&) = default;
++PinnedSectionLayout::Child& PinnedSectionLayout::Child::operator=(Child&&) =
++    default;
++PinnedSectionLayout::Child::~Child() = default;
++
++PinnedSectionLayout::PinnedSectionLayout() = default;
++PinnedSectionLayout::PinnedSectionLayout(PinnedSectionLayout&&) = default;
++PinnedSectionLayout& PinnedSectionLayout::operator=(PinnedSectionLayout&&) =
++    default;
++PinnedSectionLayout::~PinnedSectionLayout() = default;
++
++const PinnedSectionLayout::Child* PinnedSectionLayout::Find(
++    const views::View* child) const {
++  auto it = children_.find(child);
++  return it == children_.end() ? nullptr : &it->second;
++}
++
++void PinnedSectionLayout::LayoutRows(
++    const std::vector<raw_ptr<views::View>>& rows,
++    int x,
++    views::SizeBound available_width,
++    int horizontal_padding,
++    int vertical_padding,
++    int& y,
++    int& width,
++    views::ProposedLayout& layouts) const {
++  for (views::View* row : rows) {
++    const views::SizeBound row_width =
++        available_width.is_bounded()
++            ? available_width - (x + horizontal_padding)
++            : available_width;
++    gfx::Rect bounds(row->GetPreferredSize(views::SizeBounds(row_width, {})));
++    bounds.set_origin(gfx::Point(x, y));
++    if (row_width.is_bounded()) {
++      bounds.set_width(row_width.value());
++    }
++    layouts.child_layouts.emplace_back(row, true, bounds);
++    y += bounds.height() + vertical_padding;
++    width = std::max(width, bounds.right());
++  }
++}
++
++void PinnedSectionLayout::LayoutTrailingRows(
++    int x,
++    views::SizeBound available_width,
++    int horizontal_padding,
++    int vertical_padding,
++    int& y,
++    int& width,
++    views::ProposedLayout& layouts) const {
++  LayoutRows(trailing_rows_, x, available_width, horizontal_padding,
++             vertical_padding, y, width, layouts);
++  for (views::View* row : unused_rows_) {
++    layouts.child_layouts.emplace_back(row, false, gfx::Rect(x, y, 0, 0));
++  }
++}
++
++// static
++void PinnedSection::Attach(views::View* container) {
++  container->SetProperty(kPinnedSectionKey,
++                         std::make_unique<PinnedSection>(container));
++}
++
++// static
++const PinnedSection* PinnedSection::Get(const views::View* container) {
++  return container->GetProperty(kPinnedSectionKey);
++}
++
++PinnedSection::PinnedSection(views::View* container) : container_(container) {
++  container_observation_.Observe(container);
++}
++
++PinnedSection::~PinnedSection() = default;
++
++PinnedSectionLayout PinnedSection::ComputeLayout(
++    const std::vector<views::View*>& children,
++    tabs::VerticalTabStripCollapseState collapse_state) const {
++  PinnedSectionLayout layout;
++  if (!browser_) {
++    return layout;
++  }
++  SidebarWindowSync* sync = SidebarWindows::ForBrowser(browser_);
++  const SidebarList& list = GetList();
++
++  std::vector<raw_ptr<views::View>> pending_rows;
++  base::flat_map<const tabs::TabInterface*, views::View*> tab_views;
++  if (sync && !list.entries.empty()) {
++    for (views::View* child : children) {
++      if (const auto* tab_view = views::AsViewClass<TabView>(child)) {
++        tab_views.emplace(tab_view->GetTabInterface(), child);
++      }
++    }
++    const tabs::TabInterface* active_tab =
++        browser_->GetTabStripModel()->GetActiveTab();
++    const bool expanded =
++        collapse_state == tabs::VerticalTabStripCollapseState::kExpanded;
++
++    auto place_item = [&](const SidebarItem& item,
++                          const SidebarFolder* folder) {
++      const tabs::TabInterface* tab = sync->GetTabForItem(item.id);
++      auto it = tab ? tab_views.find(tab) : tab_views.end();
++      if (it == tab_views.end()) {
++        return;
++      }
++      PinnedSectionLayout::Child& child = layout.children_[it->second];
++      child.rows_before = std::move(pending_rows);
++      pending_rows.clear();
++      child.indent = folder && expanded ? kFolderIndent : 0;
++      child.hidden = folder && folder->collapsed && tab != active_tab;
++    };
++
++    for (const SidebarList::Entry& entry : list.entries) {
++      if (const auto* item = std::get_if<SidebarItem>(&entry)) {
++        place_item(*item, nullptr);
++        continue;
++      }
++      const auto& folder = std::get<SidebarFolder>(entry);
++      auto header = folder_headers_.find(folder.id);
++      if (header != folder_headers_.end()) {
++        pending_rows.push_back(header->second.get());
++      }
++      for (const SidebarItem& item : folder.items) {
++        place_item(item, &folder);
++      }
++    }
++    pending_rows.push_back(divider_.get());
++  }
++
++  // Rows left over from the section go above the first open tab.
++  if (!pending_rows.empty()) {
++    for (views::View* child : children) {
++      if (!layout.children_.contains(child)) {
++        layout.children_[child].rows_before = std::move(pending_rows);
++        pending_rows.clear();
++        break;
++      }
++    }
++    layout.trailing_rows_ = std::move(pending_rows);
++  }
++
++  auto contains = [](const std::vector<raw_ptr<views::View>>& rows,
++                     const views::View* row) {
++    return std::ranges::any_of(
++        rows, [row](const views::View* other) { return other == row; });
++  };
++  auto is_used = [&](const views::View* row) {
++    for (const auto& [child, info] : layout.children_) {
++      if (contains(info.rows_before, row)) {
++        return true;
++      }
++    }
++    return contains(layout.trailing_rows_, row);
++  };
++  if (divider_ && !is_used(divider_)) {
++    layout.unused_rows_.push_back(divider_.get());
++  }
++  for (const auto& [id, header] : folder_headers_) {
++    if (!is_used(header)) {
++      layout.unused_rows_.push_back(header.get());
++    }
++  }
++  return layout;
++}
++
++void PinnedSection::OnViewAddedToWidget(views::View* observed_view) {
++  if (browser_) {
++    return;
++  }
++  BrowserView* browser_view = BrowserView::GetBrowserViewForNativeWindow(
++      observed_view->GetWidget()->GetTopLevelWidget()->GetNativeWindow());
++  if (browser_view && browser_view->browser()) {
++    Start(browser_view->browser());
++  }
++}
++
++void PinnedSection::OnViewIsDeleting(views::View* observed_view) {
++  // The container deletes its children, the rows among them, before it
++  // deletes this.
++  divider_ = nullptr;
++  folder_headers_.clear();
++  items_observation_.Reset();
++  container_observation_.Reset();
++  space_subscription_ = {};
++  if (browser_) {
++    browser_->GetTabStripModel()->RemoveObserver(this);
++  }
++  browser_ = nullptr;
++  items_ = nullptr;
++  container_ = nullptr;
++}
++
++void PinnedSection::OnSidebarItemsChanged() {
++  UpdateRows();
++}
++
++void PinnedSection::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  // The active tab stays visible in a collapsed folder.
++  if (selection.active_tab_changed() && container_) {
++    container_->InvalidateLayout();
++  }
++}
++
++void PinnedSection::Start(BrowserWindowInterface* browser) {
++  items_ = SidebarItems::Get(browser->GetProfile());
++  if (!items_ || browser->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
++    items_ = nullptr;
++    return;
++  }
++  browser_ = browser;
++  items_observation_.Observe(items_);
++  browser_->GetTabStripModel()->AddObserver(this);
++  space_subscription_ = RegisterSpaceChanged(
++      browser_,
++      base::BindRepeating(&PinnedSection::UpdateRows, base::Unretained(this)));
++  divider_ = container_->AddChildView(std::make_unique<SectionDividerView>());
++  UpdateRows();
++}
++
++const SidebarList& PinnedSection::GetList() const {
++  return items_->GetList(
++      SidebarItems::PinnedListKey(GetSpaceForWindow(browser_)));
++}
++
++void PinnedSection::UpdateRows() {
++  if (!container_ || !items_) {
++    return;
++  }
++  std::map<std::string, raw_ptr<FolderHeaderView>> old_headers;
++  std::swap(old_headers, folder_headers_);
++  for (const SidebarList::Entry& entry : GetList().entries) {
++    const auto* folder = std::get_if<SidebarFolder>(&entry);
++    if (!folder) {
++      continue;
++    }
++    FolderHeaderView* header = nullptr;
++    if (auto it = old_headers.find(folder->id); it != old_headers.end()) {
++      header = it->second;
++      old_headers.erase(it);
++    } else {
++      header = container_->AddChildView(std::make_unique<FolderHeaderView>(
++          base::BindRepeating(&PinnedSection::ToggleFolder,
++                              base::Unretained(this), folder->id)));
++    }
++    header->SetFolder(*folder);
++    folder_headers_.emplace(folder->id, header);
++  }
++  for (auto& [id, header] : old_headers) {
++    FolderHeaderView* view = header;
++    header = nullptr;
++    container_->RemoveChildViewT(view);
++  }
++  container_->InvalidateLayout();
++}
++
++void PinnedSection::ToggleFolder(const std::string& folder_id) {
++  if (!items_) {
++    return;
++  }
++  const SidebarFolder* folder = GetList().FindFolder(folder_id);
++  if (folder) {
++    items_->SetFolderCollapsed(folder_id, !folder->collapsed);
++  }
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar/pinned_section.h
+@@ -0,0 +1,145 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_PINNED_SECTION_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_PINNED_SECTION_H_
++
++#include <map>
++#include <string>
++#include <vector>
++
++#include "base/callback_list.h"
++#include "base/containers/flat_map.h"
++#include "base/memory/raw_ptr.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/ui/rac/sidebar/sidebar_items.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "ui/views/layout/layout_types.h"
++#include "ui/views/layout/proposed_layout.h"
++#include "ui/views/view_observer.h"
++
++class BrowserWindowInterface;
++
++namespace views {
++class View;
++}  // namespace views
++
++namespace rac {
++
++class FolderHeaderView;
++
++// Where the sidebar's rows go around the open tabs container's children for
++// one layout pass. The container lays out its tab views as usual, and asks
++// this for the rows to put before each one and how to place it.
++class PinnedSectionLayout {
++ public:
++  struct Child {
++    Child();
++    Child(Child&&);
++    Child& operator=(Child&&);
++    ~Child();
++
++    // Folder headers and the divider to put above the child.
++    std::vector<raw_ptr<views::View>> rows_before;
++    int indent = 0;
++    // True for a tab inside a collapsed folder.
++    bool hidden = false;
++  };
++
++  PinnedSectionLayout();
++  PinnedSectionLayout(PinnedSectionLayout&&);
++  PinnedSectionLayout& operator=(PinnedSectionLayout&&);
++  ~PinnedSectionLayout();
++
++  // Returns null for children outside the pinned section that have no rows
++  // above them.
++  const Child* Find(const views::View* child) const;
++
++  // Places `rows` from `y` down, the same way the container places tabs.
++  // Updates `y` and `width` past the rows.
++  void LayoutRows(const std::vector<raw_ptr<views::View>>& rows,
++                  int x,
++                  views::SizeBound available_width,
++                  int horizontal_padding,
++                  int vertical_padding,
++                  int& y,
++                  int& width,
++                  views::ProposedLayout& layouts) const;
++
++  // Places the rows that follow the last child, and hides unused rows.
++  void LayoutTrailingRows(int x,
++                          views::SizeBound available_width,
++                          int horizontal_padding,
++                          int vertical_padding,
++                          int& y,
++                          int& width,
++                          views::ProposedLayout& layouts) const;
++
++ private:
++  friend class PinnedSection;
++
++  base::flat_map<const views::View*, Child> children_;
++  std::vector<raw_ptr<views::View>> trailing_rows_;
++  std::vector<raw_ptr<views::View>> unused_rows_;
++};
++
++// Draws a window's pinned tabs as a section at the top of the open tabs:
++// folder headers above the tabs in each folder, and a divider between the
++// pinned tabs and the open tabs. The tabs themselves stay Chromium's tab
++// views, so they load, drag, and close like any tab.
++class PinnedSection : public views::ViewObserver,
++                      public SidebarItems::Observer,
++                      public TabStripModelObserver {
++ public:
++  // Gives a vertical open tabs container its pinned section.
++  static void Attach(views::View* container);
++  // Returns null for containers without one.
++  static const PinnedSection* Get(const views::View* container);
++
++  explicit PinnedSection(views::View* container);
++  PinnedSection(const PinnedSection&) = delete;
++  PinnedSection& operator=(const PinnedSection&) = delete;
++  ~PinnedSection() override;
++
++  // `children` are the container's tab, group, and split views in order.
++  PinnedSectionLayout ComputeLayout(
++      const std::vector<views::View*>& children,
++      tabs::VerticalTabStripCollapseState collapse_state) const;
++
++  // views::ViewObserver:
++  void OnViewAddedToWidget(views::View* observed_view) override;
++  void OnViewIsDeleting(views::View* observed_view) override;
++
++  // SidebarItems::Observer:
++  void OnSidebarItemsChanged() override;
++
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(
++      TabStripModel* tab_strip_model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++
++ private:
++  void Start(BrowserWindowInterface* browser);
++  const SidebarList& GetList() const;
++  // Adds, updates, and removes folder headers to match the folders.
++  void UpdateRows();
++  void ToggleFolder(const std::string& folder_id);
++
++  raw_ptr<views::View> container_;
++  raw_ptr<BrowserWindowInterface> browser_ = nullptr;
++  raw_ptr<SidebarItems> items_ = nullptr;
++  raw_ptr<views::View> divider_ = nullptr;
++  std::map<std::string, raw_ptr<FolderHeaderView>> folder_headers_;
++  base::CallbackListSubscription space_subscription_;
++  base::ScopedObservation<views::View, views::ViewObserver>
++      container_observation_{this};
++  base::ScopedObservation<SidebarItems, SidebarItems::Observer>
++      items_observation_{this};
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_PINNED_SECTION_H_
+--- a/chrome/browser/ui/views/rac/sidebar/sidebar_style.cc
++++ b/chrome/browser/ui/views/rac/sidebar/sidebar_style.cc
+@@ -19,6 +19,7 @@ namespace {
+ // The active tab's color, faded so a resting tile is a soft step up from the
+ // sidebar in light, dark, and themed windows alike.
+ constexpr float kRestOpacity = 0.45f;
++constexpr float kUnloadedTitleOpacity = 0.6f;
+ 
+ }  // namespace
+ 
+@@ -40,4 +41,12 @@ void PaintFavoriteTileRest(gfx::Canvas*
+   canvas->DrawPath(path, flags);
+ }
+ 
++SkColor GetTabTitleColor(SkColor color, bool unloaded) {
++  if (!unloaded) {
++    return color;
++  }
++  return SkColorSetA(
++      color, static_cast<U8CPU>(SkColorGetA(color) * kUnloadedTitleOpacity));
++}
++
+ }  // namespace rac::sidebar_style
+--- a/chrome/browser/ui/views/rac/sidebar/sidebar_style.h
++++ b/chrome/browser/ui/views/rac/sidebar/sidebar_style.h
+@@ -5,6 +5,8 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_SIDEBAR_STYLE_H_
+ #define CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_SIDEBAR_STYLE_H_
+ 
++#include "third_party/skia/include/core/SkColor.h"
++
+ class SkPath;
+ 
+ namespace gfx {
+@@ -31,6 +33,10 @@ void PaintFavoriteTileRest(gfx::Canvas*
+                            const SkPath& path,
+                            bool frame_active);
+ 
++// A tab that hasn't loaded its page yet, such as a pinned tab the window
++// hasn't opened, has a fainter title to go with its dimmed favicon.
++SkColor GetTabTitleColor(SkColor color, bool unloaded);
++
+ }  // namespace rac::sidebar_style
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_SIDEBAR_STYLE_H_
+--- a/chrome/browser/ui/views/tabs/common/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/common/BUILD.gn
+@@ -44,6 +44,8 @@ source_set("common") {
+ 
+ source_set("impl") {
+   sources = [
++    "//chrome/browser/ui/views/rac/sidebar/pinned_section.cc",
++    "//chrome/browser/ui/views/rac/sidebar/pinned_section.h",
+     "//chrome/browser/ui/views/rac/sidebar/sidebar_style.cc",
+     "//chrome/browser/ui/views/rac/sidebar/sidebar_style.h",
+     "dragged_tabs_container.cc",
+--- a/chrome/browser/ui/views/tabs/common/tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
+@@ -1101,6 +1101,10 @@ void TabView::UpdateTabData(const tabs::
+   UpdateTitle(tab_data_.title, tab_data_.should_render_loading_title);
+   alert_indicator_->TransitionToAlertState(tab_data_.alert_state);
+   SetHoverCardDataFrom(tab_data_);
++  if (old_data.should_dim_favicon != tab_data_.should_dim_favicon &&
++      GetColorProvider()) {
++    UpdateColors();
++  }
+ }
+ 
+ void TabView::SetDataForTesting(tabs::TabData data) {
+@@ -1156,7 +1160,9 @@ void TabView::UpdateColors() {
+     should_fill_background_tab_color_ = false;
+   }
+   TabStyle::TabColors colors = tab_styling()->CalculateTargetColors();
+-  title_->SetEnabledColor(colors.foreground_color);
++  title_->SetEnabledColor(rac::sidebar_style::GetTabTitleColor(
++      colors.foreground_color, orientation_ == TabStripOrientation::kVertical &&
++                                   tab_data_.should_dim_favicon));
+   close_button_->SetColors(colors);
+   alert_indicator_->OnParentTabButtonColorChanged();
+ 
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
++#include "chrome/browser/ui/views/rac/sidebar/pinned_section.h"
+ #include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
+ #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
+@@ -107,11 +108,14 @@ UnpinnedTabContainerView::UnpinnedTabCon
+   node_destroyed_subscription_ = collection_node_->RegisterWillDestroyCallback(
+       base::BindOnce(&UnpinnedTabContainerView::ResetCollectionNode,
+                      base::Unretained(this)));
++
++  if (collection_node->orientation() == TabStripOrientation::kVertical) {
++    rac::PinnedSection::Attach(this);
++  }
+ }
+ 
+ UnpinnedTabContainerView::~UnpinnedTabContainerView() = default;
+ 
+-
+ std::optional<BrowserRootView::DropIndex>
+ UnpinnedTabContainerView::GetLinkDropIndex(const gfx::Point& loc_in_container) {
+   if (!collection_node_) {
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
+@@ -10,6 +10,7 @@
+ #include "base/numerics/safe_conversions.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
++#include "chrome/browser/ui/views/rac/sidebar/pinned_section.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
+@@ -204,6 +205,11 @@ views::ProposedLayout UnpinnedTabContain
+ 
+   const int horizontal_padding =
+       GetLayoutConstant(LayoutConstant::kVerticalTabStripHorizontalPadding);
++  const rac::PinnedSection* pinned_section =
++      rac::PinnedSection::Get(tab_container_view);
++  const rac::PinnedSectionLayout section =
++      pinned_section ? pinned_section->ComputeLayout(children, collapse_state)
++                     : rac::PinnedSectionLayout();
+ 
+   for (auto* child : children) {
+     int x =
+@@ -211,6 +217,13 @@ views::ProposedLayout UnpinnedTabContain
+                 collapse_state != tabs::VerticalTabStripCollapseState::kExpanded
+             ? 0
+             : horizontal_padding;
++    const rac::PinnedSectionLayout::Child* section_child = section.Find(child);
++    if (section_child) {
++      section.LayoutRows(section_child->rows_before, horizontal_padding,
++                         size_bounds.width(), horizontal_padding,
++                         kTabVerticalPadding, height, width, layouts);
++      x += section_child->indent;
++    }
+     views::SizeBound child_height_bound = size_bounds.height();
+     // In focused mode, pass the scroll viewport height constraint to the child
+     // focused group if the incoming size bounds height is unbounded, so that
+@@ -230,8 +243,9 @@ views::ProposedLayout UnpinnedTabContain
+     bounds.set_x(x);
+ 
+     auto drag_data = tab_container_view->GetVisualDataForDraggedView(*child);
+-    bool should_show_child =
+-        IsChildVisibleInContainer(tab_container_view, focused_group_id, child);
++    bool should_show_child = IsChildVisibleInContainer(
++                                 tab_container_view, focused_group_id, child) &&
++                             !(section_child && section_child->hidden);
+ 
+     if (!should_show_child) {
+       layouts.child_layouts.emplace_back(
+@@ -251,6 +265,9 @@ views::ProposedLayout UnpinnedTabContain
+     height += bounds.height() + kTabVerticalPadding;
+     width = std::max(width, bounds.width() + bounds.x());
+   }
++  section.LayoutTrailingRows(horizontal_padding, size_bounds.width(),
++                             horizontal_padding, kTabVerticalPadding, height,
++                             width, layouts);
+ 
+   if (height > 0) {
+     height -= kTabVerticalPadding;

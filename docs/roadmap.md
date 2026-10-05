@@ -71,10 +71,11 @@ Still needed before sharing builds:
 Spaces is the foundation; build it as an ordered chain in one worktree (data
 model, switching, dots, saving). The address bar in the sidebar and auto
 picture-in-picture are independent and can start right away. Pinned tabs and
-favorites can start too, treating each window as one space, and get
-connected to spaces once the data model is merged. Sidebar hide and reveal
-starts after the address bar in the sidebar is merged, because both change
-how frameless mode lays out the window.
+favorites treat every window as one space for now, so they can land before
+Spaces; connecting them is one file (see
+[Favorites and pinned tabs](internals/pinned-tabs.md#the-space-seam)).
+Sidebar hide and reveal starts after the address bar in the sidebar is
+merged, because both change how frameless mode lays out the window.
 
 | Feature | Covers | Code it touches |
 | --- | --- | --- |

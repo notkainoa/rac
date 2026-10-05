@@ -18,6 +18,8 @@ them, and traps that are hard to spot from the source.
 - [Overview](internals/overview.md): the layers, repo layout, how patches
   are applied, and how to make a rac change
 - [Glossary](internals/glossary.md): the words rac uses for things
+- [Favorites and pinned tabs](internals/pinned-tabs.md): how the sidebar's
+  items stay in sync with tabs, the space seam, and drag traps
 - [AI (work in progress)](internals/ai.md): ideas collected so far; nothing
   decided
 - [Bangs (work in progress)](internals/bangs.md): editable bangs and a

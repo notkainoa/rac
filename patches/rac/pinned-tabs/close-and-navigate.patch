@@ -1,0 +1,618 @@
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -97,6 +97,7 @@
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+ #include "chrome/browser/ui/passwords/manage_passwords_ui_controller.h"
+ #include "chrome/browser/ui/qrcode_generator/qrcode_generator_bubble_controller.h"
++#include "chrome/browser/ui/rac/sidebar/sidebar_hooks.h"
+ #include "chrome/browser/ui/scoped_tabbed_browser_displayer.h"
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_bubble.h"
+ #include "chrome/browser/ui/sharing_hub/screenshot/screenshot_captured_bubble_controller.h"
+@@ -1518,7 +1519,8 @@ void CloseTab(BrowserWindowInterface* br
+ 
+   const auto& selected_tabs =
+       browser->GetTabStripModel()->selection_model().selected_tabs();
+-  bool all_selected_tabs_pinned = !selected_tabs.empty();
++  bool all_selected_tabs_pinned =
++      !selected_tabs.empty() && !rac::ClosingResetsFavorites(browser);
+   for (const tabs::TabInterface* tab : selected_tabs) {
+     if (!tab->IsPinned()) {
+       all_selected_tabs_pinned = false;
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -31,6 +31,7 @@
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/rac/sidebar/sidebar_tab_tag.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -178,6 +179,11 @@ std::map<std::string, std::string> Brows
+ 
+   glic::PopulateGlicExtraData(tab_strip_model_->GetTabAtIndex(index),
+                               &extra_data);
++  if (std::string item_id =
++          rac::GetSidebarItemId(tab_strip_model_->GetWebContentsAt(index));
++      !item_id.empty()) {
++    extra_data[rac::kSidebarItemSessionKey] = item_id;
++  }
+ 
+   return extra_data;
+ }
+--- a/chrome/browser/ui/navigator/browser_navigator.cc
++++ b/chrome/browser/ui/navigator/browser_navigator.cc
+@@ -40,6 +40,7 @@
+ #include "chrome/browser/ui/location_bar/location_bar.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params_utils.h"
++#include "chrome/browser/ui/rac/sidebar/sidebar_hooks.h"
+ #include "chrome/browser/ui/singleton_tabs.h"
+ #include "chrome/browser/ui/status_bubble.h"
+ #include "chrome/browser/ui/tab_helpers.h"
+@@ -762,6 +763,7 @@ base::WeakPtr<content::NavigationHandle>
+     params->source_contents =
+         params->browser->GetTabStripModel()->GetActiveWebContents();
+   }
++  rac::AdjustSidebarTabNavigation(params);
+ 
+   WebContents* contents_to_navigate_or_insert =
+       params->contents_to_insert.get();
+--- a/chrome/browser/ui/rac/sidebar/sidebar_actions.cc
++++ b/chrome/browser/ui/rac/sidebar/sidebar_actions.cc
+@@ -246,6 +246,11 @@ void GoBackToPinnedPage(SidebarWindowSyn
+   if (!item) {
+     return;
+   }
++  // A background tab goes back without loading, as if it were closed.
++  if (!tab->IsActivated()) {
++    window->ResetTab(tab);
++    return;
++  }
+   content::NavigationController::LoadURLParams params(item->url);
+   params.transition_type = ui::PAGE_TRANSITION_AUTO_BOOKMARK;
+   tab->GetContents()->GetController().LoadURLWithParams(params);
+--- a/chrome/browser/ui/rac/sidebar/sidebar_actions.h
++++ b/chrome/browser/ui/rac/sidebar/sidebar_actions.h
+@@ -45,6 +45,7 @@ void UnpinTabs(SidebarWindowSync* window
+ // True if `tab` is a favorite or pinned tab showing a page other than the
+ // one it was pinned on.
+ bool HasLeftPinnedPage(SidebarWindowSync* window, tabs::TabInterface* tab);
++// Loads the pinned page in the active tab. Other tabs are reset unloaded.
+ void GoBackToPinnedPage(SidebarWindowSync* window, tabs::TabInterface* tab);
+ void ReplacePinnedPage(SidebarWindowSync* window, tabs::TabInterface* tab);
+ void ShowRenameTabDialog(SidebarWindowSync* window, tabs::TabInterface* tab);
+--- a/chrome/browser/ui/rac/sidebar/sidebar_hooks.cc
++++ b/chrome/browser/ui/rac/sidebar/sidebar_hooks.cc
+@@ -4,20 +4,55 @@
+ 
+ #include "chrome/browser/ui/rac/sidebar/sidebar_hooks.h"
+ 
++#include <algorithm>
++
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
+ #include "chrome/browser/ui/rac/sidebar/sidebar_actions.h"
+ #include "chrome/browser/ui/rac/sidebar/sidebar_items.h"
+ #include "chrome/browser/ui/rac/sidebar/sidebar_tab_tag.h"
+ #include "chrome/browser/ui/rac/sidebar/sidebar_window_sync.h"
++#include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/web_contents.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++#include "url/url_constants.h"
+ 
+ namespace rac {
+ 
+ namespace {
+ 
++bool IsLoaded(tabs::TabInterface* tab) {
++  content::WebContents* contents = tab->GetContents();
++  return !contents->WasDiscarded() && !contents->GetController().NeedsReload();
++}
++
++// Leaves the active tab before it closes or resets, so resetting doesn't
++// load it again and closing doesn't load the pinned tab next to it. Goes to
++// the loaded tab used most recently, or to a new tab if none is loaded.
++void LeaveActiveTab(TabStripModel* model,
++                    const std::vector<tabs::TabInterface*>& closing) {
++  tabs::TabInterface* next = nullptr;
++  for (tabs::TabInterface* tab : *model) {
++    if (std::ranges::find(closing, tab) != closing.end() || !IsLoaded(tab)) {
++      continue;
++    }
++    if (!next || tab->GetContents()->GetLastActiveTimeTicks() >
++                     next->GetContents()->GetLastActiveTimeTicks()) {
++      next = tab;
++    }
++  }
++  if (next) {
++    model->ActivateTabAt(model->GetIndexOfTab(next));
++  } else {
++    model->delegate()->AddTabAt(GURL(), -1, /*foreground=*/true);
++  }
++}
++
+ SidebarWindowSync* GetWindow(TabStripModel* model) {
+   BrowserWindowInterface* browser =
+       model->delegate()->GetBrowserWindowInterface();
+@@ -85,4 +120,73 @@ std::u16string GetSidebarTabName(const t
+   return item ? item->name : std::u16string();
+ }
+ 
++std::vector<tabs::TabInterface*> ResetSidebarTabsInsteadOfClosing(
++    TabStripModel* model,
++    std::vector<tabs::TabInterface*> tabs,
++    uint32_t close_types) {
++  SidebarWindowSync* window = GetWindow(model);
++  if (!window || !(close_types & TabCloseTypes::CLOSE_USER_GESTURE) ||
++      model->closing_all()) {
++    return tabs;
++  }
++  std::vector<tabs::TabInterface*> to_close;
++  std::vector<tabs::TabHandle> to_reset;
++  bool closes_active_sidebar_tab = false;
++  for (tabs::TabInterface* tab : tabs) {
++    if (GetSidebarTabKind(window, tab) == SidebarTabKind::kOpen) {
++      to_close.push_back(tab);
++      continue;
++    }
++    closes_active_sidebar_tab |= tab->IsActivated();
++    // Pages that ask before they're left, and split tabs, close the usual
++    // way. The window then opens their item again.
++    if (tab->IsSplit() ||
++        tab->GetContents()->NeedToFireBeforeUnloadOrUnloadEvents()) {
++      to_close.push_back(tab);
++    } else {
++      to_reset.push_back(tab->GetHandle());
++    }
++  }
++  if (closes_active_sidebar_tab) {
++    LeaveActiveTab(model, tabs);
++  }
++  for (const tabs::TabHandle& handle : to_reset) {
++    tabs::TabInterface* tab = handle.Get();
++    if (!tab) {
++      continue;
++    }
++    // So reopening a closed tab brings back the page the user left.
++    if ((close_types & TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB) &&
++        IsLoaded(tab)) {
++      model->delegate()->CreateHistoricalTab(tab->GetContents());
++    }
++    window->ResetTab(tab);
++  }
++  return to_close;
++}
++
++bool ClosingResetsFavorites(BrowserWindowInterface* browser) {
++  return SidebarWindows::ForBrowser(browser) != nullptr;
++}
++
++void AdjustSidebarTabNavigation(NavigateParams* params) {
++  content::WebContents* source = params->source_contents;
++  if (params->disposition != WindowOpenDisposition::CURRENT_TAB || !source ||
++      params->contents_to_insert ||
++      !(ui::PageTransitionGetQualifier(params->transition) &
++        ui::PAGE_TRANSITION_FROM_ADDRESS_BAR) ||
++      params->url.SchemeIs(url::kJavaScriptScheme) ||
++      params->url == source->GetLastCommittedURL()) {
++    return;
++  }
++  tabs::TabInterface* tab = tabs::TabInterface::MaybeGetFromContents(source);
++  BrowserWindowInterface* browser =
++      tab ? tab->GetBrowserWindowInterface() : nullptr;
++  SidebarWindowSync* window =
++      browser ? SidebarWindows::ForBrowser(browser) : nullptr;
++  if (window && GetSidebarTabKind(window, tab) != SidebarTabKind::kOpen) {
++    params->disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++  }
++}
++
+ }  // namespace rac
+--- a/chrome/browser/ui/rac/sidebar/sidebar_hooks.h
++++ b/chrome/browser/ui/rac/sidebar/sidebar_hooks.h
+@@ -5,12 +5,15 @@
+ #ifndef CHROME_BROWSER_UI_RAC_SIDEBAR_SIDEBAR_HOOKS_H_
+ #define CHROME_BROWSER_UI_RAC_SIDEBAR_SIDEBAR_HOOKS_H_
+ 
++#include <cstdint>
+ #include <optional>
+ #include <string>
+ #include <vector>
+ 
++class BrowserWindowInterface;
+ class Profile;
+ class TabStripModel;
++struct NavigateParams;
+ 
+ namespace tabs {
+ class TabInterface;
+@@ -35,6 +38,20 @@ std::optional<bool> WillPinTabs(TabStrip
+ // The name the user gave a favorite or pinned tab, or an empty string.
+ std::u16string GetSidebarTabName(const tabs::TabInterface* tab);
+ 
++// When the user closes favorites and pinned tabs, they stay in the sidebar,
++// unloaded and back on their pinned page. Resets those of `tabs` and returns
++// the rest, which close as usual. `close_types` is a TabCloseTypes bitmask.
++std::vector<tabs::TabInterface*> ResetSidebarTabsInsteadOfClosing(
++    TabStripModel* model,
++    std::vector<tabs::TabInterface*> tabs,
++    uint32_t close_types);
++// True if closing a favorite only resets it, so it needs no confirmation.
++bool ClosingResetsFavorites(BrowserWindowInterface* browser);
++
++// An address typed into a favorite or pinned tab opens in a new tab, so the
++// sidebar tab stays on its page. Links still open in place.
++void AdjustSidebarTabNavigation(NavigateParams* params);
++
+ }  // namespace rac
+ 
+ #endif  // CHROME_BROWSER_UI_RAC_SIDEBAR_SIDEBAR_HOOKS_H_
+--- a/chrome/browser/ui/rac/sidebar/sidebar_window_sync.cc
++++ b/chrome/browser/ui/rac/sidebar/sidebar_window_sync.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/rac/sidebar/sidebar_window_sync.h"
+ 
+ #include <algorithm>
++#include <memory>
+ #include <utility>
+ #include <vector>
+ 
+@@ -19,10 +20,14 @@
+ #include "chrome/browser/ui/rac/sidebar/sidebar_tab_tag.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/favicon/content/content_favicon_driver.h"
++#include "components/sessions/content/content_serialized_navigation_builder.h"
+ #include "components/sessions/core/serialized_navigation_entry.h"
+ #include "components/sessions/core/serialized_user_agent_override.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/restore_type.h"
+ #include "content/public/browser/web_contents.h"
+ 
+ namespace rac {
+@@ -43,6 +48,14 @@ GURL GetPageUrl(tabs::TabInterface* tab)
+   return committed.is_empty() ? contents->GetVisibleURL() : committed;
+ }
+ 
++sessions::SerializedNavigationEntry GetItemNavigation(const SidebarItem& item) {
++  sessions::SerializedNavigationEntry navigation;
++  navigation.set_index(0);
++  navigation.set_virtual_url(item.url);
++  navigation.set_title(item.title);
++  return navigation;
++}
++
+ }  // namespace
+ 
+ SidebarWindowSync::SidebarWindowSync(BrowserWindowInterface* browser,
+@@ -110,6 +123,40 @@ void SidebarWindowSync::Release(tabs::Ta
+   items_->RemoveItem(id);
+ }
+ 
++void SidebarWindowSync::ResetTab(tabs::TabInterface* tab) {
++  const SidebarItem* item = GetItemForTab(tab);
++  if (!item || tab->IsActivated()) {
++    return;
++  }
++  Profile* profile = browser_->GetProfile();
++  const sessions::SerializedNavigationEntry navigation =
++      GetItemNavigation(*item);
++  std::vector<std::unique_ptr<content::NavigationEntry>> entries =
++      sessions::ContentSerializedNavigationBuilder::ToNavigationEntries(
++          base::span_from_ref(navigation), profile);
++  content::WebContents::CreateParams params(profile);
++  params.initially_hidden = true;
++  params.desired_renderer_state =
++      content::WebContents::CreateParams::kNoRendererProcess;
++  std::unique_ptr<content::WebContents> contents =
++      content::WebContents::Create(params);
++  contents->GetController().Restore(0, content::RestoreType::kRestored,
++                                    &entries);
++  content::WebContents* new_contents = contents.get();
++  const GURL url = item->url;
++
++  // Swapping the contents, as discarding a tab does, keeps the tab's row and
++  // place. OnTabStripModelChanged() moves the tag to the new contents once
++  // the session knows it, so a restored session keeps it.
++  TabStripModel* model = browser_->GetTabStripModel();
++  model->DiscardWebContents(tab->GetContents(), std::move(contents)).reset();
++  if (auto* favicon_driver =
++          favicon::ContentFaviconDriver::FromWebContents(new_contents)) {
++    favicon_driver->FetchFavicon(url, /*is_same_document=*/false);
++  }
++  model->UpdateWebContentsState(new_contents, TabChangeType::kAll);
++}
++
+ void SidebarWindowSync::OnTabStripModelChanged(
+     TabStripModel* tab_strip_model,
+     const TabStripModelChange& change,
+@@ -303,10 +350,8 @@ void SidebarWindowSync::Reconcile() {
+   const std::vector<const SidebarItem*> pinned =
+       items_->GetList(pinned_key).AllItems();
+   auto add_tab = [&](const SidebarItem& item, int index, bool pin) {
+-    sessions::SerializedNavigationEntry navigation;
+-    navigation.set_index(0);
+-    navigation.set_virtual_url(item.url);
+-    navigation.set_title(item.title);
++    const sessions::SerializedNavigationEntry navigation =
++        GetItemNavigation(item);
+     content::WebContents* contents = chrome::AddRestoredTab(
+         browser_, base::span_from_ref(navigation), index,
+         /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
+--- a/chrome/browser/ui/rac/sidebar/sidebar_window_sync.h
++++ b/chrome/browser/ui/rac/sidebar/sidebar_window_sync.h
+@@ -64,6 +64,9 @@ class SidebarWindowSync : public TabStri
+   // Turns `tab` into an open tab before its item is removed, so it stays
+   // open in this window. Other windows close their copy if it isn't loaded.
+   void Release(tabs::TabInterface* tab);
++  // Puts `tab` back the way the window first opened it: unloaded, on its
++  // item's page, with no history. Does nothing to the active tab.
++  void ResetTab(tabs::TabInterface* tab);
+ 
+   // TabStripModelObserver:
+   void OnTabStripModelChanged(
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -1483,6 +1483,11 @@ void TabStripModel::CloseWebContents(con
+ 
+   CHECK(contents);
+   CHECK_NE(GetIndexOfWebContents(contents), kNoTab);
++  if (rac::ResetSidebarTabsInsteadOfClosing(
++          this, {GetTabForWebContents(contents)}, close_types)
++          .empty()) {
++    return;
++  }
+   CloseTabs({contents}, close_types);
+ }
+ 
+@@ -3414,7 +3419,8 @@ void TabStripModel::ExecuteCloseTabs(
+     uint32_t close_types) {
+   ReentrancyCheck::ValidateNotReentrant(&reentrancy_guard_);
+   const std::vector<tabs::TabInterface*> tabs_to_close =
+-      std::move(get_tabs_to_close).Run();
++      rac::ResetSidebarTabsInsteadOfClosing(
++          this, std::move(get_tabs_to_close).Run(), close_types);
+   if (!tabs_to_close.empty() && !closing_all_ &&
+       static_cast<int>(tabs_to_close.size()) == count() &&
+       delegate()->IsNormalWindow() &&
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar/pinned_page_button.cc
+@@ -0,0 +1,107 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/sidebar/pinned_page_button.h"
++
++#include <string>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/rac/sidebar/sidebar_actions.h"
++#include "chrome/browser/ui/rac/sidebar/sidebar_window_sync.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/tabs/public/tab_interface.h"
++#include "components/vector_icons/vector_icons.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/base/ui_base_features.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/gfx/geometry/size.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/animation/ink_drop.h"
++#include "ui/views/controls/button/image_button.h"
++#include "ui/views/controls/highlight_path_generator.h"
++
++namespace rac {
++
++namespace {
++
++constexpr int kIconSize = 14;
++constexpr int kButtonSize = 20;
++constexpr int kCornerRadius = 4;
++
++SidebarWindowSync* GetWindow(const tabs::TabInterface* tab) {
++  const BrowserWindowInterface* browser = tab->GetBrowserWindowInterface();
++  return browser ? SidebarWindows::ForBrowser(
++                       const_cast<BrowserWindowInterface*>(browser))
++                 : nullptr;
++}
++
++class PinnedPageButton : public views::ImageButton {
++  METADATA_HEADER(PinnedPageButton, views::ImageButton)
++
++ public:
++  explicit PinnedPageButton(tabs::TabHandle tab)
++      : views::ImageButton(base::BindRepeating(&PinnedPageButton::OnPressed,
++                                               base::Unretained(this))),
++        tab_(tab) {
++    const std::u16string label =
++        l10n_util::GetStringUTF16(IDS_RAC_SIDEBAR_GO_BACK_TO_PINNED_PAGE);
++    SetTooltipText(label);
++    GetViewAccessibility().SetName(label);
++    SetFocusBehavior(FocusBehavior::ACCESSIBLE_ONLY);
++    SetImageModel(STATE_NORMAL,
++                  ui::ImageModel::FromVectorIcon(
++                      features::IsRoundedIconsEnabled()
++                          ? vector_icons::kArrowBackIcon
++                          : vector_icons::kBackArrowChromeRefreshOldIcon,
++                      kColorTabForegroundInactiveFrameActive, kIconSize));
++    SetImageHorizontalAlignment(ALIGN_CENTER);
++    SetImageVerticalAlignment(ALIGN_MIDDLE);
++    views::InkDrop::Get(this)->SetMode(views::InkDropHost::InkDropMode::ON);
++    views::InkDrop::Get(this)->SetBaseColor(
++        kColorTabForegroundInactiveFrameActive);
++    views::InkDrop::Get(this)->SetHighlightOpacity(0.16f);
++    SetHasInkDropActionOnClick(true);
++    views::InstallRoundRectHighlightPathGenerator(this, gfx::Insets(),
++                                                  kCornerRadius);
++  }
++
++  // views::ImageButton:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override {
++    return gfx::Size(kButtonSize, kButtonSize);
++  }
++
++ private:
++  void OnPressed() {
++    tabs::TabInterface* tab = tab_.Get();
++    if (SidebarWindowSync* window = tab ? GetWindow(tab) : nullptr) {
++      GoBackToPinnedPage(window, tab);
++    }
++  }
++
++  const tabs::TabHandle tab_;
++};
++
++BEGIN_METADATA(PinnedPageButton)
++END_METADATA
++
++}  // namespace
++
++std::unique_ptr<views::View> CreatePinnedPageButton(tabs::TabInterface* tab) {
++  return std::make_unique<PinnedPageButton>(tab->GetHandle());
++}
++
++bool ShouldShowPinnedPageButton(const tabs::TabInterface* tab) {
++  SidebarWindowSync* window = tab ? GetWindow(tab) : nullptr;
++  auto* mutable_tab = const_cast<tabs::TabInterface*>(tab);
++  return window &&
++         GetSidebarTabKind(window, mutable_tab) == SidebarTabKind::kPinned &&
++         HasLeftPinnedPage(window, mutable_tab);
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar/pinned_page_button.h
+@@ -0,0 +1,31 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_PINNED_PAGE_BUTTON_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_PINNED_PAGE_BUTTON_H_
++
++#include <memory>
++
++namespace tabs {
++class TabInterface;
++}  // namespace tabs
++
++namespace views {
++class View;
++}  // namespace views
++
++namespace rac {
++
++// A button that takes the place of a pinned tab's favicon while the pointer
++// is over a pinned tab that has left its pinned page. Pressing it goes back
++// to the pinned page.
++std::unique_ptr<views::View> CreatePinnedPageButton(tabs::TabInterface* tab);
++
++// Whether the hovered `tab` shows the button. Favorites don't; their tiles
++// are too small to share.
++bool ShouldShowPinnedPageButton(const tabs::TabInterface* tab);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_PINNED_PAGE_BUTTON_H_
+--- a/chrome/browser/ui/views/tabs/common/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/common/BUILD.gn
+@@ -44,6 +44,8 @@ source_set("common") {
+ 
+ source_set("impl") {
+   sources = [
++    "//chrome/browser/ui/views/rac/sidebar/pinned_page_button.cc",
++    "//chrome/browser/ui/views/rac/sidebar/pinned_page_button.h",
+     "//chrome/browser/ui/views/rac/sidebar/pinned_section.cc",
+     "//chrome/browser/ui/views/rac/sidebar/pinned_section.h",
+     "//chrome/browser/ui/views/rac/sidebar/sidebar_style.cc",
+--- a/chrome/browser/ui/views/tabs/common/tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
+@@ -35,6 +35,7 @@
+ #include "chrome/browser/ui/views/frame/themed_background.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/helium/native_frame_materials.h"
++#include "chrome/browser/ui/views/rac/sidebar/pinned_page_button.h"
+ #include "chrome/browser/ui/views/rac/sidebar/sidebar_style.h"
+ #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+@@ -347,6 +348,10 @@ TabView::TabView(TabCollectionNode* coll
+     }
+   }
+ 
++  if (orientation_ == TabStripOrientation::kVertical) {
++    rac_pinned_page_button_ = AddChildView(rac::CreatePinnedPageButton(tab));
++  }
++
+   title_->SetProperty(views::kElementIdentifierKey, kVerticalTabTitleElementId);
+   SetProperty(views::kElementIdentifierKey, kTabElementId);
+   // Layout manager must be set after child views are created because the
+@@ -1105,6 +1110,9 @@ void TabView::UpdateTabData(const tabs::
+       GetColorProvider()) {
+     UpdateColors();
+   }
++  if (rac_pinned_page_button_ && hovered_) {
++    InvalidateLayout();
++  }
+ }
+ 
+ void TabView::SetDataForTesting(tabs::TabData data) {
+--- a/chrome/browser/ui/views/tabs/common/tab_view.h
++++ b/chrome/browser/ui/views/tabs/common/tab_view.h
+@@ -219,6 +219,7 @@ class TabView : public views::View,
+   const raw_ptr<AlertIndicatorButton> alert_indicator_;
+   const raw_ptr<TabCloseButton> close_button_;
+   raw_ptr<glic::TabUnderlineView> glic_tab_underline_view_ = nullptr;
++  raw_ptr<views::View> rac_pinned_page_button_ = nullptr;
+ 
+   base::CallbackListSubscription node_destroyed_subscription_;
+   base::CallbackListSubscription tab_state_changed_subscription_;
+--- a/chrome/browser/ui/views/tabs/common/tab_view_vertical_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view_vertical_layout.cc
+@@ -8,6 +8,7 @@
+ #include "chrome/browser/glic/browser_ui/tab_underline_view.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
++#include "chrome/browser/ui/views/rac/sidebar/pinned_page_button.h"
+ #include "chrome/browser/ui/views/rac/sidebar/sidebar_style.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
+ #include "chrome/browser/ui/views/tabs/shared/tab_strip_types.h"
+@@ -33,6 +34,10 @@ void TabViewVerticalLayout::OnInstalled(
+       TabChildConfig(TabView().close_button_, kIconDesignWidth, kDefaultPadding,
+                      /*align_leading=*/false,
+                      /*expand=*/false),
++      TabChildConfig(TabView().rac_pinned_page_button_, kIconDesignWidth,
++                     kHorizontalInset,
++                     /*align_leading=*/true,
++                     /*expand=*/false),
+       TabChildConfig(TabView().icon_, kIconDesignWidth, kHorizontalInset,
+                      /*align_leading=*/true,
+                      /*expand=*/false),
+@@ -165,7 +170,15 @@ bool TabViewVerticalLayout::IsChildVisib
+     return TabView().alert_indicator_->showing_alert_state().has_value();
+   }
+ 
++  if (child_view == TabView().rac_pinned_page_button_) {
++    return TabView().hovered_ && !TabView().collapsed_ &&
++           rac::ShouldShowPinnedPageButton(TabView().GetTabInterface());
++  }
++
+   if (child_view == TabView().icon_) {
++    if (IsChildVisible(TabView().rac_pinned_page_button_, width)) {
++      return false;
++    }
+     const bool should_hide_icon_for_alert =
+         TabView().pinned_ || TabView().collapsed_;
+     return !should_hide_icon_for_alert ||
