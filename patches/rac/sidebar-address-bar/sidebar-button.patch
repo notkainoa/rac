@@ -1,0 +1,171 @@
+Index: src/chrome/app/rac_strings.grdp
+===================================================================
+--- src.orig/chrome/app/rac_strings.grdp
++++ src/chrome/app/rac_strings.grdp
+@@ -60,4 +60,7 @@
+   <message name="IDS_RAC_SITE_CONTROLS_ALL_SITE_SETTINGS" desc="Menu item in site controls that opens the settings page for every site.">
+     All site settings
+   </message>
++  <message name="IDS_RAC_TOGGLE_SIDEBAR" desc="Tooltip of the button at the top of the sidebar that hides or shows the sidebar.">
++    Toggle sidebar
++  </message>
+ </grit-part>
+Index: src/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.cc
++++ src/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.cc
+@@ -20,16 +20,21 @@
+ #include "chrome/browser/ui/views/location_bar/location_bar_view.h"
+ #include "chrome/browser/ui/views/omnibox/omnibox_view_views.h"
+ #include "chrome/browser/ui/views/toolbar/app_menu_control.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_button.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
++#include "chrome/grit/generated_resources.h"
+ #include "components/prefs/pref_service.h"
+ #include "ui/base/class_property.h"
+ #include "ui/base/interaction/element_identifier.h"
++#include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/compositor/layer.h"
+ #include "ui/gfx/geometry/rect.h"
+ #include "ui/gfx/text_utils.h"
++#include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/bubble/bubble_dialog_delegate_view.h"
+ #include "ui/views/layout/flex_layout.h"
++#include "ui/views/vector_icons.h"
+ #include "ui/views/view_class_properties.h"
+ #include "ui/views/view_targeter.h"
+ #include "ui/views/view_utils.h"
+@@ -58,6 +63,8 @@ int GetToolbarTitlebarHeight() {
+          GetLayoutInsets(LayoutInset::TOOLBAR_INTERIOR_MARGIN).height();
+ }
+ 
++constexpr int kExclusionPaddingToGiveUp = 12;
++
+ // Room after the address bar's text when it grows to fit it.
+ constexpr int kTextEndPadding = 8;
+ 
+@@ -183,10 +190,22 @@ RacSidebarHeaderView::RacSidebarHeaderVi
+ 
+   exclusion_spacer_ =
+       controls_row_->AddChildView(std::make_unique<views::View>());
++  // The exclusion includes empty padding after the window buttons. A narrow
++  // sidebar gives up some of it before the controls overflow.
+   exclusion_spacer_->SetProperty(
+       views::kFlexBehaviorKey,
+-      views::FlexSpecification(views::MinimumFlexSizeRule::kPreferred,
+-                               views::MaximumFlexSizeRule::kPreferred));
++      views::FlexSpecification(base::BindRepeating(
++          [](const views::View* view, const views::SizeBounds& bounds) {
++            const gfx::Size preferred = view->GetPreferredSize();
++            if (!bounds.width().is_bounded()) {
++              return preferred;
++            }
++            const int min_width =
++                std::max(0, preferred.width() - kExclusionPaddingToGiveUp);
++            return gfx::Size(std::clamp(bounds.width().value(), min_width,
++                                        preferred.width()),
++                             preferred.height());
++          })));
+ 
+   flex_spacer_ = controls_row_->AddChildView(std::make_unique<views::View>());
+   flex_spacer_->SetProperty(
+@@ -195,6 +214,17 @@ RacSidebarHeaderView::RacSidebarHeaderVi
+                                views::MaximumFlexSizeRule::kUnbounded)
+           .WithOrder(3));
+ 
++  // The borrowed controls go after it, so it sits just before back.
++  sidebar_button_ = controls_row_->AddChildView(
++      std::make_unique<ToolbarButton>(base::BindRepeating(
++          &RacSidebarHeaderView::ToggleSidebar, base::Unretained(this))));
++  sidebar_button_->SetProperty(views::kFlexBehaviorKey,
++                               FlexFor(sidebar_button_));
++  const std::u16string sidebar_button_text =
++      l10n_util::GetStringUTF16(IDS_RAC_TOGGLE_SIDEBAR);
++  sidebar_button_->SetTooltipText(sidebar_button_text);
++  sidebar_button_->GetViewAccessibility().SetName(sidebar_button_text);
++
+   pref_change_registrar_.Init(
+       browser_view_->browser()->GetProfile()->GetPrefs());
+   pref_change_registrar_.Add(
+@@ -251,6 +281,11 @@ RacSidebarFooterView* RacSidebarHeaderVi
+ }
+ 
+ void RacSidebarHeaderView::UpdatePlacement() {
++  // ToolbarButton mirrors the icon in RTL.
++  sidebar_button_->SetVectorIcon(state_controller_->IsTabStripRightAligned()
++                                     ? views::kSidebarRightIcon
++                                     : views::kSidebarLeftIcon);
++
+   const bool should_host = ShouldHostControls();
+   if (should_host != is_hosting_controls()) {
+     if (should_host) {
+@@ -383,6 +418,16 @@ void RacSidebarHeaderView::RevealForAddr
+   browser_view_->DeprecatedLayoutImmediately();
+ }
+ 
++void RacSidebarHeaderView::ToggleSidebar() {
++  // Same as Cmd+S: frameless mode hides or keeps the sidebar, otherwise the
++  // sidebar collapses.
++  if (browser_view_->IsZenModeEnabledForLayout()) {
++    browser_view_->ToggleZenModeSideChrome();
++  } else {
++    state_controller_->RequestCollapse(!state_controller_->IsCollapsed());
++  }
++}
++
+ void RacSidebarHeaderView::SetPoppedOut(bool popped_out) {
+   if (!location_bar_) {
+     popped_out = false;
+@@ -610,8 +655,11 @@ int RacSidebarHeaderView::GetMinimumSide
+ 
+ bool RacSidebarHeaderView::IsPositionInWindowCaption(const gfx::Point& point) {
+   // Empty space in the header drags the window, like the toolbar did.
++  std::vector<views::View*> controls = {sidebar_button_};
+   for (const BorrowedView& borrowed : borrowed_) {
+-    views::View* view = borrowed.view;
++    controls.push_back(borrowed.view);
++  }
++  for (views::View* view : controls) {
+     if (!view->GetVisible() || !Contains(view)) {
+       continue;
+     }
+Index: src/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h
++++ src/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h
+@@ -22,6 +22,7 @@
+ 
+ class BrowserView;
+ class LocationBarView;
++class ToolbarButton;
+ 
+ namespace gfx {
+ class Point;
+@@ -64,7 +65,8 @@ class RacSidebarFooterView : public view
+ // of creating copies, so every bubble, shortcut, and element identifier keeps
+ // working. The toolbar itself is hidden while the views are borrowed. They go
+ // back when the setting is off, the layout changes, or the window closes.
+-// Extensions stay in the hidden toolbar; the site controls list them.
++// Extensions stay in the hidden toolbar; the site controls list them. The
++// header adds its own button before back that toggles the sidebar.
+ //
+ // The header is only shown while the sidebar is full. The footer shows in
+ // every sidebar state.
+@@ -165,6 +167,8 @@ class RacSidebarHeaderView : public view
+   void OnModeWillChange(tabs::VerticalTabStripStateController* controller);
+   void OnModeChanged(tabs::VerticalTabStripStateController* controller);
+ 
++  void ToggleSidebar();
++
+   void SetPoppedOut(bool popped_out);
+   int GetLocationBarWidth() const;
+   int GetTextWidth() const;
+@@ -175,6 +179,7 @@ class RacSidebarHeaderView : public view
+   raw_ptr<views::View> controls_row_ = nullptr;
+   raw_ptr<views::View> exclusion_spacer_ = nullptr;
+   raw_ptr<views::View> flex_spacer_ = nullptr;
++  raw_ptr<ToolbarButton> sidebar_button_ = nullptr;
+   raw_ptr<LocationBarView> location_bar_ = nullptr;
+ 
+   std::vector<BorrowedView> borrowed_;
