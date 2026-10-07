@@ -1,0 +1,222 @@
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -1694,7 +1694,7 @@
+         Allow automatic component updates
+       </message>
+       <message name="IDS_SETTINGS_HELIUM_SERVICES_UPDATE_DESCRIPTION" desc="Description of the toggle for automatic update downloads">
+-        rac will automatically check for updates to its built-in components and install them. We recommend keeping this setting enabled. Updates to rac itself don't use Helium services and are set on the About rac page.
++        rac will automatically check for updates to its built-in components and install them. We recommend keeping this setting enabled. Updates to rac itself are separate from Helium services.
+       </message>
+     </if>
+     <if expr="is_linux">
+--- a/chrome/browser/rac/updates/BUILD.gn
++++ b/chrome/browser/rac/updates/BUILD.gn
+@@ -2,6 +2,8 @@
+ # You can use, redistribute, and/or modify this source code under
+ # the terms of the GPL-3.0 license that can be found in the LICENSE file.
+ 
++import("//testing/test.gni")
++
+ source_set("updates") {
+   sources = [
+     "rac_updates.cc",
+@@ -13,3 +15,14 @@
+   ]
+   public_deps = [ "//url" ]
+ }
++
++test("rac_updates_unittests") {
++  sources = [ "rac_updates_unittest.cc" ]
++  deps = [
++    ":updates",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//testing/gtest",
++  ]
++}
+--- a/chrome/browser/rac/updates/rac_updates.cc
++++ b/chrome/browser/rac/updates/rac_updates.cc
+@@ -7,6 +7,7 @@
+ #include <string>
+ 
+ #include "base/command_line.h"
++#include "base/logging.h"
+ #include "build/build_config.h"
+ #include "components/prefs/pref_registry_simple.h"
+ #include "components/prefs/pref_service.h"
+@@ -29,8 +30,8 @@
+ #error "rac updates support arm64 and x86_64 only"
+ #endif
+ 
+-// Helium's "Update server URL" in chrome://flags. It replaces kFeedBaseUrl
+-// for testing, so it needs a trailing slash.
++// Helium's "Update server URL" in chrome://flags. It replaces the feed
++// directory for testing, with or without a trailing slash.
+ constexpr char kFeedBaseUrlSwitch[] = "custom-update-server-url";
+ 
+ }  // namespace
+@@ -44,12 +45,28 @@
+ }
+ 
+ GURL GetUpdateFeedURL() {
+-  std::string base_url = kFeedBaseUrl;
+   const auto* command_line = base::CommandLine::ForCurrentProcess();
+-  if (command_line->HasSwitch(kFeedBaseUrlSwitch)) {
+-    base_url = command_line->GetSwitchValueASCII(kFeedBaseUrlSwitch);
++  if (!command_line->HasSwitch(kFeedBaseUrlSwitch)) {
++    return GURL(kFeedBaseUrl).Resolve(kFeedFile);
+   }
+-  return GURL(base_url).Resolve(kFeedFile);
++
++  const GURL base_url(command_line->GetSwitchValueASCII(kFeedBaseUrlSwitch));
++  if (!base_url.is_valid() || !base_url.SchemeIsHTTPOrHTTPS()) {
++    // Don't log the URL: an override can contain credentials. Don't fall back
++    // to GitHub either: an explicit override must not contact another server.
++    LOG(ERROR) << "Invalid custom update server URL; update feed unavailable.";
++    return GURL();
++  }
++
++  std::string path(base_url.path());
++  if (!path.ends_with('/')) {
++    path += '/';
++  }
++  GURL::Replacements replacements;
++  replacements.SetPathStr(path);
++  // Resolve the feed within the parsed directory, dropping the base URL's
++  // query and fragment just as resolving a feed filename normally does.
++  return base_url.ReplaceComponents(replacements).Resolve(kFeedFile);
+ }
+ 
+ }  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/updates/rac_updates_unittest.cc
+@@ -0,0 +1,117 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/updates/rac_updates.h"
++
++#include <string>
++
++#include "base/command_line.h"
++#include "base/test/scoped_command_line.h"
++#include "build/build_config.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++constexpr char kUpdateServerSwitch[] = "custom-update-server-url";
++
++#if defined(ARCH_CPU_ARM64)
++constexpr char kExpectedFeedFile[] = "appcast-arm64.xml";
++#elif defined(ARCH_CPU_X86_64)
++constexpr char kExpectedFeedFile[] = "appcast-x86_64.xml";
++#else
++#error "rac updates support arm64 and x86_64 only"
++#endif
++
++TEST(RacUpdatesTest, DefaultFeed) {
++  base::test::ScopedCommandLine command_line;
++  command_line.GetProcessCommandLine()->RemoveSwitch(kUpdateServerSwitch);
++
++  EXPECT_EQ(
++      GURL(std::string(
++               "https://github.com/notkainoa/rac/releases/latest/download/") +
++           kExpectedFeedFile),
++      GetUpdateFeedURL());
++}
++
++TEST(RacUpdatesTest, RootDirectoryWithOrWithoutSlash) {
++  base::test::ScopedCommandLine command_line;
++  for (const char* base_url :
++       {"http://localhost:8000", "http://localhost:8000/"}) {
++    SCOPED_TRACE(base_url);
++    command_line.GetProcessCommandLine()->AppendSwitchASCII(kUpdateServerSwitch,
++                                                            base_url);
++
++    EXPECT_EQ(GURL(std::string("http://localhost:8000/") + kExpectedFeedFile),
++              GetUpdateFeedURL());
++  }
++}
++
++TEST(RacUpdatesTest, NestedDirectoryWithOrWithoutSlash) {
++  base::test::ScopedCommandLine command_line;
++  for (const char* base_url :
++       {"https://updates.example.test/releases/updates",
++        "https://updates.example.test/releases/updates/"}) {
++    SCOPED_TRACE(base_url);
++    command_line.GetProcessCommandLine()->AppendSwitchASCII(kUpdateServerSwitch,
++                                                            base_url);
++
++    EXPECT_EQ(
++        GURL(std::string("https://updates.example.test/releases/updates/") +
++             kExpectedFeedFile),
++        GetUpdateFeedURL());
++  }
++}
++
++TEST(RacUpdatesTest, QueryAndFragmentDoNotChangeDirectory) {
++  base::test::ScopedCommandLine command_line;
++  for (const char* base_url :
++       {"https://updates.example.test/updates?channel=stable#latest",
++        "https://updates.example.test/updates/?channel=stable#latest",
++        "https://updates.example.test/updates?channel=stable",
++        "https://updates.example.test/updates#latest"}) {
++    SCOPED_TRACE(base_url);
++    command_line.GetProcessCommandLine()->AppendSwitchASCII(kUpdateServerSwitch,
++                                                            base_url);
++
++    EXPECT_EQ(GURL(std::string("https://updates.example.test/updates/") +
++                   kExpectedFeedFile),
++              GetUpdateFeedURL());
++  }
++}
++
++TEST(RacUpdatesTest, PreservesCredentialsAndEscapedDirectory) {
++  base::test::ScopedCommandLine command_line;
++  command_line.GetProcessCommandLine()->AppendSwitchASCII(
++      kUpdateServerSwitch,
++      "https://user:password@updates.example.test/releases%2Fstable");
++
++  EXPECT_EQ(
++      GURL(
++          std::string(
++              "https://user:password@updates.example.test/releases%2Fstable/") +
++          kExpectedFeedFile),
++      GetUpdateFeedURL());
++}
++
++TEST(RacUpdatesTest, InvalidOverrideDoesNotFallBackToGitHub) {
++  base::test::ScopedCommandLine command_line;
++  for (const char* base_url :
++       {"", "updates", "/updates", "//updates.example.test/updates",
++        "not a URL", "http://", "https://[::1", "https://example.test:bad",
++        "file:///updates/", "ftp://updates.example.test/",
++        "data:text/plain,updates", "javascript:updates",
++        "mailto:updates@example.test"}) {
++    SCOPED_TRACE(base_url);
++    command_line.GetProcessCommandLine()->AppendSwitchASCII(kUpdateServerSwitch,
++                                                            base_url);
++
++    const GURL feed = GetUpdateFeedURL();
++    EXPECT_FALSE(feed.is_valid());
++    EXPECT_TRUE(feed.is_empty());
++  }
++}
++
++}  // namespace
++}  // namespace rac
+--- a/components/helium_onboarding/helium_onboarding_strings.grdp
++++ b/components/helium_onboarding/helium_onboarding_strings.grdp
+@@ -57,7 +57,7 @@
+   Allow connecting to Helium services
+ </message>
+ <message name="IDS_HELIUM_ONBOARDING_SERVICES_CONNECTION_DESC" desc="Description of the global Helium services toggle.">
+-  Helium services provide additional functionality, such as: extension downloads, native !bangs, filter list updates, and component updates. When disabled, none of these features will work, and rac won't make any web requests except checking GitHub for its own updates, which you can turn off on the About rac page.
++  Helium services provide additional functionality, such as: extension downloads, native !bangs, filter list updates, and component updates. When disabled, none of these features will work. Updates to rac itself are separate from Helium services.
+ </message>
+ <message name="IDS_HELIUM_ONBOARDING_SERVICES_BANGS_TITLE" desc="Title of the toggle for downloading the Helium bangs list.">
+   Allow downloading the !bangs list

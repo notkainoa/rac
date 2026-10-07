@@ -29,9 +29,11 @@ Use these words consistently in code, docs, issues, and PRs.
   open tabs, and the space switcher. It has two states:
   - **full**: shows titles and icons
   - **hidden**: not shown at all
-- **Frameless mode**: Helium's appearance setting that hides the sidebar and
-  top bar until you hover the window edge. The code calls it "zen mode"
-  (`helium.browser.zen_mode`).
+- **Frameless mode**: Helium's appearance setting that hides only unpinned
+  bars until you hover the corresponding window edge. By default, it hides
+  the sidebar and keeps the top bar visible. Settings let you keep either
+  visible or hide both, and can be changed while the mode is off. The code
+  calls it "zen mode" (`helium.browser.zen_mode`).
 - **Edge reveal**: moving the mouse to the left edge of the screen to
   temporarily show the full sidebar over the page when hidden,
   or to the top edge to show the hidden toolbar.

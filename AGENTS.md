@@ -111,8 +111,10 @@ the maintainer when they ask how to work on features in parallel.
   opens a window in the first.
 - **Committing.** Run `he unmerge`, commit the patch with its
   `patches/series` change, then run `he merge` to keep working.
-- **After a rebase or pull.** Run `devutils/rac/worktree.sh sync`, then
-  `he build`.
+- **Before a rebase or pull.** Save quilt edits with `quilt refresh`, then
+  run `he unmerge` before changing the branch with Git. Afterward, run
+  `he merge`, `devutils/rac/worktree.sh sync`, then `he build`. Unmerging
+  after the Git update can overwrite the incoming `patches/series`.
 - **String files.** Dev trees show rac's names, which changes the `.grd`,
   `.grdp`, and `.xtb` files in `build/src`. Run
   `devutils/rac/dev_names.py unsub` before a patch edits one, and

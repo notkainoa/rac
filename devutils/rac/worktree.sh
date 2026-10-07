@@ -9,11 +9,14 @@ set -euo pipefail
 die() { echo "rac worktree: $*" >&2; exit 1; }
 log() { echo "rac worktree: $*" >&2; }
 
-# Worktree setup scripts may run with a minimal PATH.
-case ":$PATH:" in
-  *:/opt/homebrew/bin:*) ;;
-  *) [ ! -d /opt/homebrew/bin ] || PATH="/opt/homebrew/bin:$PATH" ;;
-esac
+# Worktree setup scripts may run with a minimal PATH on Intel or Apple Silicon.
+# Prepend in reverse order; don't reorder any entries already present.
+for prefix in /usr/local/bin /opt/homebrew/bin; do
+  case ":$PATH:" in
+    *:"$prefix":*) ;;
+    *) [ ! -d "$prefix" ] || PATH="$prefix:$PATH" ;;
+  esac
+done
 for tool in git python3 quilt greadlink; do
   command -v "$tool" >/dev/null || die "$tool not found; install it with Homebrew"
 done
@@ -24,7 +27,6 @@ base=$(cd "$base" && pwd -P)
 src="$root/build/src"
 base_src="$base/build/src"
 out="$src/out/Default"
-record="$src/.pc/.rac_applied"
 trash="$base/build/.trash"
 
 quilt_() {
@@ -55,53 +57,10 @@ if libc.clonefile(sys.argv[1].encode(), sys.argv[2].encode(), CLONE_NOFOLLOW) !=
 EOF
 }
 
-# The record ($src/.pc/.rac_applied) holds "<sha256> <patch>" for each applied
-# patch, so sync can tell which patch files changed since they were applied.
-#
-#   stack record <patches dir>  write the record, hashing files in that dir
-#   stack compare               print "<keep> <applied> <wanted>
-#                               <top_unchanged>": how many applied patches
-#                               still match the series and the record, how
-#                               many are applied, how many the series lists,
-#                               and whether the top patch is still in the
-#                               series with an unchanged file
-#   stack matches               exit 0 if the applied stack equals the series
+# Patch hashes and original bytes live beside quilt's preimages in .pc.
+# The helper verifies saved postimages in temporary trees before any pop.
 stack() {
-  python3 - "$root/patches" "$src/.pc/applied-patches" "$record" "$@" <<'EOF'
-import hashlib, pathlib, sys
-patches, applied_file, record_file = map(pathlib.Path, sys.argv[1:4])
-mode = sys.argv[4]
-
-def digest(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else "missing"
-
-def series():
-    names = []
-    for line in (patches / "series.merged").read_text().split("\n"):
-        line = line.split(" #", 1)[0].strip()
-        if line and not line.startswith("#"):
-            names.append(line)
-    return names
-
-applied = list(filter(None, applied_file.read_text().split("\n")))
-
-if mode == "record":
-    source = pathlib.Path(sys.argv[5])
-    record_file.write_text("".join(f"{digest(source / n)} {n}\n" for n in applied))
-elif mode == "matches":
-    sys.exit(0 if series() == applied else 1)
-elif mode == "compare":
-    wanted = series()
-    recorded = dict(l.split(" ", 1)[::-1] for l in filter(None, record_file.read_text().split("\n")))
-    unchanged = lambda n: (patches / n).exists() and digest(patches / n) == recorded.get(n)
-    keep = 0
-    for i, name in enumerate(applied):
-        if i >= len(wanted) or wanted[i] != name or not unchanged(name):
-            break
-        keep = i + 1
-    top_unchanged = int(bool(applied) and applied[-1] in wanted and unchanged(applied[-1]))
-    print(keep, len(applied), len(wanted), top_unchanged)
-EOF
+  python3 "$root/devutils/rac/worktree_state.py" "$1" "$src" "${2:-$root/patches}"
 }
 
 # Makes the applied quilt stack match this tree's patches, popping only the
@@ -109,24 +68,18 @@ EOF
 cmd_sync() {
   [ -d "$src/.pc" ] || die "no build tree at $src"
   [ -f "$root/patches/series.merged" ] || die "patches are not merged; run: source dev.sh && he merge"
-  [ -f "$record" ] || stack record "$root/patches"
-
-  local keep applied wanted top_unchanged
-  read -r keep applied wanted top_unchanged < <(stack compare)
+  local keep applied wanted plan
+  # Command substitution propagates verification failure (a process
+  # substitution would hide it). This preflight does not change names, their
+  # archives, the patch stack, or source files.
+  plan=$(stack plan) || die "sync preflight failed; no source files were changed"
+  read -r keep applied wanted <<< "$plan"
 
   # quilt can't pop or push patches on string files that the name passes
   # changed (pop -f would even restore stale copies), so revert the names
   # first. The end of sync applies them again.
   if [ "$keep" -lt "$applied" ] || [ "$applied" -lt "$wanted" ]; then
     dev_names unsub
-  fi
-
-  # Popping with -f throws away edits that haven't been saved into a patch.
-  # They can only be detected when the top patch's file is unchanged, because
-  # quilt diff -z compares the sources against the patch file.
-  if [ "$keep" -lt "$applied" ] && [ "$top_unchanged" = 1 ] \
-    && [ -n "$(quilt_ diff -z 2>/dev/null || true)" ]; then
-    die "the top patch has unrefreshed changes; run 'quilt refresh' or discard them first"
   fi
 
   if [ "$keep" -lt "$applied" ]; then
@@ -144,10 +97,10 @@ cmd_sync() {
     die "quilt push failed; fix the patch or series, then rerun sync"
   fi
 
-  stack record "$root/patches"
+  stack save
   dev_names sub
   python3 "$root/devutils/rac/rac_version.py" -t "$src" || die "rac_version.py failed"
-  log "patch stack is in sync ($(wc -l < "$src/.pc/applied-patches" | tr -d ' ') applied)"
+  log "patch stack is in sync ($wanted applied)"
 }
 
 cmd_setup() {
@@ -179,7 +132,8 @@ cmd_setup() {
 
   # The clone still points at the main checkout in a few places.
   printf '%s\n' "$root/patches" > "$src/.pc/.quilt_patches"
-  [ -f "$record" ] || stack record "$base/patches"
+  # Seed from the clone's original base versions, never incoming patches.
+  stack seed "$base/patches" || die "the cloned base has no verified patch baseline"
   local siso="$src/third_party/siso/cipd/siso"
   "$siso" fs export -C "$out" \
     | python3 -c 'import sys; o, n = sys.argv[1:]; sys.stdout.write(sys.stdin.read().replace(o, n))' \

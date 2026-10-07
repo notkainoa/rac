@@ -13,6 +13,7 @@ services stay as they are, since those servers are run by Helium.
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 import argparse
+import copy
 import os
 import re
 import sys
@@ -25,9 +26,9 @@ import name_substitution as helium_namesub
 import name_substitution_utils as util
 
 # Phrases about something Helium runs or does, not the browser itself.
-_KEEP_AFTER = (r'(?! (?i:services|servers|partner)\b)'
+_KEEP_AFTER = (r'(?! (?i:services?|servers?|partner)\b)'
                r'(?<!development of Helium)(?<!verified by Helium)')
-PROTECTED_REGEX = re.compile(r'\bHelium (?i:services|servers|partner)\b'
+PROTECTED_REGEX = re.compile(r'\bHelium (?i:services?|servers?|partner)\b'
                              r'|(?:development of|verified by) Helium\b')
 REPLACEMENT_REGEXES = [
     (re.compile(r'\bhelium://'), 'rac://'),
@@ -66,6 +67,20 @@ def element_text(elem):
     return ''.join(elem.itertext())
 
 
+def compute_fp(message):
+    """Hashes decoded dollars without changing their GRIT serialization."""
+    message = copy.deepcopy(message)
+    if message.text:
+        message.text = message.text.replace(DOLLAR_PLACEHOLDER, '$')
+    for placeholder in message.findall('ph'):
+        if placeholder.tail:
+            placeholder.tail = placeholder.tail.replace(DOLLAR_PLACEHOLDER, '$')
+    if 'meaning' in message.attrib:
+        message.set('meaning', message.get('meaning').replace(DOLLAR_PLACEHOLDER, '$'))
+    # GRIT hashes placeholder names, not their values or examples.
+    return util.compute_fp(message)
+
+
 def replacement_sanity():
     """Checks that the replacement regexes behave as intended."""
     before_after = [
@@ -73,13 +88,17 @@ def replacement_sanity():
         ("Helium's memory", "rac's memory"),
         ('Meet Helium', 'Meet rac'),
         ('helium://settings', 'rac://settings'),
+        ('Helium service', 'Helium service'),
         ('Helium services', 'Helium services'),
         ('Allow connecting to Helium Services', 'Allow connecting to Helium Services'),
+        ('Helium Server', 'Helium Server'),
         ('blocking downloads from Helium servers', 'blocking downloads from Helium servers'),
         ('Helium Partner', 'Helium Partner'),
         ('support the development of Helium.', 'support the development of Helium.'),
         ("Its privacy wasn't verified by Helium.", "Its privacy wasn't verified by Helium."),
         ('Helium will use Helium services', 'rac will use Helium services'),
+        ('Helium serviceability', 'rac serviceability'),
+        ('Helium serverless', 'rac serverless'),
         ('HeliumNoise', 'HeliumNoise'),
     ]
     for source, expected in before_after:
@@ -122,10 +141,10 @@ def substitute_grit_file(args):
     root = xml.fromstring(text, util.get_parser())
     fp_map = {}
     for message in root.findall('.//message'):
-        old_fp = util.compute_fp(message)
+        old_fp = compute_fp(message)
         protected = bool(PROTECTED_REGEX.search(element_text(message)))
         if replace_element(message):
-            new_fp = util.compute_fp(message)
+            new_fp = compute_fp(message)
             if new_fp != old_fp:
                 fp_map[old_fp] = (new_fp, protected)
 

@@ -45,8 +45,9 @@ applies rac's names to the dev tree (see
 - Make patches with the quilt workflow in
   [overview.md](../internals/overview.md#making-a-rac-change). Commit after
   `he unmerge`, then run `he merge` to keep working.
-- After the branch's patches change outside quilt, such as after a rebase or
-  a `git pull`, run `devutils/rac/worktree.sh sync`, then `he build`.
+- Before a rebase or `git pull`, save quilt edits with `quilt refresh`, then
+  run `he unmerge`. Afterward, run `he merge`,
+  `devutils/rac/worktree.sh sync`, then `he build`.
 
 If a build in a worktree shows tens of thousands of steps, something
 invalidated the clone. Stop it and find out why before letting it run for
@@ -55,7 +56,9 @@ hours.
 ## Updating the base
 
 After merging features into `main`, update the main checkout so new
-worktrees start from it:
+worktrees start from it. First save any quilt edits with `quilt refresh`.
+Unmerge before pulling or rebasing: doing it afterward can overwrite the
+incoming `patches/series`.
 
 ```sh
 he unmerge
@@ -71,8 +74,9 @@ rebuilds a few files. A change to an early Helium patch can rebuild most of
 Chromium.
 
 Existing worktrees don't follow the base on their own. To bring one up to
-date, run `he unmerge`, rebase its branch onto `main`, run `he merge`, then
-`sync` and `he build`.
+date, save quilt edits with `quilt refresh`, run `he unmerge`, rebase its
+branch onto `main`, run `he merge`, then `devutils/rac/worktree.sh sync` and
+`he build`.
 
 ## Removing a worktree
 
@@ -102,6 +106,21 @@ each one:
 - **Quilt** records the patches folder in `.pc/.quilt_patches`. Setup points
   it at the worktree's `patches/`.
 
-`sync` relies on `build/src/.pc/.rac_applied`, which records a hash of each
-applied patch. That's how it can tell which patch files changed since they
-were applied.
+`sync` records each applied patch's hash in `build/src/.pc/.rac_applied` and
+keeps its original bytes in `.pc/.rac_patch_bytes/`. Before popping patches,
+it reconstructs their saved changes and checks affected source files,
+including edits outside the top patch. Unsaved edits or unverifiable old
+records stop sync before it changes files or restores names.
+
+Keep those records and the `.rac_names/` backups. Deleting them to bypass a
+refusal can lose edits. For an unbranded tree whose applied patches are
+already saved, the checked initializer can verify and recreate the record:
+
+```sh
+python3 devutils/rac/worktree_state.py record build/src patches
+```
+
+It refuses if it cannot verify the supplied patch versions against the
+sources. Old name backups without expected fingerprints also refuse;
+preserve them and any string edits rather than adopting the current files
+as a clean baseline.

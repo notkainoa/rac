@@ -110,6 +110,11 @@ takes about a minute, and the next build redoes the string packs (about 500
 steps). Dev trees skip Helium's translations of its own strings, so those
 show in English in other languages.
 
+The name backups include expected file fingerprints. `unsub` checks every
+pass before restoring anything and refuses if files were edited, backups
+were corrupted, or old backups cannot be verified. Preserve the edits and
+backups instead of deleting the safety record to force restoration.
+
 While the names are applied, string files (`.grd`, `.grdp`, `.xtb`) in
 `build/src` don't match what the patches expect:
 
@@ -183,8 +188,10 @@ Updates use Helium's Sparkle integration, pointed at rac's own feed:
   updates.
 - **Updates are signed with rac's EdDSA key.** Builds embed the public key,
   and `devutils/rac/sparkle.py` signs each disk image and delta with the
-  private key. Both live only in GitHub secrets. Losing the private key
-  means installed copies can't verify any future update, so keep a backup.
+  private key. CI reads both from GitHub secrets; the public key is also in
+  every released app. Keep the private key secret, with a secure backup
+  outside GitHub, and never commit it. Losing it means installed copies
+  can't verify any future update.
 - **Dev builds have no updater.** Sparkle is only built when
   `PROD_MACOS_SPARKLE_ED_PUB_KEY` is set, which only CI does. To test the
   updater locally, follow [Releases](../operations/releases.md#testing-an-update-locally).

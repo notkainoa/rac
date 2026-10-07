@@ -22,8 +22,8 @@ through that release. How updates work, and why, is in
 
    | Secret | Value |
    | --- | --- |
-   | `PROD_MACOS_SPARKLE_ED_PUB_KEY` | The `public:` line from `keygen` |
-   | `RAC_SPARKLE_ED_PRIVATE_KEY` | The `private:` line from `keygen` |
+   | `PROD_MACOS_SPARKLE_ED_PUB_KEY` | Only the base64 value after `public:`, without the label or whitespace |
+   | `RAC_SPARKLE_ED_PRIVATE_KEY` | Only the base64 value after `private:`, without the label or whitespace |
 
 3. For signed and notarized builds, add the Apple Developer secrets too:
    `PROD_MACOS_CERTIFICATE` (the Developer ID certificate as base64 `.p12`),
@@ -60,7 +60,8 @@ skips them, so nobody would get the update.
 
 ## Testing an update locally
 
-Dev builds don't include the updater. To try a change to it:
+Dev builds don't include the updater. To try a change to it, run these
+commands from the repository root:
 
 1. Make a throwaway key with `devutils/rac/sparkle.py keygen`.
 2. Add to `build/src/out/Default/args.gn`:
@@ -73,18 +74,24 @@ Dev builds don't include the updater. To try a change to it:
    `CFBundleShortVersionString` in its `Info.plist`, run `codesign --force
    --deep --sign -` on it, and put it in a disk image with `hdiutil create`.
 4. Write a feed for it, with the private key in
-   `RAC_SPARKLE_ED_PRIVATE_KEY`:
+   `RAC_SPARKLE_ED_PRIVATE_KEY`. Use the architecture of the binary under
+   test (`arm64` or `x86_64`), not `uname`: an Intel binary running under
+   Rosetta still reads the `x86_64` feed.
    ```sh
-   devutils/rac/sparkle.py appcast --arch arm64 --dmg <dmg> \
-     --base-url http://127.0.0.1:8765/ --version <new version> \
-     --out <folder>/appcast-arm64.xml
+   arch=arm64 # Use x86_64 for an Intel binary.
+   devutils/rac/sparkle.py appcast --arch "$arch" --dmg "<dmg>" \
+     --base-url http://127.0.0.1:8765/ --version "<new version>" \
+     --out "<folder>/appcast-$arch.xml"
    ```
-   Serve the folder with `python3 -m http.server 8765 --bind 127.0.0.1`.
-5. Copy the current `rac.app` to another name inside `out/Default` (the
-   copy only works there, because the dev build loads its libraries from
-   that folder). Launch it with a throwaway profile and the local feed:
+   Serve that folder from a second terminal with
+   `python3 -m http.server 8765 --bind 127.0.0.1 --directory "<folder>"`.
+5. Copy the current `build/src/out/Default/rac.app` to another name inside
+   `build/src/out/Default` (the copy only works there, because the dev build
+   loads its libraries from that folder). Launch it with a throwaway
+   profile and the local feed:
    ```sh
-   out/Default/<copy>.app/Contents/MacOS/rac --user-data-dir=/tmp/<profile> \
+   "build/src/out/Default/<copy>.app/Contents/MacOS/rac" \
+     --user-data-dir="/tmp/<profile>" \
      --custom-update-server-url=http://127.0.0.1:8765/
    ```
 6. Quit the copy once About rac says to relaunch. Don't click **Relaunch**:
