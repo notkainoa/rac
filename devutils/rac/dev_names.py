@@ -18,9 +18,12 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = '.rac_names'
@@ -150,21 +153,88 @@ def sub(tree):
 
 
 def unsub(tree):
-    """Restores the files each pass changed, newest pass first."""
+    """Restores names, rolling back caught filesystem failures.
+
+    Recovery copies protect both branded files and the verified archives
+    until restoration and ledger cleanup finish. This is not crash-atomic.
+    """
     contents = originals(tree)
     # Validate every pass before touching any file or deleting any archive.
-    for name, data in contents.items():
-        path = tree / name
-        path.write_bytes(data)
-        os.utime(path)
+    backups = {}
     for name, _ in reversed(PASSES):
         backup = backup_path(tree, name)
-        if not backup.exists():
-            continue
-        count = len(archive_contents(backup))
-        backup.unlink()
+        if backup.exists():
+            backups[name] = (backup, len(archive_contents(backup)))
+    if not backups:
+        return
+
+    expected = tree / STATE_DIR / 'expected.json'
+    recovery = Path(tempfile.mkdtemp(prefix='unsub-', dir=tree / STATE_DIR))
+    saved = {}
+    touched = []
+    try:
+        # Copy everything before the first source write. Keep metadata separate
+        # because reading a recovery copy can itself change its access time.
+        paths = [tree / name for name in contents]
+        paths.extend(backup for backup, _ in backups.values())
+        paths.append(expected)
+        metadata = {}
+        for path in paths:
+            relative = path.relative_to(tree)
+            copy = recovery / 'files' / relative
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            info = path.stat()
+            shutil.copy2(path, copy)
+            saved[path] = (copy, info)
+            metadata[relative.as_posix()] = {
+                'mode': stat.S_IMODE(info.st_mode),
+                'atime_ns': info.st_atime_ns,
+                'mtime_ns': info.st_mtime_ns,
+            }
+        (recovery / 'metadata.json').write_text(json.dumps(metadata, sort_keys=True) + '\n')
+
+        for name, data in contents.items():
+            path = tree / name
+            # A failed write can already have truncated this target.
+            touched.append(path)
+            path.write_bytes(data)
+            os.utime(path)
+        for backup, _ in backups.values():
+            touched.append(backup)
+            backup.unlink()
+        touched.append(expected)
+        expected.unlink()
+    except OSError as error:
+        failures = []
+        for path in reversed(touched):
+            copy, info = saved[path]
+            try:
+                data = copy.read_bytes()
+                if source_bytes(tree, path.relative_to(tree), missing=True) != data:
+                    path.write_bytes(data)
+                if stat.S_IMODE(path.stat().st_mode) != stat.S_IMODE(info.st_mode):
+                    path.chmod(stat.S_IMODE(info.st_mode))
+                os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+            except (OSError, ValueError) as rollback_error:
+                failures.append(f'{path.relative_to(tree)}: {rollback_error}')
+        if failures:
+            raise OSError(f'{error}; names rollback failed ({"; ".join(failures)}); '
+                          f'recovery files and metadata retained at {recovery}; '
+                          'restore these copies before retrying') from error
+        try:
+            shutil.rmtree(recovery)
+        except OSError as cleanup_error:
+            raise OSError(f'{error}; pre-restore names state preserved, but recovery '
+                          f'cleanup failed at {recovery}: {cleanup_error}') from error
+        raise
+
+    try:
+        shutil.rmtree(recovery)
+    except OSError as error:
+        raise OSError(f'names reverted, but recovery cleanup failed at {recovery}: '
+                      f'{error}') from error
+    for name, (_, count) in backups.items():
         print(f'dev_names: reverted the {name} pass ({count} files)')
-    (tree / STATE_DIR / 'expected.json').unlink(missing_ok=True)
 
 
 def main():

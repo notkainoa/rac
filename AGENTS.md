@@ -115,6 +115,10 @@ the maintainer when they ask how to work on features in parallel.
   run `he unmerge` before changing the branch with Git. Afterward, run
   `he merge`, `devutils/rac/worktree.sh sync`, then `he build`. Unmerging
   after the Git update can overwrite the incoming `patches/series`.
+- **Sync runs alone.** Until it finishes, don't edit `build/src` or
+  `patches`, run Quilt or Git operations, or start another sync in that
+  worktree. Use separate worktrees for parallel work. Preflight protects
+  existing edits, not writes made during restoration.
 - **String files.** Dev trees show rac's names, which changes the `.grd`,
   `.grdp`, and `.xtb` files in `build/src`. Run
   `devutils/rac/dev_names.py unsub` before a patch edits one, and

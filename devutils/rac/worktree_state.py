@@ -130,7 +130,15 @@ def postimages(data, before):
                 for name in before.keys() | touched.keys()}
 
 
-def verify(tree, patches, names, recorded, start=0):
+def patch_path(patches, name, core_patches=None):
+    """Only seeding may read core patches moved back by the base's unmerge."""
+    path = patches / name
+    if core_patches is not None and not path.exists():
+        return core_patches / name
+    return path
+
+
+def verify(tree, patches, names, recorded, start=0, *, core_patches=None):
     """Check each affected postimage against its next preimage or live source.
 
     A refreshed patch is accepted only if its current bytes fully reconstruct
@@ -154,6 +162,7 @@ def verify(tree, patches, names, recorded, start=0):
             else:
                 expected[file] = dev_names.source_bytes(tree, file, missing=True)
         candidates = []
+        current = patch_path(patches, name, core_patches)
         fingerprint = recorded.get(name)
         if fingerprint:
             saved = tree / '.pc' / '.rac_patch_bytes' / fingerprint
@@ -163,13 +172,11 @@ def verify(tree, patches, names, recorded, start=0):
                     raise ValueError(f'corrupt saved patch baseline: {name}')
                 candidates.append(data)
             else:
-                current = patches / name
                 # A legacy hash alone is useful only while the patch is
                 # unchanged. Never adopt an incoming replacement or removal.
                 if not current.exists() or digest(current.read_bytes()) != fingerprint:
                     raise ValueError(f'missing original patch bytes for {name}; '
                                      'restore that recorded version first')
-        current = patches / name
         if current.exists():
             candidates.append(current.read_bytes())
 
@@ -190,18 +197,19 @@ def verify(tree, patches, names, recorded, start=0):
                              'with the originally applied patches')
 
 
-def record(tree, patches, check=True):
+def record(tree, patches, check=True, *, core_patches=None):
     names = applied(tree)
     # Explicit initialization, including setup, verifies the supplied source
     # versions. Setup supplies the BASE patches, not incoming worktree patches.
-    series(patches)
+    # The applied names are authoritative here: a built base may be unmerged
+    # for committing and have no generated series.
     if check:
-        verify(tree, patches, names, {})
+        verify(tree, patches, names, {}, core_patches=core_patches)
     saved = tree / '.pc' / '.rac_patch_bytes'
     saved.mkdir(exist_ok=True)
     lines = []
     for name in names:
-        data = (patches / name).read_bytes()
+        data = patch_path(patches, name, core_patches).read_bytes()
         fingerprint = digest(data)
         (saved / fingerprint).write_bytes(data)
         lines.append(f'{fingerprint} {name}\n')
@@ -213,18 +221,21 @@ def record(tree, patches, check=True):
 
 def seed(tree, patches):
     """Preserve a clone's existing record, filling only verified legacy bytes."""
+    # he unmerge returns upstream patches to this BASE's core submodule.
+    # Never enable this fallback for plan/record/save in the incoming tree.
+    core_patches = patches.parent / 'helium-chromium' / 'patches'
     names = applied(tree)
     path = tree / '.pc' / '.rac_applied'
     if not path.exists():
-        record(tree, patches)
+        record(tree, patches, core_patches=core_patches)
         return
     recorded = read_record(tree, names)
-    verify(tree, patches, names, recorded)
+    verify(tree, patches, names, recorded, core_patches=core_patches)
     saved = tree / '.pc' / '.rac_patch_bytes'
     saved.mkdir(exist_ok=True)
     for name, fingerprint in recorded.items():
         if not (saved / fingerprint).exists():
-            data = (patches / name).read_bytes()
+            data = patch_path(patches, name, core_patches).read_bytes()
             if digest(data) != fingerprint:
                 raise ValueError(f'base patch no longer matches its record: {name}')
             (saved / fingerprint).write_bytes(data)
@@ -240,12 +251,16 @@ def plan(tree, patches):
         if name != desired or not path.exists() or digest(path.read_bytes()) != recorded.get(name):
             break
         keep += 1
+    noop = (keep == len(names) == len(wanted)
+            and dev_names.status(tree) == 'applied')
     if keep < len(names):
         verify(tree, patches, names, recorded, keep)
-    else:
-        # Verification already checks branding when patches need popping.
+    elif not noop:
+        # Check branding before either restoring it for a push or completing
+        # missing name passes. A true no-op does neither, preserving edits
+        # and legacy archives until an operation actually needs to alter them.
         dev_names.originals(tree)
-    print(keep, len(names), len(wanted))
+    print(keep, len(names), len(wanted), int(noop))
 
 
 def main():

@@ -68,37 +68,41 @@ stack() {
 cmd_sync() {
   [ -d "$src/.pc" ] || die "no build tree at $src"
   [ -f "$root/patches/series.merged" ] || die "patches are not merged; run: source dev.sh && he merge"
-  local keep applied wanted plan
+  local keep applied wanted noop plan
   # Command substitution propagates verification failure (a process
   # substitution would hide it). This preflight does not change names, their
   # archives, the patch stack, or source files.
   plan=$(stack plan) || die "sync preflight failed; no source files were changed"
-  read -r keep applied wanted <<< "$plan"
+  read -r keep applied wanted noop <<< "$plan"
 
-  # quilt can't pop or push patches on string files that the name passes
-  # changed (pop -f would even restore stale copies), so revert the names
-  # first. The end of sync applies them again.
-  if [ "$keep" -lt "$applied" ] || [ "$applied" -lt "$wanted" ]; then
-    dev_names unsub
+  # A fully branded, unchanged stack needs no quilt or baseline writes.
+  if [ "$noop" -ne 1 ]; then
+    # quilt can't pop or push patches on string files that the name passes
+    # changed (pop -f would even restore stale copies), so revert the names
+    # first. The end of sync applies them again.
+    if [ "$keep" -lt "$applied" ] || [ "$applied" -lt "$wanted" ]; then
+      dev_names unsub
+    fi
+
+    if [ "$keep" -lt "$applied" ]; then
+      log "popping $((applied - keep)) changed or removed patches"
+      local target=-a
+      [ "$keep" -eq 0 ] || target=$(sed -n "${keep}p" "$src/.pc/applied-patches")
+      quilt_ pop -f -q "$target" >/dev/null || die "quilt pop failed; see the error above"
+    fi
+
+    local status=0 push_log
+    push_log=$(quilt_ push -a -q 2>&1) || status=$?
+    # quilt exits 2 when there is nothing left to push.
+    if { [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; } || ! stack matches; then
+      printf '%s\n' "$push_log" >&2
+      die "quilt push failed; fix the patch or series, then rerun sync"
+    fi
+
+    stack save
+    dev_names sub
   fi
-
-  if [ "$keep" -lt "$applied" ]; then
-    log "popping $((applied - keep)) changed or removed patches"
-    local target=-a
-    [ "$keep" -eq 0 ] || target=$(sed -n "${keep}p" "$src/.pc/applied-patches")
-    quilt_ pop -f -q "$target" >/dev/null || die "quilt pop failed; see the error above"
-  fi
-
-  local status=0 push_log
-  push_log=$(quilt_ push -a -q 2>&1) || status=$?
-  # quilt exits 2 when there is nothing left to push.
-  if { [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; } || ! stack matches; then
-    printf '%s\n' "$push_log" >&2
-    die "quilt push failed; fix the patch or series, then rerun sync"
-  fi
-
-  stack save
-  dev_names sub
+  # rac_version.txt can change independently of the patch stack.
   python3 "$root/devutils/rac/rac_version.py" -t "$src" || die "rac_version.py failed"
   log "patch stack is in sync ($wanted applied)"
 }

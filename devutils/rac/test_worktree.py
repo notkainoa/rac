@@ -9,6 +9,7 @@ import difflib
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -414,6 +415,113 @@ print('fixture name pass')
         make_archive(self.tree, 'rac', {'strings.grd': b'Helium\n'})
         dev_names.record_expected(self.tree)
 
+    def test_noop_plan_does_not_validate_brand_archives(self):
+        self.brand()
+        with mock.patch.object(dev_names, 'originals',
+                               side_effect=AssertionError('no files will change')):
+            worktree_state.plan(self.tree, self.patches)
+
+    def test_noop_sync_preserves_file_bytes_and_timestamps(self):
+        self.brand()
+        for path in self.tree.rglob('*'):
+            if path.is_file():
+                os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+        before = {p.relative_to(self.tree): (p.read_bytes(), p.stat().st_mtime_ns)
+                  for p in self.tree.rglob('*') if p.is_file()}
+        self.sync()
+        self.sync()
+        self.assertEqual(
+            {p.relative_to(self.tree): (p.read_bytes(), p.stat().st_mtime_ns)
+             for p in self.tree.rglob('*') if p.is_file()}, before)
+
+    def test_noop_sync_still_injects_changed_rac_version(self):
+        self.brand()
+        shutil.copy2(HERE / 'rac_version.py', self.root / 'devutils' / 'rac')
+        version = self.tree / 'chrome' / 'VERSION'
+        version.parent.mkdir()
+        version.write_text('MAJOR=1\n')
+        (self.root / 'rac_version.txt').write_text('0.2.3\n')
+        self.sync()
+        self.assertEqual(version.read_text(),
+                         'MAJOR=1\nRAC_MAJOR=0\nRAC_MINOR=2\nRAC_PATCH=3\n')
+        (self.root / 'rac_version.txt').write_text('0.2.4\n')
+        self.sync()
+        self.assertEqual(version.read_text(),
+                         'MAJOR=1\nRAC_MAJOR=0\nRAC_MINOR=2\nRAC_PATCH=4\n')
+        stamp = version.stat().st_mtime_ns
+        self.sync()
+        self.assertEqual(version.stat().st_mtime_ns, stamp)
+
+    def test_noop_leaves_string_edits_until_restoration_is_needed(self):
+        self.brand()
+        (self.tree / 'strings.grd').write_bytes(b'rac UNSAVED\n')
+        before = self.snapshot()
+        self.sync()
+        self.assertEqual(self.snapshot(), before)
+        self.write_patch('b.patch', 'two', 'base two\n', 'incoming two\n')
+        self.assert_refuses_unchanged()
+
+    def test_noop_leaves_legacy_names_until_restoration_is_needed(self):
+        self.brand()
+        (self.tree / '.rac_names' / 'expected.json').unlink()
+        before = self.snapshot()
+        self.sync()
+        self.assertEqual(self.snapshot(), before)
+        self.write_patch('b.patch', 'two', 'base two\n', 'incoming two\n')
+        self.assert_refuses_unchanged()
+
+    def test_noop_does_not_adopt_legacy_patch_bytes(self):
+        self.brand()
+        shutil.rmtree(self.tree / '.pc' / '.rac_patch_bytes')
+        before = self.snapshot()
+        self.sync()
+        self.assertEqual(self.snapshot(), before)
+        self.write_patch('b.patch', 'two', 'base two\n', 'incoming two\n')
+        self.assert_refuses_unchanged()
+
+    def test_unsub_then_sync_reapplies_both_name_passes(self):
+        self.brand()
+        dev_names.unsub(self.tree)
+        self.assertEqual(dev_names.status(self.tree), 'not applied')
+        self.sync()
+        self.assertEqual(dev_names.status(self.tree), 'applied')
+        self.assertEqual((self.tree / 'strings.grd').read_bytes(), b'Chromium\n')
+
+    def test_partial_names_sync_completes_remaining_pass(self):
+        make_archive(self.tree, 'helium', {'strings.grd': b'Chromium\n'})
+        (self.tree / 'strings.grd').write_bytes(b'Helium\n')
+        dev_names.record_expected(self.tree)
+        self.assertEqual(dev_names.status(self.tree), 'partial')
+        self.sync()
+        self.assertEqual(dev_names.status(self.tree), 'applied')
+        self.assertEqual((self.tree / 'strings.grd').read_bytes(), b'Helium\n')
+
+    def test_partial_names_with_string_edits_refuse(self):
+        make_archive(self.tree, 'helium', {'strings.grd': b'Chromium\n'})
+        (self.tree / 'strings.grd').write_bytes(b'Helium\n')
+        dev_names.record_expected(self.tree)
+        (self.tree / 'strings.grd').write_bytes(b'Helium UNSAVED\n')
+        self.assert_refuses_unchanged()
+
+    def test_names_baseline_without_archives_refuses(self):
+        self.brand()
+        for name, _ in dev_names.PASSES:
+            dev_names.backup_path(self.tree, name).unlink()
+        self.assert_refuses_unchanged()
+
+    def test_branded_unrecorded_patch_still_verifies_postimages(self):
+        self.append_refreshed_patch()
+        self.brand()
+        (self.tree / 'three').write_bytes(b'UNSAVED appended\n')
+        self.assert_refuses_unchanged()
+
+    def test_new_patch_checks_branding_before_push(self):
+        self.brand()
+        (self.tree / 'strings.grd').write_bytes(b'rac UNSAVED\n')
+        self.write_patch('c.patch', 'three', '', 'incoming three\n')
+        self.series(['a.patch', 'b.patch', 'c.patch'])
+        self.assert_refuses_unchanged()
+
     def test_brand_archives_unchanged_when_patch_guard_refuses(self):
         self.brand()
         self.write_patch('b.patch', 'two', 'base two\n', 'incoming two\n')
@@ -464,6 +572,10 @@ print('fixture name pass')
     def test_clone_baseline_uses_base_versions(self):
         base = self.root / 'base-patches'
         shutil.copytree(self.patches, base)
+        # A built main checkout can legitimately be unmerged for committing.
+        (base / 'series.merged').unlink()
+        base_before = {p.relative_to(base): p.read_bytes()
+                       for p in base.rglob('*') if p.is_file()}
         (self.tree / '.pc' / '.rac_applied').unlink()
         shutil.rmtree(self.tree / '.pc' / '.rac_patch_bytes')
         self.write_patch('b.patch', 'two', 'base two\n', 'incoming two\n')
@@ -471,8 +583,198 @@ print('fixture name pass')
         fingerprint = worktree_state.read_record(self.tree, ['a.patch', 'b.patch'])['b.patch']
         self.assertEqual((self.tree / '.pc' / '.rac_patch_bytes' / fingerprint).read_bytes(),
                          (base / 'b.patch').read_bytes())
+        self.assertEqual({p.relative_to(base): p.read_bytes()
+                          for p in base.rglob('*') if p.is_file()}, base_before)
         self.sync()
         self.assertEqual((self.tree / 'two').read_text(), 'incoming two\n')
+
+    def test_unmerged_base_seeds_hash_only_record(self):
+        base = self.root / 'base-patches'
+        shutil.copytree(self.patches, base)
+        (base / 'series.merged').unlink()
+        shutil.rmtree(self.tree / '.pc' / '.rac_patch_bytes')
+        record = (self.tree / '.pc' / '.rac_applied').read_bytes()
+        self.write_patch('b.patch', 'two', 'base two\n', 'incoming two\n')
+        worktree_state.seed(self.tree, base)
+        self.assertEqual((self.tree / '.pc' / '.rac_applied').read_bytes(), record)
+        fingerprint = worktree_state.read_record(self.tree, ['a.patch', 'b.patch'])['b.patch']
+        self.assertEqual((self.tree / '.pc' / '.rac_patch_bytes' / fingerprint).read_bytes(),
+                         (base / 'b.patch').read_bytes())
+        self.sync()
+        self.assertEqual((self.tree / 'two').read_text(), 'incoming two\n')
+
+    def test_unmerged_base_preserves_saved_record(self):
+        base = self.root / 'base-patches'
+        shutil.copytree(self.patches, base)
+        (base / 'series.merged').unlink()
+        # Even a replaced base patch cannot overwrite the clone's saved bytes.
+        (base / 'b.patch').write_text(patch_text('two', 'base two\n', 'new base two\n'))
+        self.write_patch('b.patch', 'two', 'base two\n', 'incoming two\n')
+        before = self.snapshot()
+        worktree_state.seed(self.tree, base)
+        self.assertEqual(self.snapshot(), before)
+        self.sync()
+        self.assertEqual((self.tree / 'two').read_text(), 'incoming two\n')
+
+    def test_unmerged_base_hash_only_record_refuses_replaced_base_patch(self):
+        base = self.root / 'base-patches'
+        shutil.copytree(self.patches, base)
+        (base / 'series.merged').unlink()
+        shutil.rmtree(self.tree / '.pc' / '.rac_patch_bytes')
+        (base / 'b.patch').write_text(patch_text('two', 'base two\n', 'new base two\n'))
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, 'missing original patch bytes'):
+            worktree_state.seed(self.tree, base)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_unmerged_base_without_record_refuses_wrong_source_version(self):
+        base = self.root / 'base-patches'
+        shutil.copytree(self.patches, base)
+        (base / 'series.merged').unlink()
+        (self.tree / '.pc' / '.rac_applied').unlink()
+        shutil.rmtree(self.tree / '.pc' / '.rac_patch_bytes')
+        # Incoming worktree patches still match the source; seeding must
+        # nevertheless verify only the supplied base versions.
+        (base / 'b.patch').write_text(patch_text('two', 'base two\n', 'new base two\n'))
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, 'unverifiable saved patch'):
+            worktree_state.seed(self.tree, base)
+        self.assertEqual(self.snapshot(), before)
+
+    def unmerge_mixed_base(self):
+        """Use Helium's real unmerge, operating only on a temporary base."""
+        self.quilt('pop', '-a', '-q')
+        names = ['helium/core/upstream.patch', 'mac/platform.patch', 'rac/feature.patch']
+        for name in names:
+            (self.patches / name).parent.mkdir(parents=True, exist_ok=True)
+        (self.patches / 'a.patch').rename(self.patches / names[0])
+        (self.patches / 'b.patch').rename(self.patches / names[1])
+        (self.tree / 'three').write_text('base three\n')
+        self.write_patch(names[2], 'three', 'base three\n', 'saved three\n')
+        self.series(names)
+        self.quilt('push', '-a', '-q')
+        worktree_state.record(self.tree, self.patches)
+
+        base = self.root / 'base'
+        patches = base / 'patches'
+        core = base / 'helium-chromium' / 'patches'
+        shutil.copytree(self.patches, patches)
+        core.mkdir(parents=True)
+        (patches / 'series.prepend').write_text(names[0] + '\n')
+        (patches / 'series.orig').write_text('\n'.join(names[1:]) + '\n')
+        script = """
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location('update_platform_patches', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+sys.exit(0 if module.unmerge_platform_patches(
+    pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])) else 1)
+"""
+        # -B prevents even imports from writing into the real submodule.
+        subprocess.run(
+            [sys.executable, '-B', '-c', script,
+             HERE.parents[1] / 'helium-chromium' / 'devutils' / 'update_platform_patches.py',
+             patches, core], cwd=base, check=True, capture_output=True)
+        self.assertFalse((patches / names[0]).exists())
+        self.assertTrue((core / names[0]).exists())
+        self.assertFalse((patches / 'series.merged').exists())
+        self.assertEqual((core / 'series').read_text(), names[0] + '\n')
+        self.assertEqual((patches / 'series').read_text(), '\n'.join(names[1:]) + '\n')
+        originals = {names[0]: (core / names[0]).read_bytes(),
+                     **{name: (patches / name).read_bytes() for name in names[1:]}}
+        for name, file in zip(names, ['one', 'two', 'three']):
+            self.write_patch(name, file, f'base {file}\n', f'incoming {file}\n')
+        return base, patches, names, originals
+
+    def base_snapshot(self, base):
+        return {p.relative_to(base): (p.stat().st_mode, p.stat().st_mtime_ns,
+                                     p.read_bytes() if p.is_file() else None)
+                for p in [base, *base.rglob('*')]}
+
+    def test_real_unmerged_mixed_base_seeds_missing_record(self):
+        base, patches, names, originals = self.unmerge_mixed_base()
+        (self.tree / '.pc' / '.rac_applied').unlink()
+        shutil.rmtree(self.tree / '.pc' / '.rac_patch_bytes')
+        before = self.base_snapshot(base)
+        worktree_state.seed(self.tree, patches)
+        recorded = worktree_state.read_record(self.tree, names)
+        for name in names:
+            self.assertEqual(recorded[name], worktree_state.digest(originals[name]))
+            self.assertEqual((self.tree / '.pc' / '.rac_patch_bytes' /
+                              recorded[name]).read_bytes(), originals[name])
+        self.assertEqual(self.base_snapshot(base), before)
+        self.sync()
+        for file in ['one', 'two', 'three']:
+            self.assertEqual((self.tree / file).read_text(), f'incoming {file}\n')
+
+    def test_real_unmerged_mixed_base_seeds_hash_only_record(self):
+        base, patches, names, originals = self.unmerge_mixed_base()
+        shutil.rmtree(self.tree / '.pc' / '.rac_patch_bytes')
+        record = (self.tree / '.pc' / '.rac_applied').read_bytes()
+        before = self.base_snapshot(base)
+        worktree_state.seed(self.tree, patches)
+        self.assertEqual((self.tree / '.pc' / '.rac_applied').read_bytes(), record)
+        recorded = worktree_state.read_record(self.tree, names)
+        for name in names:
+            self.assertEqual((self.tree / '.pc' / '.rac_patch_bytes' /
+                              recorded[name]).read_bytes(), originals[name])
+        self.assertEqual(self.base_snapshot(base), before)
+        self.sync()
+        for file in ['one', 'two', 'three']:
+            self.assertEqual((self.tree / file).read_text(), f'incoming {file}\n')
+
+    def test_real_unmerged_mixed_base_preserves_full_saved_record(self):
+        base, patches, names, _ = self.unmerge_mixed_base()
+        # Cached originals remain sufficient even when base patch files
+        # have subsequently been removed.
+        for name in names:
+            folder = patches if name != names[0] else base / 'helium-chromium' / 'patches'
+            (folder / name).unlink()
+        base_before = self.base_snapshot(base)
+        clone_before = self.snapshot()
+        worktree_state.seed(self.tree, patches)
+        self.assertEqual(self.base_snapshot(base), base_before)
+        self.assertEqual(self.snapshot(), clone_before)
+        self.sync()
+        for file in ['one', 'two', 'three']:
+            self.assertEqual((self.tree / file).read_text(), f'incoming {file}\n')
+
+    def test_real_unmerged_core_hash_mismatch_refuses_without_writes(self):
+        base, patches, names, _ = self.unmerge_mixed_base()
+        shutil.rmtree(self.tree / '.pc' / '.rac_patch_bytes')
+        core = base / 'helium-chromium' / 'patches'
+        (core / names[0]).write_bytes((self.patches / names[0]).read_bytes())
+        base_before = self.base_snapshot(base)
+        clone_before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, 'missing original patch bytes'):
+            worktree_state.seed(self.tree, patches)
+        self.assertEqual(self.base_snapshot(base), base_before)
+        self.assertEqual(self.snapshot(), clone_before)
+
+    def test_real_unmerged_core_wrong_postimage_refuses_without_writes(self):
+        base, patches, names, _ = self.unmerge_mixed_base()
+        (self.tree / '.pc' / '.rac_applied').unlink()
+        shutil.rmtree(self.tree / '.pc' / '.rac_patch_bytes')
+        core = base / 'helium-chromium' / 'patches'
+        (core / names[0]).write_bytes((self.patches / names[0]).read_bytes())
+        base_before = self.base_snapshot(base)
+        clone_before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, 'unverifiable saved patch'):
+            worktree_state.seed(self.tree, patches)
+        self.assertEqual(self.base_snapshot(base), base_before)
+        self.assertEqual(self.snapshot(), clone_before)
+
+    def test_sync_does_not_fall_back_to_incoming_core_patch(self):
+        _, _, names, originals = self.unmerge_mixed_base()
+        shutil.rmtree(self.tree / '.pc' / '.rac_patch_bytes')
+        core = self.root / 'helium-chromium' / 'patches'
+        path = core / names[0]
+        path.parent.mkdir(parents=True)
+        path.write_bytes(originals[names[0]])
+        (self.patches / names[0]).unlink()
+        # The incoming core copy matches the original hash, but is not an
+        # authorized substitute for a missing desired merged patch.
+        self.assert_refuses_unchanged()
 
 
 class PathTest(unittest.TestCase):
