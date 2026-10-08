@@ -30,7 +30,7 @@ git remote set-url --push upstream no_push
    git submodule update --init --recursive
    ```
    Merge conflicts should be rare and mostly in `patches/series`. Keep all of
-   Helium's new entries, and keep the `# rac` section at the end.
+   Helium's new entries, and keep the `rac/` entries at the end.
 3. If the Chromium version changed, rebuild the source tree. Run
    `he reset`, then `he presetup` and `he merge`. Otherwise, just run
    `he merge`.
@@ -66,6 +66,15 @@ sense for rac:
 - `README.md`
 - `.github/PULL_REQUEST_TEMPLATE.md`
 - `.github/ISSUE_TEMPLATE/`
+
+rac also changes a few lines in Helium's release files: the `.github/`
+release scripts, `.github/workflows/build.yml`,
+`devutils/generate_sparkle_deltas.py`, and `sign_and_package_app.sh`. If one
+conflicts, take Helium's change and keep rac's file names (`rac_<version>`,
+`rac.app`), rac's version from `rac_version.txt`, and the update feed steps
+(see [Releases](releases.md)). Also keep certificate import conditional on
+`MACOS_CERTIFICATE` being set, and the ad-hoc signing fallback when
+`MACOS_CERTIFICATE_NAME` is absent, so builds without Apple secrets work.
 
 Every other helium-macos file stays Helium's. rac-only files (`AGENTS.md`,
 `CLAUDE.md`, `VISION.md`, `CONTRIBUTING.md`, `.github/SECURITY.md`,

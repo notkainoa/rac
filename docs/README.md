@@ -20,8 +20,14 @@ them, and traps that are hard to spot from the source.
 - [Glossary](internals/glossary.md): the words rac uses for things
 - [AI (work in progress)](internals/ai.md): ideas collected so far; nothing
   decided
+- [Bangs (work in progress)](internals/bangs.md): editable bangs and a
+  better address bar experience; nothing designed yet
 
 ## Operations
 
 - [Syncing with Helium](operations/upstream-sync.md): pulling in new Helium
   and Chromium releases
+- [Feature worktrees](operations/worktrees.md): working on several features
+  at once, each with its own build tree
+- [Releases](operations/releases.md): the signing key, publishing a version,
+  and testing updates

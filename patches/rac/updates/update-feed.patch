@@ -1,0 +1,212 @@
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1618,6 +1618,7 @@ source_set("core") {
+       deps += [
+         "//third_party/sparkle:build_sparkle_framework",
+         "//components/helium_services",
++        "//chrome/browser/rac/updates",
+       ]
+       frameworks += [ "Sparkle.framework" ]
+     }
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/password_manager/generated_password_leak_detection_pref.h"
+ #include "chrome/browser/prefs/session_startup_pref.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/updates/rac_updates.h"
+ #include "chrome/browser/safe_browsing/generated_safe_browsing_pref.h"
+ #include "chrome/browser/safe_browsing/generated_security_settings_bundle_pref.h"
+ #include "chrome/browser/ssl/generated_https_first_mode_pref.h"
+@@ -1284,6 +1285,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHardwareAccelerationModeEnabled] =
+       settings_api::PrefType::kBoolean;
++  (*s_allowlist)[rac::kBrowserUpdatesEnabled] =
++      settings_api::PrefType::kBoolean;
+ #if BUILDFLAG(IS_WIN)
+   (*s_allowlist)[::prefs::kForegroundLaunchOnLogin] =
+       settings_api::PrefType::kBoolean;
+--- a/chrome/browser/mac/sparkle_glue.mm
++++ b/chrome/browser/mac/sparkle_glue.mm
+@@ -26,10 +26,12 @@
+ #include "chrome/browser/obsolete_system/obsolete_system.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/rac/updates/rac_updates.h"
+ #include "chrome/browser/ui/webui/help/version_updater.h"
+ #include "chrome/grit/branded_strings.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/helium_services/helium_services_helpers.h"
++#include "components/prefs/pref_service.h"
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/web_contents.h"
+@@ -125,13 +127,9 @@
+ }
+ 
+ - (BOOL)shouldAccessUpdateService {
+-  helium::TryAcquireProfilePtr();
+-
+-  if (!profile_) {
+-    return NO;
+-  }
+-
+-  return helium::ShouldAccessUpdateService(*profile_->GetPrefs());
++  PrefService* local_state =
++      g_browser_process ? g_browser_process->local_state() : nullptr;
++  return local_state && rac::ShouldCheckForUpdates(*local_state);
+ }
+ 
+ - (BOOL)updater:(nonnull SPUUpdater *)updater
+@@ -157,14 +155,7 @@
+ 
+ // Delegated method. Return the appcast URL for the installed channel.
+ - (NSString*)feedURLStringForUpdater:(SPUUpdater*)updater {
+-  helium::TryAcquireProfilePtr();
+-
+-  if (!profile_) {
+-    return @"";
+-  }
+-
+-  return base::SysUTF8ToNSString(
+-    helium::GetBrowserUpdateURL(*profile_->GetPrefs()).spec());
++  return base::SysUTF8ToNSString(rac::GetUpdateFeedURL().spec());
+ }
+ 
+ - (void)updater:(SPUUpdater*)updater failedToDownloadUpdate:(NSError*)error {
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -77,6 +77,7 @@
+ #include "chrome/browser/push_messaging/push_messaging_app_identifier.h"
+ #include "chrome/browser/push_messaging/push_messaging_service_impl.h"
+ #include "chrome/browser/push_messaging/push_messaging_unsubscribed_entry.h"
++#include "chrome/browser/rac/updates/rac_updates.h"
+ #include "chrome/browser/rlz/chrome_rlz_tracker_delegate.h"
+ #include "chrome/browser/search/background/ntp_custom_background_service.h"
+ #include "chrome/browser/search/search.h"
+@@ -1524,6 +1525,7 @@ void RegisterLocalState(PrefRegistrySimp
+ #if BUILDFLAG(IS_ANDROID)
+   PushMessagingServiceImpl::RegisterPrefs(registry);
+ #endif
++  rac::RegisterUpdatePrefs(registry);
+   RegisterScreenshotPrefs(registry);
+   search_engines::SearchEngineChoiceService::RegisterLocalStatePrefs(registry);
+   secure_origin_allowlist::RegisterPrefs(registry);
+--- /dev/null
++++ b/chrome/browser/rac/updates/BUILD.gn
+@@ -0,0 +1,15 @@
++# Copyright 2026 The rac Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++source_set("updates") {
++  sources = [
++    "rac_updates.cc",
++    "rac_updates.h",
++  ]
++  deps = [
++    "//base",
++    "//components/prefs",
++  ]
++  public_deps = [ "//url" ]
++}
+--- /dev/null
++++ b/chrome/browser/rac/updates/rac_updates.cc
+@@ -0,0 +1,55 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/updates/rac_updates.h"
++
++#include <string>
++
++#include "base/command_line.h"
++#include "build/build_config.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
++
++namespace rac {
++
++namespace {
++
++// Every release on GitHub carries one feed per architecture. "latest" points
++// at the newest release that isn't a draft or prerelease, so an update only
++// reaches people once the maintainer publishes its release.
++constexpr char kFeedBaseUrl[] =
++    "https://github.com/notkainoa/rac/releases/latest/download/";
++
++#if defined(ARCH_CPU_ARM64)
++constexpr char kFeedFile[] = "appcast-arm64.xml";
++#elif defined(ARCH_CPU_X86_64)
++constexpr char kFeedFile[] = "appcast-x86_64.xml";
++#else
++#error "rac updates support arm64 and x86_64 only"
++#endif
++
++// Helium's "Update server URL" in chrome://flags. It replaces kFeedBaseUrl
++// for testing, so it needs a trailing slash.
++constexpr char kFeedBaseUrlSwitch[] = "custom-update-server-url";
++
++}  // namespace
++
++void RegisterUpdatePrefs(PrefRegistrySimple* registry) {
++  registry->RegisterBooleanPref(kBrowserUpdatesEnabled, true);
++}
++
++bool ShouldCheckForUpdates(const PrefService& local_state) {
++  return local_state.GetBoolean(kBrowserUpdatesEnabled);
++}
++
++GURL GetUpdateFeedURL() {
++  std::string base_url = kFeedBaseUrl;
++  const auto* command_line = base::CommandLine::ForCurrentProcess();
++  if (command_line->HasSwitch(kFeedBaseUrlSwitch)) {
++    base_url = command_line->GetSwitchValueASCII(kFeedBaseUrlSwitch);
++  }
++  return GURL(base_url).Resolve(kFeedFile);
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/updates/rac_updates.h
+@@ -0,0 +1,28 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_UPDATES_RAC_UPDATES_H_
++#define CHROME_BROWSER_RAC_UPDATES_RAC_UPDATES_H_
++
++#include "url/gurl.h"
++
++class PrefRegistrySimple;
++class PrefService;
++
++namespace rac {
++
++// Local state: whether rac checks for and installs its own updates. This is
++// separate from Helium services, which rac's updates don't use.
++inline constexpr char kBrowserUpdatesEnabled[] = "rac.browser_updates";
++
++void RegisterUpdatePrefs(PrefRegistrySimple* registry);
++
++bool ShouldCheckForUpdates(const PrefService& local_state);
++
++// The Sparkle feed for this build's CPU architecture.
++GURL GetUpdateFeedURL();
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_UPDATES_RAC_UPDATES_H_
+--- a/chrome/browser/prefs/BUILD.gn
++++ b/chrome/browser/prefs/BUILD.gn
+@@ -104,6 +104,7 @@ source_set("impl") {
+     "//chrome/browser/profiles:profile_util",
+     "//chrome/browser/push_messaging",
+     "//chrome/browser/push_messaging:service_impl_public",
++    "//chrome/browser/rac/updates",
+     "//chrome/browser/search",
+     "//chrome/browser/search/background",
+     "//chrome/browser/serial",

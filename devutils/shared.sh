@@ -36,8 +36,10 @@ prepare_sources() {
   python3 "$_main_repo/utils/domain_substitution.py" apply -r "$_main_repo/domain_regex.list" -f "$_main_repo/domain_substitution.list" "$_src_dir"
   python3 "$_main_repo/utils/name_substitution.py" --sub -t "$_src_dir"
   python3 "$_main_repo/utils/i18n_apply.py" -t "$_src_dir"
+  python3 "$_root_dir/devutils/rac/name_pass.py" --sub -t "$_src_dir"
   python3 "$_main_repo/utils/helium_version.py" \
     --tree "$_main_repo" --platform-tree "$_root_dir" --chromium-tree "$_src_dir"
+  python3 "$_root_dir/devutils/rac/rac_version.py" -t "$_src_dir"
 
   helium_resources
 }

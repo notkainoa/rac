@@ -35,11 +35,12 @@ he push | tee setup.log
 
 if [ "$_check" = "substitution" ]; then
     python3 "$_main_repo/utils/name_substitution.py" --sub -t "$_src_dir"
+    python3 "$_root_dir/devutils/rac/name_pass.py" --sub -t "$_src_dir"
     python3 "$_main_repo/utils/domain_substitution.py" apply \
         -r "$_main_repo/domain_regex.list" \
         -f "$_main_repo/domain_substitution.list" "$_src_dir"
 
-    grep -q Helium "$_src_dir/components/omnibox_strings.grdp"
+    grep -qw rac "$_src_dir/components/omnibox_strings.grdp"
     exit 0
 fi
 

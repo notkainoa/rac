@@ -38,7 +38,9 @@ and improved continuously. Everyone else is welcome, especially:
 1. **Private.** rac never sees, keeps, or sells your data. There are no rac
    accounts, no rac servers holding your browsing, no ads, and no sponsored
    content. When you use AI, your chosen provider's terms apply between you
-   and that provider. rac itself never sees your conversations.
+   and that provider. rac itself never sees your conversations. The one
+   thing rac may ever receive is a crash report, only if you turn crash
+   reports on, and only when you say yes after that crash.
 2. **Never slower than Helium.** Every feature has to earn its place without
    slowing startup, tab switching, scrolling, or typing. Features that are
    turned off cost nothing: no background work, no network calls, no
@@ -68,15 +70,19 @@ and improved continuously. Everyone else is welcome, especially:
   every space in a profile. Helium calls these "pinned" today.
 - **Pinned tabs** are Arc-style. They live in the sidebar of one space, stay
   there permanently, and are separate from that space's regular open tabs.
+  They can sit loose or inside folders. Each pinned tab remembers the page
+  it was pinned on, so you can browse away and then reset it back.
 
 ### The sidebar
 
 - Tabs live in a vertical sidebar, building on Helium's vertical layout.
-- **Cmd+S fully hides and shows the sidebar** by default. A setting switches
-  Cmd+S back to Helium's behavior, which collapses the sidebar to a compact
-  strip of site icons.
-- Moving the mouse to the left or top edge of the screen reveals the hidden
-  sidebar or toolbar. This builds on Helium's existing behavior and makes it
+- **Cmd+S and the sidebar button toggle Frameless mode**, hiding the sidebar
+  until you hover the window edge. The top bar stays visible by default.
+  Settings let you keep either visible, or hide both, and can be changed
+  while Frameless mode is off. There is no compact, icons-only sidebar.
+- Moving the mouse to the left edge of the screen shows the full sidebar
+  over the page when it's hidden. Moving it to the top edge reveals the
+  hidden toolbar. This builds on Helium's existing behavior and makes it
   feel polished.
 - An appearance setting moves the address bar into the sidebar.
 

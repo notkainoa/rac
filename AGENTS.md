@@ -16,7 +16,8 @@ what rac is, what it never compromises on, and what it deliberately won't do.
 The full reasoning is in the vision. In short:
 
 1. **Private.** No data collection, no rac accounts, no ads, nothing that
-   phones home to rac.
+   phones home to rac. The only planned exception is crash reports: off
+   by default, and sent only when the user says yes after each crash.
 2. **Never slower than Helium.** A feature that's turned off does no work.
    Watch startup, tab switching, scrolling, and typing for regressions.
 3. **Beautiful and calm.** Arc's personality with Dia's simplicity. Tasteful
@@ -58,27 +59,75 @@ separate Arc-style feature.
 3. **Touching the maintainer's real browser data.** rac is the maintainer's
    daily driver. Never point a build at a real profile folder in
    `~/Library/Application Support/`, such as `net.imput.helium` or rac's own
-   once it exists. Use `he run`, which launches with a separate dev folder
-   (`net.imput.helium.dev`).
+   `me.kainoa.rac`. In the main checkout, use `he run`, which launches with a
+   separate dev folder (`me.kainoa.rac.dev`). In a feature worktree, use
+   `devutils/rac/worktree.sh run`, which gives the worktree its own profile.
 4. **Destroying the build tree.** `build/src` is a full Chromium checkout,
    roughly 100 GB that takes hours to recreate. Don't run `he reset`, delete
-   `build/`, or start a full build without the maintainer's approval.
+   `build/`, or start a full build without the maintainer's approval. The
+   main checkout's tree is also the base that every feature worktree clones
+   (see [Worktrees](#worktrees)). In a worktree, `he build` should take
+   minutes. If it shows tens of thousands of steps, stop it and tell the
+   maintainer.
 5. **Moving the submodule by hand.** Don't use `he pull` or
    `git submodule update --remote`. The Helium core version only changes
    when a helium-macos release is merged. See
    [docs/operations/upstream-sync.md](docs/operations/upstream-sync.md).
+6. **Breaking updates for everyone.** The version in `rac_version.txt` only
+   goes up, the update signing key never changes, and the feed URL in
+   `rac/updates/update-feed.patch` never moves. Any of these strands every
+   installed copy on its current version. See
+   [docs/operations/releases.md](docs/operations/releases.md).
 
 ## Where changes go
 
 | Change | Location |
 | --- | --- |
-| Chromium or Helium behavior | `patches/rac/<area>/<name>.patch`, listed at the end of `patches/series` under `# rac` |
+| Chromium or Helium behavior | `patches/rac/<area>/<name>.patch`, listed at the end of `patches/series`, after Helium's entries |
 | Icons, logos, other assets | rac-owned files in `resources/`, wired in through the resource lists |
 | Docs | `VISION.md`, `CONTRIBUTING.md`, `docs/` (see [Documentation](#documentation)) |
 | Build or CI | Only when necessary; keep it small and isolated |
 
 How patches are applied, and the quilt workflow for making one, are in
 [docs/internals/overview.md](docs/internals/overview.md).
+
+## Worktrees
+
+Features are built in git worktrees, each with its own Chromium build tree.
+The full procedure is in
+[docs/operations/worktrees.md](docs/operations/worktrees.md). Explain it to
+the maintainer when they ask how to work on features in parallel.
+
+- **The main checkout is the base.** New worktrees clone its built
+  `build/src`, so don't do feature work there.
+- **Creating one.** In the Factory App, create a worktree with the
+  **rac feature tree** setup profile. Without Factory, run
+  `git worktree add -b feat/<name> <path> main`, then
+  `devutils/rac/worktree.sh setup` from the new worktree. Setup takes
+  about 30 seconds.
+- **Building and running.** Build with `source dev.sh && he build` and run
+  with `devutils/rac/worktree.sh run`. Never use `he run` in a worktree.
+  It shares one profile with every other build, so the second browser only
+  opens a window in the first.
+- **Committing.** Run `he unmerge`, commit the patch with its
+  `patches/series` change, then run `he merge` to keep working.
+- **Before a rebase or pull.** Save quilt edits with `quilt refresh`, then
+  run `he unmerge` before changing the branch with Git. Afterward, run
+  `he merge`, `devutils/rac/worktree.sh sync`, then `he build`. Unmerging
+  after the Git update can overwrite the incoming `patches/series`.
+- **Sync runs alone.** Until it finishes, don't edit `build/src` or
+  `patches`, run Quilt or Git operations, or start another sync in that
+  worktree. Use separate worktrees for parallel work. Preflight protects
+  existing edits, not writes made during restoration.
+- **String files.** Dev trees show rac's names, which changes the `.grd`,
+  `.grdp`, and `.xtb` files in `build/src`. Run
+  `devutils/rac/dev_names.py unsub` before a patch edits one, and
+  `worktree.sh sync` after `quilt refresh`. See
+  [docs/internals/overview.md](docs/internals/overview.md#branding-and-helium-services).
+- **Removing one.** Factory runs the cleanup script when it deletes the
+  worktree. Without Factory, run `devutils/rac/worktree.sh cleanup`, then
+  `git worktree remove --force <path>`. Only remove a worktree when the
+  maintainer asks.
 
 Patch rules:
 
@@ -90,8 +139,8 @@ Patch rules:
 - When removing code, delete the lines instead of commenting them out or
   wrapping them in `#if 0`. This keeps `quilt refresh` reliable.
 - Follow Chromium's style. Run `he format` on the topmost patch.
-- Build on what Helium already has (vertical layout, compact mode, split
-  view, side panels, zen mode, the keyboard shortcut system) instead of
+- Build on what Helium already has (vertical layout, split view, side panels,
+  frameless mode, the keyboard shortcut system) instead of
   replacing it.
 
 ## Cover every surface
@@ -103,7 +152,8 @@ done, go through this list and say which items applied:
 - **Ways in.** Sidebar, command bar, menu bar, keyboard shortcut, context
   menu, and settings. If a feature can be reached from one, check whether it
   should be reachable from the others.
-- **Sidebar states.** Full, compact, and hidden, plus edge reveal.
+- **Sidebar states.** Full and hidden, plus edge reveal. There is no compact,
+  icons-only sidebar.
 - **Windows.** Multiple profile windows, multiple spaces, incognito, and
   split view.
 - **Appearance.** Light and dark mode, every space theme, and the address
@@ -118,13 +168,52 @@ done, go through this list and say which items applied:
 ## Verifying
 
 - Prove the change works with the smallest check that shows it: build and
-  run with `he build && he run`, then exercise the changed behavior.
+  run with `he build && he run` (`devutils/rac/worktree.sh run` in a
+  worktree), then exercise the changed behavior.
 - For UI changes, capture before and after screenshots. For motion, timing,
   or interaction, capture a short video.
 - Run `he validate series` after changing `patches/series`.
 - Don't run Chromium's full test suites. If a change has focused unit tests,
   run only those.
 - Ask before driving the browser with computer-use or automation tools.
+
+## Handing off for testing
+
+When a feature is done, or you want the maintainer to try something, make it
+one command away. Build first, so the maintainer only has to run it, and
+quit any browser you launched. Then send a message like this:
+
+```md
+**Ready to test: <feature>**
+
+Worktree: `<absolute path>` (branch `<branch>`)
+
+    cd <absolute path>
+    devutils/rac/worktree.sh run
+
+**What changed:** <what a user will notice, in plain words>
+
+**Try this:**
+1. <a concrete step, such as "Press Cmd+S twice">
+2. <...>
+
+**You should see:** <the expected result for each step, and what looks
+different from rac today>
+
+**Not done yet:** <known gaps, surfaces you couldn't check, rough edges>
+```
+
+- Give the exact commands with the real path, ready to paste. If the
+  maintainer needs to rebuild, include `source dev.sh && he build` first.
+- Write the steps for someone who hasn't read the code. Name the menus,
+  shortcuts, and settings to use.
+- Cover the surfaces from [Cover every surface](#cover-every-surface) that
+  apply, such as sidebar states, dark mode, and multiple windows.
+- Each worktree's browser starts with an empty profile in `build/profile`
+  that persists between runs. Say so if testing needs setup first, such as
+  opening several tabs or creating a second space.
+- To compare with rac today, the maintainer can run `he run` in the main
+  checkout at the same time.
 
 ## Commits and pull requests
 
