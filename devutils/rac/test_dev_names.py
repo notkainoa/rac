@@ -31,7 +31,8 @@ class NamesTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='rac-test-names-')
         self.addCleanup(self.temporary.cleanup)
-        self.tree = Path(self.temporary.name)
+        self.tree = Path(self.temporary.name) / 'src'
+        self.tree.mkdir()
         (self.tree / 'OWNERS').write_text('fixture\n')
         (self.tree / 'strings.grd').write_bytes(b'rac\n')
         make_archive(self.tree, 'helium', {'strings.grd': b'Chromium\n'})
@@ -229,7 +230,7 @@ class NamesTest(unittest.TestCase):
         with mock.patch.object(Path, 'write_bytes', fail_write_and_rollback):
             with self.assertRaisesRegex(OSError, 'names rollback failed') as raised:
                 dev_names.unsub(self.tree)
-        folders = list((self.tree / dev_names.STATE_DIR).glob('unsub-*'))
+        folders = list(self.tree.parent.glob('unsub-*'))
         self.assertEqual(len(folders), 1)
         recovery = folders[0]
         self.assertIn(str(recovery), str(raised.exception))
@@ -273,7 +274,7 @@ class NamesTest(unittest.TestCase):
                 mock.patch.object(Path, 'write_bytes', fail_archive_rollback):
             with self.assertRaisesRegex(OSError, 'names rollback failed'):
                 dev_names.unsub(self.tree)
-        folders = list((self.tree / dev_names.STATE_DIR).glob('unsub-*'))
+        folders = list(self.tree.parent.glob('unsub-*'))
         self.assertEqual(len(folders), 1)
         self.assertEqual((folders[0] / 'files/.rac_names/rac.tar').read_bytes(),
                          before['.rac_names/rac.tar'])
@@ -295,7 +296,7 @@ class NamesTest(unittest.TestCase):
             with self.assertRaisesRegex(OSError, 'names rollback failed') as raised:
                 dev_names.unsub(self.tree)
         self.assertIn('injected persistent timestamp failure', str(raised.exception))
-        recovery, = (self.tree / dev_names.STATE_DIR).glob('unsub-*')
+        recovery, = self.tree.parent.glob('unsub-*')
         self.assertEqual((recovery / 'files/strings.grd').read_bytes(), before['strings.grd'])
         self.assertEqual(path.read_bytes(), before['strings.grd'])
         self.assertIn('strings.grd', json.loads((recovery / 'metadata.json').read_text()))
@@ -310,7 +311,7 @@ class NamesTest(unittest.TestCase):
         self.assertEqual((self.tree / 'strings.grd').read_bytes(), b'Chromium\n')
         self.assertEqual(dev_names.originals(self.tree), {})
         self.assertEqual(dev_names.status(self.tree), 'not applied')
-        self.assertEqual(len(list((self.tree / dev_names.STATE_DIR).glob('unsub-*'))), 1)
+        self.assertEqual(len(list(self.tree.parent.glob('unsub-*'))), 1)
         dev_names.unsub(self.tree)
 
     def test_recovery_cleanup_failure_after_rollback_reports_restored_state(self):

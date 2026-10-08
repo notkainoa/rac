@@ -8,15 +8,19 @@
 Run from the repository root with:
     python3 -m unittest devutils.rac.test_name_pass -v
 
-Only temporary GRD and XTB fixtures are modified.
+Only temporary fixtures are modified.
 """
 
 from pathlib import Path
+import json
+import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as xml
 
-from devutils.rac import name_pass
+from devutils.rac import dev_names, name_pass
 
 
 class NamePassTest(unittest.TestCase):
@@ -181,6 +185,82 @@ class NamePassTest(unittest.TestCase):
         for source, expected in cases:
             with self.subTest(source=source):
                 self.assertEqual(name_pass.replace_text(source), expected)
+
+
+class DevNamesRecoveryTest(unittest.TestCase):
+    def test_retained_recovery_is_not_rebranded_or_registered(self):
+        root = Path(__file__).resolve().parents[2]
+        for complete in (False, True):
+            with self.subTest(complete=complete), \
+                    tempfile.TemporaryDirectory(prefix='rac-test-recovery-') as folder:
+                tree = Path(folder) / 'src'
+                tree.mkdir()
+                (tree / 'OWNERS').write_text('fixture\n')
+                (tree / 'tools').mkdir()
+                (tree / 'tools/grit').symlink_to(root / 'build/src/tools/grit',
+                                               target_is_directory=True)
+                grd = tree / 'messages.grd'
+                xtb = tree / 'messages_fr.xtb'
+                message = xml.fromstring(
+                    '<message name="IDS_TEST">Chromium browser</message>')
+                name_pass.util.add_grit_to_path(root / 'build/src')
+                fingerprint = name_pass.compute_fp(message)
+                grd.write_text(
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    '<grit latest_public_release="0" current_release="1" '
+                    'source_lang_id="en" base_dir=".">'
+                    '<translations><file path="messages_fr.xtb" lang="fr" /></translations>'
+                    '<release seq="1"><messages>'
+                    '<message name="IDS_TEST">Chromium browser</message>'
+                    '</messages></release></grit>', encoding='utf-8')
+                xtb.write_text(
+                    '<translationbundle lang="fr">'
+                    f'<translation id="{fingerprint}">Chromium navigateur</translation>'
+                    '</translationbundle>', encoding='utf-8')
+                originals = {path: path.read_bytes() for path in (grd, xtb)}
+                state = tree / dev_names.STATE_DIR
+                state.mkdir()
+                run = subprocess.run
+
+                def run_pass(command, **kwargs):
+                    return run([*command, '--workers', '1'], **kwargs)
+
+                if complete:
+                    with mock.patch.object(dev_names.subprocess, 'run',
+                                           side_effect=run_pass):
+                        dev_names.sub(tree)
+                else:
+                    run_pass([sys.executable, dev_names.PASSES[0][1], '--sub',
+                              '-t', tree, '--backup-path', state / 'helium.tar'],
+                             capture_output=True, text=True, check=True)
+                    dev_names.record_expected(tree)
+
+                branded = {path: path.read_bytes() for path in (grd, xtb)}
+                with mock.patch.object(dev_names.shutil, 'rmtree',
+                                       side_effect=OSError('injected recovery cleanup failure')):
+                    with self.assertRaisesRegex(OSError, 'recovery cleanup failed') as raised:
+                        dev_names.unsub(tree)
+                # Find either layout so this test reproduces the old scanner bug.
+                recovery, = Path(folder).rglob('unsub-*')
+                self.assertIn(str(recovery), str(raised.exception))
+                for path, data in branded.items():
+                    self.assertEqual((recovery / 'files' / path.name).read_bytes(), data)
+                saved = {path: path.read_bytes() for path in recovery.rglob('*')
+                         if path.is_file()}
+                with mock.patch.object(dev_names.subprocess, 'run', side_effect=run_pass):
+                    dev_names.sub(tree)
+                self.assertEqual({path: path.read_bytes() for path in saved}, saved)
+                self.assertEqual(recovery.parent, tree.parent)
+                expected_files = {'messages.grd', 'messages_fr.xtb'}
+                ledger = json.loads((state / 'expected.json').read_text())
+                self.assertEqual(set(ledger['files']), expected_files)
+                for name, _ in dev_names.PASSES:
+                    self.assertEqual(set(dev_names.archive_contents(state / f'{name}.tar')),
+                                     expected_files)
+                dev_names.shutil.rmtree(recovery)
+                dev_names.unsub(tree)
+                for path, data in originals.items():
+                    self.assertEqual(path.read_bytes(), data)
 
 
 if __name__ == '__main__':

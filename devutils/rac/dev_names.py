@@ -169,7 +169,8 @@ def unsub(tree):
         return
 
     expected = tree / STATE_DIR / 'expected.json'
-    recovery = Path(tempfile.mkdtemp(prefix='unsub-', dir=tree / STATE_DIR))
+    # Retained copies must stay outside the tree scanned by both name passes.
+    recovery = Path(tempfile.mkdtemp(prefix='unsub-', dir=tree.parent))
     saved = {}
     touched = []
     try:
