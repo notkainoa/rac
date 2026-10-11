@@ -15,10 +15,15 @@ own, so `patches/rac/pip/` mostly changes defaults.
   opens PiP for any page with a single playing video.
 - **Leaving includes switching apps.** `auto-pip-on-app-switch.patch` opens
   PiP when another regular app (one with a Dock icon) takes focus from rac,
-  and closes it when rac is in front again. Menu bar apps and launchers
-  (Spotlight, Raycast, 1Password's quick access) don't count, because they
-  open briefly over the video. The check lives in `rac::AppFocusObserver` and
-  only runs while a tab has a video that could open PiP.
+  and closes it when the source tab is visible in rac again. Returning to a
+  different rac window doesn't close PiP if the video is still hidden.
+  Menu bar apps and launchers (Spotlight, Raycast, 1Password's quick access)
+  don't count, because they open briefly over the video. The check lives in
+  `rac::AppFocusObserver` and only runs while a tab has a video that could
+  open PiP.
+  `auto-pip-permissions.patch` removes its app-switch subscription while
+  auto-PiP is blocked for the site, globally, or by the incognito toggle.
+  Settings listeners remain so re-enabling takes effect without reloading.
 - **Leaving includes hiding the window.** `auto-pip-defaults.patch` turns on
   `kAutoPictureInPictureOnWindowOccluded`, so PiP also opens when macOS
   reports the window as hidden, for example on another desktop or behind a
@@ -32,6 +37,8 @@ own, so `patches/rac/pip/` mostly changes defaults.
   incognito windows would inherit it. `auto-pip-incognito.patch` keeps
   auto-PiP off there unless the user turns on "Allow in incognito windows" on
   the same settings page (`rac.auto_pip_in_incognito`).
+  Until then, page info explains that auto-PiP isn't allowed in incognito
+  rather than offering an Allow control that cannot take effect.
 - **Floats over full-screen apps.** `pip-over-fullscreen-apps.patch` makes
   the PiP window non-activating and lets it join existing full-screen Spaces,
   the same way Chromium's floating Glic window does.
