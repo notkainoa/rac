@@ -1,0 +1,1466 @@
+Index: src/chrome/browser/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/BUILD.gn	2026-10-12 07:09:11.513924914 -0700
++++ src/chrome/browser/BUILD.gn	2026-10-12 07:14:12.689144155 -0700
+@@ -2092,6 +2092,7 @@
+     "//chrome/browser/ai",
+     "//chrome/browser/ai:impl",
+     "//chrome/browser/rac/ai:ai",
++    "//chrome/browser/rac/ai:browser",
+     "//chrome/browser/autocomplete",
+     "//chrome/browser/autocomplete:impl",
+     "//chrome/browser/autofill",
+Index: src/chrome/browser/extensions/api/settings_private/prefs_util.cc
+===================================================================
+--- src.orig/chrome/browser/extensions/api/settings_private/prefs_util.cc	2026-10-12 07:09:11.456135176 -0700
++++ src/chrome/browser/extensions/api/settings_private/prefs_util.cc	2026-10-12 07:14:12.690444382 -0700
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/password_manager/generated_password_leak_detection_pref.h"
+ #include "chrome/browser/prefs/session_startup_pref.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/rac/pip/auto_pip_prefs.h"
+ #include "chrome/browser/rac/updates/rac_updates.h"
+ #include "chrome/browser/safe_browsing/generated_safe_browsing_pref.h"
+@@ -229,6 +230,10 @@
+   (*s_allowlist)[::prefs::kHeliumVerticalRightAligned] =
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[rac::kLayout] = settings_api::PrefType::kNumber;
++  (*s_allowlist)[rac::ai::kEnabled] = settings_api::PrefType::kBoolean;
++  (*s_allowlist)[rac::ai::kNewTabPage] = settings_api::PrefType::kBoolean;
++  (*s_allowlist)[rac::ai::kAttachCurrentTab] =
++      settings_api::PrefType::kBoolean;
+   (*s_allowlist)[rac::kCmdSCollapsesToIcons] =
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumCenteredLocationBar] =
+Index: src/chrome/browser/prefs/browser_prefs.cc
+===================================================================
+--- src.orig/chrome/browser/prefs/browser_prefs.cc	2026-10-12 07:09:10.994895788 -0700
++++ src/chrome/browser/prefs/browser_prefs.cc	2026-10-12 07:14:12.689986709 -0700
+@@ -77,6 +77,7 @@
+ #include "chrome/browser/push_messaging/push_messaging_app_identifier.h"
+ #include "chrome/browser/push_messaging/push_messaging_service_impl.h"
+ #include "chrome/browser/push_messaging/push_messaging_unsubscribed_entry.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/rac/pip/auto_pip_prefs.h"
+ #include "chrome/browser/rac/spaces/spaces_prefs.h"
+ #include "chrome/browser/rac/updates/rac_updates.h"
+@@ -1925,6 +1926,7 @@
+       registry);
+   SearchPreloadService::RegisterProfilePrefs(registry);
+   rac::RegisterSpacesProfilePrefs(registry);
++  rac::ai::RegisterProfilePrefs(registry);
+   SessionStartupPref::RegisterProfilePrefs(registry);
+   SharingSyncPreference::RegisterProfilePrefs(registry);
+ #if BUILDFLAG(ENABLE_DICE_SUPPORT)
+Index: src/chrome/browser/rac/ai/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/ai/BUILD.gn	2026-10-12 07:09:11.514408629 -0700
++++ src/chrome/browser/rac/ai/BUILD.gn	2026-10-12 07:13:58.326904279 -0700
+@@ -1,3 +1,9 @@
++# Copyright 2026 The rac Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import("//testing/test.gni")
++
+ # rac's opt-in AI browser-process code.
+ source_set("ai") {
+   sources = [
+@@ -12,6 +18,48 @@
+   ]
+ }
+ 
++# Prefs and provider descriptions. Depends only on base, prefs and net, so it
++# can be tested without a browser.
++source_set("core") {
++  sources = [
++    "ai_prefs.cc",
++    "ai_prefs.h",
++    "providers.cc",
++    "providers.h",
++  ]
++  public_deps = [
++    "//base",
++    "//url",
++  ]
++  deps = [
++    "//components/pref_registry",
++    "//components/prefs",
++    "//net",
++  ]
++}
++
++# The parts that need a profile.
++source_set("browser") {
++  sources = [
++    "ai_service.cc",
++    "ai_service.h",
++    "ai_service_factory.cc",
++    "ai_service_factory.h",
++    "key_store.cc",
++    "key_store.h",
++  ]
++  public_deps = [
++    ":core",
++    "//base",
++    "//chrome/browser/profiles:profile",
++    "//components/keyed_service/core",
++    "//components/os_crypt/async/browser",
++    "//components/os_crypt/async/common",
++    "//components/prefs",
++  ]
++  deps = [ "//chrome/browser:browser_process" ]
++}
++
+ source_set("browser_tests") {
+   testonly = true
+   sources = [ "page_context_browsertest.cc" ]
+Index: src/chrome/browser/rac/ai/ai_prefs.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/ai_prefs.cc	2026-10-12 07:14:12.688716232 -0700
+@@ -0,0 +1,55 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/ai_prefs.h"
++
++#include "chrome/browser/rac/ai/providers.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++
++namespace rac::ai {
++
++void RegisterProfilePrefs(PrefRegistrySimple* registry) {
++  registry->RegisterBooleanPref(kEnabled, false);
++  registry->RegisterStringPref(kProvider, kDefaultProviderId);
++  registry->RegisterDictionaryPref(kProviderSettings);
++  registry->RegisterDictionaryPref(kEncryptedKeys);
++  registry->RegisterBooleanPref(kNewTabPage, true);
++  registry->RegisterBooleanPref(kAttachCurrentTab, true);
++}
++
++ProviderSettings GetProviderSettings(const PrefService* prefs,
++                                     const std::string& provider_id) {
++  ProviderSettings settings;
++  const ProviderInfo* info = FindProvider(provider_id);
++  if (info) {
++    settings.base_url = info->default_base_url;
++    settings.model = info->default_model;
++  }
++  const base::DictValue* saved =
++      prefs->GetDict(kProviderSettings).FindDict(provider_id);
++  if (saved) {
++    if (const std::string* url = saved->FindString("base_url");
++        url && !url->empty()) {
++      settings.base_url = *url;
++    }
++    if (const std::string* model = saved->FindString("model");
++        model && !model->empty()) {
++      settings.model = *model;
++    }
++  }
++  return settings;
++}
++
++void SetProviderSettings(PrefService* prefs,
++                         const std::string& provider_id,
++                         const ProviderSettings& settings) {
++  ScopedDictPrefUpdate update(prefs, kProviderSettings);
++  update->Set(provider_id, base::DictValue()
++                               .Set("base_url", settings.base_url)
++                               .Set("model", settings.model));
++}
++
++}  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/ai_prefs.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/ai_prefs.h	2026-10-12 07:14:12.688249642 -0700
+@@ -0,0 +1,49 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_AI_PREFS_H_
++#define CHROME_BROWSER_RAC_AI_AI_PREFS_H_
++
++#include <string>
++
++class PrefRegistrySimple;
++class PrefService;
++
++namespace rac::ai {
++
++// Profile prefs. None of them sync.
++//
++// Master switch. While false, no service, side panel entry, WebUI, request or
++// file is created for the assistant.
++inline constexpr char kEnabled[] = "rac.ai.enabled";
++// Id of the active provider (see providers.h).
++inline constexpr char kProvider[] = "rac.ai.provider";
++// Dictionary: provider id -> {"base_url": string, "model": string}.
++inline constexpr char kProviderSettings[] = "rac.ai.provider_settings";
++// Dictionary: provider id -> base64 of the OSCrypt ciphertext of the API key.
++// Never exposed to a renderer.
++inline constexpr char kEncryptedKeys[] = "rac.ai.encrypted_keys";
++// When the assistant is on, the new tab page offers a large composer.
++inline constexpr char kNewTabPage[] = "rac.ai.new_tab_page";
++// Attach the current tab to a chat by default.
++inline constexpr char kAttachCurrentTab[] = "rac.ai.attach_current_tab";
++
++void RegisterProfilePrefs(PrefRegistrySimple* registry);
++
++struct ProviderSettings {
++  std::string base_url;
++  std::string model;
++};
++
++// Returns the user's saved settings for `provider_id`, or the provider's
++// defaults for anything unset.
++ProviderSettings GetProviderSettings(const PrefService* prefs,
++                                     const std::string& provider_id);
++void SetProviderSettings(PrefService* prefs,
++                         const std::string& provider_id,
++                         const ProviderSettings& settings);
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_AI_PREFS_H_
+Index: src/chrome/browser/rac/ai/ai_service.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/ai_service.cc	2026-10-12 07:13:50.291654767 -0700
+@@ -0,0 +1,14 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/ai_service.h"
++
++namespace rac::ai {
++
++AiService::AiService(PrefService* prefs, os_crypt_async::OSCryptAsync* os_crypt)
++    : prefs_(prefs), key_store_(prefs, os_crypt) {}
++
++AiService::~AiService() = default;
++
++}  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/ai_service.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/ai_service.h	2026-10-12 07:13:50.286523402 -0700
+@@ -0,0 +1,43 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_AI_SERVICE_H_
++#define CHROME_BROWSER_RAC_AI_AI_SERVICE_H_
++
++#include <memory>
++#include <string>
++
++#include "base/memory/raw_ptr.h"
++#include "chrome/browser/rac/ai/key_store.h"
++#include "components/keyed_service/core/keyed_service.h"
++
++class PrefService;
++
++namespace os_crypt_async {
++class OSCryptAsync;
++}
++
++namespace rac::ai {
++
++// The browser-side owner of the assistant for one regular profile. It only
++// exists while the assistant is turned on (see AiServiceFactory) and does no
++// work until something asks it to.
++class AiService : public KeyedService {
++ public:
++  AiService(PrefService* prefs, os_crypt_async::OSCryptAsync* os_crypt);
++  AiService(const AiService&) = delete;
++  AiService& operator=(const AiService&) = delete;
++  ~AiService() override;
++
++  PrefService* prefs() { return prefs_; }
++  KeyStore& key_store() { return key_store_; }
++
++ private:
++  raw_ptr<PrefService> prefs_;
++  KeyStore key_store_;
++};
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_AI_SERVICE_H_
+Index: src/chrome/browser/rac/ai/ai_service_factory.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/ai_service_factory.cc	2026-10-12 07:13:50.304718619 -0700
+@@ -0,0 +1,45 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/ai_service_factory.h"
++
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
++#include "chrome/browser/rac/ai/ai_service.h"
++#include "components/prefs/pref_service.h"
++
++namespace rac::ai {
++
++// static
++AiService* AiServiceFactory::GetForProfile(Profile* profile) {
++  if (!profile || !profile->IsRegularProfile() ||
++      !profile->GetPrefs()->GetBoolean(kEnabled)) {
++    return nullptr;
++  }
++  return static_cast<AiService*>(
++      GetInstance()->GetServiceForBrowserContext(profile, /*create=*/true));
++}
++
++// static
++AiServiceFactory* AiServiceFactory::GetInstance() {
++  static base::NoDestructor<AiServiceFactory> instance;
++  return instance.get();
++}
++
++AiServiceFactory::AiServiceFactory()
++    : ProfileKeyedServiceFactory("RacAiService",
++                                 ProfileSelections::BuildForRegularProfile()) {}
++
++AiServiceFactory::~AiServiceFactory() = default;
++
++std::unique_ptr<KeyedService>
++AiServiceFactory::BuildServiceInstanceForBrowserContext(
++    content::BrowserContext* context) const {
++  return std::make_unique<AiService>(
++      Profile::FromBrowserContext(context)->GetPrefs(),
++      g_browser_process->os_crypt_async());
++}
++
++}  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/ai_service_factory.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/ai_service_factory.h	2026-10-12 07:13:50.297706436 -0700
+@@ -0,0 +1,40 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_AI_SERVICE_FACTORY_H_
++#define CHROME_BROWSER_RAC_AI_AI_SERVICE_FACTORY_H_
++
++#include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile_keyed_service_factory.h"
++
++class Profile;
++
++namespace rac::ai {
++
++class AiService;
++
++class AiServiceFactory : public ProfileKeyedServiceFactory {
++ public:
++  // Returns nullptr unless this is a regular profile with the assistant
++  // turned on. Callers must cope with that; it's the normal state.
++  static AiService* GetForProfile(Profile* profile);
++  static AiServiceFactory* GetInstance();
++
++  AiServiceFactory(const AiServiceFactory&) = delete;
++  AiServiceFactory& operator=(const AiServiceFactory&) = delete;
++
++ private:
++  friend class base::NoDestructor<AiServiceFactory>;
++
++  AiServiceFactory();
++  ~AiServiceFactory() override;
++
++  // BrowserContextKeyedServiceFactory:
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override;
++};
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_AI_SERVICE_FACTORY_H_
+Index: src/chrome/browser/rac/ai/key_store.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/key_store.cc	2026-10-12 07:13:50.280816071 -0700
+@@ -0,0 +1,90 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/key_store.h"
++
++#include <utility>
++
++#include "base/base64.h"
++#include "base/functional/bind.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
++#include "components/os_crypt/async/browser/os_crypt_async.h"
++#include "components/os_crypt/async/common/encryptor.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++
++namespace rac::ai {
++namespace {
++
++void StoreEncrypted(base::WeakPtr<KeyStore> store,
++                    PrefService* prefs,
++                    std::string provider_id,
++                    std::string key,
++                    KeyStore::SetCallback callback,
++                    scoped_refptr<os_crypt_async::Encryptor> encryptor) {
++  std::string ciphertext;
++  if (!store || !encryptor || !encryptor->IsEncryptionAvailable() ||
++      !encryptor->EncryptString(key, &ciphertext)) {
++    std::move(callback).Run(false);
++    return;
++  }
++  ScopedDictPrefUpdate update(prefs, kEncryptedKeys);
++  update->Set(provider_id, base::Base64Encode(ciphertext));
++  std::move(callback).Run(true);
++}
++
++void DecryptStored(KeyStore::GetCallback callback,
++                   std::string ciphertext,
++                   scoped_refptr<os_crypt_async::Encryptor> encryptor) {
++  std::string key;
++  if (!encryptor || !encryptor->IsDecryptionAvailable() ||
++      !encryptor->DecryptString(ciphertext, &key) || key.empty()) {
++    std::move(callback).Run(std::nullopt);
++    return;
++  }
++  std::move(callback).Run(std::move(key));
++}
++
++}  // namespace
++
++KeyStore::KeyStore(PrefService* prefs, os_crypt_async::OSCryptAsync* os_crypt)
++    : prefs_(prefs), os_crypt_(os_crypt) {}
++
++KeyStore::~KeyStore() = default;
++
++bool KeyStore::HasKey(const std::string& provider_id) const {
++  return prefs_->GetDict(kEncryptedKeys).FindString(provider_id) != nullptr;
++}
++
++void KeyStore::SetKey(const std::string& provider_id,
++                      const std::string& key,
++                      SetCallback callback) {
++  if (key.empty() || !os_crypt_) {
++    std::move(callback).Run(false);
++    return;
++  }
++  os_crypt_->GetInstance(base::BindOnce(&StoreEncrypted,
++                                        weak_factory_.GetWeakPtr(),
++                                        prefs_.get(), provider_id, key,
++                                        std::move(callback)));
++}
++
++void KeyStore::ClearKey(const std::string& provider_id) {
++  ScopedDictPrefUpdate update(prefs_, kEncryptedKeys);
++  update->Remove(provider_id);
++}
++
++void KeyStore::GetKey(const std::string& provider_id, GetCallback callback) {
++  const std::string* encoded =
++      prefs_->GetDict(kEncryptedKeys).FindString(provider_id);
++  std::string ciphertext;
++  if (!os_crypt_ || !encoded || !base::Base64Decode(*encoded, &ciphertext)) {
++    std::move(callback).Run(std::nullopt);
++    return;
++  }
++  os_crypt_->GetInstance(
++      base::BindOnce(&DecryptStored, std::move(callback), std::move(ciphertext)));
++}
++
++}  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/key_store.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/key_store.h	2026-10-12 07:13:50.275591955 -0700
+@@ -0,0 +1,54 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_KEY_STORE_H_
++#define CHROME_BROWSER_RAC_AI_KEY_STORE_H_
++
++#include <optional>
++#include <string>
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++
++class PrefService;
++
++namespace os_crypt_async {
++class OSCryptAsync;
++}
++
++namespace rac::ai {
++
++// Provider API keys, encrypted with the operating system's keychain through
++// OSCrypt and kept in the profile's prefs. A key is never logged and never
++// leaves the browser process. If encryption isn't available, saving fails and
++// nothing is stored.
++class KeyStore {
++ public:
++  using SetCallback = base::OnceCallback<void(bool success)>;
++  using GetCallback =
++      base::OnceCallback<void(std::optional<std::string> key)>;
++
++  KeyStore(PrefService* prefs, os_crypt_async::OSCryptAsync* os_crypt);
++  KeyStore(const KeyStore&) = delete;
++  KeyStore& operator=(const KeyStore&) = delete;
++  ~KeyStore();
++
++  bool HasKey(const std::string& provider_id) const;
++  void SetKey(const std::string& provider_id,
++              const std::string& key,
++              SetCallback callback);
++  void ClearKey(const std::string& provider_id);
++  // Runs `callback` with nullopt if there is no key or it can't be decrypted.
++  void GetKey(const std::string& provider_id, GetCallback callback);
++
++ private:
++  raw_ptr<PrefService> prefs_;
++  raw_ptr<os_crypt_async::OSCryptAsync> os_crypt_;
++  base::WeakPtrFactory<KeyStore> weak_factory_{this};
++};
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_KEY_STORE_H_
+Index: src/chrome/browser/rac/ai/providers.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/providers.cc	2026-10-12 07:13:28.771193173 -0700
+@@ -0,0 +1,58 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/providers.h"
++
++#include <iterator>
++
++#include "net/base/url_util.h"
++#include "url/gurl.h"
++
++namespace rac::ai {
++namespace {
++
++constexpr ProviderInfo kProviders[] = {
++    {"openai", "OpenAI", ProviderType::kOpenAiCompatible,
++     "https://api.openai.com/v1", "gpt-4.1-mini", true, false},
++    {"anthropic", "Anthropic", ProviderType::kAnthropic,
++     "https://api.anthropic.com", "claude-sonnet-4-5", true, false},
++    {"gemini", "Google Gemini", ProviderType::kOpenAiCompatible,
++     "https://generativelanguage.googleapis.com/v1beta/openai",
++     "gemini-2.5-flash", true, false},
++    {"openrouter", "OpenRouter", ProviderType::kOpenAiCompatible,
++     "https://openrouter.ai/api/v1", "openai/gpt-4o-mini", true, false},
++    {"ollama", "Ollama (on this computer)", ProviderType::kOpenAiCompatible,
++     "http://localhost:11434/v1", "llama3.2", false, true},
++    {"lmstudio", "LM Studio (on this computer)",
++     ProviderType::kOpenAiCompatible, "http://localhost:1234/v1", "", false,
++     true},
++    {"custom", "Custom (OpenAI-compatible)", ProviderType::kOpenAiCompatible,
++     "", "", true, true},
++};
++
++}  // namespace
++
++base::span<const ProviderInfo> GetProviders() {
++  return kProviders;
++}
++
++const ProviderInfo* FindProvider(std::string_view id) {
++  for (const ProviderInfo& info : kProviders) {
++    if (id == info.id) {
++      return &info;
++    }
++  }
++  return nullptr;
++}
++
++bool IsAcceptableBaseUrl(const GURL& url) {
++  if (!url.is_valid() || !url.has_host() || url.has_username() ||
++      url.has_password() || url.has_query() || url.has_ref()) {
++    return false;
++  }
++  return url.SchemeIs("https") ||
++         (url.SchemeIs("http") && net::IsLocalhost(url));
++}
++
++}  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/providers.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/providers.h	2026-10-12 07:13:28.762796179 -0700
+@@ -0,0 +1,47 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_PROVIDERS_H_
++#define CHROME_BROWSER_RAC_AI_PROVIDERS_H_
++
++#include <string_view>
++
++#include "base/containers/span.h"
++
++class GURL;
++
++namespace rac::ai {
++
++enum class ProviderType {
++  // POST {base_url}/chat/completions with server-sent events.
++  kOpenAiCompatible,
++  // POST {base_url}/v1/messages with server-sent events.
++  kAnthropic,
++};
++
++struct ProviderInfo {
++  const char* id;
++  const char* name;
++  ProviderType type;
++  const char* default_base_url;
++  const char* default_model;
++  // False for servers that run on this computer.
++  bool requires_key;
++  // Whether the user may change the base URL.
++  bool editable_base_url;
++};
++
++inline constexpr char kDefaultProviderId[] = "openai";
++
++base::span<const ProviderInfo> GetProviders();
++
++// Returns nullptr for an unknown id.
++const ProviderInfo* FindProvider(std::string_view id);
++
++// Keys are only sent over https, or to this computer.
++bool IsAcceptableBaseUrl(const GURL& url);
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_PROVIDERS_H_
+Index: src/chrome/browser/resources/settings/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/resources/settings/BUILD.gn	2026-10-11 17:11:30.200500200 -0700
++++ src/chrome/browser/resources/settings/BUILD.gn	2026-10-12 07:15:23.558886074 -0700
+@@ -130,6 +130,7 @@
+     "privacy_page/security/security_page.ts",
+     "privacy_page/security/security_page_feature_row.ts",
+     "privacy_page/security/security_page_v2.ts",
++    "privacy_page/rac_ai_page.ts",
+     "privacy_page/services_page.ts",
+     "safety_hub/extensions_module.ts",
+     "safety_hub/notification_permissions_module.ts",
+Index: src/chrome/browser/resources/settings/lazy_load.ts
+===================================================================
+--- src.orig/chrome/browser/resources/settings/lazy_load.ts	2026-10-11 17:11:23.178077331 -0700
++++ src/chrome/browser/resources/settings/lazy_load.ts	2026-10-12 07:15:23.556942797 -0700
+@@ -34,6 +34,7 @@
+ import './privacy_page/security/security_page_v2.js';
+ import './privacy_page/security/security_page.js';
+ import './privacy_page/services_page.js';
++import './privacy_page/rac_ai_page.js';
+ import './safety_hub/safety_hub_entry_point.js';
+ import './safety_hub/safety_hub_page.js';
+ import './search_page/search_engines_page.js';
+@@ -285,6 +286,7 @@
+ export {SecurityPageFeatureRowElement} from './privacy_page/security/security_page_feature_row.js';
+ export {SecuritySettingsBundleSetting, SettingsSecurityPageV2Element} from './privacy_page/security/security_page_v2.js';
+ export {SettingsHeliumServicesPageElement} from './privacy_page/services_page.js';
++export {SettingsRacAiPageElement} from './privacy_page/rac_ai_page.js';
+ export {SettingsResetPageElement} from './reset_page/reset_page.js';
+ export {SettingsResetProfileDialogElement} from './reset_page/reset_profile_dialog.js';
+ export {SettingsSafetyHubExtensionsModuleElement} from './safety_hub/extensions_module.js';
+Index: src/chrome/browser/resources/settings/privacy_page/privacy_page.html
+===================================================================
+--- src.orig/chrome/browser/resources/settings/privacy_page/privacy_page.html	2026-10-11 17:11:23.178943896 -0700
++++ src/chrome/browser/resources/settings/privacy_page/privacy_page.html	2026-10-12 07:15:53.206543612 -0700
+@@ -51,6 +51,11 @@
+         sub-label="$i18n{heliumServicesDescription}"
+         on-click="onHeliumServicesPageClick_"
+         role-description="$i18n{subpageArrowRoleDescription}"></cr-link-row>
++    <cr-link-row id="racAiLinkRow" start-icon="cr:star-filled"
++        class="hr" label="$i18n{racAiTitle}"
++        sub-label="$i18n{racAiLinkDescription}"
++        on-click="onRacAiPageClick_"
++        role-description="$i18n{subpageArrowRoleDescription}"></cr-link-row>
+     <cr-toast id="deleteBrowsingDataToast" duration="5000">
+       <div>[[dbdDeletionConfirmationToastLabel_]]</div>
+     </cr-toast>
+Index: src/chrome/browser/resources/settings/privacy_page/privacy_page.ts
+===================================================================
+--- src.orig/chrome/browser/resources/settings/privacy_page/privacy_page.ts	2026-10-11 17:11:23.179263097 -0700
++++ src/chrome/browser/resources/settings/privacy_page/privacy_page.ts	2026-10-12 07:15:23.558433026 -0700
+@@ -185,6 +185,12 @@
+     Router.getInstance().navigateTo(routes.HELIUM_SERVICES);
+   }
+ 
++  private onRacAiPageClick_() {
++    this.interactedWithPage_();
++
++    Router.getInstance().navigateTo(routes.RAC_AI);
++  }
++
+   private onSecurityPageClick_() {
+     this.interactedWithPage_();
+     this.metricsBrowserProxy_.recordAction(
+@@ -254,6 +260,10 @@
+       map.set(routes.HELIUM_SERVICES.path, '#heliumServicesLinkRow');
+     }
+ 
++    if (routes.RAC_AI) {
++      map.set(routes.RAC_AI.path, '#racAiLinkRow');
++    }
++
+     if (routes.COOKIES) {
+       map.set(routes.COOKIES.path, '#thirdPartyCookiesLinkRow');
+     }
+Index: src/chrome/browser/resources/settings/privacy_page/privacy_page_index.html
+===================================================================
+--- src.orig/chrome/browser/resources/settings/privacy_page/privacy_page_index.html	2026-10-11 17:11:23.179604965 -0700
++++ src/chrome/browser/resources/settings/privacy_page/privacy_page_index.html	2026-10-12 07:15:23.557281218 -0700
+@@ -29,6 +29,14 @@
+     </settings-helium-services-page>
+   </template>
+ 
++  <template is="dom-if" if="[[renderView_(
++      routes_.RAC_AI, currentRoute, inSearchMode)]]">
++    <settings-rac-ai-page slot="view" id="racAi"
++        data-parent-view-id="privacy" prefs="{{prefs}}"
++        route-path$="[[routes_.RAC_AI.path]]">
++    </settings-rac-ai-page>
++  </template>
++
+   <!-- Keep entries below sorted based on the route name. -->
+ 
+   <template is="dom-if" if="[[renderView_(
+Index: src/chrome/browser/resources/settings/privacy_page/rac_ai_page.html
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/resources/settings/privacy_page/rac_ai_page.html	2026-10-12 07:15:53.222897219 -0700
+@@ -0,0 +1,127 @@
++<style include="cr-shared-style settings-shared md-select">
++  .section {
++    padding: 0 var(--cr-section-padding);
++  }
++
++  .field {
++    padding: 12px 0;
++  }
++
++  .field > .label {
++    margin-bottom: 6px;
++  }
++
++  .row-buttons {
++    display: flex;
++    gap: 8px;
++    margin-top: 8px;
++  }
++
++  select {
++    width: 100%;
++  }
++
++  .note {
++    padding: 12px var(--cr-section-padding);
++  }
++</style>
++
++<settings-subpage page-title="$i18n{racAiTitle}" route-path$="[[routePath]]">
++  <div class="cr-col first">
++    <settings-toggle-button id="enabledToggle"
++        pref="{{prefs.rac.ai.enabled}}"
++        label="$i18n{racAiToggle}"
++        sub-label="$i18n{racAiToggleDescription}">
++    </settings-toggle-button>
++    <cr-collapse opened="[[available_]]">
++      <template is="dom-if" if="[[available_]]">
++        <settings-toggle-button id="attachToggle"
++            pref="{{prefs.rac.ai.attach_current_tab}}"
++            label="$i18n{racAiAttachTab}"
++            sub-label="$i18n{racAiAttachTabDescription}">
++        </settings-toggle-button>
++        <settings-toggle-button id="newTabToggle"
++            pref="{{prefs.rac.ai.new_tab_page}}"
++            label="$i18n{racAiNewTabPage}"
++            sub-label="$i18n{racAiNewTabPageDescription}">
++        </settings-toggle-button>
++
++        <div class="section">
++          <div class="field">
++            <div class="label">$i18n{racAiProvider}</div>
++            <select class="md-select" id="provider"
++                aria-label="$i18n{racAiProvider}"
++                on-change="onProviderChange_">
++              <template is="dom-repeat" items="[[providers_]]">
++                <option value="[[item.id]]"
++                    selected$="[[isSelected_(item.id, selectedId_)]]">
++                  [[item.name]]
++                </option>
++              </template>
++            </select>
++          </div>
++
++          <template is="dom-if" if="[[selected_]]" restamp>
++            <template is="dom-if" if="[[canEditUrl_(selected_)]]" restamp>
++              <div class="field">
++                <cr-input id="baseUrl" label="$i18n{racAiBaseUrl}"
++                    value="[[selected_.baseUrl]]"
++                    placeholder="[[selected_.defaultBaseUrl]]"
++                    invalid="[[baseUrlInvalid_]]"
++                    error-message="$i18n{racAiBaseUrlInvalid}"
++                    spellcheck="false" maxlength="512">
++                </cr-input>
++              </div>
++            </template>
++            <div class="field">
++              <cr-input id="model" label="$i18n{racAiModel}"
++                  value="[[selected_.model]]"
++                  placeholder="[[selected_.defaultModel]]"
++                  spellcheck="false" maxlength="512">
++              </cr-input>
++              <div class="row-buttons">
++                <cr-button on-click="onSaveSettings_">
++                  $i18n{racAiSaveSettings}
++                </cr-button>
++              </div>
++            </div>
++
++            <template is="dom-if" if="[[needsKey_(selected_)]]" restamp>
++              <div class="field">
++                <cr-input id="key" type="password" label="$i18n{racAiKey}"
++                    invalid="[[keyFailed_]]"
++                    error-message="$i18n{racAiKeyFailed}"
++                    autocomplete="off" spellcheck="false" maxlength="4096">
++                </cr-input>
++                <div class="cr-secondary-text">
++                  <span hidden$="[[!hasKey_(selected_)]]">
++                    $i18n{racAiKeySaved}
++                  </span>
++                  <span hidden$="[[!hasNoKey_(selected_)]]">
++                    $i18n{racAiKeyNone}
++                  </span>
++                </div>
++                <div class="row-buttons">
++                  <cr-button class="action-button" on-click="onSaveKey_">
++                    $i18n{racAiSaveKey}
++                  </cr-button>
++                  <cr-button on-click="onRemoveKey_"
++                      hidden$="[[!hasKey_(selected_)]]">
++                    $i18n{racAiRemoveKey}
++                  </cr-button>
++                </div>
++              </div>
++            </template>
++            <template is="dom-if" if="[[keyNotNeeded_(selected_)]]" restamp>
++              <div class="field cr-secondary-text">
++                $i18n{racAiKeyNotNeeded}
++              </div>
++            </template>
++          </template>
++        </div>
++
++        <div class="note cr-secondary-text">$i18n{racAiPrivacyNote}</div>
++      </template>
++    </cr-collapse>
++  </div>
++</settings-subpage>
+Index: src/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts	2026-10-12 07:16:04.163867522 -0700
+@@ -0,0 +1,173 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import '../controls/settings_toggle_button.js';
++import '../settings_page/settings_subpage.js';
++import 'chrome://resources/cr_elements/cr_button/cr_button.js';
++import 'chrome://resources/cr_elements/cr_collapse/cr_collapse.js';
++import 'chrome://resources/cr_elements/cr_input/cr_input.js';
++import 'chrome://resources/cr_elements/md_select.css.js';
++
++import {PrefsMixin} from '/shared/settings/prefs/prefs_mixin.js';
++import {I18nMixin} from 'chrome://resources/cr_elements/i18n_mixin.js';
++import {sendWithPromise} from 'chrome://resources/js/cr.js';
++import {PolymerElement} from 'chrome://resources/polymer/v3_0/polymer/polymer_bundled.min.js';
++
++import {getTemplate} from './rac_ai_page.html.js';
++
++interface RacAiProvider {
++  id: string;
++  name: string;
++  baseUrl: string;
++  model: string;
++  defaultBaseUrl: string;
++  defaultModel: string;
++  requiresKey: boolean;
++  editableBaseUrl: boolean;
++  hasKey: boolean;
++}
++
++interface RacAiState {
++  available: boolean;
++  provider?: string;
++  providers?: RacAiProvider[];
++}
++
++const SettingsRacAiPageElementBase = I18nMixin(PrefsMixin(PolymerElement));
++
++export class SettingsRacAiPageElement extends SettingsRacAiPageElementBase {
++  static get is() {
++    return 'settings-rac-ai-page';
++  }
++
++  static get template() {
++    return getTemplate();
++  }
++
++  static get properties() {
++    return {
++      available_: {type: Boolean, value: false},
++      providers_: {type: Array, value: () => []},
++      selectedId_: {type: String, value: ''},
++      selected_: {type: Object, value: null},
++      baseUrlInvalid_: {type: Boolean, value: false},
++      keyFailed_: {type: Boolean, value: false},
++    };
++  }
++
++  static get observers() {
++    return ['enabledChanged_(prefs.rac.ai.enabled.value)'];
++  }
++
++  declare private available_: boolean;
++  declare private providers_: RacAiProvider[];
++  declare private selectedId_: string;
++  declare private selected_: RacAiProvider|null;
++  declare private baseUrlInvalid_: boolean;
++  declare private keyFailed_: boolean;
++
++  override ready() {
++    super.ready();
++    this.refresh_();
++  }
++
++  private enabledChanged_() {
++    this.refresh_();
++  }
++
++  private refresh_() {
++    sendWithPromise<RacAiState>('racAiGetState').then(
++        state => this.applyState_(state));
++  }
++
++  private applyState_(state: RacAiState) {
++    this.available_ = state.available;
++    this.providers_ = state.providers || [];
++    this.selectedId_ = state.provider || '';
++    this.selected_ =
++        this.providers_.find(p => p.id === this.selectedId_) || null;
++  }
++
++  private onProviderChange_(event: Event) {
++    const id = (event.target as HTMLSelectElement).value;
++    this.baseUrlInvalid_ = false;
++    this.keyFailed_ = false;
++    sendWithPromise<RacAiState>('racAiSetProvider', id)
++        .then(state => this.applyState_(state));
++  }
++
++  private onSaveSettings_() {
++    const baseUrl = this.shadowRoot!.querySelector<HTMLInputElement>(
++        '#baseUrl');
++    const model = this.shadowRoot!.querySelector<HTMLInputElement>('#model');
++    if (!this.selected_ || !model) {
++      return;
++    }
++    this.baseUrlInvalid_ = false;
++    sendWithPromise<RacAiState>(
++        'racAiSaveSettings', this.selected_.id,
++        baseUrl && this.selected_.editableBaseUrl ? baseUrl.value.trim() : '',
++        model.value.trim())
++        .then(state => this.applyState_(state))
++        .catch((reason: string) => {
++          this.baseUrlInvalid_ = reason === 'invalid_url';
++        });
++  }
++
++  private onSaveKey_() {
++    const input = this.shadowRoot!.querySelector<HTMLInputElement>('#key');
++    if (!this.selected_ || !input || !input.value) {
++      return;
++    }
++    this.keyFailed_ = false;
++    sendWithPromise<RacAiState>('racAiSetKey', this.selected_.id, input.value)
++        .then(state => {
++          input.value = '';
++          this.applyState_(state);
++        })
++        .catch(() => {
++          this.keyFailed_ = true;
++        });
++  }
++
++  private onRemoveKey_() {
++    if (!this.selected_) {
++      return;
++    }
++    sendWithPromise<RacAiState>('racAiClearKey', this.selected_.id)
++        .then(state => this.applyState_(state));
++  }
++
++  private isSelected_(id: string, selectedId: string): boolean {
++    return id === selectedId;
++  }
++
++  private needsKey_(selected: RacAiProvider|null): boolean {
++    return !!selected && selected.requiresKey;
++  }
++
++  private keyNotNeeded_(selected: RacAiProvider|null): boolean {
++    return !!selected && !selected.requiresKey;
++  }
++
++  private canEditUrl_(selected: RacAiProvider|null): boolean {
++    return !!selected && selected.editableBaseUrl;
++  }
++
++  private hasKey_(selected: RacAiProvider|null): boolean {
++    return !!selected && selected.hasKey;
++  }
++
++  private hasNoKey_(selected: RacAiProvider|null): boolean {
++    return !!selected && selected.requiresKey && !selected.hasKey;
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'settings-rac-ai-page': SettingsRacAiPageElement;
++  }
++}
++
++customElements.define(SettingsRacAiPageElement.is, SettingsRacAiPageElement);
+Index: src/chrome/browser/resources/settings/route.ts
+===================================================================
+--- src.orig/chrome/browser/resources/settings/route.ts	2026-10-11 17:11:23.178685401 -0700
++++ src/chrome/browser/resources/settings/route.ts	2026-10-12 07:21:32.693070371 -0700
+@@ -23,6 +23,7 @@
+   }
+ 
+   r.HELIUM_SERVICES = r.PRIVACY.createChild('services');
++  r.RAC_AI = r.PRIVACY.createChild('/assistant');
+ 
+   const visibility = pageVisibility || {};
+ 
+Index: src/chrome/browser/resources/settings/router.ts
+===================================================================
+--- src.orig/chrome/browser/resources/settings/router.ts	2026-10-11 17:11:23.178392033 -0700
++++ src/chrome/browser/resources/settings/router.ts	2026-10-12 07:15:23.556252453 -0700
+@@ -39,6 +39,7 @@
+   GEMINI_LOGIN: Route;
+   GLIC_SECTION: Route;
+   HELIUM_SERVICES: Route;
++  RAC_AI: Route;
+   HISTORY_SEARCH: Route;
+   IDENTITY_DOCS: Route;
+   INLINE_CUE_MENU: Route;
+Index: src/chrome/browser/ui/webui/settings/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/webui/settings/BUILD.gn	2026-10-11 17:11:23.565384173 -0700
++++ src/chrome/browser/ui/webui/settings/BUILD.gn	2026-10-12 07:14:53.541731828 -0700
+@@ -34,6 +34,8 @@
+     "glic_handler.h",
+     "hats_handler.h",
+     "helium_crash_reporting_handler.h",
++    "rac_ai_handler.h",
++    "rac_ai_strings.h",
+     "import_data_handler.h",
+     "languages_handler.h",
+     "metrics_reporting_handler.h",
+@@ -168,6 +170,8 @@
+     "glic_handler.cc",
+     "hats_handler.cc",
+     "helium_crash_reporting_handler.cc",
++    "rac_ai_handler.cc",
++    "rac_ai_strings.cc",
+     "import_data_handler.cc",
+     "languages_handler.cc",
+     "metrics_reporting_handler.cc",
+@@ -204,6 +208,7 @@
+   deps = [
+     ":settings",
+     "//chrome/app:command_ids",
++    "//chrome/browser/rac/ai:browser",
+     "//chrome/app:generated_resources",
+     "//chrome/app/vector_icons",
+     "//chrome/browser:browser_process",
+Index: src/chrome/browser/ui/webui/settings/rac_ai_handler.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/webui/settings/rac_ai_handler.cc	2026-10-12 07:14:39.980774255 -0700
+@@ -0,0 +1,157 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/webui/settings/rac_ai_handler.h"
++
++#include <string>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
++#include "chrome/browser/rac/ai/ai_service.h"
++#include "chrome/browser/rac/ai/ai_service_factory.h"
++#include "chrome/browser/rac/ai/providers.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/web_ui.h"
++#include "url/gurl.h"
++
++namespace settings {
++namespace {
++
++constexpr size_t kMaxKeyLength = 4096;
++constexpr size_t kMaxFieldLength = 512;
++
++}  // namespace
++
++RacAiHandler::RacAiHandler(Profile* profile) : profile_(profile) {}
++RacAiHandler::~RacAiHandler() = default;
++
++void RacAiHandler::RegisterMessages() {
++  web_ui()->RegisterMessageCallback(
++      "racAiGetState", base::BindRepeating(&RacAiHandler::HandleGetState,
++                                           base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiSetProvider", base::BindRepeating(&RacAiHandler::HandleSetProvider,
++                                              base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiSaveSettings",
++      base::BindRepeating(&RacAiHandler::HandleSaveSettings,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiSetKey", base::BindRepeating(&RacAiHandler::HandleSetKey,
++                                         base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiClearKey", base::BindRepeating(&RacAiHandler::HandleClearKey,
++                                           base::Unretained(this)));
++}
++
++base::DictValue RacAiHandler::CreateState() const {
++  base::DictValue state;
++  rac::ai::AiService* service = rac::ai::AiServiceFactory::GetForProfile(profile_);
++  // Without the service (assistant off, or not a regular profile) the page
++  // shows only the switch.
++  state.Set("available", service != nullptr);
++  if (!service) {
++    return state;
++  }
++  PrefService* prefs = profile_->GetPrefs();
++  state.Set("provider", prefs->GetString(rac::ai::kProvider));
++  base::ListValue providers;
++  for (const rac::ai::ProviderInfo& info : rac::ai::GetProviders()) {
++    const rac::ai::ProviderSettings settings =
++        rac::ai::GetProviderSettings(prefs, info.id);
++    providers.Append(base::DictValue()
++                         .Set("id", info.id)
++                         .Set("name", info.name)
++                         .Set("baseUrl", settings.base_url)
++                         .Set("model", settings.model)
++                         .Set("defaultBaseUrl", info.default_base_url)
++                         .Set("defaultModel", info.default_model)
++                         .Set("requiresKey", info.requires_key)
++                         .Set("editableBaseUrl", info.editable_base_url)
++                         .Set("hasKey", service->key_store().HasKey(info.id)));
++  }
++  state.Set("providers", std::move(providers));
++  return state;
++}
++
++void RacAiHandler::HandleGetState(const base::ListValue& args) {
++  AllowJavascript();
++  CHECK_EQ(args.size(), 1u);
++  ResolveJavascriptCallback(args[0], CreateState());
++}
++
++void RacAiHandler::HandleSetProvider(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 2u);
++  const std::string& id = args[1].GetString();
++  if (!rac::ai::AiServiceFactory::GetForProfile(profile_) ||
++      !rac::ai::FindProvider(id)) {
++    RejectJavascriptCallback(args[0], base::Value());
++    return;
++  }
++  profile_->GetPrefs()->SetString(rac::ai::kProvider, id);
++  ResolveJavascriptCallback(args[0], CreateState());
++}
++
++void RacAiHandler::HandleSaveSettings(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 4u);
++  const std::string& id = args[1].GetString();
++  const std::string& base_url = args[2].GetString();
++  const std::string& model = args[3].GetString();
++  const rac::ai::ProviderInfo* info = rac::ai::FindProvider(id);
++  if (!rac::ai::AiServiceFactory::GetForProfile(profile_) || !info ||
++      base_url.size() > kMaxFieldLength || model.size() > kMaxFieldLength) {
++    RejectJavascriptCallback(args[0], base::Value());
++    return;
++  }
++  // An empty value means "use the default".
++  if (!base_url.empty() &&
++      (!info->editable_base_url ||
++       !rac::ai::IsAcceptableBaseUrl(GURL(base_url)))) {
++    RejectJavascriptCallback(args[0], base::Value("invalid_url"));
++    return;
++  }
++  rac::ai::SetProviderSettings(profile_->GetPrefs(), id, {base_url, model});
++  ResolveJavascriptCallback(args[0], CreateState());
++}
++
++void RacAiHandler::HandleSetKey(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 3u);
++  const std::string callback_id = args[0].GetString();
++  const std::string& id = args[1].GetString();
++  const std::string& key = args[2].GetString();
++  rac::ai::AiService* service =
++      rac::ai::AiServiceFactory::GetForProfile(profile_);
++  if (!service || !rac::ai::FindProvider(id) || key.empty() ||
++      key.size() > kMaxKeyLength) {
++    RejectJavascriptCallback(args[0], base::Value());
++    return;
++  }
++  service->key_store().SetKey(
++      id, key,
++      base::BindOnce(&RacAiHandler::OnKeySaved, weak_factory_.GetWeakPtr(),
++                     callback_id));
++}
++
++void RacAiHandler::OnKeySaved(const std::string& callback_id, bool success) {
++  if (success) {
++    ResolveJavascriptCallback(base::Value(callback_id), CreateState());
++  } else {
++    RejectJavascriptCallback(base::Value(callback_id), base::Value());
++  }
++}
++
++void RacAiHandler::HandleClearKey(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 2u);
++  rac::ai::AiService* service =
++      rac::ai::AiServiceFactory::GetForProfile(profile_);
++  if (!service) {
++    RejectJavascriptCallback(args[0], base::Value());
++    return;
++  }
++  service->key_store().ClearKey(args[1].GetString());
++  ResolveJavascriptCallback(args[0], CreateState());
++}
++
++}  // namespace settings
+Index: src/chrome/browser/ui/webui/settings/rac_ai_handler.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/webui/settings/rac_ai_handler.h	2026-10-12 07:14:39.975618349 -0700
+@@ -0,0 +1,47 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_SETTINGS_RAC_AI_HANDLER_H_
++#define CHROME_BROWSER_UI_WEBUI_SETTINGS_RAC_AI_HANDLER_H_
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/values.h"
++#include "chrome/browser/ui/webui/settings/settings_page_ui_handler.h"
++
++class Profile;
++
++namespace settings {
++
++// Backs the assistant page in Settings. The API key only travels from the
++// page to the browser. It is never sent back; the page only learns whether
++// one is saved.
++class RacAiHandler : public SettingsPageUIHandler {
++ public:
++  explicit RacAiHandler(Profile* profile);
++  RacAiHandler(const RacAiHandler&) = delete;
++  RacAiHandler& operator=(const RacAiHandler&) = delete;
++  ~RacAiHandler() override;
++
++  // SettingsPageUIHandler:
++  void RegisterMessages() override;
++  void OnJavascriptAllowed() override {}
++  void OnJavascriptDisallowed() override {}
++
++ private:
++  base::DictValue CreateState() const;
++  void HandleGetState(const base::ListValue& args);
++  void HandleSetProvider(const base::ListValue& args);
++  void HandleSaveSettings(const base::ListValue& args);
++  void HandleSetKey(const base::ListValue& args);
++  void HandleClearKey(const base::ListValue& args);
++  void OnKeySaved(const std::string& callback_id, bool success);
++
++  raw_ptr<Profile> profile_;
++  base::WeakPtrFactory<RacAiHandler> weak_factory_{this};
++};
++
++}  // namespace settings
++
++#endif  // CHROME_BROWSER_UI_WEBUI_SETTINGS_RAC_AI_HANDLER_H_
+Index: src/chrome/browser/ui/webui/settings/rac_ai_strings.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/webui/settings/rac_ai_strings.cc	2026-10-12 07:14:39.995490714 -0700
+@@ -0,0 +1,61 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/webui/settings/rac_ai_strings.h"
++
++#include "base/containers/span.h"
++#include "content/public/browser/web_ui_data_source.h"
++
++namespace settings {
++namespace {
++
++struct Str {
++  const char* name;
++  const char* value;
++};
++
++// English only for now; rac has no translation pipeline yet.
++constexpr Str kStrings[] = {
++    {"racAiTitle", "Assistant"},
++    {"racAiToggle", "Turn on the assistant"},
++    {"racAiToggleDescription",
++     "Chat about the page you're on in a side panel. Nothing runs and nothing "
++     "is sent anywhere until you turn this on and add your own provider."},
++    {"racAiLinkDescription", "Chat, providers and API keys"},
++    {"racAiProvider", "Provider"},
++    {"racAiBaseUrl", "Server address"},
++    {"racAiBaseUrlInvalid",
++     "Use an https address, or http for a server on this computer."},
++    {"racAiModel", "Model"},
++    {"racAiKey", "API key"},
++    {"racAiKeySaved", "A key is saved, encrypted by your keychain."},
++    {"racAiKeyNone", "No key saved."},
++    {"racAiKeyNotNeeded", "This provider doesn't need a key."},
++    {"racAiKeyFailed", "The key couldn't be saved."},
++    {"racAiSaveKey", "Save key"},
++    {"racAiRemoveKey", "Remove key"},
++    {"racAiSaveSettings", "Save"},
++    {"racAiPrivacyNote",
++     "Your prompts and the pages you attach go straight to the provider you "
++     "choose, not to rac. Keys never leave the browser process."},
++    {"racAiNewTabPage", "Ask anywhere on the new tab page"},
++    {"racAiNewTabPageDescription",
++     "Show a large question box on the new tab page."},
++    {"racAiAttachTab", "Attach the current tab to new chats"},
++    {"racAiAttachTabDescription",
++     "You can always remove the tab from a message before sending it."},
++    {"racAiHistory", "Chat history"},
++    {"racAiHistoryDescription", "Chats are kept on this computer only."},
++    {"racAiClearHistory", "Delete all chats"},
++};
++
++}  // namespace
++
++void AddRacAiStrings(content::WebUIDataSource* source) {
++  for (const Str& str : kStrings) {
++    source->AddString(str.name, str.value);
++  }
++}
++
++}  // namespace settings
+Index: src/chrome/browser/ui/webui/settings/rac_ai_strings.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/webui/settings/rac_ai_strings.h	2026-10-12 07:14:39.989646923 -0700
+@@ -0,0 +1,19 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_SETTINGS_RAC_AI_STRINGS_H_
++#define CHROME_BROWSER_UI_WEBUI_SETTINGS_RAC_AI_STRINGS_H_
++
++namespace content {
++class WebUIDataSource;
++}
++
++namespace settings {
++
++// Adds the strings of the assistant page.
++void AddRacAiStrings(content::WebUIDataSource* source);
++
++}  // namespace settings
++
++#endif  // CHROME_BROWSER_UI_WEBUI_SETTINGS_RAC_AI_STRINGS_H_
+Index: src/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc	2026-10-12 07:09:11.458594461 -0700
++++ src/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc	2026-10-12 07:15:02.667428461 -0700
+@@ -59,6 +59,7 @@
+ #include "chrome/browser/ui/webui/management/management_ui.h"
+ #include "chrome/browser/ui/webui/policy_indicator_localized_strings_provider.h"
+ #include "chrome/browser/ui/webui/settings/glic_handler.h"
++#include "chrome/browser/ui/webui/settings/rac_ai_strings.h"
+ #include "chrome/browser/ui/webui/settings/reset_settings_handler.h"
+ #include "chrome/browser/ui/webui/settings/shared_settings_localized_strings_provider.h"
+ #include "chrome/browser/ui/webui/version/version_ui.h"
+@@ -4711,6 +4712,7 @@
+   AddPrivacySandboxStrings(html_source, profile);
+   AddPrivacyGuideStrings(html_source, profile);
+   AddPrivacyStrings(html_source, profile);
++  AddRacAiStrings(html_source);
+   AddSafetyHubStrings(html_source);
+   AddShortcutInputStrings(html_source);
+   AddResetStrings(html_source, profile);
+Index: src/chrome/browser/ui/webui/settings/settings_ui.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/settings/settings_ui.cc	2026-10-11 17:11:23.009955130 -0700
++++ src/chrome/browser/ui/webui/settings/settings_ui.cc	2026-10-12 07:14:53.542291711 -0700
+@@ -74,6 +74,7 @@
+ #include "chrome/browser/ui/webui/settings/glic_handler.h"
+ #include "chrome/browser/ui/webui/settings/hats_handler.h"
+ #include "chrome/browser/ui/webui/settings/helium_crash_reporting_handler.h"
++#include "chrome/browser/ui/webui/settings/rac_ai_handler.h"
+ #include "chrome/browser/ui/webui/settings/import_data_handler.h"
+ #include "chrome/browser/ui/webui/settings/metrics_reporting_handler.h"
+ #include "chrome/browser/ui/webui/settings/omnibox_everywhere_settings_handler.h"
+@@ -284,6 +285,7 @@
+   AddSettingsPageUIHandler(std::make_unique<OnDeviceAiSettingsHandler>());
+ #endif  // BUILDFLAG(GOOGLE_CHROME_BRANDING)
+   AddSettingsPageUIHandler(std::make_unique<OnStartupHandler>(profile));
++  AddSettingsPageUIHandler(std::make_unique<RacAiHandler>(profile));
+   AddSettingsPageUIHandler(std::make_unique<PeopleHandler>(profile));
+   AddSettingsPageUIHandler(std::make_unique<ProfileInfoHandler>(profile));
+   AddSettingsPageUIHandler(std::make_unique<ProtocolHandlersHandler>(profile));
