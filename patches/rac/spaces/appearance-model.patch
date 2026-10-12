@@ -1,0 +1,451 @@
+Index: src/chrome/browser/rac/spaces/space.cc
+===================================================================
+--- src.orig/chrome/browser/rac/spaces/space.cc	2026-10-12 01:01:33.520000561 -0700
++++ src/chrome/browser/rac/spaces/space.cc	2026-10-12 03:23:02.932202471 -0700
+@@ -4,9 +4,12 @@
+ 
+ #include "chrome/browser/rac/spaces/space.h"
+ 
++#include <array>
+ #include <utility>
+ 
+ #include "base/json/values_util.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
+ 
+ namespace rac {
+ 
+@@ -15,9 +18,72 @@
+ constexpr char kIdKey[] = "id";
+ constexpr char kNameKey[] = "name";
+ constexpr char kLastActiveKey[] = "last_active";
++constexpr char kIconKey[] = "icon";
++constexpr char kThemeKey[] = "theme";
++
++bool IsSrgbHex(const std::string& color) {
++  uint32_t value = 0;
++  return color.size() == 7 && color[0] == '#' &&
++         base::HexStringToUInt(std::string_view(color).substr(1), &value);
++}
+ 
+ }  // namespace
+ 
++// The eight pairs use the SpaceStyleEditor pastel and drab picker colors.
++// Display P3 channels were converted to sRGB, then clipped where necessary.
++SpaceTheme SpaceTheme::Preset(size_t index) {
++  static constexpr std::array<std::pair<std::string_view, std::string_view>,
++                              kPresetCount>
++      kColors = {{{"#FFE9F4", "#F1D1EC"},
++                  {"#FFCBD2", "#FFE0D3"},
++                  {"#FFF9E5", "#DEFDEB"},
++                  {"#DCF3FC", "#C5C6E5"},
++                  {"#4E3A5A", "#693558"},
++                  {"#8F3F42", "#B16D40"},
++                  {"#D7B35D", "#7AA982"},
++                  {"#226149", "#26456B"}}};
++  const auto& [first, second] = kColors[index % kColors.size()];
++  SpaceTheme theme;
++  theme.color1 = first;
++  theme.color2 = second;
++  return theme;
++}
++
++base::DictValue SpaceTheme::ToDict() const {
++  base::DictValue dict = unknown_fields.Clone();
++  dict.Set("color1", color1);
++  dict.Set("color2", color2);
++  dict.Set("mode", mode == Mode::kLight  ? "light"
++                   : mode == Mode::kDark ? "dark"
++                                         : "auto");
++  return dict;
++}
++
++std::optional<SpaceTheme> SpaceTheme::FromDict(const base::DictValue& dict) {
++  const std::string* color1 = dict.FindString("color1");
++  const std::string* color2 = dict.FindString("color2");
++  if (!color1 || !color2 || !IsSrgbHex(*color1) || !IsSrgbHex(*color2)) {
++    return std::nullopt;
++  }
++  SpaceTheme theme;
++  theme.color1 = *color1;
++  theme.color2 = *color2;
++  if (const std::string* mode = dict.FindString("mode")) {
++    if (*mode == "light") {
++      theme.mode = Mode::kLight;
++    } else if (*mode == "dark") {
++      theme.mode = Mode::kDark;
++    } else if (*mode != "auto") {
++      return std::nullopt;
++    }
++  }
++  theme.unknown_fields = dict.Clone();
++  theme.unknown_fields.Remove("color1");
++  theme.unknown_fields.Remove("color2");
++  theme.unknown_fields.Remove("mode");
++  return theme;
++}
++
+ Space::Space() = default;
+ 
+ Space::Space(base::Uuid id, std::string name)
+@@ -31,6 +97,15 @@
+   base::DictValue dict = unknown_fields.Clone();
+   dict.Set(kIdKey, id.AsLowercaseString());
+   dict.Set(kNameKey, name);
++  if (!icon.empty()) {
++    dict.Set(kIconKey, icon);
++  } else {
++    dict.Remove(kIconKey);
++  }
++  // Keep a theme written by a newer build if its format is not understood.
++  if (!dict.contains(kThemeKey)) {
++    dict.Set(kThemeKey, theme.ToDict());
++  }
+   if (last_active.is_null()) {
+     dict.Remove(kLastActiveKey);
+   } else {
+@@ -55,6 +130,11 @@
+   if (const std::string* stored_name = dict.FindString(kNameKey)) {
+     space.name = *stored_name;
+   }
++  if (const std::string* stored_icon = dict.FindString(kIconKey);
++      stored_icon && stored_icon->size() <= 32 &&
++      base::IsStringUTF8(*stored_icon)) {
++    space.icon = *stored_icon;
++  }
+   if (std::optional<base::Time> stored_last_active =
+           base::ValueToTime(dict.Find(kLastActiveKey))) {
+     space.last_active = *stored_last_active;
+@@ -64,6 +144,13 @@
+   space.unknown_fields.Remove(kIdKey);
+   space.unknown_fields.Remove(kNameKey);
+   space.unknown_fields.Remove(kLastActiveKey);
++  space.unknown_fields.Remove(kIconKey);
++  if (const base::DictValue* stored_theme = dict.FindDict(kThemeKey)) {
++    if (auto parsed = SpaceTheme::FromDict(*stored_theme)) {
++      space.theme = std::move(*parsed);
++      space.unknown_fields.Remove(kThemeKey);
++    }
++  }
+   return space;
+ }
+ 
+Index: src/chrome/browser/rac/spaces/space.h
+===================================================================
+--- src.orig/chrome/browser/rac/spaces/space.h	2026-10-12 01:01:33.520209940 -0700
++++ src/chrome/browser/rac/spaces/space.h	2026-10-12 03:23:02.940072237 -0700
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_RAC_SPACES_SPACE_H_
+ #define CHROME_BROWSER_RAC_SPACES_SPACE_H_
+ 
++#include <cstddef>
+ #include <optional>
+ #include <string>
+ 
+@@ -14,6 +15,25 @@
+ 
+ namespace rac {
+ 
++using SpaceId = base::Uuid;
++
++// sRGB stops for a window's space tint. Presets are converted from Arc's
++// Display P3 picker swatches, not copied assets or sampled window colors.
++struct SpaceTheme {
++  enum class Mode { kAuto, kLight, kDark };
++
++  static constexpr size_t kPresetCount = 8;
++  static SpaceTheme Preset(size_t index);
++  static std::optional<SpaceTheme> FromDict(const base::DictValue& dict);
++
++  base::DictValue ToDict() const;
++
++  std::string color1 = "#FFE9F4";
++  std::string color2 = "#F1D1EC";
++  Mode mode = Mode::kAuto;
++  base::DictValue unknown_fields;
++};
++
+ // A set of tabs inside a profile. Spaces belong to the profile, not to a
+ // window, and a window shows one space at a time.
+ struct Space {
+@@ -33,12 +53,15 @@
+   // shows a fallback.
+   std::string name;
+ 
++  // An optional emoji shown instead of the switcher dot.
++  std::string icon;
++  SpaceTheme theme;
++
+   // When a window last showed this space. Null if no window has yet.
+   base::Time last_active;
+ 
+-  // Fields this version doesn't read, such as a theme or pinned tabs written
+-  // by a newer rac. They're written back unchanged so an older build can't
+-  // erase them.
++  // Fields this version doesn't read, such as pinned tabs written by a newer
++  // rac. They're written back unchanged.
+   base::DictValue unknown_fields;
+ 
+   base::DictValue ToDict() const;
+Index: src/chrome/browser/rac/spaces/spaces_service.cc
+===================================================================
+--- src.orig/chrome/browser/rac/spaces/spaces_service.cc	2026-10-12 01:01:33.521314251 -0700
++++ src/chrome/browser/rac/spaces/spaces_service.cc	2026-10-12 03:23:02.962039338 -0700
+@@ -10,6 +10,7 @@
+ 
+ #include "base/check.h"
+ #include "base/containers/to_vector.h"
++#include "base/strings/string_util.h"
+ #include "base/time/clock.h"
+ #include "base/time/default_clock.h"
+ #include "chrome/browser/rac/spaces/spaces_prefs.h"
+@@ -48,6 +49,7 @@
+ base::Uuid SpacesService::CreateSpace(std::string name) {
+   const base::Uuid id = base::Uuid::GenerateRandomV4();
+   spaces_.emplace_back(id, std::move(name));
++  spaces_.back().theme = SpaceTheme::Preset(spaces_.size() - 1);
+   Save();
+   for (Observer& observer : observers_) {
+     observer.OnSpaceAdded(id);
+@@ -71,6 +73,59 @@
+   }
+   return true;
+ }
++
++bool SpacesService::SetSpaceThemePreset(const SpaceId& id, size_t preset) {
++  auto it = FindIterator(id);
++  if (it == spaces_.end() || preset >= SpaceTheme::kPresetCount) {
++    return false;
++  }
++  SpaceTheme chosen = SpaceTheme::Preset(preset);
++  if (it->theme.color1 == chosen.color1 && it->theme.color2 == chosen.color2) {
++    return true;
++  }
++  it->theme.color1 = std::move(chosen.color1);
++  it->theme.color2 = std::move(chosen.color2);
++  it->unknown_fields.Remove("theme");
++  Save();
++  for (Observer& observer : observers_) {
++    observer.OnSpaceAppearanceChanged(id);
++  }
++  return true;
++}
++
++bool SpacesService::SetSpaceThemeMode(const SpaceId& id,
++                                      SpaceTheme::Mode mode) {
++  auto it = FindIterator(id);
++  if (it == spaces_.end()) {
++    return false;
++  }
++  if (it->theme.mode == mode) {
++    return true;
++  }
++  it->theme.mode = mode;
++  it->unknown_fields.Remove("theme");
++  Save();
++  for (Observer& observer : observers_) {
++    observer.OnSpaceAppearanceChanged(id);
++  }
++  return true;
++}
++
++bool SpacesService::SetSpaceIcon(const SpaceId& id, std::string icon) {
++  auto it = FindIterator(id);
++  if (it == spaces_.end() || icon.size() > 32 || !base::IsStringUTF8(icon)) {
++    return false;
++  }
++  if (it->icon == icon) {
++    return true;
++  }
++  it->icon = std::move(icon);
++  Save();
++  for (Observer& observer : observers_) {
++    observer.OnSpaceAppearanceChanged(id);
++  }
++  return true;
++}
+ 
+ bool SpacesService::RemoveSpace(const base::Uuid& id) {
+   auto it = FindIterator(id);
+Index: src/chrome/browser/rac/spaces/spaces_service.h
+===================================================================
+--- src.orig/chrome/browser/rac/spaces/spaces_service.h	2026-10-12 01:01:33.521587339 -0700
++++ src/chrome/browser/rac/spaces/spaces_service.h	2026-10-12 03:18:49.261938224 -0700
+@@ -39,6 +39,7 @@
+    public:
+     virtual void OnSpaceAdded(const base::Uuid& id) {}
+     virtual void OnSpaceRenamed(const base::Uuid& id) {}
++    virtual void OnSpaceAppearanceChanged(const SpaceId& id) {}
+     virtual void OnSpaceRemoved(const base::Uuid& id) {}
+     virtual void OnSpacesReordered() {}
+   };
+@@ -64,6 +65,10 @@
+ 
+   // These return false if `id` isn't a space.
+   bool RenameSpace(const base::Uuid& id, std::string name);
++  // A preset changes the two sRGB stops, keeping the chosen light/dark mode.
++  bool SetSpaceThemePreset(const SpaceId& id, size_t preset);
++  bool SetSpaceThemeMode(const SpaceId& id, SpaceTheme::Mode mode);
++  bool SetSpaceIcon(const SpaceId& id, std::string icon);
+   // Also false if `id` is the only space.
+   bool RemoveSpace(const base::Uuid& id);
+   // `index` is the space's position after the move. False if it's out of
+Index: src/chrome/browser/rac/spaces/spaces_service_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/rac/spaces/spaces_service_unittest.cc	2026-10-12 01:01:33.522378187 -0700
++++ src/chrome/browser/rac/spaces/spaces_service_unittest.cc	2026-10-12 03:23:03.008303666 -0700
+@@ -28,11 +28,15 @@
+  public:
+   void OnSpaceAdded(const base::Uuid& id) override { added.push_back(id); }
+   void OnSpaceRenamed(const base::Uuid& id) override { renamed.push_back(id); }
++  void OnSpaceAppearanceChanged(const SpaceId& id) override {
++    appearance.push_back(id);
++  }
+   void OnSpaceRemoved(const base::Uuid& id) override { removed.push_back(id); }
+   void OnSpacesReordered() override { ++reordered; }
+ 
+   std::vector<base::Uuid> added;
+   std::vector<base::Uuid> renamed;
++  std::vector<SpaceId> appearance;
+   std::vector<base::Uuid> removed;
+   int reordered = 0;
+ };
+@@ -121,6 +125,51 @@
+   service->RemoveObserver(&observer);
+ }
+ 
++TEST_F(SpacesServiceTest, AppearancePresetsAndIconPersistPerSpace) {
++  auto service = MakeService();
++  const SpaceId first = service->spaces()[0].id;
++  const SpaceId second = service->CreateSpace("Work");
++  RecordingObserver observer;
++  service->AddObserver(&observer);
++
++  ASSERT_EQ(service->FindSpace(first)->theme.color1, "#FFE9F4");
++  ASSERT_EQ(service->FindSpace(second)->theme.color1, "#FFCBD2");
++  EXPECT_FALSE(service->SetSpaceThemePreset(second, SpaceTheme::kPresetCount));
++  EXPECT_TRUE(service->SetSpaceThemePreset(second, 7));
++  EXPECT_TRUE(service->SetSpaceThemeMode(second, SpaceTheme::Mode::kDark));
++  EXPECT_TRUE(service->SetSpaceIcon(second, "🌊"));
++  EXPECT_FALSE(service->SetSpaceIcon(first, std::string(33, 'x')));
++  EXPECT_THAT(observer.appearance, ElementsAre(second, second, second));
++  service->RemoveObserver(&observer);
++
++  service.reset();
++  auto restored = MakeService();
++  ASSERT_NE(restored->FindSpace(second), nullptr);
++  EXPECT_EQ(restored->FindSpace(second)->theme.color1, "#226149");
++  EXPECT_EQ(restored->FindSpace(second)->theme.color2, "#26456B");
++  EXPECT_EQ(restored->FindSpace(second)->theme.mode, SpaceTheme::Mode::kDark);
++  EXPECT_EQ(restored->FindSpace(second)->icon, "🌊");
++  EXPECT_EQ(restored->FindSpace(first)->theme.color1, "#FFE9F4");
++}
++
++TEST_F(SpacesServiceTest, UnknownThemeFieldsSurviveAppearanceEdits) {
++  auto service = MakeService();
++  const SpaceId id = service->spaces()[0].id;
++  service->SetSpaceThemePreset(id, 2);
++  base::DictValue stored = Stored().Clone();
++  base::DictValue& space = (*stored.FindList("spaces"))[0].GetDict();
++  space.FindDict("theme")->Set("future_texture", "grain");
++  prefs_.SetDict(kSpaces, std::move(stored));
++
++  service.reset();
++  service = MakeService();
++  EXPECT_TRUE(service->SetSpaceThemeMode(id, SpaceTheme::Mode::kLight));
++  const auto* theme =
++      (*Stored().FindList("spaces"))[0].GetDict().FindDict("theme");
++  ASSERT_TRUE(theme);
++  EXPECT_EQ(*theme->FindString("future_texture"), "grain");
++}
++
+ TEST_F(SpacesServiceTest, RemoveNotifiesWithACopyOfTheId) {
+   auto service = MakeService();
+   const base::Uuid second = service->CreateSpace("Second");
+Index: src/chrome/browser/ui/rac/spaces/spaces_window_manager.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/spaces/spaces_window_manager.cc	2026-10-12 02:46:49.385399485 -0700
++++ src/chrome/browser/ui/rac/spaces/spaces_window_manager.cc	2026-10-12 03:18:19.169014524 -0700
+@@ -53,6 +53,7 @@
+   // The space this window shows or, when `showing_elsewhere` is set, points
+   // at.
+   std::optional<base::Uuid> space;
++  std::optional<SpaceId> last_notified_active_space;
+ 
+   // True while the space is open in another window and this window shows the
+   // "open in another window" screen.
+@@ -139,6 +140,12 @@
+   return state ? state->space : std::nullopt;
+ }
+ 
++std::optional<SpaceId> SpacesWindowManager::GetActiveSpaceId(
++    const BrowserWindowInterface* browser) const {
++  const WindowState* state = FindState(browser);
++  return state && !state->showing_elsewhere ? state->space : std::nullopt;
++}
++
+ bool SpacesWindowManager::IsShowingElsewhereScreen(
+     const BrowserWindowInterface* browser) const {
+   const WindowState* state = FindState(browser);
+@@ -918,6 +925,15 @@
+ 
+ void SpacesWindowManager::NotifyWindowSpaceChanged(
+     BrowserWindowInterface* browser) {
++  WindowState* state = FindState(browser);
++  const auto active = GetActiveSpaceId(browser);
++  if (state && active != state->last_notified_active_space) {
++    const auto previous = state->last_notified_active_space;
++    state->last_notified_active_space = active;
++    for (Observer& observer : observers_) {
++      observer.OnActiveSpaceChanged(browser, previous, active);
++    }
++  }
+   for (Observer& observer : observers_) {
+     observer.OnWindowSpaceChanged(browser);
+   }
+@@ -1054,6 +1070,12 @@
+   for (Observer& observer : observers_) {
+     observer.OnSpacesChanged();
+   }
++}
++
++void SpacesWindowManager::OnSpaceAppearanceChanged(const SpaceId& id) {
++  for (Observer& observer : observers_) {
++    observer.OnSpacesChanged();
++  }
+ }
+ 
+ void SpacesWindowManager::OnSpaceRemoved(const base::Uuid& id) {
+Index: src/chrome/browser/ui/rac/spaces/spaces_window_manager.h
+===================================================================
+--- src.orig/chrome/browser/ui/rac/spaces/spaces_window_manager.h	2026-10-12 02:46:49.386201718 -0700
++++ src/chrome/browser/ui/rac/spaces/spaces_window_manager.h	2026-10-12 03:23:03.120595175 -0700
+@@ -62,6 +62,11 @@
+ 
+   class Observer : public base::CheckedObserver {
+    public:
++    // Fired only when this window's active space changes. Null means the
++    // window has not claimed a space or is displaying the elsewhere screen.
++    virtual void OnActiveSpaceChanged(BrowserWindowInterface* browser,
++                                      const std::optional<SpaceId>& previous,
++                                      const std::optional<SpaceId>& current) {}
+     // `browser` shows a different space, or started or stopped showing the
+     // "open in another window" screen.
+     virtual void OnWindowSpaceChanged(BrowserWindowInterface* browser) {}
+@@ -87,6 +92,8 @@
+   // window" screen, this is the space it points at.
+   std::optional<base::Uuid> GetSpaceForWindow(
+       const BrowserWindowInterface* browser) const;
++  std::optional<SpaceId> GetActiveSpaceId(
++      const BrowserWindowInterface* browser) const;
+   bool IsShowingElsewhereScreen(const BrowserWindowInterface* browser) const;
+ 
+   // The window showing `space`, or null. Hidden tabs still belong to a real
+@@ -195,6 +202,7 @@
+   // SpacesService::Observer:
+   void OnSpaceAdded(const base::Uuid& id) override;
+   void OnSpaceRenamed(const base::Uuid& id) override;
++  void OnSpaceAppearanceChanged(const SpaceId& id) override;
+   void OnSpaceRemoved(const base::Uuid& id) override;
+   void OnSpacesReordered() override;
+ 
