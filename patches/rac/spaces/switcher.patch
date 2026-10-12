@@ -1,0 +1,593 @@
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn	2026-10-12 01:28:17.367619198 -0700
++++ src/chrome/browser/ui/BUILD.gn	2026-10-12 02:11:02.906319244 -0700
+@@ -2498,6 +2498,10 @@
+       "rac/spaces/move_tab_to_space_sub_menu_model.h",
+       "rac/spaces/space_elsewhere_dialog.cc",
+       "rac/spaces/space_elsewhere_dialog.h",
++      "rac/spaces/space_swipe_controller.cc",
++      "rac/spaces/space_swipe_controller.h",
++      "rac/spaces/space_switcher_view.cc",
++      "rac/spaces/space_switcher_view.h",
+       "rac/spaces/spaces_snapshot.cc",
+       "rac/spaces/spaces_snapshot.h",
+       "rac/spaces/spaces_window_manager.cc",
+Index: src/chrome/browser/ui/rac/spaces/space_swipe_controller.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/rac/spaces/space_swipe_controller.cc	2026-10-12 02:11:02.907122976 -0700
+@@ -0,0 +1,158 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/spaces/space_swipe_controller.h"
++
++#include <cmath>
++
++#include "base/i18n/rtl.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
++#include "chrome/browser/ui/views/frame/base_tab_strip_region_view.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
++#include "ui/events/event.h"
++
++namespace rac {
++
++SpaceSwipeController::SpaceSwipeController(
++    VerticalTabStripRegionView* region_view)
++    : region_view_(region_view) {
++  CHECK(region_view_);
++  region_view_->AddPreTargetHandler(this);
++}
++
++SpaceSwipeController::~SpaceSwipeController() {
++  region_view_->RemovePreTargetHandler(this);
++}
++
++#if BUILDFLAG(IS_MAC)
++void SpaceSwipeController::OnScrollEvent(ui::ScrollEvent* event) {
++  if (!region_view_ || region_view_->IsDragging()) {
++    return;
++  }
++
++  // Handle fling cancellation and stream resets.
++  if (event->type() == ui::EventType::kScrollFlingStart ||
++      event->type() == ui::EventType::kScrollFlingCancel) {
++    if (gesture_state_ == GestureState::kHorizontalSwipe) {
++      event->SetHandled();
++      event->StopPropagation();
++    }
++    ResetGesture();
++    return;
++  }
++
++  // Momentum events never trigger a switch. While locked into a horizontal
++  // swipe they're consumed until the momentum stream ends.
++  if (event->momentum_phase() != ui::EventMomentumPhase::NONE) {
++    if (gesture_state_ == GestureState::kHorizontalSwipe) {
++      event->SetHandled();
++      event->StopPropagation();
++    }
++    if (event->momentum_phase() == ui::EventMomentumPhase::END) {
++      ResetGesture();
++    }
++    return;
++  }
++
++  if (event->scroll_event_phase() == ui::ScrollEventPhase::kBegan) {
++    ResetGesture();
++  }
++
++  if (event->scroll_event_phase() == ui::ScrollEventPhase::kEnd) {
++    if (gesture_state_ == GestureState::kHorizontalSwipe) {
++      event->SetHandled();
++      event->StopPropagation();
++    }
++    ResetGesture();
++    return;
++  }
++
++  ProcessSwipeOffset(event->x_offset(), event->y_offset(), event);
++}
++#endif
++
++void SpaceSwipeController::ProcessSwipeOffset(float x_offset,
++                                              float y_offset,
++                                              ui::Event* event) {
++  const base::TimeTicks now = base::TimeTicks::Now();
++  if (!last_event_time_.is_null() &&
++      (now - last_event_time_) > kGestureResetTimeout) {
++    ResetGesture();
++  }
++  last_event_time_ = now;
++
++  if (gesture_state_ == GestureState::kVerticalPassthrough) {
++    return;
++  }
++
++  cumulative_x_ += x_offset;
++  cumulative_y_ += y_offset;
++
++  if (gesture_state_ == GestureState::kNone) {
++    if (std::abs(cumulative_y_) >= kAxisLockThreshold &&
++        std::abs(cumulative_y_) > std::abs(cumulative_x_)) {
++      gesture_state_ = GestureState::kVerticalPassthrough;
++      return;
++    }
++    if (std::abs(cumulative_x_) >= kAxisLockThreshold &&
++        std::abs(cumulative_x_) > std::abs(cumulative_y_)) {
++      gesture_state_ = GestureState::kHorizontalSwipe;
++    }
++  }
++
++  if (gesture_state_ == GestureState::kHorizontalSwipe) {
++    // Trigger exactly once per physical swipe. Only consume the gesture when
++    // there's a space to switch to, so swipes past either end still reach
++    // other handlers.
++    if (!has_triggered_in_current_gesture_ &&
++        std::abs(cumulative_x_) >= kSwipeThreshold) {
++      bool forward = cumulative_x_ < 0;
++      if (base::i18n::IsRTL()) {
++        forward = !forward;
++      }
++      if (!SwitchSpace(forward)) {
++        return;
++      }
++      has_triggered_in_current_gesture_ = true;
++    }
++    if (has_triggered_in_current_gesture_) {
++      event->SetHandled();
++      event->StopPropagation();
++    }
++  }
++}
++
++void SpaceSwipeController::ResetGesture() {
++  gesture_state_ = GestureState::kNone;
++  cumulative_x_ = 0.0f;
++  cumulative_y_ = 0.0f;
++  has_triggered_in_current_gesture_ = false;
++}
++
++bool SpaceSwipeController::SwitchSpace(bool forward) {
++  BrowserWindowInterface* browser = region_view_->browser_view()->browser();
++  SpacesWindowManager* manager = SpacesWindowManager::From(browser);
++  if (!manager || manager->spaces()->spaces().size() < 2) {
++    return false;
++  }
++  const std::optional<base::Uuid> current = manager->GetSpaceForWindow(browser);
++  if (!current) {
++    return false;
++  }
++  const std::optional<size_t> index = manager->spaces()->GetIndex(*current);
++  if (!index) {
++    return false;
++  }
++  const size_t count = manager->spaces()->spaces().size();
++  const int next = static_cast<int>(*index) + (forward ? 1 : -1);
++  if (next < 0 || static_cast<size_t>(next) >= count) {
++    return false;
++  }
++  manager->ShowAdjacentSpace(browser, forward ? 1 : -1);
++  return true;
++}
++
++}  // namespace rac
+Index: src/chrome/browser/ui/rac/spaces/space_swipe_controller.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/rac/spaces/space_swipe_controller.h	2026-10-12 02:11:02.907476528 -0700
+@@ -0,0 +1,62 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_SPACES_SPACE_SWIPE_CONTROLLER_H_
++#define CHROME_BROWSER_UI_RAC_SPACES_SPACE_SWIPE_CONTROLLER_H_
++
++#include "base/memory/raw_ptr.h"
++#include "base/time/time.h"
++#include "build/build_config.h"
++#include "ui/events/event_handler.h"
++
++class VerticalTabStripRegionView;
++
++namespace rac {
++
++// Handles two-finger horizontal swipes across the vertical tab strip to
++// move between spaces. Installed as a pre-target handler on
++// VerticalTabStripRegionView, after the tab-group focus swipe controller,
++// which gets events first while its feature is on.
++class SpaceSwipeController : public ui::EventHandler {
++ public:
++  static constexpr float kAxisLockThreshold = 15.0f;
++  static constexpr float kSwipeThreshold = 75.0f;
++  static constexpr base::TimeDelta kGestureResetTimeout =
++      base::Milliseconds(300);
++
++  explicit SpaceSwipeController(VerticalTabStripRegionView* region_view);
++  SpaceSwipeController(const SpaceSwipeController&) = delete;
++  SpaceSwipeController& operator=(const SpaceSwipeController&) = delete;
++  ~SpaceSwipeController() override;
++
++  // ui::EventHandler:
++#if BUILDFLAG(IS_MAC)
++  void OnScrollEvent(ui::ScrollEvent* event) override;
++#endif
++
++ private:
++  enum class GestureState {
++    kNone,
++    kHorizontalSwipe,
++    kVerticalPassthrough,
++  };
++
++  void ProcessSwipeOffset(float x_offset, float y_offset, ui::Event* event);
++  void ResetGesture();
++  // Switches the window's space, if it can move in that direction. Returns
++  // false when there's nothing to switch to.
++  bool SwitchSpace(bool forward);
++
++  const raw_ptr<VerticalTabStripRegionView> region_view_;
++
++  GestureState gesture_state_ = GestureState::kNone;
++  float cumulative_x_ = 0.0f;
++  float cumulative_y_ = 0.0f;
++  bool has_triggered_in_current_gesture_ = false;
++  base::TimeTicks last_event_time_;
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_RAC_SPACES_SPACE_SWIPE_CONTROLLER_H_
+Index: src/chrome/browser/ui/rac/spaces/space_switcher_view.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/rac/spaces/space_switcher_view.cc	2026-10-12 02:11:02.907820622 -0700
+@@ -0,0 +1,186 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/spaces/space_switcher_view.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/app/vector_icons/vector_icons.h"
++#include "chrome/browser/rac/spaces/space.h"
++#include "chrome/browser/rac/spaces/spaces_service.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_ink_drop_util.h"
++#include "chrome/grit/generated_resources.h"
++#include "ui/accessibility/ax_enums.mojom.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/controls/button/button.h"
++#include "ui/views/controls/button/label_button.h"
++#include "ui/views/layout/flex_layout.h"
++
++namespace rac {
++
++namespace {
++
++constexpr int kDotTargetSize = 24;
++constexpr float kDotRadius = 4.0f;
++constexpr float kActiveDotRadius = 5.0f;
++constexpr int kDotGap = 2;
++constexpr int kAddIconSize = 14;
++
++// One dot in the switcher. A filled circle; the current space's dot is
++// bigger and brighter.
++class SpaceDotButton : public views::Button {
++  METADATA_HEADER(SpaceDotButton, views::Button)
++
++ public:
++  SpaceDotButton(base::RepeatingClosure on_pressed, bool active)
++      : views::Button(std::move(on_pressed)), active_(active) {
++    SetPreferredSize(gfx::Size(kDotTargetSize, kDotTargetSize));
++    SetFocusBehavior(FocusBehavior::ACCESSIBLE_ONLY);
++    ConfigureInkDrop(this);
++  }
++
++  // views::Button:
++  void OnPaintBackground(gfx::Canvas* canvas) override {
++    const ui::ColorProvider* color_provider = GetColorProvider();
++    if (!color_provider) {
++      return;
++    }
++    const SkColor color = color_provider->GetColor(
++        active_ ? kColorToolbarButtonIcon : kColorToolbarButtonIconInactive);
++    const gfx::Rect bounds = GetLocalBounds();
++    const float radius = active_ ? kActiveDotRadius : kDotRadius;
++    cc::PaintFlags flags;
++    flags.setAntiAlias(true);
++    flags.setColor(color);
++    canvas->DrawCircle(bounds.CenterPoint(), radius, flags);
++  }
++
++ private:
++  bool active_;
++};
++
++BEGIN_METADATA(SpaceDotButton)
++END_METADATA
++
++}  // namespace
++
++SpaceSwitcherView::SpaceSwitcherView(
++    BrowserWindowInterface* browser,
++    tabs::VerticalTabStripStateController* state_controller)
++    : browser_(browser), manager_(SpacesWindowManager::From(browser_)) {
++  layout_ = SetLayoutManager(std::make_unique<views::FlexLayout>());
++  layout_->SetMainAxisAlignment(views::LayoutAlignment::kCenter)
++      .SetCrossAxisAlignment(views::LayoutAlignment::kCenter)
++      .SetInteriorMargin(gfx::Insets::VH(2, 0))
++      .SetDefault(views::kMarginsKey, gfx::Insets(kDotGap));
++
++  GetViewAccessibility().SetRole(ax::mojom::Role::kToolbar);
++  GetViewAccessibility().SetName(
++      l10n_util::GetStringUTF16(IDS_RAC_SPACES_SWITCHER_ACCESSIBLE_NAME));
++
++  if (!manager_) {
++    SetVisible(false);
++    return;
++  }
++  manager_->AddObserver(this);
++
++  if (state_controller) {
++    SetOrientation(state_controller->GetCollapseState() !=
++                   tabs::VerticalTabStripCollapseState::kExpanded);
++    collapse_subscription_ =
++        state_controller->RegisterOnCollapseChanged(base::BindRepeating(
++            [](SpaceSwitcherView* self,
++               tabs::VerticalTabStripCollapseState state) {
++              self->SetOrientation(
++                  state != tabs::VerticalTabStripCollapseState::kExpanded);
++            },
++            base::Unretained(this)));
++  }
++
++  Rebuild();
++}
++
++BEGIN_METADATA(SpaceSwitcherView)
++END_METADATA
++
++SpaceSwitcherView::~SpaceSwitcherView() {
++  if (manager_) {
++    manager_->RemoveObserver(this);
++  }
++}
++
++void SpaceSwitcherView::OnThemeChanged() {
++  views::View::OnThemeChanged();
++  SchedulePaint();
++}
++
++void SpaceSwitcherView::OnWindowSpaceChanged(BrowserWindowInterface* browser) {
++  if (browser == browser_) {
++    Rebuild();
++  }
++}
++
++void SpaceSwitcherView::OnSpacesChanged() {
++  Rebuild();
++}
++
++void SpaceSwitcherView::Rebuild() {
++  RemoveAllChildViews();
++  if (!manager_) {
++    return;
++  }
++  const std::optional<base::Uuid> current =
++      manager_->GetSpaceForWindow(browser_);
++  const auto& spaces = manager_->spaces()->spaces();
++  for (size_t i = 0; i < spaces.size(); ++i) {
++    const Space& space = spaces[i];
++    const std::u16string name =
++        space.name.empty()
++            ? l10n_util::GetStringFUTF16(IDS_RAC_SPACE_FALLBACK_NAME,
++                                         base::NumberToString16(i + 1))
++            : base::UTF8ToUTF16(space.name);
++    auto dot = std::make_unique<SpaceDotButton>(
++        base::BindRepeating(&SpacesWindowManager::ShowSpace,
++                            base::Unretained(manager_), browser_, space.id),
++        current == space.id);
++    dot->SetTooltipText(name);
++    dot->SetAccessibleName(name);
++    AddChildView(std::move(dot));
++  }
++
++  auto add_button = std::make_unique<views::LabelButton>(
++      base::BindRepeating(&SpacesWindowManager::CreateAndShowSpace,
++                          base::Unretained(manager_), browser_));
++  const int icon_size = kAddIconSize;
++  add_button->SetImageModel(views::Button::STATE_NORMAL,
++                            ui::ImageModel::FromVectorIcon(
++                                kAddIcon, kColorToolbarButtonIcon, icon_size));
++  const std::u16string add_name =
++      l10n_util::GetStringUTF16(IDS_RAC_SPACES_NEW_SPACE);
++  add_button->SetTooltipText(add_name);
++  add_button->SetAccessibleName(add_name);
++  add_button->SetFocusBehavior(FocusBehavior::ACCESSIBLE_ONLY);
++  ConfigureInkDrop(add_button.get());
++  AddChildView(std::move(add_button));
++}
++
++void SpaceSwitcherView::SetOrientation(bool collapsed) {
++  layout_->SetOrientation(collapsed ? views::LayoutOrientation::kVertical
++                                    : views::LayoutOrientation::kHorizontal);
++}
++
++}  // namespace rac
+Index: src/chrome/browser/ui/rac/spaces/space_switcher_view.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/rac/spaces/space_switcher_view.h	2026-10-12 02:11:02.908155173 -0700
+@@ -0,0 +1,68 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_SPACES_SPACE_SWITCHER_VIEW_H_
++#define CHROME_BROWSER_UI_RAC_SPACES_SPACE_SWITCHER_VIEW_H_
++
++#include <memory>
++
++#include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
++#include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/view.h"
++
++class BrowserWindowInterface;
++
++namespace views {
++class FlexLayout;
++}
++
++namespace tabs {
++class VerticalTabStripStateController;
++}  // namespace tabs
++
++namespace rac {
++
++// The row of space dots at the bottom of the vertical tab strip: one dot
++// per space, then a button that creates a space. Dots stack into a column
++// when the strip is collapsed. Hidden in windows without spaces (incognito,
++// apps, popups).
++class SpaceSwitcherView : public views::View,
++                          public SpacesWindowManager::Observer {
++  METADATA_HEADER(SpaceSwitcherView, views::View)
++
++ public:
++  SpaceSwitcherView(BrowserWindowInterface* browser,
++                    tabs::VerticalTabStripStateController* state_controller);
++  SpaceSwitcherView(const SpaceSwitcherView&) = delete;
++  SpaceSwitcherView& operator=(const SpaceSwitcherView&) = delete;
++  ~SpaceSwitcherView() override;
++
++  // views::View:
++  void OnThemeChanged() override;
++
++  // SpacesWindowManager::Observer:
++  void OnWindowSpaceChanged(BrowserWindowInterface* browser) override;
++  void OnSpacesChanged() override;
++
++ private:
++  // Rebuilds the dots from the profile's spaces, keeping the new-space
++  // button last.
++  void Rebuild();
++  // Restacks the dots for the strip's width.
++  void SetOrientation(bool collapsed);
++
++  const raw_ptr<BrowserWindowInterface> browser_;
++  // Null in windows without spaces.
++  const raw_ptr<SpacesWindowManager> manager_;
++
++  raw_ptr<views::FlexLayout> layout_ = nullptr;
++
++  base::CallbackListSubscription collapse_subscription_;
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_RAC_SPACES_SPACE_SWITCHER_VIEW_H_
+Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc	2026-10-11 17:11:37.410496100 -0700
++++ src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc	2026-10-12 02:11:02.909663177 -0700
+@@ -25,16 +25,18 @@
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/omnibox/omnibox_tab_helper.h"
++#include "chrome/browser/ui/rac/spaces/space_swipe_controller.h"
++#include "chrome/browser/ui/rac/spaces/space_switcher_view.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/hover_tab_selector.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/ui_features.h"
++#include "chrome/browser/ui/view_ids.h"
+ #include "chrome/browser/ui/views/animations/tab_strip_animations.h"
+ #include "chrome/browser/ui/views/frame/base_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+-#include "chrome/browser/ui/view_ids.h"
+ #include "chrome/browser/ui/views/frame/custom_corners_background.h"
+ #include "chrome/browser/ui/views/frame/shadow_frame_view.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+@@ -140,6 +142,10 @@
+ 
+   gemini_button_ = AddChildView(std::make_unique<views::View>());
+ 
++  // rac: the space switcher sits at the bottom of the strip.
++  space_switcher_ = AddChildView(std::make_unique<rac::SpaceSwitcherView>(
++      browser_view->browser(), state_controller_));
++
+   resize_area_ = AddChildView(std::make_unique<views::ResizeArea>(this));
+   resize_area_->SetProperty(views::kViewIgnoredByLayoutKey, true);
+   resize_area_->SetFocusBehavior(views::View::FocusBehavior::ACCESSIBLE_ONLY);
+@@ -174,6 +180,9 @@
+         std::make_unique<VerticalTabStripFocusSwipeController>(this);
+   }
+ 
++  // rac: horizontal two-finger swipes over the strip switch spaces.
++  space_swipe_controller_ = std::make_unique<rac::SpaceSwipeController>(this);
++
+   SetNotifyEnterExitOnChild(true);
+   UpdateColors();
+   UpdateInteriorMargin();
+Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h	2026-10-11 17:11:36.282746631 -0700
++++ src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h	2026-10-12 02:11:02.910423617 -0700
+@@ -34,6 +34,11 @@
+ class BrowserView;
+ class VerticalTabStripBottomContainer;
+ class VerticalTabStripFocusSwipeController;
++
++namespace rac {
++class SpaceSwitcherView;
++class SpaceSwipeController;
++}  // namespace rac
+ class ShadowFrameView;
+ 
+ namespace tabs {
+@@ -234,6 +239,8 @@
+ 
+   raw_ptr<VerticalTabStripBottomContainer> bottom_button_container_ = nullptr;
+   raw_ptr<views::View> gemini_button_ = nullptr;
++  // rac: the space switcher at the bottom of the strip.
++  raw_ptr<rac::SpaceSwitcherView> space_switcher_ = nullptr;
+   raw_ptr<views::ResizeArea> resize_area_ = nullptr;
+   raw_ptr<ShadowFrameView> shadow_frame_ = nullptr;
+   int resize_area_width_;
+@@ -289,9 +296,13 @@
+   ClickEventHandler click_handler_{this};
+   std::unique_ptr<VerticalTabStripFocusSwipeController> focus_swipe_controller_;
+ 
++  // rac: horizontal swipe over the strip switches spaces.
++  std::unique_ptr<rac::SpaceSwipeController> space_swipe_controller_;
++
+   // Allows the swipe controller to inspect tab dragging state and rotate
+   // focused tab groups on the TabStripModel.
+   friend class VerticalTabStripFocusSwipeController;
++  friend class rac::SpaceSwipeController;
+ 
+   // The mouse exit event debounce timer.
+   base::OneShotTimer mouse_exit_timer_;

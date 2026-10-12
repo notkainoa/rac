@@ -1,0 +1,326 @@
+Index: src/chrome/browser/rac/spaces/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/spaces/BUILD.gn	2026-10-12 01:06:53.092975913 -0700
++++ src/chrome/browser/rac/spaces/BUILD.gn	2026-10-12 02:44:13.488742379 -0700
+@@ -47,13 +47,18 @@
+ # chrome/browser/rac/spaces:rac_spaces_unittests`. It's separate from
+ # Chromium's unit_tests, which takes hours to build.
+ test("rac_spaces_unittests") {
+-  sources = [ "spaces_service_unittest.cc" ]
++  sources = [
++    "spaces_service_unittest.cc",
++    "spaces_store_unittest.cc",
++  ]
+   deps = [
+     ":spaces",
+     "//base",
+     "//base/test:run_all_unittests",
+     "//base/test:test_support",
+     "//components/prefs:test_support",
++    "//components/sessions",
++    "//components/tab_groups",
+     "//testing/gmock",
+     "//testing/gtest",
+   ]
+Index: src/chrome/browser/rac/spaces/spaces_store.cc
+===================================================================
+--- src.orig/chrome/browser/rac/spaces/spaces_store.cc	2026-10-12 01:06:53.093529680 -0700
++++ src/chrome/browser/rac/spaces/spaces_store.cc	2026-10-12 02:44:13.489583405 -0700
+@@ -11,6 +11,7 @@
+ #include "base/base64.h"
+ #include "base/files/file_util.h"
+ #include "base/files/important_file_writer.h"
++#include "base/functional/bind.h"
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
+ #include "base/json/values_util.h"
+@@ -18,6 +19,7 @@
+ #include "base/pickle.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/task/thread_pool.h"
+ #include "base/token.h"
+ 
+ namespace rac {
+@@ -44,6 +46,21 @@
+ constexpr char kColorKey[] = "color";
+ constexpr char kCollapsedKey[] = "collapsed";
+ 
++void WriteSpaces(const base::FilePath& dir, base::DictValue snapshot) {
++  std::string json;
++  if (!base::JSONWriter::Write(snapshot, &json)) {
++    LOG(ERROR) << "rac: couldn't serialize spaces";
++    return;
++  }
++  const base::FilePath path = dir.AppendASCII("rac spaces");
++  // Keep the last good file, in case this write is cut short.
++  base::CopyFile(path, dir.AppendASCII("rac spaces.bak"));
++  if (!base::ImportantFileWriter::WriteFileAtomically(path, json,
++                                                      "RacSpacesStore")) {
++    LOG(ERROR) << "rac: couldn't write spaces";
++  }
++}
++
+ std::string SerializeNavigation(
+     const sessions::SerializedNavigationEntry& navigation) {
+   base::Pickle pickle;
+@@ -188,7 +205,10 @@
+ }
+ 
+ SpacesStore::SpacesStore(base::FilePath profile_dir)
+-    : dir_(std::move(profile_dir)) {}
++    : dir_(std::move(profile_dir)),
++      write_task_runner_(base::ThreadPool::CreateSequencedTaskRunner(
++          {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
++           base::TaskShutdownBehavior::BLOCK_SHUTDOWN})) {}
+ 
+ SpacesStore::~SpacesStore() {
+   if (write_pending_) {
+@@ -261,16 +281,14 @@
+ 
+ void SpacesStore::SaveNow() {
+   save_timer_.Stop();
+-  write_pending_ = false;
+-  std::string json;
+-  if (!base::JSONWriter::Write(ToDict(), &json)) {
+-    LOG(ERROR) << "rac: couldn't serialize spaces";
++  if (!write_pending_) {
+     return;
+   }
+-  const base::FilePath path = dir_.AppendASCII("rac spaces");
+-  // Keep the last good file, in case this write is cut short.
+-  base::CopyFile(path, dir_.AppendASCII("rac spaces.bak"));
+-  base::ImportantFileWriter::WriteFileAtomically(path, json, "RacSpacesStore");
++  // The task owns its snapshot and paths, so it can finish after this store
++  // is destroyed. Sequencing keeps older saves from replacing newer ones.
++  write_task_runner_->PostTask(FROM_HERE,
++                               base::BindOnce(&WriteSpaces, dir_, ToDict()));
++  write_pending_ = false;
+ }
+ 
+ base::DictValue SpacesStore::ToDict() const {
+Index: src/chrome/browser/rac/spaces/spaces_store.h
+===================================================================
+--- src.orig/chrome/browser/rac/spaces/spaces_store.h	2026-10-12 01:06:53.093806563 -0700
++++ src/chrome/browser/rac/spaces/spaces_store.h	2026-10-12 02:44:13.490018209 -0700
+@@ -11,6 +11,8 @@
+ #include <vector>
+ 
+ #include "base/files/file_path.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "base/time/time.h"
+ #include "base/timer/timer.h"
+ #include "base/uuid.h"
+@@ -61,7 +63,8 @@
+ // never loses a hidden space's tabs.
+ //
+ // Writes are coalesced and atomic, and the previous file is kept as
+-// `rac spaces.bak`. All methods must be called on the UI thread.
++// `rac spaces.bak`. All methods must be called on the UI thread. Disk writes
++// run on a background sequence and complete before normal browser shutdown.
+ class SpacesStore {
+  public:
+   static constexpr int kVersion = 1;
+@@ -83,12 +86,14 @@
+   void Remove(const base::Uuid& space);
+ 
+   bool HasPendingWrite() const;
++  // Posts the pending snapshot for writing without blocking the caller.
+   void SaveNow();
+ 
+  private:
+   base::DictValue ToDict() const;
+ 
+   const base::FilePath dir_;
++  const scoped_refptr<base::SequencedTaskRunner> write_task_runner_;
+   std::map<base::Uuid, StoredSpace> spaces_;
+ 
+   // Top-level keys this build doesn't read, written back unchanged.
+Index: src/chrome/browser/rac/spaces/spaces_store_unittest.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/spaces/spaces_store_unittest.cc	2026-10-12 02:44:13.490380720 -0700
+@@ -0,0 +1,182 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/spaces/spaces_store.h"
++
++#include <memory>
++#include <string>
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/test/task_environment.h"
++#include "base/threading/thread_restrictions.h"
++#include "base/time/time.h"
++#include "base/uuid.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++class SpacesStoreTest : public testing::Test {
++ protected:
++  void SetUp() override { ASSERT_TRUE(dir_.CreateUniqueTempDir()); }
++  void TearDown() override { task_environment_.RunUntilIdle(); }
++
++  StoredSpace MakeSpace(const base::Uuid& id, const std::string& marker) {
++    StoredSpace space;
++    space.space = id;
++    space.unknown_fields.Set("marker", marker);
++    return space;
++  }
++
++  base::test::TaskEnvironment task_environment_{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME,
++      base::test::TaskEnvironment::ThreadPoolExecutionMode::QUEUED};
++  base::ScopedTempDir dir_;
++};
++
++TEST_F(SpacesStoreTest, DelayedSaveDoesNotBlockUIThread) {
++  SpacesStore store(dir_.GetPath());
++  const base::Uuid id = base::Uuid::GenerateRandomV4();
++  store.Put(MakeSpace(id, "saved"));
++
++  {
++    // The browser disallows blocking once its main loop starts. Exercise the
++    // same timer-driven save that runs just after creating a new space.
++    base::ScopedDisallowBlocking disallow_blocking;
++    task_environment_.FastForwardBy(base::Seconds(1));
++  }
++
++  EXPECT_FALSE(store.HasPendingWrite());
++  SpacesStore reloaded(dir_.GetPath());
++  reloaded.Load();
++  ASSERT_TRUE(reloaded.Find(id));
++  EXPECT_EQ(*reloaded.Find(id)->unknown_fields.FindString("marker"), "saved");
++}
++
++TEST_F(SpacesStoreTest, ExplicitSaveQueuesIOAndOutlivesStore) {
++  const base::Uuid id = base::Uuid::GenerateRandomV4();
++  {
++    SpacesStore store(dir_.GetPath());
++    store.Put(MakeSpace(id, "saved"));
++    base::ScopedDisallowBlocking disallow_blocking;
++    store.SaveNow();
++    EXPECT_FALSE(store.HasPendingWrite());
++  }
++  // No disk work runs until the background tasks are allowed to execute.
++  EXPECT_FALSE(base::PathExists(dir_.GetPath().AppendASCII("rac spaces")));
++  task_environment_.RunUntilIdle();
++
++  SpacesStore reloaded(dir_.GetPath());
++  reloaded.Load();
++  ASSERT_TRUE(reloaded.Find(id));
++  EXPECT_EQ(*reloaded.Find(id)->unknown_fields.FindString("marker"), "saved");
++}
++
++TEST_F(SpacesStoreTest, DestructionFlushesPendingSaveWithoutBlocking) {
++  const base::Uuid id = base::Uuid::GenerateRandomV4();
++  auto store = std::make_unique<SpacesStore>(dir_.GetPath());
++  store->Put(MakeSpace(id, "saved on quit"));
++  {
++    base::ScopedDisallowBlocking disallow_blocking;
++    store.reset();
++  }
++  task_environment_.RunUntilIdle();
++
++  SpacesStore reloaded(dir_.GetPath());
++  reloaded.Load();
++  ASSERT_TRUE(reloaded.Find(id));
++  EXPECT_EQ(*reloaded.Find(id)->unknown_fields.FindString("marker"),
++            "saved on quit");
++}
++
++TEST_F(SpacesStoreTest, SavesRemainOrderedAndKeepPreviousSnapshot) {
++  SpacesStore store(dir_.GetPath());
++  const base::Uuid id = base::Uuid::GenerateRandomV4();
++  {
++    base::ScopedDisallowBlocking disallow_blocking;
++    store.Put(MakeSpace(id, "first"));
++    store.SaveNow();
++    store.Put(MakeSpace(id, "second"));
++    store.SaveNow();
++  }
++  task_environment_.RunUntilIdle();
++
++  SpacesStore reloaded(dir_.GetPath());
++  reloaded.Load();
++  ASSERT_TRUE(reloaded.Find(id));
++  EXPECT_EQ(*reloaded.Find(id)->unknown_fields.FindString("marker"), "second");
++
++  // A damaged primary file should restore the previous completed save.
++  ASSERT_TRUE(base::WriteFile(dir_.GetPath().AppendASCII("rac spaces"), "{"));
++  SpacesStore fallback(dir_.GetPath());
++  fallback.Load();
++  ASSERT_TRUE(fallback.Find(id));
++  EXPECT_EQ(*fallback.Find(id)->unknown_fields.FindString("marker"), "first");
++}
++
++TEST_F(SpacesStoreTest, CoalescesChangesUntilOneSecondAfterLastChange) {
++  SpacesStore store(dir_.GetPath());
++  const base::Uuid id = base::Uuid::GenerateRandomV4();
++  store.Put(MakeSpace(id, "first"));
++  task_environment_.FastForwardBy(base::Milliseconds(500));
++  store.Put(MakeSpace(id, "second"));
++  task_environment_.FastForwardBy(base::Milliseconds(999));
++  EXPECT_TRUE(store.HasPendingWrite());
++  EXPECT_FALSE(base::PathExists(dir_.GetPath().AppendASCII("rac spaces")));
++  {
++    base::ScopedDisallowBlocking disallow_blocking;
++    task_environment_.FastForwardBy(base::Milliseconds(1));
++  }
++
++  EXPECT_FALSE(store.HasPendingWrite());
++  EXPECT_FALSE(base::PathExists(dir_.GetPath().AppendASCII("rac spaces.bak")));
++  SpacesStore reloaded(dir_.GetPath());
++  reloaded.Load();
++  ASSERT_TRUE(reloaded.Find(id));
++  EXPECT_EQ(*reloaded.Find(id)->unknown_fields.FindString("marker"), "second");
++}
++
++TEST_F(SpacesStoreTest, RemovalIsSavedWithoutBlocking) {
++  SpacesStore store(dir_.GetPath());
++  const base::Uuid id = base::Uuid::GenerateRandomV4();
++  store.Put(MakeSpace(id, "saved"));
++  store.SaveNow();
++  task_environment_.RunUntilIdle();
++
++  {
++    base::ScopedDisallowBlocking disallow_blocking;
++    store.Remove(id);
++    task_environment_.FastForwardBy(base::Seconds(1));
++  }
++  SpacesStore reloaded(dir_.GetPath());
++  reloaded.Load();
++  EXPECT_FALSE(reloaded.Find(id));
++}
++
++TEST_F(SpacesStoreTest, SaveWithoutChangesDoesNotOverwriteBackup) {
++  SpacesStore store(dir_.GetPath());
++  const base::Uuid id = base::Uuid::GenerateRandomV4();
++  store.Put(MakeSpace(id, "first"));
++  store.SaveNow();
++  task_environment_.RunUntilIdle();
++  store.Put(MakeSpace(id, "second"));
++  store.SaveNow();
++  task_environment_.RunUntilIdle();
++  {
++    base::ScopedDisallowBlocking disallow_blocking;
++    store.SaveNow();
++    task_environment_.RunUntilIdle();
++  }
++
++  ASSERT_TRUE(base::WriteFile(dir_.GetPath().AppendASCII("rac spaces"), "{"));
++  SpacesStore reloaded(dir_.GetPath());
++  reloaded.Load();
++  ASSERT_TRUE(reloaded.Find(id));
++  EXPECT_EQ(*reloaded.Find(id)->unknown_fields.FindString("marker"), "first");
++}
++
++}  // namespace
++}  // namespace rac
