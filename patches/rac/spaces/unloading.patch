@@ -1,0 +1,175 @@
+Index: src/chrome/browser/ui/rac/spaces/spaces_window_manager.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/spaces/spaces_window_manager.cc	2026-10-12 01:06:53.099849077 -0700
++++ src/chrome/browser/ui/rac/spaces/spaces_window_manager.cc	2026-10-12 01:27:15.572900834 -0700
+@@ -9,6 +9,7 @@
+ 
+ #include "base/check.h"
+ #include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
+ #include "chrome/browser/lifetime/browser_shutdown.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/search/search.h"
+@@ -79,6 +80,15 @@
+          search::IsNTPOrRelatedURL(contents->GetVisibleURL(), profile);
+ }
+ 
++// Unloading leaves alone the tabs a user is likely to notice stopping:
++// sound, picture-in-picture, and tabs still loading.
++bool CanUnload(tabs::TabInterface* tab) {
++  content::WebContents* contents = tab->GetContents();
++  return !contents->WasDiscarded() && !contents->IsLoading() &&
++         !contents->IsCurrentlyAudible() &&
++         !contents->HasPictureInPictureVideo();
++}
++
+ }  // namespace
+ 
+ SpacesWindowManager::SpacesWindowManager(Profile* profile,
+@@ -341,6 +351,7 @@
+     hidden_[space].Append(std::move(moved));
+     store_.Put(SnapshotHiddenSpace(space, hidden_[space]));
+   }
++  UpdateUnloadTimer();
+ }
+ 
+ void SpacesWindowManager::DeleteSpace(const base::Uuid& space) {
+@@ -368,9 +379,56 @@
+     hidden_.erase(it);
+   }
+   store_.Remove(space);
++  UpdateUnloadTimer();
+   spaces_->RemoveSpace(space);
+ }
+ 
++void SpacesWindowManager::UnloadSpace(const base::Uuid& space) {
++  auto it = hidden_.find(space);
++  if (it == hidden_.end()) {
++    return;
++  }
++  for (tabs::TabInterface* tab : it->second.GetTabs()) {
++    if (CanUnload(tab)) {
++      tab->GetContents()->Discard(base::DoNothing());
++    }
++  }
++}
++
++bool SpacesWindowManager::IsSpaceUnloaded(const base::Uuid& space) const {
++  auto it = hidden_.find(space);
++  if (it == hidden_.end() || it->second.empty()) {
++    return false;
++  }
++  for (tabs::TabInterface* tab : it->second.GetTabs()) {
++    if (!tab->GetContents()->WasDiscarded()) {
++      return false;
++    }
++  }
++  return true;
++}
++
++void SpacesWindowManager::UnloadStaleHiddenSpaces() {
++  const base::TimeTicks now = base::TimeTicks::Now();
++  for (const auto& [space, hidden] : hidden_) {
++    if (now - hidden.hidden_at() >= kHiddenUnloadDelay) {
++      UnloadSpace(space);
++    }
++  }
++  UpdateUnloadTimer();
++}
++
++void SpacesWindowManager::UpdateUnloadTimer() {
++  if (hidden_.empty()) {
++    unload_timer_.Stop();
++    return;
++  }
++  if (!unload_timer_.IsRunning()) {
++    unload_timer_.Start(FROM_HERE, base::Minutes(1), this,
++                        &SpacesWindowManager::UnloadStaleHiddenSpaces);
++  }
++}
++
+ size_t SpacesWindowManager::GetTabCount(const base::Uuid& space) const {
+   if (auto it = hidden_.find(space); it != hidden_.end()) {
+     return it->second.GetTabs().size();
+@@ -502,6 +560,7 @@
+   // where an empty strip is expected.
+   hidden_[space].Append(HiddenSpace::Detach(model, indices));
+   store_.Put(SnapshotHiddenSpace(space, hidden_[space]));
++  UpdateUnloadTimer();
+ }
+ 
+ tabs::TabInterface* SpacesWindowManager::RevealSpace(WindowState& state,
+@@ -510,6 +569,7 @@
+   if (it != hidden_.end() && !it->second.empty()) {
+     HiddenSpace hidden = std::move(it->second);
+     hidden_.erase(it);
++    UpdateUnloadTimer();
+     return hidden.InsertInto(state.browser->GetTabStripModel());
+   }
+   // No live tabs. The store may still have them, after a crash or if the
+@@ -764,6 +824,7 @@
+     hidden_.erase(it);
+   }
+   store_.Remove(id);
++  UpdateUnloadTimer();
+   const base::Uuid fallback = spaces_->spaces().front().id;
+   for (const auto& [browser, state] : windows_) {
+     if (state->space == id) {
+Index: src/chrome/browser/ui/rac/spaces/spaces_window_manager.h
+===================================================================
+--- src.orig/chrome/browser/ui/rac/spaces/spaces_window_manager.h	2026-10-12 01:06:53.100146545 -0700
++++ src/chrome/browser/ui/rac/spaces/spaces_window_manager.h	2026-10-12 01:27:15.573781353 -0700
+@@ -15,6 +15,7 @@
+ #include "base/observer_list.h"
+ #include "base/observer_list_types.h"
+ #include "base/scoped_observation.h"
++#include "base/timer/timer.h"
+ #include "base/uuid.h"
+ #include "chrome/browser/rac/spaces/spaces_service.h"
+ #include "chrome/browser/rac/spaces/spaces_store.h"
+@@ -55,6 +56,10 @@
+                             public TabStripModelObserver,
+                             public SpacesService::Observer {
+  public:
++  // How long a hidden space keeps its tabs loaded before they're unloaded
++  // to free memory.
++  static constexpr base::TimeDelta kHiddenUnloadDelay = base::Minutes(15);
++
+   class Observer : public base::CheckedObserver {
+    public:
+     // `browser` shows a different space, or started or stopped showing the
+@@ -112,6 +117,14 @@
+ 
+   size_t GetTabCount(const base::Uuid& space) const;
+ 
++  // Discards the tabs of a hidden space to free their memory. They reload
++  // when a window shows the space again. Tabs playing audio, showing
++  // picture-in-picture, or still loading stay live. Does nothing for a
++  // space a window shows.
++  void UnloadSpace(const base::Uuid& space);
++  // True when the space's tabs are hidden and all unloaded.
++  bool IsSpaceUnloaded(const base::Uuid& space) const;
++
+   void AddObserver(Observer* observer);
+   void RemoveObserver(Observer* observer);
+ 
+@@ -159,6 +172,11 @@
+   // reopens in it and the tab restore service knows it.
+   void SaveWindowSpaceToSession(const WindowState& state);
+ 
++  // Discards the tabs of spaces hidden longer than the delay.
++  void UnloadStaleHiddenSpaces();
++  // Runs the unload timer while any space is hidden.
++  void UpdateUnloadTimer();
++
+   // BrowserCollectionObserver:
+   void OnBrowserCreated(BrowserWindowInterface* browser) override;
+   void OnBrowserClosed(BrowserWindowInterface* browser) override;
+@@ -194,6 +212,7 @@
+   std::map<base::Uuid, HiddenSpace> hidden_;
+ 
+   base::ObserverList<Observer> observers_;
++  base::RepeatingTimer unload_timer_;
+   base::ScopedObservation<ProfileBrowserCollection, BrowserCollectionObserver>
+       browser_collection_observation_{this};
+   base::ScopedObservation<SpacesService, SpacesService::Observer>
