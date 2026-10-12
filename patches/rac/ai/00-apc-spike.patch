@@ -1,0 +1,195 @@
+Index: src/chrome/browser/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/BUILD.gn	2026-10-11 17:11:42.598077026 -0700
++++ src/chrome/browser/BUILD.gn	2026-10-12 00:22:31.701056465 -0700
+@@ -2091,6 +2091,7 @@
+     "//chrome/browser/affiliations",
+     "//chrome/browser/ai",
+     "//chrome/browser/ai:impl",
++    "//chrome/browser/rac/ai:ai",
+     "//chrome/browser/autocomplete",
+     "//chrome/browser/autocomplete:impl",
+     "//chrome/browser/autofill",
+Index: src/chrome/browser/rac/ai/BUILD.gn
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/BUILD.gn	2026-10-12 00:41:53.712156293 -0700
+@@ -0,0 +1,26 @@
++# rac's opt-in AI browser-process code.
++source_set("ai") {
++  sources = [
++    "page_context.cc",
++    "page_context.h",
++  ]
++  deps = [
++    "//base",
++    "//components/optimization_guide/content/browser:browser",
++    "//components/optimization_guide/proto:optimization_guide_proto",
++    "//content/public/browser",
++  ]
++}
++
++source_set("browser_tests") {
++  testonly = true
++  sources = [ "page_context_browsertest.cc" ]
++  deps = [
++    ":ai",
++    "//base/test:test_support",
++    "//chrome/test:test_support",
++    "//components/optimization_guide/proto:optimization_guide_proto",
++    "//content/test:test_support",
++    "//testing/gtest",
++  ]
++}
+Index: src/chrome/browser/rac/ai/page_context.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/page_context.cc	2026-10-12 00:44:33.206223174 -0700
+@@ -0,0 +1,66 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/ai/page_context.h"
++
++#include <algorithm>
++#include <string>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "components/optimization_guide/content/browser/page_content_proto_provider.h"
++#include "components/optimization_guide/proto/features/common_quality_data.pb.h"
++#include "content/public/browser/web_contents.h"
++#include "third_party/blink/public/mojom/content_extraction/ai_page_content.mojom.h"
++
++namespace rac::ai {
++namespace {
++
++constexpr size_t kMaximumPageTextBytes = 32 * 1024;
++
++void AppendText(const optimization_guide::proto::ContentNode& node,
++                std::string& output) {
++  if (output.size() >= kMaximumPageTextBytes) {
++    return;
++  }
++  if (node.content_attributes().has_text_data()) {
++    const std::string& text =
++        node.content_attributes().text_data().text_content();
++    output.append(text, 0, std::min(text.size(),
++                                    kMaximumPageTextBytes - output.size()));
++    if (output.size() < kMaximumPageTextBytes) {
++      output.push_back('\n');
++    }
++  }
++  for (const auto& child : node.children_nodes()) {
++    AppendText(child, output);
++  }
++}
++
++void OnPageContent(base::OnceCallback<void(PageTextResult)> callback,
++                   optimization_guide::AIPageContentResultOrError result) {
++  if (!result.has_value()) {
++    std::move(callback).Run(base::unexpected(std::move(result.error())));
++    return;
++  }
++  std::string text;
++  AppendText(result->proto.root_node(), text);
++  std::move(callback).Run(base::ok(std::move(text)));
++}
++
++}  // namespace
++
++void ExtractPageText(content::WebContents* contents,
++                     base::OnceCallback<void(PageTextResult)> callback) {
++  if (!contents) {
++    std::move(callback).Run(base::unexpected("No page to read"));
++    return;
++  }
++  optimization_guide::GetAIPageContent(
++      contents,
++      optimization_guide::DefaultAIPageContentOptions(
++          /*on_critical_path=*/true),
++      base::BindOnce(&OnPageContent, std::move(callback)));
++}
++
++}  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/page_context.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/page_context.h	2026-10-12 00:22:31.661647567 -0700
+@@ -0,0 +1,26 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_AI_PAGE_CONTEXT_H_
++#define CHROME_BROWSER_RAC_AI_PAGE_CONTEXT_H_
++
++#include <string>
++
++#include "base/functional/callback.h"
++#include "base/types/expected.h"
++
++namespace content {
++class WebContents;
++}
++
++namespace rac::ai {
++
++// Reads a page only in response to an explicit user send. The caller must
++// check the AI pref and validate the target tab before invoking this method.
++using PageTextResult = base::expected<std::string, std::string>;
++void ExtractPageText(content::WebContents* contents,
++                     base::OnceCallback<void(PageTextResult)> callback);
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_PAGE_CONTEXT_H_
+Index: src/chrome/browser/rac/ai/page_context_browsertest.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/page_context_browsertest.cc	2026-10-12 00:22:31.664928013 -0700
+@@ -0,0 +1,33 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/ai/page_context.h"
++
++#include <string>
++
++#include "base/test/test_future.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/test/base/in_process_browser_test.h"
++#include "content/public/test/browser_test.h"
++#include "content/public/test/browser_test_utils.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace rac::ai {
++
++IN_PROC_BROWSER_TEST_F(InProcessBrowserTest, RacAIExtractsPageText) {
++  auto* contents = browser()->tab_strip_model()->GetActiveWebContents();
++  ASSERT_TRUE(content::NavigateToURL(
++      contents,
++      GURL("data:text/html,%3Ch1%3ERacAPCHeading%3C/h1%3E"
++           "%3Cp%3ERacAPCParagraph%3C/p%3E")));
++  base::test::TestFuture<PageTextResult> future;
++  ExtractPageText(contents, future.GetCallback());
++  auto result = future.Take();
++  ASSERT_TRUE(result.has_value()) << result.error();
++  EXPECT_NE(result->find("RacAPCHeading"), std::string::npos);
++  EXPECT_NE(result->find("RacAPCParagraph"), std::string::npos);
++}
++
++}  // namespace rac::ai
+Index: src/chrome/test/BUILD.gn
+===================================================================
+--- src.orig/chrome/test/BUILD.gn	2026-10-11 17:11:39.047388527 -0700
++++ src/chrome/test/BUILD.gn	2026-10-12 00:22:31.759674834 -0700
+@@ -1931,6 +1931,7 @@
+       "//chrome/browser/affiliations",
+       "//chrome/browser/ai",
+       "//chrome/browser/ai:browser_tests",
++      "//chrome/browser/rac/ai:browser_tests",
+       "//chrome/browser/apps/app_service",
+       "//chrome/browser/apps/app_service:app_registry_cache_waiter",
+       "//chrome/browser/apps/app_service:test_support",
