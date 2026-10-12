@@ -1,0 +1,224 @@
+--- a/chrome/browser/picture_in_picture/auto_picture_in_picture_window_occlusion_helper_web_contents.cc
++++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_window_occlusion_helper_web_contents.cc
+@@ -6,6 +6,11 @@
+ 
+ #include "content/public/browser/web_contents.h"
+ 
++#if BUILDFLAG(IS_MAC)
++#include "base/functional/bind.h"
++#include "chrome/browser/rac/pip/app_focus_observer_mac.h"
++#endif
++
+ // static
+ std::unique_ptr<AutoPictureInPictureWindowOcclusionHelperBase>
+ AutoPictureInPictureWindowOcclusionHelperBase::CreatePlatformHelper(
+@@ -36,6 +41,15 @@ void AutoPictureInPictureWindowOcclusion
+   }
+   is_observing_ = true;
+   // We are already observing the WebContents, so there is nothing else to do.
++#if BUILDFLAG(IS_MAC)
++  // Another app taking focus counts as occluding the window.
++  app_focus_observer_ = std::make_unique<rac::AppFocusObserver>(
++      base::BindRepeating(
++          [](AutoPictureInPictureWindowOcclusionHelperWebContents* helper) {
++            helper->RunCallback(helper->GetOcclusionState());
++          },
++          base::Unretained(this)));
++#endif
+ }
+ 
+ void AutoPictureInPictureWindowOcclusionHelperWebContents::StopObserving() {
+@@ -45,6 +59,9 @@ void AutoPictureInPictureWindowOcclusion
+   is_observing_ = false;
+   // We want to continue observing the WebContents, so there is nothing else to
+   // do.
++#if BUILDFLAG(IS_MAC)
++  app_focus_observer_.reset();
++#endif
+ }
+ 
+ AutoPictureInPictureWindowOcclusionHelperBase::OcclusionState
+@@ -52,6 +69,11 @@ AutoPictureInPictureWindowOcclusionHelpe
+     const {
+   switch (current_visibility_) {
+     case content::Visibility::VISIBLE:
++#if BUILDFLAG(IS_MAC)
++      if (app_focus_observer_ && app_focus_observer_->IsAnotherAppInFront()) {
++        return OcclusionState::kOccluded;
++      }
++#endif
+       return OcclusionState::kVisible;
+     case content::Visibility::OCCLUDED:
+       return OcclusionState::kOccluded;
+--- a/chrome/browser/picture_in_picture/auto_picture_in_picture_window_occlusion_helper_web_contents.h
++++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_window_occlusion_helper_web_contents.h
+@@ -5,6 +5,9 @@
+ #ifndef CHROME_BROWSER_PICTURE_IN_PICTURE_AUTO_PICTURE_IN_PICTURE_WINDOW_OCCLUSION_HELPER_WEB_CONTENTS_H_
+ #define CHROME_BROWSER_PICTURE_IN_PICTURE_AUTO_PICTURE_IN_PICTURE_WINDOW_OCCLUSION_HELPER_WEB_CONTENTS_H_
+ 
++#include <memory>
++
++#include "build/build_config.h"
+ #include "chrome/browser/picture_in_picture/auto_picture_in_picture_window_occlusion_helper_base.h"
+ #include "content/public/browser/visibility.h"
+ #include "content/public/browser/web_contents_observer.h"
+@@ -13,6 +16,12 @@ namespace content {
+ class WebContents;
+ }  // namespace content
+ 
++#if BUILDFLAG(IS_MAC)
++namespace rac {
++class AppFocusObserver;
++}  // namespace rac
++#endif
++
+ // This class tracks the window occlusion state of a given WebContents by
+ // listening for content::WebContentsObserver::OnVisibilityChanged() calls. On
+ // the platforms where we use this, it detects both occlusion by another Chrome
+@@ -41,6 +50,9 @@ class AutoPictureInPictureWindowOcclusio
+  private:
+   bool is_observing_ = false;
+   content::Visibility current_visibility_ = content::Visibility::HIDDEN;
++#if BUILDFLAG(IS_MAC)
++  std::unique_ptr<rac::AppFocusObserver> app_focus_observer_;
++#endif
+ };
+ 
+ #endif  // CHROME_BROWSER_PICTURE_IN_PICTURE_AUTO_PICTURE_IN_PICTURE_WINDOW_OCCLUSION_HELPER_WEB_CONTENTS_H_
+--- a/chrome/browser/rac/pip/BUILD.gn
++++ b/chrome/browser/rac/pip/BUILD.gn
+@@ -8,7 +8,15 @@ source_set("pip") {
+     "auto_pip_prefs.h",
+   ]
+   deps = [
++    "//base",
+     "//components/pref_registry",
+     "//components/prefs",
+   ]
++  if (is_mac) {
++    sources += [
++      "app_focus_observer_mac.h",
++      "app_focus_observer_mac.mm",
++    ]
++    frameworks = [ "AppKit.framework" ]
++  }
+ }
+--- /dev/null
++++ b/chrome/browser/rac/pip/app_focus_observer_mac.h
+@@ -0,0 +1,42 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_PIP_APP_FOCUS_OBSERVER_MAC_H_
++#define CHROME_BROWSER_RAC_PIP_APP_FOCUS_OBSERVER_MAC_H_
++
++#include <memory>
++
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++
++namespace rac {
++
++// Tracks whether another regular app (one with a Dock icon) has taken focus
++// from rac. Menu bar apps and launchers such as Spotlight, Raycast, or
++// 1Password's quick access open briefly over whatever the user is looking at,
++// so they leave the state unchanged.
++class AppFocusObserver {
++ public:
++  // `on_change` runs whenever IsAnotherAppInFront() changes.
++  explicit AppFocusObserver(base::RepeatingClosure on_change);
++  AppFocusObserver(const AppFocusObserver&) = delete;
++  AppFocusObserver& operator=(const AppFocusObserver&) = delete;
++  ~AppFocusObserver();
++
++  bool IsAnotherAppInFront() const { return another_app_in_front_; }
++
++ private:
++  struct ObjCStorage;
++
++  void SetAnotherAppInFront(bool another_app_in_front);
++
++  base::RepeatingClosure on_change_;
++  bool another_app_in_front_ = false;
++  std::unique_ptr<ObjCStorage> objc_storage_;
++  base::WeakPtrFactory<AppFocusObserver> weak_factory_{this};
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_PIP_APP_FOCUS_OBSERVER_MAC_H_
+--- /dev/null
++++ b/chrome/browser/rac/pip/app_focus_observer_mac.mm
+@@ -0,0 +1,71 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#import "chrome/browser/rac/pip/app_focus_observer_mac.h"
++
++#import <AppKit/AppKit.h>
++
++#include <optional>
++
++namespace rac {
++
++namespace {
++
++// Returns whether activating `app` changes which app is in front, or nullopt
++// when it should be ignored (a menu bar app or launcher).
++std::optional<bool> IsAnotherAppInFrontAfterActivating(
++    NSRunningApplication* app) {
++  if (!app || [app isEqual:NSRunningApplication.currentApplication]) {
++    return false;
++  }
++  if (app.activationPolicy != NSApplicationActivationPolicyRegular) {
++    return std::nullopt;
++  }
++  return true;
++}
++
++}  // namespace
++
++struct AppFocusObserver::ObjCStorage {
++  id __strong observer;
++};
++
++AppFocusObserver::AppFocusObserver(base::RepeatingClosure on_change)
++    : on_change_(std::move(on_change)),
++      objc_storage_(std::make_unique<ObjCStorage>()) {
++  another_app_in_front_ =
++      IsAnotherAppInFrontAfterActivating(
++          NSWorkspace.sharedWorkspace.frontmostApplication)
++          .value_or(false);
++
++  base::WeakPtr<AppFocusObserver> weak_this = weak_factory_.GetWeakPtr();
++  objc_storage_->observer = [NSWorkspace.sharedWorkspace.notificationCenter
++      addObserverForName:NSWorkspaceDidActivateApplicationNotification
++                  object:nil
++                   queue:nil
++              usingBlock:^(NSNotification* notification) {
++                NSRunningApplication* app =
++                    notification.userInfo[NSWorkspaceApplicationKey];
++                std::optional<bool> in_front =
++                    IsAnotherAppInFrontAfterActivating(app);
++                if (weak_this && in_front.has_value()) {
++                  weak_this->SetAnotherAppInFront(*in_front);
++                }
++              }];
++}
++
++AppFocusObserver::~AppFocusObserver() {
++  [NSWorkspace.sharedWorkspace.notificationCenter
++      removeObserver:objc_storage_->observer];
++}
++
++void AppFocusObserver::SetAnotherAppInFront(bool another_app_in_front) {
++  if (another_app_in_front_ == another_app_in_front) {
++    return;
++  }
++  another_app_in_front_ = another_app_in_front;
++  on_change_.Run();
++}
++
++}  // namespace rac
