@@ -1,0 +1,1256 @@
+Index: src/chrome/browser/ui/rac/sidebar/sidebar_items.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/sidebar/sidebar_items.cc	2026-10-12 08:24:54.105918022 -0700
++++ src/chrome/browser/ui/rac/sidebar/sidebar_items.cc	2026-10-12 08:29:41.757125270 -0700
+@@ -322,6 +322,54 @@
+   SaveAndNotify();
+ }
+ 
++void SidebarItems::MoveItems(const std::vector<std::string>& ids,
++                             std::string_view list_key,
++                             const SidebarPosition& position) {
++  if (!position.folder_id.empty()) {
++    std::string folder_list;
++    if (!FindMutableFolder(position.folder_id, &folder_list) ||
++        folder_list != list_key) {
++      return;
++    }
++  }
++  std::vector<SidebarItem> taken;
++  std::set<std::string> emptied_folders;
++  for (const std::string& id : ids) {
++    std::optional<ItemLocation> location = LocateItem(id);
++    if (!location) {
++      continue;
++    }
++    if (location->folder) {
++      std::vector<SidebarItem>& items = location->folder->items;
++      taken.push_back(std::move(items[location->index]));
++      items.erase(items.begin() + location->index);
++      if (items.empty()) {
++        emptied_folders.insert(location->folder->id);
++      }
++      continue;
++    }
++    auto it = location->list->entries.begin() + location->index;
++    taken.push_back(std::get<SidebarItem>(std::move(*it)));
++    location->list->entries.erase(it);
++  }
++  if (taken.empty()) {
++    return;
++  }
++  SidebarPosition target = position;
++  for (SidebarItem& item : taken) {
++    InsertItem(list_key, target, std::move(item));
++    ++target.index;
++  }
++  for (auto& [key, list] : lists_) {
++    std::erase_if(list.entries, [&](const SidebarList::Entry& entry) {
++      const auto* folder = std::get_if<SidebarFolder>(&entry);
++      return folder && folder->items.empty() &&
++             emptied_folders.contains(folder->id);
++    });
++  }
++  SaveAndNotify();
++}
++
+ void SidebarItems::SetOrder(std::string_view list_key,
+                             const std::vector<std::string>& ids) {
+   SidebarList* list = nullptr;
+Index: src/chrome/browser/ui/rac/sidebar/sidebar_items.h
+===================================================================
+--- src.orig/chrome/browser/ui/rac/sidebar/sidebar_items.h	2026-10-12 08:24:54.106187437 -0700
++++ src/chrome/browser/ui/rac/sidebar/sidebar_items.h	2026-10-12 08:29:41.757831017 -0700
+@@ -128,6 +128,12 @@
+   void MoveItem(std::string_view id,
+                 std::string_view list_key,
+                 const SidebarPosition& position);
++  // Puts the items in `ids` at `position`, in order. `position` counts the
++  // entries as if the items were already taken out, and a folder they leave
++  // empty stays until they're placed, so it can be where they go.
++  void MoveItems(const std::vector<std::string>& ids,
++                 std::string_view list_key,
++                 const SidebarPosition& position);
+   // Reorders the top-level entries of `list_key` to follow `ids`, which may
+   // name items and folders. Entries missing from `ids` keep their place.
+   void SetOrder(std::string_view list_key, const std::vector<std::string>& ids);
+Index: src/chrome/browser/ui/rac/sidebar/sidebar_window_sync.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/sidebar/sidebar_window_sync.cc	2026-10-12 08:24:54.177971551 -0700
++++ src/chrome/browser/ui/rac/sidebar/sidebar_window_sync.cc	2026-10-12 08:30:45.355815535 -0700
+@@ -5,7 +5,10 @@
+ #include "chrome/browser/ui/rac/sidebar/sidebar_window_sync.h"
+ 
+ #include <algorithm>
++#include <cstdint>
+ #include <memory>
++#include <optional>
++#include <string_view>
+ #include <utility>
+ #include <vector>
+ 
+@@ -57,8 +60,33 @@
+   return navigation;
+ }
+ 
++std::optional<SidebarPosition> GetItemPosition(const SidebarList& list,
++                                               std::string_view id) {
++  for (size_t i = 0; i < list.entries.size(); ++i) {
++    const SidebarList::Entry& entry = list.entries[i];
++    if (const auto* item = std::get_if<SidebarItem>(&entry)) {
++      if (item->id == id) {
++        return SidebarPosition{std::string(), i};
++      }
++      continue;
++    }
++    const auto& folder = std::get<SidebarFolder>(entry);
++    for (size_t j = 0; j < folder.items.size(); ++j) {
++      if (folder.items[j].id == id) {
++        return SidebarPosition{folder.id, j};
++      }
++    }
++  }
++  return std::nullopt;
++}
++
+ }  // namespace
+ 
++SidebarWindowSync::Drag::Drag() = default;
++SidebarWindowSync::Drag::Drag(Drag&&) = default;
++SidebarWindowSync::Drag& SidebarWindowSync::Drag::operator=(Drag&&) = default;
++SidebarWindowSync::Drag::~Drag() = default;
++
+ SidebarWindowSync::SidebarWindowSync(BrowserWindowInterface* browser,
+                                      SidebarItems* items)
+     : browser_(browser),
+@@ -167,6 +195,70 @@
+   model->UpdateWebContentsState(new_contents, TabChangeType::kAll);
+ }
+ 
++void SidebarWindowSync::StartDrag(const std::vector<tabs::TabInterface*>& tabs,
++                                  bool can_pin) {
++  // Also runs before Start() in the window a drag creates for tabs dragged
++  // out of the tab strip. It waits for the drag, so a window that only
++  // carried the tabs to another window closes without opening any items.
++  drag_.emplace();
++  drag_->can_pin = can_pin;
++  for (tabs::TabInterface* tab : tabs) {
++    drag_->tabs.push_back({tab->GetHandle(), tab->IsPinned(),
++                           browser_->GetTabStripModel()->GetIndexOfTab(tab)});
++  }
++  // Pinned tabs stay in place until the drag moves them.
++  const std::string pinned_key = SidebarItems::PinnedListKey(space_);
++  for (tabs::TabInterface* tab : tabs) {
++    if (tab->IsPinned()) {
++      continue;
++    }
++    const std::string id = GetSidebarItemId(tab->GetContents());
++    std::string list_key;
++    if (!id.empty() && items_->FindItem(id, &list_key) &&
++        list_key == pinned_key) {
++      drag_->pinned_position = GetItemPosition(items_->GetList(pinned_key), id);
++    }
++    break;
++  }
++  drag_changed_callbacks_.Notify();
++}
++
++void SidebarWindowSync::SetDragPinnedPosition(
++    std::optional<SidebarPosition> position) {
++  if (drag_) {
++    drag_->pinned_position = std::move(position);
++  }
++}
++
++void SidebarWindowSync::SetDragDropped() {
++  if (drag_) {
++    drag_->dropped = true;
++  }
++}
++
++void SidebarWindowSync::EndDrag() {
++  if (!drag_) {
++    return;
++  }
++  Drag drag = std::move(*drag_);
++  drag_.reset();
++  {
++    base::AutoReset<int> changing(&changing_tabs_, changing_tabs_ + 1);
++    if (drag.dropped) {
++      CommitDrag(drag);
++    } else {
++      CancelDrag(drag);
++    }
++  }
++  drag_changed_callbacks_.Notify();
++  ScheduleReconcile();
++}
++
++base::CallbackListSubscription SidebarWindowSync::RegisterDragChanged(
++    base::RepeatingClosure callback) {
++  return drag_changed_callbacks_.Add(std::move(callback));
++}
++
+ void SidebarWindowSync::OnTabStripModelChanged(
+     TabStripModel* tab_strip_model,
+     const TabStripModelChange& change,
+@@ -187,7 +279,7 @@
+       ScheduleReconcile();
+       return;
+     case TabStripModelChange::kMoved:
+-      if (change.GetMove()->tab->IsPinned()) {
++      if (change.GetMove()->tab->IsPinned() && !drag_) {
+         PullFavoritesOrder();
+       }
+       ScheduleReconcile();
+@@ -216,7 +308,7 @@
+ 
+ void SidebarWindowSync::OnTabPinnedStateChanged(tabs::TabInterface* tab,
+                                                 int index) {
+-  if (IsChangingTabs() || !started_) {
++  if (IsChangingTabs() || !started_ || drag_) {
+     return;
+   }
+   const std::string id = GetSidebarItemId(tab->GetContents());
+@@ -291,7 +383,9 @@
+ void SidebarWindowSync::Reconcile() {
+   reconcile_pending_ = false;
+   TabStripModel* model = browser_->GetTabStripModel();
+-  if (!started_ || model->closing_all() || browser_->IsDeleteScheduled()) {
++  // A drag ends with a reconcile.
++  if (!started_ || drag_ || restoring_drag_ || model->empty() ||
++      model->closing_all() || browser_->IsDeleteScheduled()) {
+     return;
+   }
+   base::AutoReset<int> changing(&changing_tabs_, changing_tabs_ + 1);
+@@ -474,6 +568,95 @@
+   items_->SetOrder(SidebarItems::kFavorites, ids);
+ }
+ 
++void SidebarWindowSync::CommitDrag(const Drag& drag) {
++  TabStripModel* model = browser_->GetTabStripModel();
++  std::vector<tabs::TabInterface*> tabs;
++  for (const Drag::DraggedTab& dragged : drag.tabs) {
++    tabs::TabInterface* tab = dragged.tab.Get();
++    if (tab && model->GetIndexOfTab(tab) != TabStripModel::kNoTab) {
++      tabs.push_back(tab);
++    }
++  }
++
++  // Tabs dropped among the favorites. Reconcile() turns open tabs pinned
++  // there into favorites.
++  for (tabs::TabInterface* tab : tabs) {
++    const std::string id = GetSidebarItemId(tab->GetContents());
++    if (tab->IsPinned() && !id.empty() && items_->FindItem(id) &&
++        !IsFavorite(tab)) {
++      items_->MoveItem(
++          id, SidebarItems::kFavorites,
++          SidebarPosition{std::string(),
++                          static_cast<size_t>(model->GetIndexOfTab(tab))});
++    }
++  }
++  PullFavoritesOrder();
++
++  // The rest become pinned tabs or open tabs.
++  const std::string pinned_key = SidebarItems::PinnedListKey(space_);
++  std::vector<std::string> pinned_ids;
++  for (tabs::TabInterface* tab : tabs) {
++    if (tab->IsPinned()) {
++      continue;
++    }
++    content::WebContents* contents = tab->GetContents();
++    std::string id = GetSidebarItemId(contents);
++    if (!id.empty() && !items_->FindItem(id)) {
++      SetSidebarItemId(contents, std::string());
++      id.clear();
++    }
++    const bool pin = drag.can_pin && space_.is_valid() &&
++                     drag.pinned_position && !tab->GetGroup() &&
++                     !tab->IsSplit();
++    if (!pin) {
++      Release(tab);
++      continue;
++    }
++    if (id.empty()) {
++      id = items_->AddItem(pinned_key, SidebarPosition{std::string(), SIZE_MAX},
++                           GetPageUrl(tab), contents->GetTitle());
++      if (id.empty()) {
++        continue;
++      }
++      SetSidebarItemId(contents, id);
++    }
++    pinned_ids.push_back(std::move(id));
++  }
++  if (!pinned_ids.empty()) {
++    items_->MoveItems(pinned_ids, pinned_key, *drag.pinned_position);
++  }
++}
++
++void SidebarWindowSync::CancelDrag(const Drag& drag) {
++  // The drag controller still holds the dragged tabs' views, which pinning
++  // or unpinning the tabs would replace, so wait for it to go away.
++  restoring_drag_ = true;
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&SidebarWindowSync::RestoreDraggedTabs,
++                                weak_factory_.GetWeakPtr(), drag.tabs));
++}
++
++void SidebarWindowSync::RestoreDraggedTabs(std::vector<Drag::DraggedTab> tabs) {
++  restoring_drag_ = false;
++  TabStripModel* model = browser_->GetTabStripModel();
++  if (!drag_ && !model->closing_all()) {
++    base::AutoReset<int> changing(&changing_tabs_, changing_tabs_ + 1);
++    for (const Drag::DraggedTab& dragged : tabs) {
++      tabs::TabInterface* tab = dragged.tab.Get();
++      int index = tab ? model->GetIndexOfTab(tab) : TabStripModel::kNoTab;
++      if (index == TabStripModel::kNoTab ||
++          tab->IsPinned() == dragged.was_pinned) {
++        continue;
++      }
++      index = model->SetTabPinned(index, dragged.was_pinned);
++      model->MoveWebContentsAt(index,
++                               std::min(dragged.index, model->count() - 1),
++                               /*select_after_move=*/false);
++    }
++  }
++  ScheduleReconcile();
++}
++
+ SidebarWindows::SidebarWindows(Profile* profile, SidebarItems* items)
+     : profile_(profile), items_(items) {
+   ProfileBrowserCollection* collection =
+@@ -507,6 +690,21 @@
+   windows_.erase(browser);
+ }
+ 
++// static
++SidebarWindowSync* SidebarWindows::ForTabStripModel(TabStripModel* model) {
++  SidebarItems* items = SidebarItems::Get(model->profile());
++  SidebarWindows* windows = items ? items->windows() : nullptr;
++  if (!windows) {
++    return nullptr;
++  }
++  for (auto& [browser, sync] : windows->windows_) {
++    if (browser->GetTabStripModel() == model) {
++      return sync.get();
++    }
++  }
++  return nullptr;
++}
++
+ SidebarWindowSync* SidebarWindows::Find(BrowserWindowInterface* browser) {
+   auto it = windows_.find(browser);
+   return it == windows_.end() ? nullptr : it->second.get();
+Index: src/chrome/browser/ui/rac/sidebar/sidebar_window_sync.h
+===================================================================
+--- src.orig/chrome/browser/ui/rac/sidebar/sidebar_window_sync.h	2026-10-12 08:24:54.127716334 -0700
++++ src/chrome/browser/ui/rac/sidebar/sidebar_window_sync.h	2026-10-12 08:30:11.606825249 -0700
+@@ -7,7 +7,9 @@
+ 
+ #include <map>
+ #include <memory>
++#include <optional>
+ #include <string>
++#include <vector>
+ 
+ #include "base/callback_list.h"
+ #include "base/functional/callback_forward.h"
+@@ -19,6 +21,7 @@
+ #include "chrome/browser/ui/rac/sidebar/sidebar_items.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "components/tabs/public/tab_interface.h"
+ 
+ class BrowserCollection;
+ class BrowserWindowInterface;
+@@ -46,6 +49,32 @@
+                           public SidebarItems::Observer,
+                           public SpacesWindowManager::Observer {
+  public:
++  // A drag of tabs in this window. While it lasts, the window stops matching
++  // its tabs to the items, so the drag can move tabs freely between
++  // favorites, pinned tabs, and open tabs. The drop decides what they become.
++  struct Drag {
++    struct DraggedTab {
++      tabs::TabHandle tab;
++      bool was_pinned = false;
++      int index = 0;
++    };
++
++    Drag();
++    Drag(Drag&&);
++    Drag& operator=(Drag&&);
++    ~Drag();
++
++    // In tab strip order.
++    std::vector<DraggedTab> tabs;
++    // False for tab groups and split tabs, which can only be open tabs.
++    bool can_pin = true;
++    // Where the dragged tabs that aren't favorites go among the pinned tabs,
++    // or nullopt to make them open tabs. Counts the entries as if the
++    // dragged tabs' items were already taken out.
++    std::optional<SidebarPosition> pinned_position;
++    bool dropped = false;
++  };
++
+   SidebarWindowSync(BrowserWindowInterface* browser, SidebarItems* items);
+   SidebarWindowSync(const SidebarWindowSync&) = delete;
+   SidebarWindowSync& operator=(const SidebarWindowSync&) = delete;
+@@ -73,6 +102,19 @@
+   // item's page, with no history. Does nothing to the active tab.
+   void ResetTab(tabs::TabInterface* tab);
+ 
++  // Starts a drag of `tabs`, in tab strip order.
++  void StartDrag(const std::vector<tabs::TabInterface*>& tabs, bool can_pin);
++  // Returns null if no drag is in progress.
++  const Drag* drag() const { return drag_ ? &*drag_ : nullptr; }
++  void SetDragPinnedPosition(std::optional<SidebarPosition> position);
++  void SetDragDropped();
++  // Ends the drag. A dropped drag turns the tabs into what they were dropped
++  // as; any other drag puts them back.
++  void EndDrag();
++  // Runs `callback` when a drag starts or ends.
++  base::CallbackListSubscription RegisterDragChanged(
++      base::RepeatingClosure callback);
++
+   // TabStripModelObserver:
+   void OnTabStripModelChanged(
+       TabStripModel* tab_strip_model,
+@@ -103,6 +145,9 @@
+   void Reconcile();
+   // Copies the order the user dragged favorites into back to the items.
+   void PullFavoritesOrder();
++  void CommitDrag(const Drag& drag);
++  void CancelDrag(const Drag& drag);
++  void RestoreDraggedTabs(std::vector<Drag::DraggedTab> tabs);
+   bool IsChangingTabs() const { return changing_tabs_ > 0; }
+ 
+   const raw_ptr<BrowserWindowInterface> browser_;
+@@ -115,6 +160,10 @@
+   // Counts nested changes this class is making to the tab strip, so it can
+   // ignore the notifications they send.
+   int changing_tabs_ = 0;
++  std::optional<Drag> drag_;
++  // Set from a canceled drag until its tabs are back where they started.
++  bool restoring_drag_ = false;
++  base::RepeatingClosureList drag_changed_callbacks_;
+   base::RepeatingClosureList space_callbacks_;
+   base::ScopedObservation<SpacesWindowManager, SpacesWindowManager::Observer>
+       spaces_observation_{this};
+@@ -133,6 +182,7 @@
+ 
+   // Returns null for windows without favorites and pinned tabs.
+   static SidebarWindowSync* ForBrowser(BrowserWindowInterface* browser);
++  static SidebarWindowSync* ForTabStripModel(TabStripModel* model);
+ 
+   // BrowserCollectionObserver:
+   void OnBrowserCreated(BrowserWindowInterface* browser) override;
+Index: src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc	2026-09-28 14:07:24.000000000 -0700
++++ src/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc	2026-10-12 08:29:41.759929340 -0700
+@@ -17,6 +17,7 @@
+ #include "chrome/browser/ui/tabs/hover_tab_selector.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/rac/sidebar/sidebar_drag.h"
+ #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
+ #include "chrome/browser/ui/views/tabs/common/root_tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+@@ -413,7 +414,8 @@
+   // Note: if the drag has not attached to this tab strip yet, it doesn't matter
+   // which container is used because the first drag loop iteration just attaches
+   // it.
+-  if (drag_handler_->IsDraggingPinnedTabs()) {
++  if (rac::DragTargetsFavorites(*drag_handler_, GetUnpinnedTabsContainer(),
++                                point_in_screen)) {
+     return &GetPinnedTabsContainer()->GetTabDragTarget(point_in_screen);
+   }
+   return &GetUnpinnedTabsContainer()->GetTabDragTarget(point_in_screen);
+Index: src/chrome/browser/ui/views/rac/sidebar/pinned_section.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/sidebar/pinned_section.cc	2026-10-12 08:24:54.109455213 -0700
++++ src/chrome/browser/ui/views/rac/sidebar/pinned_section.cc	2026-10-12 08:30:11.618129195 -0700
+@@ -6,9 +6,12 @@
+ 
+ #include <algorithm>
+ #include <memory>
++#include <optional>
++#include <set>
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
++#include "base/strings/string_number_conversions.h"
+ #include "cc/paint/paint_flags.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/rac/spaces/space_tab_tag.h"
+@@ -17,9 +20,14 @@
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/rac/sidebar/pinned_tabs_space.h"
+ #include "chrome/browser/ui/rac/sidebar/sidebar_menus.h"
++#include "chrome/browser/ui/rac/sidebar/sidebar_tab_tag.h"
+ #include "chrome/browser/ui/rac/sidebar/sidebar_window_sync.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
++#include "chrome/browser/ui/views/tabs/common/tab_drag_handler.h"
++#include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "components/vector_icons/vector_icons.h"
+@@ -60,6 +68,131 @@
+ constexpr int kDividerHeight = 9;
+ constexpr int kDividerInset = 8;
+ 
++const tabs::TabInterface* GetNodeTab(const TabCollectionNode& node) {
++  if (node.type() != TabCollectionNode::Type::TAB) {
++    return nullptr;
++  }
++  return std::get<tabs::ConstDanglingUntriagedTabInterface>(node.GetNodeData());
++}
++
++const TabCollectionNode* GetNodeForView(const views::View* view) {
++  if (const auto* tab_view = views::AsViewClass<TabView>(view)) {
++    return tab_view->collection_node();
++  }
++  if (const auto* group_view = views::AsViewClass<TabGroupView>(view)) {
++    return group_view->collection_node();
++  }
++  if (const auto* split_view = views::AsViewClass<SplitTabView>(view)) {
++    return split_view->collection_node();
++  }
++  return nullptr;
++}
++
++// The dragged tabs that are dropped as pinned tabs if the drag ends now.
++std::vector<const tabs::TabInterface*> GetTabsToPin(
++    const SidebarWindowSync::Drag& drag) {
++  std::vector<const tabs::TabInterface*> tabs;
++  if (!drag.can_pin || !drag.pinned_position) {
++    return tabs;
++  }
++  for (const SidebarWindowSync::Drag::DraggedTab& dragged : drag.tabs) {
++    const tabs::TabInterface* tab = dragged.tab.Get();
++    if (tab && !tab->IsPinned() && !tab->GetGroup()) {
++      tabs.push_back(tab);
++    }
++  }
++  return tabs;
++}
++
++// Returns `list` without the dragged tabs' items. Folders they leave empty
++// stay, so the drag can go back into them.
++SidebarList WithoutDraggedItems(const SidebarList& list,
++                                const SidebarWindowSync::Drag& drag) {
++  std::set<std::string> ids;
++  for (const SidebarWindowSync::Drag::DraggedTab& dragged : drag.tabs) {
++    if (const tabs::TabInterface* tab = dragged.tab.Get()) {
++      ids.insert(GetSidebarItemId(tab->GetContents()));
++    }
++  }
++  SidebarList result;
++  for (const SidebarList::Entry& entry : list.entries) {
++    if (const auto* item = std::get_if<SidebarItem>(&entry)) {
++      if (!ids.contains(item->id)) {
++        result.entries.push_back(*item);
++      }
++      continue;
++    }
++    SidebarFolder folder = std::get<SidebarFolder>(entry);
++    std::erase_if(folder.items, [&](const SidebarItem& item) {
++      return ids.contains(item.id);
++    });
++    result.entries.push_back(std::move(folder));
++  }
++  return result;
++}
++
++// The number of items, inside folders or not, before `position`.
++size_t CountItemsBefore(const SidebarList& list,
++                        const SidebarPosition& position) {
++  size_t count = 0;
++  for (size_t i = 0; i < list.entries.size(); ++i) {
++    const SidebarList::Entry& entry = list.entries[i];
++    if (position.folder_id.empty() && i == position.index) {
++      break;
++    }
++    if (std::holds_alternative<SidebarItem>(entry)) {
++      ++count;
++      continue;
++    }
++    const auto& folder = std::get<SidebarFolder>(entry);
++    if (folder.id == position.folder_id) {
++      return count + std::min(position.index, folder.items.size());
++    }
++    count += folder.items.size();
++  }
++  return count;
++}
++
++// The pinned tabs as they'd be if the drag ended now, for the layout to
++// show. Dragged tabs get stand-in items, since open tabs have none yet.
++struct DragList {
++  SidebarList list;
++  base::flat_map<std::string, const tabs::TabInterface*> dragged_tabs;
++};
++
++DragList MakeDragList(const SidebarList& list,
++                      const SidebarWindowSync::Drag& drag) {
++  DragList result;
++  result.list = WithoutDraggedItems(list, drag);
++  const std::vector<const tabs::TabInterface*> tabs = GetTabsToPin(drag);
++  if (tabs.empty()) {
++    return result;
++  }
++  std::vector<SidebarItem> items;
++  for (const tabs::TabInterface* tab : tabs) {
++    SidebarItem& item = items.emplace_back();
++    item.id = "rac.drag." + base::NumberToString(items.size());
++    result.dragged_tabs.emplace(item.id, tab);
++  }
++  const SidebarPosition& position = *drag.pinned_position;
++  std::vector<SidebarList::Entry>& entries = result.list.entries;
++  if (position.folder_id.empty()) {
++    const size_t index = std::min(position.index, entries.size());
++    entries.insert(entries.begin() + index, items.begin(), items.end());
++    return result;
++  }
++  for (SidebarList::Entry& entry : entries) {
++    auto* folder = std::get_if<SidebarFolder>(&entry);
++    if (folder && folder->id == position.folder_id) {
++      const size_t index = std::min(position.index, folder->items.size());
++      folder->items.insert(folder->items.begin() + index, items.begin(),
++                           items.end());
++      break;
++    }
++  }
++  return result;
++}
++
+ }  // namespace
+ 
+ // A folder's row. Pressing it opens or closes the folder, and right-clicking
+@@ -280,11 +413,18 @@
+     return layout;
+   }
+   SidebarWindowSync* sync = SidebarWindows::ForBrowser(browser_);
+-  const SidebarList& list = GetList();
++  const SidebarWindowSync::Drag* drag = sync ? sync->drag() : nullptr;
++  std::optional<DragList> drag_list;
++  if (drag) {
++    drag_list.emplace(MakeDragList(GetList(), *drag));
++  }
++  const SidebarList& list = drag_list ? drag_list->list : GetList();
+ 
+   std::vector<raw_ptr<views::View>> pending_rows;
+   base::flat_map<const tabs::TabInterface*, views::View*> tab_views;
+-  if (sync && !list.entries.empty()) {
++  // While a tab is dragged, the divider shows even with no pinned tabs, to
++  // mark where they go.
++  if (sync && (!list.entries.empty() || (drag && drag->can_pin))) {
+     for (views::View* child : children) {
+       if (const auto* tab_view = views::AsViewClass<TabView>(child)) {
+         tab_views.emplace(tab_view->GetTabInterface(), child);
+@@ -297,7 +437,18 @@
+ 
+     auto place_item = [&](const SidebarItem& item,
+                           const SidebarFolder* folder) {
+-      const tabs::TabInterface* tab = sync->GetTabForItem(item.id);
++      const tabs::TabInterface* tab = nullptr;
++      bool dragged = false;
++      if (drag_list) {
++        auto dragged_tab = drag_list->dragged_tabs.find(item.id);
++        if (dragged_tab != drag_list->dragged_tabs.end()) {
++          tab = dragged_tab->second;
++          dragged = true;
++        }
++      }
++      if (!tab) {
++        tab = sync->GetTabForItem(item.id);
++      }
+       auto it = tab ? tab_views.find(tab) : tab_views.end();
+       if (it == tab_views.end()) {
+         return;
+@@ -306,7 +457,8 @@
+       child.rows_before = std::move(pending_rows);
+       pending_rows.clear();
+       child.indent = folder && expanded ? kFolderIndent : 0;
+-      child.hidden = folder && folder->collapsed && tab != active_tab;
++      child.hidden =
++          folder && folder->collapsed && tab != active_tab && !dragged;
+     };
+ 
+     for (const SidebarList::Entry& entry : list.entries) {
+@@ -366,6 +518,157 @@
+   return layout;
+ }
+ 
++bool PinnedSection::HandleTabDrag(TabDragHandler& handler,
++                                  const TabCollectionNode& container_node,
++                                  const views::ProposedLayout& layout,
++                                  const gfx::Rect& dragged_bounds) const {
++  SidebarWindowSync* sync =
++      browser_ ? SidebarWindows::ForBrowser(browser_) : nullptr;
++  const SidebarWindowSync::Drag* drag = sync ? sync->drag() : nullptr;
++  if (!drag) {
++    return false;
++  }
++  const SidebarList base = WithoutDraggedItems(GetList(), *drag);
++
++  // Where each pinned tab that isn't dragged is, and its place among all the
++  // items.
++  struct ItemPlace {
++    SidebarPosition position;
++    size_t order = 0;
++  };
++  base::flat_map<std::string, ItemPlace> item_places;
++  base::flat_map<std::string, size_t> folder_indexes;
++  size_t order = 0;
++  for (size_t i = 0; i < base.entries.size(); ++i) {
++    const SidebarList::Entry& entry = base.entries[i];
++    if (const auto* item = std::get_if<SidebarItem>(&entry)) {
++      item_places[item->id] = {SidebarPosition{std::string(), i}, order++};
++      continue;
++    }
++    const auto& folder = std::get<SidebarFolder>(entry);
++    folder_indexes[folder.id] = i;
++    for (size_t j = 0; j < folder.items.size(); ++j) {
++      item_places[folder.items[j].id] = {SidebarPosition{folder.id, j},
++                                         order++};
++    }
++  }
++  auto get_place = [&](const TabCollectionNode& node) -> const ItemPlace* {
++    const tabs::TabInterface* tab = GetNodeTab(node);
++    if (!tab) {
++      return nullptr;
++    }
++    auto it = item_places.find(GetSidebarItemId(tab->GetContents()));
++    return it == item_places.end() ? nullptr : &it->second;
++  };
++  auto expanded_folder = [&](const std::string& folder_id) {
++    const SidebarFolder* folder =
++        folder_id.empty() ? nullptr : base.FindFolder(folder_id);
++    return folder && !folder->collapsed ? folder_id : std::string();
++  };
++
++  // The rows and tabs the drop can go before, top to bottom, with the
++  // dragged tabs' own space taken out.
++  struct Slot {
++    // Where the drop goes if it's before this slot, or nullopt for open tabs.
++    std::optional<SidebarPosition> position;
++    // The open folder this slot is the header or a tab of.
++    std::string folder_id;
++    raw_ptr<const TabCollectionNode> node = nullptr;
++    int center_y = 0;
++  };
++  std::vector<Slot> slots;
++  const int dragged_height = dragged_bounds.height();
++  bool after_dragged = false;
++  for (const views::ChildLayout& child : layout.child_layouts) {
++    if (!child.visible) {
++      continue;
++    }
++    if (handler.IsViewDragging(*child.child_view)) {
++      after_dragged = true;
++      continue;
++    }
++    Slot slot;
++    slot.center_y =
++        child.bounds.CenterPoint().y() - (after_dragged ? dragged_height : 0);
++    if (child.child_view == divider_) {
++      slot.position = SidebarPosition{std::string(), base.entries.size()};
++    } else if (const auto* header =
++                   views::AsViewClass<FolderHeaderView>(child.child_view)) {
++      auto it = std::ranges::find_if(folder_headers_, [&](const auto& entry) {
++        return entry.second == header;
++      });
++      if (it == folder_headers_.end() || !folder_indexes.contains(it->first)) {
++        continue;
++      }
++      slot.position =
++          SidebarPosition{std::string(), folder_indexes.at(it->first)};
++      slot.folder_id = expanded_folder(it->first);
++    } else if (const TabCollectionNode* node =
++                   GetNodeForView(child.child_view)) {
++      slot.node = node;
++      if (const ItemPlace* place = get_place(*node)) {
++        slot.position = place->position;
++        slot.folder_id = expanded_folder(place->position.folder_id);
++      }
++    } else {
++      continue;
++    }
++    slots.push_back(std::move(slot));
++  }
++
++  // The drop goes before the first slot whose middle is below the top of the
++  // dragged tabs, as when Chromium reorders tabs.
++  const int dragged_top = dragged_bounds.y();
++  size_t next = 0;
++  while (next < slots.size() && dragged_top >= slots[next].center_y) {
++    ++next;
++  }
++  std::optional<SidebarPosition> position;
++  if (next < slots.size()) {
++    position = slots[next].position;
++  }
++  // Below the last tab of an open folder, the upper half of the gap is the
++  // end of the folder and the lower half is after it.
++  if (next > 0 && !slots[next - 1].folder_id.empty() &&
++      (next == slots.size() ||
++       slots[next].folder_id != slots[next - 1].folder_id)) {
++    const Slot& previous = slots[next - 1];
++    const int next_center = next < slots.size()
++                                ? slots[next].center_y
++                                : previous.center_y + dragged_height;
++    if (dragged_top < (previous.center_y + next_center) / 2) {
++      position =
++          SidebarPosition{previous.folder_id,
++                          base.FindFolder(previous.folder_id)->items.size()};
++    }
++  }
++  if (!drag->can_pin) {
++    position.reset();
++  }
++
++  // Move the dragged tabs in the tab strip to match: before the first tab
++  // that comes after the drop.
++  const TabCollectionNode* target = nullptr;
++  if (position || (next < slots.size() && slots[next].position)) {
++    const size_t before = position ? CountItemsBefore(base, *position) : order;
++    for (const auto& child : container_node.children()) {
++      if (handler.IsViewDragging(*child->view())) {
++        continue;
++      }
++      const ItemPlace* place = get_place(*child);
++      if (!place || place->order >= before) {
++        target = child.get();
++        break;
++      }
++    }
++  } else if (next < slots.size()) {
++    target = slots[next].node;
++  }
++  sync->SetDragPinnedPosition(position);
++  handler.HandleDraggedTabsIntoPosition(container_node, target);
++  return true;
++}
++
+ void PinnedSection::OnViewAddedToWidget(views::View* observed_view) {
+   if (browser_) {
+     return;
+@@ -387,6 +690,7 @@
+   items_observation_.Reset();
+   container_observation_.Reset();
+   space_subscription_ = {};
++  drag_subscription_ = {};
+   if (browser_) {
+     browser_->GetTabStripModel()->RemoveObserver(this);
+   }
+@@ -421,6 +725,9 @@
+   if (SidebarWindowSync* sync = SidebarWindows::ForBrowser(browser_)) {
+     space_subscription_ = sync->RegisterSpaceChanged(
+         base::BindRepeating(&PinnedSection::UpdateRows, base::Unretained(this)));
++    drag_subscription_ = sync->RegisterDragChanged(base::BindRepeating(
++        [](views::View* container) { container->InvalidateLayout(); },
++        base::Unretained(container_.get())));
+   }
+   divider_ = container_->AddChildView(std::make_unique<SectionDividerView>());
+   UpdateRows();
+Index: src/chrome/browser/ui/views/rac/sidebar/pinned_section.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/sidebar/pinned_section.h	2026-10-12 08:24:54.109860503 -0700
++++ src/chrome/browser/ui/views/rac/sidebar/pinned_section.h	2026-10-12 08:29:41.761450124 -0700
+@@ -24,9 +24,12 @@
+ #include "ui/views/view_observer.h"
+ 
+ class BrowserWindowInterface;
++class TabCollectionNode;
++class TabDragHandler;
+ 
+ namespace gfx {
+ class Point;
++class Rect;
+ }  // namespace gfx
+ 
+ namespace views {
+@@ -116,6 +119,14 @@
+       const std::vector<views::View*>& children,
+       tabs::VerticalTabStripCollapseState collapse_state) const;
+ 
++  // Moves the dragged tabs to where `dragged_bounds` puts them in the
++  // container's `layout`, which may be among the pinned tabs or in a folder.
++  // Returns false if the container should handle the drag itself.
++  bool HandleTabDrag(TabDragHandler& handler,
++                     const TabCollectionNode& container_node,
++                     const views::ProposedLayout& layout,
++                     const gfx::Rect& dragged_bounds) const;
++
+   // views::ViewObserver:
+   void OnViewAddedToWidget(views::View* observed_view) override;
+   void OnViewIsDeleting(views::View* observed_view) override;
+@@ -148,6 +159,7 @@
+   std::unique_ptr<ui::SimpleMenuModel> folder_menu_;
+   std::unique_ptr<views::MenuRunner> folder_menu_runner_;
+   base::CallbackListSubscription space_subscription_;
++  base::CallbackListSubscription drag_subscription_;
+   base::ScopedObservation<views::View, views::ViewObserver>
+       container_observation_{this};
+   base::ScopedObservation<SidebarItems, SidebarItems::Observer>
+Index: src/chrome/browser/ui/views/rac/sidebar/sidebar_drag.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/views/rac/sidebar/sidebar_drag.cc	2026-10-12 08:29:41.762025538 -0700
+@@ -0,0 +1,142 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/sidebar/sidebar_drag.h"
++
++#include <algorithm>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "chrome/browser/ui/rac/sidebar/sidebar_window_sync.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/views/rac/sidebar/pinned_section.h"
++#include "chrome/browser/ui/views/tabs/common/tab_drag_handler.h"
++#include "chrome/browser/ui/views/tabs/dragging/drag_session_data.h"
++#include "chrome/browser/ui/views/tabs/dragging/tab_drag_context.h"
++#include "components/tabs/public/tab_interface.h"
++#include "ui/gfx/geometry/point.h"
++#include "ui/views/controls/scroll_view.h"
++#include "ui/views/view.h"
++
++namespace rac {
++
++namespace {
++
++SidebarWindowSync* GetDraggingWindow(TabStripModel& model) {
++  SidebarWindowSync* sync = SidebarWindows::ForTabStripModel(&model);
++  return sync && sync->drag() && sync->drag()->can_pin ? sync : nullptr;
++}
++
++}  // namespace
++
++void OnTabDragStarted(TabStripModel& model, const DragSessionData& session) {
++  SidebarWindowSync* sync = SidebarWindows::ForTabStripModel(&model);
++  if (!sync) {
++    return;
++  }
++  bool can_pin =
++      !session.group_header_drag_data_ && session.dragging_groups.empty();
++  std::vector<tabs::TabInterface*> tabs;
++  for (const TabDragData& data : session.tab_drag_data_) {
++    tabs::TabInterface* tab =
++        data.contents ? tabs::TabInterface::GetFromContents(data.contents)
++                      : nullptr;
++    if (!tab || model.GetIndexOfTab(tab) == TabStripModel::kNoTab) {
++      continue;
++    }
++    can_pin = can_pin && !tab->IsSplit();
++    tabs.push_back(tab);
++  }
++  sync->StartDrag(tabs, can_pin);
++}
++
++void OnTabsDropped(TabStripModel& model) {
++  if (SidebarWindowSync* sync = SidebarWindows::ForTabStripModel(&model)) {
++    sync->SetDragDropped();
++  }
++}
++
++void OnTabDragEnded(TabStripModel& model) {
++  if (SidebarWindowSync* sync = SidebarWindows::ForTabStripModel(&model)) {
++    sync->EndDrag();
++  }
++}
++
++bool DragTargetsFavorites(TabDragHandler& handler,
++                          views::View* unpinned_container,
++                          const gfx::Point& point_in_screen) {
++  TabDragContext* context = handler.GetDragContext();
++  views::ScrollView* scroll_view =
++      unpinned_container
++          ? views::ScrollView::GetScrollViewForContents(unpinned_container)
++          : nullptr;
++  if (!context || !GetDraggingWindow(*context->GetTabStripModel()) ||
++      !scroll_view || !PinnedSection::Get(unpinned_container)) {
++    return handler.IsDraggingPinnedTabs();
++  }
++  return point_in_screen.y() < scroll_view->GetBoundsInScreen().y();
++}
++
++std::vector<RecreatedDragView> MatchDraggedTabsToContainer(
++    TabDragHandler& handler,
++    DragSessionData& session,
++    bool pinned) {
++  TabDragContext* context = handler.GetDragContext();
++  TabStripModel& model = *context->GetTabStripModel();
++  if (!GetDraggingWindow(model)) {
++    return {};
++  }
++  struct Change {
++    raw_ptr<TabDragData> data;
++    raw_ptr<tabs::TabInterface> tab;
++    gfx::Vector2d offset;
++  };
++  std::vector<Change> changes;
++  for (TabDragData& data : session.tab_drag_data_) {
++    tabs::TabInterface* tab =
++        data.contents ? tabs::TabInterface::GetFromContents(data.contents)
++                      : nullptr;
++    if (!tab || tab->IsPinned() == pinned || !data.attached_view) {
++      continue;
++    }
++    changes.push_back({&data, tab,
++                       handler
++                           .GetOffsetFromSourceAtDragStart(
++                               handler.ViewFromTabSlot(data.attached_view))
++                           .value_or(gfx::Vector2d())});
++  }
++  if (changes.empty()) {
++    return {};
++  }
++
++  // Changing a tab's pin state destroys its view and slot view, and the
++  // layouts it triggers ask which views are dragging.
++  for (Change& change : changes) {
++    change.data->attached_view = nullptr;
++  }
++  // Pinning moves a tab to the end of the favorites, and unpinning moves it
++  // to the top of the open tabs. Unpin last to first to keep their order.
++  if (!pinned) {
++    std::ranges::reverse(changes);
++  }
++  for (Change& change : changes) {
++    const int index = model.GetIndexOfTab(change.tab);
++    if (index != TabStripModel::kNoTab) {
++      model.SetTabPinned(index, pinned);
++    }
++  }
++
++  std::vector<RecreatedDragView> views;
++  for (Change& change : changes) {
++    change.data->pinned = change.tab->IsPinned();
++    change.data->attached_view =
++        context->GetTabForContents(change.data->contents);
++    if (change.data->attached_view) {
++      views.push_back({change.data->attached_view, change.offset});
++    }
++  }
++  return views;
++}
++
++}  // namespace rac
+Index: src/chrome/browser/ui/views/rac/sidebar/sidebar_drag.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/views/rac/sidebar/sidebar_drag.h	2026-10-12 08:29:41.762406578 -0700
+@@ -0,0 +1,63 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_SIDEBAR_DRAG_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_SIDEBAR_DRAG_H_
++
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "ui/gfx/geometry/vector2d.h"
++
++class TabDragHandler;
++class TabSlotView;
++class TabStripModel;
++struct DragSessionData;
++
++namespace gfx {
++class Point;
++}  // namespace gfx
++
++namespace views {
++class View;
++}  // namespace views
++
++namespace rac {
++
++// Hooks that let a tab drag in the vertical sidebar move tabs between
++// favorites, pinned tabs, and open tabs. Chromium keeps a drag of pinned
++// tabs among the pinned tabs; in rac, where the pointer is decides.
++
++// Called when dragged tabs attach to `model`'s window, at the start of a drag
++// or when it moves in from another window.
++void OnTabDragStarted(TabStripModel& model, const DragSessionData& session);
++// Called when the dragged tabs are dropped in `model`'s window.
++void OnTabsDropped(TabStripModel& model);
++// Called when the drag stops or leaves `model`'s window.
++void OnTabDragEnded(TabStripModel& model);
++
++// Returns whether a drag at `point_in_screen` goes to the favorites, which
++// are above `unpinned_container`, instead of the open tabs.
++bool DragTargetsFavorites(TabDragHandler& handler,
++                          views::View* unpinned_container,
++                          const gfx::Point& point_in_screen);
++
++// A dragged tab's new slot view, with the dragged view's offset from the
++// source view at the start of the drag.
++struct RecreatedDragView {
++  raw_ptr<TabSlotView> slot_view;
++  gfx::Vector2d offset;
++};
++
++// Pins the dragged tabs as they enter the favorites, or unpins them as they
++// leave. That recreates their views, so this points `session` at the new
++// ones and returns them for the caller to prepare for dragging.
++std::vector<RecreatedDragView> MatchDraggedTabsToContainer(
++    TabDragHandler& handler,
++    DragSessionData& session,
++    bool pinned);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_SIDEBAR_DRAG_H_
+Index: src/chrome/browser/ui/views/tabs/common/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/BUILD.gn	2026-10-12 08:24:54.129546117 -0700
++++ src/chrome/browser/ui/views/tabs/common/BUILD.gn	2026-10-12 08:29:41.762803951 -0700
+@@ -48,6 +48,8 @@
+     "//chrome/browser/ui/views/rac/sidebar/pinned_page_button.h",
+     "//chrome/browser/ui/views/rac/sidebar/pinned_section.cc",
+     "//chrome/browser/ui/views/rac/sidebar/pinned_section.h",
++    "//chrome/browser/ui/views/rac/sidebar/sidebar_drag.cc",
++    "//chrome/browser/ui/views/rac/sidebar/sidebar_drag.h",
+     "//chrome/browser/ui/views/rac/sidebar/sidebar_style.cc",
+     "//chrome/browser/ui/views/rac/sidebar/sidebar_style.h",
+     "dragged_tabs_container.cc",
+Index: src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc	2026-09-28 14:07:24.000000000 -0700
++++ src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc	2026-10-12 08:29:41.763666531 -0700
+@@ -12,6 +12,8 @@
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/views/rac/sidebar/pinned_section.h"
++#include "chrome/browser/ui/views/rac/sidebar/sidebar_drag.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_drag_handler.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
+@@ -137,6 +139,11 @@
+   return true;
+ }
+ 
++void DraggedTabsContainer::HandleTabDrop(
++    TabDragTarget::DragController& controller) {
++  rac::OnTabsDropped(*GetDragHandler().GetDragContext()->GetTabStripModel());
++}
++
+ void DraggedTabsContainer::HandleTabDragEnteredContainer() {
+   last_move_drag_x_ = std::nullopt;
+   CHECK(collection_node_);
+@@ -632,6 +639,14 @@
+ 
+   TabDragHandler& drag_handler = GetDragHandler();
+   const views::ProposedLayout& drag_layout = GetLayoutForDrag();
++  if (const auto* pinned_section =
++          rac::PinnedSection::Get(base::to_address(host_view_));
++      pinned_section &&
++      pinned_section->HandleTabDrag(drag_handler, *collection_node_,
++                                    drag_layout, dragged_tab_bounds)) {
++    host_view_->InvalidateLayout();
++    return;
++  }
+   const auto* target = GetTargetForTabDrag(drag_layout, dragged_tab_bounds);
+ 
+   // A null target implies the drag is at the end of the container. We
+Index: src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/dragged_tabs_container.h	2026-09-28 14:07:24.000000000 -0700
++++ src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.h	2026-10-12 08:29:41.764160778 -0700
+@@ -66,7 +66,7 @@
+   void OnTabDragExited(const gfx::Point& point_in_screen) final;
+   void OnTabDragEnded() final;
+   bool CanDropTab() final;
+-  void HandleTabDrop(TabDragTarget::DragController& controller) final {}
++  void HandleTabDrop(TabDragTarget::DragController& controller) final;
+   base::CallbackListSubscription RegisterWillDestroyCallback(
+       base::OnceClosure callback) final;
+ 
+Index: src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc	2026-09-28 14:07:24.000000000 -0700
++++ src/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc	2026-10-12 08:29:41.765207565 -0700
+@@ -17,6 +17,7 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
++#include "chrome/browser/ui/views/rac/sidebar/sidebar_drag.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_link_drop_handler.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
+@@ -382,6 +383,18 @@
+     const TabCollectionNode& node) {
+   CHECK(drag_controller_);
+   const auto& drag_session_data = drag_controller_->GetSessionData();
++  if (node.type() == TabCollectionNode::Type::PINNED ||
++      node.type() == TabCollectionNode::Type::UNPINNED) {
++    for (const rac::RecreatedDragView& recreated :
++         rac::MatchDraggedTabsToContainer(
++             *this, drag_controller_->GetMutableSessionData(),
++             node.type() == TabCollectionNode::Type::PINNED)) {
++      views::View* dragged_view = ViewFromTabSlot(recreated.slot_view);
++      dragged_view->SetPaintToLayer();
++      dragged_view->layer()->SetFillsBoundsOpaquely(false);
++      dragged_view->SetProperty(kOffsetAtTabDragStart, recreated.offset);
++    }
++  }
+ 
+   const TabDragData* source_drag_data =
+       drag_session_data.source_view_drag_data();
+@@ -710,12 +723,14 @@
+ }
+ 
+ void TabDragHandlerImpl::DestroyDragController() {
++  rac::OnTabDragEnded(*tab_strip_model_);
+   drag_controller_.reset();
+ }
+ 
+ void TabDragHandlerImpl::StartedDragging(
+     const std::vector<TabSlotView*>& views) {
+   const auto& drag_data = drag_controller_->GetSessionData();
++  rac::OnTabDragStarted(*tab_strip_model_, drag_data);
+   if (base::FeatureList::IsEnabled(features::kCollapseTabGroupDuringDrag) &&
+       drag_data.group_header_drag_data_.has_value()) {
+     tab_groups::TabGroupId group_id = drag_data.group_header_drag_data_->group;
+@@ -780,11 +795,13 @@
+ }
+ 
+ void TabDragHandlerImpl::DraggedTabsDetached() {
++  rac::OnTabDragEnded(*tab_strip_model_);
+   expand_on_hover_lock_.reset();
+   scroll_synchronizers_.clear();
+ }
+ 
+ void TabDragHandlerImpl::StoppedDragging() {
++  rac::OnTabDragEnded(*tab_strip_model_);
+   expand_on_hover_lock_.reset();
+   scroll_synchronizers_.clear();
+ 
+Index: src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h	2026-09-28 14:07:24.000000000 -0700
++++ src/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.h	2026-10-12 08:29:41.766085102 -0700
+@@ -228,6 +228,10 @@
+   const DragSessionData& GetSessionData() const override;
+   const TabDragContext* GetAttachedContext() const override;
+ 
++  // Lets the attached context point the session at new views after it
++  // recreated the views of dragged tabs, for example by pinning them.
++  DragSessionData& GetMutableSessionData() { return drag_data_; }
++
+  private:
+   friend class TabDragControllerTest;
+ 
