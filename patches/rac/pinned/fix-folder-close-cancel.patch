@@ -1,0 +1,231 @@
+Index: src/chrome/browser/ui/rac/sidebar/sidebar_actions.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/sidebar/sidebar_actions.cc	2026-10-12 05:17:03.030217631 -0700
++++ src/chrome/browser/ui/rac/sidebar/sidebar_actions.cc	2026-10-12 08:53:31.119137129 -0700
+@@ -411,22 +411,29 @@
+     return;
+   }
+   std::vector<tabs::TabHandle> to_close;
++  std::vector<std::string> ids;
+   for (const SidebarItem& item : folder->items) {
++    ids.push_back(item.id);
+     if (tabs::TabInterface* tab = window->GetTabForItem(item.id)) {
+-      SetSidebarItemId(tab->GetContents(), std::string());
+       to_close.push_back(tab->GetHandle());
+     }
+   }
+-  items->RemoveFolder(folder_id);
++  if (!window->BeginFolderDeletion(std::string(folder_id), std::move(ids))) {
++    return;
++  }
+   TabStripModel* model = window->browser()->GetTabStripModel();
++  bool blocked = false;
+   for (const tabs::TabHandle& handle : to_close) {
+     tabs::TabInterface* tab = handle.Get();
+     // Never close the window's last tab, which would close the window.
+     if (tab && model->count() > 1) {
+       model->CloseWebContentsAt(model->GetIndexOfTab(tab),
+                                 TabCloseTypes::CLOSE_USER_GESTURE);
++    } else if (tab) {
++      blocked = true;
+     }
+   }
++  window->FinishFolderDeletion(folder_id, blocked);
+ }
+ 
+ }  // namespace rac
+Index: src/chrome/browser/ui/rac/sidebar/sidebar_window_sync.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/sidebar/sidebar_window_sync.cc	2026-10-12 08:50:09.098529940 -0700
++++ src/chrome/browser/ui/rac/sidebar/sidebar_window_sync.cc	2026-10-12 08:53:31.075084457 -0700
+@@ -30,6 +30,7 @@
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/restore_type.h"
+ #include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_contents_observer.h"
+ 
+ namespace rac {
+ 
+@@ -59,6 +60,40 @@
+ 
+ }  // namespace
+ 
++struct SidebarWindowSync::PendingFolderDeletion {
++  class CloseObserver : public content::WebContentsObserver {
++   public:
++    CloseObserver(content::WebContents* contents,
++                  PendingFolderDeletion* pending,
++                  SidebarWindowSync* window)
++        : content::WebContentsObserver(contents),
++          pending_(pending),
++          window_(window) {}
++
++    void BeforeUnloadFired(bool proceed) override {
++      if (!proceed) {
++        Cancel();
++      }
++    }
++
++    void BeforeUnloadDialogCancelled() override { Cancel(); }
++
++   private:
++    void Cancel() {
++      pending_->cancelled = true;
++      window_->ScheduleFolderDeletionCheck();
++    }
++
++    const raw_ptr<PendingFolderDeletion> pending_;
++    const raw_ptr<SidebarWindowSync> window_;
++  };
++
++  std::vector<std::string> ids;
++  std::vector<std::unique_ptr<CloseObserver>> observers;
++  bool requesting = true;
++  bool cancelled = false;
++};
++
+ SidebarWindowSync::SidebarWindowSync(BrowserWindowInterface* browser,
+                                      SidebarItems* items)
+     : browser_(browser),
+@@ -167,6 +202,69 @@
+   model->UpdateWebContentsState(new_contents, TabChangeType::kAll);
+ }
+ 
++bool SidebarWindowSync::BeginFolderDeletion(
++    std::string folder_id,
++    std::vector<std::string> item_ids) {
++  if (pending_folder_deletions_.contains(folder_id)) {
++    return false;
++  }
++  auto pending = std::make_unique<PendingFolderDeletion>();
++  pending->ids = std::move(item_ids);
++  for (const std::string& id : pending->ids) {
++    if (tabs::TabInterface* tab = GetTabForItem(id)) {
++      pending->observers.push_back(
++          std::make_unique<PendingFolderDeletion::CloseObserver>(
++              tab->GetContents(), pending.get(), this));
++    }
++  }
++  pending_folder_deletions_.emplace(std::move(folder_id), std::move(pending));
++  return true;
++}
++
++void SidebarWindowSync::FinishFolderDeletion(std::string_view folder_id,
++                                              bool blocked) {
++  auto it = pending_folder_deletions_.find(std::string(folder_id));
++  if (it == pending_folder_deletions_.end()) {
++    return;
++  }
++  it->second->requesting = false;
++  it->second->cancelled |= blocked;
++  ScheduleFolderDeletionCheck();
++}
++
++void SidebarWindowSync::ScheduleFolderDeletionCheck() {
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&SidebarWindowSync::CheckFolderDeletions,
++                                weak_factory_.GetWeakPtr()));
++}
++
++void SidebarWindowSync::CheckFolderDeletions() {
++  for (auto it = pending_folder_deletions_.begin();
++       it != pending_folder_deletions_.end();) {
++    PendingFolderDeletion& pending = *it->second;
++    if (pending.requesting) {
++      ++it;
++      continue;
++    }
++    const bool all_closed = std::ranges::none_of(
++        pending.ids, [this](const std::string& id) {
++          return GetTabForItem(id) != nullptr;
++        });
++    if (!pending.cancelled && !all_closed) {
++      ++it;
++      continue;
++    }
++    const std::string folder_id = it->first;
++    const bool committed = !pending.cancelled && all_closed;
++    it = pending_folder_deletions_.erase(it);
++    if (committed) {
++      items_->RemoveFolder(folder_id);
++    } else {
++      ScheduleReconcile();
++    }
++  }
++}
++
+ void SidebarWindowSync::OnTabStripModelChanged(
+     TabStripModel* tab_strip_model,
+     const TabStripModelChange& change,
+@@ -185,6 +283,10 @@
+     case TabStripModelChange::kInserted:
+     case TabStripModelChange::kRemoved:
+       ScheduleReconcile();
++      if (change.type() == TabStripModelChange::kRemoved &&
++          !pending_folder_deletions_.empty()) {
++        ScheduleFolderDeletionCheck();
++      }
+       return;
+     case TabStripModelChange::kMoved:
+       if (change.GetMove()->tab->IsPinned()) {
+@@ -423,6 +525,16 @@
+   }
+   for (size_t i = 0; i < pinned.size(); ++i) {
+     if (!tab_for_item.contains(pinned[i]->id)) {
++      bool closing = false;
++      for (const auto& [folder_id, pending] : pending_folder_deletions_) {
++        if (std::ranges::contains(pending->ids, pinned[i]->id)) {
++          closing = true;
++          break;
++        }
++      }
++      if (closing) {
++        continue;
++      }
+       add_tab(*pinned[i],
+               std::min(model->IndexOfFirstNonPinnedTab() + static_cast<int>(i),
+                        model->count()),
+Index: src/chrome/browser/ui/rac/sidebar/sidebar_window_sync.h
+===================================================================
+--- src.orig/chrome/browser/ui/rac/sidebar/sidebar_window_sync.h	2026-10-12 04:58:39.205967565 -0700
++++ src/chrome/browser/ui/rac/sidebar/sidebar_window_sync.h	2026-10-12 08:53:31.058345033 -0700
+@@ -8,6 +8,8 @@
+ #include <map>
+ #include <memory>
+ #include <string>
++#include <string_view>
++#include <vector>
+ 
+ #include "base/callback_list.h"
+ #include "base/functional/callback_forward.h"
+@@ -72,6 +74,11 @@
+   // Puts `tab` back the way the window first opened it: unloaded, on its
+   // item's page, with no history. Does nothing to the active tab.
+   void ResetTab(tabs::TabInterface* tab);
++  // Suppress recreation while a folder's tabs close. Keep the items if any
++  // beforeunload is canceled or a tab cannot be closed.
++  bool BeginFolderDeletion(std::string folder_id,
++                           std::vector<std::string> item_ids);
++  void FinishFolderDeletion(std::string_view folder_id, bool blocked);
+ 
+   // TabStripModelObserver:
+   void OnTabStripModelChanged(
+@@ -103,6 +110,8 @@
+   void Reconcile();
+   // Copies the order the user dragged favorites into back to the items.
+   void PullFavoritesOrder();
++  void CheckFolderDeletions();
++  void ScheduleFolderDeletionCheck();
+   bool IsChangingTabs() const { return changing_tabs_ > 0; }
+ 
+   const raw_ptr<BrowserWindowInterface> browser_;
+@@ -115,6 +124,9 @@
+   // Counts nested changes this class is making to the tab strip, so it can
+   // ignore the notifications they send.
+   int changing_tabs_ = 0;
++  struct PendingFolderDeletion;
++  std::map<std::string, std::unique_ptr<PendingFolderDeletion>>
++      pending_folder_deletions_;
+   base::RepeatingClosureList space_callbacks_;
+   base::ScopedObservation<SpacesWindowManager, SpacesWindowManager::Observer>
+       spaces_observation_{this};
