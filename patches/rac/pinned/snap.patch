@@ -1,0 +1,557 @@
+Index: src/chrome/browser/ui/views/rac/sidebar/drag_snap.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/views/rac/sidebar/drag_snap.cc	2026-10-12 08:31:27.294625016 -0700
+@@ -0,0 +1,220 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/sidebar/drag_snap.h"
++
++#include <algorithm>
++#include <cmath>
++#include <utility>
++
++#include "base/notreached.h"
++#include "base/numerics/safe_conversions.h"
++#include "ui/gfx/animation/animation.h"
++#include "ui/gfx/geometry/cubic_bezier.h"
++#include "ui/gfx/geometry/point.h"
++#include "ui/views/view.h"
++
++namespace rac {
++
++namespace {
++
++// How long a dragged tab takes to reach its new slot.
++constexpr base::TimeDelta kGlideDuration = base::Milliseconds(150);
++
++// A gently pulled row covers this share of the pointer's distance from its
++// slot, so it hops the rest of a row when the slot changes.
++constexpr double kGentleFollow = 0.75;
++
++// How hard a favorite resists leaving its cell: the rubber band of a
++// scroll view's overscroll, which gives at most half a cell.
++constexpr double kGridResistance = 0.55;
++
++// A tab dragged out of one container into another starts from where the old
++// one drew it, if that was this recent.
++constexpr base::TimeDelta kHandOffWindow = base::Milliseconds(100);
++
++// Where the last single dragged tab was drawn, in screen coordinates. Moving
++// a tab between the favorites and the tab list moves it to another container,
++// which starts its own `DragSnap`.
++struct LastDrawn {
++  gfx::Point origin_in_screen;
++  base::TimeTicks time;
++};
++
++LastDrawn& GetLastDrawn() {
++  static LastDrawn last_drawn;
++  return last_drawn;
++}
++
++int RubberBand(int distance, int limit) {
++  if (limit <= 0) {
++    return 0;
++  }
++  const double pulled =
++      (1.0 - 1.0 / (std::abs(distance) * kGridResistance / limit + 1.0)) *
++      limit;
++  return base::ClampRound(std::copysign(pulled, distance));
++}
++
++int PullAxis(DragSnap::Strength strength, int slot, int pointer, int cell) {
++  switch (strength) {
++    case DragSnap::Strength::kNone:
++      return pointer;
++    case DragSnap::Strength::kGentle:
++      return slot + base::ClampRound((pointer - slot) * kGentleFollow);
++    case DragSnap::Strength::kGrid:
++      return slot + RubberBand(pointer - slot, cell / 2);
++  }
++  NOTREACHED();
++}
++
++}  // namespace
++
++DragSnap::DragSnap(views::View& host,
++                   Strength strength,
++                   base::RepeatingClosure redraw)
++    : host_(host),
++      strength_(strength),
++      redraw_(std::move(redraw)),
++      glide_animation_(kGlideDuration,
++                       gfx::LinearAnimation::kDefaultFrameRate,
++                       this) {}
++
++DragSnap::~DragSnap() = default;
++
++void DragSnap::SetSlot(const views::View& view, const gfx::Rect& slot) {
++  if (strength_ == Strength::kNone) {
++    return;
++  }
++  views_[&view].slot = slot;
++}
++
++gfx::Vector2d DragSnap::Draw(const views::View& view,
++                             const gfx::Vector2d& pointer,
++                             bool horizontal,
++                             bool vertical) {
++  auto it = views_.find(&view);
++  if (it == views_.end()) {
++    return pointer;
++  }
++  ViewState& state = it->second;
++  const base::TimeTicks now = base::TimeTicks::Now();
++  const gfx::Vector2d target = Pull(state, pointer, horizontal, vertical);
++  const bool single = views_.size() == 1;
++  LastDrawn& last_drawn = GetLastDrawn();
++
++  if (state.drawn_slot) {
++    if (*state.drawn_slot != state.slot.origin()) {
++      StartGlide(state, state.drawn - target, horizontal, vertical, now);
++    }
++  } else if (single && !last_drawn.time.is_null() &&
++             now - last_drawn.time < kHandOffWindow) {
++    const gfx::Vector2d from = views::View::ConvertPointFromScreen(
++                                   &*host_, last_drawn.origin_in_screen)
++                                   .OffsetFromOrigin() -
++                               target;
++    // Anything farther came from somewhere unrelated, like another window.
++    const int max_distance =
++        2 * std::max(state.slot.width(), state.slot.height());
++    if (std::abs(from.x()) <= max_distance &&
++        std::abs(from.y()) <= max_distance) {
++      StartGlide(state, from, horizontal, vertical, now);
++    }
++  }
++
++  state.drawn = target + GlideOffset(state, now);
++  state.drawn_slot = state.slot.origin();
++  if (single) {
++    gfx::Point origin = gfx::PointAtOffsetFromOrigin(state.drawn);
++    views::View::ConvertPointToScreen(&*host_, &origin);
++    last_drawn = {.origin_in_screen = origin, .time = now};
++  }
++  return state.drawn;
++}
++
++gfx::Vector2d DragSnap::Peek(const views::View& view,
++                             const gfx::Vector2d& pointer,
++                             bool horizontal,
++                             bool vertical) const {
++  auto it = views_.find(&view);
++  if (it == views_.end()) {
++    return pointer;
++  }
++  const ViewState& state = it->second;
++  if (state.drawn_slot && *state.drawn_slot != state.slot.origin()) {
++    // The slot moved after the last draw; the view is still where it was.
++    return state.drawn;
++  }
++  return Pull(state, pointer, horizontal, vertical) +
++         GlideOffset(state, base::TimeTicks::Now());
++}
++
++void DragSnap::Forget(const views::View& view) {
++  views_.erase(&view);
++}
++
++void DragSnap::Reset() {
++  views_.clear();
++  glide_animation_.Stop();
++}
++
++void DragSnap::AnimationProgressed(const gfx::Animation* animation) {
++  redraw_.Run();
++}
++
++void DragSnap::AnimationEnded(const gfx::Animation* animation) {
++  redraw_.Run();
++}
++
++gfx::Vector2d DragSnap::Pull(const ViewState& state,
++                             const gfx::Vector2d& pointer,
++                             bool horizontal,
++                             bool vertical) const {
++  return gfx::Vector2d(horizontal ? PullAxis(strength_, state.slot.x(),
++                                             pointer.x(), state.slot.width())
++                                  : pointer.x(),
++                       vertical ? PullAxis(strength_, state.slot.y(),
++                                           pointer.y(), state.slot.height())
++                                : pointer.y());
++}
++
++gfx::Vector2d DragSnap::GlideOffset(const ViewState& state,
++                                    base::TimeTicks now) const {
++  if (state.glide_start.is_null()) {
++    return gfx::Vector2d();
++  }
++  const double progress = (now - state.glide_start) / kGlideDuration;
++  if (progress >= 1.0) {
++    return gfx::Vector2d();
++  }
++  // A strong ease-out: the tab leaves at once and settles softly.
++  const gfx::CubicBezier ease_out(0.23, 1, 0.32, 1);
++  const double remaining = 1.0 - ease_out.Solve(std::max(progress, 0.0));
++  return gfx::Vector2d(base::ClampRound(state.glide_from.x() * remaining),
++                       base::ClampRound(state.glide_from.y() * remaining));
++}
++
++void DragSnap::StartGlide(ViewState& state,
++                          gfx::Vector2d from,
++                          bool horizontal,
++                          bool vertical,
++                          base::TimeTicks now) {
++  if (!horizontal) {
++    from.set_x(0);
++  }
++  if (!vertical) {
++    from.set_y(0);
++  }
++  if (from.IsZero() ||
++      gfx::Animation::RichAnimationDuration(kGlideDuration).is_zero()) {
++    state.glide_start = base::TimeTicks();
++    return;
++  }
++  state.glide_from = from;
++  state.glide_start = now;
++  glide_animation_.Stop();
++  glide_animation_.Start();
++}
++
++}  // namespace rac
+Index: src/chrome/browser/ui/views/rac/sidebar/drag_snap.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/views/rac/sidebar/drag_snap.h	2026-10-12 08:31:27.295061972 -0700
+@@ -0,0 +1,113 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_DRAG_SNAP_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_DRAG_SNAP_H_
++
++#include <optional>
++
++#include "base/containers/flat_map.h"
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/raw_ref.h"
++#include "base/time/time.h"
++#include "ui/gfx/animation/animation_delegate.h"
++#include "ui/gfx/animation/linear_animation.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/vector2d.h"
++
++namespace views {
++class View;
++}  // namespace views
++
++namespace rac {
++
++// Draws dragged sidebar tabs pulled toward the slot they would drop into, so
++// favorites move from cell to cell and rows settle near their place in the
++// list. The pointer alone still decides where the tabs drop; this only
++// changes where they're drawn.
++//
++// Positions are drag offsets in the container: the translation a dragged view
++// is drawn with, or its origin once the drag ends.
++class DragSnap : public gfx::AnimationDelegate {
++ public:
++  enum class Strength {
++    kNone,
++    // Rows follow the pointer most of the way and hop the rest when their
++    // slot changes.
++    kGentle,
++    // Favorites stay close to their cell and glide to the next one.
++    kGrid,
++  };
++
++  DragSnap(views::View& host, Strength strength, base::RepeatingClosure redraw);
++  DragSnap(const DragSnap&) = delete;
++  DragSnap& operator=(const DragSnap&) = delete;
++  ~DragSnap() override;
++
++  // Records where `view` would land if dropped now. `slot` is the drag offset
++  // of that place and the view's size there.
++  void SetSlot(const views::View& view, const gfx::Rect& slot);
++
++  // Returns where to draw `view` when the pointer alone would put it at
++  // `pointer`, and remembers it so a slot change glides from there. Only the
++  // axes the drag moves on are pulled.
++  gfx::Vector2d Draw(const views::View& view,
++                     const gfx::Vector2d& pointer,
++                     bool horizontal,
++                     bool vertical);
++
++  // Like `Draw`, without changing any state.
++  gfx::Vector2d Peek(const views::View& view,
++                     const gfx::Vector2d& pointer,
++                     bool horizontal,
++                     bool vertical) const;
++
++  // Whether any dragged view has a slot yet.
++  bool has_slots() const { return !views_.empty(); }
++
++  // Forgets `view`, which is going away.
++  void Forget(const views::View& view);
++
++  // Forgets every slot, for when the drag ends or leaves the container.
++  void Reset();
++
++  // gfx::AnimationDelegate:
++  void AnimationProgressed(const gfx::Animation* animation) override;
++  void AnimationEnded(const gfx::Animation* animation) override;
++
++ private:
++  struct ViewState {
++    gfx::Rect slot;
++    // The slot origin when the view was last drawn, if it has been.
++    std::optional<gfx::Point> drawn_slot;
++    gfx::Vector2d drawn;
++    // How far from its pulled position the view was when it started gliding,
++    // and when that was.
++    gfx::Vector2d glide_from;
++    base::TimeTicks glide_start;
++  };
++
++  gfx::Vector2d Pull(const ViewState& state,
++                     const gfx::Vector2d& pointer,
++                     bool horizontal,
++                     bool vertical) const;
++  gfx::Vector2d GlideOffset(const ViewState& state, base::TimeTicks now) const;
++  void StartGlide(ViewState& state,
++                  gfx::Vector2d from,
++                  bool horizontal,
++                  bool vertical,
++                  base::TimeTicks now);
++
++  const raw_ref<views::View> host_;
++  const Strength strength_;
++  base::RepeatingClosure redraw_;
++  base::flat_map<raw_ptr<const views::View>, ViewState> views_;
++  // Runs while any view glides; each view times its own glide.
++  gfx::LinearAnimation glide_animation_;
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_DRAG_SNAP_H_
+Index: src/chrome/browser/ui/views/tabs/common/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/BUILD.gn	2026-10-12 08:29:41.762803951 -0700
++++ src/chrome/browser/ui/views/tabs/common/BUILD.gn	2026-10-12 08:31:27.295453345 -0700
+@@ -44,6 +44,8 @@
+ 
+ source_set("impl") {
+   sources = [
++    "//chrome/browser/ui/views/rac/sidebar/drag_snap.cc",
++    "//chrome/browser/ui/views/rac/sidebar/drag_snap.h",
+     "//chrome/browser/ui/views/rac/sidebar/pinned_page_button.cc",
+     "//chrome/browser/ui/views/rac/sidebar/pinned_page_button.h",
+     "//chrome/browser/ui/views/rac/sidebar/pinned_section.cc",
+Index: src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc	2026-10-12 08:29:41.763666531 -0700
++++ src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc	2026-10-12 08:31:27.296317716 -0700
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
+ 
+ #include "base/callback_list.h"
++#include "base/functional/bind.h"
+ #include "base/i18n/rtl.h"
+ #include "base/notreached.h"
+ #include "base/time/time.h"
+@@ -53,6 +54,19 @@
+ 
+   return dragged_view_bounds_offset_from_bounds;
+ }
++
++rac::DragSnap::Strength GetSnapStrength(
++    DraggedTabsContainer::DragLayout drag_layout) {
++  switch (drag_layout) {
++    case DraggedTabsContainer::DragLayout::kSquash:
++      return rac::DragSnap::Strength::kGrid;
++    case DraggedTabsContainer::DragLayout::kVertical:
++      return rac::DragSnap::Strength::kGentle;
++    case DraggedTabsContainer::DragLayout::kHorizontal:
++      return rac::DragSnap::Strength::kNone;
++  }
++  NOTREACHED();
++}
+ }  // namespace
+ 
+ DraggedTabsContainer::DraggedTabsContainer(views::View& host_view,
+@@ -63,7 +77,19 @@
+       collection_node_(collection_node),
+       drag_start_animation_(this),
+       drag_axes_(drag_axes),
+-      drag_layout_(drag_layout) {
++      drag_layout_(drag_layout),
++      drag_snap_(host_view,
++                 GetSnapStrength(drag_layout),
++                 base::BindRepeating(
++                     [](DraggedTabsContainer* container) {
++                       if (container->IsHandlingDrag()) {
++                         container->UpdateDraggingViewTransforms(
++                             views::View::ConvertPointFromScreen(
++                                 base::to_address(container->host_view_),
++                                 container->last_drag_point_in_screen_));
++                       }
++                     },
++                     base::Unretained(this))) {
+   host_view_observation_.Observe(&host_view);
+   node_destroyed_subscription_ =
+       collection_node_->RegisterWillDestroyCallback(base::BindOnce(
+@@ -119,6 +145,16 @@
+   UpdateDraggingViewTransforms(point_in_container);
+ 
+   HandleTabDragInContainer(dragged_bounds_in_container, point_in_container);
++
++  // rac: the drag may have moved the dragged views to new slots, which draws
++  // them pulled toward those instead.
++  if (IsHandlingDrag()) {
++    if (needs_drag_slots_) {
++      needs_drag_slots_ = false;
++      host_view_->InvalidateLayout();
++    }
++    UpdateDraggingViewTransforms(point_in_container);
++  }
+ }
+ 
+ void DraggedTabsContainer::OnTabDragExited(const gfx::Point& point_in_screen) {
+@@ -180,6 +216,7 @@
+   }
+ 
+   if (dragging_views_.contains(observed_view)) {
++    drag_snap_.Forget(*observed_view);
+     dragging_views_.erase(observed_view);
+     dragged_view_observations_.RemoveObservation(observed_view);
+   }
+@@ -211,6 +248,7 @@
+ 
+   const auto& session_data = controller.GetSessionData();
+   BuildDragLayout(session_data);
++  needs_drag_slots_ = true;
+ 
+   InitializeDragStartAnimation(controller);
+ }
+@@ -410,6 +448,8 @@
+   // are set to (0,0), but afterward the drag, the bounds must be updated to
+   // the actual position, without animating.
+   UpdateTargetLayoutForDrag(GetDraggingViews());
++  drag_snap_.Reset();
++  needs_drag_slots_ = false;
+   dragging_views_.clear();
+   dragged_view_observations_.RemoveAllObservations();
+   animating_views_start_offsets_.clear();
+@@ -430,9 +470,15 @@
+     }
+     // Use a transformation to render the dragged views, offset from the
+     // container's origin.
++    gfx::Vector2d position = GetDraggingViewPositionForBounds(
++        dragged_view, bounding_box_for_point, visual_data.offset);
++    if (!visual_data.should_hide) {
++      position =
++          drag_snap_.Draw(*dragged_view, position, IsHorizontalDragSupported(),
++                          IsVerticalDragSupported());
++    }
+     gfx::Transform transform;
+-    transform.Translate(GetDraggingViewPositionForBounds(
+-        dragged_view, bounding_box_for_point, visual_data.offset));
++    transform.Translate(position);
+ 
+     dragged_view->SetTransform(transform);
+   }
+@@ -528,9 +574,15 @@
+         base::to_address(host_view_), last_drag_point_in_screen_);
+     const gfx::Rect bounding_box_for_point =
+         GetDraggingViewsBoundsAtPointClamped(point_in_container);
++    gfx::Vector2d offset = GetDraggingViewPositionForBounds(
++        &view, bounding_box_for_point, it->second.offset);
++    if (!it->second.should_hide) {
++      // Settle from where the drag drew the view.
++      offset = drag_snap_.Peek(view, offset, IsHorizontalDragSupported(),
++                               IsVerticalDragSupported());
++    }
+     return std::make_optional(DraggedViewVisualData{
+-        .offset = GetDraggingViewPositionForBounds(
+-            &view, bounding_box_for_point, it->second.offset),
++        .offset = offset,
+         .should_hide = should_hide,
+         .should_float = should_float,
+     });
+Index: src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/dragged_tabs_container.h	2026-10-12 08:29:41.764160778 -0700
++++ src/chrome/browser/ui/views/tabs/common/dragged_tabs_container.h	2026-10-12 08:31:27.296796464 -0700
+@@ -10,6 +10,7 @@
+ #include "base/memory/raw_ref.h"
+ #include "base/scoped_multi_source_observation.h"
+ #include "base/scoped_observation.h"
++#include "chrome/browser/ui/views/rac/sidebar/drag_snap.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_drag_scroll_handler.h"
+ #include "chrome/browser/ui/views/tabs/dragging/tab_drag_target.h"
+ #include "ui/gfx/animation/animation_delegate.h"
+@@ -108,6 +109,12 @@
+   std::optional<DraggedViewVisualData> GetVisualDataForDraggedView(
+       const views::View& view) const;
+ 
++  // rac: records the drag offset that would put the dragged `view` in its
++  // slot, so the drag can draw it pulled there.
++  void SetDragSlot(const views::View& view, const gfx::Rect& slot) const {
++    drag_snap_.SetSlot(view, slot);
++  }
++
+   // Returns whether the two rects overlap by at least the provided minimums for
+   // each axis.
+   // E.g, if only `min_x_overlap` is provided, then this will return true
+@@ -263,6 +270,11 @@
+   std::optional<base::CallbackListSubscription> on_scrolled_subscription_ =
+       std::nullopt;
+ 
++  // Layouts record slots while they're calculated, which is const.
++  mutable rac::DragSnap drag_snap_;
++  // Whether the layout must run once more to record the dragged views' slots.
++  bool needs_drag_slots_ = false;
++
+   base::OnceClosureList on_will_destroy_callback_list_;
+ };
+ 
+Index: src/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc	2026-10-12 08:31:11.786505322 -0700
++++ src/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc	2026-10-12 08:31:27.297447294 -0700
+@@ -448,6 +448,12 @@
+       continue;
+     }
+ 
++    // rac: the dragged favorite's cell. Its padding is added below either
++    // way, so the cell's drag offset is the flow position without it.
++    if (drag_data && !base::i18n::IsRTL() &&
++        size_bounds.width() == views::SizeBound(width())) {
++      SetDragSlot(*child, gfx::Rect(x, y, child_width, bounds.height()));
++    }
+     bounds.set_y(drag_data ? drag_data->offset.y() : y);
+     int child_x = drag_data ? drag_data->offset.x() : x;
+     if (drag_data && base::i18n::IsRTL()) {
+Index: src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc	2026-10-12 08:24:54.088582480 -0700
++++ src/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc	2026-10-12 08:31:27.298114249 -0700
+@@ -264,6 +264,11 @@
+       bounds.set_width(size_bounds.width().value() - bounds.x() -
+                        horizontal_padding);
+     }
++    if (drag_data) {
++      // rac: the dragged row's place in the list.
++      tab_container_view->SetDragSlot(
++          *child, gfx::Rect(0, height, bounds.width(), bounds.height()));
++    }
+     layouts.child_layouts.emplace_back(child, true, bounds);
+     height += bounds.height() + kTabVerticalPadding;
+     width = std::max(width, bounds.width() + bounds.x());
