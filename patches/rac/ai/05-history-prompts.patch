@@ -1,0 +1,1708 @@
+Index: src/chrome/browser/rac/ai/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/ai/BUILD.gn	2026-10-12 08:15:00.248966353 -0700
++++ src/chrome/browser/rac/ai/BUILD.gn	2026-10-12 08:20:29.804511915 -0700
+@@ -28,8 +28,12 @@
+     "chat_prompt.h",
+     "chat_protocol.cc",
+     "chat_protocol.h",
++    "chat_history.cc",
++    "chat_history.h",
+     "providers.cc",
+     "providers.h",
++    "saved_prompts.cc",
++    "saved_prompts.h",
+     "sse_parser.cc",
+     "sse_parser.h",
+   ]
+@@ -55,6 +59,8 @@
+     "chat_session.h",
+     "chat_stream.cc",
+     "chat_stream.h",
++    "history_store.cc",
++    "history_store.h",
+     "key_store.cc",
+     "key_store.h",
+   ]
+@@ -81,8 +87,10 @@
+ #   out/Default/rac_ai_unittests
+ test("rac_ai_unittests") {
+   sources = [
++    "chat_history_unittest.cc",
+     "chat_prompt_unittest.cc",
+     "chat_protocol_unittest.cc",
++    "saved_prompts_unittest.cc",
+     "sse_parser_unittest.cc",
+   ]
+   deps = [
+@@ -90,6 +98,7 @@
+     "//base",
+     "//base/test:run_all_unittests",
+     "//base/test:test_support",
++    "//components/prefs:test_support",
+     "//testing/gtest",
+   ]
+ }
+Index: src/chrome/browser/rac/ai/ai_prefs.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_prefs.cc	2026-10-12 07:14:12.688716232 -0700
++++ src/chrome/browser/rac/ai/ai_prefs.cc	2026-10-12 08:20:29.803006255 -0700
+@@ -18,6 +18,8 @@
+   registry->RegisterDictionaryPref(kEncryptedKeys);
+   registry->RegisterBooleanPref(kNewTabPage, true);
+   registry->RegisterBooleanPref(kAttachCurrentTab, true);
++  registry->RegisterBooleanPref(kSaveHistory, true);
++  registry->RegisterListPref(kSavedPrompts);
+ }
+ 
+ ProviderSettings GetProviderSettings(const PrefService* prefs,
+Index: src/chrome/browser/rac/ai/ai_prefs.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_prefs.h	2026-10-12 07:14:12.688249642 -0700
++++ src/chrome/browser/rac/ai/ai_prefs.h	2026-10-12 08:20:29.802833548 -0700
+@@ -29,6 +29,11 @@
+ // Attach the current tab to a chat by default.
+ inline constexpr char kAttachCurrentTab[] = "rac.ai.attach_current_tab";
+ 
++// Keep finished conversations in the profile folder so they can be reopened.
++inline constexpr char kSaveHistory[] = "rac.ai.save_history";
++// List of {id, title, text}: prompts the user saved to reuse.
++inline constexpr char kSavedPrompts[] = "rac.ai.saved_prompts";
++
+ void RegisterProfilePrefs(PrefRegistrySimple* registry);
+ 
+ struct ProviderSettings {
+Index: src/chrome/browser/rac/ai/ai_service.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_service.cc	2026-10-12 07:45:41.877019487 -0700
++++ src/chrome/browser/rac/ai/ai_service.cc	2026-10-12 08:20:29.803841959 -0700
+@@ -11,9 +11,11 @@
+ AiService::AiService(
+     PrefService* prefs,
+     os_crypt_async::OSCryptAsync* os_crypt,
++    const base::FilePath& profile_path,
+     scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory)
+     : prefs_(prefs),
+       key_store_(prefs, os_crypt),
++      history_store_(profile_path.AppendASCII("rac_ai_history.json")),
+       url_loader_factory_(std::move(url_loader_factory)) {}
+ 
+ AiService::~AiService() = default;
+Index: src/chrome/browser/rac/ai/ai_service.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_service.h	2026-10-12 07:45:41.877350364 -0700
++++ src/chrome/browser/rac/ai/ai_service.h	2026-10-12 08:20:29.803635877 -0700
+@@ -8,8 +8,10 @@
+ #include <memory>
+ #include <string>
+ 
++#include "base/files/file_path.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
++#include "chrome/browser/rac/ai/history_store.h"
+ #include "chrome/browser/rac/ai/key_store.h"
+ #include "components/keyed_service/core/keyed_service.h"
+ #include "services/network/public/cpp/shared_url_loader_factory.h"
+@@ -29,6 +31,7 @@
+  public:
+   AiService(PrefService* prefs,
+             os_crypt_async::OSCryptAsync* os_crypt,
++            const base::FilePath& profile_path,
+             scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory);
+   AiService(const AiService&) = delete;
+   AiService& operator=(const AiService&) = delete;
+@@ -36,6 +39,7 @@
+ 
+   PrefService* prefs() { return prefs_; }
+   KeyStore& key_store() { return key_store_; }
++  HistoryStore& history_store() { return history_store_; }
+   network::SharedURLLoaderFactory* url_loader_factory() {
+     return url_loader_factory_.get();
+   }
+@@ -43,6 +47,7 @@
+  private:
+   raw_ptr<PrefService> prefs_;
+   KeyStore key_store_;
++  HistoryStore history_store_;
+   scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory_;
+ };
+ 
+Index: src/chrome/browser/rac/ai/ai_service_factory.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_service_factory.cc	2026-10-12 07:45:41.877715949 -0700
++++ src/chrome/browser/rac/ai/ai_service_factory.cc	2026-10-12 08:20:29.804036458 -0700
+@@ -41,6 +41,7 @@
+   Profile* profile = Profile::FromBrowserContext(context);
+   return std::make_unique<AiService>(
+       profile->GetPrefs(), g_browser_process->os_crypt_async(),
++      profile->GetPath(),
+       profile->GetDefaultStoragePartition()
+           ->GetURLLoaderFactoryForBrowserProcess());
+ }
+Index: src/chrome/browser/rac/ai/chat_history.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/chat_history.cc	2026-10-12 08:21:07.797885810 -0700
+@@ -0,0 +1,206 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/chat_history.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/json/values_util.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++
++namespace rac::ai {
++namespace {
++
++constexpr int kVersion = 1;
++
++bool ReadMessage(const base::Value& value, StoredMessage* out) {
++  const base::DictValue* dict = value.GetIfDict();
++  if (!dict) {
++    return false;
++  }
++  const std::string* role = dict->FindString("role");
++  const std::string* text = dict->FindString("text");
++  if (!role || !text || (*role != "user" && *role != "assistant") ||
++      !base::IsStringUTF8(*text)) {
++    return false;
++  }
++  out->role = *role;
++  out->text = *text;
++  if (const base::ListValue* attached = dict->FindList("attached")) {
++    for (const base::Value& title : *attached) {
++      if (title.is_string() && base::IsStringUTF8(title.GetString()) &&
++          out->attached.size() < 8) {
++        out->attached.push_back(title.GetString().substr(0, 200));
++      }
++    }
++  }
++  return true;
++}
++
++bool ReadMessages(const base::ListValue& list, Conversation* out) {
++  if (list.empty() || list.size() > kMaxStoredMessages) {
++    return false;
++  }
++  size_t total = 0;
++  for (const base::Value& value : list) {
++    StoredMessage message;
++    if (!ReadMessage(value, &message)) {
++      return false;
++    }
++    total += message.text.size();
++    out->messages.push_back(std::move(message));
++  }
++  return total <= kMaxStoredChars;
++}
++
++base::DictValue MessageToValue(const StoredMessage& message) {
++  base::DictValue dict;
++  dict.Set("role", message.role);
++  dict.Set("text", message.text);
++  if (!message.attached.empty()) {
++    base::ListValue attached;
++    for (const std::string& title : message.attached) {
++      attached.Append(title);
++    }
++    dict.Set("attached", std::move(attached));
++  }
++  return dict;
++}
++
++}  // namespace
++
++bool IsValidConversationId(std::string_view id) {
++  if (id.size() < 8 || id.size() > 64) {
++    return false;
++  }
++  return std::ranges::all_of(
++      id, [](char c) { return base::IsAsciiAlphaNumeric(c) || c == '-'; });
++}
++
++std::string MakeTitle(std::string_view first_user_text) {
++  std::u16string text = base::UTF8ToUTF16(first_user_text);
++  for (char16_t& c : text) {
++    if (c == u'\n' || c == u'\r' || c == u'\t') {
++      c = u' ';
++    }
++  }
++  base::TrimWhitespace(text, base::TRIM_ALL, &text);
++  if (text.size() > kMaxTitleChars) {
++    size_t cut = kMaxTitleChars;
++    // Don't leave half of a surrogate pair behind.
++    if ((text[cut - 1] & 0xFC00) == 0xD800) {
++      --cut;
++    }
++    text.resize(cut);
++    text += u"\u2026";
++  }
++  return base::UTF16ToUTF8(text);
++}
++
++bool ConversationFromValue(const base::DictValue& value,
++                           base::Time now,
++                           Conversation* out) {
++  const std::string* id = value.FindString("id");
++  const base::ListValue* messages = value.FindList("messages");
++  if (!id || !IsValidConversationId(*id) || !messages) {
++    return false;
++  }
++  Conversation conversation;
++  conversation.id = *id;
++  conversation.updated = now;
++  if (!ReadMessages(*messages, &conversation)) {
++    return false;
++  }
++  for (const StoredMessage& message : conversation.messages) {
++    if (message.role == "user") {
++      conversation.title = MakeTitle(message.text);
++      break;
++    }
++  }
++  if (conversation.title.empty()) {
++    return false;
++  }
++  *out = std::move(conversation);
++  return true;
++}
++
++base::DictValue ConversationToValue(const Conversation& conversation,
++                                    bool with_messages) {
++  base::DictValue dict;
++  dict.Set("id", conversation.id);
++  dict.Set("title", conversation.title);
++  dict.Set("updated", base::TimeToValue(conversation.updated));
++  if (with_messages) {
++    base::ListValue messages;
++    for (const StoredMessage& message : conversation.messages) {
++      messages.Append(MessageToValue(message));
++    }
++    dict.Set("messages", std::move(messages));
++  }
++  return dict;
++}
++
++std::string SerializeConversations(const std::vector<Conversation>& all) {
++  base::ListValue list;
++  for (const Conversation& conversation : all) {
++    list.Append(ConversationToValue(conversation, /*with_messages=*/true));
++  }
++  base::DictValue root;
++  root.Set("version", kVersion);
++  root.Set("conversations", std::move(list));
++  std::string json;
++  base::JSONWriter::Write(root, &json);
++  return json;
++}
++
++std::vector<Conversation> ParseConversations(std::string_view json) {
++  std::vector<Conversation> all;
++  std::optional<base::DictValue> root =
++      base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC);
++  if (!root || root->FindInt("version") != kVersion) {
++    return all;
++  }
++  const base::ListValue* list = root->FindList("conversations");
++  if (!list) {
++    return all;
++  }
++  for (const base::Value& value : *list) {
++    const base::DictValue* dict = value.GetIfDict();
++    const std::string* id = dict ? dict->FindString("id") : nullptr;
++    const std::string* title = dict ? dict->FindString("title") : nullptr;
++    const base::ListValue* messages =
++        dict ? dict->FindList("messages") : nullptr;
++    std::optional<base::Time> updated =
++        dict ? base::ValueToTime(dict->Find("updated")) : std::nullopt;
++    if (!id || !title || !messages || !updated || !IsValidConversationId(*id) ||
++        !base::IsStringUTF8(*title) || all.size() >= kMaxConversations) {
++      continue;
++    }
++    Conversation conversation;
++    conversation.id = *id;
++    conversation.title = title->substr(0, 400);
++    conversation.updated = *updated;
++    if (ReadMessages(*messages, &conversation)) {
++      all.push_back(std::move(conversation));
++    }
++  }
++  return all;
++}
++
++void UpsertConversation(std::vector<Conversation>& all,
++                        Conversation conversation) {
++  std::erase_if(all, [&](const Conversation& existing) {
++    return existing.id == conversation.id;
++  });
++  all.insert(all.begin(), std::move(conversation));
++  if (all.size() > kMaxConversations) {
++    all.resize(kMaxConversations);
++  }
++}
++
++}  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/chat_history.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/chat_history.h	2026-10-12 08:20:29.805306702 -0700
+@@ -0,0 +1,62 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_CHAT_HISTORY_H_
++#define CHROME_BROWSER_RAC_AI_CHAT_HISTORY_H_
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/time/time.h"
++#include "base/values.h"
++
++namespace rac::ai {
++
++inline constexpr size_t kMaxConversations = 200;
++inline constexpr size_t kMaxStoredMessages = 200;
++inline constexpr size_t kMaxStoredChars = 400 * 1024;
++inline constexpr size_t kMaxTitleChars = 80;
++
++struct StoredMessage {
++  std::string role;  // "user" or "assistant".
++  std::string text;
++  // Titles of the tabs attached to a user message.
++  std::vector<std::string> attached;
++};
++
++struct Conversation {
++  std::string id;
++  std::string title;
++  base::Time updated;
++  std::vector<StoredMessage> messages;
++};
++
++// Ids come from the page, and end up in a file. Accept only plain ones.
++bool IsValidConversationId(std::string_view id);
++
++// A short title from the first thing the user said.
++std::string MakeTitle(std::string_view first_user_text);
++
++// Reads a conversation sent by the page. Returns false if it is malformed or
++// too big. Fills in the title and takes `updated` from `now`.
++bool ConversationFromValue(const base::DictValue& value,
++                           base::Time now,
++                           Conversation* out);
++
++base::DictValue ConversationToValue(const Conversation& conversation,
++                                    bool with_messages);
++
++std::string SerializeConversations(const std::vector<Conversation>& all);
++// Returns what could be read; a damaged file yields an empty list.
++std::vector<Conversation> ParseConversations(std::string_view json);
++
++// Puts `conversation` first, replacing one with the same id, and drops the
++// oldest beyond kMaxConversations.
++void UpsertConversation(std::vector<Conversation>& all,
++                        Conversation conversation);
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_CHAT_HISTORY_H_
+Index: src/chrome/browser/rac/ai/chat_history_unittest.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/chat_history_unittest.cc	2026-10-12 08:20:35.428117746 -0700
+@@ -0,0 +1,112 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/chat_history.h"
++
++#include <string>
++
++#include "base/json/json_reader.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::ai {
++namespace {
++
++base::DictValue Sent(const std::string& id, const std::string& first) {
++  base::ListValue messages;
++  messages.Append(base::DictValue()
++                      .Set("role", "user")
++                      .Set("text", first)
++                      .Set("attached", base::ListValue().Append("A page")));
++  messages.Append(
++      base::DictValue().Set("role", "assistant").Set("text", "Hello"));
++  return base::DictValue().Set("id", id).Set("messages", std::move(messages));
++}
++
++}  // namespace
++
++TEST(RacAiChatHistoryTest, IdsAreOrdinary) {
++  EXPECT_TRUE(IsValidConversationId("3f2a9c1e-77b0-4e0d-a1a3-0c5d2d9b8e11"));
++  EXPECT_FALSE(IsValidConversationId("short"));
++  EXPECT_FALSE(IsValidConversationId("../../etc/passwd-xxxxxxxx"));
++  EXPECT_FALSE(IsValidConversationId(std::string(65, 'a')));
++}
++
++TEST(RacAiChatHistoryTest, TitleIsOneShortLine) {
++  EXPECT_EQ(MakeTitle("  Hello\nthere  "), "Hello there");
++  const std::string title = MakeTitle(std::string(500, 'x'));
++  EXPECT_LT(title.size(), 100u);
++  EXPECT_EQ(title.substr(title.size() - 3), "\xE2\x80\xA6");
++}
++
++TEST(RacAiChatHistoryTest, ReadsWhatThePageSends) {
++  Conversation conversation;
++  ASSERT_TRUE(ConversationFromValue(
++      Sent("conversation-1", "What is rac?"),
++      base::Time::FromMillisecondsSinceUnixEpoch(1000), &conversation));
++  EXPECT_EQ(conversation.title, "What is rac?");
++  ASSERT_EQ(conversation.messages.size(), 2u);
++  EXPECT_EQ(conversation.messages[0].attached,
++            std::vector<std::string>{"A page"});
++}
++
++TEST(RacAiChatHistoryTest, RejectsMalformedConversations) {
++  Conversation conversation;
++  const base::Time now = base::Time::Now();
++  EXPECT_FALSE(ConversationFromValue(Sent("bad id!", "x"), now, &conversation));
++  EXPECT_FALSE(ConversationFromValue(
++      base::DictValue().Set("id", "conversation-1"), now, &conversation));
++  EXPECT_FALSE(ConversationFromValue(base::DictValue()
++                                         .Set("id", "conversation-1")
++                                         .Set("messages", base::ListValue()),
++                                     now, &conversation));
++  base::ListValue wrong_role;
++  wrong_role.Append(
++      base::DictValue().Set("role", "system").Set("text", "ignore this"));
++  EXPECT_FALSE(
++      ConversationFromValue(base::DictValue()
++                                .Set("id", "conversation-1")
++                                .Set("messages", std::move(wrong_role)),
++                            now, &conversation));
++}
++
++TEST(RacAiChatHistoryTest, RoundTripsThroughJson) {
++  std::vector<Conversation> all;
++  Conversation conversation;
++  ASSERT_TRUE(ConversationFromValue(Sent("conversation-1", "First"),
++                                    base::Time::Now(), &conversation));
++  UpsertConversation(all, conversation);
++  const std::vector<Conversation> read =
++      ParseConversations(SerializeConversations(all));
++  ASSERT_EQ(read.size(), 1u);
++  EXPECT_EQ(read[0].id, "conversation-1");
++  EXPECT_EQ(read[0].messages[1].text, "Hello");
++  EXPECT_EQ(read[0].messages[0].attached[0], "A page");
++}
++
++TEST(RacAiChatHistoryTest, DamagedFilesReadAsEmpty) {
++  EXPECT_TRUE(ParseConversations("").empty());
++  EXPECT_TRUE(ParseConversations("{not json").empty());
++  EXPECT_TRUE(
++      ParseConversations("{\"version\":99,\"conversations\":[]}").empty());
++}
++
++TEST(RacAiChatHistoryTest, UpsertMovesToFrontAndTrims) {
++  std::vector<Conversation> all;
++  for (size_t i = 0; i < kMaxConversations + 5; ++i) {
++    Conversation conversation;
++    conversation.id = "conversation-" + std::to_string(i);
++    conversation.title = "t";
++    UpsertConversation(all, conversation);
++  }
++  EXPECT_EQ(all.size(), kMaxConversations);
++  EXPECT_EQ(all.front().id, "conversation-204");
++  Conversation again;
++  again.id = "conversation-100";
++  again.title = "t";
++  UpsertConversation(all, again);
++  EXPECT_EQ(all.front().id, "conversation-100");
++  EXPECT_EQ(all.size(), kMaxConversations);
++}
++
++}  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/history_store.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/history_store.cc	2026-10-12 08:20:35.445133498 -0700
+@@ -0,0 +1,140 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/history_store.h"
++
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/task/thread_pool.h"
++
++namespace rac::ai {
++namespace {
++
++// Larger than any file we write, so a damaged or hostile file can't make the
++// browser read without limit.
++constexpr int64_t kMaxFileBytes = 16 * 1024 * 1024;
++
++std::string ReadFile(const base::FilePath& path) {
++  std::string contents;
++  if (!base::ReadFileToStringWithMaxSize(path, &contents, kMaxFileBytes)) {
++    contents.clear();
++  }
++  return contents;
++}
++
++}  // namespace
++
++HistoryStore::HistoryStore(const base::FilePath& path)
++    : path_(path),
++      task_runner_(base::ThreadPool::CreateSequencedTaskRunner(
++          {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
++           base::TaskShutdownBehavior::BLOCK_SHUTDOWN})),
++      writer_(path, task_runner_, "RacAiHistory") {}
++
++HistoryStore::~HistoryStore() = default;
++
++void HistoryStore::WhenLoaded(base::OnceClosure task) {
++  if (loaded_) {
++    std::move(task).Run();
++    return;
++  }
++  waiting_.push_back(std::move(task));
++  if (load_started_) {
++    return;
++  }
++  load_started_ = true;
++  task_runner_->PostTaskAndReplyWithResult(
++      FROM_HERE, base::BindOnce(&ReadFile, path_),
++      base::BindOnce(&HistoryStore::OnLoaded, weak_factory_.GetWeakPtr()));
++}
++
++void HistoryStore::OnLoaded(std::string contents) {
++  conversations_ = ParseConversations(contents);
++  loaded_ = true;
++  std::vector<base::OnceClosure> waiting = std::move(waiting_);
++  for (base::OnceClosure& task : waiting) {
++    std::move(task).Run();
++  }
++}
++
++void HistoryStore::List(ListCallback callback) {
++  WhenLoaded(base::BindOnce(
++      [](base::WeakPtr<HistoryStore> self, ListCallback callback) {
++        std::vector<Conversation> result;
++        if (self) {
++          for (const Conversation& conversation : self->conversations_) {
++            Conversation summary;
++            summary.id = conversation.id;
++            summary.title = conversation.title;
++            summary.updated = conversation.updated;
++            result.push_back(std::move(summary));
++          }
++        }
++        std::move(callback).Run(std::move(result));
++      },
++      weak_factory_.GetWeakPtr(), std::move(callback)));
++}
++
++void HistoryStore::Get(const std::string& id, GetCallback callback) {
++  WhenLoaded(base::BindOnce(
++      [](base::WeakPtr<HistoryStore> self, std::string id,
++         GetCallback callback) {
++        std::optional<Conversation> result;
++        if (self) {
++          for (const Conversation& conversation : self->conversations_) {
++            if (conversation.id == id) {
++              result = conversation;
++              break;
++            }
++          }
++        }
++        std::move(callback).Run(std::move(result));
++      },
++      weak_factory_.GetWeakPtr(), id, std::move(callback)));
++}
++
++void HistoryStore::Save(Conversation conversation) {
++  WhenLoaded(base::BindOnce(
++      [](base::WeakPtr<HistoryStore> self, Conversation conversation) {
++        if (!self) {
++          return;
++        }
++        UpsertConversation(self->conversations_, std::move(conversation));
++        self->writer_.ScheduleWrite(self.get());
++      },
++      weak_factory_.GetWeakPtr(), std::move(conversation)));
++}
++
++void HistoryStore::Delete(const std::string& id) {
++  WhenLoaded(base::BindOnce(
++      [](base::WeakPtr<HistoryStore> self, std::string id) {
++        if (!self) {
++          return;
++        }
++        std::erase_if(self->conversations_,
++                      [&](const Conversation& c) { return c.id == id; });
++        self->writer_.ScheduleWrite(self.get());
++      },
++      weak_factory_.GetWeakPtr(), id));
++}
++
++void HistoryStore::Clear() {
++  WhenLoaded(base::BindOnce(
++      [](base::WeakPtr<HistoryStore> self) {
++        if (!self) {
++          return;
++        }
++        self->conversations_.clear();
++        self->writer_.ScheduleWrite(self.get());
++      },
++      weak_factory_.GetWeakPtr()));
++}
++
++std::optional<std::string> HistoryStore::SerializeData() {
++  return SerializeConversations(conversations_);
++}
++
++}  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/history_store.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/history_store.h	2026-10-12 08:20:29.806003949 -0700
+@@ -0,0 +1,62 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_HISTORY_STORE_H_
++#define CHROME_BROWSER_RAC_AI_HISTORY_STORE_H_
++
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/files/important_file_writer.h"
++#include "base/functional/callback.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/rac/ai/chat_history.h"
++
++namespace rac::ai {
++
++// The user's past conversations, kept in one file in the profile folder and
++// nowhere else. The file is read the first time something asks for it, so a
++// profile that never opens the assistant never touches it. Writes are batched
++// and atomic.
++class HistoryStore : public base::ImportantFileWriter::DataSerializer {
++ public:
++  using ListCallback = base::OnceCallback<void(std::vector<Conversation>)>;
++  using GetCallback = base::OnceCallback<void(std::optional<Conversation>)>;
++
++  explicit HistoryStore(const base::FilePath& path);
++  HistoryStore(const HistoryStore&) = delete;
++  HistoryStore& operator=(const HistoryStore&) = delete;
++  ~HistoryStore() override;
++
++  // Newest first, without messages.
++  void List(ListCallback callback);
++  void Get(const std::string& id, GetCallback callback);
++  void Save(Conversation conversation);
++  void Delete(const std::string& id);
++  void Clear();
++
++  // base::ImportantFileWriter::DataSerializer:
++  std::optional<std::string> SerializeData() override;
++
++ private:
++  void WhenLoaded(base::OnceClosure task);
++  void OnLoaded(std::string contents);
++
++  base::FilePath path_;
++  scoped_refptr<base::SequencedTaskRunner> task_runner_;
++  base::ImportantFileWriter writer_;
++  bool load_started_ = false;
++  bool loaded_ = false;
++  std::vector<base::OnceClosure> waiting_;
++  std::vector<Conversation> conversations_;
++  base::WeakPtrFactory<HistoryStore> weak_factory_{this};
++};
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_HISTORY_STORE_H_
+Index: src/chrome/browser/rac/ai/saved_prompts.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/saved_prompts.cc	2026-10-12 08:20:35.456909066 -0700
+@@ -0,0 +1,66 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/saved_prompts.h"
++
++#include <utility>
++
++#include "base/strings/string_util.h"
++#include "base/uuid.h"
++#include "base/values.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
++#include "chrome/browser/rac/ai/chat_history.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++
++namespace rac::ai {
++
++std::vector<SavedPrompt> GetSavedPrompts(const PrefService* prefs) {
++  std::vector<SavedPrompt> result;
++  for (const base::Value& value : prefs->GetList(kSavedPrompts)) {
++    const base::DictValue* dict = value.GetIfDict();
++    const std::string* id = dict ? dict->FindString("id") : nullptr;
++    const std::string* title = dict ? dict->FindString("title") : nullptr;
++    const std::string* text = dict ? dict->FindString("text") : nullptr;
++    if (id && title && text && result.size() < kMaxSavedPrompts) {
++      result.push_back({*id, *title, *text});
++    }
++  }
++  return result;
++}
++
++bool AddSavedPrompt(PrefService* prefs,
++                    const std::string& title,
++                    const std::string& text) {
++  std::string trimmed_text(base::TrimWhitespaceASCII(text, base::TRIM_ALL));
++  if (trimmed_text.empty() || trimmed_text.size() > kMaxPromptChars ||
++      !base::IsStringUTF8(trimmed_text) || !base::IsStringUTF8(title)) {
++    return false;
++  }
++  std::string clean_title = MakeTitle(title.empty() ? trimmed_text : title);
++  if (clean_title.size() > kMaxPromptTitleChars * 4) {
++    clean_title.resize(kMaxPromptTitleChars * 4);
++  }
++  ScopedListPrefUpdate update(prefs, kSavedPrompts);
++  if (update->size() >= kMaxSavedPrompts) {
++    return false;
++  }
++  update->Append(
++      base::DictValue()
++          .Set("id", base::Uuid::GenerateRandomV4().AsLowercaseString())
++          .Set("title", std::move(clean_title))
++          .Set("text", std::move(trimmed_text)));
++  return true;
++}
++
++void RemoveSavedPrompt(PrefService* prefs, const std::string& id) {
++  ScopedListPrefUpdate update(prefs, kSavedPrompts);
++  update->EraseIf([&](const base::Value& value) {
++    const base::DictValue* dict = value.GetIfDict();
++    const std::string* existing = dict ? dict->FindString("id") : nullptr;
++    return existing && *existing == id;
++  });
++}
++
++}  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/saved_prompts.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/saved_prompts.h	2026-10-12 08:20:29.806465155 -0700
+@@ -0,0 +1,38 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_SAVED_PROMPTS_H_
++#define CHROME_BROWSER_RAC_AI_SAVED_PROMPTS_H_
++
++#include <string>
++#include <vector>
++
++class PrefService;
++
++namespace rac::ai {
++
++inline constexpr size_t kMaxSavedPrompts = 50;
++inline constexpr size_t kMaxPromptTitleChars = 60;
++inline constexpr size_t kMaxPromptChars = 4000;
++
++struct SavedPrompt {
++  std::string id;
++  std::string title;
++  std::string text;
++};
++
++// Prompts the user keeps to reuse, stored in the profile's prefs.
++std::vector<SavedPrompt> GetSavedPrompts(const PrefService* prefs);
++
++// Adds a prompt. An empty title is taken from the text. Returns false if the
++// text is empty or too long, or the list is full.
++bool AddSavedPrompt(PrefService* prefs,
++                    const std::string& title,
++                    const std::string& text);
++
++void RemoveSavedPrompt(PrefService* prefs, const std::string& id);
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_SAVED_PROMPTS_H_
+Index: src/chrome/browser/rac/ai/saved_prompts_unittest.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/saved_prompts_unittest.cc	2026-10-12 08:20:35.462482123 -0700
+@@ -0,0 +1,57 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/saved_prompts.h"
++
++#include <string>
++
++#include "chrome/browser/rac/ai/ai_prefs.h"
++#include "components/prefs/testing_pref_service.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::ai {
++
++class RacAiSavedPromptsTest : public testing::Test {
++ protected:
++  RacAiSavedPromptsTest() { RegisterProfilePrefs(prefs_.registry()); }
++  TestingPrefServiceSimple prefs_;
++};
++
++TEST_F(RacAiSavedPromptsTest, StartsEmpty) {
++  EXPECT_TRUE(GetSavedPrompts(&prefs_).empty());
++}
++
++TEST_F(RacAiSavedPromptsTest, AddsAndRemoves) {
++  ASSERT_TRUE(AddSavedPrompt(&prefs_, "Summarize", "Summarize this page."));
++  ASSERT_TRUE(AddSavedPrompt(&prefs_, "", "Translate to French"));
++  std::vector<SavedPrompt> prompts = GetSavedPrompts(&prefs_);
++  ASSERT_EQ(prompts.size(), 2u);
++  EXPECT_EQ(prompts[0].title, "Summarize");
++  EXPECT_EQ(prompts[0].text, "Summarize this page.");
++  EXPECT_EQ(prompts[1].title, "Translate to French");
++  EXPECT_NE(prompts[0].id, prompts[1].id);
++
++  RemoveSavedPrompt(&prefs_, prompts[0].id);
++  prompts = GetSavedPrompts(&prefs_);
++  ASSERT_EQ(prompts.size(), 1u);
++  EXPECT_EQ(prompts[0].text, "Translate to French");
++}
++
++TEST_F(RacAiSavedPromptsTest, RejectsBadPrompts) {
++  EXPECT_FALSE(AddSavedPrompt(&prefs_, "t", "   "));
++  EXPECT_FALSE(
++      AddSavedPrompt(&prefs_, "t", std::string(kMaxPromptChars + 1, 'a')));
++  EXPECT_FALSE(AddSavedPrompt(&prefs_, "t", "bad \xFF utf8"));
++  EXPECT_TRUE(GetSavedPrompts(&prefs_).empty());
++}
++
++TEST_F(RacAiSavedPromptsTest, StopsAtTheLimit) {
++  for (size_t i = 0; i < kMaxSavedPrompts; ++i) {
++    ASSERT_TRUE(AddSavedPrompt(&prefs_, "t", "prompt " + std::to_string(i)));
++  }
++  EXPECT_FALSE(AddSavedPrompt(&prefs_, "t", "one too many"));
++  EXPECT_EQ(GetSavedPrompts(&prefs_).size(), kMaxSavedPrompts);
++}
++
++}  // namespace rac::ai
+Index: src/chrome/browser/resources/rac_ai/app.css
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/app.css	2026-10-12 08:14:53.602685217 -0700
++++ src/chrome/browser/resources/rac_ai/app.css	2026-10-12 08:20:29.863044217 -0700
+@@ -593,3 +593,151 @@
+ body[data-mode='page'] .empty {
+   padding-top: 24vh;
+ }
++
++/* History and saved prompts */
++
++.drawer {
++  background: var(--surface-page);
++  bottom: 0;
++  display: flex;
++  flex-direction: column;
++  left: 0;
++  position: absolute;
++  right: 0;
++  top: 44px;
++  z-index: 5;
++}
++
++.drawer-head {
++  align-items: center;
++  display: flex;
++  flex: none;
++  padding: 0 10px 8px 14px;
++}
++
++.segments {
++  background: var(--token);
++  border-radius: 999px;
++  display: flex;
++  padding: 2px;
++}
++
++.segment {
++  background: none;
++  border: 0;
++  border-radius: 999px;
++  color: var(--text-muted);
++  font-size: 13px;
++  padding: 3px 14px;
++}
++
++.segment[aria-selected='true'] {
++  background: var(--surface-raised);
++  box-shadow: 0 0 0 0.5px var(--hairline);
++  color: var(--text);
++}
++
++.drawer-list {
++  flex: 1;
++  margin: 0 auto;
++  max-width: var(--column);
++  overflow-y: auto;
++  padding: 0 10px;
++  width: 100%;
++}
++
++.row {
++  align-items: center;
++  border-radius: var(--radius-card);
++  display: flex;
++  gap: 4px;
++}
++
++.row:hover,
++.row:focus-within {
++  background: var(--token);
++}
++
++.row-main {
++  background: none;
++  border: 0;
++  display: flex;
++  flex: 1;
++  flex-direction: column;
++  min-width: 0;
++  padding: 8px 10px;
++  text-align: start;
++}
++
++.row-title {
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.row-detail {
++  color: var(--text-muted);
++  font-size: 13px;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.row .icon-button {
++  flex: none;
++  opacity: 0;
++}
++
++.row:hover .icon-button,
++.row:focus-within .icon-button {
++  opacity: 1;
++}
++
++.drawer-empty {
++  color: var(--text-muted);
++  padding: 24px 10px;
++  text-align: center;
++}
++
++.drawer-foot {
++  align-items: center;
++  display: flex;
++  flex: none;
++  gap: 12px;
++  justify-content: space-between;
++  margin: 0 auto;
++  max-width: var(--column);
++  padding: 10px 14px 14px;
++  width: 100%;
++}
++
++.check {
++  align-items: center;
++  color: var(--text-muted);
++  display: flex;
++  font-size: 13px;
++  gap: 6px;
++}
++
++.text-button {
++  background: none;
++  border: 0;
++  border-radius: 8px;
++  color: var(--text-muted);
++  font-size: 13px;
++  padding: 4px 8px;
++}
++
++.text-button:hover:not(:disabled) {
++  background: var(--token);
++  color: var(--text);
++}
++
++.text-button:disabled {
++  color: var(--text-faint);
++  cursor: default;
++}
++
++body[data-mode='page'] .drawer-head {
++  padding-inline: 24px;
++}
+Index: src/chrome/browser/resources/rac_ai/app.ts
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/app.ts	2026-10-12 08:14:53.603031590 -0700
++++ src/chrome/browser/resources/rac_ai/app.ts	2026-10-12 08:22:58.345977659 -0700
+@@ -25,6 +25,7 @@
+   needsKey?: boolean;
+   providerName?: string;
+   model?: string;
++  saveHistory?: boolean;
+ }
+ 
+ interface UpdateEvent {
+@@ -34,6 +35,25 @@
+   error?: string;
+ }
+ 
++interface StoredMessage {
++  role: 'user'|'assistant';
++  text: string;
++  attached?: string[];
++}
++
++interface ConversationInfo {
++  id: string;
++  title: string;
++  updatedMs: number;
++  messages?: StoredMessage[];
++}
++
++interface SavedPrompt {
++  id: string;
++  title: string;
++  text: string;
++}
++
+ interface Message {
+   role: 'user'|'assistant';
+   text: string;
+@@ -56,6 +76,10 @@
+ let followCurrent = false;
+ let currentTab: TabInfo|null = null;
+ const extraTabs: TabInfo[] = [];
++let conversationId: string = crypto.randomUUID();
++let saveHistory = true;
++let drawerView: 'chats'|'prompts' = 'chats';
++let confirmTimer = 0;
+ 
+ const thread = getRequiredElement('thread');
+ const scroller = getRequiredElement('scroll');
+@@ -68,6 +92,15 @@
+ const modelName = getRequiredElement('modelName');
+ const chips = getRequiredElement('chips');
+ const picker = getRequiredElement('picker');
++const drawer = getRequiredElement('drawer');
++const drawerList = getRequiredElement('drawerList');
++const tabChats = getRequiredElement('tabChats');
++const tabPrompts = getRequiredElement('tabPrompts');
++const chatsFooter = getRequiredElement('chatsFooter');
++const promptsFooter = getRequiredElement('promptsFooter');
++const saveHistoryBox = getRequiredElement<HTMLInputElement>('saveHistory');
++const clearAllButton = getRequiredElement<HTMLButtonElement>('clearAll');
++const savePromptButton = getRequiredElement<HTMLButtonElement>('savePrompt');
+ const addTabButton = getRequiredElement<HTMLButtonElement>('addTab');
+ 
+ function openUrl(url: string) {
+@@ -391,10 +424,11 @@
+     last.element?.remove();
+     messages.pop();
+   }
++  saveConversation();
+   render();
+ }
+ 
+-function newChat() {
++function resetChat() {
+   if (streaming) {
+     sendToBrowser('racAiStop');
+   }
+@@ -404,12 +438,181 @@
+   thread.replaceChildren();
+   extraTabs.length = 0;
+   followCurrent = attachDefault;
++  conversationId = crypto.randomUUID();
+   closePicker();
++  closeDrawer();
+   renderChips();
++}
++
++function newChat() {
++  resetChat();
++  render();
++  input.focus();
++}
++
++function saveConversation() {
++  if (!saveHistory) {
++    return;
++  }
++  const stored: StoredMessage[] =
++      messages.filter(m => m.text && !m.error).map(m => {
++        const entry: StoredMessage = {role: m.role, text: m.text};
++        if (m.attached && m.attached.length > 0) {
++          entry.attached = m.attached;
++        }
++        return entry;
++      });
++  if (stored.length > 0) {
++    sendToBrowser('racAiHistorySave', [{id: conversationId, messages: stored}]);
++  }
++}
++
++function openConversation(info: ConversationInfo) {
++  resetChat();
++  conversationId = info.id;
++  for (const stored of info.messages ?? []) {
++    messages.push({
++      role: stored.role,
++      text: stored.text,
++      attached: stored.attached,
++    });
++  }
+   render();
++  scrollToEnd();
+   input.focus();
+ }
+ 
++function formatDate(ms: number): string {
++  const date = new Date(ms);
++  const sameDay = date.toDateString() === new Date().toDateString();
++  return sameDay ?
++      date.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'}) :
++      date.toLocaleDateString([], {month: 'short', day: 'numeric'});
++}
++
++function makeRow(
++    title: string, detail: string, onOpen: () => void,
++    onDelete: () => void): HTMLElement {
++  const row = document.createElement('div');
++  row.className = 'row';
++  const main = document.createElement('button');
++  main.type = 'button';
++  main.className = 'row-main';
++  const titleElement = document.createElement('span');
++  titleElement.className = 'row-title';
++  titleElement.textContent = title;
++  const detailElement = document.createElement('span');
++  detailElement.className = 'row-detail';
++  detailElement.textContent = detail;
++  main.append(titleElement, detailElement);
++  main.addEventListener('click', onOpen);
++  const remove = document.createElement('button');
++  remove.type = 'button';
++  remove.className = 'icon-button';
++  const label = loadTimeData.getString('deleteItem');
++  remove.setAttribute('aria-label', label);
++  remove.title = label;
++  const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
++  icon.setAttribute('viewBox', '0 0 20 20');
++  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
++  path.setAttribute('d', 'M6 6l8 8M14 6l-8 8');
++  icon.appendChild(path);
++  remove.appendChild(icon);
++  remove.addEventListener('click', onDelete);
++  row.append(main, remove);
++  return row;
++}
++
++function showEmpty(key: string) {
++  const empty = document.createElement('div');
++  empty.className = 'drawer-empty';
++  empty.textContent = loadTimeData.getString(key);
++  drawerList.replaceChildren(empty);
++}
++
++function resetClearButton() {
++  clearTimeout(confirmTimer);
++  clearAllButton.textContent = loadTimeData.getString('clearAll');
++  clearAllButton.dataset['confirm'] = '';
++}
++
++async function showChats() {
++  const list =
++      await sendWithPromise<ConversationInfo[]>('racAiHistoryList');
++  if (drawerView !== 'chats' || drawer.hidden) {
++    return;
++  }
++  if (list.length === 0) {
++    showEmpty(saveHistory ? 'noChats' : 'historyOff');
++    clearAllButton.disabled = true;
++    return;
++  }
++  clearAllButton.disabled = false;
++  drawerList.replaceChildren(...list.map(info => makeRow(
++      info.title, formatDate(info.updatedMs), async () => {
++        const full = await sendWithPromise<ConversationInfo|null>(
++            'racAiHistoryGet', info.id);
++        if (full) {
++          openConversation(full);
++        }
++      }, () => {
++        sendToBrowser('racAiHistoryDelete', [info.id]);
++        if (info.id === conversationId) {
++          conversationId = crypto.randomUUID();
++        }
++        showChats();
++      })));
++}
++
++async function showPrompts() {
++  const list = await sendWithPromise<SavedPrompt[]>('racAiPromptsGet');
++  if (drawerView !== 'prompts' || drawer.hidden) {
++    return;
++  }
++  savePromptButton.disabled = input.value.trim().length === 0;
++  if (list.length === 0) {
++    showEmpty('noPrompts');
++    return;
++  }
++  drawerList.replaceChildren(...list.map(prompt => makeRow(
++      prompt.title, prompt.text.replace(/\s+/g, ' '), () => {
++        input.value = prompt.text;
++        resizeInput();
++        updateControls();
++        closeDrawer();
++        input.focus();
++      }, () => {
++        sendToBrowser('racAiPromptRemove', [prompt.id]);
++        showPrompts();
++      })));
++}
++
++function setDrawerView(view: 'chats'|'prompts') {
++  drawerView = view;
++  tabChats.setAttribute('aria-selected', String(view === 'chats'));
++  tabPrompts.setAttribute('aria-selected', String(view === 'prompts'));
++  chatsFooter.hidden = view !== 'chats';
++  promptsFooter.hidden = view !== 'prompts';
++  saveHistoryBox.checked = saveHistory;
++  resetClearButton();
++  if (view === 'chats') {
++    showChats();
++  } else {
++    showPrompts();
++  }
++}
++
++function openDrawer() {
++  closePicker();
++  drawer.hidden = false;
++  setDrawerView(drawerView);
++}
++
++function closeDrawer() {
++  drawer.hidden = true;
++  drawerList.replaceChildren();
++}
++
+ function onUpdate(event: UpdateEvent) {
+   if (event.id !== activeId) {
+     return;
+@@ -432,6 +635,9 @@
+     last.element?.remove();
+     messages.pop();
+   }
++  if (!streaming) {
++    saveConversation();
++  }
+   queueRender();
+ }
+ 
+@@ -451,6 +657,9 @@
+     followCurrent = attachDefault;
+     initialized = true;
+   }
++  if (state.saveHistory !== undefined) {
++    saveHistory = state.saveHistory;
++  }
+   currentTab = state.currentTab ?? null;
+   renderChips();
+   if (state.enabled && state.providerName) {
+@@ -505,9 +714,50 @@
+     if (event.key === 'Escape' && !picker.hidden) {
+       closePicker();
+       input.focus();
++    } else if (event.key === 'Escape' && !drawer.hidden) {
++      closeDrawer();
++      input.focus();
+     }
+   });
+   stopButton.addEventListener('click', stop);
++  getRequiredElement('historyButton').addEventListener('click', () => {
++    if (drawer.hidden) {
++      openDrawer();
++    } else {
++      closeDrawer();
++    }
++  });
++  getRequiredElement('drawerClose').addEventListener('click', closeDrawer);
++  tabChats.addEventListener('click', () => setDrawerView('chats'));
++  tabPrompts.addEventListener('click', () => setDrawerView('prompts'));
++  saveHistoryBox.addEventListener('change', () => {
++    saveHistory = saveHistoryBox.checked;
++    sendToBrowser('racAiSetSaveHistory', [saveHistory]);
++    if (saveHistory) {
++      saveConversation();
++    }
++    showChats();
++  });
++  clearAllButton.addEventListener('click', () => {
++    // Deleting everything takes two clicks, since there is no undo.
++    if (clearAllButton.dataset['confirm'] !== 'yes') {
++      clearAllButton.dataset['confirm'] = 'yes';
++      clearAllButton.textContent = loadTimeData.getString('confirmAgain');
++      confirmTimer = setTimeout(resetClearButton, 4000);
++      return;
++    }
++    resetClearButton();
++    sendToBrowser('racAiHistoryClear');
++    conversationId = crypto.randomUUID();
++    showChats();
++  });
++  savePromptButton.addEventListener('click', () => {
++    const text = input.value.trim();
++    if (text) {
++      sendToBrowser('racAiPromptAdd', ['', text]);
++      showPrompts();
++    }
++  });
+   getRequiredElement('newChat').addEventListener('click', newChat);
+   const openSettings = () => sendToBrowser('racAiOpenSettings');
+   getRequiredElement('openSettings').addEventListener('click', openSettings);
+Index: src/chrome/browser/resources/rac_ai/index.html
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/index.html	2026-10-12 08:14:53.603383380 -0700
++++ src/chrome/browser/resources/rac_ai/index.html	2026-10-12 08:20:29.863323174 -0700
+@@ -16,6 +16,10 @@
+           <span id="modelName"></span>
+         </button>
+         <span class="spacer"></span>
++        <button id="historyButton" class="icon-button" type="button"
++            data-i18n-label="history">
++          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.5"/><path d="M10 6.5V10l2.4 1.6"/></svg>
++        </button>
+         <button id="newChat" class="icon-button" type="button"
+             data-i18n-label="newChat">
+           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4.5v11M4.5 10h11"/></svg>
+@@ -26,6 +30,35 @@
+         </button>
+       </header>
+ 
++      <section id="drawer" class="drawer" hidden>
++        <div class="drawer-head">
++          <div class="segments" role="tablist">
++            <button id="tabChats" class="segment" type="button" role="tab"
++                data-i18n="tabChats"></button>
++            <button id="tabPrompts" class="segment" type="button" role="tab"
++                data-i18n="tabPrompts"></button>
++          </div>
++          <span class="spacer"></span>
++          <button id="drawerClose" class="icon-button" type="button"
++              data-i18n-label="close">
++            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 6l8 8M14 6l-8 8"/></svg>
++          </button>
++        </div>
++        <div id="drawerList" class="drawer-list"></div>
++        <div id="chatsFooter" class="drawer-foot">
++          <label class="check">
++            <input id="saveHistory" type="checkbox">
++            <span data-i18n="saveHistory"></span>
++          </label>
++          <button id="clearAll" class="text-button" type="button"
++              data-i18n="clearAll"></button>
++        </div>
++        <div id="promptsFooter" class="drawer-foot" hidden>
++          <button id="savePrompt" class="text-button" type="button" disabled
++              data-i18n="savePrompt"></button>
++        </div>
++      </section>
++
+       <main id="scroll" class="scroll">
+         <div id="empty" class="empty" hidden>
+           <div class="orb" aria-hidden="true"></div>
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc	2026-10-12 08:19:40.600669055 -0700
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc	2026-10-12 08:20:35.540727539 -0700
+@@ -15,6 +15,8 @@
+ #include "chrome/browser/rac/ai/ai_service.h"
+ #include "chrome/browser/rac/ai/ai_service_factory.h"
+ #include "chrome/browser/rac/ai/chat_session.h"
++#include "chrome/browser/rac/ai/history_store.h"
++#include "chrome/browser/rac/ai/saved_prompts.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/webui/webui_embedding_context.h"
+ #include "components/prefs/pref_service.h"
+@@ -96,6 +98,35 @@
+       "racAiOpenUrl",
+       base::BindRepeating(&PageHandler::HandleOpenUrl, base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
++      "racAiHistoryList", base::BindRepeating(&PageHandler::HandleHistoryList,
++                                              base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiHistoryGet", base::BindRepeating(&PageHandler::HandleHistoryGet,
++                                             base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiHistorySave", base::BindRepeating(&PageHandler::HandleHistorySave,
++                                              base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiHistoryDelete",
++      base::BindRepeating(&PageHandler::HandleHistoryDelete,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiHistoryClear", base::BindRepeating(&PageHandler::HandleHistoryClear,
++                                               base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiSetSaveHistory",
++      base::BindRepeating(&PageHandler::HandleSetSaveHistory,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiPromptsGet", base::BindRepeating(&PageHandler::HandlePromptsGet,
++                                             base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiPromptAdd", base::BindRepeating(&PageHandler::HandlePromptAdd,
++                                            base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiPromptRemove", base::BindRepeating(&PageHandler::HandlePromptRemove,
++                                               base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
+       "racAiOpenSettings", base::BindRepeating(&PageHandler::HandleOpenSettings,
+                                                base::Unretained(this)));
+ }
+@@ -212,6 +243,7 @@
+                                 !settings.base_url.empty());
+     state.Set("needsKey", info && info->requires_key && !has_key);
+     state.Set("attachCurrentTab", prefs->GetBoolean(kAttachCurrentTab));
++    state.Set("saveHistory", prefs->GetBoolean(kSaveHistory));
+     WatchTabs();
+     if (tabs::TabInterface* tab = GetAttachableCurrentTab()) {
+       state.Set("currentTab", DescribeTab(tab, true));
+@@ -404,4 +436,125 @@
+   }
+ }
+ 
++namespace {
++
++// The page wants a plain millisecond timestamp, not the stored form.
++base::DictValue ToPage(const Conversation& conversation, bool with_messages) {
++  base::DictValue dict = ConversationToValue(conversation, with_messages);
++  dict.Set("updatedMs", conversation.updated.InMillisecondsFSinceUnixEpoch());
++  return dict;
++}
++
++}  // namespace
++
++void PageHandler::HandleHistoryList(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 1u);
++  AllowJavascript();
++  AiService* service = AiServiceFactory::GetForProfile(profile_);
++  if (!service || !profile_->GetPrefs()->GetBoolean(kSaveHistory)) {
++    ResolveJavascriptCallback(args[0], base::ListValue());
++    return;
++  }
++  service->history_store().List(base::BindOnce(&PageHandler::OnHistoryList,
++                                               weak_factory_.GetWeakPtr(),
++                                               args[0].Clone()));
++}
++
++void PageHandler::OnHistoryList(base::Value callback_id,
++                                std::vector<Conversation> conversations) {
++  base::ListValue list;
++  for (const Conversation& conversation : conversations) {
++    list.Append(ToPage(conversation, /*with_messages=*/false));
++  }
++  ResolveJavascriptCallback(callback_id, list);
++}
++
++void PageHandler::HandleHistoryGet(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 2u);
++  AllowJavascript();
++  AiService* service = AiServiceFactory::GetForProfile(profile_);
++  const std::string& id = args[1].GetString();
++  if (!service || !IsValidConversationId(id)) {
++    ResolveJavascriptCallback(args[0], base::Value());
++    return;
++  }
++  service->history_store().Get(
++      id, base::BindOnce(&PageHandler::OnHistoryGet, weak_factory_.GetWeakPtr(),
++                         args[0].Clone()));
++}
++
++void PageHandler::OnHistoryGet(base::Value callback_id,
++                               std::optional<Conversation> conversation) {
++  if (conversation) {
++    ResolveJavascriptCallback(callback_id,
++                              ToPage(*conversation, /*with_messages=*/true));
++  } else {
++    ResolveJavascriptCallback(callback_id, base::Value());
++  }
++}
++
++void PageHandler::HandleHistorySave(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 1u);
++  AiService* service = AiServiceFactory::GetForProfile(profile_);
++  const base::DictValue* dict = args[0].GetIfDict();
++  Conversation conversation;
++  if (!service || !dict || !profile_->GetPrefs()->GetBoolean(kSaveHistory) ||
++      !ConversationFromValue(*dict, base::Time::Now(), &conversation)) {
++    return;
++  }
++  service->history_store().Save(std::move(conversation));
++}
++
++void PageHandler::HandleHistoryDelete(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 1u);
++  AiService* service = AiServiceFactory::GetForProfile(profile_);
++  const std::string& id = args[0].GetString();
++  if (service && IsValidConversationId(id)) {
++    service->history_store().Delete(id);
++  }
++}
++
++void PageHandler::HandleHistoryClear(const base::ListValue& args) {
++  if (AiService* service = AiServiceFactory::GetForProfile(profile_)) {
++    service->history_store().Clear();
++  }
++}
++
++void PageHandler::HandleSetSaveHistory(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 1u);
++  if (AiServiceFactory::GetForProfile(profile_) && args[0].is_bool()) {
++    profile_->GetPrefs()->SetBoolean(kSaveHistory, args[0].GetBool());
++  }
++}
++
++void PageHandler::HandlePromptsGet(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 1u);
++  AllowJavascript();
++  base::ListValue list;
++  if (AiServiceFactory::GetForProfile(profile_)) {
++    for (const SavedPrompt& prompt : GetSavedPrompts(profile_->GetPrefs())) {
++      list.Append(base::DictValue()
++                      .Set("id", prompt.id)
++                      .Set("title", prompt.title)
++                      .Set("text", prompt.text));
++    }
++  }
++  ResolveJavascriptCallback(args[0], list);
++}
++
++void PageHandler::HandlePromptAdd(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 2u);
++  if (AiServiceFactory::GetForProfile(profile_)) {
++    AddSavedPrompt(profile_->GetPrefs(), args[0].GetString(),
++                   args[1].GetString());
++  }
++}
++
++void PageHandler::HandlePromptRemove(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 1u);
++  if (AiServiceFactory::GetForProfile(profile_)) {
++    RemoveSavedPrompt(profile_->GetPrefs(), args[0].GetString());
++  }
++}
++
+ }  // namespace rac::ai
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h	2026-10-12 08:16:33.449252079 -0700
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h	2026-10-12 08:20:29.828346300 -0700
+@@ -6,6 +6,7 @@
+ #define CHROME_BROWSER_UI_WEBUI_RAC_AI_RAC_AI_PAGE_HANDLER_H_
+ 
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+@@ -13,6 +14,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/values.h"
++#include "chrome/browser/rac/ai/chat_history.h"
+ #include "chrome/browser/rac/ai/chat_prompt.h"
+ #include "chrome/browser/rac/ai/chat_protocol.h"
+ #include "chrome/browser/rac/ai/page_context.h"
+@@ -55,6 +57,19 @@
+   void HandleStop(const base::ListValue& args);
+   void HandleOpenUrl(const base::ListValue& args);
+   void HandleOpenSettings(const base::ListValue& args);
++  void HandleHistoryList(const base::ListValue& args);
++  void HandleHistoryGet(const base::ListValue& args);
++  void HandleHistorySave(const base::ListValue& args);
++  void HandleHistoryDelete(const base::ListValue& args);
++  void HandleHistoryClear(const base::ListValue& args);
++  void HandleSetSaveHistory(const base::ListValue& args);
++  void HandlePromptsGet(const base::ListValue& args);
++  void HandlePromptAdd(const base::ListValue& args);
++  void HandlePromptRemove(const base::ListValue& args);
++  void OnHistoryList(base::Value callback_id,
++                     std::vector<Conversation> conversations);
++  void OnHistoryGet(base::Value callback_id,
++                    std::optional<Conversation> conversation);
+ 
+   BrowserWindowInterface* GetBrowser();
+   // The foreground tab of this page's window, or null if it can't be shared
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc	2026-10-12 08:16:39.276866015 -0700
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc	2026-10-12 08:20:29.804609498 -0700
+@@ -52,6 +52,18 @@
+     {"noTabs", "No other tabs to add"},
+     {"removeTab", "Remove tab"},
+     {"attachFailed", "Couldn't read:"},
++    {"history", "Chats and prompts"},
++    {"close", "Close"},
++    {"tabChats", "Chats"},
++    {"tabPrompts", "Prompts"},
++    {"noChats", "No saved chats yet."},
++    {"historyOff", "Chats aren't being saved."},
++    {"noPrompts", "No saved prompts yet."},
++    {"saveHistory", "Save chats on this device"},
++    {"clearAll", "Delete all chats"},
++    {"confirmAgain", "Click again to delete"},
++    {"deleteItem", "Delete"},
++    {"savePrompt", "Save the message as a prompt"},
+ };
+ 
+ }  // namespace
