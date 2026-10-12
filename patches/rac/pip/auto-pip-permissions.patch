@@ -1,0 +1,534 @@
+--- a/chrome/browser/picture_in_picture/auto_picture_in_picture_window_occlusion_helper_web_contents.cc
++++ b/chrome/browser/picture_in_picture/auto_picture_in_picture_window_occlusion_helper_web_contents.cc
+@@ -44,6 +44,7 @@ void AutoPictureInPictureWindowOcclusion
+ #if BUILDFLAG(IS_MAC)
+   // Another app taking focus counts as occluding the window.
+   app_focus_observer_ = std::make_unique<rac::AppFocusObserver>(
++      web_contents(),
+       base::BindRepeating(
+           [](AutoPictureInPictureWindowOcclusionHelperWebContents* helper) {
+             helper->RunCallback(helper->GetOcclusionState());
+--- a/chrome/browser/rac/pip/BUILD.gn
++++ b/chrome/browser/rac/pip/BUILD.gn
+@@ -2,6 +2,8 @@
+ # You can use, redistribute, and/or modify this source code under
+ # the terms of the GPL-3.0 license that can be found in the LICENSE file.
+ 
++import("//testing/test.gni")
++
+ source_set("pip") {
+   sources = [
+     "auto_pip_prefs.cc",
+@@ -9,8 +11,12 @@ source_set("pip") {
+   ]
+   deps = [
+     "//base",
++    "//chrome/browser/content_settings:content_settings_factory",
++    "//chrome/browser/profiles:profile",
++    "//components/content_settings/core/browser",
+     "//components/pref_registry",
+     "//components/prefs",
++    "//content/public/browser",
+   ]
+   if (is_mac) {
+     sources += [
+@@ -19,4 +25,31 @@ source_set("pip") {
+     ]
+     frameworks = [ "AppKit.framework" ]
+   }
++}
++
++if (is_mac) {
++  test("rac_pip_tests") {
++    sources = [
++      "app_focus_observer_mac_unittest.mm",
++      "auto_pip_permissions_unittest.cc",
++    ]
++    deps = [
++      ":pip",
++      "//base/test:test_support",
++      "//chrome/browser/content_settings:content_settings_factory",
++      "//chrome/browser/profiles:profile",
++      "//chrome/browser/ui/page_info",
++      "//chrome/browser/ui/page_info:impl",
++      "//chrome/test:test_support_unit",
++      "//chrome/test/base:chrome_render_view_host_test_harness",
++      "//components/content_settings/core/browser",
++      "//components/prefs",
++      "//components/strings:components_strings",
++      "//content/test:test_support",
++      "//testing/gtest",
++      "//ui/base",
++      "//url",
++    ]
++    frameworks = [ "AppKit.framework" ]
++  }
+ }
+--- a/chrome/browser/rac/pip/app_focus_observer_mac.h
++++ b/chrome/browser/rac/pip/app_focus_observer_mac.h
+@@ -9,6 +9,12 @@
+ 
+ #include "base/functional/callback.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "components/content_settings/core/browser/content_settings_observer.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "content/public/browser/web_contents_observer.h"
++
++class HostContentSettingsMap;
+ 
+ namespace rac {
+ 
+@@ -16,24 +22,40 @@ namespace rac {
+ // from rac. Menu bar apps and launchers such as Spotlight, Raycast, or
+ // 1Password's quick access open briefly over whatever the user is looking at,
+ // so they leave the state unchanged.
+-class AppFocusObserver {
++class AppFocusObserver : public content::WebContentsObserver,
++                         public content_settings::Observer {
+  public:
+   // `on_change` runs whenever IsAnotherAppInFront() changes.
+-  explicit AppFocusObserver(base::RepeatingClosure on_change);
++  AppFocusObserver(content::WebContents* web_contents,
++                   base::RepeatingClosure on_change);
+   AppFocusObserver(const AppFocusObserver&) = delete;
+   AppFocusObserver& operator=(const AppFocusObserver&) = delete;
+-  ~AppFocusObserver();
++  ~AppFocusObserver() override;
+ 
+   bool IsAnotherAppInFront() const { return another_app_in_front_; }
++  bool IsObservingAppActivationForTesting() const;
+ 
+  private:
+   struct ObjCStorage;
+ 
++  // content::WebContentsObserver:
++  void PrimaryPageChanged(content::Page& page) override;
++
++  // content_settings::Observer:
++  void OnContentSettingChanged(
++      const ContentSettingsPattern& primary_pattern,
++      const ContentSettingsPattern& secondary_pattern,
++      ContentSettingsTypeSet content_type_set) override;
++
++  void UpdateObservation();
+   void SetAnotherAppInFront(bool another_app_in_front);
+ 
+   base::RepeatingClosure on_change_;
+   bool another_app_in_front_ = false;
+   std::unique_ptr<ObjCStorage> objc_storage_;
++  base::ScopedObservation<HostContentSettingsMap, content_settings::Observer>
++      content_settings_observation_{this};
++  PrefChangeRegistrar incognito_pref_registrar_;
+   base::WeakPtrFactory<AppFocusObserver> weak_factory_{this};
+ };
+ 
+--- a/chrome/browser/rac/pip/app_focus_observer_mac.mm
++++ b/chrome/browser/rac/pip/app_focus_observer_mac.mm
+@@ -7,6 +7,14 @@
+ #import <AppKit/AppKit.h>
+ 
+ #include <optional>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/content_settings/host_content_settings_map_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/pip/auto_pip_prefs.h"
++#include "components/content_settings/core/browser/host_content_settings_map.h"
++#include "content/public/browser/web_contents.h"
+ 
+ namespace rac {
+ 
+@@ -31,13 +39,73 @@ struct AppFocusObserver::ObjCStorage {
+   id __strong observer;
+ };
+ 
+-AppFocusObserver::AppFocusObserver(base::RepeatingClosure on_change)
+-    : on_change_(std::move(on_change)),
++AppFocusObserver::AppFocusObserver(content::WebContents* web_contents,
++                                   base::RepeatingClosure on_change)
++    : content::WebContentsObserver(web_contents),
++      on_change_(std::move(on_change)),
+       objc_storage_(std::make_unique<ObjCStorage>()) {
+-  another_app_in_front_ =
+-      IsAnotherAppInFrontAfterActivating(
+-          NSWorkspace.sharedWorkspace.frontmostApplication)
+-          .value_or(false);
++  Profile* profile =
++      Profile::FromBrowserContext(web_contents->GetBrowserContext());
++  content_settings_observation_.Observe(
++      HostContentSettingsMapFactory::GetForProfile(profile));
++  if (profile->IsIncognitoProfile()) {
++    incognito_pref_registrar_.Init(profile->GetOriginalProfile()->GetPrefs());
++    incognito_pref_registrar_.Add(
++        kAutoPipInIncognito,
++        base::BindRepeating(&AppFocusObserver::UpdateObservation,
++                            base::Unretained(this)));
++  }
++  UpdateObservation();
++}
++
++AppFocusObserver::~AppFocusObserver() {
++  if (objc_storage_->observer) {
++    [NSWorkspace.sharedWorkspace.notificationCenter
++        removeObserver:objc_storage_->observer];
++  }
++}
++
++bool AppFocusObserver::IsObservingAppActivationForTesting() const {
++  return objc_storage_->observer != nil;
++}
++
++void AppFocusObserver::PrimaryPageChanged(content::Page& page) {
++  UpdateObservation();
++}
++
++void AppFocusObserver::OnContentSettingChanged(
++    const ContentSettingsPattern& primary_pattern,
++    const ContentSettingsPattern& secondary_pattern,
++    ContentSettingsTypeSet content_type_set) {
++  if (content_type_set.Contains(ContentSettingsType::AUTO_PICTURE_IN_PICTURE) &&
++      primary_pattern.Matches(web_contents()->GetLastCommittedURL()) &&
++      secondary_pattern.Matches(web_contents()->GetLastCommittedURL())) {
++    UpdateObservation();
++  }
++}
++
++void AppFocusObserver::UpdateObservation() {
++  const GURL& url = web_contents()->GetLastCommittedURL();
++  const ContentSetting setting =
++      content_settings_observation_.GetSource()->GetContentSetting(
++          url, url, ContentSettingsType::AUTO_PICTURE_IN_PICTURE);
++  const bool allowed =
++      setting != CONTENT_SETTING_BLOCK &&
++      (!incognito_pref_registrar_.prefs() ||
++       (setting == CONTENT_SETTING_ALLOW &&
++        IsAutoPipAllowedInIncognito(*incognito_pref_registrar_.prefs())));
++  if (!allowed) {
++    if (objc_storage_->observer) {
++      [NSWorkspace.sharedWorkspace.notificationCenter
++          removeObserver:objc_storage_->observer];
++      objc_storage_->observer = nil;
++    }
++    SetAnotherAppInFront(false);
++    return;
++  }
++  if (objc_storage_->observer) {
++    return;
++  }
+ 
+   base::WeakPtr<AppFocusObserver> weak_this = weak_factory_.GetWeakPtr();
+   objc_storage_->observer = [NSWorkspace.sharedWorkspace.notificationCenter
+@@ -53,11 +121,9 @@ AppFocusObserver::AppFocusObserver(base:
+                   weak_this->SetAnotherAppInFront(*in_front);
+                 }
+               }];
+-}
+-
+-AppFocusObserver::~AppFocusObserver() {
+-  [NSWorkspace.sharedWorkspace.notificationCenter
+-      removeObserver:objc_storage_->observer];
++  another_app_in_front_ = IsAnotherAppInFrontAfterActivating(
++                              NSWorkspace.sharedWorkspace.frontmostApplication)
++                              .value_or(false);
+ }
+ 
+ void AppFocusObserver::SetAnotherAppInFront(bool another_app_in_front) {
+--- /dev/null
++++ b/chrome/browser/rac/pip/app_focus_observer_mac_unittest.mm
+@@ -0,0 +1,185 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#import "chrome/browser/rac/pip/app_focus_observer_mac.h"
++
++#import <AppKit/AppKit.h>
++
++#include "base/test/bind.h"
++#include "chrome/browser/content_settings/host_content_settings_map_factory.h"
++#include "chrome/browser/rac/pip/auto_pip_prefs.h"
++#include "chrome/test/base/chrome_render_view_host_test_harness.h"
++#include "chrome/test/base/testing_profile.h"
++#include "components/content_settings/core/browser/host_content_settings_map.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/test/web_contents_tester.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++// Only the activation policy and NSObject's identity comparison are needed.
++// Posting a synthetic notification avoids driving real apps during unit tests.
++@interface RacPipTestApplication : NSObject
++@property(nonatomic) NSApplicationActivationPolicy activationPolicy;
++@end
++
++@implementation RacPipTestApplication
++@synthesize activationPolicy = _activationPolicy;
++@end
++
++namespace rac {
++namespace {
++
++void ActivateApplication(id app) {
++  [NSWorkspace.sharedWorkspace.notificationCenter
++      postNotificationName:NSWorkspaceDidActivateApplicationNotification
++                    object:nil
++                  userInfo:@{NSWorkspaceApplicationKey : app}];
++}
++
++class AppFocusObserverTest : public ChromeRenderViewHostTestHarness {
++ protected:
++  void SetUp() override {
++    ChromeRenderViewHostTestHarness::SetUp();
++    NavigateAndCommit(url_);
++  }
++
++  void TearDown() override {
++    observer_.reset();
++    incognito_contents_.reset();
++    ChromeRenderViewHostTestHarness::TearDown();
++  }
++
++  HostContentSettingsMap* settings() {
++    return HostContentSettingsMapFactory::GetForProfile(profile());
++  }
++
++  void Observe(content::WebContents* contents) {
++    observer_ = std::make_unique<AppFocusObserver>(
++        contents, base::BindLambdaForTesting([this] { ++changes_; }));
++    ActivateApplication(NSRunningApplication.currentApplication);
++    changes_ = 0;
++  }
++
++  void ActivateOtherApp(NSApplicationActivationPolicy policy =
++                            NSApplicationActivationPolicyRegular) {
++    RacPipTestApplication* app = [[RacPipTestApplication alloc] init];
++    app.activationPolicy = policy;
++    ActivateApplication(app);
++  }
++
++  const GURL url_{"https://example.com/video"};
++  int changes_ = 0;
++  std::unique_ptr<content::WebContents> incognito_contents_;
++  std::unique_ptr<AppFocusObserver> observer_;
++};
++
++TEST_F(AppFocusObserverTest, BlockedAtCreationDoesNotSubscribe) {
++  settings()->SetDefaultContentSetting(
++      ContentSettingsType::AUTO_PICTURE_IN_PICTURE, CONTENT_SETTING_BLOCK);
++  Observe(web_contents());
++  EXPECT_FALSE(observer_->IsObservingAppActivationForTesting());
++  ActivateOtherApp();
++  EXPECT_FALSE(observer_->IsAnotherAppInFront());
++  EXPECT_EQ(0, changes_);
++}
++
++TEST_F(AppFocusObserverTest, GlobalPermissionChangesStopAndRestartObservation) {
++  Observe(web_contents());
++  EXPECT_TRUE(observer_->IsObservingAppActivationForTesting());
++  ActivateOtherApp();
++  EXPECT_TRUE(observer_->IsAnotherAppInFront());
++  EXPECT_EQ(1, changes_);
++
++  settings()->SetDefaultContentSetting(
++      ContentSettingsType::AUTO_PICTURE_IN_PICTURE, CONTENT_SETTING_BLOCK);
++  EXPECT_FALSE(observer_->IsObservingAppActivationForTesting());
++  EXPECT_FALSE(observer_->IsAnotherAppInFront());
++  const int changes_after_block = changes_;
++  ActivateOtherApp();
++  EXPECT_EQ(changes_after_block, changes_);
++
++  settings()->SetDefaultContentSetting(
++      ContentSettingsType::AUTO_PICTURE_IN_PICTURE, CONTENT_SETTING_ALLOW);
++  EXPECT_TRUE(observer_->IsObservingAppActivationForTesting());
++  ActivateApplication(NSRunningApplication.currentApplication);
++  ActivateOtherApp();
++  EXPECT_TRUE(observer_->IsAnotherAppInFront());
++}
++
++TEST_F(AppFocusObserverTest, SiteExceptionsOverrideTheDefault) {
++  Observe(web_contents());
++  settings()->SetContentSettingDefaultScope(
++      url_, url_, ContentSettingsType::AUTO_PICTURE_IN_PICTURE,
++      CONTENT_SETTING_BLOCK);
++  EXPECT_FALSE(observer_->IsObservingAppActivationForTesting());
++  settings()->SetContentSettingDefaultScope(
++      url_, url_, ContentSettingsType::AUTO_PICTURE_IN_PICTURE,
++      CONTENT_SETTING_ALLOW);
++  settings()->SetDefaultContentSetting(
++      ContentSettingsType::AUTO_PICTURE_IN_PICTURE, CONTENT_SETTING_BLOCK);
++  EXPECT_TRUE(observer_->IsObservingAppActivationForTesting());
++}
++
++TEST_F(AppFocusObserverTest, NavigationRechecksTheSitePermission) {
++  Observe(web_contents());
++  const GURL blocked("https://blocked.example/video");
++  settings()->SetContentSettingDefaultScope(
++      blocked, blocked, ContentSettingsType::AUTO_PICTURE_IN_PICTURE,
++      CONTENT_SETTING_BLOCK);
++  EXPECT_TRUE(observer_->IsObservingAppActivationForTesting());
++  NavigateAndCommit(blocked);
++  EXPECT_FALSE(observer_->IsObservingAppActivationForTesting());
++  NavigateAndCommit(url_);
++  EXPECT_TRUE(observer_->IsObservingAppActivationForTesting());
++}
++
++TEST_F(AppFocusObserverTest,
++       IncognitoToggleUpdatesObservationWithoutReloading) {
++  auto* incognito = profile()->GetPrimaryOTRProfile(/*create_if_needed=*/true);
++  incognito_contents_ =
++      content::WebContentsTester::CreateTestWebContents(incognito, nullptr);
++  content::WebContentsTester::For(incognito_contents_.get())
++      ->NavigateAndCommit(url_);
++  Observe(incognito_contents_.get());
++  EXPECT_FALSE(observer_->IsObservingAppActivationForTesting());
++  ActivateOtherApp();
++  EXPECT_EQ(0, changes_);
++
++  profile()->GetPrefs()->SetBoolean(kAutoPipInIncognito, true);
++  EXPECT_TRUE(observer_->IsObservingAppActivationForTesting());
++  profile()->GetPrefs()->SetBoolean(kAutoPipInIncognito, false);
++  EXPECT_FALSE(observer_->IsObservingAppActivationForTesting());
++
++  profile()->GetPrefs()->SetBoolean(kAutoPipInIncognito, true);
++  auto* incognito_settings =
++      HostContentSettingsMapFactory::GetForProfile(incognito);
++  incognito_settings->SetDefaultContentSetting(
++      ContentSettingsType::AUTO_PICTURE_IN_PICTURE, CONTENT_SETTING_ASK);
++  EXPECT_FALSE(observer_->IsObservingAppActivationForTesting());
++}
++
++TEST_F(AppFocusObserverTest, LaunchersDoNotChangeAppFocus) {
++  Observe(web_contents());
++  ActivateOtherApp(NSApplicationActivationPolicyAccessory);
++  EXPECT_FALSE(observer_->IsAnotherAppInFront());
++  EXPECT_EQ(0, changes_);
++  ActivateOtherApp();
++  EXPECT_TRUE(observer_->IsAnotherAppInFront());
++  ActivateOtherApp(NSApplicationActivationPolicyAccessory);
++  EXPECT_TRUE(observer_->IsAnotherAppInFront());
++  ActivateApplication(NSRunningApplication.currentApplication);
++  EXPECT_FALSE(observer_->IsAnotherAppInFront());
++}
++
++TEST_F(AppFocusObserverTest, DestructionUnsubscribes) {
++  Observe(web_contents());
++  observer_.reset();
++  ActivateOtherApp();
++  profile()->GetPrefs()->SetBoolean(kAutoPipInIncognito, true);
++  settings()->SetDefaultContentSetting(
++      ContentSettingsType::AUTO_PICTURE_IN_PICTURE, CONTENT_SETTING_BLOCK);
++  EXPECT_EQ(0, changes_);
++}
++
++}  // namespace
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/pip/auto_pip_permissions_unittest.cc
+@@ -0,0 +1,60 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/pip/auto_pip_prefs.h"
++#include "chrome/browser/ui/page_info/chrome_page_info_ui_delegate.h"
++#include "chrome/test/base/chrome_render_view_host_test_harness.h"
++#include "chrome/test/base/testing_profile.h"
++#include "components/content_settings/core/common/content_settings_types.h"
++#include "components/prefs/pref_service.h"
++#include "components/strings/grit/components_strings.h"
++#include "content/public/test/web_contents_tester.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/base/l10n/l10n_util.h"
++
++namespace rac {
++namespace {
++
++using AutoPipPermissionsTest = ChromeRenderViewHostTestHarness;
++
++TEST_F(AutoPipPermissionsTest, RegularProfileHasNoIncognitoRestriction) {
++  ChromePageInfoUiDelegate delegate(web_contents(),
++                                    GURL("https://example.com"));
++  EXPECT_TRUE(
++      delegate.ShouldShowAllow(ContentSettingsType::AUTO_PICTURE_IN_PICTURE));
++  EXPECT_TRUE(delegate
++                  .GetAutomaticallyBlockedReason(
++                      ContentSettingsType::AUTO_PICTURE_IN_PICTURE)
++                  .empty());
++}
++
++TEST_F(AutoPipPermissionsTest, IncognitoControlExplainsProfileGate) {
++  auto contents = content::WebContentsTester::CreateTestWebContents(
++      profile()->GetPrimaryOTRProfile(/*create_if_needed=*/true), nullptr);
++  ChromePageInfoUiDelegate delegate(contents.get(),
++                                    GURL("https://example.com"));
++  EXPECT_FALSE(
++      delegate.ShouldShowAllow(ContentSettingsType::AUTO_PICTURE_IN_PICTURE));
++  EXPECT_EQ(l10n_util::GetStringUTF16(
++                IDS_PAGE_INFO_STATE_TEXT_NOT_ALLOWED_IN_INCOGNITO),
++            delegate.GetAutomaticallyBlockedReason(
++                ContentSettingsType::AUTO_PICTURE_IN_PICTURE));
++
++  profile()->GetPrefs()->SetBoolean(kAutoPipInIncognito, true);
++  EXPECT_TRUE(
++      delegate.ShouldShowAllow(ContentSettingsType::AUTO_PICTURE_IN_PICTURE));
++  EXPECT_TRUE(delegate
++                  .GetAutomaticallyBlockedReason(
++                      ContentSettingsType::AUTO_PICTURE_IN_PICTURE)
++                  .empty());
++
++  profile()->GetPrefs()->SetBoolean(kAutoPipInIncognito, false);
++  EXPECT_FALSE(delegate
++                   .GetAutomaticallyBlockedReason(
++                       ContentSettingsType::AUTO_PICTURE_IN_PICTURE)
++                   .empty());
++}
++
++}  // namespace
++}  // namespace rac
+--- a/chrome/browser/ui/page_info/BUILD.gn
++++ b/chrome/browser/ui/page_info/BUILD.gn
+@@ -84,6 +84,7 @@ source_set("impl") {
+     "//chrome/browser/permissions/system",
+     "//chrome/browser/picture_in_picture",
+     "//chrome/browser/profiles:profile",
++    "//chrome/browser/rac/pip",
+     "//chrome/browser/safe_browsing",
+     "//chrome/browser/ssl",
+     "//chrome/browser/subresource_filter",
+--- a/chrome/browser/ui/page_info/chrome_page_info_ui_delegate.cc
++++ b/chrome/browser/ui/page_info/chrome_page_info_ui_delegate.cc
+@@ -13,6 +13,7 @@
+ #include "chrome/browser/permissions/permission_manager_factory.h"
+ #include "chrome/browser/permissions/system/system_permission_settings.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/pip/auto_pip_prefs.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/chrome_pages.h"
+@@ -66,6 +67,10 @@ ChromePageInfoUiDelegate::ChromePageInfo
+ 
+ bool ChromePageInfoUiDelegate::ShouldShowAllow(ContentSettingsType type) {
+   switch (type) {
++    case ContentSettingsType::AUTO_PICTURE_IN_PICTURE:
++      return !GetProfile()->IsIncognitoProfile() ||
++             rac::IsAutoPipAllowedInIncognito(
++                 *GetProfile()->GetOriginalProfile()->GetPrefs());
+     // Notifications, idle detection, and web app installation do not support
+     // CONTENT_SETTING_ALLOW in incognito.
+     case ContentSettingsType::NOTIFICATIONS:
+@@ -94,6 +99,14 @@ bool ChromePageInfoUiDelegate::ShouldSho
+ std::u16string ChromePageInfoUiDelegate::GetAutomaticallyBlockedReason(
+     ContentSettingsType type) {
+   switch (type) {
++    case ContentSettingsType::AUTO_PICTURE_IN_PICTURE:
++      if (GetProfile()->IsIncognitoProfile() &&
++          !rac::IsAutoPipAllowedInIncognito(
++              *GetProfile()->GetOriginalProfile()->GetPrefs())) {
++        return l10n_util::GetStringUTF16(
++            IDS_PAGE_INFO_STATE_TEXT_NOT_ALLOWED_IN_INCOGNITO);
++      }
++      break;
+     // Notifications, idle detection, and web app installation do not support
+     // CONTENT_SETTING_ALLOW in incognito.
+     case ContentSettingsType::NOTIFICATIONS:
