@@ -1,0 +1,1242 @@
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn	2026-10-14 15:28:35.624059627 -0700
++++ src/chrome/browser/ui/BUILD.gn	2026-10-14 19:44:49.800094785 -0700
+@@ -2540,6 +2540,8 @@
+       "views/rac/spaces/space_tint_background.h",
+       "views/rac/spaces/space_tab_list_header.cc",
+       "views/rac/spaces/space_tab_list_header.h",
++      "views/rac/spaces/space_pager.cc",
++      "views/rac/spaces/space_pager.h",
+       "rac/spaces/space_elsewhere_dialog.cc",
+       "rac/spaces/space_elsewhere_dialog.h",
+       "rac/spaces/space_menu.cc",
+Index: src/chrome/browser/ui/rac/spaces/space_swipe_controller.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/spaces/space_swipe_controller.cc	2026-10-12 11:05:33.706838833 -0700
++++ src/chrome/browser/ui/rac/spaces/space_swipe_controller.cc	2026-10-14 20:08:48.382382088 -0700
+@@ -6,13 +6,17 @@
+ 
+ #include <cmath>
+ 
++#include "base/functional/bind.h"
+ #include "base/i18n/rtl.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
+ #include "chrome/browser/ui/views/frame/base_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
++#include "chrome/browser/ui/views/rac/spaces/space_pager.h"
++#include "chrome/browser/ui/views/tabs/common/tab_strip_view.h"
+ #include "ui/events/event.h"
++#include "ui/views/controls/scroll_view.h"
+ 
+ namespace rac {
+ 
+@@ -20,6 +24,16 @@
+     VerticalTabStripRegionView* region_view)
+     : region_view_(region_view) {
+   CHECK(region_view_);
++  // The pager lives in this controller, which the region view owns.
++  pager_ = SpacePager::Create(
++      region_view_->browser_view()->browser(),
++      base::BindRepeating(
++          [](VerticalTabStripRegionView* region_view) -> views::View* {
++            TabStripView* tab_strip = region_view->tab_strip_view();
++            return tab_strip ? tab_strip->unpinned_tabs_scroll_view()
++                             : nullptr;
++          },
++          base::Unretained(region_view_)));
+   region_view_->AddPreTargetHandler(this);
+ }
+ 
+@@ -78,7 +92,7 @@
+                                               float y_offset,
+                                               ui::Event* event) {
+   const base::TimeTicks now = base::TimeTicks::Now();
+-  if (!last_event_time_.is_null() &&
++  if (!last_event_time_.is_null() && !(pager_ && pager_->is_dragging()) &&
+       (now - last_event_time_) > kGestureResetTimeout) {
+     ResetGesture();
+   }
+@@ -103,6 +117,24 @@
+     }
+   }
+ 
++  if (gesture_state_ == GestureState::kHorizontalSwipe && pager_ &&
++      !pager_->is_dragging() && !has_triggered_in_current_gesture_ &&
++      event->IsScrollEvent() &&
++      event->AsScrollEvent()->scroll_event_phase() !=
++          ui::ScrollEventPhase::kNone &&
++      pager_->BeginDrag()) {
++    // The pages pick up everything the fingers moved before the lock.
++    x_offset = cumulative_x_;
++  }
++  if (pager_ && pager_->is_dragging()) {
++    pager_->UpdateDrag(x_offset);
++    drag_timeout_.Start(FROM_HERE, kDragTimeout, this,
++                        &SpaceSwipeController::EndDrag);
++    event->SetHandled();
++    event->StopPropagation();
++    return;
++  }
++
+   if (gesture_state_ == GestureState::kHorizontalSwipe) {
+     // Trigger exactly once per physical swipe. Only consume the gesture when
+     // there's a space to switch to, so swipes past either end still reach
+@@ -125,7 +157,15 @@
+   }
+ }
+ 
++void SpaceSwipeController::EndDrag() {
++  drag_timeout_.Stop();
++  if (pager_ && pager_->is_dragging()) {
++    pager_->EndDrag();
++  }
++}
++
+ void SpaceSwipeController::ResetGesture() {
++  EndDrag();
+   gesture_state_ = GestureState::kNone;
+   cumulative_x_ = 0.0f;
+   cumulative_y_ = 0.0f;
+Index: src/chrome/browser/ui/rac/spaces/space_swipe_controller.h
+===================================================================
+--- src.orig/chrome/browser/ui/rac/spaces/space_swipe_controller.h	2026-10-12 11:05:33.707171426 -0700
++++ src/chrome/browser/ui/rac/spaces/space_swipe_controller.h	2026-10-14 20:08:48.365276330 -0700
+@@ -5,8 +5,11 @@
+ #ifndef CHROME_BROWSER_UI_RAC_SPACES_SPACE_SWIPE_CONTROLLER_H_
+ #define CHROME_BROWSER_UI_RAC_SPACES_SPACE_SWIPE_CONTROLLER_H_
+ 
++#include <memory>
++
+ #include "base/memory/raw_ptr.h"
+ #include "base/time/time.h"
++#include "base/timer/timer.h"
+ #include "build/build_config.h"
+ #include "ui/events/event_handler.h"
+ 
+@@ -14,16 +17,23 @@
+ 
+ namespace rac {
+ 
++class SpacePager;
++
+ // Handles two-finger horizontal swipes across the vertical tab strip to
+-// move between spaces. Installed as a pre-target handler on
+-// VerticalTabStripRegionView, after the tab-group focus swipe controller,
+-// which gets events first while its feature is on.
++// move between spaces. A trackpad swipe drags the sidebar's pages with the
++// fingers; a scroll without phases switches once it goes far enough.
++// Installed as a pre-target handler on VerticalTabStripRegionView, after the
++// tab-group focus swipe controller, which gets events first while its
++// feature is on.
+ class SpaceSwipeController : public ui::EventHandler {
+  public:
+   static constexpr float kAxisLockThreshold = 15.0f;
+   static constexpr float kSwipeThreshold = 75.0f;
+   static constexpr base::TimeDelta kGestureResetTimeout =
+       base::Milliseconds(300);
++  // Fingers resting mid-swipe send nothing, so a drag waits much longer
++  // than a phaseless scroll before deciding its end was lost.
++  static constexpr base::TimeDelta kDragTimeout = base::Seconds(2);
+ 
+   explicit SpaceSwipeController(VerticalTabStripRegionView* region_view);
+   SpaceSwipeController(const SpaceSwipeController&) = delete;
+@@ -43,12 +53,19 @@
+   };
+ 
+   void ProcessSwipeOffset(float x_offset, float y_offset, ui::Event* event);
++  // Lets go of the pages, if the swipe is dragging them.
++  void EndDrag();
+   void ResetGesture();
+   // Switches the window's space, if it can move in that direction. Returns
+   // false when there's nothing to switch to.
+   bool SwitchSpace(bool forward);
+ 
+   const raw_ptr<VerticalTabStripRegionView> region_view_;
++  // Drags the sidebar's pages with the fingers. Null in windows without
++  // spaces.
++  std::unique_ptr<SpacePager> pager_;
++  // Ends a drag whose end event never comes.
++  base::OneShotTimer drag_timeout_;
+ 
+   GestureState gesture_state_ = GestureState::kNone;
+   float cumulative_x_ = 0.0f;
+Index: src/chrome/browser/ui/rac/spaces/spaces_window_manager.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/spaces/spaces_window_manager.cc	2026-10-14 08:28:06.624027935 -0700
++++ src/chrome/browser/ui/rac/spaces/spaces_window_manager.cc	2026-10-14 19:36:23.087975610 -0700
+@@ -192,6 +192,9 @@
+     RefreshVisibility(*state);
+     return;
+   }
++  for (Observer& observer : observers_) {
++    observer.OnWindowSpaceWillChange(browser);
++  }
+   base::AutoReset<bool> changing(&state->changing_space, true);
+   TabStripModel* model = browser->GetTabStripModel();
+   tab_groups::TabGroupSyncService* tab_group_service =
+Index: src/chrome/browser/ui/rac/spaces/spaces_window_manager.h
+===================================================================
+--- src.orig/chrome/browser/ui/rac/spaces/spaces_window_manager.h	2026-10-14 08:28:06.624470919 -0700
++++ src/chrome/browser/ui/rac/spaces/spaces_window_manager.h	2026-10-14 19:36:23.073239634 -0700
+@@ -66,6 +66,9 @@
+ 
+   class Observer : public base::CheckedObserver {
+    public:
++    // `browser` is about to show another space. Its tabs still show the
++    // current one.
++    virtual void OnWindowSpaceWillChange(BrowserWindowInterface* browser) {}
+     // Fired only when this window's active space changes. Null means the
+     // window has not claimed a space or is displaying the elsewhere screen.
+     virtual void OnActiveSpaceChanged(BrowserWindowInterface* browser,
+Index: src/chrome/browser/ui/views/rac/spaces/space_pager.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/views/rac/spaces/space_pager.cc	2026-10-14 20:16:27.619844309 -0700
+@@ -0,0 +1,762 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/spaces/space_pager.h"
++
++#include <algorithm>
++#include <cmath>
++#include <numbers>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/memory/ptr_util.h"
++#include "base/task/sequenced_task_runner.h"
++#include "cc/animation/keyframe_model.h"
++#include "cc/paint/display_item_list.h"
++#include "cc/trees/target_property.h"
++#include "chrome/browser/rac/spaces/spaces_service.h"
++#include "ui/compositor/compositor.h"
++#include "ui/compositor/layer.h"
++#include "ui/compositor/layer_animation_delegate.h"
++#include "ui/compositor/layer_animation_element.h"
++#include "ui/compositor/layer_animation_sequence.h"
++#include "ui/compositor/layer_animator.h"
++#include "ui/compositor/layer_delegate.h"
++#include "ui/compositor/layer_threaded_animation_delegate.h"
++#include "ui/compositor/layer_tree_owner.h"
++#include "ui/compositor/paint_context.h"
++#include "ui/compositor/paint_recorder.h"
++#include "ui/gfx/animation/animation.h"
++#include "ui/gfx/animation/keyframe/animation_curve.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/geometry/size_conversions.h"
++#include "ui/gfx/geometry/transform.h"
++#include "ui/gfx/geometry/transform_operations.h"
++#include "ui/views/controls/scroll_view.h"
++#include "ui/views/view.h"
++
++namespace rac {
++
++namespace {
++
++// Arc's page spring: critically damped with a 0.25 s response.
++constexpr double kSpringOmega = 2 * std::numbers::pi / 0.25;
++// Arc moves its pages half as far as the scroll delta, which keeps a page
++// under control for a whole trackpad's travel.
++constexpr float kDragScale = 0.5f;
++// Arc's resistance past the first and last space, in Apple's rubber band
++// formula.
++constexpr float kRubberBandCoefficient = 0.15f;
++constexpr float kRubberBandDimension = 255.0f;
++// A flick this fast, in DIPs per second, turns the page even if it hasn't
++// gone halfway.
++constexpr float kFlickVelocity = 300.0f;
++// Before a flick counts, so a tap with a wobble doesn't switch.
++constexpr float kFlickMinimumOffset = 4.0f;
++// How far back the release speed is measured, and how long the fingers can
++// rest before letting go still counts as a stop.
++constexpr base::TimeDelta kVelocityWindow = base::Milliseconds(100);
++constexpr base::TimeDelta kRestTime = base::Milliseconds(60);
++constexpr int kPageGap = 12;
++constexpr base::TimeDelta kCrossFadeDuration = base::Milliseconds(150);
++
++gfx::Transform Translation(float x) {
++  return gfx::Transform::MakeTranslation(x, 0);
++}
++
++// Replays one layer's recorded paint, so the copy keeps looking like the
++// original after the original changes.
++class RecordedPainter : public ui::LayerDelegate {
++ public:
++  explicit RecordedPainter(ui::Layer& source) : size_(source.size()) {
++    auto list = base::MakeRefCounted<cc::DisplayItemList>();
++    source.delegate()->OnPaintLayer(ui::PaintContext(
++        list.get(), source.device_scale_factor(), gfx::Rect(size_),
++        source.GetCompositor()->is_pixel_canvas()));
++    list->Finalize();
++    record_ = list->paint_op_buffer().DeepCopyAsRecord();
++  }
++  RecordedPainter(const RecordedPainter&) = delete;
++  RecordedPainter& operator=(const RecordedPainter&) = delete;
++  ~RecordedPainter() override = default;
++
++  // ui::LayerDelegate:
++  void OnPaintLayer(const ui::PaintContext& context) override {
++    // The record is already in the context's space, so it's replayed
++    // without the recorder's own scale.
++    ui::PaintRecorder recorder(
++        context,
++        gfx::ScaleToRoundedSize(size_, context.is_pixel_canvas()
++                                           ? context.device_scale_factor()
++                                           : 1.0f),
++        1.0f, 1.0f, nullptr);
++    recorder.canvas()->sk_canvas()->drawPicture(record_);
++  }
++  void OnDeviceScaleFactorChanged(float old_device_scale_factor,
++                                  float new_device_scale_factor) override {}
++
++ private:
++  const gfx::Size size_;
++  cc::PaintRecord record_;
++};
++
++// The spring as a compositor curve, so it runs on the compositor thread.
++// `rest` is where the layer ends up.
++class SpringCurve : public gfx::TransformAnimationCurve {
++ public:
++  SpringCurve(const SpacePager::Spring& spring, float rest)
++      : spring_(spring), rest_(rest), duration_(spring.Duration()) {}
++  SpringCurve(const SpringCurve&) = default;
++  SpringCurve& operator=(const SpringCurve&) = delete;
++  ~SpringCurve() override = default;
++
++  // gfx::TransformAnimationCurve:
++  base::TimeDelta Duration() const override { return duration_; }
++  std::unique_ptr<gfx::AnimationCurve> Clone() const override {
++    return std::make_unique<SpringCurve>(*this);
++  }
++  gfx::TransformOperations GetValue(base::TimeDelta t) const override {
++    gfx::TransformOperations operations;
++    operations.AppendTranslate(
++        rest_ + (t >= duration_ ? 0 : spring_.OffsetAt(t)), 0, 0);
++    return operations;
++  }
++  gfx::TransformOperations GetTransformedValue(
++      base::TimeDelta t,
++      gfx::TimingFunction::LimitDirection limit_direction) const override {
++    return GetValue(t);
++  }
++  bool PreservesAxisAlignment() const override { return true; }
++  bool MaximumScale(float* max_scale) const override {
++    *max_scale = 1.0f;
++    return true;
++  }
++
++ private:
++  const SpacePager::Spring spring_;
++  const float rest_;
++  const base::TimeDelta duration_;
++};
++
++// Moves a layer from the spring's offset to `rest`. ui::LayerAnimator's own
++// transitions only take fixed curves, which can't start at the swipe's
++// speed.
++class SpringElement : public ui::LayerAnimationElement {
++ public:
++  SpringElement(const SpacePager::Spring& spring, float rest)
++      : ui::LayerAnimationElement(TRANSFORM, spring.Duration()),
++        spring_(spring),
++        rest_(rest) {}
++  SpringElement(const SpringElement&) = delete;
++  SpringElement& operator=(const SpringElement&) = delete;
++  ~SpringElement() override = default;
++
++  // How far from rest the compositor has the layer now.
++  float GetOffset() const {
++    const base::TimeTicks start = effective_start_time();
++    return start.is_null() ? spring_.offset
++                           : spring_.OffsetAt(base::TimeTicks::Now() - start);
++  }
++
++  // ui::LayerAnimationElement:
++  bool IsThreaded(ui::LayerAnimationDelegate* delegate) const override {
++    return true;
++  }
++
++ protected:
++  std::string DebugName() const override { return "SpacePagerSpring"; }
++  void OnStart(ui::LayerAnimationDelegate* delegate) override {
++    delegate->SetTransformFromAnimation(
++        Translation(rest_ + spring_.offset),
++        ui::PropertyChangeReason::FROM_ANIMATION);
++  }
++  bool OnProgress(double t, ui::LayerAnimationDelegate* delegate) override {
++    if (t < 1.0) {
++      return false;
++    }
++    if (Started()) {
++      delegate->GetThreadedAnimationDelegate()->RemoveThreadedAnimation(
++          keyframe_model_id());
++    }
++    delegate->SetTransformFromAnimation(
++        Translation(rest_), ui::PropertyChangeReason::FROM_ANIMATION);
++    return true;
++  }
++  void OnGetTarget(TargetValue* target) const override {
++    target->transform = Translation(rest_);
++  }
++  void OnAbort(ui::LayerAnimationDelegate* delegate) override {
++    if (!delegate || !Started()) {
++      return;
++    }
++    delegate->GetThreadedAnimationDelegate()->RemoveThreadedAnimation(
++        keyframe_model_id());
++    delegate->SetTransformFromAnimation(
++        Translation(rest_ + GetOffset()),
++        ui::PropertyChangeReason::FROM_ANIMATION);
++  }
++  void RequestEffectiveStart(ui::LayerAnimationDelegate* delegate) override {
++    // The compositor sets the real start time when it first ticks the curve.
++    set_effective_start_time(base::TimeTicks());
++    UpdateKeyframeModelId();
++    std::unique_ptr<cc::KeyframeModel> keyframe_model =
++        cc::KeyframeModel::Create(
++            std::make_unique<SpringCurve>(spring_, rest_), keyframe_model_id(),
++            animation_group_id(),
++            cc::KeyframeModel::TargetPropertyId(
++                cc::TargetProperty::TRANSFORM));
++    keyframe_model->set_needs_synchronized_start_time(true);
++    delegate->GetThreadedAnimationDelegate()->AddThreadedAnimation(
++        std::move(keyframe_model));
++  }
++
++ private:
++  const SpacePager::Spring spring_;
++  const float rest_;
++};
++
++std::unique_ptr<ui::LayerAnimationSequence> CreateSpring(
++    const SpacePager::Spring& spring,
++    float rest) {
++  return std::make_unique<ui::LayerAnimationSequence>(
++      std::make_unique<SpringElement>(spring, rest));
++}
++
++}  // namespace
++
++// A space's page as it last looked: a copy of the page's layers, each
++// replaying the paint its original last recorded.
++class SpacePager::Page {
++ public:
++  static std::unique_ptr<Page> Record(views::View& view) {
++    ui::Layer* source = view.layer();
++    if (!source || !source->GetCompositor()) {
++      return nullptr;
++    }
++    auto page = base::WrapUnique(new Page(source->size(),
++                                          source->device_scale_factor()));
++    std::unique_ptr<ui::Layer> root = page->Copy(*source);
++    root->SetBounds(gfx::Rect(source->size()));
++    root->SetTransform(gfx::Transform());
++    root->SetOpacity(1.0f);
++    root->SetVisible(true);
++    page->CopyChildren(*source, *root);
++    page->tree_ = std::make_unique<ui::LayerTreeOwner>(std::move(root));
++    return page;
++  }
++
++  Page(const Page&) = delete;
++  Page& operator=(const Page&) = delete;
++  ~Page() {
++    if (root()->parent()) {
++      root()->parent()->Remove(root());
++    }
++  }
++
++  ui::Layer* root() { return tree_->root(); }
++  const gfx::Size& size() const { return size_; }
++  // Spaces have different numbers of tabs, so only the width has to match.
++  bool Fits(const ui::Layer& layer) const {
++    return layer.size().width() == size_.width() &&
++           layer.device_scale_factor() == device_scale_factor_;
++  }
++
++ private:
++  Page(const gfx::Size& size, float device_scale_factor)
++      : size_(size), device_scale_factor_(device_scale_factor) {}
++
++  std::unique_ptr<ui::Layer> Copy(ui::Layer& source) {
++    std::unique_ptr<ui::Layer> copy = source.Clone();
++    // The copy can't scroll, so it's moved by the original's scroll offset.
++    const gfx::PointF scroll = source.CurrentScrollOffset();
++    if (!scroll.IsOrigin()) {
++      gfx::Transform transform =
++          gfx::Transform::MakeTranslation(-scroll.x(), -scroll.y());
++      transform.PreConcat(copy->transform());
++      copy->SetTransform(transform);
++    }
++    if (source.type() == ui::LAYER_TEXTURED && source.delegate()) {
++      painters_.push_back(std::make_unique<RecordedPainter>(source));
++      copy->set_delegate(painters_.back().get());
++      copy->SchedulePaint(gfx::Rect(copy->size()));
++    }
++    return copy;
++  }
++
++  void CopyChildren(ui::Layer& source, ui::Layer& destination) {
++    for (ui::Layer* child : source.children()) {
++      if (!child->GetTargetVisibility() || child->bounds().IsEmpty()) {
++        continue;
++      }
++      std::unique_ptr<ui::Layer> copy = Copy(*child);
++      CopyChildren(*child, *copy);
++      // The tree owner deletes the whole tree.
++      destination.Add(copy.release());
++    }
++  }
++
++  const gfx::Size size_;
++  const float device_scale_factor_;
++  // Outlives the layers that paint with it.
++  std::vector<std::unique_ptr<RecordedPainter>> painters_;
++  std::unique_ptr<ui::LayerTreeOwner> tree_;
++};
++
++float SpacePager::Spring::OffsetAt(base::TimeDelta time) const {
++  const double t = std::max(0.0, time.InSecondsF());
++  const double rate = velocity + kSpringOmega * offset;
++  return (offset + rate * t) * std::exp(-kSpringOmega * t);
++}
++
++float SpacePager::Spring::VelocityAt(base::TimeDelta time) const {
++  const double t = std::max(0.0, time.InSecondsF());
++  const double rate = velocity + kSpringOmega * offset;
++  return (rate - kSpringOmega * (offset + rate * t)) *
++         std::exp(-kSpringOmega * t);
++}
++
++base::TimeDelta SpacePager::Spring::Duration() const {
++  // Arc samples its spring at 240 Hz; the same steps find where it rests.
++  constexpr base::TimeDelta kStep = base::Hertz(240);
++  constexpr base::TimeDelta kLongest = base::Milliseconds(1500);
++  base::TimeDelta time = kStep;
++  while (time < kLongest &&
++         (std::abs(OffsetAt(time)) > 0.25f ||
++          std::abs(VelocityAt(time)) > 15.0f)) {
++    time += kStep;
++  }
++  return time;
++}
++
++// static
++std::unique_ptr<SpacePager> SpacePager::Create(BrowserWindowInterface* browser,
++                                               PageGetter get_page) {
++  SpacesWindowManager* manager = SpacesWindowManager::From(browser);
++  return manager ? std::make_unique<SpacePager>(browser, manager,
++                                                std::move(get_page))
++                 : nullptr;
++}
++
++SpacePager::SpacePager(BrowserWindowInterface* browser,
++                       SpacesWindowManager* manager,
++                       PageGetter get_page)
++    : browser_(browser), manager_(manager), get_page_(std::move(get_page)) {
++  manager_observation_.Observe(manager_);
++}
++
++SpacePager::~SpacePager() {
++  // The animations can outlive the pager; stop hearing about them first.
++  if (settling_) {
++    settling_->RemoveObserver(this);
++  }
++  ClearFade();
++  HidePages();
++  pages_.clear();
++}
++
++bool SpacePager::BeginDrag() {
++  views::View* page = GetPage();
++  if (!page || gfx::Animation::PrefersReducedMotion() ||
++      !manager_->GetActiveSpaceId(browser_)) {
++    return false;
++  }
++  drag_offset_ = Stop();
++  dragging_ = true;
++  samples_.clear();
++  samples_.push_back({base::TimeTicks::Now(), drag_offset_});
++  ShowNeighbors();
++  SetOffset(RubberBand(drag_offset_));
++  return true;
++}
++
++void SpacePager::UpdateDrag(float delta) {
++  if (!dragging_) {
++    return;
++  }
++  drag_offset_ += delta * kDragScale;
++  SetOffset(RubberBand(drag_offset_));
++  const base::TimeTicks now = base::TimeTicks::Now();
++  samples_.push_back({now, drag_offset_});
++  while (samples_.size() > 2 &&
++         now - samples_.front().time > kVelocityWindow) {
++    samples_.pop_front();
++  }
++}
++
++void SpacePager::EndDrag() {
++  if (!dragging_) {
++    return;
++  }
++  dragging_ = false;
++  const float offset = GetOffset();
++  const float velocity = GetDragVelocity();
++  const float half = GetPageSpacing() / 2;
++  // Negative offsets show the next space.
++  int direction = 0;
++  if (offset < -kFlickMinimumOffset && GetAdjacentSpace(1) &&
++      velocity < kFlickVelocity &&
++      (offset < -half || velocity < -kFlickVelocity)) {
++    direction = 1;
++  } else if (offset > kFlickMinimumOffset && GetAdjacentSpace(-1) &&
++             velocity > -kFlickVelocity &&
++             (offset > half || velocity > kFlickVelocity)) {
++    direction = -1;
++  }
++  if (direction) {
++    release_ = Spring{offset, velocity};
++    manager_->ShowAdjacentSpace(browser_, direction);
++    if (!release_) {
++      return;
++    }
++    // The window didn't switch after all.
++    release_.reset();
++  }
++  Settle(offset, velocity);
++}
++
++void SpacePager::OnWindowSpaceWillChange(BrowserWindowInterface* browser) {
++  if (browser != browser_) {
++    return;
++  }
++  views::View* page = GetPage();
++  if (!page || !manager_->GetActiveSpaceId(browser_)) {
++    return;
++  }
++  dragging_ = false;
++  leaving_offset_ = release_ ? release_->offset : Stop();
++  HidePages();
++  leaving_ = Page::Record(*page);
++}
++
++void SpacePager::OnActiveSpaceChanged(BrowserWindowInterface* browser,
++                                      const std::optional<SpaceId>& previous,
++                                      const std::optional<SpaceId>& current) {
++  if (browser != browser_) {
++    return;
++  }
++  std::unique_ptr<Page> leaving = std::move(leaving_);
++  const std::optional<Spring> release = std::exchange(release_, std::nullopt);
++  views::View* page = GetPage();
++  if (!page) {
++    return;
++  }
++  const std::optional<size_t> from =
++      previous ? manager_->spaces()->GetIndex(*previous) : std::nullopt;
++  const std::optional<size_t> to =
++      current ? manager_->spaces()->GetIndex(*current) : std::nullopt;
++  if (!leaving || !from || !to || *from == *to) {
++    SetOffset(0);
++    return;
++  }
++  if (gfx::Animation::PrefersReducedMotion()) {
++    SetOffset(0);
++    CrossFade(std::move(leaving));
++    return;
++  }
++  const int direction = *to > *from ? 1 : -1;
++  const float spacing = GetPageSpacing();
++  Page* old_page = leaving.get();
++  Remember(*previous, std::move(leaving));
++  // The new page comes in from beside the old one, which stays where it was
++  // and leaves the other way.
++  ShowPage(old_page, -direction * spacing);
++  Settle(leaving_offset_ + direction * spacing,
++         release ? release->velocity : 0.0f);
++}
++
++void SpacePager::OnWindowSpaceChanged(BrowserWindowInterface* browser) {
++  if (browser != browser_ || !leaving_) {
++    return;
++  }
++  // The window left for the "open in another window" screen.
++  leaving_.reset();
++  release_.reset();
++  SetOffset(0);
++}
++
++void SpacePager::OnSpacesChanged() {
++  // Names, icons, and order show on the pages.
++  if (dragging_ || settling_) {
++    stale_ = true;
++    return;
++  }
++  pages_.clear();
++}
++
++void SpacePager::OnLayerAnimationEnded(ui::LayerAnimationSequence* sequence) {
++  if (sequence == settling_) {
++    settling_ = nullptr;
++    HidePages();
++  } else if (sequence == fading_sequence_) {
++    fading_sequence_ = nullptr;
++    PostClearFade();
++  }
++}
++
++void SpacePager::OnLayerAnimationAborted(
++    ui::LayerAnimationSequence* sequence) {
++  if (sequence == settling_) {
++    settling_ = nullptr;
++    if (!stopping_) {
++      HidePages();
++    }
++  } else if (sequence == fading_sequence_) {
++    fading_sequence_ = nullptr;
++    PostClearFade();
++  }
++}
++
++views::View* SpacePager::GetPage() const {
++  views::View* page = get_page_.Run();
++  if (!page || !page->IsDrawn() || page->width() <= 0) {
++    return nullptr;
++  }
++  if (!page->layer()) {
++    page->SetPaintToLayer();
++    page->layer()->SetFillsBoundsOpaquely(false);
++  }
++  return page;
++}
++
++float SpacePager::GetPageSpacing() const {
++  views::View* page = GetPage();
++  return page ? page->width() + kPageGap : 0;
++}
++
++std::optional<SpaceId> SpacePager::GetAdjacentSpace(int direction) const {
++  const std::optional<SpaceId> current = manager_->GetActiveSpaceId(browser_);
++  const std::optional<size_t> index =
++      current ? manager_->spaces()->GetIndex(*current) : std::nullopt;
++  if (!index) {
++    return std::nullopt;
++  }
++  const auto& spaces = manager_->spaces()->spaces();
++  const int next = static_cast<int>(*index) + direction;
++  if (next < 0 || static_cast<size_t>(next) >= spaces.size()) {
++    return std::nullopt;
++  }
++  return spaces[next].id;
++}
++
++float SpacePager::GetOffset() const {
++  if (settling_) {
++    return static_cast<SpringElement*>(settling_->FirstElement())->GetOffset();
++  }
++  views::View* page = GetPage();
++  return page ? page->layer()->transform().To2dTranslation().x() : 0;
++}
++
++float SpacePager::Stop() {
++  const float offset = GetOffset();
++  if (settling_) {
++    stopping_ = true;
++    if (views::View* page = GetPage()) {
++      page->layer()->GetAnimator()->AbortAllAnimations();
++    }
++    stopping_ = false;
++    settling_ = nullptr;
++  }
++  ClearFade();
++  HidePages();
++  SetOffset(offset);
++  return offset;
++}
++
++void SpacePager::ShowNeighbors() {
++  const float spacing = GetPageSpacing();
++  for (int direction : {-1, 1}) {
++    if (const std::optional<SpaceId> space = GetAdjacentSpace(direction)) {
++      if (Page* page = Recall(*space)) {
++        ShowPage(page, direction * spacing);
++      }
++    }
++  }
++}
++
++void SpacePager::ShowPage(Page* page, float position) {
++  views::View* view = GetPage();
++  ui::Layer* strip = view ? view->layer()->parent() : nullptr;
++  ui::Layer* host = strip ? strip->parent() : nullptr;
++  if (!host) {
++    return;
++  }
++  // The tab strip clips to its own height, which follows the current space's
++  // tabs, so the other pages go in a clip of their own above it.
++  if (!clip_) {
++    clip_ = ui::Layer::Create(ui::LAYER_NOT_DRAWN);
++    clip_->SetName("SpacePager");
++    clip_->SetMasksToBounds(true);
++  }
++  if (clip_->parent() != host) {
++    host->Add(clip_.get());
++  }
++  host->StackAbove(clip_.get(), strip);
++  shown_.push_back({page, position});
++  clip_->Add(page->root());
++
++  const gfx::Rect& live = view->layer()->bounds();
++  int height = live.height();
++  for (const Shown& shown : shown_) {
++    height = std::max(height, shown.page->size().height());
++    shown.page->root()->SetBounds(
++        gfx::Rect(gfx::Point(live.x(), 0), shown.page->size()));
++  }
++  clip_->SetBounds(gfx::Rect(strip->bounds().x(), strip->bounds().y() + live.y(),
++                             strip->bounds().width(), height));
++  page->root()->SetTransform(Translation(
++      position + view->layer()->transform().To2dTranslation().x()));
++}
++
++void SpacePager::HidePages() {
++  for (const Shown& shown : std::exchange(shown_, {})) {
++    shown.page->root()->GetAnimator()->AbortAllAnimations();
++    clip_->Remove(shown.page->root());
++  }
++  if (clip_ && clip_->parent()) {
++    clip_->parent()->Remove(clip_.get());
++  }
++  if (stale_ && !dragging_ && !settling_) {
++    stale_ = false;
++    pages_.clear();
++  }
++}
++
++void SpacePager::SetOffset(float offset) {
++  if (views::View* page = GetPage()) {
++    page->layer()->SetTransform(Translation(offset));
++  }
++  for (const Shown& shown : shown_) {
++    shown.page->root()->SetTransform(Translation(shown.position + offset));
++  }
++}
++
++void SpacePager::Settle(float offset, float velocity) {
++  views::View* page = GetPage();
++  if (!page) {
++    return;
++  }
++  // Toward rest, a spring this fast would overshoot by a visible amount.
++  const float limit = 2 * kSpringOmega * std::abs(offset);
++  if (velocity * offset < 0) {
++    velocity = std::clamp(velocity, -limit, limit);
++  }
++  const Spring spring{offset, velocity};
++  ui::LayerAnimator* animator = page->layer()->GetAnimator();
++  if (settling_) {
++    stopping_ = true;
++    animator->AbortAllAnimations();
++    stopping_ = false;
++    settling_ = nullptr;
++  }
++  for (const Shown& shown : shown_) {
++    shown.page->root()->GetAnimator()->AbortAllAnimations();
++  }
++  SetOffset(offset);
++  // The pages beside run the same spring. They start in the same frame, so
++  // they keep their distance.
++  for (const Shown& shown : shown_) {
++    shown.page->root()->GetAnimator()->StartAnimation(
++        CreateSpring(spring, shown.position).release());
++  }
++  std::unique_ptr<ui::LayerAnimationSequence> sequence =
++      CreateSpring(spring, 0);
++  sequence->AddObserver(this);
++  settling_ = sequence.get();
++  animator->StartAnimation(sequence.release());
++}
++
++void SpacePager::CrossFade(std::unique_ptr<Page> page) {
++  ClearFade();
++  fading_ = std::move(page);
++  ShowPage(fading_.get(), 0);
++  auto sequence = std::make_unique<ui::LayerAnimationSequence>(
++      ui::LayerAnimationElement::CreateOpacityElement(0.0f,
++                                                      kCrossFadeDuration));
++  sequence->AddObserver(this);
++  fading_sequence_ = sequence.get();
++  fading_->root()->GetAnimator()->StartAnimation(sequence.release());
++}
++
++void SpacePager::PostClearFade() {
++  // The fading layer's animator is still notifying.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&SpacePager::ClearFade,
++                                weak_ptr_factory_.GetWeakPtr()));
++}
++
++void SpacePager::ClearFade() {
++  if (fading_sequence_) {
++    fading_sequence_->RemoveObserver(this);
++    fading_sequence_ = nullptr;
++  }
++  if (!fading_) {
++    return;
++  }
++  std::erase_if(shown_, [this](const Shown& shown) {
++    return shown.page == fading_.get();
++  });
++  fading_.reset();
++  if (shown_.empty() && clip_->parent()) {
++    clip_->parent()->Remove(clip_.get());
++  }
++}
++
++void SpacePager::Remember(const SpaceId& space, std::unique_ptr<Page> page) {
++  pages_[space] = std::move(page);
++}
++
++SpacePager::Page* SpacePager::Recall(const SpaceId& space) {
++  auto it = pages_.find(space);
++  views::View* view = GetPage();
++  if (it == pages_.end() || !view) {
++    return nullptr;
++  }
++  if (!it->second->Fits(*view->layer())) {
++    pages_.erase(it);
++    return nullptr;
++  }
++  return it->second.get();
++}
++
++float SpacePager::RubberBand(float offset) const {
++  const float spacing = GetPageSpacing();
++  const float lowest = GetAdjacentSpace(1) ? -spacing : 0;
++  const float highest = GetAdjacentSpace(-1) ? spacing : 0;
++  const auto band = [](float distance) {
++    return distance * kRubberBandDimension * kRubberBandCoefficient /
++           (kRubberBandDimension + kRubberBandCoefficient * distance);
++  };
++  if (offset > highest) {
++    return highest + band(offset - highest);
++  }
++  if (offset < lowest) {
++    return lowest - band(lowest - offset);
++  }
++  return offset;
++}
++
++float SpacePager::GetDragVelocity() const {
++  if (samples_.size() < 2) {
++    return 0;
++  }
++  const Sample& last = samples_.back();
++  if (base::TimeTicks::Now() - last.time > kRestTime) {
++    return 0;
++  }
++  const Sample* first = &samples_.front();
++  for (const Sample& sample : samples_) {
++    if (last.time - sample.time <= kVelocityWindow) {
++      first = &sample;
++      break;
++    }
++  }
++  const double seconds = (last.time - first->time).InSecondsF();
++  if (seconds < 0.008) {
++    return 0;
++  }
++  return (last.offset - first->offset) / seconds;
++}
++
++}  // namespace rac
+Index: src/chrome/browser/ui/views/rac/spaces/space_pager.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/views/rac/spaces/space_pager.h	2026-10-14 20:10:03.676882134 -0700
+@@ -0,0 +1,177 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_SPACES_SPACE_PAGER_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_SPACES_SPACE_PAGER_H_
++
++#include <map>
++#include <memory>
++#include <optional>
++#include <vector>
++
++#include "base/containers/circular_deque.h"
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/time/time.h"
++#include "chrome/browser/rac/spaces/space.h"
++#include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
++#include "ui/compositor/layer.h"
++#include "ui/compositor/layer_animation_observer.h"
++
++class BrowserWindowInterface;
++
++namespace views {
++class View;
++}  // namespace views
++
++namespace rac {
++
++// Lays a window's spaces side by side in the sidebar, as in Arc. Everything
++// below the favorites is one space's page. A switch slides the old page out
++// and the new one in, and a two-finger swipe drags the pages, then lets go
++// into a spring that keeps the swipe's speed.
++//
++// Only the current space's tabs exist as views, so the other pages are
++// recordings of how each space last looked, taken as the window left it.
++// They hold paint commands, not pixels, and are on screen only while pages
++// move. Every frame of motion changes only layer transforms, and the spring
++// runs on the compositor thread, so it stays smooth while the new space
++// loads.
++class SpacePager : public SpacesWindowManager::Observer,
++                   public ui::LayerAnimationObserver {
++ public:
++  // Returns the view that slides as the page: the open tabs below the
++  // favorites. Null while there isn't one.
++  using PageGetter = base::RepeatingCallback<views::View*()>;
++
++  // Null for windows without spaces.
++  static std::unique_ptr<SpacePager> Create(BrowserWindowInterface* browser,
++                                            PageGetter get_page);
++
++  SpacePager(BrowserWindowInterface* browser,
++             SpacesWindowManager* manager,
++             PageGetter get_page);
++  SpacePager(const SpacePager&) = delete;
++  SpacePager& operator=(const SpacePager&) = delete;
++  ~SpacePager() override;
++
++  // Starts dragging the pages with a swipe. Returns false when the pages
++  // can't follow the fingers: the sidebar isn't showing, or the system asks
++  // for reduced motion.
++  bool BeginDrag();
++  // `delta` is the swipe's horizontal scroll delta. Negative moves toward
++  // the next space.
++  void UpdateDrag(float delta);
++  // Settles on a page, switching spaces if the swipe went far or fast
++  // enough.
++  void EndDrag();
++  bool is_dragging() const { return dragging_; }
++
++  // SpacesWindowManager::Observer:
++  void OnWindowSpaceWillChange(BrowserWindowInterface* browser) override;
++  void OnActiveSpaceChanged(BrowserWindowInterface* browser,
++                            const std::optional<SpaceId>& previous,
++                            const std::optional<SpaceId>& current) override;
++  void OnWindowSpaceChanged(BrowserWindowInterface* browser) override;
++  void OnSpacesChanged() override;
++
++  // ui::LayerAnimationObserver:
++  void OnLayerAnimationEnded(ui::LayerAnimationSequence* sequence) override;
++  void OnLayerAnimationAborted(ui::LayerAnimationSequence* sequence) override;
++  void OnLayerAnimationScheduled(
++      ui::LayerAnimationSequence* sequence) override {}
++
++  // A critically damped spring, as Arc settles its pages: no bounce, and it
++  // starts at the speed it's given.
++  struct Spring {
++    // Distance from the resting place, and speed, in DIPs and DIPs per
++    // second.
++    float offset = 0;
++    float velocity = 0;
++
++    float OffsetAt(base::TimeDelta time) const;
++    float VelocityAt(base::TimeDelta time) const;
++    // When it's close enough to rest to stop.
++    base::TimeDelta Duration() const;
++  };
++
++ private:
++  class Page;
++
++  // The open tabs and everything else that slides. Null while the sidebar
++  // isn't showing.
++  views::View* GetPage() const;
++  // How far apart the pages are.
++  float GetPageSpacing() const;
++  std::optional<SpaceId> GetAdjacentSpace(int direction) const;
++  // Where the page is drawn right now, mid-spring included.
++  float GetOffset() const;
++  // Stops any spring where it is and puts the other pages away.
++  float Stop();
++  // Shows the recorded pages beside the current one, for a drag.
++  void ShowNeighbors();
++  void ShowPage(Page* page, float position);
++  void HidePages();
++  void SetOffset(float offset);
++  void Settle(float offset, float velocity);
++  void CrossFade(std::unique_ptr<Page> page);
++  // Deletes the faded page once its animator is done with it.
++  void PostClearFade();
++  void ClearFade();
++  // Keeps `page`, the space's latest look, until the window shows it again.
++  void Remember(const SpaceId& space, std::unique_ptr<Page> page);
++  Page* Recall(const SpaceId& space);
++  float RubberBand(float offset) const;
++  float GetDragVelocity() const;
++
++  const raw_ptr<BrowserWindowInterface> browser_;
++  const raw_ptr<SpacesWindowManager> manager_;
++  const PageGetter get_page_;
++
++  // Each space's last look, by space.
++  std::map<SpaceId, std::unique_ptr<Page>> pages_;
++  // The recorded pages on screen, and where each rests beside the live one.
++  struct Shown {
++    raw_ptr<Page> page;
++    float position;
++  };
++  std::vector<Shown> shown_;
++  // Holds the recorded pages while they're on screen.
++  std::unique_ptr<ui::Layer> clip_;
++  // The page leaving during a switch, until it's known where it goes.
++  std::unique_ptr<Page> leaving_;
++  // Where the leaving page was when the switch started.
++  float leaving_offset_ = 0;
++  // Under reduced motion, the old page fading out over the new one.
++  std::unique_ptr<Page> fading_;
++  raw_ptr<ui::LayerAnimationSequence> fading_sequence_ = nullptr;
++  // The space list changed while pages were showing; forget them after.
++  bool stale_ = false;
++
++  bool dragging_ = false;
++  // The fingers' travel, before rubber banding.
++  float drag_offset_ = 0;
++  struct Sample {
++    base::TimeTicks time;
++    float offset;
++  };
++  base::circular_deque<Sample> samples_;
++  // Set while a swipe switches spaces, so the switch starts where the
++  // swipe let go.
++  std::optional<Spring> release_;
++
++  raw_ptr<ui::LayerAnimationSequence> settling_ = nullptr;
++  // True while stopping the spring on purpose, which keeps the pages.
++  bool stopping_ = false;
++
++  base::ScopedObservation<SpacesWindowManager, SpacesWindowManager::Observer>
++      manager_observation_{this};
++  base::WeakPtrFactory<SpacePager> weak_ptr_factory_{this};
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_SPACES_SPACE_PAGER_H_
+Index: src/chrome/browser/ui/views/rac/spaces/space_tab_list_header.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/spaces/space_tab_list_header.cc	2026-10-14 08:28:06.362980168 -0700
++++ src/chrome/browser/ui/views/rac/spaces/space_tab_list_header.cc	2026-10-14 19:36:49.013855233 -0700
+@@ -24,24 +24,17 @@
+ #include "ui/base/models/image_model.h"
+ #include "ui/base/mojom/menu_source_type.mojom.h"
+ #include "ui/color/color_provider.h"
+-#include "ui/compositor/layer.h"
+-#include "ui/compositor/layer_animator.h"
+-#include "ui/compositor/scoped_layer_animation_settings.h"
+ #include "ui/events/event.h"
+-#include "ui/gfx/animation/animation.h"
+-#include "ui/gfx/animation/tween.h"
+ #include "ui/gfx/canvas.h"
+ #include "ui/gfx/font.h"
+ #include "ui/gfx/font_list.h"
+ #include "ui/gfx/geometry/rect.h"
+-#include "ui/gfx/geometry/transform.h"
+ #include "ui/gfx/text_constants.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/controls/button/image_button.h"
+ #include "ui/views/controls/image_view.h"
+ #include "ui/views/controls/label.h"
+ #include "ui/views/controls/menu/menu_types.h"
+-#include "ui/views/controls/scroll_view.h"
+ #include "ui/views/vector_icons.h"
+ 
+ namespace rac {
+@@ -217,9 +210,6 @@
+     return;
+   }
+   UpdateTitle();
+-  if (previous && current && GetVisible()) {
+-    AnimateTabList(*previous, *current);
+-  }
+ }
+ 
+ void SpaceTabListHeader::OnWindowSpaceChanged(BrowserWindowInterface* browser) {
+@@ -294,39 +284,6 @@
+   UpdateControls();
+ }
+ 
+-void SpaceTabListHeader::AnimateTabList(const SpaceId& previous,
+-                                        const SpaceId& current) {
+-  // The open tabs and this row scroll together; favorites stay put.
+-  views::ScrollView* tab_list = views::ScrollView::GetScrollViewForContents(
+-      parent());
+-  if (!tab_list || !tab_list->GetVisible()) {
+-    return;
+-  }
+-  if (!tab_list->layer()) {
+-    tab_list->SetPaintToLayer();
+-    tab_list->layer()->SetFillsBoundsOpaquely(false);
+-  }
+-  ui::Layer* layer = tab_list->layer();
+-  layer->GetAnimator()->StopAnimating();
+-  // The model has already changed. Bring the new list in without holding
+-  // input or retaining an image of the old tabs.
+-  layer->SetOpacity(0.35f);
+-  const bool reduced_motion = gfx::Animation::PrefersReducedMotion();
+-  gfx::Transform start;
+-  if (!reduced_motion) {
+-    const size_t before = manager_->spaces()->GetIndex(previous).value_or(0);
+-    const size_t after = manager_->spaces()->GetIndex(current).value_or(0);
+-    start.Translate(after > before ? 24 : -24, 0);
+-  }
+-  layer->SetTransform(start);
+-  ui::ScopedLayerAnimationSettings animation(layer->GetAnimator());
+-  animation.SetTransitionDuration(
+-      base::Milliseconds(reduced_motion ? 140 : 180));
+-  animation.SetTweenType(gfx::Tween::FAST_OUT_SLOW_IN);
+-  layer->SetOpacity(1.0f);
+-  layer->SetTransform(gfx::Transform());
+-}
+-
+ BEGIN_METADATA(SpaceTabListHeader)
+ END_METADATA
+ 
+Index: src/chrome/browser/ui/views/rac/spaces/space_tab_list_header.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/spaces/space_tab_list_header.h	2026-10-14 08:28:06.363457235 -0700
++++ src/chrome/browser/ui/views/rac/spaces/space_tab_list_header.h	2026-10-14 19:36:42.012097337 -0700
+@@ -23,7 +23,7 @@
+ // The space's name, above its pinned tabs, as in Arc. Pressing it hides or
+ // shows the pinned tabs. On hover a chevron takes the icon's place and a
+ // "more" button opens the space's menu; while the pinned tabs are hidden
+-// the chevron stays. Also slides the tab list in when the space changes.
++// the chevron stays.
+ class SpaceTabListHeader : public views::Button,
+                            public views::ContextMenuController,
+                            public SpacesWindowManager::Observer {
+@@ -68,7 +68,6 @@
+   void ShowMenu(views::View* source,
+                 const gfx::Rect& anchor_bounds,
+                 ui::mojom::MenuSourceType source_type);
+-  void AnimateTabList(const SpaceId& previous, const SpaceId& current);
+ 
+   const raw_ptr<BrowserWindowInterface> browser_;
+   const raw_ptr<SpacesWindowManager> manager_;

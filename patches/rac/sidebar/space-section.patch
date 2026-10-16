@@ -1,0 +1,1448 @@
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn
++++ src/chrome/browser/ui/BUILD.gn
+@@ -2536,6 +2536,8 @@
+       "views/rac/spaces/space_tab_list_header.h",
+       "rac/spaces/space_elsewhere_dialog.cc",
+       "rac/spaces/space_elsewhere_dialog.h",
++      "rac/spaces/space_menu.cc",
++      "rac/spaces/space_menu.h",
+       "rac/spaces/space_swipe_controller.cc",
+       "rac/spaces/space_swipe_controller.h",
+       "rac/spaces/space_switcher_view.cc",
+Index: src/chrome/browser/ui/rac/sidebar/sidebar_items.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/sidebar/sidebar_items.cc
++++ src/chrome/browser/ui/rac/sidebar/sidebar_items.cc
+@@ -98,6 +98,9 @@
+   }
+   base::DictValue value;
+   value.Set(kEntries, std::move(entries));
++  if (list.collapsed) {
++    value.Set(kCollapsed, true);
++  }
+   return value;
+ }
+ 
+@@ -106,6 +109,7 @@
+ SidebarList ListFromValue(const base::DictValue& value,
+                           std::set<std::string>& seen_ids) {
+   SidebarList list;
++  list.collapsed = value.FindBool(kCollapsed).value_or(false);
+   const base::ListValue* entries = value.FindList(kEntries);
+   if (!entries) {
+     return list;
+@@ -507,6 +511,15 @@
+   }
+ }
+ 
++void SidebarItems::SetListCollapsed(std::string_view list_key,
++                                    bool collapsed) {
++  if (GetList(list_key).collapsed == collapsed) {
++    return;
++  }
++  lists_[std::string(list_key)].collapsed = collapsed;
++  SaveAndNotify();
++}
++
+ void SidebarItems::AddObserver(Observer* observer) {
+   observers_.AddObserver(observer);
+ }
+@@ -664,7 +677,7 @@
+ void SidebarItems::SaveAndNotify() {
+   base::DictValue lists;
+   for (const auto& [key, list] : lists_) {
+-    if (!list.entries.empty()) {
++    if (!list.entries.empty() || list.collapsed) {
+       lists.Set(key, ListToValue(list));
+     }
+   }
+Index: src/chrome/browser/ui/rac/sidebar/sidebar_items.h
+===================================================================
+--- src.orig/chrome/browser/ui/rac/sidebar/sidebar_items.h
++++ src/chrome/browser/ui/rac/sidebar/sidebar_items.h
+@@ -79,6 +79,8 @@
+   const SidebarFolder* FindFolderOfItem(std::string_view item_id) const;
+ 
+   std::vector<Entry> entries;
++  // A space's pinned tabs hide under its name, as in Arc.
++  bool collapsed = false;
+ };
+ 
+ // Where an item goes: `index` within `folder_id`, or among the top-level
+@@ -155,6 +157,7 @@
+   void RemoveFolder(std::string_view folder_id);
+   void SetFolderTitle(std::string_view folder_id, const std::u16string& title);
+   void SetFolderCollapsed(std::string_view folder_id, bool collapsed);
++  void SetListCollapsed(std::string_view list_key, bool collapsed);
+ 
+   void AddObserver(Observer* observer);
+   void RemoveObserver(Observer* observer);
+Index: src/chrome/browser/ui/rac/spaces/space_menu.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/spaces/space_menu.cc
+@@ -0,0 +1,257 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/spaces/space_menu.h"
++
++#include <array>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/rac/spaces/space.h"
++#include "chrome/browser/rac/spaces/spaces_service.h"
++#include "chrome/browser/ui/rac/spaces/space_dialogs.h"
++#include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
++#include "chrome/grit/generated_resources.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "third_party/skia/include/core/SkCanvas.h"
++#include "third_party/skia/include/core/SkPaint.h"
++#include "ui/base/models/image_model.h"
++#include "ui/base/mojom/menu_source_type.mojom.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/image/image_skia.h"
++#include "ui/gfx/image/image_skia_rep.h"
++#include "ui/views/controls/menu/menu_runner.h"
++#include "ui/views/view.h"
++#include "ui/views/widget/widget.h"
++
++namespace rac {
++
++namespace {
++
++enum SpaceMenuCommand {
++  kRenameCommand = 1,
++  kMoveLeftCommand,
++  kMoveRightCommand,
++  kUnloadCommand,
++  kDeleteCommand,
++  kThemeSubmenuCommand,
++  kIconSubmenuCommand,
++  kFirstThemeCommand = 100,
++  kThemeAutoCommand = 108,
++  kThemeLightCommand,
++  kThemeDarkCommand,
++  kFirstIconCommand = 200,
++  kClearIconCommand = 208,
++};
++
++constexpr std::array<std::string_view, 8> kIcons = {
++    "🌸", "🍑", "🌿", "☁️", "🌙", "🍁", "☀️", "🌊"};
++static_assert(kThemeAutoCommand - kFirstThemeCommand >=
++              static_cast<int>(SpaceTheme::kPresetCount));
++static_assert(kClearIconCommand - kFirstIconCommand >=
++              static_cast<int>(kIcons.size()));
++
++// A filled circle for the color menu, as in Dia's picker.
++ui::ImageModel CreateSwatch(size_t preset) {
++  constexpr int kSize = 12;
++  constexpr float kScale = 2.0f;
++  uint32_t rgb = 0;
++  base::HexStringToUInt(SpaceTheme::PresetSwatch(preset).substr(1), &rgb);
++  SkBitmap bitmap;
++  bitmap.allocN32Pixels(kSize * kScale, kSize * kScale);
++  bitmap.eraseColor(SK_ColorTRANSPARENT);
++  SkCanvas canvas(bitmap);
++  SkPaint paint;
++  paint.setAntiAlias(true);
++  paint.setColor(SkColorSetA(rgb, SK_AlphaOPAQUE));
++  const float r = kSize * kScale / 2;
++  canvas.drawCircle(r, r, r - 1, paint);
++  paint.setStyle(SkPaint::kStroke_Style);
++  paint.setStrokeWidth(1);
++  paint.setColor(SkColorSetA(SK_ColorBLACK, 0x26));
++  canvas.drawCircle(r, r, r - 1.5f, paint);
++  return ui::ImageModel::FromImageSkia(
++      gfx::ImageSkia(gfx::ImageSkiaRep(bitmap, kScale)));
++}
++
++}  // namespace
++
++SpaceMenu::SpaceMenu(SpacesWindowManager* manager) : manager_(manager) {}
++
++SpaceMenu::~SpaceMenu() = default;
++
++void SpaceMenu::Show(const base::Uuid& space,
++                     views::View* bubble_anchor,
++                     views::View* source,
++                     const gfx::Rect& anchor_bounds,
++                     views::MenuAnchorPosition anchor_position,
++                     ui::mojom::MenuSourceType source_type,
++                     base::RepeatingClosure on_closed) {
++  if (!manager_ || !source->GetWidget()) {
++    return;
++  }
++  space_ = space;
++  bubble_anchor_ = bubble_anchor;
++
++  menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++  theme_menu_ = std::make_unique<ui::SimpleMenuModel>(this);
++  for (size_t i = 0; i < SpaceTheme::kPresetCount; ++i) {
++    theme_menu_->AddCheckItem(kFirstThemeCommand + i,
++                              std::u16string(SpaceTheme::PresetName(i)));
++    theme_menu_->SetIcon(theme_menu_->GetItemCount() - 1, CreateSwatch(i));
++  }
++  theme_menu_->AddSeparator(ui::NORMAL_SEPARATOR);
++  theme_menu_->AddCheckItem(kThemeAutoCommand, u"Automatic");
++  theme_menu_->AddCheckItem(kThemeLightCommand, u"Light");
++  theme_menu_->AddCheckItem(kThemeDarkCommand, u"Dark");
++
++  icon_menu_ = std::make_unique<ui::SimpleMenuModel>(this);
++  for (size_t i = 0; i < kIcons.size(); ++i) {
++    icon_menu_->AddCheckItem(kFirstIconCommand + i,
++                             base::UTF8ToUTF16(kIcons[i]));
++  }
++  icon_menu_->AddSeparator(ui::NORMAL_SEPARATOR);
++  icon_menu_->AddCheckItem(kClearIconCommand, u"Use Dot");
++
++  menu_model_->AddItemWithStringId(kRenameCommand, IDS_RAC_SPACES_RENAME);
++  menu_model_->AddSubMenu(kIconSubmenuCommand, u"Icon", icon_menu_.get());
++  menu_model_->AddSubMenu(kThemeSubmenuCommand, u"Color", theme_menu_.get());
++  menu_model_->AddItemWithStringId(kMoveLeftCommand, IDS_RAC_SPACES_MOVE_LEFT);
++  menu_model_->AddItemWithStringId(kMoveRightCommand,
++                                   IDS_RAC_SPACES_MOVE_RIGHT);
++  menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
++  menu_model_->AddItemWithStringId(kUnloadCommand, IDS_RAC_SPACES_UNLOAD);
++  menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
++  menu_model_->AddItemWithStringId(kDeleteCommand, IDS_RAC_SPACES_DELETE);
++
++  menu_runner_ = std::make_unique<views::MenuRunner>(
++      menu_model_.get(), views::MenuRunner::CONTEXT_MENU, std::move(on_closed));
++  menu_runner_->RunMenuAt(source->GetWidget(), nullptr, anchor_bounds,
++                          anchor_position, source_type);
++}
++
++bool SpaceMenu::IsShowing() const {
++  return menu_runner_ && menu_runner_->IsRunning();
++}
++
++void SpaceMenu::Cancel() {
++  if (IsShowing()) {
++    menu_runner_->Cancel();
++  }
++}
++
++bool SpaceMenu::IsCommandIdChecked(int command_id) const {
++  if (!manager_ || !space_) {
++    return false;
++  }
++  const Space* space = manager_->spaces()->FindSpace(*space_);
++  if (!space) {
++    return false;
++  }
++  if (command_id >= kFirstThemeCommand &&
++      command_id < kFirstThemeCommand + SpaceTheme::kPresetCount) {
++    const auto preset = SpaceTheme::Preset(command_id - kFirstThemeCommand);
++    return space->theme.color1 == preset.color1 &&
++           space->theme.color2 == preset.color2;
++  }
++  if (command_id >= kFirstIconCommand &&
++      command_id < kFirstIconCommand + static_cast<int>(kIcons.size())) {
++    return space->icon == kIcons[command_id - kFirstIconCommand];
++  }
++  switch (command_id) {
++    case kThemeAutoCommand:
++      return space->theme.mode == SpaceTheme::Mode::kAuto;
++    case kThemeLightCommand:
++      return space->theme.mode == SpaceTheme::Mode::kLight;
++    case kThemeDarkCommand:
++      return space->theme.mode == SpaceTheme::Mode::kDark;
++    case kClearIconCommand:
++      return space->icon.empty();
++    default:
++      return false;
++  }
++}
++
++bool SpaceMenu::IsCommandIdEnabled(int command_id) const {
++  if (!manager_ || !space_) {
++    return false;
++  }
++  SpacesService* spaces = manager_->spaces();
++  const std::optional<size_t> index = spaces->GetIndex(*space_);
++  if (!index) {
++    return false;
++  }
++  switch (command_id) {
++    case kMoveLeftCommand:
++      return *index > 0;
++    case kMoveRightCommand:
++      return *index + 1 < spaces->spaces().size();
++    case kUnloadCommand:
++      return !manager_->GetWindowHoldingSpace(*space_) &&
++             !manager_->IsSpaceUnloaded(*space_) &&
++             manager_->GetTabCount(*space_) > 0;
++    case kDeleteCommand:
++      return spaces->spaces().size() > 1;
++    default:
++      return true;
++  }
++}
++
++void SpaceMenu::ExecuteCommand(int command_id, int event_flags) {
++  if (!manager_ || !space_) {
++    return;
++  }
++  const base::Uuid space = *space_;
++  SpacesService* spaces = manager_->spaces();
++  if (command_id >= kFirstThemeCommand &&
++      command_id < kFirstThemeCommand + SpaceTheme::kPresetCount) {
++    spaces->SetSpaceThemePreset(space, command_id - kFirstThemeCommand);
++    return;
++  }
++  if (command_id >= kFirstIconCommand &&
++      command_id < kFirstIconCommand + static_cast<int>(kIcons.size())) {
++    spaces->SetSpaceIcon(space,
++                         std::string(kIcons[command_id - kFirstIconCommand]));
++    return;
++  }
++  const std::optional<size_t> index = spaces->GetIndex(space);
++  switch (command_id) {
++    case kRenameCommand:
++      ShowRenameSpaceBubble(bubble_anchor_, spaces, space);
++      break;
++    case kThemeAutoCommand:
++      spaces->SetSpaceThemeMode(space, SpaceTheme::Mode::kAuto);
++      break;
++    case kThemeLightCommand:
++      spaces->SetSpaceThemeMode(space, SpaceTheme::Mode::kLight);
++      break;
++    case kThemeDarkCommand:
++      spaces->SetSpaceThemeMode(space, SpaceTheme::Mode::kDark);
++      break;
++    case kClearIconCommand:
++      spaces->SetSpaceIcon(space, "");
++      break;
++    case kMoveLeftCommand:
++      if (index && *index > 0) {
++        spaces->MoveSpace(space, *index - 1);
++      }
++      break;
++    case kMoveRightCommand:
++      if (index && *index + 1 < spaces->spaces().size()) {
++        spaces->MoveSpace(space, *index + 1);
++      }
++      break;
++    case kUnloadCommand:
++      manager_->UnloadSpace(space);
++      break;
++    case kDeleteCommand:
++      ShowDeleteSpaceBubble(bubble_anchor_, manager_, space);
++      break;
++  }
++}
++
++}  // namespace rac
+Index: src/chrome/browser/ui/rac/spaces/space_menu.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/spaces/space_menu.h
+@@ -0,0 +1,70 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_SPACES_SPACE_MENU_H_
++#define CHROME_BROWSER_UI_RAC_SPACES_SPACE_MENU_H_
++
++#include <memory>
++#include <optional>
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/uuid.h"
++#include "ui/base/mojom/menu_source_type.mojom-forward.h"
++#include "ui/menus/simple_menu_model.h"
++#include "ui/views/controls/menu/menu_types.h"
++
++namespace gfx {
++class Rect;
++}
++
++namespace views {
++class MenuRunner;
++class View;
++}  // namespace views
++
++namespace rac {
++
++class SpacesWindowManager;
++
++// A space's menu: rename, icon, color, order, unload, and delete. Shown from
++// the space dots and the space's name above its pinned tabs.
++class SpaceMenu : public ui::SimpleMenuModel::Delegate {
++ public:
++  explicit SpaceMenu(SpacesWindowManager* manager);
++  SpaceMenu(const SpaceMenu&) = delete;
++  SpaceMenu& operator=(const SpaceMenu&) = delete;
++  ~SpaceMenu() override;
++
++  // `bubble_anchor` anchors the rename and delete bubbles, so it must outlive
++  // them.
++  void Show(const base::Uuid& space,
++            views::View* bubble_anchor,
++            views::View* source,
++            const gfx::Rect& anchor_bounds,
++            views::MenuAnchorPosition anchor_position,
++            ui::mojom::MenuSourceType source_type,
++            base::RepeatingClosure on_closed = base::RepeatingClosure());
++  bool IsShowing() const;
++  void Cancel();
++
++  // ui::SimpleMenuModel::Delegate:
++  bool IsCommandIdChecked(int command_id) const override;
++  bool IsCommandIdEnabled(int command_id) const override;
++  void ExecuteCommand(int command_id, int event_flags) override;
++
++ private:
++  const raw_ptr<SpacesWindowManager> manager_;
++  // Set while the menu is open: the space it acts on.
++  std::optional<base::Uuid> space_;
++  raw_ptr<views::View> bubble_anchor_ = nullptr;
++  std::unique_ptr<ui::SimpleMenuModel> menu_model_;
++  std::unique_ptr<ui::SimpleMenuModel> theme_menu_;
++  std::unique_ptr<ui::SimpleMenuModel> icon_menu_;
++  std::unique_ptr<views::MenuRunner> menu_runner_;
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_RAC_SPACES_SPACE_MENU_H_
+Index: src/chrome/browser/ui/rac/spaces/space_switcher_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/spaces/space_switcher_view.cc
++++ src/chrome/browser/ui/rac/spaces/space_switcher_view.cc
+@@ -4,7 +4,6 @@
+ 
+ #include "chrome/browser/ui/rac/spaces/space_switcher_view.h"
+ 
+-#include <array>
+ #include <memory>
+ #include <utility>
+ 
+@@ -16,7 +15,6 @@
+ #include "chrome/browser/rac/spaces/spaces_service.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+-#include "chrome/browser/ui/rac/spaces/space_dialogs.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_ink_drop_util.h"
+ #include "chrome/grit/generated_resources.h"
+@@ -26,18 +24,12 @@
+ #include "ui/base/models/image_model.h"
+ #include "ui/color/color_provider.h"
+ #include "ui/compositor/layer.h"
+-#include "third_party/skia/include/core/SkBitmap.h"
+-#include "third_party/skia/include/core/SkCanvas.h"
+-#include "third_party/skia/include/core/SkPaint.h"
+ #include "ui/gfx/canvas.h"
+ #include "ui/gfx/geometry/insets.h"
+-#include "ui/gfx/image/image_skia.h"
+-#include "ui/gfx/image/image_skia_rep.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/controls/button/button.h"
+ #include "ui/views/controls/button/label_button.h"
+ #include "ui/views/controls/label.h"
+-#include "ui/views/controls/menu/menu_runner.h"
+ #include "ui/views/layout/fill_layout.h"
+ #include "ui/views/layout/flex_layout.h"
+ #include "ui/views/view_utils.h"
+@@ -46,23 +38,6 @@
+ 
+ namespace {
+ 
+-// Commands in the dot context menu.
+-enum SpaceMenuCommand {
+-  kRenameCommand = 1,
+-  kMoveLeftCommand,
+-  kMoveRightCommand,
+-  kUnloadCommand,
+-  kDeleteCommand,
+-  kThemeSubmenuCommand,
+-  kIconSubmenuCommand,
+-  kFirstThemeCommand = 100,
+-  kThemeAutoCommand = 108,
+-  kThemeLightCommand,
+-  kThemeDarkCommand,
+-  kFirstIconCommand = 200,
+-  kClearIconCommand = 208,
+-};
+-
+ // Arc's switcher: small dots, an emoji in place of the dot when a space has
+ // one.
+ constexpr int kDotTargetSize = 22;
+@@ -72,34 +47,6 @@
+ constexpr float kInactiveIconOpacity = 0.55f;
+ constexpr int kAddIconSize = 14;
+ 
+-constexpr std::array<std::string_view, 8> kIcons = {
+-    "🌸", "🍑", "🌿", "☁️", "🌙", "🍁", "☀️", "🌊"};
+-static_assert(kThemeAutoCommand - kFirstThemeCommand >=
+-              static_cast<int>(SpaceTheme::kPresetCount));
+-
+-// A filled circle for the color menu, as in Dia's picker.
+-ui::ImageModel CreateSwatch(size_t preset) {
+-  constexpr int kSize = 12;
+-  constexpr float kScale = 2.0f;
+-  uint32_t rgb = 0;
+-  base::HexStringToUInt(SpaceTheme::PresetSwatch(preset).substr(1), &rgb);
+-  SkBitmap bitmap;
+-  bitmap.allocN32Pixels(kSize * kScale, kSize * kScale);
+-  bitmap.eraseColor(SK_ColorTRANSPARENT);
+-  SkCanvas canvas(bitmap);
+-  SkPaint paint;
+-  paint.setAntiAlias(true);
+-  paint.setColor(SkColorSetA(rgb, SK_AlphaOPAQUE));
+-  const float r = kSize * kScale / 2;
+-  canvas.drawCircle(r, r, r - 1, paint);
+-  paint.setStyle(SkPaint::kStroke_Style);
+-  paint.setStrokeWidth(1);
+-  paint.setColor(SkColorSetA(SK_ColorBLACK, 0x26));
+-  canvas.drawCircle(r, r, r - 1.5f, paint);
+-  return ui::ImageModel::FromImageSkia(
+-      gfx::ImageSkia(gfx::ImageSkiaRep(bitmap, kScale)));
+-}
+-
+ // One dot in the switcher. A filled circle; the current space's dot is
+ // bigger and brighter.
+ class SpaceDotButton : public views::Button {
+@@ -166,7 +113,9 @@
+ SpaceSwitcherView::SpaceSwitcherView(
+     BrowserWindowInterface* browser,
+     tabs::VerticalTabStripStateController* state_controller)
+-    : browser_(browser), manager_(SpacesWindowManager::From(browser_)) {
++    : browser_(browser),
++      manager_(SpacesWindowManager::From(browser_)),
++      menu_(manager_) {
+   layout_ = SetLayoutManager(std::make_unique<views::FlexLayout>());
+   layout_->SetMainAxisAlignment(views::LayoutAlignment::kCenter)
+       .SetCrossAxisAlignment(views::LayoutAlignment::kCenter)
+@@ -224,9 +173,7 @@
+ }
+ 
+ void SpaceSwitcherView::Rebuild() {
+-  if (menu_runner_ && menu_runner_->IsRunning()) {
+-    menu_runner_->Cancel();
+-  }
++  menu_.Cancel();
+   RemoveAllChildViews();
+   if (!manager_) {
+     return;
+@@ -268,116 +215,6 @@
+   AddChildView(std::move(add_button));
+ }
+ 
+-bool SpaceSwitcherView::IsCommandIdChecked(int command_id) const {
+-  if (!manager_ || !menu_space_) {
+-    return false;
+-  }
+-  const Space* space = manager_->spaces()->FindSpace(*menu_space_);
+-  if (!space) {
+-    return false;
+-  }
+-  if (command_id >= kFirstThemeCommand &&
+-      command_id < kFirstThemeCommand + SpaceTheme::kPresetCount) {
+-    const auto preset = SpaceTheme::Preset(command_id - kFirstThemeCommand);
+-    return space->theme.color1 == preset.color1 &&
+-           space->theme.color2 == preset.color2;
+-  }
+-  if (command_id >= kFirstIconCommand &&
+-      command_id < kFirstIconCommand + kIcons.size()) {
+-    return space->icon == kIcons[command_id - kFirstIconCommand];
+-  }
+-  switch (command_id) {
+-    case kThemeAutoCommand:
+-      return space->theme.mode == SpaceTheme::Mode::kAuto;
+-    case kThemeLightCommand:
+-      return space->theme.mode == SpaceTheme::Mode::kLight;
+-    case kThemeDarkCommand:
+-      return space->theme.mode == SpaceTheme::Mode::kDark;
+-    case kClearIconCommand:
+-      return space->icon.empty();
+-    default:
+-      return false;
+-  }
+-}
+-
+-bool SpaceSwitcherView::IsCommandIdEnabled(int command_id) const {
+-  if (!manager_ || !menu_space_) {
+-    return false;
+-  }
+-  SpacesService* spaces = manager_->spaces();
+-  const std::optional<size_t> index = spaces->GetIndex(*menu_space_);
+-  if (!index) {
+-    return false;
+-  }
+-  switch (command_id) {
+-    case kMoveLeftCommand:
+-      return index && *index > 0;
+-    case kMoveRightCommand:
+-      return index && *index + 1 < spaces->spaces().size();
+-    case kUnloadCommand:
+-      return !manager_->GetWindowHoldingSpace(*menu_space_) &&
+-             !manager_->IsSpaceUnloaded(*menu_space_) &&
+-             manager_->GetTabCount(*menu_space_) > 0;
+-    case kDeleteCommand:
+-      return spaces->spaces().size() > 1;
+-    default:
+-      return true;
+-  }
+-}
+-
+-void SpaceSwitcherView::ExecuteCommand(int command_id, int event_flags) {
+-  if (!manager_ || !menu_space_) {
+-    return;
+-  }
+-  const base::Uuid space = *menu_space_;
+-  SpacesService* spaces = manager_->spaces();
+-  if (command_id >= kFirstThemeCommand &&
+-      command_id < kFirstThemeCommand + SpaceTheme::kPresetCount) {
+-    spaces->SetSpaceThemePreset(space, command_id - kFirstThemeCommand);
+-    return;
+-  }
+-  if (command_id >= kFirstIconCommand &&
+-      command_id < kFirstIconCommand + kIcons.size()) {
+-    spaces->SetSpaceIcon(space,
+-                         std::string(kIcons[command_id - kFirstIconCommand]));
+-    return;
+-  }
+-  const std::optional<size_t> index = spaces->GetIndex(space);
+-  switch (command_id) {
+-    case kRenameCommand:
+-      ShowRenameSpaceBubble(menu_anchor_, spaces, space);
+-      break;
+-    case kThemeAutoCommand:
+-      spaces->SetSpaceThemeMode(space, SpaceTheme::Mode::kAuto);
+-      break;
+-    case kThemeLightCommand:
+-      spaces->SetSpaceThemeMode(space, SpaceTheme::Mode::kLight);
+-      break;
+-    case kThemeDarkCommand:
+-      spaces->SetSpaceThemeMode(space, SpaceTheme::Mode::kDark);
+-      break;
+-    case kClearIconCommand:
+-      spaces->SetSpaceIcon(space, "");
+-      break;
+-    case kMoveLeftCommand:
+-      if (index && *index > 0) {
+-        spaces->MoveSpace(space, *index - 1);
+-      }
+-      break;
+-    case kMoveRightCommand:
+-      if (index && *index + 1 < spaces->spaces().size()) {
+-        spaces->MoveSpace(space, *index + 1);
+-      }
+-      break;
+-    case kUnloadCommand:
+-      manager_->UnloadSpace(space);
+-      break;
+-    case kDeleteCommand:
+-      ShowDeleteSpaceBubble(menu_anchor_, manager_, space);
+-      break;
+-  }
+-}
+-
+ void SpaceSwitcherView::ShowContextMenuForViewImpl(
+     views::View* source,
+     const gfx::Point& point,
+@@ -386,47 +223,10 @@
+   if (!dot || !manager_) {
+     return;
+   }
+-  menu_space_ = dot->space();
+   // Dots are rebuilt on space changes. The switcher itself is a stable bubble
+   // anchor, even when Rename or Delete rebuilds its children.
+-  menu_anchor_ = this;
+-
+-  menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
+-  theme_menu_ = std::make_unique<ui::SimpleMenuModel>(this);
+-  for (size_t i = 0; i < SpaceTheme::kPresetCount; ++i) {
+-    theme_menu_->AddCheckItem(kFirstThemeCommand + i,
+-                              std::u16string(SpaceTheme::PresetName(i)));
+-    theme_menu_->SetIcon(theme_menu_->GetItemCount() - 1, CreateSwatch(i));
+-  }
+-  theme_menu_->AddSeparator(ui::NORMAL_SEPARATOR);
+-  theme_menu_->AddCheckItem(kThemeAutoCommand, u"Automatic");
+-  theme_menu_->AddCheckItem(kThemeLightCommand, u"Light");
+-  theme_menu_->AddCheckItem(kThemeDarkCommand, u"Dark");
+-
+-  icon_menu_ = std::make_unique<ui::SimpleMenuModel>(this);
+-  for (size_t i = 0; i < kIcons.size(); ++i) {
+-    icon_menu_->AddCheckItem(kFirstIconCommand + i,
+-                             base::UTF8ToUTF16(kIcons[i]));
+-  }
+-  icon_menu_->AddSeparator(ui::NORMAL_SEPARATOR);
+-  icon_menu_->AddCheckItem(kClearIconCommand, u"Use Dot");
+-
+-  menu_model_->AddItemWithStringId(kRenameCommand, IDS_RAC_SPACES_RENAME);
+-  menu_model_->AddSubMenu(kIconSubmenuCommand, u"Icon", icon_menu_.get());
+-  menu_model_->AddSubMenu(kThemeSubmenuCommand, u"Color", theme_menu_.get());
+-  menu_model_->AddItemWithStringId(kMoveLeftCommand, IDS_RAC_SPACES_MOVE_LEFT);
+-  menu_model_->AddItemWithStringId(kMoveRightCommand,
+-                                   IDS_RAC_SPACES_MOVE_RIGHT);
+-  menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
+-  menu_model_->AddItemWithStringId(kUnloadCommand, IDS_RAC_SPACES_UNLOAD);
+-  menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
+-  menu_model_->AddItemWithStringId(kDeleteCommand, IDS_RAC_SPACES_DELETE);
+-
+-  menu_runner_ = std::make_unique<views::MenuRunner>(
+-      menu_model_.get(), views::MenuRunner::CONTEXT_MENU);
+-  menu_runner_->RunMenuAt(source->GetWidget(), nullptr,
+-                          source->GetBoundsInScreen(),
+-                          views::MenuAnchorPosition::kTopLeft, source_type);
++  menu_.Show(dot->space(), this, source, source->GetBoundsInScreen(),
++             views::MenuAnchorPosition::kTopLeft, source_type);
+ }
+ 
+ void SpaceSwitcherView::SetOrientation(bool collapsed) {
+Index: src/chrome/browser/ui/rac/spaces/space_switcher_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/rac/spaces/space_switcher_view.h
++++ src/chrome/browser/ui/rac/spaces/space_switcher_view.h
+@@ -5,15 +5,11 @@
+ #ifndef CHROME_BROWSER_UI_RAC_SPACES_SPACE_SWITCHER_VIEW_H_
+ #define CHROME_BROWSER_UI_RAC_SPACES_SPACE_SWITCHER_VIEW_H_
+ 
+-#include <memory>
+-
+-#include <optional>
+-
+ #include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
++#include "chrome/browser/ui/rac/spaces/space_menu.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+-#include "ui/menus/simple_menu_model.h"
+ #include "ui/views/context_menu_controller.h"
+ #include "ui/views/view.h"
+ 
+@@ -25,7 +21,6 @@
+ 
+ namespace views {
+ class FlexLayout;
+-class MenuRunner;
+ }
+ 
+ namespace tabs {
+@@ -40,7 +35,6 @@
+ // apps, popups).
+ class SpaceSwitcherView : public views::View,
+                           public SpacesWindowManager::Observer,
+-                          public ui::SimpleMenuModel::Delegate,
+                           public views::ContextMenuController {
+   METADATA_HEADER(SpaceSwitcherView, views::View)
+ 
+@@ -54,11 +48,6 @@
+   // views::View:
+   void OnThemeChanged() override;
+ 
+-  // ui::SimpleMenuModel::Delegate:
+-  bool IsCommandIdChecked(int command_id) const override;
+-  bool IsCommandIdEnabled(int command_id) const override;
+-  void ExecuteCommand(int command_id, int event_flags) override;
+-
+   // views::ContextMenuController:
+   void ShowContextMenuForViewImpl(views::View* source,
+                                   const gfx::Point& point,
+@@ -81,14 +70,7 @@
+ 
+   raw_ptr<views::FlexLayout> layout_ = nullptr;
+ 
+-  // Set while the dot context menu is open: the space it acts on and the
+-  // dot it's anchored to.
+-  std::optional<base::Uuid> menu_space_;
+-  raw_ptr<views::View> menu_anchor_ = nullptr;
+-  std::unique_ptr<ui::SimpleMenuModel> menu_model_;
+-  std::unique_ptr<ui::SimpleMenuModel> theme_menu_;
+-  std::unique_ptr<ui::SimpleMenuModel> icon_menu_;
+-  std::unique_ptr<views::MenuRunner> menu_runner_;
++  SpaceMenu menu_;
+ 
+   base::CallbackListSubscription collapse_subscription_;
+ };
+Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -42,7 +42,6 @@
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/helium/frame_corner_radius.h"
+ #include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h"
+-#include "chrome/browser/ui/views/rac/spaces/space_tab_list_header.h"
+ #include "chrome/browser/ui/views/rac/spaces/space_tint_background.h"
+ #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
+ #include "chrome/browser/ui/views/tabs/common/root_tab_collection_node.h"
+@@ -134,11 +133,6 @@
+       ->SetProperty(views::kMarginsKey,
+                     gfx::Insets::VH(0, region_horizontal_padding));
+ 
+-  // rac: the active space names the list directly beneath it.
+-  space_tab_list_header_ =
+-      AddChildView(std::make_unique<rac::SpaceTabListHeader>(
+-          browser_view->browser(), state_controller_));
+-
+   bottom_button_container_ =
+       AddChildView(std::make_unique<VerticalTabStripBottomContainer>(
+           state_controller_, root_action_item, browser_view->browser(),
+@@ -747,7 +741,6 @@
+   tab_strip_view()->SetPaintToLayer();
+   tab_strip_view()->layer()->SetFillsBoundsOpaquely(false);
+   tab_strip_view()->layer()->SetMasksToBounds(true);
+-  space_tab_list_header_->SetTabList(tab_strip_view());
+   tab_strip_view()->SetProperty(
+       views::kFlexBehaviorKey,
+       views::FlexSpecification(views::MinimumFlexSizeRule::kScaleToMinimum,
+@@ -783,7 +776,6 @@
+ }
+ 
+ void VerticalTabStripRegionView::OnTabStripViewWillClear() {
+-  space_tab_list_header_->SetTabList(nullptr);
+   on_animation_update_subscription_.reset();
+   expand_on_hover_enabled_changed_subscription_.reset();
+   omnibox_tab_helper_observation_.Reset();
+Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
++++ src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+@@ -36,7 +36,6 @@
+ class VerticalTabStripFocusSwipeController;
+ 
+ namespace rac {
+-class SpaceTabListHeader;
+ class SpaceSwitcherView;
+ class SpaceSwipeController;
+ }  // namespace rac
+@@ -240,7 +239,6 @@
+   bool zen_mode_floating_style_ = false;
+ 
+   raw_ptr<VerticalTabStripBottomContainer> bottom_button_container_ = nullptr;
+-  raw_ptr<rac::SpaceTabListHeader> space_tab_list_header_ = nullptr;
+   raw_ptr<views::View> gemini_button_ = nullptr;
+   // rac: the space switcher at the bottom of the strip.
+   raw_ptr<rac::SpaceSwitcherView> space_switcher_ = nullptr;
+Index: src/chrome/browser/ui/views/rac/sidebar/pinned_section.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/sidebar/pinned_section.cc
++++ src/chrome/browser/ui/views/rac/sidebar/pinned_section.cc
+@@ -25,6 +25,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/rac/sidebar/new_tab_row.h"
++#include "chrome/browser/ui/views/rac/spaces/space_tab_list_header.h"
+ #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+@@ -412,7 +413,8 @@
+ // static
+ bool PinnedSection::IsRow(const views::View& view) {
+   return views::IsViewClass<FolderHeaderView>(&view) ||
+-         views::IsViewClass<SectionDividerView>(&view);
++         views::IsViewClass<SectionDividerView>(&view) ||
++         views::IsViewClass<SpaceTabListHeader>(&view);
+ }
+ 
+ PinnedSection::PinnedSection(views::View* container) : container_(container) {
+@@ -439,7 +441,15 @@
+   const SidebarList* list =
+       !items_ ? nullptr : (drag_list ? &drag_list->list : &GetList());
+ 
++  const bool expanded =
++      collapse_state == tabs::VerticalTabStripCollapseState::kExpanded;
++  // The compact sidebar has no room for the name, so it can't hide the
++  // pinned tabs either.
++  const bool pinned_tabs_collapsed = expanded && items_ && GetList().collapsed;
+   std::vector<raw_ptr<views::View>> pending_rows;
++  if (space_header_ && expanded) {
++    pending_rows.push_back(space_header_.get());
++  }
+   base::flat_map<const tabs::TabInterface*, views::View*> tab_views;
+   // With no pinned tabs, the divider shows only once a drag reaches the top
+   // of the open tabs, which puts a stand-in for the dragged tabs in `list`.
+@@ -452,8 +462,6 @@
+     }
+     const tabs::TabInterface* active_tab =
+         browser_->GetTabStripModel()->GetActiveTab();
+-    const bool expanded =
+-        collapse_state == tabs::VerticalTabStripCollapseState::kExpanded;
+ 
+     auto place_item = [&](const SidebarItem& item,
+                           const SidebarFolder* folder) {
+@@ -476,9 +484,10 @@
+       PinnedSectionLayout::Child& child = layout.children_[it->second];
+       child.rows_before = std::move(pending_rows);
+       pending_rows.clear();
+-      child.indent = folder && expanded ? kFolderIndent : 0;
+-      child.hidden =
+-          folder && folder->collapsed && tab != active_tab && !dragged;
++      child.indent =
++          folder && expanded && !pinned_tabs_collapsed ? kFolderIndent : 0;
++      child.hidden = (pinned_tabs_collapsed || (folder && folder->collapsed)) &&
++                     tab != active_tab && !dragged;
+     };
+ 
+     for (const SidebarList::Entry& entry : list->entries) {
+@@ -488,7 +497,7 @@
+       }
+       const auto& folder = std::get<SidebarFolder>(entry);
+       auto header = folder_headers_.find(folder.id);
+-      if (header != folder_headers_.end()) {
++      if (header != folder_headers_.end() && !pinned_tabs_collapsed) {
+         pending_rows.push_back(header->second.get());
+       }
+       for (const SidebarItem& item : folder.items) {
+@@ -538,6 +547,9 @@
+   if (divider_ && !is_used(divider_)) {
+     layout.unused_rows_.push_back(divider_.get());
+   }
++  if (space_header_ && !is_used(space_header_)) {
++    layout.unused_rows_.push_back(space_header_.get());
++  }
+   for (const auto& [id, header] : folder_headers_) {
+     if (!is_used(header)) {
+       layout.unused_rows_.push_back(header.get());
+@@ -718,6 +730,7 @@
+   // deletes this.
+   divider_ = nullptr;
+   new_tab_row_ = nullptr;
++  space_header_ = nullptr;
+   folder_headers_.clear();
+   folder_menu_runner_.reset();
+   folder_menu_.reset();
+@@ -768,6 +781,12 @@
+         base::Unretained(container_.get())));
+   }
+   divider_ = container_->AddChildView(std::make_unique<SectionDividerView>());
++  if (SpacesWindowManager::From(browser_)) {
++    space_header_ = container_->AddChildView(
++        std::make_unique<SpaceTabListHeader>(
++            browser_, base::BindRepeating(&PinnedSection::TogglePinnedTabs,
++                                          base::Unretained(this))));
++  }
+   UpdateRows();
+ }
+ 
+@@ -780,6 +799,9 @@
+   if (!container_ || !items_) {
+     return;
+   }
++  if (space_header_) {
++    space_header_->SetPinnedTabsCollapsed(GetList().collapsed);
++  }
+   std::map<std::string, raw_ptr<FolderHeaderView>> old_headers;
+   std::swap(old_headers, folder_headers_);
+   for (const SidebarList::Entry& entry : GetList().entries) {
+@@ -823,6 +845,15 @@
+   }
+ }
+ 
++void PinnedSection::TogglePinnedTabs() {
++  if (!items_ || !browser_) {
++    return;
++  }
++  items_->SetListCollapsed(
++      SidebarItems::PinnedListKey(GetSpaceForWindow(browser_)),
++      !GetList().collapsed);
++}
++
+ void PinnedSection::ShowFolderMenu(const std::string& folder_id,
+                                    const gfx::Point& point,
+                                    ui::mojom::MenuSourceType source_type) {
+Index: src/chrome/browser/ui/views/rac/sidebar/pinned_section.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/sidebar/pinned_section.h
++++ src/chrome/browser/ui/views/rac/sidebar/pinned_section.h
+@@ -40,6 +40,7 @@
+ namespace rac {
+ 
+ class FolderHeaderView;
++class SpaceTabListHeader;
+ 
+ // Where the sidebar's rows go around the open tabs container's children for
+ // one layout pass. The container lays out its tab views as usual, and asks
+@@ -101,9 +102,10 @@
+ };
+ 
+ // Draws a window's pinned tabs as a section at the top of the open tabs:
+-// folder headers above the tabs in each folder, a divider between the
+-// pinned tabs and the open tabs, and the "+ New Tab" row below the divider. The tabs themselves stay Chromium's tab
+-// views, so they load, drag, and close like any tab.
++// the space's name, which hides and shows the pinned tabs, folder headers
++// above the tabs in each folder, a divider between the pinned tabs and the
++// open tabs, and the "+ New Tab" row below the divider. The tabs themselves
++// stay Chromium's tab views, so they load, drag, and close like any tab.
+ class PinnedSection : public views::ViewObserver,
+                       public SidebarItems::Observer,
+                       public TabStripModelObserver {
+@@ -153,6 +155,7 @@
+   // Adds, updates, and removes folder headers to match the folders.
+   void UpdateRows();
+   void ToggleFolder(const std::string& folder_id);
++  void TogglePinnedTabs();
+   void ShowFolderMenu(const std::string& folder_id,
+                       const gfx::Point& point,
+                       ui::mojom::MenuSourceType source_type);
+@@ -164,6 +167,8 @@
+   // The "+ New Tab" row above the open tabs. Present in every normal window,
+   // including ones that have no pinned tabs to show.
+   raw_ptr<views::View> new_tab_row_ = nullptr;
++  // Null in windows without spaces or pinned tabs.
++  raw_ptr<SpaceTabListHeader> space_header_ = nullptr;
+   std::map<std::string, raw_ptr<FolderHeaderView>> folder_headers_;
+   // Owned here, since the folder's commands can remove its header.
+   std::unique_ptr<ui::SimpleMenuModel> folder_menu_;
+Index: src/chrome/browser/ui/views/rac/spaces/space_tab_list_header.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/spaces/space_tab_list_header.cc
++++ src/chrome/browser/ui/views/rac/spaces/space_tab_list_header.cc
+@@ -4,64 +4,119 @@
+ 
+ #include "chrome/browser/ui/views/rac/spaces/space_tab_list_header.h"
+ 
++#include <algorithm>
++#include <memory>
++#include <utility>
++
+ #include "base/functional/bind.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "cc/paint/paint_flags.h"
+ #include "chrome/browser/rac/spaces/space.h"
+ #include "chrome/browser/rac/spaces/spaces_service.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+-#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_ink_drop_util.h"
+ #include "chrome/grit/generated_resources.h"
++#include "components/vector_icons/vector_icons.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/base/mojom/menu_source_type.mojom.h"
++#include "ui/color/color_provider.h"
+ #include "ui/compositor/layer.h"
+ #include "ui/compositor/layer_animator.h"
+ #include "ui/compositor/scoped_layer_animation_settings.h"
++#include "ui/events/event.h"
+ #include "ui/gfx/animation/animation.h"
+ #include "ui/gfx/animation/tween.h"
++#include "ui/gfx/canvas.h"
+ #include "ui/gfx/font.h"
+ #include "ui/gfx/font_list.h"
++#include "ui/gfx/geometry/rect.h"
+ #include "ui/gfx/geometry/transform.h"
+-#include "ui/views/border.h"
++#include "ui/gfx/text_constants.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/controls/button/image_button.h"
++#include "ui/views/controls/image_view.h"
+ #include "ui/views/controls/label.h"
+-#include "ui/views/layout/fill_layout.h"
++#include "ui/views/controls/menu/menu_types.h"
++#include "ui/views/controls/scroll_view.h"
++#include "ui/views/vector_icons.h"
+ 
+ namespace rac {
+ 
+-BEGIN_METADATA(SpaceTabListHeader)
+-END_METADATA
++namespace {
++
++// Matches a tab's favicon and title placement so the row lines up with the
++// pinned tabs below it.
++constexpr int kIconSize = 16;
++constexpr int kTitleGap = 7;
++constexpr int kMoreButtonSize = 20;
++constexpr int kMoreIconSize = 14;
++constexpr float kDotRadius = 3.0f;
++
++void ConfigureLabel(views::Label& label) {
++  label.SetAutoColorReadabilityEnabled(false);
++  label.SetBackgroundColor(SK_ColorTRANSPARENT);
++  label.SetSkipSubpixelRenderingOpacityCheck(true);
++  label.SetCanProcessEventsWithinSubtree(false);
++}
++
++}  // namespace
++
++SpaceTabListHeader::SpaceTabListHeader(BrowserWindowInterface* browser,
++                                       PressedCallback toggle_pinned_tabs)
++    : views::Button(std::move(toggle_pinned_tabs)),
++      browser_(browser),
++      manager_(SpacesWindowManager::From(browser)),
++      menu_(manager_) {
++  set_context_menu_controller(this);
++  SetNotifyEnterExitOnChild(true);
++  SetFocusBehavior(FocusBehavior::ACCESSIBLE_ONLY);
++
++  chevron_ = AddChildView(std::make_unique<views::ImageView>());
++  chevron_->SetCanProcessEventsWithinSubtree(false);
++  icon_ = AddChildView(std::make_unique<views::Label>());
++  ConfigureLabel(*icon_);
++  icon_->SetHorizontalAlignment(gfx::ALIGN_CENTER);
++  title_ = AddChildView(std::make_unique<views::Label>());
++  ConfigureLabel(*title_);
++  title_->SetHorizontalAlignment(gfx::ALIGN_TO_HEAD);
++  title_->SetElideBehavior(gfx::FADE_TAIL);
++  title_->SetEnabledColor(kColorRacTextSecondary);
++  title_->SetFontList(
++      title_->font_list().DeriveWithWeight(gfx::Font::Weight::SEMIBOLD));
++
++  more_button_ = AddChildView(std::make_unique<views::ImageButton>(
++      base::BindRepeating(
++          [](SpaceTabListHeader* self) {
++            self->ShowMenu(self->more_button_,
++                           self->more_button_->GetBoundsInScreen(),
++                           ui::mojom::MenuSourceType::kMouse);
++          },
++          base::Unretained(this))));
++  more_button_->SetImageModel(
++      views::Button::STATE_NORMAL,
++      ui::ImageModel::FromVectorIcon(views::kMoreHorizIcon,
++                                     kColorRacTextSecondary, kMoreIconSize));
++  more_button_->SetImageHorizontalAlignment(views::ImageButton::ALIGN_CENTER);
++  more_button_->SetImageVerticalAlignment(views::ImageButton::ALIGN_MIDDLE);
++  more_button_->SetFocusBehavior(FocusBehavior::ACCESSIBLE_ONLY);
++  more_button_->SetTooltipText(
++      l10n_util::GetStringUTF16(IDS_SETTINGS_MORE_ACTIONS));
++  ConfigureInkDrop(more_button_);
++  // The space's name replaces this once the window has an active space.
++  GetViewAccessibility().SetName(
++      l10n_util::GetStringUTF16(IDS_RAC_SPACES_SWITCHER_ACCESSIBLE_NAME));
+ 
+-SpaceTabListHeader::SpaceTabListHeader(
+-    BrowserWindowInterface* browser,
+-    tabs::VerticalTabStripStateController* state_controller)
+-    : browser_(browser), manager_(SpacesWindowManager::From(browser)) {
+-  SetLayoutManager(std::make_unique<views::FillLayout>());
+-  label_ = AddChildView(std::make_unique<views::Label>());
+-  label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+-  label_->SetEnabledColor(kColorRacTextPrimary);
+-  label_->SetFontList(label_->font_list()
+-                          .DeriveWithWeight(gfx::Font::Weight::MEDIUM)
+-                          .DeriveWithSizeDelta(2));
+-  label_->SetBorder(views::CreateEmptyBorder(gfx::Insets::TLBR(8, 12, 6, 12)));
+   if (!manager_) {
+     SetVisible(false);
+     return;
+   }
+   manager_->AddObserver(this);
+-  if (state_controller) {
+-    collapsed_ = state_controller->GetCollapseState() !=
+-                 tabs::VerticalTabStripCollapseState::kExpanded;
+-    collapse_subscription_ =
+-        state_controller->RegisterOnCollapseChanged(base::BindRepeating(
+-            [](SpaceTabListHeader* self,
+-               tabs::VerticalTabStripCollapseState state) {
+-              self->collapsed_ =
+-                  state != tabs::VerticalTabStripCollapseState::kExpanded;
+-              self->UpdateTitle();
+-            },
+-            base::Unretained(this)));
+-  }
+   UpdateTitle();
++  UpdateControls();
+ }
+ 
+ SpaceTabListHeader::~SpaceTabListHeader() {
+@@ -70,8 +125,88 @@
+   }
+ }
+ 
+-void SpaceTabListHeader::SetTabList(views::View* tab_list) {
+-  tab_list_ = tab_list;
++void SpaceTabListHeader::SetPinnedTabsCollapsed(bool collapsed) {
++  if (pinned_tabs_collapsed_ == collapsed) {
++    return;
++  }
++  pinned_tabs_collapsed_ = collapsed;
++  UpdateControls();
++}
++
++gfx::Size SpaceTabListHeader::CalculatePreferredSize(
++    const views::SizeBounds& available_size) const {
++  return gfx::Size(available_size.width().value_or(0),
++                   GetLayoutConstant(LayoutConstant::kVerticalTabHeight));
++}
++
++void SpaceTabListHeader::Layout(PassKey) {
++  gfx::Rect content(width(),
++                    GetLayoutConstant(LayoutConstant::kVerticalTabHeight));
++  content.Inset(gfx::Insets::VH(
++      GetLayoutConstant(LayoutConstant::kTabVerticalPadding),
++      GetLayoutConstant(LayoutConstant::kTabHorizontalPadding)));
++  const gfx::Rect icon(content.x(),
++                       content.y() + (content.height() - kIconSize) / 2,
++                       kIconSize, kIconSize);
++  chevron_->SetBounds(icon.x(), icon.y(), icon.width(), icon.height());
++  icon_->SetBounds(icon.x() - 2, content.y(), icon.width() + 4,
++                   content.height());
++  more_button_->SetBounds(
++      content.right() - kMoreButtonSize + 2,
++      content.y() + (content.height() - kMoreButtonSize) / 2, kMoreButtonSize,
++      kMoreButtonSize);
++  const int title_x = icon.right() + kTitleGap;
++  const int title_right = more_button_->GetVisible()
++                              ? more_button_->x() - kTitleGap
++                              : content.right();
++  const int line_height = title_->GetLineHeight();
++  title_->SetBounds(title_x, content.y() + (content.height() - line_height) / 2,
++                    std::max(0, title_right - title_x), line_height);
++}
++
++void SpaceTabListHeader::OnMouseEntered(const ui::MouseEvent& event) {
++  views::Button::OnMouseEntered(event);
++  hovered_ = true;
++  UpdateControls();
++}
++
++void SpaceTabListHeader::OnMouseExited(const ui::MouseEvent& event) {
++  views::Button::OnMouseExited(event);
++  hovered_ = IsMouseHovered();
++  UpdateControls();
++}
++
++void SpaceTabListHeader::StateChanged(ButtonState old_state) {
++  views::Button::StateChanged(old_state);
++  SchedulePaint();
++}
++
++void SpaceTabListHeader::PaintButtonContents(gfx::Canvas* canvas) {
++  const ui::ColorProvider* colors = GetColorProvider();
++  if (!colors) {
++    return;
++  }
++  if (hovered_ || GetState() == STATE_PRESSED || menu_.IsShowing()) {
++    cc::PaintFlags flags;
++    flags.setAntiAlias(true);
++    flags.setColor(colors->GetColor(kColorRacTabBackgroundHovered));
++    canvas->DrawRoundRect(
++        GetLocalBounds(),
++        GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius), flags);
++  }
++  if (!has_icon_ && !chevron_->GetVisible()) {
++    cc::PaintFlags flags;
++    flags.setAntiAlias(true);
++    flags.setColor(colors->GetColor(kColorRacTextSecondary));
++    canvas->DrawCircle(chevron_->bounds().CenterPoint(), kDotRadius, flags);
++  }
++}
++
++void SpaceTabListHeader::ShowContextMenuForViewImpl(
++    views::View* source,
++    const gfx::Point& point,
++    ui::mojom::MenuSourceType source_type) {
++  ShowMenu(this, gfx::Rect(point, gfx::Size()), source_type);
+ }
+ 
+ void SpaceTabListHeader::OnActiveSpaceChanged(
+@@ -82,7 +217,7 @@
+     return;
+   }
+   UpdateTitle();
+-  if (previous && current && !collapsed_ && GetVisible()) {
++  if (previous && current && GetVisible()) {
+     AnimateTabList(*previous, *current);
+   }
+ }
+@@ -102,29 +237,76 @@
+       manager_ ? manager_->GetActiveSpaceId(browser_) : std::nullopt;
+   const Space* space =
+       active ? manager_->spaces()->FindSpace(*active) : nullptr;
+-  SetVisible(space && !collapsed_);
+   if (!space) {
+     return;
+   }
+   const auto index = manager_->spaces()->GetIndex(*active);
+-  std::u16string title =
++  const std::u16string title =
+       space->name.empty()
+           ? l10n_util::GetStringFUTF16(
+                 IDS_RAC_SPACE_FALLBACK_NAME,
+                 base::NumberToString16(index.value_or(0) + 1))
+           : base::UTF8ToUTF16(space->name);
+-  if (!space->icon.empty()) {
+-    title = base::UTF8ToUTF16(space->icon) + u"  " + title;
++  title_->SetText(title);
++  GetViewAccessibility().SetName(title);
++  has_icon_ = !space->icon.empty();
++  icon_->SetText(base::UTF8ToUTF16(space->icon));
++  UpdateControls();
++}
++
++void SpaceTabListHeader::UpdateControls() {
++  const bool menu_showing = menu_.IsShowing();
++  const bool show_chevron = pinned_tabs_collapsed_ || hovered_ || menu_showing;
++  chevron_->SetImage(ui::ImageModel::FromVectorIcon(
++      pinned_tabs_collapsed_ ? vector_icons::kKeyboardArrowRightFlippableIcon
++                             : vector_icons::kKeyboardArrowDownIcon,
++      kColorRacTextSecondary, kIconSize));
++  chevron_->SetVisible(show_chevron);
++  icon_->SetVisible(has_icon_ && !show_chevron);
++  more_button_->SetVisible(hovered_ || menu_showing);
++  if (pinned_tabs_collapsed_) {
++    GetViewAccessibility().SetIsCollapsed();
++  } else {
++    GetViewAccessibility().SetIsExpanded();
+   }
+-  label_->SetText(title);
++  InvalidateLayout();
++  SchedulePaint();
++}
++
++void SpaceTabListHeader::ShowMenu(views::View* source,
++                                  const gfx::Rect& anchor_bounds,
++                                  ui::mojom::MenuSourceType source_type) {
++  const auto active =
++      manager_ ? manager_->GetActiveSpaceId(browser_) : std::nullopt;
++  if (!active) {
++    return;
++  }
++  menu_.Show(*active, this, source, anchor_bounds,
++             source == more_button_ ? views::MenuAnchorPosition::kTopRight
++                                    : views::MenuAnchorPosition::kTopLeft,
++             source_type,
++             base::BindRepeating(
++                 [](SpaceTabListHeader* self) {
++                   self->hovered_ = self->IsMouseHovered();
++                   self->UpdateControls();
++                 },
++                 base::Unretained(this)));
++  UpdateControls();
+ }
+ 
+ void SpaceTabListHeader::AnimateTabList(const SpaceId& previous,
+                                         const SpaceId& current) {
+-  if (!tab_list_ || !tab_list_->GetVisible() || !tab_list_->layer()) {
++  // The open tabs and this row scroll together; favorites stay put.
++  views::ScrollView* tab_list = views::ScrollView::GetScrollViewForContents(
++      parent());
++  if (!tab_list || !tab_list->GetVisible()) {
+     return;
+   }
+-  ui::Layer* layer = tab_list_->layer();
++  if (!tab_list->layer()) {
++    tab_list->SetPaintToLayer();
++    tab_list->layer()->SetFillsBoundsOpaquely(false);
++  }
++  ui::Layer* layer = tab_list->layer();
+   layer->GetAnimator()->StopAnimating();
+   // The model has already changed. Bring the new list in without holding
+   // input or retaining an image of the old tabs.
+@@ -145,4 +327,7 @@
+   layer->SetTransform(gfx::Transform());
+ }
+ 
++BEGIN_METADATA(SpaceTabListHeader)
++END_METADATA
++
+ }  // namespace rac
+Index: src/chrome/browser/ui/views/rac/spaces/space_tab_list_header.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/spaces/space_tab_list_header.h
++++ src/chrome/browser/ui/views/rac/spaces/space_tab_list_header.h
+@@ -5,34 +5,55 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_RAC_SPACES_SPACE_TAB_LIST_HEADER_H_
+ #define CHROME_BROWSER_UI_VIEWS_RAC_SPACES_SPACE_TAB_LIST_HEADER_H_
+ 
+-#include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
++#include "chrome/browser/ui/rac/spaces/space_menu.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+-#include "ui/views/view.h"
++#include "ui/views/context_menu_controller.h"
++#include "ui/views/controls/button/button.h"
+ 
+-namespace tabs {
+-class VerticalTabStripStateController;
+-}
+ namespace views {
++class ImageButton;
++class ImageView;
+ class Label;
+-}
++}  // namespace views
+ 
+ namespace rac {
+ 
+-// The space title above the tab list, and its compositor-only page transition.
+-class SpaceTabListHeader : public views::View,
++// The space's name, above its pinned tabs, as in Arc. Pressing it hides or
++// shows the pinned tabs. On hover a chevron takes the icon's place and a
++// "more" button opens the space's menu; while the pinned tabs are hidden
++// the chevron stays. Also slides the tab list in when the space changes.
++class SpaceTabListHeader : public views::Button,
++                           public views::ContextMenuController,
+                            public SpacesWindowManager::Observer {
+-  METADATA_HEADER(SpaceTabListHeader, views::View)
++  METADATA_HEADER(SpaceTabListHeader, views::Button)
+ 
+  public:
+   SpaceTabListHeader(BrowserWindowInterface* browser,
+-                     tabs::VerticalTabStripStateController* state_controller);
++                     PressedCallback toggle_pinned_tabs);
++  SpaceTabListHeader(const SpaceTabListHeader&) = delete;
++  SpaceTabListHeader& operator=(const SpaceTabListHeader&) = delete;
+   ~SpaceTabListHeader() override;
+ 
+-  // The tab strip may be reset when the layout changes.
+-  void SetTabList(views::View* tab_list);
++  void SetPinnedTabsCollapsed(bool collapsed);
+ 
++  // views::Button:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override;
++  void Layout(PassKey) override;
++  void OnMouseEntered(const ui::MouseEvent& event) override;
++  void OnMouseExited(const ui::MouseEvent& event) override;
++  void StateChanged(ButtonState old_state) override;
++  void PaintButtonContents(gfx::Canvas* canvas) override;
++
++  // views::ContextMenuController:
++  void ShowContextMenuForViewImpl(
++      views::View* source,
++      const gfx::Point& point,
++      ui::mojom::MenuSourceType source_type) override;
++
++  // SpacesWindowManager::Observer:
+   void OnActiveSpaceChanged(BrowserWindowInterface* browser,
+                             const std::optional<SpaceId>& previous,
+                             const std::optional<SpaceId>& current) override;
+@@ -41,14 +62,25 @@
+ 
+  private:
+   void UpdateTitle();
++  // Shows the chevron or the space's icon, and the more button, for the
++  // hover and collapsed states.
++  void UpdateControls();
++  void ShowMenu(views::View* source,
++                const gfx::Rect& anchor_bounds,
++                ui::mojom::MenuSourceType source_type);
+   void AnimateTabList(const SpaceId& previous, const SpaceId& current);
+ 
+   const raw_ptr<BrowserWindowInterface> browser_;
+   const raw_ptr<SpacesWindowManager> manager_;
+-  raw_ptr<views::Label> label_ = nullptr;
+-  raw_ptr<views::View> tab_list_ = nullptr;
+-  bool collapsed_ = false;
+-  base::CallbackListSubscription collapse_subscription_;
++  SpaceMenu menu_;
++  raw_ptr<views::ImageView> chevron_ = nullptr;
++  // The space's emoji. Spaces without one show a dot instead.
++  raw_ptr<views::Label> icon_ = nullptr;
++  raw_ptr<views::Label> title_ = nullptr;
++  raw_ptr<views::ImageButton> more_button_ = nullptr;
++  bool pinned_tabs_collapsed_ = false;
++  bool hovered_ = false;
++  bool has_icon_ = false;
+ };
+ 
+ }  // namespace rac

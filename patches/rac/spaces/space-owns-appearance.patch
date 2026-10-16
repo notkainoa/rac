@@ -1,0 +1,282 @@
+Index: src/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
+===================================================================
+--- src.orig/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
++++ src/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
+@@ -12,9 +12,9 @@ export function getHtml(this: SettingsAp
+ <settings-section page-title="$i18n{appearancePageTitle}">
+   <div route-path="default">
+     <div class="settings-row first" id="themeRow"
+-        ?hidden="${!this.pageVisibility_.setTheme}">
++        ?hidden="${!this.pageVisibility_.setTheme || !this.themeIdPref_?.value}">
+       <cr-link-row id="openTheme" class="first"
+-          ?hidden="${!this.pageVisibility_.setTheme}"
++          ?hidden="${!this.pageVisibility_.setTheme || !this.themeIdPref_?.value}"
+           label="$i18n{themes}" sub-label="${this.themeSublabel_}"
+           @click="${this.onThemeClick_}" external></cr-link-row>
+ <if expr="not is_linux">
+Index: src/chrome/browser/resources/side_panel/customize_chrome/app.css
+===================================================================
+--- src.orig/chrome/browser/resources/side_panel/customize_chrome/app.css
++++ src/chrome/browser/resources/side_panel/customize_chrome/app.css
+@@ -23,6 +23,12 @@
+   display: block;
+ }
+ 
++/* Spaces own the browser's colors, so Chrome's theme picker is hidden. */
++#appearance,
++#appearance + .sp-cards-separator {
++  display: none;
++}
++
+ .sp-card {
+   font-size: 12px;
+   font-weight: 500;
+Index: src/chrome/browser/ui/rac/spaces/spaces_window_manager.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/spaces/spaces_window_manager.cc
++++ src/chrome/browser/ui/rac/spaces/spaces_window_manager.cc
+@@ -21,6 +21,7 @@
+ #include "chrome/browser/sessions/session_service_factory.h"
+ #include "chrome/browser/sessions/tab_restore_service_factory.h"
+ #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
++#include "chrome/browser/themes/theme_service_factory.h"
+ #include "chrome/browser/ui/browser_init_state.h"
+ #include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+@@ -42,6 +43,7 @@
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/base_window.h"
++#include "ui/color/color_provider_key.h"
+ #include "ui/views/widget/widget.h"
+ #include "url/url_constants.h"
+ 
+@@ -113,6 +115,10 @@ SpacesWindowManager::SpacesWindowManager
+     return true;
+   });
+   spaces_observation_.Observe(spaces_);
++  if (ThemeService* theme = ThemeServiceFactory::GetForProfile(profile_)) {
++    theme_observation_.Observe(theme);
++    ResetBrowserTheme();
++  }
+ }
+ 
+ SpacesWindowManager::~SpacesWindowManager() {
+@@ -581,6 +587,7 @@ void SpacesWindowManager::Shutdown() {
+   windows_.clear();
+   unload_timer_.Stop();
+   hidden_since_.clear();
++  theme_observation_.Reset();
+ }
+ 
+ SpacesWindowManager::WindowState* SpacesWindowManager::FindState(
+@@ -938,6 +945,9 @@ void SpacesWindowManager::SaveWindowSpac
+ void SpacesWindowManager::NotifyWindowSpaceChanged(
+     BrowserWindowInterface* browser) {
+   WindowState* state = FindState(browser);
++  if (state) {
++    UpdateColorMode(*state);
++  }
+   const auto active = GetActiveSpaceId(browser);
+   if (state && active != state->last_notified_active_space) {
+     const auto previous = state->last_notified_active_space;
+@@ -951,6 +961,54 @@ void SpacesWindowManager::NotifyWindowSp
+   }
+ }
+ 
++void SpacesWindowManager::UpdateColorMode(const WindowState& state) {
++  ui::BaseWindow* window = state.browser->GetWindow();
++  views::Widget* widget =
++      window
++          ? views::Widget::GetWidgetForNativeWindow(window->GetNativeWindow())
++          : nullptr;
++  if (!widget) {
++    return;
++  }
++  const Space* space = state.space ? spaces_->FindSpace(*state.space) : nullptr;
++  std::optional<ui::ColorProviderKey::ColorMode> color_mode;
++  if (space && space->theme.mode == SpaceTheme::Mode::kLight) {
++    color_mode = ui::ColorProviderKey::ColorMode::kLight;
++  } else if (space && space->theme.mode == SpaceTheme::Mode::kDark) {
++    color_mode = ui::ColorProviderKey::ColorMode::kDark;
++  }
++  widget->SetColorModeOverride(color_mode);
++}
++
++void SpacesWindowManager::ResetBrowserTheme() {
++  theme_reset_pending_ = false;
++  ThemeService* theme = ThemeServiceFactory::GetForProfile(profile_);
++  if (!theme || theme->UsingPolicyTheme()) {
++    return;
++  }
++  if (theme->GetBrowserColorScheme() !=
++      ThemeService::BrowserColorScheme::kSystem) {
++    theme->SetBrowserColorScheme(ThemeService::BrowserColorScheme::kSystem);
++  }
++  // Extension themes stay; only Chrome's seed colors are cleared.
++  if (!theme->UsingExtensionTheme() &&
++      (!theme->GetIsGrayscale() || theme->GetUserColor())) {
++    theme->SetIsGrayscale(true);
++  }
++}
++
++void SpacesWindowManager::OnThemeChanged() {
++  // Profile creation and theme sync can still set a seed color. Reset after
++  // the change finishes notifying rather than from inside it.
++  if (theme_reset_pending_) {
++    return;
++  }
++  theme_reset_pending_ = true;
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&SpacesWindowManager::ResetBrowserTheme,
++                                weak_ptr_factory_.GetWeakPtr()));
++}
++
+ void SpacesWindowManager::OnBrowserCreated(BrowserWindowInterface* browser) {
+   if (!IsSupportedBrowser(browser)) {
+     return;
+@@ -992,6 +1050,10 @@ void SpacesWindowManager::OnBrowserClose
+ 
+ void SpacesWindowManager::OnBrowserActivated(BrowserWindowInterface* browser) {
+   WindowState* state = FindState(browser);
++  if (state) {
++    // The window may not have had a widget when it claimed its space.
++    UpdateColorMode(*state);
++  }
+   if (state && state->space && !state->showing_elsewhere) {
+     spaces_->MarkSpaceActive(*state->space);
+   }
+@@ -1085,6 +1147,11 @@ void SpacesWindowManager::OnSpaceRenamed
+ }
+ 
+ void SpacesWindowManager::OnSpaceAppearanceChanged(const SpaceId& id) {
++  for (const auto& [browser, state] : windows_) {
++    if (state->space == id) {
++      UpdateColorMode(*state);
++    }
++  }
+   for (Observer& observer : observers_) {
+     observer.OnSpacesChanged();
+   }
+Index: src/chrome/browser/ui/rac/spaces/spaces_window_manager.h
+===================================================================
+--- src.orig/chrome/browser/ui/rac/spaces/spaces_window_manager.h
++++ src/chrome/browser/ui/rac/spaces/spaces_window_manager.h
+@@ -20,6 +20,8 @@
+ #include "base/uuid.h"
+ #include "chrome/browser/rac/spaces/spaces_service.h"
+ #include "chrome/browser/rac/spaces/spaces_store.h"
++#include "chrome/browser/themes/theme_service.h"
++#include "chrome/browser/themes/theme_service_observer.h"
+ #include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+@@ -55,7 +57,8 @@ inline constexpr char kWindowSpaceExtraD
+ class SpacesWindowManager : public KeyedService,
+                             public BrowserCollectionObserver,
+                             public TabStripModelObserver,
+-                            public SpacesService::Observer {
++                            public SpacesService::Observer,
++                            public ThemeServiceObserver {
+  public:
+   // How long a hidden space keeps its tabs loaded before they're unloaded
+   // to free memory.
+@@ -175,6 +178,13 @@ class SpacesWindowManager : public Keyed
+   void HandleWindowClosing(BrowserWindowInterface* browser);
+   void NotifyWindowSpaceChanged(BrowserWindowInterface* browser);
+ 
++  // A space's Light or Dark mode sets its window's color mode. Auto leaves
++  // the window following macOS.
++  void UpdateColorMode(const WindowState& state);
++  // Spaces own the window's colors, so the browser-wide color scheme and seed
++  // color, which rac has no setting for, are reset to their defaults.
++  void ResetBrowserTheme();
++
+   // Records the window's space in the session service, so the window
+   // reopens in it and the tab restore service knows it.
+   void SaveWindowSpaceToSession(const WindowState& state);
+@@ -210,6 +220,9 @@ class SpacesWindowManager : public Keyed
+   void OnSpaceRemoved(const base::Uuid& id) override;
+   void OnSpacesReordered() override;
+ 
++  // ThemeServiceObserver:
++  void OnThemeChanged() override;
++
+   // Runs when an elsewhere dialog finishes closing, for any reason. Deletes
+   // the closed widget and clears the pointer in the window state.
+   void OnElsewhereWidgetClosed(BrowserWindowInterface* browser);
+@@ -233,6 +246,9 @@ class SpacesWindowManager : public Keyed
+       browser_collection_observation_{this};
+   base::ScopedObservation<SpacesService, SpacesService::Observer>
+       spaces_observation_{this};
++  base::ScopedObservation<ThemeService, ThemeServiceObserver>
++      theme_observation_{this};
++  bool theme_reset_pending_ = false;
+ 
+   base::WeakPtrFactory<SpacesWindowManager> weak_ptr_factory_{this};
+ };
+Index: src/chrome/browser/ui/rac/spaces/spaces_window_manager_factory.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/spaces/spaces_window_manager_factory.cc
++++ src/chrome/browser/ui/rac/spaces/spaces_window_manager_factory.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/rac/spaces/spaces_service_factory.h"
++#include "chrome/browser/themes/theme_service_factory.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
+ 
+ namespace rac {
+@@ -27,6 +28,7 @@ SpacesWindowManagerFactory::SpacesWindow
+     : ProfileKeyedServiceFactory("RacSpacesWindowManager",
+                                  ProfileSelections::BuildForRegularProfile()) {
+   DependsOn(SpacesServiceFactory::GetInstance());
++  DependsOn(ThemeServiceFactory::GetInstance());
+ }
+ 
+ std::unique_ptr<KeyedService>
+Index: src/chrome/browser/ui/views/rac/spaces/space_tint_background.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/spaces/space_tint_background.cc
++++ src/chrome/browser/ui/views/rac/spaces/space_tint_background.cc
+@@ -16,10 +16,10 @@
+ #include "third_party/skia/include/core/SkColor.h"
+ #include "ui/color/color_provider.h"
+ #include "cc/paint/paint_flags.h"
++#include "ui/color/color_provider_key.h"
+ #include "ui/gfx/canvas.h"
+ #include "ui/gfx/geometry/rect.h"
+ #include "ui/gfx/skia_paint_util.h"
+-#include "ui/native_theme/native_theme.h"
+ #include "ui/views/view.h"
+ #include "ui/views/widget/widget.h"
+ 
+@@ -78,21 +78,21 @@ void PaintSpaceTint(gfx::Canvas* canvas,
+   const Space* space =
+       active ? manager->spaces()->FindSpace(*active) : nullptr;
+   const ui::ColorProvider* colors = view->GetColorProvider();
+-  if (!space || !colors) {
++  const views::Widget* widget = view->GetWidget();
++  if (!space || !colors || !widget) {
+     return;
+   }
+-  const bool dark = space->theme.mode == SpaceTheme::Mode::kDark ||
+-                    (space->theme.mode == SpaceTheme::Mode::kAuto &&
+-                     view->GetNativeTheme()->preferred_color_scheme() ==
+-                         ui::NativeTheme::PreferredColorScheme::kDark);
++  // Match the window's own color mode, which the space's mode sets, so the
++  // gradient never paints dark stops over a light window or the reverse.
++  const bool dark =
++      widget->GetColorMode() == ui::ColorProviderKey::ColorMode::kDark;
+   const SkAlpha alpha = SkColorGetA(colors->GetColor(
+       dark ? kColorRacSpaceTintDark : kColorRacSpaceTintLight));
+   // The gradient spans the window, so every view that paints the wash
+   // continues it without a seam.
+   gfx::Point start;
+   gfx::Size span = view->size();
+-  if (const views::Widget* widget = view->GetWidget();
+-      widget && widget->GetRootView()) {
++  if (widget->GetRootView()) {
+     views::View::ConvertPointToWidget(view, &start);
+     start = gfx::Point(-start.x(), -start.y());
+     span = widget->GetRootView()->size();

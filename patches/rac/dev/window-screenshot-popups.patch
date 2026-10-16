@@ -1,0 +1,374 @@
+--- a/chrome/browser/ui/views/rac/window_screenshot.mm
++++ b/chrome/browser/ui/views/rac/window_screenshot.mm
+@@ -15,12 +15,14 @@
+ #include "base/containers/span.h"
+ #include "base/files/file_util.h"
+ #include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/logging.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/sys_string_conversions.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "base/time/time.h"
+@@ -32,11 +34,18 @@
+ #include "third_party/skia/include/core/SkBitmap.h"
+ #include "third_party/skia/include/core/SkCanvas.h"
+ #include "third_party/skia/include/core/SkImage.h"
++#include "third_party/skia/include/core/SkRRect.h"
+ #include "ui/compositor/compositor.h"
+ #include "ui/compositor/layer.h"
++#include "ui/events/base_event_utils.h"
++#include "ui/events/event.h"
++#include "ui/events/keycodes/keyboard_codes.h"
+ #include "ui/gfx/codec/png_codec.h"
+ #include "ui/gfx/geometry/rect.h"
++#include "ui/views/controls/textfield/textfield.h"
++#include "ui/views/focus/focus_manager.h"
+ #include "ui/views/view.h"
++#include "ui/views/view_utils.h"
+ #include "ui/views/widget/widget.h"
+ 
+ namespace rac {
+@@ -132,54 +141,144 @@ void DrawWindowButtons(views::Widget* wi
+   }
+ }
+ 
+-void CaptureCompositor(base::WeakPtr<views::Widget> widget,
+-                       const base::FilePath& path) {
++using BitmapCallback = base::OnceCallback<void(std::optional<SkBitmap>)>;
++
++// Copies `widget`'s root layer as the compositor last drew it.
++bool CopyRootLayer(views::Widget* widget, BitmapCallback done) {
+   if (!widget || widget->IsClosed() || !widget->GetCompositor() ||
+       !widget->GetCompositor()->root_layer()) {
+-    LOG(ERROR) << "rac window screenshot: no compositor layer";
+-    return;
++    return false;
+   }
+-
+   ui::Layer* layer = widget->GetCompositor()->root_layer();
+   const gfx::Rect area(layer->size());
+   auto request = std::make_unique<viz::CopyOutputRequest>(
+       viz::CopyOutputRequest::ResultFormat::RGBA,
+       viz::CopyOutputRequest::ResultDestination::kSystemMemory,
+       base::BindOnce(
+-          [](base::WeakPtr<views::Widget> widget, const base::FilePath& path,
++          [](BitmapCallback done,
+              std::unique_ptr<viz::CopyOutputResult> result) {
+             if (!result || result->IsEmpty()) {
++              std::move(done).Run(std::nullopt);
++              return;
++            }
++            std::move(done).Run(
++                result->ScopedAccessSkBitmap().GetOutScopedBitmap());
++          },
++          std::move(done)));
++  request->set_area(area);
++  layer->RequestCopyOfOutput(std::move(request));
++  widget->GetCompositor()->ScheduleFullRedraw();
++  widget->GetCompositor()->ScheduleDraw();
++  return true;
++}
++
++// The popups the window owns that are on screen, such as bubbles. Each has
++// its own window and compositor, so the window's copy misses them.
++std::vector<base::WeakPtr<views::Widget>> VisiblePopups(views::Widget* widget) {
++  std::vector<base::WeakPtr<views::Widget>> popups;
++  for (views::Widget* owned :
++       views::Widget::GetAllOwnedWidgets(widget->GetNativeView())) {
++    if (owned != widget && owned->IsVisible() && !owned->IsClosed()) {
++      popups.push_back(owned->GetWeakPtr());
++    }
++  }
++  return popups;
++}
++
++void WriteBitmap(const SkBitmap& bitmap, const base::FilePath& path) {
++  LOG(ERROR) << "rac window screenshot: compositor bitmap " << bitmap.width()
++             << "x" << bitmap.height();
++  std::optional<std::vector<uint8_t>> png =
++      gfx::PNGCodec::EncodeBGRASkBitmap(bitmap, /*discard_transparency=*/false);
++  if (!png) {
++    LOG(ERROR) << "rac window screenshot: PNG encode failed";
++    return;
++  }
++  base::ThreadPool::PostTask(
++      FROM_HERE, {base::MayBlock()},
++      base::BindOnce(&WriteBytes, path, std::move(*png)));
++}
++
++// Paints each popup over the window's bitmap where it sits on screen, then
++// writes the result.
++void DrawPopupsAndWrite(base::WeakPtr<views::Widget> widget,
++                        SkBitmap bitmap,
++                        std::vector<base::WeakPtr<views::Widget>> popups,
++                        base::FilePath path) {
++  while (!popups.empty() && !popups.back()) {
++    popups.pop_back();
++  }
++  if (!widget || popups.empty()) {
++    WriteBitmap(bitmap, path);
++    return;
++  }
++  base::WeakPtr<views::Widget> popup = popups.back();
++  popups.pop_back();
++  auto draw = base::BindOnce(
++      [](base::WeakPtr<views::Widget> widget,
++         base::WeakPtr<views::Widget> popup, SkBitmap bitmap,
++         std::vector<base::WeakPtr<views::Widget>> popups, base::FilePath path,
++         std::optional<SkBitmap> image) {
++        if (widget && popup && image && !image->drawsNothing()) {
++          const gfx::Rect host = widget->GetWindowBoundsInScreen();
++          const gfx::Rect rect = popup->GetWindowBoundsInScreen();
++          const float scale =
++              host.width() > 0
++                  ? static_cast<float>(bitmap.width()) / host.width()
++                  : 1.0f;
++          const SkRect dest = SkRect::MakeXYWH(
++              (rect.x() - host.x()) * scale, (rect.y() - host.y()) * scale,
++              rect.width() * scale, rect.height() * scale);
++          // AppKit rounds the popup's corners outside the compositor.
++          const CGFloat radius = popup->GetNativeWindow()
++                                     .GetNativeNSWindow()
++                                     .contentView.layer.cornerRadius;
++          SkCanvas canvas(bitmap);
++          canvas.clipRRect(
++              SkRRect::MakeRectXY(dest, radius * scale, radius * scale),
++              /*doAntiAlias=*/true);
++          canvas.drawImageRect(image->asImage(), dest,
++                               SkSamplingOptions(SkFilterMode::kLinear));
++        }
++        DrawPopupsAndWrite(widget, std::move(bitmap), std::move(popups),
++                           std::move(path));
++      },
++      widget, popup, bitmap, popups, path);
++  // On failure the callback is dropped unrun, so carry on without it.
++  auto [first, second] = base::SplitOnceCallback(std::move(draw));
++  if (!CopyRootLayer(popup.get(), std::move(first))) {
++    std::move(second).Run(std::nullopt);
++  }
++}
++
++void CaptureCompositor(base::WeakPtr<views::Widget> widget,
++                       const base::FilePath& path) {
++  const bool requested = CopyRootLayer(
++      widget.get(),
++      base::BindOnce(
++          [](base::WeakPtr<views::Widget> widget, const base::FilePath& path,
++             std::optional<SkBitmap> bitmap) {
++            if (!bitmap) {
+               LOG(ERROR) << "rac window screenshot: compositor copy empty";
+               if (widget) {
+                 CaptureNSView(widget.get(), path);
+               }
+               return;
+             }
+-            SkBitmap bitmap =
+-                result->ScopedAccessSkBitmap().GetOutScopedBitmap();
+-            if (widget) {
+-              DrawWindowButtons(widget.get(), &bitmap);
+-            }
+-            LOG(ERROR) << "rac window screenshot: compositor bitmap "
+-                       << bitmap.width() << "x" << bitmap.height();
+-            std::optional<std::vector<uint8_t>> png =
+-                gfx::PNGCodec::EncodeBGRASkBitmap(
+-                    bitmap, /*discard_transparency=*/false);
+-            if (!png) {
+-              LOG(ERROR) << "rac window screenshot: PNG encode failed";
++            if (!widget) {
++              WriteBitmap(*bitmap, path);
+               return;
+             }
+-            base::ThreadPool::PostTask(
+-                FROM_HERE, {base::MayBlock()},
+-                base::BindOnce(&WriteBytes, path, std::move(*png)));
++            DrawWindowButtons(widget.get(), &*bitmap);
++            DrawPopupsAndWrite(widget, std::move(*bitmap),
++                               VisiblePopups(widget.get()), path);
+           },
+           widget, path));
+-  request->set_area(area);
+-  layer->RequestCopyOfOutput(std::move(request));
+-  widget->GetCompositor()->ScheduleFullRedraw();
+-  widget->GetCompositor()->ScheduleDraw();
+-  LOG(ERROR) << "rac window screenshot: compositor copy requested "
+-             << area.ToString();
++  if (!requested) {
++    LOG(ERROR) << "rac window screenshot: no compositor layer";
++    return;
++  }
++  LOG(ERROR) << "rac window screenshot: compositor copy requested";
+ }
+ 
+ void Capture(base::WeakPtr<views::Widget> widget, base::FilePath path) {
+@@ -214,6 +313,131 @@ std::optional<base::FilePath> TakeReques
+ 
+ void PollRequests(base::WeakPtr<views::Widget> widget, base::FilePath requests);
+ 
++// The window, or the popup of it, that a click at window point `point`
++// lands in, with the point in its coordinates.
++views::Widget* WidgetAt(views::Widget* widget, gfx::Point* point) {
++  const gfx::Point origin = widget->GetWindowBoundsInScreen().origin();
++  const gfx::Point screen = origin + point->OffsetFromOrigin();
++  for (const base::WeakPtr<views::Widget>& popup : VisiblePopups(widget)) {
++    const gfx::Rect rect = popup->GetWindowBoundsInScreen();
++    if (rect.Contains(screen)) {
++      *point = screen - rect.OffsetFromOrigin();
++      return popup.get();
++    }
++  }
++  return widget;
++}
++
++// The popup that has focus, else the window.
++views::Widget* FocusedWidget(views::Widget* widget) {
++  views::Widget* focused = widget;
++  for (const base::WeakPtr<views::Widget>& popup : VisiblePopups(widget)) {
++    if (popup->IsActive() || focused == widget) {
++      focused = popup.get();
++    }
++  }
++  return focused;
++}
++
++void SendMouse(views::Widget* target,
++               ui::EventType type,
++               const gfx::Point& point) {
++  const int flags =
++      type == ui::EventType::kMouseMoved ? 0 : ui::EF_LEFT_MOUSE_BUTTON;
++  ui::MouseEvent event(type, point, point, ui::EventTimeForNow(), flags, flags);
++  target->OnMouseEvent(&event);
++}
++
++std::optional<ui::KeyboardCode> KeyNamed(std::string_view name) {
++  if (name == "return") {
++    return ui::VKEY_RETURN;
++  }
++  if (name == "escape") {
++    return ui::VKEY_ESCAPE;
++  }
++  if (name == "tab") {
++    return ui::VKEY_TAB;
++  }
++  if (name == "backspace") {
++    return ui::VKEY_BACK;
++  }
++  if (name == "up") {
++    return ui::VKEY_UP;
++  }
++  if (name == "down") {
++    return ui::VKEY_DOWN;
++  }
++  if (name == "left") {
++    return ui::VKEY_LEFT;
++  }
++  if (name == "right") {
++    return ui::VKEY_RIGHT;
++  }
++  return std::nullopt;
++}
++
++void RunCommand(base::WeakPtr<views::Widget> widget, int command_id);
++
++// Drives the window from a request, without the real mouse or keyboard.
++// Points are in window coordinates, as in screenshots divided by their
++// scale:
++//   command ID      runs a browser command
++//   move X Y        moves the pointer there, for hover states
++//   click X Y       clicks there, in a popup if one is on top
++//   type TEXT       types into the focused text field
++//   key NAME        presses return, escape, tab, backspace, or an arrow
++bool HandleInput(views::Widget* widget,
++                 const std::vector<std::string>& words,
++                 const std::string& line) {
++  const std::string& verb = words[0];
++  int x = 0;
++  int y = 0;
++  if (verb == "command" && words.size() == 2 &&
++      base::StringToInt(words[1], &x)) {
++    RunCommand(widget->GetWeakPtr(), x);
++    return true;
++  }
++  if ((verb == "move" || verb == "click") && words.size() == 3 &&
++      base::StringToInt(words[1], &x) && base::StringToInt(words[2], &y)) {
++    gfx::Point point(x, y);
++    views::Widget* target = WidgetAt(widget, &point);
++    SendMouse(target, ui::EventType::kMouseMoved, point);
++    if (verb == "click") {
++      SendMouse(target, ui::EventType::kMousePressed, point);
++      SendMouse(target, ui::EventType::kMouseReleased, point);
++    }
++    return true;
++  }
++  if (verb == "type" && words.size() >= 2) {
++    views::Widget* target = FocusedWidget(widget);
++    views::View* focused = target->GetFocusManager()
++                               ? target->GetFocusManager()->GetFocusedView()
++                               : nullptr;
++    if (auto* field = views::AsViewClass<views::Textfield>(focused)) {
++      field->InsertText(
++          base::UTF8ToUTF16(base::TrimWhitespaceASCII(
++              std::string_view(line).substr(verb.size()), base::TRIM_ALL)),
++          ui::TextInputClient::InsertTextCursorBehavior::kMoveCursorAfterText);
++    } else {
++      LOG(ERROR) << "rac window screenshot: no text field has focus";
++    }
++    return true;
++  }
++  if (verb == "key" && words.size() == 2) {
++    if (std::optional<ui::KeyboardCode> code = KeyNamed(words[1])) {
++      views::Widget* target = FocusedWidget(widget);
++      ui::KeyEvent press(ui::EventType::kKeyPressed, *code, ui::EF_NONE);
++      target->OnKeyEvent(&press);
++      // The press may have closed the popup.
++      target = FocusedWidget(widget);
++      ui::KeyEvent release(ui::EventType::kKeyReleased, *code, ui::EF_NONE);
++      target->OnKeyEvent(&release);
++    }
++    return true;
++  }
++  return false;
++}
++
+ void OnRequest(base::WeakPtr<views::Widget> widget,
+                base::FilePath requests,
+                std::optional<base::FilePath> path) {
+@@ -229,9 +453,11 @@ void OnRequest(base::WeakPtr<views::Widg
+   int y = 0;
+   if (hit.size() == 4 && hit[0] == "hit" && base::StringToInt(hit[1], &x) &&
+       base::StringToInt(hit[2], &y)) {
++    gfx::Point point(x, y);
++    views::Widget* target = WidgetAt(widget.get(), &point);
+     std::string chain;
+     for (views::View* view =
+-             widget->GetRootView()->GetEventHandlerForPoint(gfx::Point(x, y));
++             target->GetRootView()->GetEventHandlerForPoint(point);
+          view; view = view->parent()) {
+       chain += std::string(view->GetClassName()) + "\n";
+     }
+@@ -240,6 +466,9 @@ void OnRequest(base::WeakPtr<views::Widg
+         base::BindOnce([](base::FilePath out,
+                           std::string chain) { base::WriteFile(out, chain); },
+                        base::FilePath(hit[3]), std::move(chain)));
++  } else if (!hit.empty() &&
++             HandleInput(widget.get(), hit, path ? path->value() : "")) {
++    // Done.
+   } else if (path) {
+     Capture(widget, *path);
+   }
+@@ -310,8 +539,8 @@ void MaybeScheduleWindowScreenshot(views
+           kWindowScreenshotRequestSwitch);
+   if (!requests.empty() && !polling) {
+     polling = true;
+-    // A test drives the window with the real mouse. A floating window level
+-    // would keep it on top too, but would hide its popups behind it.
++    // Popups only open, and keep focus, in the active app. A floating window
++    // level would keep it on top too, but would hide its popups behind it.
+     [NSApp activate];
+     base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
+         FROM_HERE,

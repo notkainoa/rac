@@ -1,0 +1,283 @@
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn
++++ src/chrome/browser/ui/BUILD.gn
+@@ -2511,6 +2511,8 @@ static_library("ui") {
+     sources += [
+       "views/rac/ai/assistant_actions.cc",
+       "views/rac/ai/assistant_actions.h",
++      "views/rac/ai/assistant_edge_handle.cc",
++      "views/rac/ai/assistant_edge_handle.h",
+       "views/rac/ai/assistant_menu.cc",
+       "views/rac/ai/assistant_menu.h",
+       "views/rac/ai/assistant_side_panel.cc",
+Index: src/chrome/browser/ui/views/frame/browser_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view.cc
++++ src/chrome/browser/ui/views/frame/browser_view.cc
+@@ -206,6 +206,7 @@
+ #include "chrome/browser/ui/views/profiles/avatar_toolbar_button.h"
+ #include "chrome/browser/ui/views/profiles/profile_menu_coordinator.h"
+ #include "chrome/browser/ui/views/qrcode_generator/qrcode_generator_bubble.h"
++#include "chrome/browser/ui/views/rac/ai/assistant_edge_handle.h"
+ #include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h"
+ #include "chrome/browser/ui/views/rac/window_screenshot.h"
+ #include "chrome/browser/ui/views/send_tab_to_self/send_tab_to_self_bubble_view.h"
+@@ -1080,6 +1081,7 @@ BrowserView::BrowserView(BrowserWindowIn
+       BrowserViewLayoutViews::kShadowOverlayElementId);
+ 
+   side_panel_ = AddChildView(std::make_unique<SidePanel>(this));
++  rac::ai::AddAssistantEdgeHandle(this);
+ 
+   // Tabstrip comes basically last because it should be before toolbar in the
+   // focus order but also needs to paint on top of everything.
+Index: src/chrome/browser/ui/views/rac/ai/assistant_edge_handle.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/rac/ai/assistant_edge_handle.cc
+@@ -0,0 +1,218 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/ai/assistant_edge_handle.h"
++
++#include <algorithm>
++#include <memory>
++
++#include "base/memory/raw_ptr.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/rac/layout_prefs.h"
++#include "chrome/browser/ui/side_panel/side_panel_entry_id.h"
++#include "chrome/browser/ui/side_panel/side_panel_entry_key.h"
++#include "chrome/browser/ui/side_panel/side_panel_enums.h"
++#include "chrome/browser/ui/side_panel/side_panel_ui.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/contents_container_view.h"
++#include "chrome/browser/ui/views/frame/multi_contents_view.h"
++#include "chrome/browser/ui/views/rac/ai/assistant_actions.h"
++#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "components/prefs/pref_service.h"
++#include "ui/base/cursor/cursor.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/events/event.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/vector2d.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/view.h"
++#include "ui/views/view_observer.h"
++#include "ui/views/view_targeter.h"
++#include "ui/views/view_targeter_delegate.h"
++
++namespace rac::ai {
++namespace {
++
++// AppKit resizes the window from 3 points inside its edge, so the handle
++// stops there and leaves those points to the window.
++constexpr int kWindowResizeMargin = 3;
++
++// Covers the whole browser view so it never needs laying out, but takes
++// events only over the margin, which it works out as each event arrives.
++class AssistantEdgeHandle : public views::View,
++                            public views::ViewTargeterDelegate,
++                            public views::ViewObserver {
++  METADATA_HEADER(AssistantEdgeHandle, views::View)
++
++ public:
++  explicit AssistantEdgeHandle(BrowserView* browser_view)
++      : browser_view_(browser_view) {
++    SetEventTargeter(std::make_unique<views::ViewTargeter>(this));
++    GetViewAccessibility().SetIsIgnored(true);
++    observation_.Observe(browser_view);
++  }
++
++  AssistantEdgeHandle(const AssistantEdgeHandle&) = delete;
++  AssistantEdgeHandle& operator=(const AssistantEdgeHandle&) = delete;
++  ~AssistantEdgeHandle() override = default;
++
++  // views::View:
++  ui::Cursor GetCursor(const ui::MouseEvent& event) override {
++    // Not the window's edge-resize arrows, which sit a few points away.
++    return ui::mojom::CursorType::kColumnResize;
++  }
++
++  bool OnMousePressed(const ui::MouseEvent& event) override {
++    if (!event.IsOnlyLeftMouseButton()) {
++      return false;
++    }
++    press_x_ = event.x();
++    pulling_ = false;
++    return true;
++  }
++
++  bool OnMouseDragged(const ui::MouseEvent& event) override {
++    if (pulling_) {
++      if (SidePanel* panel = browser_view_->side_panel()) {
++        panel_width_ = GetPanelWidth(event, *panel);
++        panel->SetPanelWidth(panel_width_);
++      }
++      return true;
++    }
++    const int inward =
++        right_side_ ? press_x_ - event.x() : event.x() - press_x_;
++    if (inward <= 0 ||
++        !views::View::ExceededDragThreshold(gfx::Vector2d(inward, 0))) {
++      return true;
++    }
++    SidePanel* panel = browser_view_->side_panel();
++    SidePanelUI* ui = SidePanelUI::From(browser_view_->browser());
++    if (!panel || !ui) {
++      return true;
++    }
++    pulling_ = true;
++    // The panel takes its width from the pref as it opens, and it opens
++    // without sliding so its edge stays under the pointer.
++    panel_width_ = GetPanelWidth(event, *panel);
++    SaveWidth();
++    ui->Show(SidePanelEntryKey(SidePanelEntryId::kRacAi),
++             SidePanelOpenTrigger::kToolbarButton,
++             /*suppress_animations=*/true);
++    return true;
++  }
++
++  void OnMouseReleased(const ui::MouseEvent& event) override {
++    if (pulling_) {
++      pulling_ = false;
++      SaveWidth();
++      return;
++    }
++    if (event.IsLeftMouseButton() && HitTestPoint(event.location())) {
++      ToggleAssistant(browser_view_->browser());
++    }
++  }
++
++  void OnMouseCaptureLost() override {
++    if (pulling_) {
++      pulling_ = false;
++      SaveWidth();
++    }
++  }
++
++  // views::ViewTargeterDelegate:
++  bool DoesIntersectRect(const views::View* target,
++                         const gfx::Rect& rect) const override {
++    return GetHandleBounds().Intersects(rect);
++  }
++
++  // views::ViewObserver:
++  void OnViewBoundsChanged(views::View* observed_view) override {
++    SetBoundsRect(observed_view->GetLocalBounds());
++  }
++
++  void OnViewIsDeleting(views::View* observed_view) override {
++    observation_.Reset();
++  }
++
++ private:
++  // In this view's coordinates, which are the browser view's. Empty while
++  // the handle has nothing to do.
++  gfx::Rect GetHandleBounds() const {
++    const SidePanel* panel = browser_view_->side_panel();
++    // With any panel open, the margin no longer meets the window edge.
++    if (!panel || panel->GetVisible()) {
++      return gfx::Rect();
++    }
++    // The top bar layout has the Chat button instead.
++    const PrefService* prefs =
++        browser_view_->browser()->GetProfile()->GetPrefs();
++    if (rac::GetLayout(prefs) == rac::Layout::kTopBar ||
++        !prefs->GetBoolean(kEnabled)) {
++      return gfx::Rect();
++    }
++    const MultiContentsView* page = browser_view_->multi_contents_view();
++    if (!page || !page->GetVisible()) {
++      return gfx::Rect();
++    }
++    gfx::Rect cards;
++    for (const auto& card : page->contents_container_views()) {
++      if (card->GetVisible()) {
++        cards.Union(views::View::ConvertRectToTarget(card, this,
++                                                     card->GetLocalBounds()));
++      }
++    }
++    if (cards.IsEmpty()) {
++      return gfx::Rect();
++    }
++    right_side_ = panel->IsRightAligned();
++    const int left = right_side_ ? cards.right() : kWindowResizeMargin;
++    const int right = right_side_ ? width() - kWindowResizeMargin : cards.x();
++    if (right <= left) {
++      return gfx::Rect();
++    }
++    return gfx::Rect(left, cards.y(), right - left, cards.height());
++  }
++
++  // The width that puts the panel's inner edge under the pointer.
++  int GetPanelWidth(const ui::MouseEvent& event, const SidePanel& panel) const {
++    const int from_edge = right_side_ ? width() - event.x() : event.x();
++    return std::max(panel.GetMinimumSize().width(), from_edge);
++  }
++
++  void SaveWidth() {
++    if (SidePanel* panel = browser_view_->side_panel()) {
++      panel->UpdateSidePanelWidthPref(
++          SidePanelEntryIdToString(SidePanelEntryId::kRacAi), panel_width_);
++    }
++  }
++
++  const raw_ptr<BrowserView> browser_view_;
++  // Which side the margin was on at the last hit test, so a drag keeps it.
++  mutable bool right_side_ = true;
++  int press_x_ = 0;
++  bool pulling_ = false;
++  int panel_width_ = 0;
++  base::ScopedObservation<views::View, views::ViewObserver> observation_{this};
++};
++
++BEGIN_METADATA(AssistantEdgeHandle)
++END_METADATA
++
++}  // namespace
++
++void AddAssistantEdgeHandle(BrowserView* browser_view) {
++  if (!browser_view->GetIsNormalType() ||
++      !browser_view->browser()->GetProfile()->IsRegularProfile()) {
++    return;
++  }
++  browser_view
++      ->AddChildView(std::make_unique<AssistantEdgeHandle>(browser_view))
++      ->SetBoundsRect(browser_view->GetLocalBounds());
++}
++
++}  // namespace rac::ai
+Index: src/chrome/browser/ui/views/rac/ai/assistant_edge_handle.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/rac/ai/assistant_edge_handle.h
+@@ -0,0 +1,22 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_AI_ASSISTANT_EDGE_HANDLE_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_AI_ASSISTANT_EDGE_HANDLE_H_
++
++class BrowserView;
++
++namespace rac::ai {
++
++// The sidebar layout has no Chat button, so the margin between the page card
++// and the window edge on the side the assistant opens takes its place:
++// clicking it opens the assistant, and dragging it pulls the panel out to
++// the width the user drags to. Does nothing for windows that can't have the
++// assistant. Call once all of `browser_view`'s page views exist, since the
++// handle must sit above them.
++void AddAssistantEdgeHandle(BrowserView* browser_view);
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_AI_ASSISTANT_EDGE_HANDLE_H_

@@ -1,0 +1,2938 @@
+Index: src/chrome/browser/rac/ai/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/ai/BUILD.gn
++++ src/chrome/browser/rac/ai/BUILD.gn
+@@ -65,6 +65,8 @@ source_set("browser") {
+     "history_store.h",
+     "key_store.cc",
+     "key_store.h",
++    "model_list.cc",
++    "model_list.h",
+   ]
+   public_deps = [
+     ":core",
+Index: src/chrome/browser/rac/ai/chat_history.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/chat_history.cc
++++ src/chrome/browser/rac/ai/chat_history.cc
+@@ -10,6 +10,7 @@
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
+ #include "base/json/values_util.h"
++#include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ 
+@@ -102,6 +103,31 @@ std::string MakeTitle(std::string_view f
+   return base::UTF16ToUTF8(text);
+ }
+ 
++std::string CleanGeneratedTitle(std::string_view reply) {
++  // Reasoning models think out loud before they answer.
++  reply = base::TrimWhitespaceASCII(reply, base::TRIM_LEADING);
++  if (base::StartsWith(reply, "<think>")) {
++    const size_t end = reply.find("</think>");
++    reply = end == std::string_view::npos
++                ? std::string_view()
++                : reply.substr(end + sizeof("</think>") - 1);
++  }
++  std::string_view line;
++  for (std::string_view candidate : base::SplitStringPiece(
++           reply, "\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++    line = candidate;
++    break;
++  }
++  if (base::StartsWith(line, "title:",
++                       base::CompareCase::INSENSITIVE_ASCII)) {
++    line.remove_prefix(6);
++  }
++  // Models like to dress titles up as Markdown or quote them.
++  line = base::TrimString(line, " \t\"'`*#_", base::TRIM_ALL);
++  line = base::TrimString(line, " .\"'`*_", base::TRIM_TRAILING);
++  return base::IsStringUTF8(line) ? MakeTitle(line) : std::string();
++}
++
+ bool ConversationFromValue(const base::DictValue& value,
+                            base::Time now,
+                            Conversation* out) {
+@@ -116,10 +142,16 @@ bool ConversationFromValue(const base::D
+   if (!ReadMessages(*messages, &conversation)) {
+     return false;
+   }
++  if (const std::string* title = value.FindString("title");
++      title && base::IsStringUTF8(*title)) {
++    conversation.title = MakeTitle(*title);
++  }
+   for (const StoredMessage& message : conversation.messages) {
++    if (!conversation.title.empty()) {
++      break;
++    }
+     if (message.role == "user") {
+       conversation.title = MakeTitle(message.text);
+-      break;
+     }
+   }
+   if (conversation.title.empty()) {
+Index: src/chrome/browser/rac/ai/chat_history.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/chat_history.h
++++ src/chrome/browser/rac/ai/chat_history.h
+@@ -39,8 +39,13 @@ bool IsValidConversationId(std::string_v
+ // A short title from the first thing the user said.
+ std::string MakeTitle(std::string_view first_user_text);
+ 
++// A title from a model's reply to "name this chat": its first line without
++// quotes, Markdown or a final period. Empty if nothing is left.
++std::string CleanGeneratedTitle(std::string_view reply);
++
+ // Reads a conversation sent by the page. Returns false if it is malformed or
+-// too big. Fills in the title and takes `updated` from `now`.
++// too big. Uses the page's title if it sent one, or else makes one from the
++// first user message, and takes `updated` from `now`.
+ bool ConversationFromValue(const base::DictValue& value,
+                            base::Time now,
+                            Conversation* out);
+Index: src/chrome/browser/rac/ai/chat_history_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/chat_history_unittest.cc
++++ src/chrome/browser/rac/ai/chat_history_unittest.cc
+@@ -50,6 +50,29 @@ TEST(RacAiChatHistoryTest, ReadsWhatTheP
+             std::vector<std::string>{"A page"});
+ }
+ 
++TEST(RacAiChatHistoryTest, PrefersTheTitleThePageSends) {
++  Conversation conversation;
++  base::DictValue sent = Sent("conversation-1", "What is rac?");
++  sent.Set("title", "  About rac\n");
++  ASSERT_TRUE(ConversationFromValue(sent, base::Time::Now(), &conversation));
++  EXPECT_EQ(conversation.title, "About rac");
++  sent.Set("title", "   ");
++  ASSERT_TRUE(ConversationFromValue(sent, base::Time::Now(), &conversation));
++  EXPECT_EQ(conversation.title, "What is rac?");
++}
++
++TEST(RacAiChatHistoryTest, CleansGeneratedTitles) {
++  EXPECT_EQ(CleanGeneratedTitle("\n\"Kumquat Test Page\".\nMore text"),
++            "Kumquat Test Page");
++  EXPECT_EQ(CleanGeneratedTitle("Title: **Browser QA notes**"),
++            "Browser QA notes");
++  EXPECT_EQ(CleanGeneratedTitle("# Trip ideas"), "Trip ideas");
++  EXPECT_EQ(CleanGeneratedTitle(" \n\"\"\n"), "");
++  EXPECT_EQ(CleanGeneratedTitle("<think>\nA title.\n</think>\n\nTrip ideas"),
++            "Trip ideas");
++  EXPECT_EQ(CleanGeneratedTitle("<think>never finished"), "");
++}
++
+ TEST(RacAiChatHistoryTest, RejectsMalformedConversations) {
+   Conversation conversation;
+   const base::Time now = base::Time::Now();
+Index: src/chrome/browser/rac/ai/model_list.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/ai/model_list.cc
+@@ -0,0 +1,90 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/model_list.h"
++
++#include <memory>
++#include <optional>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback.h"
++#include "base/strings/string_util.h"
++#include "base/time/time.h"
++#include "chrome/browser/rac/ai/chat_protocol.h"
++#include "chrome/browser/rac/ai/providers.h"
++#include "net/base/load_flags.h"
++#include "net/base/url_util.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/fetch_api.mojom.h"
++#include "url/gurl.h"
++
++namespace rac::ai {
++namespace {
++
++constexpr size_t kMaxBodyBytes = 256 * 1024;
++// Servers on this computer answer at once, or not at all.
++constexpr base::TimeDelta kTimeout = base::Seconds(3);
++
++constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("rac_ai_models", R"(
++      semantics {
++        sender: "rac assistant"
++        description:
++          "Asks an AI server running on this computer, such as Ollama, "
++          "which models it has, so the user can pick one."
++        trigger: "The user opens the model menu in the assistant."
++        data: "None."
++        destination: LOCAL
++        internal { contacts { email: "noreply@example.com" } }
++        user_data { type: NONE }
++        last_reviewed: "2026-10-13"
++      }
++      policy {
++        cookies_allowed: NO
++        setting:
++          "Off by default. Turn the assistant on or off in Settings > Privacy "
++          "and security > Assistant."
++        policy_exception_justification: "Not implemented."
++      })");
++
++void OnBody(std::unique_ptr<network::SimpleURLLoader> loader,
++            base::OnceCallback<void(std::vector<std::string>)> callback,
++            std::optional<std::string> body) {
++  std::move(callback).Run(body ? ParseModelList(*body)
++                               : std::vector<std::string>());
++}
++
++}  // namespace
++
++void FetchModelList(
++    network::SharedURLLoaderFactory* factory,
++    const std::string& base_url,
++    base::OnceCallback<void(std::vector<std::string>)> callback) {
++  std::string_view trimmed =
++      base::TrimString(base_url, "/", base::TRIM_TRAILING);
++  const GURL url(std::string(trimmed) + "/models");
++  if (!factory || !IsAcceptableBaseUrl(url) ||
++      !net::IsLocalhost(url)) {
++    std::move(callback).Run({});
++    return;
++  }
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = url;
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  request->redirect_mode = network::mojom::RedirectMode::kError;
++  request->load_flags = net::LOAD_DISABLE_CACHE;
++  std::unique_ptr<network::SimpleURLLoader> loader =
++      network::SimpleURLLoader::Create(std::move(request), kTrafficAnnotation);
++  loader->SetTimeoutDuration(kTimeout);
++  network::SimpleURLLoader* raw = loader.get();
++  raw->DownloadToString(
++      factory, base::BindOnce(&OnBody, std::move(loader), std::move(callback)),
++      kMaxBodyBytes);
++}
++
++}  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/model_list.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/ai/model_list.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_MODEL_LIST_H_
++#define CHROME_BROWSER_RAC_AI_MODEL_LIST_H_
++
++#include <string>
++#include <vector>
++
++#include "base/functional/callback_forward.h"
++
++namespace network {
++class SharedURLLoaderFactory;
++}
++
++namespace rac::ai {
++
++// Asks the OpenAI-compatible server at `base_url` which models it has. Only
++// for servers on this computer, which need no key. Runs `callback` with an
++// empty list if the server can't be reached or answers with something else.
++void FetchModelList(
++    network::SharedURLLoaderFactory* factory,
++    const std::string& base_url,
++    base::OnceCallback<void(std::vector<std::string>)> callback);
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_MODEL_LIST_H_
+Index: src/chrome/browser/resources/rac_ai/app.css
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/app.css
++++ src/chrome/browser/resources/rac_ai/app.css
+@@ -68,30 +68,51 @@ a:focus-visible {
+   align-items: center;
+   display: flex;
+   flex: none;
+-  gap: 4px;
++  gap: 2px;
+   height: 44px;
+-  padding: 0 10px 0 14px;
++  padding: 0 10px;
++  position: relative;
++  z-index: 6;
+ }
+ 
+ .spacer {
+   flex: 1;
+ }
+ 
+-.chip {
+-  background: var(--token);
++/* The chat's name opens the list of chats. */
++.title-button {
++  align-items: center;
++  background: none;
+   border: 0;
+-  border-radius: 999px;
++  border-radius: 8px;
+   color: var(--text-muted);
++  display: flex;
+   font-size: 13px;
+-  max-width: 70%;
++  font-weight: 500;
++  gap: 2px;
++  height: 28px;
++  min-width: 0;
++  padding: 0 4px 0 8px;
++}
++
++.title-button:hover,
++.title-button[aria-expanded='true'] {
++  background: var(--token-hover);
++  color: var(--text);
++}
++
++.title-text {
+   overflow: hidden;
+-  padding: 4px 12px;
+   text-overflow: ellipsis;
+   white-space: nowrap;
+ }
+ 
+-.chip:hover {
+-  background: var(--token-hover);
++.chevron {
++  flex: none;
++  height: 14px;
++  opacity: 0.7;
++  stroke-width: 1.8;
++  width: 14px;
+ }
+ 
+ .icon-button {
+@@ -111,6 +132,16 @@ a:focus-visible {
+   color: color-mix(in srgb, CanvasText 85%, var(--surface-page));
+ }
+ 
++/* Dia's header icons: the new chat button is dim, the close button
++ * brighter. */
++#newChat {
++  color: light-dark(rgb(0 0 0 / 40%), rgb(255 255 255 / 34%));
++}
++
++#closePanel {
++  color: light-dark(rgb(0 0 0 / 62%), rgb(255 255 255 / 58%));
++}
++
+ svg {
+   fill: none;
+   height: 18px;
+@@ -137,6 +168,8 @@ body {
+   --symbol-hover-bg: light-dark(rgb(0 0 0 / 5%), rgb(255 255 255 / 5%));
+   --link: color-mix(in oklab, var(--theme-primary), currentcolor 30%);
+   --ease-out: cubic-bezier(0.2, 0, 0, 1);
++  --send-bg: var(--theme-primary);
++  --send-fg: rgb(0 0 0 / 85%);
+ }
+ 
+ @media (prefers-color-scheme: dark) {
+@@ -149,6 +182,8 @@ body {
+     --bubble-flat: color-mix(in srgb, var(--theme-primary) 50%,
+         var(--surface-page));
+     --bubble-text: color-mix(in srgb, CanvasText 98%, var(--bubble-flat));
++    /* Dia lifts the send button off its dark theme color. */
++    --send-bg: color-mix(in srgb, var(--theme-primary) 74%, white);
+   }
+ }
+ 
+@@ -157,12 +192,15 @@ body[data-theme='neutral'] {
+   --bubble-bottom: color-mix(in srgb, CanvasText 9%, transparent);
+   --bubble-flat: color-mix(in srgb, CanvasText 12%, var(--surface-page));
+   --link: light-dark(#3a88c4, #5aaee0);
++  --send-bg: light-dark(rgb(0 0 0 / 85%), rgb(255 255 255 / 92%));
++  --send-fg: light-dark(#fff, #000);
+ }
+ 
+ body:not([data-theme]) {
+   --bubble-top: color-mix(in oklab, CanvasText 9%, transparent);
+   --bubble-bottom: var(--bubble-top);
+   --bubble-flat: color-mix(in srgb, CanvasText 9%, var(--surface-page));
++  --send-fg: #fff;
+ }
+ 
+ /* The composer floats over the end of the thread. Text fades out as it
+@@ -771,25 +809,42 @@ body:not([data-theme]) {
+   padding: 7px 16px;
+ }
+ 
+-/* Composer */
++/* Composer. Measured from Dia's: the text sits on top and the buttons in a
++ * row under it, 16px from the top, 14px from the sides and bottom. */
+ 
+ .composer {
+-  background: var(--surface-raised);
+-  border-radius: var(--radius-bubble);
+-  box-shadow: 0 0 0 0.5px var(--hairline), 0 1px 3px rgb(0 0 0 / 8%);
++  background: light-dark(#fff, #2d2d2d);
++  border: 0.5px solid light-dark(rgb(0 0 0 / 12%), rgb(255 255 255 / 15%));
++  border-radius: 20px;
+   display: flex;
+   flex-direction: column;
+-  gap: 8px;
+   margin: 0 auto;
+   max-width: var(--column);
+-  padding: 10px 10px 10px 12px;
++  padding: 16px 14px 14px;
+   position: relative;
+ }
+ 
+-.composer-row {
+-  align-items: flex-end;
++.composer textarea {
++  background: none;
++  border: 0;
++  color: inherit;
++  font: 16px/24px system-ui, -apple-system, sans-serif;
++  max-height: 240px;
++  min-height: 24px;
++  outline: none;
++  padding: 0 10px;
++  resize: none;
++}
++
++.composer textarea::placeholder {
++  color: light-dark(rgb(0 0 0 / 40%), rgb(255 255 255 / 50%));
++}
++
++.composer-tools {
++  align-items: center;
+   display: flex;
+-  gap: 8px;
++  gap: 4px;
++  margin-top: 13px;
+ }
+ 
+ .tool {
+@@ -797,351 +852,395 @@ body:not([data-theme]) {
+   background: none;
+   border: 0;
+   border-radius: 50%;
+-  color: var(--text-muted);
++  color: light-dark(rgb(0 0 0 / 38%), rgb(255 255 255 / 25%));
+   display: flex;
+   flex: none;
+-  height: 28px;
++  height: 32px;
+   justify-content: center;
+-  width: 28px;
++  padding: 0;
++  width: 32px;
+ }
+ 
+-.tool:hover:not(:disabled) {
++.tool:hover:not(:disabled),
++.tool[aria-expanded='true'] {
+   background: var(--token-hover);
++  color: light-dark(rgb(0 0 0 / 70%), rgb(255 255 255 / 70%));
+ }
+ 
+ .tool:disabled {
+-  color: var(--text-faint);
+   cursor: default;
++  opacity: 0.6;
+ }
+ 
+-.tool svg,
+-.chip-remove svg {
+-  fill: none;
+-  height: 18px;
+-  stroke: currentcolor;
+-  stroke-linecap: round;
+-  stroke-linejoin: round;
++.tool svg {
++  height: 20px;
+   stroke-width: 1.5;
+-  width: 18px;
++  width: 20px;
+ }
+ 
+-.chips {
+-  display: flex;
+-  flex-wrap: wrap;
+-  gap: 6px;
+-}
+-
+-.tab-chip {
++.model-button {
+   align-items: center;
+-  background: var(--token);
++  background: none;
+   border: 0;
+-  border-radius: 999px;
+-  display: inline-flex;
++  border-radius: 16px;
++  color: light-dark(rgb(0 0 0 / 55%), rgb(255 255 255 / 50%));
++  display: flex;
+   font-size: 13px;
+-  gap: 6px;
+-  max-width: 100%;
+-  padding: 3px 4px 3px 8px;
+-}
+-
+-.tab-chip.ghost {
+-  background: none;
+-  box-shadow: inset 0 0 0 1px var(--hairline);
+-  color: var(--text-muted);
+-  padding-right: 10px;
+-}
+-
+-.tab-chip.ghost:hover {
+-  background: var(--token);
++  gap: 2px;
++  height: 32px;
++  margin-inline-end: 4px;
++  min-width: 0;
++  padding: 0 6px 0 10px;
+ }
+ 
+-.tab-chip img {
+-  border-radius: 3px;
+-  flex: none;
+-  height: 14px;
+-  width: 14px;
++.model-button:hover,
++.model-button[aria-expanded='true'] {
++  background: var(--token-hover);
++  color: light-dark(rgb(0 0 0 / 80%), rgb(255 255 255 / 80%));
+ }
+ 
+-.tab-chip .title {
++.model-name {
++  max-width: 160px;
+   overflow: hidden;
+   text-overflow: ellipsis;
+   white-space: nowrap;
+ }
+ 
+-.chip-remove {
++.send {
+   align-items: center;
+-  background: none;
++  background: var(--send-bg);
+   border: 0;
+   border-radius: 50%;
+-  color: var(--text-muted);
++  color: var(--send-fg);
+   display: flex;
+   flex: none;
+-  height: 18px;
++  height: 32px;
+   justify-content: center;
+   padding: 0;
+-  width: 18px;
++  transition: background-color 120ms, color 120ms;
++  width: 32px;
+ }
+ 
+-.chip-remove:hover {
+-  background: var(--token-hover);
++.send svg {
++  height: 18px;
++  stroke-width: 2;
++  width: 18px;
+ }
+ 
+-.chip-remove svg {
+-  height: 12px;
+-  width: 12px;
++.send:hover:not(:disabled) {
++  filter: brightness(1.06);
+ }
+ 
+-.picker {
+-  background: var(--surface-raised);
+-  border-radius: var(--radius-card);
+-  bottom: calc(100% + 6px);
+-  box-shadow: 0 0 0 0.5px var(--hairline), 0 4px 16px rgb(0 0 0 / 16%);
+-  left: 0;
+-  max-height: 260px;
+-  overflow-y: auto;
+-  padding: 4px;
+-  position: absolute;
+-  right: 0;
++.send:disabled {
++  background: light-dark(rgb(0 0 0 / 5%), rgb(255 255 255 / 6%));
++  color: light-dark(rgb(0 0 0 / 25%), rgb(255 255 255 / 28%));
++  cursor: default;
+ }
+ 
+-.picker-item {
+-  align-items: center;
+-  background: none;
+-  border: 0;
+-  border-radius: 7px;
+-  display: flex;
+-  gap: 8px;
+-  padding: 6px 8px;
+-  text-align: start;
+-  width: 100%;
++.stop svg {
++  fill: currentcolor;
++  stroke: none;
+ }
+ 
+-.picker-item:hover,
+-.picker-item:focus-visible {
+-  background: var(--token-hover);
++.send[hidden] {
++  display: none;
+ }
+ 
+-.picker-item img {
+-  flex: none;
+-  height: 14px;
+-  width: 14px;
++/* Pages and files on the message being written. */
++.chips {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 8px;
++  margin-bottom: 16px;
++  padding: 0 2px;
+ }
+ 
+-.picker-item .title {
+-  overflow: hidden;
+-  text-overflow: ellipsis;
+-  white-space: nowrap;
++.composer-card {
++  background: light-dark(#ededed, #404040);
++  border-radius: 10px;
++  padding: 0 10px 0 8px;
++  position: relative;
+ }
+ 
+-.picker-empty {
+-  color: var(--text-muted);
+-  padding: 8px;
++.composer-card:hover {
++  background: light-dark(#e5e5e5, #464646);
+ }
+ 
+-.composer:focus-within {
+-  box-shadow: 0 0 0 1.5px var(--accent), 0 1px 3px rgb(0 0 0 / 8%);
++.composer-card .attachment-label,
++.composer-card .attachment-subtitle {
++  font-size: 13px;
++  line-height: 18px;
+ }
+ 
+-textarea {
+-  background: none;
+-  border: 0;
+-  color: inherit;
+-  flex: 1;
+-  font: inherit;
+-  max-height: 200px;
+-  min-height: 24px;
+-  outline: none !important;
+-  padding: 3px 0;
+-  resize: none;
++.composer-card .attachment-label {
++  color: light-dark(#242424, #e2e2e2);
+ }
+ 
+-textarea::placeholder {
+-  color: var(--text-faint);
++.composer-card .attachment-subtitle {
++  color: light-dark(#777, #a9a9a9);
+ }
+ 
+-.send {
++.card-remove {
+   align-items: center;
+-  background: var(--accent);
++  background: light-dark(#fff, #5a5a5a);
+   border: 0;
+   border-radius: 50%;
+-  color: var(--accent-text);
++  box-shadow: 0 0 0 0.5px light-dark(rgb(0 0 0 / 18%), rgb(0 0 0 / 50%)),
++      0 1px 2px rgb(0 0 0 / 20%);
++  color: light-dark(rgb(0 0 0 / 70%), rgb(255 255 255 / 85%));
+   display: flex;
+-  flex: none;
+-  height: 28px;
++  height: 18px;
+   justify-content: center;
+-  width: 28px;
++  opacity: 0;
++  padding: 0;
++  position: absolute;
++  right: -6px;
++  top: -6px;
++  transition: opacity 120ms;
++  width: 18px;
+ }
+ 
+-.send:disabled {
+-  background: var(--token);
+-  color: var(--text-faint);
+-  cursor: default;
++.card-remove svg {
++  height: 10px;
++  stroke-width: 2;
++  width: 10px;
+ }
+ 
+-.send[hidden] {
+-  display: none;
++.composer-card:hover .card-remove,
++.card-remove:focus-visible {
++  opacity: 1;
++}
++
++.composer-note {
++  color: var(--text-muted);
++  font-size: 13px;
++  margin: -6px 10px 10px;
+ }
+ 
+ [hidden] {
+   display: none !important;
+ }
+ 
+-/* Full-page chat, opened from the new tab page. */
+-body[data-mode='page'] .header {
+-  padding-inline: 24px;
++/* Menus. Like Dia's: a dark glass panel with a hairline, 24px rows and small
++ * capital section names. */
++.menu {
++  -webkit-backdrop-filter: blur(24px) saturate(1.4);
++  backdrop-filter: blur(24px) saturate(1.4);
++  background: light-dark(rgb(252 252 252 / 92%), rgb(30 27 26 / 92%));
++  border-radius: 12px;
++  box-shadow: 0 0 0 0.5px light-dark(rgb(0 0 0 / 14%), rgb(0 0 0 / 90%)),
++      inset 0 0 0 0.5px light-dark(transparent, rgb(255 255 255 / 30%)),
++      0 8px 28px rgb(0 0 0 / 22%);
++  color: var(--text);
++  display: flex;
++  flex-direction: column;
++  font-size: 13px;
++  max-height: min(440px, calc(100vh - 120px));
++  overflow: hidden;
++  padding: 6px;
++  position: absolute;
++  z-index: 10;
+ }
+ 
+-body[data-mode='page'] .empty {
+-  padding-top: 24vh;
++.menu-list,
++.model-menu,
++.history-menu {
++  min-height: 0;
++  overflow-y: auto;
+ }
+ 
+-/* History and saved prompts */
+-
+-.drawer {
+-  background: var(--surface-page);
+-  bottom: 0;
++.menu-list {
+   display: flex;
+   flex-direction: column;
+-  left: 0;
+-  position: absolute;
+-  right: 0;
+-  top: 44px;
+-  z-index: 5;
+ }
+ 
+-.drawer-head {
+-  align-items: center;
++.menu-tabs {
+   display: flex;
+-  flex: none;
+-  padding: 0 10px 8px 14px;
++  flex: 0 1 auto;
++  flex-direction: column;
++  max-height: calc(8 * 24px);
++  min-height: 0;
++  overflow-y: auto;
+ }
+ 
+-.segments {
+-  background: var(--token);
+-  border-radius: 999px;
+-  display: flex;
+-  padding: 2px;
++.attach-menu {
++  bottom: 52px;
++  left: 14px;
++  width: min(332px, calc(100% - 28px));
+ }
+ 
+-.segment {
+-  background: none;
+-  border: 0;
+-  border-radius: 999px;
+-  color: var(--text-muted);
+-  font-size: 13px;
+-  padding: 3px 14px;
++.model-menu {
++  bottom: 52px;
++  right: 14px;
++  width: min(280px, calc(100% - 28px));
+ }
+ 
+-.segment[aria-selected='true'] {
+-  background: var(--surface-raised);
+-  box-shadow: 0 0 0 0.5px var(--hairline);
+-  color: var(--text);
++.history-menu {
++  left: 8px;
++  max-height: min(480px, calc(100vh - 64px));
++  top: calc(100% - 4px);
++  width: min(320px, calc(100% - 16px));
+ }
+ 
+-.drawer-list {
+-  flex: 1;
+-  margin: 0 auto;
+-  max-width: var(--column);
+-  overflow-y: auto;
+-  padding: 0 10px;
+-  width: 100%;
++.menu-search {
++  background: light-dark(rgb(0 0 0 / 6%), #2e2e2e);
++  border: 0;
++  border-radius: 6px;
++  color: inherit;
++  flex: none;
++  font: inherit;
++  height: 24px;
++  margin-bottom: 4px;
++  outline: none;
++  padding: 0 8px;
+ }
+ 
+-.row {
+-  align-items: center;
+-  border-radius: var(--radius-card);
+-  display: flex;
+-  gap: 4px;
++.menu-search::placeholder {
++  color: light-dark(rgb(0 0 0 / 45%), rgb(255 255 255 / 60%));
+ }
+ 
+-.row:hover,
+-.row:focus-within {
+-  background: var(--token);
++.menu-section {
++  color: light-dark(rgb(0 0 0 / 38%), rgb(255 255 255 / 25%));
++  font-size: 11px;
++  font-weight: 600;
++  letter-spacing: 0.04em;
++  padding: 6px 10px 3px;
++  text-transform: uppercase;
+ }
+ 
+-.row-main {
++.menu-item {
++  align-items: center;
+   background: none;
+   border: 0;
++  border-radius: 6px;
++  color: light-dark(rgb(0 0 0 / 88%), rgb(255 255 255 / 90%));
+   display: flex;
+-  flex: 1;
+-  flex-direction: column;
++  flex: none;
++  gap: 7px;
++  height: 24px;
+   min-width: 0;
+-  padding: 8px 10px;
++  outline: none;
++  padding: 0 10px;
+   text-align: start;
++  width: 100%;
+ }
+ 
+-.row-title {
+-  overflow: hidden;
+-  text-overflow: ellipsis;
+-  white-space: nowrap;
++.menu-item:focus,
++.menu-item:hover {
++  background: light-dark(rgb(0 0 0 / 6%), rgb(255 255 255 / 8%));
+ }
+ 
+-.row-detail {
+-  color: var(--text-muted);
+-  font-size: 13px;
++/* The highlight shows focus; no ring on top of it. */
++.menu-item:focus-visible {
++  outline: none;
++}
++
++.menu-icon {
++  display: grid;
++  flex: none;
++  height: 16px;
++  place-items: center;
++  width: 16px;
++}
++
++.menu-icon img {
++  border-radius: 3px;
++  height: 16px;
++  width: 16px;
++}
++
++.menu-icon svg {
++  height: 16px;
++  stroke-width: 1.4;
++  width: 16px;
++}
++
++.menu-label {
++  flex: 0 1 auto;
++  min-width: 0;
+   overflow: hidden;
+   text-overflow: ellipsis;
+   white-space: nowrap;
+ }
+ 
+-.row .icon-button {
++.menu-count {
++  color: light-dark(rgb(0 0 0 / 45%), rgb(255 255 255 / 55%));
+   flex: none;
+-  opacity: 0;
++  font-variant-numeric: tabular-nums;
+ }
+ 
+-.row:hover .icon-button,
+-.row:focus-within .icon-button {
+-  opacity: 1;
++.history-menu .menu-label {
++  flex: 1;
++}
++
++.menu-separator {
++  background: light-dark(rgb(0 0 0 / 8%), rgb(255 255 255 / 12%));
++  flex: none;
++  height: 1px;
++  margin: 5px 10px;
+ }
+ 
+-.drawer-empty {
++.menu-note {
+   color: var(--text-muted);
+-  padding: 24px 10px;
+-  text-align: center;
++  padding: 4px 10px 6px;
+ }
+ 
+-.drawer-foot {
++.history-row {
+   align-items: center;
+   display: flex;
+-  flex: none;
+-  gap: 12px;
+-  justify-content: space-between;
+-  margin: 0 auto;
+-  max-width: var(--column);
+-  padding: 10px 14px 14px;
+-  width: 100%;
++  position: relative;
+ }
+ 
+-.check {
+-  align-items: center;
+-  color: var(--text-muted);
+-  display: flex;
+-  font-size: 13px;
+-  gap: 6px;
++.history-row .menu-item {
++  height: 28px;
++  padding-inline-end: 32px;
+ }
+ 
+-.text-button {
++.history-row.current .menu-label {
++  font-weight: 600;
++}
++
++.row-remove {
++  align-items: center;
+   background: none;
+   border: 0;
+-  border-radius: 8px;
++  border-radius: 5px;
+   color: var(--text-muted);
+-  font-size: 13px;
+-  padding: 4px 8px;
++  display: flex;
++  height: 20px;
++  justify-content: center;
++  opacity: 0;
++  padding: 0;
++  position: absolute;
++  right: 6px;
++  width: 20px;
++}
++
++.row-remove svg {
++  height: 12px;
++  stroke-width: 1.8;
++  width: 12px;
+ }
+ 
+-.text-button:hover:not(:disabled) {
+-  background: var(--token);
++.row-remove:hover {
++  background: light-dark(rgb(0 0 0 / 8%), rgb(255 255 255 / 12%));
+   color: var(--text);
+ }
+ 
+-.text-button:disabled {
+-  color: var(--text-faint);
+-  cursor: default;
++.history-row:hover .row-remove,
++.history-row:focus-within .row-remove {
++  opacity: 1;
+ }
+ 
+-body[data-mode='page'] .drawer-head {
++/* Full-page chat, opened from the new tab page. */
++body[data-mode='page'] .header {
+   padding-inline: 24px;
+ }
+ 
++body[data-mode='page'] .empty {
++  padding-top: 24vh;
++}
++
+ /* As the new tab page, the greeting and the composer sit together in the
+  * middle until the first message. */
+ body[data-mode='page'][data-chat='empty'] .app {
+@@ -1186,45 +1285,16 @@ body[data-mode='panel'] {
+   --token-hover: light-dark(rgb(0 0 0 / 8%), rgb(255 255 255 / 10%));
+ }
+ 
++/* The header's icons sit 12px inside the composer's edges, as in Dia. */
+ body[data-mode='panel'] .header {
+   height: 40px;
+-  padding: 0 2px 0 0;
+-}
+-
+-/* Like the header's icon buttons, the model picker shows its fill only
+- * under the pointer or keyboard focus. */
+-body[data-mode='panel'] .chip {
+-  background: none;
+-}
+-
+-body[data-mode='panel'] .chip:hover,
+-body[data-mode='panel'] .chip:focus-visible {
+-  background: var(--token-hover);
++  padding: 0 13px 0 6px;
+ }
+ 
+ body[data-mode='panel'] .composer-wrap {
+   padding: 0 7px 7px 0;
+ }
+ 
+-body[data-mode='panel'] .drawer {
+-  background: none;
+-  top: 40px;
+-}
+-
+-body[data-mode='panel'] .drawer-head {
+-  padding: 0 2px 8px 0;
+-}
+-
+-body[data-mode='panel'] .drawer-list {
+-  padding: 0 7px 0 0;
+-}
+-
+-body[data-mode='panel'] .drawer-foot {
+-  padding: 10px 7px 7px 0;
+-}
+-
+-/* The drawer has no fill of its own here, so hide the chat under it. */
+-.app:has(.drawer:not([hidden])) .viewport,
+-.app:has(.drawer:not([hidden])) .composer-wrap {
+-  visibility: hidden;
++body[data-mode='panel'] .history-menu {
++  left: 4px;
+ }
+Index: src/chrome/browser/resources/rac_ai/app.ts
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/app.ts
++++ src/chrome/browser/resources/rac_ai/app.ts
+@@ -56,10 +56,30 @@ interface ConversationInfo {
+   messages?: StoredMessage[];
+ }
+ 
+-interface SavedPrompt {
++interface ModelProvider {
+   id: string;
+-  title: string;
++  name: string;
++  models: string[];
++}
++
++interface ModelChoices {
++  provider: string;
++  model: string;
++  providers: ModelProvider[];
++}
++
++// A text file the user picked, already read.
++interface FileAttachment {
++  name: string;
+   text: string;
++  size: number;
++}
++
++// What an attachment card shows.
++interface Card {
++  title: string;
++  url?: string;
++  detail?: string;
+ }
+ 
+ interface Message {
+@@ -68,14 +88,21 @@ interface Message {
+   error?: string;
+   attached?: string[];
+   // Only for messages sent in this page; saved chats keep titles alone.
+-  attachedUrls?: string[];
++  cards?: Card[];
+   tabIds?: number[];
++  files?: FileAttachment[];
+   notice?: string;
+   sentMs?: number;
+   element?: HTMLElement;
+   body?: HTMLElement;
+ }
+ 
++// The browser reads at most this many tabs, and takes this many files, for
++// one message.
++const MAX_TABS = 6;
++const MAX_FILES = 4;
++const MAX_FILE_BYTES = 1024 * 1024;
++
+ const messages: Message[] = [];
+ let activeId = 0;
+ let streaming = false;
+@@ -83,23 +110,36 @@ let configured = false;
+ let renderQueued = false;
+ let attachDefault = true;
+ let initialized = false;
+-// The chip for the foreground tab follows it as the user switches tabs, until
++// The card for the foreground tab follows it as the user switches tabs, until
+ // the user removes it.
+ let followCurrent = false;
+ let currentTab: TabInfo|null = null;
+ const extraTabs: TabInfo[] = [];
++const files: FileAttachment[] = [];
+ let conversationId: string = crypto.randomUUID();
++let chatTitle = '';
++let titleRequested = false;
+ let saveHistory = true;
+-let drawerView: 'chats'|'prompts' = 'chats';
+-let confirmTimer = 0;
++let noteTimer = 0;
++let pickerTabs: TabInfo[] = [];
+ // While set, the thread keeps the newest text in view. Scrolling up stops
+ // it; scrolling back to the end, or sending, starts it again.
+ let autoFollow = false;
+ const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+ 
+ const CHECK_ICON = 'M5 10.5l3.2 3.2L15 7';
++const CLOSE_ICON = 'M6 6l8 8M14 6l-8 8';
+ const PAGE_ICON = 'M6.25 3.75h5l3.5 3.5v8.25c0 .41-.34.75-.75.75h-7.75' +
+     'a.75.75 0 0 1-.75-.75v-11a.75.75 0 0 1 .75-.75zM11 4v3.5h3.5';
++const TABS_ICON = 'M5.75 7.25h8.5a1.5 1.5 0 0 1 1.5 1.5v6a1.5 1.5 0 0 1' +
++    '-1.5 1.5h-8.5a1.5 1.5 0 0 1-1.5-1.5v-6a1.5 1.5 0 0 1 1.5-1.5zM5.75 ' +
++    '4.75h8.5M7 2.75h6';
++const UPLOAD_ICON = 'M6.25 3.75h5l3.5 3.5v8.25c0 .41-.34.75-.75.75h-7.75' +
++    'a.75.75 0 0 1-.75-.75v-11a.75.75 0 0 1 .75-.75zM11 4v3.5h3.5M10 ' +
++    '9.75v4.5M7.75 12h4.5';
++const SETTINGS_ICON = 'M10 7.4a2.6 2.6 0 1 0 0 5.2 2.6 2.6 0 0 0 0-5.2zM10 ' +
++    '2.8v2.1M10 15.1v2.1M2.8 10h2.1M15.1 10h2.1M4.9 4.9l1.5 1.5M13.6 ' +
++    '13.6l1.5 1.5M4.9 15.1l1.5-1.5M13.6 6.4l1.5-1.5';
+ 
+ const thread = getRequiredElement('thread');
+ const scroller = getRequiredElement('scroll');
+@@ -110,25 +150,36 @@ const sendButton = getRequiredElement<HT
+ const stopButton = getRequiredElement<HTMLButtonElement>('stop');
+ const emptyState = getRequiredElement('empty');
+ const setupState = getRequiredElement('setup');
+-const modelChip = getRequiredElement('modelChip');
+-const modelName = getRequiredElement('modelName');
+ const chips = getRequiredElement('chips');
++const composerNote = getRequiredElement('composerNote');
+ const picker = getRequiredElement('picker');
+-const drawer = getRequiredElement('drawer');
+-const drawerList = getRequiredElement('drawerList');
+-const tabChats = getRequiredElement('tabChats');
+-const tabPrompts = getRequiredElement('tabPrompts');
+-const chatsFooter = getRequiredElement('chatsFooter');
+-const promptsFooter = getRequiredElement('promptsFooter');
+-const saveHistoryBox = getRequiredElement<HTMLInputElement>('saveHistory');
+-const clearAllButton = getRequiredElement<HTMLButtonElement>('clearAll');
+-const savePromptButton = getRequiredElement<HTMLButtonElement>('savePrompt');
++const pickerSearch = getRequiredElement<HTMLInputElement>('pickerSearch');
++const pickerList = getRequiredElement('pickerList');
++const fileInput = getRequiredElement<HTMLInputElement>('fileInput');
+ const addTabButton = getRequiredElement<HTMLButtonElement>('addTab');
++const modelButton = getRequiredElement<HTMLButtonElement>('modelButton');
++const modelName = getRequiredElement('modelName');
++const modelMenu = getRequiredElement('modelMenu');
++const titleButton = getRequiredElement<HTMLButtonElement>('chatTitle');
++const titleText = getRequiredElement('chatTitleText');
++const historyMenu = getRequiredElement('historyMenu');
++
++// Each menu and the button that opens it.
++const menus: Array<[HTMLElement, HTMLElement]> = [
++  [picker, addTabButton],
++  [modelMenu, modelButton],
++  [historyMenu, titleButton],
++];
+ 
+ function openUrl(url: string) {
+   sendToBrowser('racAiOpenUrl', [url]);
+ }
+ 
++function openSettings() {
++  closeMenus();
++  sendToBrowser('racAiOpenSettings');
++}
++
+ function applyStrings() {
+   for (const element of document.querySelectorAll<HTMLElement>(
+            '[data-i18n]')) {
+@@ -140,7 +191,7 @@ function applyStrings() {
+     element.setAttribute('aria-label', text);
+     element.title = text;
+   }
+-  for (const element of document.querySelectorAll<HTMLTextAreaElement>(
++  for (const element of document.querySelectorAll<HTMLInputElement>(
+            '[data-i18n-placeholder]')) {
+     element.placeholder =
+         loadTimeData.getString(element.dataset['i18nPlaceholder']!);
+@@ -154,11 +205,13 @@ function updateControls() {
+   stopButton.hidden = !streaming;
+   input.disabled = !configured;
+   addTabButton.disabled = !configured;
++  modelButton.hidden = !configured || !modelName.textContent;
+   emptyState.hidden = !configured || messages.length > 0;
+   document.body.dataset['chat'] = messages.length > 0 ? 'active' : 'empty';
+   setupState.hidden = configured;
+   thread.hidden = !configured;
+   updatePlaceholder();
++  updateTitle();
+ }
+ 
+ function updatePlaceholder() {
+@@ -172,6 +225,17 @@ function updatePlaceholder() {
+   }
+ }
+ 
++function updateTitle() {
++  const first = messages.find(m => m.role === 'user');
++  // Until the model names the chat, or if it can't, the first question
++  // stands in.
++  const text = chatTitle || (titleRequested && first?.text) ||
++      loadTimeData.getString('untitled');
++  if (titleText.textContent !== text) {
++    titleText.textContent = text;
++  }
++}
++
+ function scrollToEnd(smooth = false) {
+   scroller.scrollTo({
+     top: scroller.scrollHeight,
+@@ -216,11 +280,29 @@ function makeFavicon(url: string): HTMLI
+   return image;
+ }
+ 
+-function makeTitle(text: string): HTMLElement {
+-  const title = document.createElement('span');
+-  title.className = 'title';
+-  title.textContent = text;
+-  return title;
++function hostOf(url: string): string {
++  try {
++    return new URL(url).hostname.replace(/^www\./, '');
++  } catch {
++    return '';
++  }
++}
++
++function formatSize(bytes: number): string {
++  if (bytes < 1024) {
++    return `${bytes} B`;
++  }
++  if (bytes < 1024 * 1024) {
++    return `${Math.round(bytes / 1024)} KB`;
++  }
++  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
++}
++
++function fileCard(file: FileAttachment): Card {
++  const dot = file.name.lastIndexOf('.');
++  const type = dot > 0 ? file.name.slice(dot + 1).toUpperCase() :
++                         loadTimeData.getString('file');
++  return {title: file.name, detail: `${type} · ${formatSize(file.size)}`};
+ }
+ 
+ function attachedTabs(): TabInfo[] {
+@@ -236,24 +318,85 @@ function attachedTabs(): TabInfo[] {
+   return tabs;
+ }
+ 
+-function makeChip(tab: TabInfo, onRemove: () => void): HTMLElement {
+-  const chip = document.createElement('div');
+-  chip.className = 'tab-chip';
+-  chip.title = tab.url;
+-  chip.append(makeFavicon(tab.url), makeTitle(tab.title));
+-  const remove = document.createElement('button');
+-  remove.type = 'button';
+-  remove.className = 'chip-remove';
+-  remove.setAttribute('aria-label', loadTimeData.getString('removeTab'));
+-  const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+-  icon.setAttribute('viewBox', '0 0 20 20');
+-  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+-  path.setAttribute('d', 'M6 6l8 8M14 6l-8 8');
+-  icon.appendChild(path);
+-  remove.appendChild(icon);
+-  remove.addEventListener('click', onRemove);
+-  chip.appendChild(remove);
+-  return chip;
++function attachTabs(tabs: TabInfo[]) {
++  for (const tab of tabs) {
++    if (attachedTabs().length >= MAX_TABS) {
++      showNote('tooManyAttached');
++      break;
++    }
++    if (currentTab && tab.id === currentTab.id) {
++      followCurrent = true;
++    } else if (!extraTabs.some(t => t.id === tab.id)) {
++      extraTabs.push(tab);
++    }
++  }
++  closeMenus();
++  renderChips();
++  input.focus();
++}
++
++function removeTab(tab: TabInfo) {
++  if (currentTab && tab.id === currentTab.id) {
++    followCurrent = false;
++  }
++  const index = extraTabs.findIndex(t => t.id === tab.id);
++  if (index >= 0) {
++    extraTabs.splice(index, 1);
++  }
++  renderChips();
++}
++
++function showNote(key: string) {
++  clearTimeout(noteTimer);
++  composerNote.textContent = loadTimeData.getString(key);
++  composerNote.hidden = false;
++  noteTimer = setTimeout(() => {
++    composerNote.hidden = true;
++  }, 4000);
++}
++
++function makeAttachmentCard(card: Card): HTMLElement {
++  const element = document.createElement('div');
++  element.className = 'attachment';
++  const tile = document.createElement('span');
++  tile.className = 'attachment-tile';
++  if (card.url) {
++    const favicon = makeFavicon(card.url);
++    favicon.addEventListener(
++        'error', () => tile.appendChild(makeIcon(PAGE_ICON)));
++    tile.appendChild(favicon);
++  } else {
++    tile.appendChild(makeIcon(PAGE_ICON));
++  }
++  const text = document.createElement('span');
++  text.className = 'attachment-text';
++  const label = document.createElement('span');
++  label.className = 'attachment-label';
++  label.textContent = card.title;
++  text.appendChild(label);
++  const detail = card.detail ?? (card.url ? hostOf(card.url) : '');
++  if (detail) {
++    const subtitle = document.createElement('span');
++    subtitle.className = 'attachment-subtitle';
++    subtitle.textContent = detail;
++    text.appendChild(subtitle);
++  }
++  element.title = card.url ?? card.title;
++  element.append(tile, text);
++  return element;
++}
++
++// A card in the composer, with a way to take it back off the message.
++function makeComposerCard(card: Card, onRemove: () => void): HTMLElement {
++  const element = makeAttachmentCard(card);
++  element.classList.add('composer-card');
++  const label = loadTimeData.getString('remove');
++  const remove = makeIconButton(label, makeIcon(CLOSE_ICON), () => {
++    onRemove();
++    input.focus();
++  }, 'card-remove');
++  element.appendChild(remove);
++  return element;
+ }
+ 
+ function renderChips() {
+@@ -262,79 +405,326 @@ function renderChips() {
+     chips.hidden = true;
+     return;
+   }
+-  if (followCurrent && currentTab) {
+-    chips.appendChild(makeChip(currentTab, () => {
+-      followCurrent = false;
+-      renderChips();
+-    }));
+-  }
+-  for (const tab of extraTabs) {
+-    if (followCurrent && currentTab && tab.id === currentTab.id) {
+-      continue;
+-    }
+-    chips.appendChild(makeChip(tab, () => {
+-      extraTabs.splice(extraTabs.indexOf(tab), 1);
++  for (const tab of attachedTabs()) {
++    chips.appendChild(makeComposerCard(
++        {title: tab.title, url: tab.url}, () => removeTab(tab)));
++  }
++  for (const file of files) {
++    chips.appendChild(makeComposerCard(fileCard(file), () => {
++      files.splice(files.indexOf(file), 1);
+       renderChips();
+     }));
+   }
+-  // A way back after removing the foreground tab's chip.
+-  if (!followCurrent && currentTab &&
+-      !extraTabs.some(t => t.id === currentTab!.id)) {
+-    const ghost = document.createElement('button');
+-    ghost.type = 'button';
+-    ghost.className = 'tab-chip ghost';
+-    ghost.append(makeFavicon(currentTab.url), makeTitle(currentTab.title));
+-    ghost.title = loadTimeData.getString('addCurrent');
+-    ghost.addEventListener('click', () => {
+-      followCurrent = true;
+-      renderChips();
+-    });
+-    chips.appendChild(ghost);
+-  }
+   chips.hidden = chips.childElementCount === 0;
+   updatePlaceholder();
+ }
+ 
+-function closePicker() {
+-  picker.hidden = true;
+-  picker.replaceChildren();
++// Menus
++
++function closeMenus() {
++  for (const [menu, button] of menus) {
++    menu.hidden = true;
++    button.setAttribute('aria-expanded', 'false');
++  }
++  pickerList.replaceChildren();
++}
++
++function showMenu(menu: HTMLElement, button: HTMLElement) {
++  closeMenus();
++  menu.hidden = false;
++  button.setAttribute('aria-expanded', 'true');
++}
++
++function makeSection(key: string): HTMLElement {
++  const section = document.createElement('div');
++  section.className = 'menu-section';
++  section.setAttribute('role', 'presentation');
++  section.textContent = loadTimeData.getString(key);
++  return section;
++}
++
++function makeSectionText(text: string): HTMLElement {
++  const section = document.createElement('div');
++  section.className = 'menu-section';
++  section.setAttribute('role', 'presentation');
++  section.textContent = text;
++  return section;
++}
++
++function makeSeparator(): HTMLElement {
++  const separator = document.createElement('div');
++  separator.className = 'menu-separator';
++  separator.setAttribute('role', 'separator');
++  return separator;
++}
++
++function makeMenuNote(text: string): HTMLElement {
++  const note = document.createElement('div');
++  note.className = 'menu-note';
++  note.textContent = text;
++  return note;
++}
++
++function makeMenuItem(
++    icon: Element|null, label: string, onClick: () => void,
++    role = 'menuitem', count?: number): HTMLButtonElement {
++  const item = document.createElement('button');
++  item.type = 'button';
++  item.className = 'menu-item';
++  item.setAttribute('role', role);
++  item.tabIndex = -1;
++  const iconBox = document.createElement('span');
++  iconBox.className = 'menu-icon';
++  if (icon) {
++    iconBox.appendChild(icon);
++  }
++  const text = document.createElement('span');
++  text.className = 'menu-label';
++  text.textContent = label;
++  item.append(iconBox, text);
++  if (count !== undefined) {
++    const countElement = document.createElement('span');
++    countElement.className = 'menu-count';
++    countElement.textContent = `(${count})`;
++    item.appendChild(countElement);
++  }
++  item.addEventListener('click', onClick);
++  return item;
++}
++
++function menuItems(menu: HTMLElement): HTMLElement[] {
++  return Array.from(menu.querySelectorAll<HTMLElement>('.menu-item'));
++}
++
++// Arrow keys move between items; the attach menu's search box sits above
++// the first.
++function onMenuKey(menu: HTMLElement, event: KeyboardEvent) {
++  const items = menuItems(menu);
++  const search = menu === picker ? pickerSearch : null;
++  const index = items.indexOf(document.activeElement as HTMLElement);
++  let next: HTMLElement|null|undefined = null;
++  if (event.key === 'ArrowDown') {
++    next = items[Math.min(index + 1, items.length - 1)];
++  } else if (event.key === 'ArrowUp') {
++    next = index <= 0 && search ? search : items[Math.max(index - 1, 0)];
++  } else if (event.key === 'Home') {
++    next = items[0];
++  } else if (event.key === 'End') {
++    next = items[items.length - 1];
++  } else if (event.key === 'Enter' && document.activeElement === search) {
++    items[0]?.click();
++    event.preventDefault();
++    return;
++  } else {
++    return;
++  }
++  next?.focus();
++  event.preventDefault();
+ }
+ 
+ async function openPicker() {
+   if (!configured || !picker.hidden) {
+     return;
+   }
++  showMenu(picker, addTabButton);
++  pickerSearch.value = '';
++  pickerTabs = [];
++  renderPicker();
++  pickerSearch.focus();
+   const tabs = await sendWithPromise<TabInfo[]>('racAiGetTabs');
++  if (!picker.hidden) {
++    pickerTabs = tabs;
++    renderPicker();
++  }
++}
++
++function renderPicker() {
++  const query = pickerSearch.value.trim().toLowerCase();
+   const attached = attachedTabs();
+-  const choices = tabs.filter(tab => !attached.some(a => a.id === tab.id));
+-  picker.replaceChildren();
+-  if (choices.length === 0) {
+-    const empty = document.createElement('div');
+-    empty.className = 'picker-empty';
+-    empty.textContent = loadTimeData.getString('noTabs');
+-    picker.appendChild(empty);
+-  }
+-  for (const tab of choices) {
+-    const item = document.createElement('button');
+-    item.type = 'button';
+-    item.className = 'picker-item';
+-    item.setAttribute('role', 'option');
++  const free = pickerTabs.filter(tab => !attached.some(a => a.id === tab.id));
++  const matches = free.filter(
++      tab => !query || tab.title.toLowerCase().includes(query) ||
++          tab.url.toLowerCase().includes(query));
++  const list: HTMLElement[] = [makeSection('sectionTabs')];
++  if (matches.length === 0) {
++    list.push(makeMenuNote(loadTimeData.getString('noMatches')));
++  }
++  // The tabs scroll on their own so the rows below stay in reach.
++  const tabRows = document.createElement('div');
++  tabRows.className = 'menu-tabs';
++  for (const tab of matches) {
++    const item = makeMenuItem(
++        makeFavicon(tab.url), tab.title, () => attachTabs([tab]), 'option');
+     item.title = tab.url;
+-    item.append(makeFavicon(tab.url), makeTitle(tab.title));
+-    item.addEventListener('click', () => {
+-      if (currentTab && tab.id === currentTab.id) {
+-        followCurrent = true;
+-      } else {
+-        extraTabs.push(tab);
++    tabRows.append(item);
++  }
++  list.push(tabRows);
++  if (!query) {
++    const groups: HTMLElement[] = [];
++    if (free.length >= 2) {
++      groups.push(makeMenuItem(
++          makeIcon(TABS_ICON), loadTimeData.getString('allTabs'),
++          () => attachTabs(free), 'option', free.length));
++    }
++    const host = currentTab ? hostOf(currentTab.url) : '';
++    const sameHost = host ? free.filter(tab => hostOf(tab.url) === host) : [];
++    if (sameHost.length >= 2 && sameHost.length < free.length) {
++      groups.push(makeMenuItem(
++          makeFavicon(currentTab!.url),
++          loadTimeData.getStringF('allHostTabs', host),
++          () => attachTabs(sameHost), 'option', sameHost.length));
++    }
++    if (groups.length > 0) {
++      list.push(makeSeparator(), ...groups);
++    }
++    list.push(
++        makeSeparator(), makeSection('sectionFiles'),
++        makeMenuItem(
++            makeIcon(UPLOAD_ICON), loadTimeData.getString('uploadFile'),
++            () => {
++              closeMenus();
++              fileInput.click();
++            },
++            'option'));
++  }
++  pickerList.replaceChildren(...list);
++}
++
++async function addFiles(picked: File[]) {
++  for (const file of picked) {
++    if (files.length >= MAX_FILES) {
++      showNote('tooManyAttached');
++      break;
++    }
++    if (file.size > MAX_FILE_BYTES) {
++      showNote('fileTooBig');
++      continue;
++    }
++    let text: string;
++    try {
++      text = new TextDecoder('utf-8', {fatal: true})
++                 .decode(await file.arrayBuffer());
++    } catch {
++      showNote('fileNotText');
++      continue;
++    }
++    if (text.includes('\0')) {
++      showNote('fileNotText');
++      continue;
++    }
++    files.push({name: file.name, text, size: file.size});
++  }
++  renderChips();
++  updateControls();
++  input.focus();
++}
++
++async function openModelMenu() {
++  if (!configured) {
++    return;
++  }
++  showMenu(modelMenu, modelButton);
++  modelMenu.replaceChildren(
++      makeMenuNote(loadTimeData.getString('loadingModels')));
++  const choices = await sendWithPromise<ModelChoices>('racAiGetModels');
++  if (modelMenu.hidden) {
++    return;
++  }
++  const list: HTMLElement[] = [];
++  for (const provider of choices.providers) {
++    if (provider.models.length === 0) {
++      continue;
++    }
++    list.push(makeSectionText(provider.name));
++    for (const model of provider.models) {
++      const current =
++          provider.id === choices.provider && model === choices.model;
++      const item = makeMenuItem(
++          current ? makeIcon(CHECK_ICON) : null, model,
++          () => selectModel(provider, model), 'menuitemradio');
++      item.setAttribute('aria-checked', String(current));
++      list.push(item);
++    }
++  }
++  if (list.length > 0) {
++    list.push(makeSeparator());
++  }
++  list.push(makeMenuItem(
++      makeIcon(SETTINGS_ICON), loadTimeData.getString('settings'),
++      openSettings));
++  modelMenu.replaceChildren(...list);
++  const checked = modelMenu.querySelector<HTMLElement>('[aria-checked=true]');
++  (checked ?? menuItems(modelMenu)[0])?.focus();
++}
++
++function selectModel(provider: ModelProvider, model: string) {
++  sendToBrowser('racAiSelectModel', [provider.id, model]);
++  modelName.textContent = model;
++  modelButton.title = `${provider.name} · ${model}`;
++  closeMenus();
++  input.focus();
++}
++
++function formatDate(ms: number): string {
++  const date = new Date(ms);
++  const sameDay = date.toDateString() === new Date().toDateString();
++  return sameDay ?
++      date.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'}) :
++      date.toLocaleDateString([], {month: 'short', day: 'numeric'});
++}
++
++async function openHistory() {
++  showMenu(historyMenu, titleButton);
++  historyMenu.replaceChildren();
++  const list =
++      await sendWithPromise<ConversationInfo[]>('racAiHistoryList');
++  if (historyMenu.hidden) {
++    return;
++  }
++  renderHistory(list);
++  const current =
++      historyMenu.querySelector<HTMLElement>('.history-row.current .menu-item');
++  (current ?? menuItems(historyMenu)[0])?.focus();
++}
++
++function renderHistory(list: ConversationInfo[]) {
++  if (list.length === 0) {
++    historyMenu.replaceChildren(makeMenuNote(
++        loadTimeData.getString(saveHistory ? 'noChats' : 'historyOff')));
++    return;
++  }
++  historyMenu.replaceChildren(...list.map(info => {
++    const row = document.createElement('div');
++    row.className = 'history-row';
++    row.classList.toggle('current', info.id === conversationId);
++    const item = makeMenuItem(null, info.title, async () => {
++      closeMenus();
++      const full = await sendWithPromise<ConversationInfo|null>(
++          'racAiHistoryGet', info.id);
++      if (full) {
++        openConversation(full);
+       }
+-      closePicker();
+-      renderChips();
+-      input.focus();
+     });
+-    picker.appendChild(item);
+-  }
+-  picker.hidden = false;
+-  picker.querySelector<HTMLElement>('.picker-item')?.focus();
++    item.querySelector('.menu-icon')!.remove();
++    const time = document.createElement('span');
++    time.className = 'menu-count';
++    time.textContent = formatDate(info.updatedMs);
++    item.appendChild(time);
++    const remove = makeIconButton(
++        loadTimeData.getString('deleteItem'), makeIcon(CLOSE_ICON), () => {
++          sendToBrowser('racAiHistoryDelete', [info.id]);
++          if (info.id === conversationId) {
++            conversationId = crypto.randomUUID();
++          }
++          row.remove();
++          if (!historyMenu.querySelector('.history-row')) {
++            renderHistory([]);
++          }
++        }, 'row-remove');
++    remove.tabIndex = -1;
++    row.append(item, remove);
++    return row;
++  }));
+ }
+ 
+ function makeIconButton(
+@@ -366,45 +756,6 @@ function makeCopyButton(
+   return button;
+ }
+ 
+-function hostOf(url: string): string {
+-  try {
+-    return new URL(url).hostname.replace(/^www\./, '');
+-  } catch {
+-    return '';
+-  }
+-}
+-
+-function makeAttachmentCard(title: string, url?: string): HTMLElement {
+-  const card = document.createElement('div');
+-  card.className = 'attachment';
+-  const tile = document.createElement('span');
+-  tile.className = 'attachment-tile';
+-  if (url) {
+-    const favicon = makeFavicon(url);
+-    favicon.addEventListener(
+-        'error', () => tile.appendChild(makeIcon(PAGE_ICON)));
+-    tile.appendChild(favicon);
+-  } else {
+-    tile.appendChild(makeIcon(PAGE_ICON));
+-  }
+-  const text = document.createElement('span');
+-  text.className = 'attachment-text';
+-  const label = document.createElement('span');
+-  label.className = 'attachment-label';
+-  label.textContent = title;
+-  text.appendChild(label);
+-  const host = url ? hostOf(url) : '';
+-  if (host) {
+-    const subtitle = document.createElement('span');
+-    subtitle.className = 'attachment-subtitle';
+-    subtitle.textContent = host;
+-    text.appendChild(subtitle);
+-  }
+-  card.title = url ?? title;
+-  card.append(tile, text);
+-  return card;
+-}
+-
+ // A one-line bubble is a pill. A long one shows its first lines until it's
+ // clicked.
+ const bubbleObserver = new ResizeObserver(entries => {
+@@ -427,14 +778,14 @@ const bubbleObserver = new ResizeObserve
+ 
+ function renderUserMessage(message: Message, element: HTMLElement) {
+   element.className = 'item item-user';
+-  const titles = message.attached ?? [];
+-  if (titles.length > 0) {
++  const cards =
++      message.cards ?? (message.attached ?? []).map(title => ({title}));
++  if (cards.length > 0) {
+     const attachments = document.createElement('div');
+     attachments.className = 'attachments';
+-    titles.forEach((title, index) => {
+-      attachments.appendChild(
+-          makeAttachmentCard(title, message.attachedUrls?.[index]));
+-    });
++    for (const card of cards) {
++      attachments.appendChild(makeAttachmentCard(card));
++    }
+     element.appendChild(attachments);
+   }
+   const bubble = document.createElement('div');
+@@ -581,11 +932,16 @@ function transcript() {
+       .map(m => ({role: m.role, text: m.text}));
+ }
+ 
+-function startReply(tabIds: number[]) {
++function startReply(question: Message) {
+   activeId++;
+   streaming = true;
+   messages.push({role: 'assistant', text: ''});
+-  sendToBrowser('racAiSend', [activeId, transcript(), tabIds]);
++  sendToBrowser('racAiSend', [
++    activeId,
++    transcript(),
++    question.tabIds ?? [],
++    (question.files ?? []).map(f => ({name: f.name, text: f.text})),
++  ]);
+   render();
+ }
+ 
+@@ -595,23 +951,30 @@ function send() {
+     return;
+   }
+   const tabs = attachedTabs();
+-  messages.push({
++  const sentFiles = files.splice(0);
++  const question: Message = {
+     role: 'user',
+     text,
+-    attached: tabs.map(tab => tab.title),
+-    attachedUrls: tabs.map(tab => tab.url),
++    attached: [...tabs.map(tab => tab.title), ...sentFiles.map(f => f.name)],
++    cards: [
++      ...tabs.map(tab => ({title: tab.title, url: tab.url})),
++      ...sentFiles.map(fileCard),
++    ],
+     tabIds: tabs.map(tab => tab.id),
++    files: sentFiles,
+     sentMs: Date.now(),
+-  });
++  };
++  messages.push(question);
+   setAutoFollow(true);
+   input.value = '';
+   resizeInput();
+   // Pages are read again for every message, so the reply sees them as they
+-  // are now. Tabs added by hand are used once; the foreground tab's chip stays.
++  // are now. Tabs added by hand are used once; the foreground tab's card
++  // stays.
+   extraTabs.length = 0;
+-  closePicker();
++  closeMenus();
+   renderChips();
+-  startReply(tabs.map(tab => tab.id));
++  startReply(question);
+ }
+ 
+ function retry() {
+@@ -619,10 +982,11 @@ function retry() {
+     return;
+   }
+   const last = messages[messages.length - 1];
+-  if (last && last.role === 'assistant' && last.error) {
++  const question = messages[messages.length - 2];
++  if (last && last.role === 'assistant' && last.error && question) {
+     last.element?.remove();
+     messages.pop();
+-    startReply(messages[messages.length - 1]?.tabIds ?? []);
++    startReply(question);
+   }
+ }
+ 
+@@ -652,10 +1016,12 @@ function resetChat() {
+   thread.replaceChildren();
+   setAutoFollow(false);
+   extraTabs.length = 0;
++  files.length = 0;
+   followCurrent = attachDefault;
+   conversationId = crypto.randomUUID();
+-  closePicker();
+-  closeDrawer();
++  chatTitle = '';
++  titleRequested = false;
++  closeMenus();
+   renderChips();
+ }
+ 
+@@ -665,6 +1031,27 @@ function newChat() {
+   input.focus();
+ }
+ 
++// After the first reply, the model names the chat.
++function requestTitle() {
++  const question = messages[0];
++  const answer = messages[1];
++  if (titleRequested || !question || question.role !== 'user' || !answer ||
++      !answer.text || answer.error) {
++    return;
++  }
++  titleRequested = true;
++  const id = conversationId;
++  sendWithPromise<string|null>('racAiMakeTitle', question.text, answer.text)
++      .then(title => {
++        if (title && id === conversationId) {
++          chatTitle = title;
++          updateTitle();
++          saveConversation();
++        }
++      });
++  updateTitle();
++}
++
+ function saveConversation() {
+   if (!saveHistory) {
+     return;
+@@ -678,13 +1065,17 @@ function saveConversation() {
+         return entry;
+       });
+   if (stored.length > 0) {
+-    sendToBrowser('racAiHistorySave', [{id: conversationId, messages: stored}]);
++    sendToBrowser('racAiHistorySave', [
++      {id: conversationId, title: chatTitle, messages: stored},
++    ]);
+   }
+ }
+ 
+ function openConversation(info: ConversationInfo) {
+   resetChat();
+   conversationId = info.id;
++  chatTitle = info.title;
++  titleRequested = true;
+   for (const stored of info.messages ?? []) {
+     messages.push({
+       role: stored.role,
+@@ -697,137 +1088,6 @@ function openConversation(info: Conversa
+   input.focus();
+ }
+ 
+-function formatDate(ms: number): string {
+-  const date = new Date(ms);
+-  const sameDay = date.toDateString() === new Date().toDateString();
+-  return sameDay ?
+-      date.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'}) :
+-      date.toLocaleDateString([], {month: 'short', day: 'numeric'});
+-}
+-
+-function makeRow(
+-    title: string, detail: string, onOpen: () => void,
+-    onDelete: () => void): HTMLElement {
+-  const row = document.createElement('div');
+-  row.className = 'row';
+-  const main = document.createElement('button');
+-  main.type = 'button';
+-  main.className = 'row-main';
+-  const titleElement = document.createElement('span');
+-  titleElement.className = 'row-title';
+-  titleElement.textContent = title;
+-  const detailElement = document.createElement('span');
+-  detailElement.className = 'row-detail';
+-  detailElement.textContent = detail;
+-  main.append(titleElement, detailElement);
+-  main.addEventListener('click', onOpen);
+-  const remove = document.createElement('button');
+-  remove.type = 'button';
+-  remove.className = 'icon-button';
+-  const label = loadTimeData.getString('deleteItem');
+-  remove.setAttribute('aria-label', label);
+-  remove.title = label;
+-  const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+-  icon.setAttribute('viewBox', '0 0 20 20');
+-  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+-  path.setAttribute('d', 'M6 6l8 8M14 6l-8 8');
+-  icon.appendChild(path);
+-  remove.appendChild(icon);
+-  remove.addEventListener('click', onDelete);
+-  row.append(main, remove);
+-  return row;
+-}
+-
+-function showEmpty(key: string) {
+-  const empty = document.createElement('div');
+-  empty.className = 'drawer-empty';
+-  empty.textContent = loadTimeData.getString(key);
+-  drawerList.replaceChildren(empty);
+-}
+-
+-function resetClearButton() {
+-  clearTimeout(confirmTimer);
+-  clearAllButton.textContent = loadTimeData.getString('clearAll');
+-  clearAllButton.dataset['confirm'] = '';
+-}
+-
+-async function showChats() {
+-  const list =
+-      await sendWithPromise<ConversationInfo[]>('racAiHistoryList');
+-  if (drawerView !== 'chats' || drawer.hidden) {
+-    return;
+-  }
+-  if (list.length === 0) {
+-    showEmpty(saveHistory ? 'noChats' : 'historyOff');
+-    clearAllButton.disabled = true;
+-    return;
+-  }
+-  clearAllButton.disabled = false;
+-  drawerList.replaceChildren(...list.map(info => makeRow(
+-      info.title, formatDate(info.updatedMs), async () => {
+-        const full = await sendWithPromise<ConversationInfo|null>(
+-            'racAiHistoryGet', info.id);
+-        if (full) {
+-          openConversation(full);
+-        }
+-      }, () => {
+-        sendToBrowser('racAiHistoryDelete', [info.id]);
+-        if (info.id === conversationId) {
+-          conversationId = crypto.randomUUID();
+-        }
+-        showChats();
+-      })));
+-}
+-
+-async function showPrompts() {
+-  const list = await sendWithPromise<SavedPrompt[]>('racAiPromptsGet');
+-  if (drawerView !== 'prompts' || drawer.hidden) {
+-    return;
+-  }
+-  savePromptButton.disabled = input.value.trim().length === 0;
+-  if (list.length === 0) {
+-    showEmpty('noPrompts');
+-    return;
+-  }
+-  drawerList.replaceChildren(...list.map(prompt => makeRow(
+-      prompt.title, prompt.text.replace(/\s+/g, ' '), () => {
+-        input.value = prompt.text;
+-        resizeInput();
+-        updateControls();
+-        closeDrawer();
+-        input.focus();
+-      }, () => {
+-        sendToBrowser('racAiPromptRemove', [prompt.id]);
+-        showPrompts();
+-      })));
+-}
+-
+-function setDrawerView(view: 'chats'|'prompts') {
+-  drawerView = view;
+-  tabChats.setAttribute('aria-selected', String(view === 'chats'));
+-  tabPrompts.setAttribute('aria-selected', String(view === 'prompts'));
+-  chatsFooter.hidden = view !== 'chats';
+-  promptsFooter.hidden = view !== 'prompts';
+-  saveHistoryBox.checked = saveHistory;
+-  resetClearButton();
+-  if (view === 'chats') {
+-    showChats();
+-  } else {
+-    showPrompts();
+-  }
+-}
+-
+-function openDrawer() {
+-  closePicker();
+-  drawer.hidden = false;
+-  setDrawerView(drawerView);
+-}
+-
+-function closeDrawer() {
+-  drawer.hidden = true;
+-  drawerList.replaceChildren();
+-}
+-
+ function onUpdate(event: UpdateEvent) {
+   if (event.id !== activeId) {
+     return;
+@@ -852,13 +1112,14 @@ function onUpdate(event: UpdateEvent) {
+   }
+   if (!streaming) {
+     saveConversation();
++    requestTitle();
+   }
+   queueRender();
+ }
+ 
+ function resizeInput() {
+   input.style.height = 'auto';
+-  input.style.height = `${Math.min(input.scrollHeight, 200)}px`;
++  input.style.height = `${Math.min(input.scrollHeight, 240)}px`;
+ }
+ 
+ function applyState(state: InitState) {
+@@ -879,12 +1140,12 @@ function applyState(state: InitState) {
+   applyTheme(state.theme);
+   renderChips();
+   if (state.enabled && state.providerName) {
+-    modelChip.hidden = false;
+-    modelName.textContent = state.model ?
++    modelName.textContent = state.model || state.providerName;
++    modelButton.title = state.model ?
+         `${state.providerName} · ${state.model}` :
+         state.providerName;
+   } else {
+-    modelChip.hidden = true;
++    modelName.textContent = '';
+   }
+   updateControls();
+ }
+@@ -948,92 +1209,71 @@ function init() {
+       send();
+     }
+   });
++  // A click anywhere in the box puts the caret in the text.
++  getRequiredElement('composer').addEventListener('mousedown', event => {
++    const target = event.target as HTMLElement;
++    if (!target.closest('button, input, textarea, .menu, .attachment')) {
++      event.preventDefault();
++      input.focus();
++    }
++  });
+   sendButton.addEventListener('click', send);
++  stopButton.addEventListener('click', stop);
+   addTabButton.addEventListener('click', () => {
+     if (picker.hidden) {
+       openPicker();
+     } else {
+-      closePicker();
++      closeMenus();
+     }
+   });
+-  picker.addEventListener('keydown', (event: KeyboardEvent) => {
+-    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+-      return;
+-    }
+-    const items =
+-        Array.from(picker.querySelectorAll<HTMLButtonElement>('.picker-item'));
+-    if (items.length === 0) {
+-      return;
++  modelButton.addEventListener('click', () => {
++    if (modelMenu.hidden) {
++      openModelMenu();
++    } else {
++      closeMenus();
+     }
+-    const index = items.indexOf(document.activeElement as HTMLButtonElement);
+-    const next = event.key === 'Home' ?
+-        0 :
+-        event.key === 'End' ?
+-        items.length - 1 :
+-        (index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) %
+-            items.length;
+-    items[next]?.focus();
+-    event.preventDefault();
+   });
+-  document.addEventListener('click', (event: MouseEvent) => {
+-    if (!picker.hidden && !picker.contains(event.target as Node) &&
+-        !addTabButton.contains(event.target as Node)) {
+-      closePicker();
++  titleButton.addEventListener('click', () => {
++    if (historyMenu.hidden) {
++      openHistory();
++    } else {
++      closeMenus();
+     }
+   });
+-  document.addEventListener('keydown', (event: KeyboardEvent) => {
+-    if (event.key === 'Escape' && !picker.hidden) {
+-      closePicker();
+-      input.focus();
+-    } else if (event.key === 'Escape' && !drawer.hidden) {
+-      closeDrawer();
+-      input.focus();
+-    }
++  pickerSearch.addEventListener('input', renderPicker);
++  for (const [menu] of menus) {
++    menu.addEventListener(
++        'keydown', (event: KeyboardEvent) => onMenuKey(menu, event));
++    menu.addEventListener('pointermove', (event: PointerEvent) => {
++      const item = (event.target as HTMLElement).closest<HTMLElement>(
++          '.menu-item');
++      if (item && document.activeElement !== item) {
++        item.focus({preventScroll: true});
++      }
++    });
++  }
++  fileInput.addEventListener('change', () => {
++    const picked = Array.from(fileInput.files ?? []);
++    fileInput.value = '';
++    addFiles(picked);
+   });
+-  stopButton.addEventListener('click', stop);
+-  getRequiredElement('historyButton').addEventListener('click', () => {
+-    if (drawer.hidden) {
+-      openDrawer();
+-    } else {
+-      closeDrawer();
++  document.addEventListener('pointerdown', (event: PointerEvent) => {
++    const target = event.target as Node;
++    for (const [menu, button] of menus) {
++      if (!menu.hidden && !menu.contains(target) && !button.contains(target)) {
++        closeMenus();
++      }
+     }
+   });
+-  getRequiredElement('drawerClose').addEventListener('click', closeDrawer);
+-  tabChats.addEventListener('click', () => setDrawerView('chats'));
+-  tabPrompts.addEventListener('click', () => setDrawerView('prompts'));
+-  saveHistoryBox.addEventListener('change', () => {
+-    saveHistory = saveHistoryBox.checked;
+-    sendToBrowser('racAiSetSaveHistory', [saveHistory]);
+-    if (saveHistory) {
+-      saveConversation();
+-    }
+-    showChats();
+-  });
+-  clearAllButton.addEventListener('click', () => {
+-    // Deleting everything takes two clicks, since there is no undo.
+-    if (clearAllButton.dataset['confirm'] !== 'yes') {
+-      clearAllButton.dataset['confirm'] = 'yes';
+-      clearAllButton.textContent = loadTimeData.getString('confirmAgain');
+-      confirmTimer = setTimeout(resetClearButton, 4000);
+-      return;
+-    }
+-    resetClearButton();
+-    sendToBrowser('racAiHistoryClear');
+-    conversationId = crypto.randomUUID();
+-    showChats();
+-  });
+-  savePromptButton.addEventListener('click', () => {
+-    const text = input.value.trim();
+-    if (text) {
+-      sendToBrowser('racAiPromptAdd', ['', text]);
+-      showPrompts();
++  document.addEventListener('keydown', (event: KeyboardEvent) => {
++    const open = menus.find(([menu]) => !menu.hidden);
++    if (event.key === 'Escape' && open) {
++      closeMenus();
++      (open[0] === historyMenu ? open[1] : input).focus();
+     }
+   });
+   getRequiredElement('newChat').addEventListener('click', newChat);
+-  const openSettings = () => sendToBrowser('racAiOpenSettings');
+-  getRequiredElement('openSettings').addEventListener('click', openSettings);
+   getRequiredElement('setupButton').addEventListener('click', openSettings);
+-  modelChip.addEventListener('click', openSettings);
+ 
+   addWebUiListener('rac-ai-update', onUpdate);
+   addWebUiListener('rac-ai-theme', applyTheme);
+@@ -1053,6 +1293,7 @@ function init() {
+   addWebUiListener('rac-ai-disabled', () => {
+     streaming = false;
+     configured = false;
++    closeMenus();
+     updateControls();
+   });
+   // The page can be reopened after its settings changed, so look again
+Index: src/chrome/browser/resources/rac_ai/index.html
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/index.html
++++ src/chrome/browser/resources/rac_ai/index.html
+@@ -12,56 +12,23 @@
+   <body>
+     <div id="app" class="app">
+       <header class="header">
+-        <button id="modelChip" class="chip" type="button" hidden>
+-          <span id="modelName"></span>
+-        </button>
+-        <span class="spacer"></span>
+-        <button id="historyButton" class="icon-button" type="button"
+-            data-i18n-label="history">
+-          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.5"/><path d="M10 6.5V10l2.4 1.6"/></svg>
+-        </button>
+         <button id="newChat" class="icon-button" type="button"
+             data-i18n-label="newChat">
+-          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4.5v11M4.5 10h11"/></svg>
++          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M9.25 3.75h-3.5a2 2 0 0 0-2 2v8.5a2 2 0 0 0 2 2h8.5a2 2 0 0 0 2-2v-3.5"/><path d="M14.4 3.35a1.45 1.45 0 0 1 2.05 2.05L10.5 11.35l-2.6.55.55-2.6z"/></svg>
+         </button>
+-        <button id="openSettings" class="icon-button" type="button"
+-            data-i18n-label="settings">
+-          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="2.6"/><path d="M10 2.8v2.1M10 15.1v2.1M2.8 10h2.1M15.1 10h2.1M4.9 4.9l1.5 1.5M13.6 13.6l1.5 1.5M4.9 15.1l1.5-1.5M13.6 6.4l1.5-1.5"/></svg>
++        <button id="chatTitle" class="title-button" type="button"
++            aria-haspopup="menu" aria-expanded="false" data-i18n-label="chats">
++          <span id="chatTitleText" class="title-text"></span>
++          <svg class="chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 8.25L10 11.75l3.5-3.5"/></svg>
+         </button>
++        <span class="spacer"></span>
+         <button id="closePanel" class="icon-button" type="button" hidden
+             data-i18n-label="close">
+-          <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="4" width="14" height="12" rx="3"/><path d="M12 4.5v11"/></svg>
++          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5.5 5.5l9 9M14.5 5.5l-9 9"/></svg>
+         </button>
+-      </header>
+-
+-      <section id="drawer" class="drawer" hidden>
+-        <div class="drawer-head">
+-          <div class="segments" role="tablist">
+-            <button id="tabChats" class="segment" type="button" role="tab"
+-                data-i18n="tabChats"></button>
+-            <button id="tabPrompts" class="segment" type="button" role="tab"
+-                data-i18n="tabPrompts"></button>
+-          </div>
+-          <span class="spacer"></span>
+-          <button id="drawerClose" class="icon-button" type="button"
+-              data-i18n-label="close">
+-            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 6l8 8M14 6l-8 8"/></svg>
+-          </button>
+-        </div>
+-        <div id="drawerList" class="drawer-list"></div>
+-        <div id="chatsFooter" class="drawer-foot">
+-          <label class="check">
+-            <input id="saveHistory" type="checkbox">
+-            <span data-i18n="saveHistory"></span>
+-          </label>
+-          <button id="clearAll" class="text-button" type="button"
+-              data-i18n="clearAll"></button>
++        <div id="historyMenu" class="menu history-menu" role="menu" hidden>
+         </div>
+-        <div id="promptsFooter" class="drawer-foot" hidden>
+-          <button id="savePrompt" class="text-button" type="button" disabled
+-              data-i18n="savePrompt"></button>
+-        </div>
+-      </section>
++      </header>
+ 
+       <div id="viewport" class="viewport">
+         <main id="scroll" class="scroll">
+@@ -82,24 +49,44 @@
+       <footer id="composerWrap" class="composer-wrap">
+         <div id="composer" class="composer">
+           <div id="chips" class="chips" hidden></div>
+-          <div class="composer-row">
++          <div id="composerNote" class="composer-note" role="status" hidden>
++          </div>
++          <textarea id="input" rows="1" spellcheck="true"
++              data-i18n-placeholder="placeholder"
++              data-i18n-label="placeholder"></textarea>
++          <div class="composer-tools">
+             <button id="addTab" class="tool" type="button" disabled
++                aria-haspopup="listbox" aria-expanded="false"
+                 data-i18n-label="attach">
+-              <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3.5" y="5" width="13" height="10" rx="2.5"/><path d="M3.5 8h13"/></svg>
++              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4.25v11.5M4.25 10h11.5"/></svg>
++            </button>
++            <span class="spacer"></span>
++            <button id="modelButton" class="model-button" type="button" hidden
++                aria-haspopup="menu" aria-expanded="false"
++                data-i18n-label="chooseModel">
++              <span id="modelName" class="model-name"></span>
++              <svg class="chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="M7 8l3-3 3 3M7 12l3 3 3-3"/></svg>
+             </button>
+-            <textarea id="input" rows="1" spellcheck="true"
+-                data-i18n-placeholder="placeholder"
+-                data-i18n-label="placeholder"></textarea>
+             <button id="send" class="send" type="button" disabled
+                 data-i18n-label="send">
+-              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 15.5v-11M5.5 9l4.5-4.5L14.5 9"/></svg>
++              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 15.25V4.75M5.25 9.5L10 4.75l4.75 4.75"/></svg>
+             </button>
+             <button id="stop" class="send stop" type="button" hidden
+                 data-i18n-label="stop">
+               <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="6" y="6" width="8" height="8" rx="1.5"/></svg>
+             </button>
+           </div>
+-          <div id="picker" class="picker" role="listbox" hidden></div>
++          <div id="picker" class="menu attach-menu" hidden>
++            <input id="pickerSearch" class="menu-search" type="text"
++                autocomplete="off" spellcheck="false" role="combobox"
++                aria-controls="pickerList" aria-expanded="true"
++                data-i18n-placeholder="searchTabs"
++                data-i18n-label="searchTabs">
++            <div id="pickerList" class="menu-list" role="listbox"></div>
++          </div>
++          <div id="modelMenu" class="menu model-menu" role="menu" hidden>
++          </div>
++          <input id="fileInput" type="file" multiple hidden>
+         </div>
+       </footer>
+     </div>
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+@@ -10,14 +10,19 @@
+ 
+ #include "base/functional/bind.h"
+ #include "base/location.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/rac/ai/ai_service.h"
+ #include "chrome/browser/rac/ai/ai_service_factory.h"
++#include "chrome/browser/rac/ai/chat_protocol.h"
+ #include "chrome/browser/rac/ai/chat_session.h"
+ #include "chrome/browser/rac/ai/history_store.h"
++#include "chrome/browser/rac/ai/model_list.h"
++#include "chrome/browser/rac/ai/providers.h"
+ #include "chrome/browser/rac/ai/saved_prompts.h"
+ #include "chrome/browser/rac/spaces/space.h"
+ #include "chrome/browser/rac/spaces/spaces_service.h"
+@@ -41,6 +46,16 @@ constexpr size_t kMaxMessages = 200;
+ constexpr size_t kMaxTotalChars = 400 * 1024;
+ constexpr size_t kMaxAttachedTabs = 6;
+ constexpr size_t kMaxListedTabs = 100;
++constexpr size_t kMaxAttachedFiles = 4;
++// Files are cut to kMaxPageChars in the prompt; this only bounds the message.
++constexpr size_t kMaxFileChars = 1024 * 1024;
++constexpr size_t kMaxModelChars = 200;
++constexpr size_t kMaxTitleSourceChars = 4000;
++constexpr size_t kMaxTitleReplyChars = 2000;
++
++constexpr char kTitlePrompt[] =
++    "Write a title for the chat below in 2 to 6 words, in the language of "
++    "the question. Reply with the title only, without quotes or a period.";
+ 
+ constexpr char kSystemPrompt[] =
+     "You are the assistant built into the rac web browser. Be direct and "
+@@ -84,6 +99,21 @@ struct PageHandler::PendingSend {
+   std::vector<std::string> failed;
+ };
+ 
++// The model menu: each provider the user set up, with the models it offers.
++struct PageHandler::ModelQuery {
++  struct Entry {
++    std::string id;
++    std::string name;
++    std::string base_url;
++    // Servers on this computer are asked for their models.
++    bool local = false;
++    std::vector<std::string> models;
++  };
++  base::Value callback_id;
++  std::vector<Entry> entries;
++  size_t next = 0;
++};
++
+ PageHandler::PageHandler(Profile* profile) : profile_(profile) {}
+ 
+ PageHandler::~PageHandler() = default;
+@@ -139,9 +169,20 @@ void PageHandler::RegisterMessages() {
+   web_ui()->RegisterMessageCallback(
+       "racAiClosePanel", base::BindRepeating(&PageHandler::HandleClosePanel,
+                                              base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiGetModels", base::BindRepeating(&PageHandler::HandleGetModels,
++                                            base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiSelectModel", base::BindRepeating(&PageHandler::HandleSelectModel,
++                                              base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiMakeTitle", base::BindRepeating(&PageHandler::HandleMakeTitle,
++                                            base::Unretained(this)));
+ }
+ 
+ void PageHandler::OnJavascriptDisallowed() {
++  title_session_.reset();
++  title_callback_ = base::Value();
+   pref_registrar_.RemoveAll();
+   spaces_observation_.Reset();
+   active_tab_subscription_ = base::CallbackListSubscription();
+@@ -330,7 +371,7 @@ void PageHandler::HandleGetTabs(const ba
+ }
+ 
+ void PageHandler::HandleSend(const base::ListValue& args) {
+-  CHECK_EQ(args.size(), 3u);
++  CHECK(args.size() == 3u || args.size() == 4u);
+   AllowJavascript();
+   const int send_id = args[0].GetInt();
+   const base::ListValue& list = args[1].GetList();
+@@ -376,6 +417,21 @@ void PageHandler::HandleSend(const base:
+     }
+     send->tab_ids.push_back(value.GetInt());
+   }
++  // Text files the user picked. The page has already read them.
++  const base::ListValue empty;
++  const base::ListValue* files =
++      args.size() == 4u && args[3].is_list() ? &args[3].GetList() : &empty;
++  for (const base::Value& value : *files) {
++    const base::DictValue* dict = value.GetIfDict();
++    const std::string* name = dict ? dict->FindString("name") : nullptr;
++    const std::string* text = dict ? dict->FindString("text") : nullptr;
++    if (!name || !text || send->pages.size() >= kMaxAttachedFiles ||
++        text->size() > kMaxFileChars || !base::IsStringUTF8(*name) ||
++        !base::IsStringUTF8(*text)) {
++      return;
++    }
++    send->pages.push_back({*name, std::string(), *text});
++  }
+ 
+   StopSession();
+   active_send_id_ = send_id;
+@@ -514,6 +570,167 @@ void PageHandler::HandleClosePanel(const
+           browser->GetWeakPtr()));
+ }
+ 
++void PageHandler::HandleGetModels(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 1u);
++  AllowJavascript();
++  auto query = std::make_unique<ModelQuery>();
++  query->callback_id = args[0].Clone();
++  if (AiService* service = AiServiceFactory::GetForProfile(profile_)) {
++    PrefService* prefs = profile_->GetPrefs();
++    const std::string active = prefs->GetString(kProvider);
++    const base::DictValue& saved = prefs->GetDict(kProviderSettings);
++    for (const ProviderInfo& info : GetProviders()) {
++      if (info.id != active && !saved.Find(info.id)) {
++        continue;
++      }
++      if (info.requires_key && !service->key_store().HasKey(info.id)) {
++        continue;
++      }
++      const ProviderSettings settings = GetProviderSettings(prefs, info.id);
++      if (settings.base_url.empty()) {
++        continue;
++      }
++      ModelQuery::Entry entry;
++      entry.id = info.id;
++      entry.name = info.name;
++      entry.base_url = settings.base_url;
++      entry.local = !info.requires_key;
++      if (!settings.model.empty()) {
++        entry.models.push_back(settings.model);
++      }
++      query->entries.push_back(std::move(entry));
++    }
++  }
++  ListNextModels(std::move(query));
++}
++
++void PageHandler::ListNextModels(std::unique_ptr<ModelQuery> query) {
++  AiService* service = AiServiceFactory::GetForProfile(profile_);
++  while (service && query->next < query->entries.size()) {
++    if (query->entries[query->next].local) {
++      const std::string base_url = query->entries[query->next].base_url;
++      FetchModelList(service->url_loader_factory(), base_url,
++                     base::BindOnce(&PageHandler::OnModelsListed,
++                                    weak_factory_.GetWeakPtr(),
++                                    std::move(query)));
++      return;
++    }
++    ++query->next;
++  }
++  if (!IsJavascriptAllowed()) {
++    return;
++  }
++  PrefService* prefs = profile_->GetPrefs();
++  const std::string active = prefs->GetString(kProvider);
++  base::ListValue providers;
++  for (ModelQuery::Entry& entry : query->entries) {
++    base::ListValue models;
++    for (std::string& model : entry.models) {
++      models.Append(std::move(model));
++    }
++    providers.Append(base::DictValue()
++                         .Set("id", entry.id)
++                         .Set("name", entry.name)
++                         .Set("models", std::move(models)));
++  }
++  ResolveJavascriptCallback(
++      query->callback_id,
++      base::DictValue()
++          .Set("provider", active)
++          .Set("model", GetProviderSettings(prefs, active).model)
++          .Set("providers", std::move(providers)));
++}
++
++void PageHandler::OnModelsListed(std::unique_ptr<ModelQuery> query,
++                                 std::vector<std::string> models) {
++  ModelQuery::Entry& entry = query->entries[query->next];
++  for (std::string& model : models) {
++    if (entry.models.size() < kMaxListedModels &&
++        std::ranges::find(entry.models, model) == entry.models.end()) {
++      entry.models.push_back(std::move(model));
++    }
++  }
++  ++query->next;
++  ListNextModels(std::move(query));
++}
++
++void PageHandler::HandleSelectModel(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 2u);
++  const std::string* provider_id = args[0].GetIfString();
++  const std::string* model = args[1].GetIfString();
++  const ProviderInfo* info =
++      provider_id ? FindProvider(*provider_id) : nullptr;
++  if (!AiServiceFactory::GetForProfile(profile_) || !info || !model ||
++      model->empty() || model->size() > kMaxModelChars ||
++      !base::IsStringUTF8(*model)) {
++    return;
++  }
++  PrefService* prefs = profile_->GetPrefs();
++  ProviderSettings settings = GetProviderSettings(prefs, info->id);
++  settings.model = *model;
++  SetProviderSettings(prefs, info->id, settings);
++  prefs->SetString(kProvider, info->id);
++}
++
++void PageHandler::HandleMakeTitle(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 3u);
++  AllowJavascript();
++  // Only the newest chat gets a title.
++  FinishTitle(base::Value());
++  title_callback_ = args[0].Clone();
++  AiService* service = AiServiceFactory::GetForProfile(profile_);
++  const std::string* question = args[1].GetIfString();
++  const std::string* answer = args[2].GetIfString();
++  if (!service || !question || !answer || question->empty()) {
++    FinishTitle(base::Value());
++    return;
++  }
++  std::string cut_question;
++  std::string cut_answer;
++  base::TruncateUTF8ToByteSize(*question, kMaxTitleSourceChars,
++                               &cut_question);
++  base::TruncateUTF8ToByteSize(*answer, kMaxTitleSourceChars, &cut_answer);
++  ChatRequest request;
++  request.system_prompt = kTitlePrompt;
++  request.messages.push_back(
++      {ChatMessage::Role::kUser,
++       base::StrCat({"Question:\n", cut_question, "\n\nAnswer:\n",
++                     cut_answer})});
++  title_text_.clear();
++  title_session_ = std::make_unique<ChatSession>(
++      service, std::move(request),
++      base::BindRepeating(&PageHandler::OnTitleUpdate,
++                          weak_factory_.GetWeakPtr()));
++  title_session_->Start();
++}
++
++void PageHandler::OnTitleUpdate(StreamUpdate update) {
++  if (title_callback_.is_none()) {
++    return;
++  }
++  if (title_text_.size() < kMaxTitleReplyChars) {
++    title_text_ += update.text_delta;
++  }
++  if (update.error) {
++    FinishTitle(base::Value());
++  } else if (update.done) {
++    std::string title = CleanGeneratedTitle(title_text_);
++    FinishTitle(title.empty() ? base::Value() : base::Value(std::move(title)));
++  }
++}
++
++// Leaves `title_session_` alone: this can run inside its callback.
++void PageHandler::FinishTitle(base::Value title) {
++  if (title_callback_.is_none()) {
++    return;
++  }
++  base::Value callback_id = std::move(title_callback_);
++  title_callback_ = base::Value();
++  if (IsJavascriptAllowed()) {
++    ResolveJavascriptCallback(callback_id, title);
++  }
++}
++
+ namespace {
+ 
+ // The page wants a plain millisecond timestamp, not the stored form.
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+@@ -59,6 +59,7 @@ class PageHandler : public content::WebU
+  private:
+   class TabObserver;
+   struct PendingSend;
++  struct ModelQuery;
+ 
+   void HandleInit(const base::ListValue& args);
+   void HandleGetTabs(const base::ListValue& args);
+@@ -76,6 +77,14 @@ class PageHandler : public content::WebU
+   void HandlePromptsGet(const base::ListValue& args);
+   void HandlePromptAdd(const base::ListValue& args);
+   void HandlePromptRemove(const base::ListValue& args);
++  void HandleGetModels(const base::ListValue& args);
++  void HandleSelectModel(const base::ListValue& args);
++  void HandleMakeTitle(const base::ListValue& args);
++  void ListNextModels(std::unique_ptr<ModelQuery> query);
++  void OnModelsListed(std::unique_ptr<ModelQuery> query,
++                      std::vector<std::string> models);
++  void OnTitleUpdate(StreamUpdate update);
++  void FinishTitle(base::Value title);
+   void OnHistoryList(base::Value callback_id,
+                      std::vector<Conversation> conversations);
+   void OnHistoryGet(base::Value callback_id,
+@@ -108,6 +117,11 @@ class PageHandler : public content::WebU
+   PrefChangeRegistrar pref_registrar_;
+   std::unique_ptr<ChatSession> session_;
+   int active_send_id_ = 0;
++  // Names a finished chat. Separate from `session_`, so the next message
++  // doesn't cancel it.
++  std::unique_ptr<ChatSession> title_session_;
++  base::Value title_callback_;
++  std::string title_text_;
+   base::CallbackListSubscription active_tab_subscription_;
+   std::unique_ptr<TabObserver> tab_observer_;
+   base::ScopedObservation<SpacesWindowManager, SpacesWindowManager::Observer>
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+@@ -30,9 +30,9 @@ struct Str {
+ // English only for now; rac has no translation pipeline yet.
+ constexpr Str kStrings[] = {
+     {"title", "Assistant"},
+-    {"placeholder", "Ask a question"},
+-    {"placeholderPage", "Ask a question about this page"},
+-    {"placeholderNext", "Ask another question"},
++    {"placeholder", "Ask a question\u2026"},
++    {"placeholderPage", "Ask a question about this page\u2026"},
++    {"placeholderNext", "Ask another question\u2026"},
+     {"errorTitle", "The assistant couldn't respond."},
+     {"copyMessage", "Copy message"},
+     {"copyCode", "Copy code"},
+@@ -53,24 +53,29 @@ constexpr Str kStrings[] = {
+     {"disabled", "The assistant is turned off."},
+     {"thinking", "Thinking"},
+     {"you", "You"},
+-    {"attach", "Add a tab"},
+-    {"addCurrent", "Add the current tab"},
+-    {"noTabs", "No other tabs to add"},
+-    {"removeTab", "Remove tab"},
++    {"attach", "Add tabs or files"},
++    {"remove", "Remove"},
+     {"attachFailed", "Couldn't read:"},
+     {"newTabTitle", "New Tab"},
+-    {"history", "Chats and prompts"},
+     {"close", "Close"},
+-    {"tabChats", "Chats"},
+-    {"tabPrompts", "Prompts"},
++    {"searchTabs", "Search tabs"},
++    {"sectionTabs", "Tabs"},
++    {"noMatches", "No matching tabs"},
++    {"allTabs", "All open tabs"},
++    {"allHostTabs", "All open $1 tabs"},
++    {"sectionFiles", "Files"},
++    {"uploadFile", "Upload file from computer"},
++    {"file", "File"},
++    {"fileNotText", "Only text files can be added for now."},
++    {"fileTooBig", "That file is too big to add."},
++    {"tooManyAttached", "That's as many as one message can take."},
++    {"chats", "Chats"},
++    {"untitled", "New chat"},
+     {"noChats", "No saved chats yet."},
+     {"historyOff", "Chats aren't being saved."},
+-    {"noPrompts", "No saved prompts yet."},
+-    {"saveHistory", "Save chats on this device"},
+-    {"clearAll", "Delete all chats"},
+-    {"confirmAgain", "Click again to delete"},
+     {"deleteItem", "Delete"},
+-    {"savePrompt", "Save the message as a prompt"},
++    {"chooseModel", "Choose a model"},
++    {"loadingModels", "Looking for models\u2026"},
+ };
+ 
+ }  // namespace
+Index: src/chrome/browser/rac/ai/chat_protocol.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/chat_protocol.cc
++++ src/chrome/browser/rac/ai/chat_protocol.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/rac/ai/chat_protocol.h"
+ 
++#include <algorithm>
+ #include <string_view>
+ 
+ #include "base/json/json_reader.h"
+@@ -14,6 +15,8 @@
+ namespace rac::ai {
+ namespace {
+ 
++constexpr size_t kMaxModelIdChars = 200;
++
+ constexpr int kAnthropicMaxTokens = 8192;
+ 
+ const char* RoleName(ChatMessage::Role role) {
+@@ -181,4 +184,28 @@ std::string ExtractErrorMessage(std::str
+   return ErrorFromDict(*dict).value_or(std::string());
+ }
+ 
++std::vector<std::string> ParseModelList(std::string_view json) {
++  std::vector<std::string> ids;
++  std::optional<base::DictValue> dict =
++      base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC);
++  const base::ListValue* data = dict ? dict->FindList("data") : nullptr;
++  if (!data) {
++    return ids;
++  }
++  for (const base::Value& entry : *data) {
++    const base::DictValue* model = entry.GetIfDict();
++    const std::string* id = model ? model->FindString("id") : nullptr;
++    if (!id || id->empty() || id->size() > kMaxModelIdChars ||
++        !base::IsStringUTF8(*id) ||
++        std::ranges::find(ids, *id) != ids.end()) {
++      continue;
++    }
++    ids.push_back(*id);
++    if (ids.size() >= kMaxListedModels) {
++      break;
++    }
++  }
++  return ids;
++}
++
+ }  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/chat_protocol.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/chat_protocol.h
++++ src/chrome/browser/rac/ai/chat_protocol.h
+@@ -7,6 +7,7 @@
+ 
+ #include <optional>
+ #include <string>
++#include <string_view>
+ #include <utility>
+ #include <vector>
+ 
+@@ -68,6 +69,12 @@ class StreamDecoder {
+ // returns an empty string.
+ std::string ExtractErrorMessage(std::string_view body);
+ 
++inline constexpr size_t kMaxListedModels = 50;
++
++// Model ids from an OpenAI-compatible `GET /models` body, in the server's
++// order. Ids that are empty, too long or repeated are skipped.
++std::vector<std::string> ParseModelList(std::string_view json);
++
+ }  // namespace rac::ai
+ 
+ #endif  // CHROME_BROWSER_RAC_AI_CHAT_PROTOCOL_H_
+Index: src/chrome/browser/rac/ai/chat_protocol_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/chat_protocol_unittest.cc
++++ src/chrome/browser/rac/ai/chat_protocol_unittest.cc
+@@ -4,7 +4,11 @@
+ 
+ #include "chrome/browser/rac/ai/chat_protocol.h"
+ 
++#include <string>
++#include <vector>
++
+ #include "base/json/json_reader.h"
++#include "base/strings/string_number_conversions.h"
+ #include "chrome/browser/rac/ai/providers.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+@@ -166,4 +170,36 @@ TEST(RacAiProvidersTest, EveryDefaultIsU
+   }
+ }
+ 
++TEST(RacAiModelListTest, ReadsIdsInOrder) {
++  EXPECT_EQ(ParseModelList(R"({"object":"list","data":[{"id":"llama3"},
++      {"id":"qwen3:8b","object":"model"}]})"),
++            (std::vector<std::string>{"llama3", "qwen3:8b"}));
++}
++
++TEST(RacAiModelListTest, SkipsBadAndRepeatedIds) {
++  EXPECT_EQ(ParseModelList(R"({"data":[{"id":""},{"id":7},"llama3",
++      {"name":"x"},{"id":"a"},{"id":"a"},{"id":"b"}]})"),
++            (std::vector<std::string>{"a", "b"}));
++  EXPECT_EQ(ParseModelList(
++                R"({"data":[{"id":")" + std::string(201, 'x') + R"("}]})"),
++            std::vector<std::string>());
++}
++
++TEST(RacAiModelListTest, IgnoresOtherBodies) {
++  EXPECT_TRUE(ParseModelList("").empty());
++  EXPECT_TRUE(ParseModelList("<html></html>").empty());
++  EXPECT_TRUE(ParseModelList(R"({"data":{"id":"a"}})").empty());
++  EXPECT_TRUE(ParseModelList(R"([{"id":"a"}])").empty());
++}
++
++TEST(RacAiModelListTest, StopsAtTheLimit) {
++  std::string json = R"({"data":[)";
++  for (size_t i = 0; i < kMaxListedModels + 5; ++i) {
++    json += (i ? "," : "") + std::string(R"({"id":"m)") +
++            base::NumberToString(i) + R"("})";
++  }
++  json += "]}";
++  EXPECT_EQ(ParseModelList(json).size(), kMaxListedModels);
++}
++
+ }  // namespace rac::ai

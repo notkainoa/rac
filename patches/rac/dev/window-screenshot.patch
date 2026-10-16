@@ -1,0 +1,403 @@
+Index: src/chrome/browser/ui/views/frame/browser_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view.cc
++++ src/chrome/browser/ui/views/frame/browser_view.cc
+@@ -207,6 +207,7 @@
+ #include "chrome/browser/ui/views/profiles/profile_menu_coordinator.h"
+ #include "chrome/browser/ui/views/qrcode_generator/qrcode_generator_bubble.h"
+ #include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h"
++#include "chrome/browser/ui/views/rac/window_screenshot.h"
+ #include "chrome/browser/ui/views/send_tab_to_self/send_tab_to_self_bubble_view.h"
+ #include "chrome/browser/ui/views/send_tab_to_self/send_tab_to_self_device_picker_bubble_view.h"
+ #include "chrome/browser/ui/views/send_tab_to_self/send_tab_to_self_promo_bubble_view.h"
+@@ -2363,6 +2364,7 @@ void BrowserView::Show() {
+   }
+ 
+   OnWindowDidShow();
++  rac::MaybeScheduleWindowScreenshot(GetWidget());
+ 
+   // The fullscreen transition clears out focus, but there are some cases (for
+   // example, new window in Mac fullscreen with toolbar showing) where we need
+Index: src/chrome/browser/ui/views/rac/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/BUILD.gn
++++ src/chrome/browser/ui/views/rac/BUILD.gn
+@@ -10,6 +10,8 @@ source_set("look") {
+     "rac_look.h",
+     "top_bar.cc",
+     "top_bar.h",
++    "window_screenshot.h",
++    "window_screenshot.mm",
+   ]
+ 
+   deps = [
+@@ -22,11 +24,14 @@ source_set("look") {
+     "//chrome/browser/ui/color:color_headers",
+     "//chrome/browser/ui/rac:sidebar_address_bar_prefs",
+     "//components/prefs",
++    "//components/viz/common",
+     "//components/vector_icons",
+     "//content/public/browser",
+     "//skia",
+     "//ui/color",
++    "//ui/compositor",
+     "//ui/gfx",
++    "//ui/gfx/codec",
+     "//ui/gfx/geometry",
+     "//ui/views",
+   ]
+Index: src/chrome/browser/ui/views/rac/window_screenshot.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/rac/window_screenshot.h
+@@ -0,0 +1,23 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_WINDOW_SCREENSHOT_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_WINDOW_SCREENSHOT_H_
++
++namespace views {
++class Widget;
++}
++
++namespace rac {
++
++// If launched with --rac-window-screenshot=PATH, paints this window's views
++// after the first layout and writes a PNG. No-op otherwise.
++//
++// Agents use this on macOS 26, where screencapture / ScreenCaptureKit of
++// another process (and often this one) returns a blank image.
++void MaybeScheduleWindowScreenshot(views::Widget* widget);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_WINDOW_SCREENSHOT_H_
+Index: src/chrome/browser/ui/views/rac/window_screenshot.mm
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/rac/window_screenshot.mm
+@@ -0,0 +1,322 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/window_screenshot.h"
++
++#import <Cocoa/Cocoa.h>
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/command_line.h"
++#include "base/containers/span.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/memory/weak_ptr.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/strings/sys_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "base/time/time.h"
++#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "components/viz/common/frame_sinks/copy_output_request.h"
++#include "components/viz/common/frame_sinks/copy_output_result.h"
++#include "skia/ext/skia_utils_mac.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "third_party/skia/include/core/SkCanvas.h"
++#include "third_party/skia/include/core/SkImage.h"
++#include "ui/compositor/compositor.h"
++#include "ui/compositor/layer.h"
++#include "ui/gfx/codec/png_codec.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/views/view.h"
++#include "ui/views/widget/widget.h"
++
++namespace rac {
++namespace {
++
++constexpr char kWindowScreenshotSwitch[] = "rac-window-screenshot";
++constexpr char kWindowScreenshotDelaySwitch[] = "rac-window-screenshot-delay";
++// A browser command ID to run halfway to the screenshot, e.g. to open a
++// panel in a layout with no button for it.
++constexpr char kWindowScreenshotCommandSwitch[] =
++    "rac-window-screenshot-command";
++constexpr base::TimeDelta kAttemptDelay = base::Seconds(2);
++// A file to poll for more screenshots after the first. Writing a PNG path
++// into it captures the window to that path, so a test can drive the window
++// and look at it as often as it needs. See OnRequest() for hit testing.
++constexpr char kWindowScreenshotRequestSwitch[] =
++    "rac-window-screenshot-requests";
++constexpr base::TimeDelta kRequestPollInterval = base::Milliseconds(250);
++
++void WriteBytes(const base::FilePath& path, std::vector<uint8_t> bytes) {
++  if (bytes.empty()) {
++    LOG(ERROR) << "rac window screenshot empty, not writing " << path;
++    return;
++  }
++  if (!base::WriteFile(path, base::span<const uint8_t>(bytes))) {
++    LOG(ERROR) << "rac window screenshot write failed: " << path;
++    return;
++  }
++  LOG(ERROR) << "rac window screenshot wrote " << path << " (" << bytes.size()
++             << " bytes)";
++}
++
++bool CaptureNSView(views::Widget* widget, const base::FilePath& path) {
++  NSWindow* window = widget->GetNativeWindow().GetNativeNSWindow();
++  if (!window) {
++    return false;
++  }
++  NSView* view = window.contentView.superview ?: window.contentView;
++  if (!view) {
++    return false;
++  }
++  const NSRect bounds = view.bounds;
++  NSBitmapImageRep* rep = [view bitmapImageRepForCachingDisplayInRect:bounds];
++  if (!rep) {
++    return false;
++  }
++  [view cacheDisplayInRect:bounds toBitmapImageRep:rep];
++  NSData* data = [rep representationUsingType:NSBitmapImageFileTypePNG
++                                   properties:@{}];
++  if (!data || data.length == 0) {
++    return false;
++  }
++  const auto* bytes = static_cast<const uint8_t*>(data.bytes);
++  std::vector<uint8_t> png(bytes, bytes + data.length);
++  base::ThreadPool::PostTask(FROM_HERE, {base::MayBlock()},
++                             base::BindOnce(&WriteBytes, path, std::move(png)));
++  return true;
++}
++
++// The traffic lights are AppKit views above the compositor, so the copy
++// misses them. Paint each one where it sits in the window.
++void DrawWindowButtons(views::Widget* widget, SkBitmap* bitmap) {
++  NSWindow* window = widget->GetNativeWindow().GetNativeNSWindow();
++  NSView* content = window.contentView;
++  if (!content || content.bounds.size.width <= 0) {
++    return;
++  }
++  const CGFloat scale = bitmap->width() / content.bounds.size.width;
++  const CGFloat height = content.bounds.size.height;
++  SkCanvas canvas(*bitmap);
++  for (NSWindowButton type :
++       {NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton}) {
++    NSButton* button = [window standardWindowButton:type];
++    if (!button || button.hidden || !button.window) {
++      continue;
++    }
++    NSBitmapImageRep* rep =
++        [button bitmapImageRepForCachingDisplayInRect:button.bounds];
++    if (!rep) {
++      continue;
++    }
++    [button cacheDisplayInRect:button.bounds toBitmapImageRep:rep];
++    const SkBitmap image = skia::CGImageToSkBitmap(rep.CGImage);
++    if (image.drawsNothing()) {
++      continue;
++    }
++    const NSRect frame = [button convertRect:button.bounds toView:nil];
++    const SkRect dest =
++        SkRect::MakeXYWH(frame.origin.x * scale,
++                         (height - frame.origin.y - frame.size.height) * scale,
++                         frame.size.width * scale, frame.size.height * scale);
++    canvas.drawImageRect(image.asImage(), dest, SkSamplingOptions());
++  }
++}
++
++void CaptureCompositor(base::WeakPtr<views::Widget> widget,
++                       const base::FilePath& path) {
++  if (!widget || widget->IsClosed() || !widget->GetCompositor() ||
++      !widget->GetCompositor()->root_layer()) {
++    LOG(ERROR) << "rac window screenshot: no compositor layer";
++    return;
++  }
++
++  ui::Layer* layer = widget->GetCompositor()->root_layer();
++  const gfx::Rect area(layer->size());
++  auto request = std::make_unique<viz::CopyOutputRequest>(
++      viz::CopyOutputRequest::ResultFormat::RGBA,
++      viz::CopyOutputRequest::ResultDestination::kSystemMemory,
++      base::BindOnce(
++          [](base::WeakPtr<views::Widget> widget, const base::FilePath& path,
++             std::unique_ptr<viz::CopyOutputResult> result) {
++            if (!result || result->IsEmpty()) {
++              LOG(ERROR) << "rac window screenshot: compositor copy empty";
++              if (widget) {
++                CaptureNSView(widget.get(), path);
++              }
++              return;
++            }
++            SkBitmap bitmap =
++                result->ScopedAccessSkBitmap().GetOutScopedBitmap();
++            if (widget) {
++              DrawWindowButtons(widget.get(), &bitmap);
++            }
++            LOG(ERROR) << "rac window screenshot: compositor bitmap "
++                       << bitmap.width() << "x" << bitmap.height();
++            std::optional<std::vector<uint8_t>> png =
++                gfx::PNGCodec::EncodeBGRASkBitmap(
++                    bitmap, /*discard_transparency=*/false);
++            if (!png) {
++              LOG(ERROR) << "rac window screenshot: PNG encode failed";
++              return;
++            }
++            base::ThreadPool::PostTask(
++                FROM_HERE, {base::MayBlock()},
++                base::BindOnce(&WriteBytes, path, std::move(*png)));
++          },
++          widget, path));
++  request->set_area(area);
++  layer->RequestCopyOfOutput(std::move(request));
++  widget->GetCompositor()->ScheduleFullRedraw();
++  widget->GetCompositor()->ScheduleDraw();
++  LOG(ERROR) << "rac window screenshot: compositor copy requested "
++             << area.ToString();
++}
++
++void Capture(base::WeakPtr<views::Widget> widget, base::FilePath path) {
++  if (!widget || widget->IsClosed()) {
++    LOG(ERROR) << "rac window screenshot: widget gone";
++    return;
++  }
++  // NSView cacheDisplayInRect only gets the traffic lights on a GPU window.
++  // Copy the compositor's root layer instead.
++  if (widget->GetCompositor() && widget->GetCompositor()->root_layer()) {
++    CaptureCompositor(widget, path);
++    return;
++  }
++  LOG(ERROR) << "rac window screenshot: no compositor, trying NSView";
++  if (!CaptureNSView(widget.get(), path)) {
++    LOG(ERROR) << "rac window screenshot failed";
++  }
++}
++
++std::optional<base::FilePath> TakeRequest(const base::FilePath& requests) {
++  std::string contents;
++  if (!base::ReadFileToString(requests, &contents)) {
++    return std::nullopt;
++  }
++  base::DeleteFile(requests);
++  std::string_view path = base::TrimWhitespaceASCII(contents, base::TRIM_ALL);
++  if (path.empty()) {
++    return std::nullopt;
++  }
++  return base::FilePath(path);
++}
++
++void PollRequests(base::WeakPtr<views::Widget> widget, base::FilePath requests);
++
++void OnRequest(base::WeakPtr<views::Widget> widget,
++               base::FilePath requests,
++               std::optional<base::FilePath> path) {
++  if (!widget || widget->IsClosed()) {
++    return;
++  }
++  // "hit X Y OUT" writes the views that a click at window point X,Y goes to,
++  // which is how AppKit decides between the views and the page under them.
++  std::vector<std::string> hit =
++      base::SplitString(path ? path->value() : std::string(), " ",
++                        base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++  int x = 0;
++  int y = 0;
++  if (hit.size() == 4 && hit[0] == "hit" && base::StringToInt(hit[1], &x) &&
++      base::StringToInt(hit[2], &y)) {
++    std::string chain;
++    for (views::View* view =
++             widget->GetRootView()->GetEventHandlerForPoint(gfx::Point(x, y));
++         view; view = view->parent()) {
++      chain += std::string(view->GetClassName()) + "\n";
++    }
++    base::ThreadPool::PostTask(
++        FROM_HERE, {base::MayBlock()},
++        base::BindOnce([](base::FilePath out,
++                          std::string chain) { base::WriteFile(out, chain); },
++                       base::FilePath(hit[3]), std::move(chain)));
++  } else if (path) {
++    Capture(widget, *path);
++  }
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE, base::BindOnce(&PollRequests, widget, requests),
++      kRequestPollInterval);
++}
++
++void PollRequests(base::WeakPtr<views::Widget> widget,
++                  base::FilePath requests) {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock()}, base::BindOnce(&TakeRequest, requests),
++      base::BindOnce(&OnRequest, widget, requests));
++}
++
++void RunCommand(base::WeakPtr<views::Widget> widget, int command_id) {
++  if (!widget || widget->IsClosed()) {
++    return;
++  }
++  if (BrowserView* browser_view = BrowserView::GetBrowserViewForNativeWindow(
++          widget->GetNativeWindow())) {
++    chrome::ExecuteCommand(browser_view->browser(), command_id);
++  }
++}
++
++}  // namespace
++
++void MaybeScheduleWindowScreenshot(views::Widget* widget) {
++  const base::FilePath path =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValuePath(
++          kWindowScreenshotSwitch);
++  if (path.empty() || !widget) {
++    return;
++  }
++
++  // Spaces and session restore settle after the first paint, so callers can
++  // ask for a later frame.
++  base::TimeDelta delay = kAttemptDelay;
++  int seconds = 0;
++  if (base::StringToInt(
++          base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++              kWindowScreenshotDelaySwitch),
++          &seconds) &&
++      seconds > 0) {
++    delay = base::Seconds(seconds);
++  }
++
++  int command_id = 0;
++  if (base::StringToInt(
++          base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++              kWindowScreenshotCommandSwitch),
++          &command_id) &&
++      command_id > 0) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(&RunCommand, widget->GetWeakPtr(), command_id),
++        delay / 2);
++  }
++
++  LOG(ERROR) << "rac window screenshot scheduled -> " << path;
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE, base::BindOnce(&Capture, widget->GetWeakPtr(), path), delay);
++
++  // Only the first window answers requests, so two never race for one.
++  static bool polling = false;
++  const base::FilePath requests =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValuePath(
++          kWindowScreenshotRequestSwitch);
++  if (!requests.empty() && !polling) {
++    polling = true;
++    // A test drives the window with the real mouse. A floating window level
++    // would keep it on top too, but would hide its popups behind it.
++    [NSApp activate];
++    base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(&PollRequests, widget->GetWeakPtr(), requests), delay);
++  }
++}
++
++}  // namespace rac
