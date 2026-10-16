@@ -58,7 +58,9 @@ takes several hours.
 ## Contributing
 
 Contributions are welcome, including AI-assisted ones, as long as they're
-tested and shown working. Read [CONTRIBUTING.md](CONTRIBUTING.md). Bugs,
+run in a real build and shown with screenshots. Agents test it themselves;
+they don't hand first look to the maintainer. Read
+[CONTRIBUTING.md](CONTRIBUTING.md). Bugs,
 ideas, and questions all go in [Issues](https://github.com/notkainoa/rac/issues).
 
 ## Credits

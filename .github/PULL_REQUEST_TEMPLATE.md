@@ -11,10 +11,13 @@ they belong in the same PR. Unrelated fixes go in separate PRs. -->
 ## Verification
 
 <!-- How you tested this in a real rac build, and what you saw. Say what you
-couldn't check. "It builds" alone isn't enough.
+couldn't check. "It builds" alone isn't enough. Agents must run the build
+themselves and attach screenshots; do not ask the maintainer to take first
+look.
 
-UI changes: before and after screenshots.
+UI changes: before and after screenshots of the running window.
 Motion, timing, or interaction: a short video.
+On macOS 26, launch with `--rac-window-screenshot=/absolute/path.png`.
 Attach these here; don't commit them to the repo. -->
 
 ## Checklist

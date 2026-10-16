@@ -41,7 +41,11 @@ applies rac's names to the dev tree (see
 - Run with `devutils/rac/worktree.sh run`, not `he run`. `he run` uses
   one shared dev profile. If two builds launch with the same profile, the
   second one only opens a window in the browser that's already running.
-  `run` gives each worktree its own profile in `build/profile`.
+  `run` gives each worktree its own profile in `build/profile`. Extra
+  flags pass through, including `--rac-window-screenshot=/path.png` for
+  an in-process PNG of the window (needed on macOS 26). Agents attach
+  those screenshots when the work is done; they don't hand first look
+  to the maintainer.
 - Make patches with the quilt workflow in
   [overview.md](../internals/overview.md#making-a-rac-change). Commit after
   `he unmerge`, then run `he merge` to keep working.

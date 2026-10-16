@@ -5,7 +5,9 @@ Start with the [vision](../VISION.md) to learn what rac is and isn't, then the
 
 ## Working on rac
 
-- [Contributing](../CONTRIBUTING.md): how to propose and submit changes
+- [Contributing](../CONTRIBUTING.md): how to propose and submit changes.
+  Agents test in a real build and attach screenshots; they don't hand first
+  look to the maintainer. See [AGENTS.md](../AGENTS.md#verifying).
 - [Building](building.md): requirements, release builds, and the `he` dev
   tool. This file comes from Helium, so it says "Helium" and `helium-macos`.
   For rac, use this repo instead.

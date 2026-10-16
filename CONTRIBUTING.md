@@ -69,10 +69,15 @@ The rules that matter most:
 - **One problem per PR.** If you're fixing two unrelated things, open two
   PRs.
 - **Build it and run it.** Exercise the changed behavior in a real rac
-  build. Say what you checked and what you couldn't check.
-- **Show it.** UI changes need before and after screenshots. Changes
-  involving motion, timing, or interaction need a short video. Attach these
-  to the PR; don't commit them to the repo.
+  build. Agents run it themselves and attach screenshots in the reply;
+  they don't ask the maintainer to take first look. Say what you checked
+  and what you couldn't check.
+- **Show it.** UI changes need before and after screenshots of the running
+  window. Changes involving motion, timing, or interaction need a short
+  video. Attach these to the PR (and embed them in the agent reply);
+  don't commit them to the repo. On macOS 26, launch with
+  `--rac-window-screenshot=/absolute/path.png` so the app writes its own
+  window; `screencapture -l` of another process is blank.
 - **Explain it.** Describe the problem, then how your change fixes it.
 - **Commit titles** use conventional commits, such as
   `feat(spaces): add space switcher dots` or
@@ -82,7 +87,8 @@ The rules that matter most:
 ## Using AI
 
 AI-assisted contributions are welcome. The same rules apply as for any PR:
-you must understand the change, test it yourself, and include the evidence.
+you must understand the change, run it yourself, and include screenshots
+of the running window. Don't ask the maintainer to take first look.
 At the end of the PR description, say which model and tool you used. If your
 agent reads repo instructions, point it at [AGENTS.md](AGENTS.md).
 

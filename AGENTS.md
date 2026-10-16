@@ -157,27 +157,41 @@ done, go through this list and say which items applied:
 - **AI off.** Once AI exists, the feature must work, and cost nothing, with
   AI turned off.
 - **Docs.** Check whether the change makes existing docs wrong.
+- **Proof.** When the change is visible, your reply includes screenshots
+  of the surfaces you actually opened. See [Verifying](#verifying).
 
 ## Verifying
 
-- Prove the change works with the smallest check that shows it: build and
-  run with `he build && he run` (`devutils/rac/worktree.sh run` in a
-  worktree), then exercise the changed behavior.
-- For UI changes, capture before and after screenshots. For motion, timing,
-  or interaction, capture a short video.
+You test it. The maintainer does not take first look. A reply that says
+"ready to test" without screenshots of the running build is unfinished.
+
+- Build and run it yourself: `he build && he run` in the main checkout,
+  `devutils/rac/worktree.sh run` in a worktree. Never `open` rac.app
+  (Launch Services can start the installed copy against a real profile).
+- Exercise the changed behavior in that process. Cover the surfaces in
+  [Cover every surface](#cover-every-surface) that apply.
+- **UI changes must ship with screenshots in your reply**, as markdown
+  images with absolute paths. Before and after when the change is visual.
+  Motion, timing, or interaction: a short video as well. Embed the files;
+  don't only link them, and don't commit them to the repo.
+- On macOS 26, `screencapture -l` of another app is blank. Launch with
+  `--rac-window-screenshot=/absolute/path.png` so rac writes its own
+  window after the first paint. Wait until that PNG has real pixels
+  (not a transparent or all-black frame), then embed it.
 - Run `he validate series` after changing `patches/series`.
-- Don't run Chromium's full test suites. If a change has focused unit tests,
-  run only those.
+- Don't run Chromium's full test suites. If a change has focused unit
+  tests, run only those.
 - Ask before driving the browser with computer-use or automation tools.
+  Asking is not a substitute for the screenshots above.
 
-## Handing off for testing
+## Showing the maintainer
 
-When a feature is done, or you want the maintainer to try something, make it
-one command away. Build first, so the maintainer only has to run it, and
-quit any browser you launched. Then send a message like this:
+After you have already run it and attached screenshots, you can still
+leave a one-command path so the maintainer can poke at it. Build first,
+quit any browser you launched, and use this shape:
 
 ```md
-**Ready to test: <feature>**
+**I tested: <feature>**
 
 Worktree: `<absolute path>` (branch `<branch>`)
 
@@ -186,12 +200,9 @@ Worktree: `<absolute path>` (branch `<branch>`)
 
 **What changed:** <what a user will notice, in plain words>
 
-**Try this:**
-1. <a concrete step, such as "Press Cmd+S twice">
-2. <...>
+**What I ran:** <the exact layout, pages, and sidebar states you opened>
 
-**You should see:** <the expected result for each step, and what looks
-different from rac today>
+**Screenshots:** <embedded images of the running window>
 
 **Not done yet:** <known gaps, surfaces you couldn't check, rough edges>
 ```
@@ -199,12 +210,12 @@ different from rac today>
 - Give the exact commands with the real path, ready to paste. If the
   maintainer needs to rebuild, include `source dev.sh && he build` first.
 - Write the steps for someone who hasn't read the code. Name the menus,
-  shortcuts, and settings to use.
+  shortcuts, and settings you used.
 - Cover the surfaces from [Cover every surface](#cover-every-surface) that
   apply, such as sidebar states, dark mode, and multiple windows.
 - Each worktree's browser starts with an empty profile in `build/profile`
-  that persists between runs. Say so if testing needs setup first, such as
-  opening several tabs or creating a second space.
+  that persists between runs. Say so if the shots needed setup first, such
+  as opening several tabs or creating a second space.
 - To compare with rac today, the maintainer can run `he run` in the main
   checkout at the same time.
 
