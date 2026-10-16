@@ -76,11 +76,10 @@ and improved continuously. Everyone else is welcome, especially:
 ### The sidebar
 
 - Tabs live in a vertical sidebar, building on Helium's vertical layout.
-- **Cmd+S fully hides and shows the sidebar** by default. A setting switches
-  Cmd+S back to Helium's behavior, which collapses the sidebar to a compact
-  strip of site icons.
-- Moving the mouse to the left edge of the screen shows the full sidebar
-  over the page, whether it's hidden or compact. Moving it to the top edge
+- **Cmd+S turns frameless mode on and off**, which fully hides and shows the
+  sidebar.
+- While the sidebar is hidden, moving the mouse to the left edge of the
+  screen shows the full sidebar over the page. Moving it to the top edge
   reveals the hidden toolbar. This builds on Helium's existing behavior and
   makes it feel polished.
 - An appearance setting moves the address bar into the sidebar.
