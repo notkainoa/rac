@@ -1,0 +1,1534 @@
+--- a/chrome/browser/rac/ai/BUILD.gn
++++ b/chrome/browser/rac/ai/BUILD.gn
+@@ -25,10 +25,14 @@ source_set("core") {
+   sources = [
+     "acp/acp_client.cc",
+     "acp/acp_client.h",
++    "acp/acp_service.cc",
++    "acp/acp_service.h",
+     "acp/acp_transport.cc",
+     "acp/acp_transport.h",
+     "acp/agent_path.cc",
+     "acp/agent_path.h",
++    "acp/agent_recipes.cc",
++    "acp/agent_recipes.h",
+     "ai_prefs.cc",
+     "ai_prefs.h",
+     "chat_prompt.cc",
+@@ -102,6 +106,7 @@ source_set("browser") {
+ test("rac_ai_unittests") {
+   sources = [
+     "acp/acp_client_unittest.cc",
++    "acp/agent_recipes_unittest.cc",
+     "ai_prefs_unittest.cc",
+     "chat_history_unittest.cc",
+     "chat_prompt_unittest.cc",
+--- /dev/null
++++ b/chrome/browser/rac/ai/acp/acp_service.cc
+@@ -0,0 +1,397 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/ai/acp/acp_service.h"
++
++#include <unistd.h>
++
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/strings/string_split.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "chrome/browser/rac/ai/acp/agent_recipes.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
++#include "components/prefs/pref_service.h"
++
++namespace rac::ai {
++namespace {
++
++base::FilePath AbsoluteOverride(const PrefService* prefs,
++                                std::string_view agent_id) {
++  const std::string* value = prefs->GetDict(kAgentPaths).FindString(agent_id);
++  if (!value || value->empty() || (*value)[0] != '/') {
++    return base::FilePath();
++  }
++  return base::FilePath(*value);
++}
++
++std::vector<std::string> CustomArgv(const PrefService* prefs) {
++  std::vector<std::string> argv;
++  for (std::string_view part : base::SplitStringPiece(
++           prefs->GetString(kAgentCustomCommand), " ", base::TRIM_WHITESPACE,
++           base::SPLIT_WANT_NONEMPTY)) {
++    argv.emplace_back(part);
++  }
++  return argv;
++}
++
++}  // namespace
++
++AcpService::AcpService(PrefService* prefs, base::FilePath profile_path)
++    : prefs_(prefs), profile_path_(std::move(profile_path)) {
++  VLOG(1) << "rac ACP service created";
++}
++
++AcpService::~AcpService() {
++  Shutdown();
++}
++
++void AcpService::Shutdown() {
++  shutting_down_ = true;
++  Stop();
++  path_cache_.Invalidate();
++}
++
++base::FilePath AcpService::CacheRoot() const {
++  return profile_path_.AppendASCII("Cache").AppendASCII("rac-agent");
++}
++
++base::FilePath AcpService::ScratchDirFor(std::string_view agent_id) const {
++  return CacheRoot().AppendASCII("scratch").AppendASCII(agent_id);
++}
++
++void AcpService::ListAgents(AgentListCallback done) {
++  if (shutting_down_ || !IsAiEnabled(prefs_)) {
++    std::move(done).Run(base::ListValue());
++    return;
++  }
++  path_cache_.Ensure(base::BindOnce(
++      &AcpService::OnPathReady, weak_factory_.GetWeakPtr(), std::move(done)));
++}
++
++void AcpService::OnPathReady(AgentListCallback done,
++                             std::string search_path,
++                             std::string error) {
++  base::ListValue agents;
++  const std::string selected = prefs_->GetString(kAgentId);
++  for (const AgentRecipe& recipe : GetAgentRecipes()) {
++    base::DictValue row;
++    row.Set("id", recipe.id);
++    row.Set("name", recipe.name);
++    row.Set("kind", "agent");
++    row.Set("authHelp", recipe.auth_help);
++    row.Set("selected", selected == recipe.id);
++    bool installed = false;
++    if (std::string_view(recipe.id) == "custom") {
++      const auto argv = CustomArgv(prefs_);
++      installed = !argv.empty() && argv[0][0] == '/' &&
++                  access(argv[0].c_str(), X_OK) == 0;
++      if (!argv.empty()) {
++        row.Set("path", argv[0]);
++      }
++    } else {
++      base::FilePath resolved = AbsoluteOverride(prefs_, recipe.id);
++      if (resolved.empty() && !search_path.empty()) {
++        for (const char* name : recipe.executables) {
++          resolved = FindExecutableOnPath(name, search_path);
++          if (!resolved.empty()) {
++            break;
++          }
++        }
++      }
++      if (!resolved.empty()) {
++        installed = access(resolved.value().c_str(), X_OK) == 0;
++        row.Set("path", resolved.value());
++      }
++      if (recipe.uses_npx && !search_path.empty()) {
++        const char* companion =
++            std::string_view(recipe.id) == "codex" ? "codex" : "claude";
++        base::FilePath companion_path = AbsoluteOverride(prefs_, companion);
++        if (companion_path.empty()) {
++          companion_path = FindExecutableOnPath(companion, search_path);
++        }
++        installed = installed && !companion_path.empty();
++        if (!companion_path.empty()) {
++          row.Set("companionPath", companion_path.value());
++        }
++      }
++    }
++    row.Set("installed", installed);
++    if (!error.empty()) {
++      row.Set("probeError", error);
++    }
++    agents.Append(std::move(row));
++  }
++  std::move(done).Run(std::move(agents));
++}
++
++void AcpService::Prompt(std::string agent_id,
++                        std::string text,
++                        UpdateCallback on_update,
++                        AgentEventCallback on_agent_event,
++                        DoneCallback done) {
++  finishing_ = false;
++  on_update_ = std::move(on_update);
++  on_agent_event_ = std::move(on_agent_event);
++  prompt_done_ = std::move(done);
++  if (shutting_down_ || !IsAiEnabled(prefs_)) {
++    FinishPrompt("The assistant is turned off.");
++    return;
++  }
++
++  if (session_ && session_->agent_id == agent_id && session_->ready &&
++      session_->client &&
++      session_->client->state() == AcpClient::State::kReady) {
++    OnSessionReady(std::move(text), "");
++    return;
++  }
++
++  path_cache_.Ensure(base::BindOnce(
++      [](base::WeakPtr<AcpService> self, std::string agent_id, std::string text,
++         std::string search_path, std::string error) {
++        if (!self) {
++          return;
++        }
++        if (search_path.empty() && std::string_view(agent_id) != "custom") {
++          self->FinishPrompt(error.empty() ? "Could not discover agent PATH."
++                                           : error);
++          return;
++        }
++        self->BeginLaunch(
++            std::move(agent_id), std::move(search_path),
++            base::BindOnce(&AcpService::OnSessionReady, self, std::move(text)));
++      },
++      weak_factory_.GetWeakPtr(), std::move(agent_id), std::move(text)));
++}
++
++void AcpService::TeardownSession() {
++  if (session_ && session_->client) {
++    session_->client->Stop();
++  }
++  if (session_) {
++    session_->transport.AsyncCall(&AcpTransport::Kill);
++    session_->transport.Reset();
++  }
++  session_.reset();
++}
++
++void AcpService::BeginLaunch(std::string agent_id,
++                             std::string search_path,
++                             DoneCallback ready) {
++  TeardownSession();
++  if (!IsAiEnabled(prefs_)) {
++    std::move(ready).Run("The assistant is turned off.");
++    return;
++  }
++  const AgentRecipe* recipe = FindAgentRecipe(agent_id);
++  if (!recipe) {
++    std::move(ready).Run("Unknown agent.");
++    return;
++  }
++
++  AcpLaunchSpec launch;
++  base::DictValue session_extra;
++  const base::FilePath scratch = ScratchDirFor(agent_id);
++  bool ok = false;
++  if (std::string_view(agent_id) == "custom") {
++    ok = PrepareCustomAgentLaunch(CustomArgv(prefs_), scratch, search_path,
++                                  launch);
++  } else {
++    AgentLaunchPaths paths;
++    paths.search_path = search_path;
++    paths.executable = AbsoluteOverride(prefs_, agent_id);
++    if (paths.executable.empty()) {
++      for (const char* name : recipe->executables) {
++        paths.executable = FindExecutableOnPath(name, search_path);
++        if (!paths.executable.empty()) {
++          break;
++        }
++      }
++    }
++    if (recipe->uses_npx) {
++      const char* companion =
++          std::string_view(agent_id) == "codex" ? "codex" : "claude";
++      paths.companion = AbsoluteOverride(prefs_, companion);
++      if (paths.companion.empty()) {
++        paths.companion = FindExecutableOnPath(companion, search_path);
++      }
++    }
++    ok = PrepareAgentLaunch(*recipe, paths, scratch, CacheRoot(), launch,
++                            session_extra);
++  }
++  if (!ok || launch.argv.empty()) {
++    std::move(ready).Run("That agent is not installed.");
++    return;
++  }
++
++  auto session = std::make_unique<Session>();
++  session->agent_id = agent_id;
++  session->scratch = scratch;
++  session->transport = base::SequenceBound<AcpTransport>(
++      base::ThreadPool::CreateSequencedTaskRunner(
++          {base::MayBlock(), base::TaskPriority::USER_VISIBLE}));
++
++  base::WeakPtr<AcpService> self = weak_factory_.GetWeakPtr();
++  session->client = std::make_unique<AcpClient>(
++      base::BindRepeating(
++          [](base::WeakPtr<AcpService> self, base::DictValue message) {
++            if (self && self->session_) {
++              self->session_->transport.AsyncCall(&AcpTransport::Write)
++                  .WithArgs(std::move(message));
++            }
++          },
++          self),
++      base::BindRepeating(
++          [](base::WeakPtr<AcpService> self) {
++            if (self && self->session_) {
++              self->session_->transport.AsyncCall(&AcpTransport::Stop);
++            }
++          },
++          self),
++      base::BindRepeating(&AcpService::OnClientUpdate, self));
++  session->client->SetPermissionPolicy(
++      base::BindRepeating(&AcpService::OnPermission, self));
++
++  session_extra.Set("cwd", scratch.value());
++  if (!session_extra.contains("mcpServers")) {
++    session_extra.Set("mcpServers", base::ListValue());
++  }
++
++  VLOG(1) << "rac ACP initialize fs.readTextFile=false "
++          << "fs.writeTextFile=false terminal=false cwd=" << scratch.value();
++
++  auto ui = base::SequencedTaskRunner::GetCurrentDefault();
++  session->transport.AsyncCall(&AcpTransport::Start)
++      .WithArgs(
++          std::move(launch),
++          base::BindRepeating(
++              [](scoped_refptr<base::SequencedTaskRunner> ui,
++                 base::WeakPtr<AcpService> self, base::DictValue message) {
++                ui->PostTask(FROM_HERE,
++                             base::BindOnce(&AcpService::OnTransportMessage,
++                                            self, std::move(message)));
++              },
++              ui, self),
++          base::BindOnce(
++              [](scoped_refptr<base::SequencedTaskRunner> ui,
++                 base::WeakPtr<AcpService> self, std::string error) {
++                ui->PostTask(FROM_HERE,
++                             base::BindOnce(&AcpService::OnTransportClosed,
++                                            self, std::move(error)));
++              },
++              ui, self));
++
++  session->client->Start(
++      std::move(session_extra),
++      base::BindOnce(
++          [](base::WeakPtr<AcpService> self, const AgentRecipe* recipe,
++             DoneCallback ready, std::string error) {
++            if (!self || !self->session_) {
++              std::move(ready).Run(error.empty() ? "Cancelled" : error);
++              return;
++            }
++            if (self->session_->client->state() ==
++                AcpClient::State::kNeedsAuth) {
++              std::string help = "Sign in required";
++              if (recipe && recipe->auth_help[0]) {
++                help = std::string("Sign in required: ") + recipe->auth_help;
++              }
++              std::move(ready).Run(std::move(help));
++              return;
++            }
++            self->session_->ready = error.empty();
++            std::move(ready).Run(std::move(error));
++          },
++          self, recipe, std::move(ready)));
++  session_ = std::move(session);
++}
++
++void AcpService::OnSessionReady(std::string text, std::string error) {
++  if (!error.empty()) {
++    FinishPrompt(std::move(error));
++    return;
++  }
++  if (!session_ || !session_->client) {
++    FinishPrompt("The agent session failed.");
++    return;
++  }
++  session_->client->Prompt(
++      std::move(text),
++      base::BindOnce(&AcpService::FinishPrompt, weak_factory_.GetWeakPtr()));
++}
++
++void AcpService::OnTransportMessage(base::DictValue message) {
++  if (session_ && session_->client) {
++    session_->client->Receive(std::move(message));
++  }
++}
++
++void AcpService::OnTransportClosed(std::string error) {
++  if (shutting_down_) {
++    return;
++  }
++  if (session_ && session_->client) {
++    session_->client->Fail(error.empty() ? "The agent exited." : error);
++  }
++  FinishPrompt(error.empty() ? "The agent exited." : std::move(error));
++}
++
++void AcpService::OnClientUpdate(base::DictValue update) {
++  const std::string* kind = update.FindString("sessionUpdate");
++  if (!kind) {
++    return;
++  }
++  if (*kind == "agent_message_chunk") {
++    const base::DictValue* content = update.FindDict("content");
++    const std::string* text = content ? content->FindString("text") : nullptr;
++    if (text && on_update_) {
++      on_update_.Run(StreamUpdate{.text_delta = *text});
++    }
++    return;
++  }
++  if (on_agent_event_) {
++    on_agent_event_.Run(std::move(update));
++  }
++}
++
++void AcpService::OnPermission(const base::DictValue& tool,
++                              base::OnceCallback<void(bool)> decide) {
++  std::move(decide).Run(IsApprovedRacMcpTool(tool));
++}
++
++void AcpService::FinishPrompt(std::string error) {
++  if (finishing_) {
++    return;
++  }
++  finishing_ = true;
++  if (on_update_) {
++    StreamUpdate update;
++    update.done = true;
++    if (!error.empty()) {
++      update.error = error;
++    }
++    on_update_.Run(std::move(update));
++  }
++  on_update_.Reset();
++  on_agent_event_.Reset();
++  if (prompt_done_) {
++    std::move(prompt_done_).Run(std::move(error));
++  }
++}
++
++void AcpService::Cancel() {
++  if (session_ && session_->client) {
++    session_->client->Cancel();
++  }
++}
++
++void AcpService::Stop() {
++  TeardownSession();
++  FinishPrompt("Cancelled");
++}
++
++}  // namespace rac::ai
+--- /dev/null
++++ b/chrome/browser/rac/ai/acp/acp_service.h
+@@ -0,0 +1,93 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_AI_ACP_ACP_SERVICE_H_
++#define CHROME_BROWSER_RAC_AI_ACP_ACP_SERVICE_H_
++
++#include <memory>
++#include <string>
++
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/threading/sequence_bound.h"
++#include "base/values.h"
++#include "chrome/browser/rac/ai/acp/acp_client.h"
++#include "chrome/browser/rac/ai/acp/acp_transport.h"
++#include "chrome/browser/rac/ai/acp/agent_path.h"
++#include "chrome/browser/rac/ai/chat_protocol.h"
++
++class PrefService;
++
++namespace rac::ai {
++
++// Per-profile ACP owner. Created lazily by AiService only while AI is on.
++// Shutdown tears down child processes immediately.
++class AcpService {
++ public:
++  using AgentListCallback = base::OnceCallback<void(base::ListValue agents)>;
++  using UpdateCallback = base::RepeatingCallback<void(StreamUpdate)>;
++  using AgentEventCallback = base::RepeatingCallback<void(base::DictValue)>;
++  using DoneCallback = base::OnceCallback<void(std::string error)>;
++
++  AcpService(PrefService* prefs, base::FilePath profile_path);
++  AcpService(const AcpService&) = delete;
++  AcpService& operator=(const AcpService&) = delete;
++  ~AcpService();
++
++  void Shutdown();
++
++  void ListAgents(AgentListCallback done);
++
++  // `text` should already include any wrapped page context.
++  void Prompt(std::string agent_id,
++              std::string text,
++              UpdateCallback on_update,
++              AgentEventCallback on_agent_event,
++              DoneCallback done);
++
++  void Cancel();
++  void Stop();
++
++ private:
++  struct Session {
++    std::string agent_id;
++    base::FilePath scratch;
++    std::unique_ptr<AcpClient> client;
++    base::SequenceBound<AcpTransport> transport;
++    bool ready = false;
++  };
++
++  void OnPathReady(AgentListCallback done,
++                   std::string search_path,
++                   std::string error);
++  void BeginLaunch(std::string agent_id,
++                   std::string search_path,
++                   DoneCallback ready);
++  void OnSessionReady(std::string text, std::string error);
++  void OnTransportMessage(base::DictValue message);
++  void OnTransportClosed(std::string error);
++  void OnClientUpdate(base::DictValue update);
++  void OnPermission(const base::DictValue& tool,
++                    base::OnceCallback<void(bool)> decide);
++  void FinishPrompt(std::string error);
++  void TeardownSession();
++  base::FilePath ScratchDirFor(std::string_view agent_id) const;
++  base::FilePath CacheRoot() const;
++
++  raw_ptr<PrefService> prefs_;
++  base::FilePath profile_path_;
++  AgentPathCache path_cache_;
++  std::unique_ptr<Session> session_;
++  UpdateCallback on_update_;
++  AgentEventCallback on_agent_event_;
++  DoneCallback prompt_done_;
++  bool finishing_ = false;
++  bool shutting_down_ = false;
++  base::WeakPtrFactory<AcpService> weak_factory_{this};
++};
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_ACP_ACP_SERVICE_H_
+--- /dev/null
++++ b/chrome/browser/rac/ai/acp/agent_recipes.cc
+@@ -0,0 +1,403 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/ai/acp/agent_recipes.h"
++
++#include <map>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/environment.h"
++#include "base/files/file_util.h"
++#include "base/json/json_writer.h"
++#include "base/strings/string_util.h"
++
++// PutEnv / WriteFile helpers live below.
++
++namespace rac::ai {
++namespace {
++
++constexpr const char* kOpenCodeExe[] = {"opencode"};
++constexpr const char* kOpenCodeArgs[] = {"acp"};
++constexpr const char* kCursorExe[] = {"cursor-agent"};
++constexpr const char* kCursorArgs[] = {"acp"};
++constexpr const char* kGeminiExe[] = {"gemini"};
++constexpr const char* kGeminiArgs[] = {"--acp"};
++constexpr const char* kCopilotExe[] = {"copilot"};
++constexpr const char* kCopilotArgs[] = {
++    "--acp",
++    "--stdio",
++    "--disable-builtin-mcps",
++    "--no-custom-instructions",
++    "--deny-tool=shell",
++    "--deny-tool=write",
++    "--deny-tool=url",
++    "--excluded-tools=bash,powershell,apply_patch,create,edit,web_fetch,task,"
++    "write_agent",
++};
++constexpr const char* kNpxExe[] = {"npx"};
++constexpr const char* kGooseExe[] = {"goose"};
++constexpr const char* kGooseArgs[] = {"acp"};
++
++constexpr AgentRecipe kRecipes[] = {
++    {.id = "opencode",
++     .name = "OpenCode",
++     .executables = kOpenCodeExe,
++     .fixed_args = kOpenCodeArgs,
++     .auth_help = "opencode auth login"},
++    {.id = "cursor",
++     .name = "Cursor",
++     .executables = kCursorExe,
++     .fixed_args = kCursorArgs,
++     .auth_help = "cursor-agent login"},
++    {.id = "gemini",
++     .name = "Gemini",
++     .executables = kGeminiExe,
++     .fixed_args = kGeminiArgs,
++     .auth_help = "gemini (sign in with the Gemini CLI)"},
++    {.id = "copilot",
++     .name = "Copilot",
++     .executables = kCopilotExe,
++     .fixed_args = kCopilotArgs,
++     .auth_help = "copilot login"},
++    {.id = "codex",
++     .name = "Codex",
++     .executables = kNpxExe,
++     .uses_npx = true,
++     .npx_package = "@agentclientprotocol/codex-acp@2.2.2",
++     .auth_help = "codex login"},
++    {.id = "claude",
++     .name = "Claude (your Claude Code login)",
++     .executables = kNpxExe,
++     .uses_npx = true,
++     .npx_package = "@agentclientprotocol/claude-agent-acp@0.93.0",
++     .auth_help = "claude auth login"},
++    {.id = "goose",
++     .name = "Goose",
++     .executables = kGooseExe,
++     .fixed_args = kGooseArgs,
++     .auth_help = "Configure the Goose CLI"},
++    {.id = "custom",
++     .name = "Custom ACP command",
++     .executables = {},
++     .auth_help = ""},
++};
++
++bool WriteScratchFile(const base::FilePath& path, std::string_view contents) {
++  return base::CreateDirectory(path.DirName()) &&
++         base::WriteFile(path, contents);
++}
++
++void PutEnv(std::map<std::string, std::string>& env,
++            const char* key,
++            std::string value) {
++  env[key] = std::move(value);
++}
++
++void BaseEnv(std::map<std::string, std::string>& env,
++             const AgentLaunchPaths& paths,
++             const base::FilePath& scratch,
++             const base::FilePath& cache_root) {
++  auto process_env = base::Environment::Create();
++  if (auto home = process_env->GetVar("HOME")) {
++    PutEnv(env, "HOME", *home);
++  }
++  if (auto tmp = process_env->GetVar("TMPDIR")) {
++    PutEnv(env, "TMPDIR", *tmp);
++  } else {
++    PutEnv(env, "TMPDIR", scratch.AppendASCII("tmp").value());
++  }
++  if (auto lang = process_env->GetVar("LANG")) {
++    PutEnv(env, "LANG", *lang);
++  }
++  PutEnv(env, "PATH", paths.search_path);
++  PutEnv(env, "TERM", "dumb");
++  PutEnv(env, "NO_COLOR", "1");
++  base::CreateDirectory(scratch.AppendASCII("tmp"));
++  base::CreateDirectory(cache_root.AppendASCII("npx"));
++  PutEnv(env, "npm_config_cache", cache_root.AppendASCII("npx").value());
++}
++
++bool PrepareOpenCode(const AgentLaunchPaths& paths,
++                     const base::FilePath& scratch,
++                     AcpLaunchSpec& launch) {
++  const std::string config = R"({
++  "$schema":"https://opencode.ai/config.json",
++  "share":"disabled",
++  "autoupdate":false,
++  "plugin":[],
++  "permission":{"*":"deny","rac_*":"allow"},
++  "tools":{"bash":false,"edit":false,"write":false,"patch":false,
++           "webfetch":false,"websearch":false,"task":false,"read":false,
++           "glob":false,"grep":false,"list":false}
++})";
++  if (!WriteScratchFile(scratch.AppendASCII("opencode.json"), config)) {
++    return false;
++  }
++  PutEnv(launch.environment, "OPENCODE_CONFIG_CONTENT", config);
++  PutEnv(launch.environment, "OPENCODE_DISABLE_PROJECT_CONFIG", "true");
++  PutEnv(launch.environment, "OPENCODE_DISABLE_AUTOUPDATE", "true");
++  PutEnv(launch.environment, "OPENCODE_DISABLE_DEFAULT_PLUGINS", "true");
++  PutEnv(launch.environment, "OPENCODE_PERMISSION",
++         R"({"*":"deny","rac_*":"allow"})");
++  for (const char* name : {"config", "data", "cache", "state"}) {
++    base::FilePath dir = scratch.AppendASCII(name);
++    base::CreateDirectory(dir);
++    std::string key = std::string("XDG_") + base::ToUpperASCII(name) + "_HOME";
++    PutEnv(launch.environment, key.c_str(), dir.value());
++  }
++  launch.argv = {paths.executable.value(), "acp"};
++  return true;
++}
++
++bool PrepareCursor(const AgentLaunchPaths& paths,
++                   const base::FilePath& scratch,
++                   AcpLaunchSpec& launch) {
++  const std::string config =
++      R"json({"permissions":{"allow":["Mcp(rac:*)"],"deny":["Shell(*)","Write(**)","WebFetch(*)","Read(**)"]}})json";
++  if (!WriteScratchFile(scratch.AppendASCII(".cursor").AppendASCII("cli.json"),
++                        config)) {
++    return false;
++  }
++  PutEnv(launch.environment, "CURSOR_CONFIG_DIR",
++         scratch.AppendASCII(".cursor-config").value());
++  PutEnv(launch.environment, "CURSOR_DATA_DIR",
++         scratch.AppendASCII(".cursor-data").value());
++  PutEnv(launch.environment, "CURSOR_AGENT_STORE_DIR",
++         scratch.AppendASCII(".cursor-store").value());
++  PutEnv(launch.environment, "CURSOR_PROJECT_DIR", scratch.value());
++  base::CreateDirectory(scratch.AppendASCII(".cursor-config"));
++  base::CreateDirectory(scratch.AppendASCII(".cursor-data"));
++  base::CreateDirectory(scratch.AppendASCII(".cursor-store"));
++  launch.argv = {paths.executable.value(), "acp"};
++  return true;
++}
++
++bool PrepareGemini(const AgentLaunchPaths& paths,
++                   const base::FilePath& scratch,
++                   AcpLaunchSpec& launch) {
++  const std::string config = R"({
++  "tools":{"exclude":["run_shell_command","write_file","replace","web_fetch",
++                      "google_web_search"]},
++  "privacy":{"usageStatisticsEnabled":false},
++  "telemetry":{"enabled":false},
++  "general":{"enableAutoUpdate":false}
++})";
++  if (!WriteScratchFile(
++          scratch.AppendASCII(".gemini").AppendASCII("settings.json"),
++          config)) {
++    return false;
++  }
++  PutEnv(launch.environment, "GEMINI_TELEMETRY_ENABLED", "false");
++  launch.argv = {paths.executable.value(), "--acp"};
++  return true;
++}
++
++bool PrepareCopilot(const AgentLaunchPaths& paths,
++                    const base::FilePath& scratch,
++                    AcpLaunchSpec& launch) {
++  launch.argv = {paths.executable.value()};
++  for (const char* arg : kCopilotArgs) {
++    launch.argv.push_back(arg);
++  }
++  return true;
++}
++
++bool PrepareCodex(const AgentLaunchPaths& paths,
++                  const base::FilePath& scratch,
++                  const base::FilePath& cache_root,
++                  AcpLaunchSpec& launch) {
++  if (paths.companion.empty()) {
++    return false;
++  }
++  base::DictValue features;
++  features.Set("shell_tool", false);
++  features.Set("unified_exec", false);
++  features.Set("apply_patch_freeform", false);
++  features.Set("multi_agent", false);
++  features.Set("hooks", false);
++  features.Set("memory_tool", false);
++  base::DictValue analytics;
++  analytics.Set("enabled", false);
++  base::DictValue otel;
++  otel.Set("exporter", "none");
++  otel.Set("trace_exporter", "none");
++  otel.Set("metrics_exporter", "none");
++  base::DictValue history;
++  history.Set("persistence", "none");
++  base::DictValue config;
++  config.Set("sandbox_mode", "read-only");
++  config.Set("approval_policy", "on-request");
++  config.Set("web_search", "disabled");
++  config.Set("features", std::move(features));
++  config.Set("analytics", std::move(analytics));
++  config.Set("otel", std::move(otel));
++  config.Set("history", std::move(history));
++  config.Set("log_dir", scratch.AppendASCII("codex-logs").value());
++  std::optional<std::string> json = base::WriteJson(config);
++  if (!json) {
++    return false;
++  }
++  PutEnv(launch.environment, "CODEX_PATH", paths.companion.value());
++  PutEnv(launch.environment, "CODEX_CONFIG", std::move(*json));
++  PutEnv(launch.environment, "INITIAL_AGENT_MODE", "read-only");
++  PutEnv(launch.environment, "APP_SERVER_LOGS",
++         scratch.AppendASCII("codex-logs").value());
++  base::CreateDirectory(scratch.AppendASCII("codex-logs"));
++  launch.argv = {paths.executable.value(), "-y",
++                 "@agentclientprotocol/codex-acp@2.2.2"};
++  return true;
++}
++
++bool PrepareClaude(const AgentLaunchPaths& paths,
++                   const base::FilePath& scratch,
++                   base::DictValue& session_extra,
++                   AcpLaunchSpec& launch) {
++  if (paths.companion.empty()) {
++    return false;
++  }
++  PutEnv(launch.environment, "CLAUDE_CODE_EXECUTABLE", paths.companion.value());
++  PutEnv(launch.environment, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
++  PutEnv(launch.environment, "DISABLE_TELEMETRY", "1");
++  PutEnv(launch.environment, "DISABLE_ERROR_REPORTING", "1");
++  PutEnv(launch.environment, "DISABLE_AUTOUPDATER", "1");
++  PutEnv(launch.environment, "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "false");
++  base::DictValue extra_args;
++  extra_args.Set("strict-mcp-config", "");
++  extra_args.Set("no-session-persistence", "");
++  extra_args.Set("disable-slash-commands", "");
++  base::DictValue settings;
++  settings.Set("disableAllHooks", true);
++  base::ListValue setting_sources;
++  setting_sources.Append("user");
++  base::DictValue options;
++  options.Set("tools", base::ListValue());
++  options.Set("settingSources", std::move(setting_sources));
++  options.Set("settings", std::move(settings));
++  options.Set("allowDangerouslySkipPermissions", false);
++  options.Set("persistSession", false);
++  options.Set("promptSuggestions", false);
++  options.Set("extraArgs", std::move(extra_args));
++  base::DictValue claude_code;
++  claude_code.Set("options", std::move(options));
++  base::DictValue meta;
++  meta.Set("claudeCode", std::move(claude_code));
++  session_extra.Set("_meta", std::move(meta));
++  launch.argv = {paths.executable.value(), "-y",
++                 "@agentclientprotocol/claude-agent-acp@0.93.0"};
++  return true;
++}
++
++bool PrepareGoose(const AgentLaunchPaths& paths,
++                  const base::FilePath& scratch,
++                  base::DictValue& session_extra,
++                  AcpLaunchSpec& launch) {
++  PutEnv(launch.environment, "GOOSE_MODE", "approve");
++  PutEnv(launch.environment, "GOOSE_TELEMETRY_ENABLED", "false");
++  PutEnv(launch.environment, "OTEL_SDK_DISABLED", "true");
++  PutEnv(launch.environment, "GOOSE_DISABLE_SESSION_NAMING", "true");
++  // enabledExtensions is filled by the session owner once the MCP socket path
++  // is known; recipes only mark the agent.
++  session_extra.Set("_meta", base::DictValue().Set("racGoose", true));
++  launch.argv = {paths.executable.value(), "acp"};
++  return true;
++}
++
++}  // namespace
++
++base::span<const AgentRecipe> GetAgentRecipes() {
++  return kRecipes;
++}
++
++const AgentRecipe* FindAgentRecipe(std::string_view id) {
++  for (const AgentRecipe& recipe : kRecipes) {
++    if (recipe.id == id) {
++      return &recipe;
++    }
++  }
++  return nullptr;
++}
++
++bool PrepareAgentLaunch(const AgentRecipe& recipe,
++                        const AgentLaunchPaths& paths,
++                        const base::FilePath& scratch,
++                        const base::FilePath& cache_root,
++                        AcpLaunchSpec& launch,
++                        base::DictValue& session_extra) {
++  if (paths.executable.empty() || scratch.empty()) {
++    return false;
++  }
++  if (!base::CreateDirectory(scratch)) {
++    return false;
++  }
++  launch = AcpLaunchSpec();
++  launch.cwd = scratch;
++  BaseEnv(launch.environment, paths, scratch, cache_root);
++  if (std::string_view(recipe.id) == "opencode") {
++    return PrepareOpenCode(paths, scratch, launch);
++  }
++  if (std::string_view(recipe.id) == "cursor") {
++    return PrepareCursor(paths, scratch, launch);
++  }
++  if (std::string_view(recipe.id) == "gemini") {
++    return PrepareGemini(paths, scratch, launch);
++  }
++  if (std::string_view(recipe.id) == "copilot") {
++    return PrepareCopilot(paths, scratch, launch);
++  }
++  if (std::string_view(recipe.id) == "codex") {
++    return PrepareCodex(paths, scratch, cache_root, launch);
++  }
++  if (std::string_view(recipe.id) == "claude") {
++    return PrepareClaude(paths, scratch, session_extra, launch);
++  }
++  if (std::string_view(recipe.id) == "goose") {
++    return PrepareGoose(paths, scratch, session_extra, launch);
++  }
++  return false;
++}
++
++bool PrepareCustomAgentLaunch(const std::vector<std::string>& argv,
++                              const base::FilePath& scratch,
++                              const std::string& search_path,
++                              AcpLaunchSpec& launch) {
++  if (argv.empty() || argv[0].empty() || argv[0][0] != '/' || scratch.empty()) {
++    return false;
++  }
++  if (!base::CreateDirectory(scratch)) {
++    return false;
++  }
++  launch = AcpLaunchSpec();
++  launch.cwd = scratch;
++  launch.argv = argv;
++  AgentLaunchPaths paths;
++  paths.search_path = search_path;
++  BaseEnv(launch.environment, paths, scratch, scratch);
++  return true;
++}
++
++bool IsApprovedRacMcpTool(const base::DictValue& tool) {
++  // WP6 owns real approval. Until then, reject every permission request.
++  // Correlate only structured names so titles alone cannot authorize.
++  const std::string* name = tool.FindString("name");
++  if (name && base::StartsWith(*name, "mcp__rac__")) {
++    return false;
++  }
++  const std::string* title = tool.FindString("title");
++  if (title && base::StartsWith(*title, "rac:")) {
++    return false;
++  }
++  const base::DictValue* raw = tool.FindDict("rawInput");
++  if (raw) {
++    const std::string* server = raw->FindString("server");
++    const std::string* provider = raw->FindString("providerIdentifier");
++    if ((server && *server == "rac") || (provider && *provider == "rac")) {
++      return false;
++    }
++  }
++  return false;
++}
++
++}  // namespace rac::ai
+--- /dev/null
++++ b/chrome/browser/rac/ai/acp/agent_recipes.h
+@@ -0,0 +1,63 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_AI_ACP_AGENT_RECIPES_H_
++#define CHROME_BROWSER_RAC_AI_ACP_AGENT_RECIPES_H_
++
++#include <map>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++#include "base/values.h"
++#include "chrome/browser/rac/ai/acp/acp_transport.h"
++
++namespace rac::ai {
++
++struct AgentRecipe {
++  const char* id;
++  const char* name;
++  // Primary executable names probed on PATH, in order.
++  base::span<const char* const> executables;
++  // True when the recipe runs through npx and needs a companion CLI path env.
++  bool uses_npx = false;
++  const char* npx_package = nullptr;  // pinned package@version when uses_npx
++  // Extra fixed argv after the resolved executable (e.g. "acp", "--acp").
++  base::span<const char* const> fixed_args;
++  // Human sign-in guidance shown when auth is required.
++  const char* auth_help = "";
++};
++
++base::span<const AgentRecipe> GetAgentRecipes();
++const AgentRecipe* FindAgentRecipe(std::string_view id);
++
++// Absolute path overrides and resolved PATH feed BuildAgentLaunch.
++struct AgentLaunchPaths {
++  base::FilePath executable;  // primary binary or npx
++  base::FilePath companion;   // e.g. codex / claude / cursor-agent
++  std::string search_path;    // PATH for the child
++};
++
++// Writes per-agent restriction files under `scratch` and returns launch argv,
++// environment, and optional session/new `_meta`. Never reads credential files.
++bool PrepareAgentLaunch(const AgentRecipe& recipe,
++                        const AgentLaunchPaths& paths,
++                        const base::FilePath& scratch,
++                        const base::FilePath& cache_root,
++                        AcpLaunchSpec& launch,
++                        base::DictValue& session_extra);
++
++// Custom ACP command: absolute executable + argv from prefs.
++bool PrepareCustomAgentLaunch(const std::vector<std::string>& argv,
++                              const base::FilePath& scratch,
++                              const std::string& search_path,
++                              AcpLaunchSpec& launch);
++
++// Default-deny permission helper used until WP6 registers rac MCP tools.
++bool IsApprovedRacMcpTool(const base::DictValue& tool);
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_ACP_AGENT_RECIPES_H_
+--- /dev/null
++++ b/chrome/browser/rac/ai/acp/agent_recipes_unittest.cc
+@@ -0,0 +1,48 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/ai/acp/agent_recipes.h"
++
++#include "base/files/scoped_temp_dir.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::ai {
++
++TEST(AgentRecipesTest, ListsExpectedAgents) {
++  auto recipes = GetAgentRecipes();
++  ASSERT_GE(recipes.size(), 8u);
++  EXPECT_TRUE(FindAgentRecipe("opencode"));
++  EXPECT_TRUE(FindAgentRecipe("cursor"));
++  EXPECT_TRUE(FindAgentRecipe("claude"));
++  EXPECT_TRUE(FindAgentRecipe("codex"));
++  EXPECT_TRUE(FindAgentRecipe("custom"));
++  EXPECT_EQ(FindAgentRecipe("claude")->name,
++            std::string("Claude (your Claude Code login)"));
++}
++
++TEST(AgentRecipesTest, PermissionHookRejectsByDefault) {
++  base::DictValue rac_tool;
++  rac_tool.Set("name", "mcp__rac__rac_echo");
++  rac_tool.Set("title", "rac: rac_echo");
++  EXPECT_FALSE(IsApprovedRacMcpTool(rac_tool));
++  base::DictValue shell;
++  shell.Set("name", "Shell");
++  shell.Set("kind", "execute");
++  EXPECT_FALSE(IsApprovedRacMcpTool(shell));
++}
++
++TEST(AgentRecipesTest, CustomLaunchRequiresAbsoluteExecutable) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  AcpLaunchSpec launch;
++  EXPECT_FALSE(PrepareCustomAgentLaunch({"python3", "x"}, temp.GetPath(),
++                                        "/usr/bin", launch));
++  EXPECT_TRUE(PrepareCustomAgentLaunch(
++      {"/usr/bin/env", "python3", "/tmp/rac-ai/fake_acp_agent.py"},
++      temp.GetPath(), "/usr/bin:/bin", launch));
++  ASSERT_FALSE(launch.argv.empty());
++  EXPECT_EQ(launch.argv[0], "/usr/bin/env");
++  EXPECT_EQ(launch.cwd, temp.GetPath());
++}
++
++}  // namespace rac::ai
+--- a/chrome/browser/rac/ai/ai_prefs.cc
++++ b/chrome/browser/rac/ai/ai_prefs.cc
+@@ -24,6 +24,9 @@ void RegisterProfilePrefs(PrefRegistrySi
+   registry->RegisterBooleanPref(kAttachCurrentTab, true);
+   registry->RegisterBooleanPref(kSaveHistory, true);
+   registry->RegisterListPref(kSavedPrompts);
++  registry->RegisterStringPref(kAgentId, std::string());
++  registry->RegisterDictionaryPref(kAgentPaths);
++  registry->RegisterStringPref(kAgentCustomCommand, std::string());
+ }
+ 
+ ProviderSettings GetProviderSettings(const PrefService* prefs,
+--- a/chrome/browser/rac/ai/ai_prefs.h
++++ b/chrome/browser/rac/ai/ai_prefs.h
+@@ -33,6 +33,12 @@ inline constexpr char kAttachCurrentTab[
+ inline constexpr char kSaveHistory[] = "rac.ai.save_history";
+ // List of {id, title, text}: prompts the user saved to reuse.
+ inline constexpr char kSavedPrompts[] = "rac.ai.saved_prompts";
++// Selected agent recipe id. Empty means the direct provider in kProvider.
++inline constexpr char kAgentId[] = "rac.ai.agent_id";
++// Dictionary: agent id -> absolute executable path override.
++inline constexpr char kAgentPaths[] = "rac.ai.agent_paths";
++// Space-separated argv for "Custom ACP command" (absolute executable first).
++inline constexpr char kAgentCustomCommand[] = "rac.ai.agent_custom_command";
+ 
+ bool IsAiEnabled(const PrefService* prefs);
+ 
+--- a/chrome/browser/rac/ai/ai_service.cc
++++ b/chrome/browser/rac/ai/ai_service.cc
+@@ -1,6 +1,6 @@
+ // Copyright 2026 The rac Authors
+-// You can use, redistribute, and/or modify this source code under
+-// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++// Use of this source code is governed by a GPL-3.0 license that can be found in
++// the LICENSE file.
+ 
+ #include "chrome/browser/rac/ai/ai_service.h"
+ 
+@@ -19,17 +19,25 @@ AiService::AiService(
+     scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory)
+     : prefs_(prefs),
+       key_store_(prefs, os_crypt),
++      profile_path_(profile_path),
+       history_path_(profile_path.AppendASCII("rac_ai_history.json")),
+       url_loader_factory_(std::move(url_loader_factory)) {
+   VLOG(1) << "rac AI service created";
+   pref_registrar_.Init(prefs);
+-  pref_registrar_.Add(kEnabled, base::BindRepeating(
+-                                    [](AiService* self) {
+-                                      if (!IsAiEnabled(self->prefs_)) {
+-                                        self->history_store_.reset();
+-                                      }
+-                                    },
+-                                    base::Unretained(this)));
++  pref_registrar_.Add(kEnabled,
++                      base::BindRepeating(&AiService::OnEnabledChanged,
++                                          base::Unretained(this)));
++}
++
++void AiService::OnEnabledChanged() {
++  if (IsAiEnabled(prefs_)) {
++    return;
++  }
++  if (acp_service_) {
++    acp_service_->Shutdown();
++    acp_service_.reset();
++  }
++  history_store_.reset();
+ }
+ 
+ HistoryStore& AiService::history_store() {
+@@ -41,6 +49,18 @@ HistoryStore& AiService::history_store()
+   return *history_store_;
+ }
+ 
+-AiService::~AiService() = default;
++AcpService* AiService::acp_service() {
++  CHECK(IsAiEnabled(prefs_));
++  if (!acp_service_) {
++    acp_service_ = std::make_unique<AcpService>(prefs_, profile_path_);
++  }
++  return acp_service_.get();
++}
++
++AiService::~AiService() {
++  if (acp_service_) {
++    acp_service_->Shutdown();
++  }
++}
+ 
+ }  // namespace rac::ai
+--- a/chrome/browser/rac/ai/ai_service.h
++++ b/chrome/browser/rac/ai/ai_service.h
+@@ -11,6 +11,7 @@
+ #include "base/files/file_path.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
++#include "chrome/browser/rac/ai/acp/acp_service.h"
+ #include "chrome/browser/rac/ai/history_store.h"
+ #include "chrome/browser/rac/ai/key_store.h"
+ #include "components/keyed_service/core/keyed_service.h"
+@@ -41,15 +42,22 @@ class AiService : public KeyedService {
+   PrefService* prefs() { return prefs_; }
+   KeyStore& key_store() { return key_store_; }
+   HistoryStore& history_store();
++  // Lazy; created on first agent use and destroyed when AI turns off.
++  AcpService* acp_service();
++  AcpService* acp_service_if_created() { return acp_service_.get(); }
+   network::SharedURLLoaderFactory* url_loader_factory() {
+     return url_loader_factory_.get();
+   }
+ 
+  private:
++  void OnEnabledChanged();
++
+   raw_ptr<PrefService> prefs_;
+   KeyStore key_store_;
++  base::FilePath profile_path_;
+   base::FilePath history_path_;
+   std::unique_ptr<HistoryStore> history_store_;
++  std::unique_ptr<AcpService> acp_service_;
+   PrefChangeRegistrar pref_registrar_;
+   scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory_;
+ };
+--- a/chrome/browser/resources/rac_ai/app.ts
++++ b/chrome/browser/resources/rac_ai/app.ts
+@@ -25,10 +25,28 @@ interface InitState {
+   needsKey?: boolean;
+   providerName?: string;
+   model?: string;
++  agentId?: string;
+   saveHistory?: boolean;
+   theme?: Theme|null;
+ }
+ 
++// Installed CLI agents (ACP). WP5 builds the full picker; this page lists them
++// in the model menu and streams tool/plan events via rac-ai-agent-update.
++interface AgentInfo {
++  id: string;
++  name: string;
++  kind: string;
++  installed: boolean;
++  selected?: boolean;
++  path?: string;
++  authHelp?: string;
++}
++
++interface AgentUpdateEvent {
++  id: number;
++  update: Record<string, unknown>;
++}
++
+ // The stops of the window's space, as "#rrggbb".
+ interface Theme {
+   neutral: boolean;
+@@ -606,9 +624,28 @@ async function openModelMenu() {
+   if (!configured) {
+     return;
+   }
+-  const choices = await sendWithPromise<ModelChoices>('racAiGetModels');
++  const [choices, agents] = await Promise.all([
++    sendWithPromise<ModelChoices>('racAiGetModels'),
++    sendWithPromise<AgentInfo[]>('racAiListAgents')
++        .catch(() => [] as AgentInfo[]),
++  ]);
+   const actions = new Map<string, () => void>();
+   const entries: MenuEntry[] = [];
++  const installed = agents.filter(agent => agent.installed);
++  if (installed.length > 0) {
++    entries.push({type: 'heading', label: 'Agents'});
++    installed.forEach((agent, i) => {
++      const id = `agent:${i}`;
++      entries.push({
++        id,
++        label: agent.name,
++        detail: agent.path,
++        checked: !!agent.selected,
++      });
++      actions.set(id, () => selectAgent(agent));
++    });
++    entries.push({type: 'separator'});
++  }
+   choices.providers.forEach((provider, i) => {
+     if (provider.models.length === 0) {
+       return;
+@@ -619,7 +656,8 @@ async function openModelMenu() {
+       entries.push({
+         id,
+         label: model,
+-        checked: provider.id === choices.provider && model === choices.model,
++        checked: !installed.some(a => a.selected) &&
++            provider.id === choices.provider && model === choices.model,
+       });
+       actions.set(id, () => selectModel(provider, model));
+     });
+@@ -634,7 +672,7 @@ async function openModelMenu() {
+   });
+   actions.set('settings', openSettings);
+   showMenu(
+-      modelButton, {above: true, align: 'end', width: 240, entries}, actions);
++      modelButton, {above: true, align: 'end', width: 280, entries}, actions);
+ }
+ 
+ function selectModel(provider: ModelProvider, model: string) {
+@@ -644,6 +682,39 @@ function selectModel(provider: ModelProv
+   input.focus();
+ }
+ 
++function selectAgent(agent: AgentInfo) {
++  sendToBrowser('racAiSelectAgent', [agent.id]);
++  modelName.textContent = agent.name;
++  modelButton.title = agent.path ? `${agent.name} · ${agent.path}` : agent.name;
++  input.focus();
++}
++
++function onAgentUpdate(event: AgentUpdateEvent) {
++  if (event.id !== activeId) {
++    return;
++  }
++  const kind = event.update['sessionUpdate'];
++  const last = messages[messages.length - 1];
++  if (!last || last.role !== 'assistant') {
++    return;
++  }
++  if (kind === 'agent_thought_chunk') {
++    const content = event.update['content'] as {text?: string} | undefined;
++    if (content?.text) {
++      last.notice = (last.notice ?? '') + content.text;
++      queueRender();
++    }
++    return;
++  }
++  if (kind === 'tool_call' || kind === 'tool_call_update' || kind === 'plan') {
++    const title = (event.update['title'] as string | undefined) ??
++        (kind === 'plan' ? 'Plan update' :
++                           (typeof kind === 'string' ? kind : 'Agent update'));
++    last.notice = title;
++    queueRender();
++  }
++}
++
+ function formatDate(ms: number): string {
+   const date = new Date(ms);
+   const sameDay = date.toDateString() === new Date().toDateString();
+@@ -1199,6 +1270,7 @@ function init() {
+   getRequiredElement('setupButton').addEventListener('click', openSettings);
+ 
+   addWebUiListener('rac-ai-update', onUpdate);
++  addWebUiListener('rac-ai-agent-update', onAgentUpdate);
+   addWebUiListener('rac-ai-menu', onMenuEvent);
+   addWebUiListener('rac-ai-theme', applyTheme);
+   addWebUiListener('rac-ai-current-tab', (tab: TabInfo|null) => {
+--- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
++++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+@@ -15,9 +15,12 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/ai/acp/acp_service.h"
++#include "chrome/browser/rac/ai/acp/agent_recipes.h"
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/rac/ai/ai_service.h"
+ #include "chrome/browser/rac/ai/ai_service_factory.h"
++#include "chrome/browser/rac/ai/chat_prompt.h"
+ #include "chrome/browser/rac/ai/chat_protocol.h"
+ #include "chrome/browser/rac/ai/chat_session.h"
+ #include "chrome/browser/rac/ai/history_store.h"
+@@ -34,6 +37,7 @@
+ #include "chrome/browser/ui/views/rac/ai/assistant_menu.h"
+ #include "chrome/browser/ui/webui/webui_embedding_context.h"
+ #include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/render_frame_host.h"
+@@ -200,6 +204,19 @@ void PageHandler::RegisterMessages() {
+       "racAiSelectModel", base::BindRepeating(&PageHandler::HandleSelectModel,
+                                               base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
++      "racAiListAgents", base::BindRepeating(&PageHandler::HandleListAgents,
++                                             base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiSelectAgent", base::BindRepeating(&PageHandler::HandleSelectAgent,
++                                              base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiSetAgentPath", base::BindRepeating(&PageHandler::HandleSetAgentPath,
++                                               base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiSetCustomAgentCommand",
++      base::BindRepeating(&PageHandler::HandleSetCustomAgentCommand,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
+       "racAiMakeTitle", base::BindRepeating(&PageHandler::HandleMakeTitle,
+                                             base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
+@@ -225,6 +242,11 @@ void PageHandler::OnJavascriptDisallowed
+ void PageHandler::StopSession() {
+   reading_factory_.InvalidateWeakPtrs();
+   session_.reset();
++  if (AiService* service = AiServiceFactory::GetForProfile(profile_)) {
++    if (AcpService* acp = service->acp_service_if_created()) {
++      acp->Cancel();
++    }
++  }
+   active_send_id_ = 0;
+ }
+ 
+@@ -360,11 +382,18 @@ void PageHandler::HandleInit(const base:
+     const ProviderSettings settings = GetProviderSettings(prefs, provider_id);
+     const bool has_key = info && (!info->requires_key ||
+                                   service->key_store().HasKey(provider_id));
+-    state.Set("providerName", info ? info->name : "");
+-    state.Set("model", settings.model);
+-    state.Set("configured", info && has_key && !settings.model.empty() &&
+-                                !settings.base_url.empty());
+-    state.Set("needsKey", info && info->requires_key && !has_key);
++    const std::string agent_id = prefs->GetString(kAgentId);
++    const AgentRecipe* agent = FindAgentRecipe(agent_id);
++    const bool agent_mode = agent != nullptr;
++    const bool direct_configured = info && has_key && !settings.model.empty() &&
++                                   !settings.base_url.empty();
++    state.Set("providerName",
++              agent_mode ? agent->name : (info ? info->name : ""));
++    state.Set("model", agent_mode ? std::string() : settings.model);
++    state.Set("agentId", agent_id);
++    state.Set("configured", agent_mode || direct_configured);
++    state.Set("needsKey",
++              !agent_mode && info && info->requires_key && !has_key);
+     state.Set("attachCurrentTab", prefs->GetBoolean(kAttachCurrentTab));
+     state.Set("saveHistory", prefs->GetBoolean(kSaveHistory));
+     WatchTabs();
+@@ -535,6 +564,11 @@ void PageHandler::StartSession(std::uniq
+     FireWebUIListener("rac-ai-attach-failed", event);
+   }
+   send->request.pages = std::move(send->pages);
++  const std::string agent_id = profile_->GetPrefs()->GetString(kAgentId);
++  if (!agent_id.empty()) {
++    StartAgentSession(std::move(send), agent_id);
++    return;
++  }
+   const int send_id = send->send_id;
+   session_ = std::make_unique<ChatSession>(
+       service, std::move(send->request),
+@@ -544,6 +578,113 @@ void PageHandler::StartSession(std::uniq
+   session_->Start();
+ }
+ 
++void PageHandler::StartAgentSession(std::unique_ptr<PendingSend> send,
++                                    const std::string& agent_id) {
++  AiService* service = AiServiceFactory::GetForProfile(profile_);
++  if (!service || profile_->IsOffTheRecord()) {
++    OnUpdate(send->send_id,
++             {.error = profile_->IsOffTheRecord()
++                           ? "Agents are not available in Incognito."
++                           : "The assistant is turned off."});
++    return;
++  }
++  if (!FindAgentRecipe(agent_id)) {
++    OnUpdate(send->send_id, {.error = "Unknown agent."});
++    return;
++  }
++  page_context_.Apply(send->request);
++  std::string prompt =
++      BuildSystemPrompt(send->request.system_prompt, send->request.pages);
++  for (const ChatMessage& message : send->request.messages) {
++    prompt.append("\n\n");
++    prompt.append(message.role == ChatMessage::Role::kUser ? "User: "
++                                                           : "Assistant: ");
++    prompt.append(message.text);
++  }
++  const int send_id = send->send_id;
++  service->acp_service()->Prompt(
++      agent_id, std::move(prompt),
++      base::BindRepeating(&PageHandler::OnUpdate, weak_factory_.GetWeakPtr(),
++                          send_id),
++      base::BindRepeating(&PageHandler::OnAgentEvent,
++                          weak_factory_.GetWeakPtr(), send_id),
++      base::DoNothing());
++}
++
++void PageHandler::OnAgentEvent(int send_id, base::DictValue update) {
++  if (!IsJavascriptAllowed() ||
++      (send_id != active_send_id_ && active_send_id_ != 0)) {
++    return;
++  }
++  base::DictValue event;
++  event.Set("id", send_id);
++  event.Set("update", std::move(update));
++  FireWebUIListener("rac-ai-agent-update", event);
++}
++
++void PageHandler::HandleListAgents(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 1u);
++  AllowJavascript();
++  AiService* service = AiServiceFactory::GetForProfile(profile_);
++  if (!service || profile_->IsOffTheRecord()) {
++    ResolveJavascriptCallback(args[0], base::ListValue());
++    return;
++  }
++  service->acp_service()->ListAgents(
++      base::BindOnce(&PageHandler::OnAgentsListed, weak_factory_.GetWeakPtr(),
++                     args[0].Clone()));
++}
++
++void PageHandler::OnAgentsListed(base::Value callback_id,
++                                 base::ListValue agents) {
++  if (!IsJavascriptAllowed()) {
++    return;
++  }
++  ResolveJavascriptCallback(callback_id, agents);
++}
++
++void PageHandler::HandleSelectAgent(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 1u);
++  AllowJavascript();
++  const std::string id = args[0].GetString();
++  if (!id.empty() && !FindAgentRecipe(id)) {
++    return;
++  }
++  if (!id.empty() && profile_->IsOffTheRecord()) {
++    return;
++  }
++  profile_->GetPrefs()->SetString(kAgentId, id);
++}
++
++void PageHandler::HandleSetAgentPath(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 2u);
++  AllowJavascript();
++  const std::string id = args[0].GetString();
++  const std::string path = args[1].GetString();
++  if (!FindAgentRecipe(id)) {
++    return;
++  }
++  if (!path.empty() && path[0] != '/') {
++    return;
++  }
++  ScopedDictPrefUpdate update(profile_->GetPrefs(), kAgentPaths);
++  if (path.empty()) {
++    update->Remove(id);
++  } else {
++    update->Set(id, path);
++  }
++}
++
++void PageHandler::HandleSetCustomAgentCommand(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 1u);
++  AllowJavascript();
++  const std::string command = args[0].GetString();
++  if (!command.empty() && command[0] != '/') {
++    return;
++  }
++  profile_->GetPrefs()->SetString(kAgentCustomCommand, command);
++}
++
+ void PageHandler::HandleStop(const base::ListValue& args) {
+   StopSession();
+ }
+@@ -733,6 +874,7 @@ void PageHandler::HandleSelectModel(cons
+   settings.model = *model;
+   SetProviderSettings(prefs, info->id, settings);
+   prefs->SetString(kProvider, info->id);
++  prefs->SetString(kAgentId, std::string());
+ }
+ 
+ void PageHandler::HandleMakeTitle(const base::ListValue& args) {
+--- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
++++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+@@ -85,6 +85,10 @@ class PageHandler : public content::WebU
+   void HandlePromptRemove(const base::ListValue& args);
+   void HandleGetModels(const base::ListValue& args);
+   void HandleSelectModel(const base::ListValue& args);
++  void HandleListAgents(const base::ListValue& args);
++  void HandleSelectAgent(const base::ListValue& args);
++  void HandleSetAgentPath(const base::ListValue& args);
++  void HandleSetCustomAgentCommand(const base::ListValue& args);
+   void HandleMakeTitle(const base::ListValue& args);
+   void HandleShowMenu(const base::ListValue& args);
+   void HandleCloseMenu(const base::ListValue& args);
+@@ -122,7 +126,11 @@ class PageHandler : public content::WebU
+                   std::string url,
+                   PageTextResult result);
+   void StartSession(std::unique_ptr<PendingSend> send);
++  void StartAgentSession(std::unique_ptr<PendingSend> send,
++                         const std::string& agent_id);
+   void OnUpdate(int send_id, StreamUpdate update);
++  void OnAgentEvent(int send_id, base::DictValue update);
++  void OnAgentsListed(base::Value callback_id, base::ListValue agents);
+   void OnEnabledChanged();
+   void StopSession();
+ 
