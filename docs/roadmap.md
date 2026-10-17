@@ -3,10 +3,10 @@
 The order in which rac gets built. This page lists what each phase covers.
 Track active work in GitHub issues, not here.
 
-Status: **phase 2**. rac has its own name, bundle ID, data directory,
-version, and updater, with Helium's icons and services. Phase 1's icons,
-DMG art, onboarding, and release setup are put off until later; they're
-still needed before sharing builds.
+Status: **phase 3**. rac has its own name, bundle ID, data directory,
+version, and updater, with Helium's icons and services, and phase 2's
+features are built. When phase 4 is done, rac is ready to release. Phase 5
+is optional and comes after the release.
 
 ## How the phases work
 
@@ -30,9 +30,7 @@ colliding.
 - Build and run unmodified Helium from this repo on the maintainer's Mac.
 - Project docs, contribution guide, agent guide, and feature worktrees.
 
-## Phase 1: Make it rac
-
-Nothing gets shared with other people until this phase is done.
+## Phase 1: Make it rac (done)
 
 Foundation: **Identity.** It causes a large rebuild, so merge it before
 branching the rest.
@@ -42,12 +40,10 @@ branching the rest.
 | **Identity** (first) | App name, bundle ID, data directory, keychain name, Apple team ID. rac and Helium must be installable side by side. | Branding, product directory, keychain |
 | Cut Helium services | Crash reporting off; Helium's other services stay | Service prefs and URLs |
 | Updater | rac's own version, feed on GitHub releases, and signing key, independent of Helium services | `rac/updates/`, release scripts |
-| Icons and DMG art | App icon, logos, DMG background | `resources/` only |
 | Name pass | A substitution step after Helium's that turns "Helium" into "rac" in user-facing text | New substitution step |
-| Onboarding | rac's own first-run flow, using Helium's existing Arc importer | Onboarding page |
-| CI and releases | Replace Helium's workflows (especially `bump.yml`), signing, notarization, packaging | `.github/`, signing scripts |
 
-What's done and what still talks to Helium is in
+Icons, onboarding, and release setup moved to phase 4. What still talks to
+Helium is in
 [internals/overview.md](internals/overview.md#branding-and-helium-services).
 
 Decided:
@@ -60,13 +56,7 @@ Decided:
   consent screen. rac may host its own copy later.
 - Helium's icon stays until rac's is designed.
 
-Still needed before sharing builds:
-
-- An Apple Developer account for signing and notarization.
-- The update signing key in GitHub secrets (see
-  [Releases](operations/releases.md#one-time-setup)).
-
-## Phase 2: Foundations
+## Phase 2: Foundations (built)
 
 Spaces is the foundation; build it as an ordered chain in one worktree (data
 model, switching, dots, saving). The address bar in the sidebar and auto
@@ -104,46 +94,49 @@ being too large.
   [helium#1765](https://github.com/imputnet/helium/pull/1765). Chromium has
   related flags, such as `auto-picture-in-picture-on-window-occluded`.
 
-## Phase 3: Themes and tools
+## Phase 3: Finish the features
 
-Space themes needs Spaces from phase 2. The rest are independent of each
-other and can be built in parallel.
+Everything a user expects in rac's first release. Space themes needs Spaces
+from phase 2; the rest are independent of each other and can be built in
+parallel.
 
 | Feature | Covers | Code it touches |
 | --- | --- | --- |
 | Space themes | A color, gradient, and icon for each space | Themes and colors |
-| Command bar | A quick launcher for tabs, history, and actions, available in place of the new tab page | New rac page, new tab page hook |
-| Boosts | Custom CSS and JavaScript for each site, with an editor | Content script injection, new rac page |
+| AI basics | The AI sidebar that reads the current page, AI in the new tab page, Cmd+F "Ask", and link hover summaries. Foundation: **AI settings** (the onboarding opt-in, the settings toggle, and providers). Ideas so far are in [internals/ai.md](internals/ai.md) | `rac/ai/`, side panel, new tab page |
 | Media controls in the sidebar | Built on Chromium's media controls | Bottom of the sidebar |
+| Settings cleanup | Fewer settings: remove or hide what rac decides for the user, in rac's settings layout | Settings pages |
 
-## Phase 4: Polish
+## Phase 4: Ready to release
+
+Finishing everything up. When this phase is done, rac can be released.
 
 | Feature | Covers |
 | --- | --- |
-| Arc import | Bring Arc's spaces, pinned tabs, and favorites into rac's |
-| Onboarding update | Space themes, import, and sidebar layout choices in the first run |
+| Icons and DMG art | App icon, logos, DMG background, in `resources/` only |
+| Onboarding | rac's own first-run flow, with the AI opt-in, space themes, and sidebar layout choices, using Helium's existing importer |
 | Bangs | A settings page to view, edit, delete, and add bangs, with edits that survive list updates, and a rethought address bar experience for bangs. Design first; see [internals/bangs.md](internals/bangs.md) |
 | Performance check | Startup, tab switching, scrolling, and typing compared with Helium, with each feature on and off |
-| Micro-interactions | Tasteful motion, one worktree per area (sidebar, spaces, command bar) |
+| Micro-interactions | Tasteful motion, one worktree per area (sidebar, spaces, AI) |
+| CI and releases | Replace Helium's workflows (especially `bump.yml`), signing, notarization, packaging, in `.github/` and the signing scripts |
 
-## Phase 5: AI basics (to be designed)
+Needed before the first release:
 
-Designed from scratch, in a design doc that can be written during an
-earlier phase. See [internals/ai.md](internals/ai.md) for the ideas so far.
+- An Apple Developer account for signing and notarization.
+- The update signing key in GitHub secrets (see
+  [Releases](operations/releases.md#one-time-setup)).
 
-Foundation: **AI settings.** The onboarding opt-in, the settings toggle, and
-providers. When those are merged, these can be built in parallel:
+## Phase 5: After the release (optional)
 
-- The AI sidebar that reads the current page.
-- AI in the new tab page and the command bar.
-- Cmd+F "Ask".
-- Link hover summaries.
+Nothing here blocks a release. Build these after it, in any order.
 
-## Phase 6: Agent (to be designed)
-
-Foundation: **browser control** across tabs, with user confirmation. After
-it, the safety check on agent actions can be built in parallel with agent
-features.
+| Feature | Covers |
+| --- | --- |
+| Command bar | A quick launcher for tabs, history, and actions, available in place of the new tab page, with AI in it |
+| Boosts | Custom CSS and JavaScript for each site, with an editor |
+| Arc import | Bring Arc's spaces, pinned tabs, and favorites into rac's |
+| Dia import | Bring a Dia setup into rac. What it can cover needs research first |
+| Agent | Browser control across tabs, with user confirmation, then a safety check on agent actions. To be designed |
 
 ## Later
 

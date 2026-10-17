@@ -134,7 +134,7 @@ What still connects to Helium's servers:
 | Crash reports (`crash.helium.computer`) | Off, but not removed. `rac/privacy/disable-crash-uploads.patch` only empties the upload URL, makes the mode always "disabled" (so reports are deleted, never offered or sent), and hides the setting. Helium's crash reporting code is untouched, so rac can add its own later (see [Crash reports](#crash-reports)). |
 | Helium services (extension downloads, uBlock lists, spell check, bangs, component updates) | Kept as they are, behind Helium's consent screen and labeled as Helium's. The onboarding links to Helium's privacy policy and terms for them. rac may host its own copy later; Helium's server code is open source (`imputnet/helium-services`). |
 
-The [roadmap](../roadmap.md) tracks the rest of this work in phase 1.
+The [roadmap](../roadmap.md) tracks the rest of this work in phase 4.
 
 ### Crash reports
 
