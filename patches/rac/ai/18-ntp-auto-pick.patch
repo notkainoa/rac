@@ -1,0 +1,712 @@
+Index: src/chrome/browser/resources/rac_ai/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/BUILD.gn
++++ src/chrome/browser/resources/rac_ai/BUILD.gn
+@@ -17,6 +17,7 @@ build_webui("build") {
+   ts_files = [
+     "app.ts",
+     "browser_proxy.ts",
++    "intent.ts",
+     "markdown.ts",
+   ]
+ 
+Index: src/chrome/browser/resources/rac_ai/app.css
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/app.css
++++ src/chrome/browser/resources/rac_ai/app.css
+@@ -1083,3 +1083,95 @@ body[data-mode='panel'] .header {
+ body[data-mode='panel'] .composer-wrap {
+   padding: 0 7px 7px 0;
+ }
++
++/* New tab page: the composer searches or asks. The chip says which; it only
++ * exists once there is text to act on. */
++
++.mode-chip {
++  align-items: center;
++  background: var(--token);
++  border: 0;
++  border-radius: 16px;
++  color: var(--text-muted);
++  display: inline-flex;
++  flex: none;
++  font: 500 13px/1 system-ui, -apple-system, sans-serif;
++  gap: 6px;
++  height: 32px;
++  margin-inline-start: 4px;
++  overflow: hidden;
++  padding: 0 10px 0 8px;
++  transition: background-color 120ms, color 120ms;
++  white-space: nowrap;
++}
++
++.mode-chip[hidden] {
++  display: none;
++}
++
++.mode-chip:hover {
++  background: var(--token-hover);
++  color: var(--text);
++}
++
++.mode-chip svg {
++  height: 16px;
++  stroke-width: 1.5;
++  width: 16px;
++}
++
++.mode-chip .orb {
++  animation: none;
++  height: 12px;
++  margin: 2px;
++  width: 12px;
++}
++
++.mode-chip:not([data-mode='search']) .mode-icon-search,
++.mode-chip:not([data-mode='open']) .mode-icon-open,
++.mode-chip:not([data-mode='ask']) .mode-icon-ask {
++  display: none;
++}
++
++.kbd {
++  border: 1px solid var(--hairline);
++  border-radius: 4px;
++  color: var(--text-faint);
++  font: 11px/14px system-ui, -apple-system, sans-serif;
++  height: 16px;
++  padding: 0 4px;
++}
++
++.mode-chip:not(.show-kbd) .kbd {
++  display: none;
++}
++
++.visually-hidden {
++  block-size: 1px;
++  clip-path: inset(50%);
++  inline-size: 1px;
++  overflow: hidden;
++  position: absolute;
++  white-space: nowrap;
++}
++
++.send .arrow-right,
++.composer:is([data-intent='search'], [data-intent='open']) .send .arrow-up {
++  display: none;
++}
++
++.composer:is([data-intent='search'], [data-intent='open']) .send .arrow-right {
++  display: inline;
++}
++
++.composer:is([data-intent='search'], [data-intent='open'])
++    .send:not(:disabled, .stop) {
++  background: light-dark(rgb(0 0 0 / 85%), rgb(255 255 255 / 85%));
++  color: light-dark(#fff, #1b1b1b);
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .mode-chip {
++    transition: none;
++  }
++}
+Index: src/chrome/browser/resources/rac_ai/app.ts
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/app.ts
++++ src/chrome/browser/resources/rac_ai/app.ts
+@@ -8,6 +8,8 @@ import {loadTimeData} from 'chrome://res
+ import {getRequiredElement} from 'chrome://resources/js/util.js';
+ 
+ import {addWebUiListener, sendToBrowser, sendWithPromise} from './browser_proxy.js';
++import {classify} from './intent.js';
++import type {Intent, Mode} from './intent.js';
+ import {makeCopyIcon, makeIcon, renderMarkdown} from './markdown.js';
+ 
+ interface TabInfo {
+@@ -125,6 +127,20 @@ let noteTimer = 0;
+ // it; scrolling back to the end, or sending, starts it again.
+ let autoFollow = false;
+ const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
++// The new tab page's composer picks between searching and asking as the user
++// types. `intent` is what Return does; `manualMode` is the user's own choice,
++// which holds until the text is cleared.
++const pageMode = new URLSearchParams(location.search).get('mode') === 'page';
++let intent: Intent = {mode: 'search', url: false};
++let manualMode: Mode|null = null;
++let intentTimer = 0;
++let announceTimer = 0;
++let lastAnnounceMs = 0;
++let chipKey = '';
++let inputFocused = false;
++// Wait this long after typing stops before the choice may flip mid-word.
++const INTENT_DELAY_MS = 300;
++const ANNOUNCE_GAP_MS = 1000;
+ 
+ const CHECK_ICON = 'M5 10.5l3.2 3.2L15 7';
+ const CLOSE_ICON = 'M6 6l8 8M14 6l-8 8';
+@@ -148,6 +164,10 @@ const modelButton = getRequiredElement<H
+ const modelName = getRequiredElement('modelName');
+ const titleButton = getRequiredElement<HTMLButtonElement>('chatTitle');
+ const titleText = getRequiredElement('chatTitleText');
++const composer = getRequiredElement('composer');
++const modeChip = getRequiredElement<HTMLButtonElement>('modeChip');
++const modeLabel = getRequiredElement('modeLabel');
++const modeAnnounce = getRequiredElement('modeAnnounce');
+ 
+ function openUrl(url: string) {
+   sendToBrowser('racAiOpenUrl', [url]);
+@@ -176,14 +196,157 @@ function applyStrings() {
+   }
+ }
+ 
++// What Return does now. Anywhere but the new tab page's first message, the
++// composer only asks.
++function shownMode(): Mode {
++  return pageMode && messages.length === 0 && !streaming ?
++      (configured ? intent.mode : 'search') :
++      'ask';
++}
++
++function canToggleMode(): boolean {
++  return pageMode && configured && messages.length === 0 && !streaming &&
++      input.value.trim().length > 0;
++}
++
++function announceMode(mode: Mode) {
++  clearTimeout(announceTimer);
++  const say = () => {
++    lastAnnounceMs = performance.now();
++    modeAnnounce.textContent =
++        loadTimeData.getString(mode === 'ask' ? 'willAsk' : 'willSearch');
++  };
++  const wait = lastAnnounceMs + ANNOUNCE_GAP_MS - performance.now();
++  if (wait <= 0) {
++    say();
++  } else {
++    announceTimer = setTimeout(say, wait);
++  }
++}
++
++function renderIntent() {
++  const mode = shownMode();
++  const open = mode === 'search' && intent.url && pageMode;
++  const label = open ? 'modeOpen' : mode === 'ask' ? 'modeAsk' : 'modeSearch';
++  composer.dataset['intent'] = pageMode ? (open ? 'open' : mode) : 'ask';
++  const sendLabel = loadTimeData.getString(
++      mode === 'ask' ? 'send' :
++          open       ? 'modeOpen' :
++                       'modeSearch');
++  sendButton.setAttribute('aria-label', sendLabel);
++  sendButton.title = sendLabel;
++
++  const show = canToggleMode();
++  const wasShown = !modeChip.hidden;
++  const key = `${mode}:${open}`;
++  if (show && wasShown && key !== chipKey && !reducedMotion.matches) {
++    const from = modeChip.getBoundingClientRect().width;
++    writeChip(mode, open, label);
++    const to = modeChip.getBoundingClientRect().width;
++    modeChip.animate(
++        [{width: `${from}px`}, {width: `${to}px`}],
++        {duration: 160, easing: 'cubic-bezier(0.2, 0, 0, 1)'});
++    modeLabel.animate([{opacity: 0}, {opacity: 1}], {duration: 120});
++  } else {
++    writeChip(mode, open, label);
++  }
++  modeChip.hidden = !show;
++  modeChip.classList.toggle('show-kbd', show && inputFocused);
++  chipKey = key;
++}
++
++function writeChip(mode: Mode, open: boolean, label: string) {
++  modeChip.dataset['mode'] = open ? 'open' : mode;
++  modeChip.setAttribute('aria-checked', String(mode === 'ask'));
++  modeChip.title = loadTimeData.getString(
++      mode === 'ask' ? 'modeSwitchToSearch' : 'modeSwitchToAsk');
++  modeLabel.textContent = loadTimeData.getString(label);
++}
++
++function applyIntent(next: Intent) {
++  if (next.mode === intent.mode && next.url === intent.url) {
++    return;
++  }
++  const flipped = next.mode !== intent.mode;
++  intent = next;
++  if (flipped && canToggleMode()) {
++    announceMode(next.mode);
++  }
++  updateControls();
++}
++
++// Runs as the user types. A flip waits for a word boundary or a short pause,
++// so the chip doesn't flutter letter by letter.
++function onTextChanged() {
++  if (!pageMode) {
++    return;
++  }
++  clearTimeout(intentTimer);
++  const text = input.value;
++  if (!text.trim()) {
++    manualMode = null;
++    intent = {mode: 'search', url: false};
++    return;
++  }
++  const next = classify(text);
++  if (manualMode) {
++    applyIntent({mode: manualMode, url: manualMode === 'search' && next.url});
++  } else if (/\s$/.test(text) || next.mode === intent.mode) {
++    applyIntent(next);
++  } else {
++    intentTimer = setTimeout(() => {
++      if (!manualMode) {
++        applyIntent(classify(input.value));
++      }
++    }, INTENT_DELAY_MS);
++  }
++}
++
++function toggleMode() {
++  if (!canToggleMode()) {
++    return;
++  }
++  clearTimeout(intentTimer);
++  manualMode = shownMode() === 'ask' ? 'search' : 'ask';
++  intent = {
++    mode: manualMode,
++    url: manualMode === 'search' && classify(input.value).url,
++  };
++  announceMode(manualMode);
++  updateControls();
++}
++
++function search(text: string) {
++  sendToBrowser('racAiSearch', [text.slice(0, 2000)]);
++}
++
++// Does the shown choice, or with `other` the one it isn't, once.
++function submit(other = false) {
++  const text = input.value.trim();
++  if (!text || streaming) {
++    return;
++  }
++  let mode = shownMode();
++  if (other && canToggleMode()) {
++    mode = mode === 'ask' ? 'search' : 'ask';
++  }
++  if (mode === 'search') {
++    search(text);
++  } else {
++    send();
++  }
++}
++
+ function updateControls() {
+   const hasText = input.value.trim().length > 0;
+-  sendButton.disabled = !configured || !hasText;
++  const searching = shownMode() === 'search';
++  sendButton.disabled = !hasText || (!searching && !configured);
+   sendButton.hidden = streaming;
+   stopButton.hidden = !streaming;
+-  input.disabled = !configured;
++  input.disabled = !configured && !pageMode;
+   addTabButton.disabled = !configured;
+-  modelButton.hidden = !configured || !modelName.textContent;
++  modelButton.hidden = !configured || !modelName.textContent || searching;
++  renderIntent();
+   emptyState.hidden = !configured || messages.length > 0;
+   document.body.dataset['chat'] = messages.length > 0 ? 'active' : 'empty';
+   setupState.hidden = configured;
+@@ -192,10 +355,18 @@ function updateControls() {
+   updateTitle();
+ }
+ 
++function placeholderKey(): string {
++  if (messages.length > 0) {
++    return 'placeholderNext';
++  }
++  if (pageMode) {
++    return configured ? 'ntpPlaceholder' : 'ntpPlaceholderSearch';
++  }
++  return followCurrent && currentTab ? 'placeholderPage' : 'placeholder';
++}
++
+ function updatePlaceholder() {
+-  const key = messages.length > 0  ? 'placeholderNext' :
+-      followCurrent && currentTab ? 'placeholderPage' :
+-                                    'placeholder';
++  const key = placeholderKey();
+   const text = loadTimeData.getString(key);
+   if (input.placeholder !== text) {
+     input.placeholder = text;
+@@ -932,6 +1103,7 @@ function send() {
+   messages.push(question);
+   setAutoFollow(true);
+   input.value = '';
++  onTextChanged();
+   resizeInput();
+   // Pages are read again for every message, so the reply sees them as they
+   // are now. Tabs added by hand are used once; the foreground tab's card
+@@ -999,6 +1171,8 @@ function resetChat() {
+   conversationId = crypto.randomUUID();
+   chatTitle = '';
+   titleRequested = false;
++  manualMode = null;
++  intent = {mode: 'search', url: false};
+   closeMenus();
+   renderChips();
+ }
+@@ -1130,8 +1304,6 @@ function applyState(state: InitState) {
+ 
+ function init() {
+   applyStrings();
+-  const pageMode =
+-      new URLSearchParams(location.search).get('mode') === 'page';
+   document.body.dataset['mode'] = pageMode ? 'page' : 'panel';
+   if (pageMode) {
+     document.title = loadTimeData.getString('newTabTitle');
+@@ -1144,8 +1316,21 @@ function init() {
+ 
+   input.addEventListener('input', () => {
+     resizeInput();
++    onTextChanged();
+     updateControls();
+   });
++  input.addEventListener('focus', () => {
++    inputFocused = true;
++    renderIntent();
++  });
++  input.addEventListener('blur', () => {
++    inputFocused = false;
++    renderIntent();
++  });
++  modeChip.addEventListener('click', () => {
++    toggleMode();
++    input.focus();
++  });
+   // The composer floats over the end of the thread, which fades out under
+   // it.
+   new ResizeObserver(() => {
+@@ -1182,9 +1367,16 @@ function init() {
+       toggleMenu(addTabButton, openPicker);
+       return;
+     }
++    if (event.key === 'Tab' && !event.shiftKey && !event.altKey &&
++        !event.ctrlKey && !event.metaKey && !event.isComposing &&
++        canToggleMode()) {
++      event.preventDefault();
++      toggleMode();
++      return;
++    }
+     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+       event.preventDefault();
+-      send();
++      submit(event.metaKey);
+     }
+   });
+   // A click anywhere in the box puts the caret in the text.
+@@ -1195,7 +1387,7 @@ function init() {
+       input.focus();
+     }
+   });
+-  sendButton.addEventListener('click', send);
++  sendButton.addEventListener('click', () => submit());
+   stopButton.addEventListener('click', stop);
+   addTabButton.addEventListener(
+       'click', () => toggleMenu(addTabButton, openPicker));
+Index: src/chrome/browser/resources/rac_ai/index.html
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/index.html
++++ src/chrome/browser/resources/rac_ai/index.html
+@@ -58,6 +58,17 @@
+                 data-i18n-label="attach">
+               <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4.25v11.5M4.25 10h11.5"/></svg>
+             </button>
++            <button id="modeChip" class="mode-chip" type="button"
++                role="switch" aria-checked="true" hidden
++                data-i18n-label="modeSwitchLabel">
++              <svg class="mode-icon mode-icon-search" viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="5.25"/><path d="M13 13l3.5 3.5"/></svg>
++              <svg class="mode-icon mode-icon-open" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.25"/><path d="M3.75 10h12.5M10 3.75c-2 2-2.9 4-2.9 6.25s.9 4.25 2.9 6.25c2-2 2.9-4 2.9-6.25S12 5.75 10 3.75z"/></svg>
++              <span class="orb mode-icon mode-icon-ask" aria-hidden="true"></span>
++              <span id="modeLabel" class="mode-label"></span>
++              <kbd class="kbd" aria-hidden="true">⇥</kbd>
++            </button>
++            <span id="modeAnnounce" class="visually-hidden" role="status"
++                aria-live="polite"></span>
+             <span class="spacer"></span>
+             <button id="modelButton" class="model-button" type="button" hidden
+                 aria-haspopup="menu" aria-expanded="false"
+@@ -67,7 +78,7 @@
+             </button>
+             <button id="send" class="send" type="button" disabled
+                 data-i18n-label="send">
+-              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 15.25V4.75M5.25 9.5L10 4.75l4.75 4.75"/></svg>
++              <svg viewBox="0 0 20 20" aria-hidden="true"><path class="arrow-up" d="M10 15.25V4.75M5.25 9.5L10 4.75l4.75 4.75"/><path class="arrow-right" d="M4.75 10h10.5M10.5 5.25L15.25 10l-4.75 4.75"/></svg>
+             </button>
+             <button id="stop" class="send stop" type="button" hidden
+                 data-i18n-label="stop">
+Index: src/chrome/browser/resources/rac_ai/intent.ts
+===================================================================
+--- /dev/null
++++ src/chrome/browser/resources/rac_ai/intent.ts
+@@ -0,0 +1,122 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Decides, from the text alone, whether the new tab page's composer should
++// search or ask the assistant. Everything here is local and cheap enough to
++// run on every keystroke; no model is ever involved.
++
++export type Mode = 'search'|'ask';
++
++export interface Intent {
++  mode: Mode;
++  // The text looks like an address. It still searches (the browser opens it),
++  // but the composer says "Open".
++  url: boolean;
++}
++
++// "who is x" asks at three words. Verbs that begin a yes/no question also
++// begin product names ("can opener reviews"), so they need a fourth word.
++const WH_WORDS = new Set([
++  'who',
++  'whom',
++  'whose',
++  'what',
++  'when',
++  'where',
++  'why',
++  'which',
++  'how',
++  'what\'s',
++  'who\'s',
++  'where\'s',
++  'how\'s',
++  'when\'s',
++  'why\'s',
++]);
++
++const AUX_WORDS = new Set([
++  'is',     'are',      'am',     'was',    'were',  'do',     'does',
++  'did',    'can',      'could',  'should', 'would', 'will',   'shall',
++  'may',    'might',    'have',   'has',    'had',   'isn\'t', 'aren\'t',
++  'don\'t', 'doesn\'t', 'can\'t', 'won\'t',
++]);
++
++// Verbs people start a request to an assistant with.
++const REQUEST_WORDS = new Set([
++  'explain', 'summarize',  'summarise', 'describe', 'compare', 'translate',
++  'suggest', 'recommend',  'rewrite',   'draft',    'write',   'generate',
++  'create',  'brainstorm', 'teach',     'help',     'tell',    'give',
++  'show',    'list',       'make',      'plan',     'analyze', 'analyse',
++]);
++
++const FIRST_PERSON =
++    new Set(['i', 'i\'m', 'i\'ve', 'my', 'me', 'we', 'you', 'your']);
++
++// Google-style operators mean the user knows exactly what they want to search.
++const OPERATOR =
++    /(^|\s)(site|filetype|intitle|inurl|before|after|related|cache):\S/i;
++
++const SCHEME = /^[a-z][a-z0-9+.-]*:\/\/\S+$/i;
++const HOST_PORT =
++    /^(localhost|\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:]+\])(:\d+)?([/?#]\S*)?$/i;
++const DOMAIN = /^([a-z0-9-]+\.)+[a-z]{2,}(:\d+)?([/?#]\S*)?$/i;
++
++const QUESTION_MARKS = ['?', '\uFF1F', '\u061F', '\u037E'];
++
++// CJK text has no spaces between words: count characters instead.
++const CJK =
++    /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
++const CJK_LONG = 15;
++const WORDS_LONG = 8;
++const WORDS_WITH_PRONOUN = 5;
++
++export function looksLikeUrl(text: string): boolean {
++  const trimmed = text.trim();
++  if (!trimmed || /\s/.test(trimmed)) {
++    return false;
++  }
++  return SCHEME.test(trimmed) || HOST_PORT.test(trimmed) ||
++      DOMAIN.test(trimmed) || /^(www|localhost)\b/i.test(trimmed);
++}
++
++function words(text: string): string[] {
++  return text.toLowerCase().split(/\s+/).filter(Boolean);
++}
++
++export function classify(text: string): Intent {
++  const trimmed = text.trim();
++  if (!trimmed) {
++    return {mode: 'search', url: false};
++  }
++  if (looksLikeUrl(trimmed)) {
++    return {mode: 'search', url: true};
++  }
++  const search: Intent = {mode: 'search', url: false};
++  const ask: Intent = {mode: 'ask', url: false};
++  if (OPERATOR.test(trimmed) || /^".*"$/.test(trimmed)) {
++    return search;
++  }
++  if (QUESTION_MARKS.includes(trimmed.slice(-1))) {
++    return ask;
++  }
++  const list = words(trimmed);
++  const first = (list[0] ?? '').replace(/[^\p{L}\p{N}']/gu, '');
++  if (list.length === 1) {
++    return CJK.test(trimmed) && trimmed.length >= CJK_LONG ? ask : search;
++  }
++  if (list.length >= WORDS_LONG) {
++    return ask;
++  }
++  if (list.length >= 3 && (WH_WORDS.has(first) || REQUEST_WORDS.has(first))) {
++    return ask;
++  }
++  if (list.length >= 4 && AUX_WORDS.has(first)) {
++    return ask;
++  }
++  if (list.length >= WORDS_WITH_PRONOUN &&
++      list.some(w => FIRST_PERSON.has(w))) {
++    return ask;
++  }
++  return search;
++}
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+@@ -14,6 +14,7 @@
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "chrome/browser/autocomplete/autocomplete_classifier_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/rac/ai/ai_service.h"
+@@ -34,6 +35,8 @@
+ #include "chrome/browser/ui/views/rac/ai/assistant_menu.h"
+ #include "chrome/browser/ui/views/rac/ai/assistant_side_panel.h"
+ #include "chrome/browser/ui/webui/webui_embedding_context.h"
++#include "components/omnibox/browser/autocomplete_classifier.h"
++#include "components/omnibox/browser/autocomplete_match.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_controller.h"
+@@ -42,8 +45,11 @@
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_observer.h"
+ #include "content/public/browser/web_ui.h"
++#include "content/public/common/url_constants.h"
+ #include "services/network/public/cpp/simple_url_loader.h"
+ #include "third_party/blink/public/mojom/frame/user_activation_notification_type.mojom.h"
++#include "third_party/metrics_proto/omnibox_event.pb.h"
++#include "ui/base/page_transition_types.h"
+ #include "ui/base/window_open_disposition.h"
+ #include "ui/gfx/geometry/rect_conversions.h"
+ #include "ui/gfx/geometry/rect_f.h"
+@@ -63,6 +69,7 @@ constexpr size_t kMaxFileChars = 1024 *
+ constexpr size_t kMaxModelChars = 200;
+ constexpr size_t kMaxTitleSourceChars = 4000;
+ constexpr size_t kMaxTitleReplyChars = 2000;
++constexpr size_t kMaxSearchBytes = 2000;
+ constexpr size_t kMaxMenuEntries = 300;
+ constexpr size_t kMaxMenuText = 500;
+ constexpr int kMaxMenuWidth = 600;
+@@ -207,6 +214,9 @@ void PageHandler::RegisterMessages() {
+       "racAiTakeAsk",
+       base::BindRepeating(&PageHandler::HandleTakeAsk, base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
++      "racAiSearch",
++      base::BindRepeating(&PageHandler::HandleSearch, base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
+       "racAiShowMenu", base::BindRepeating(&PageHandler::HandleShowMenu,
+                                            base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
+@@ -669,6 +679,54 @@ void PageHandler::OnAskPosted() {
+   }
+ }
+ 
++// The new tab page's Search: opens `text` in this tab the way the address bar
++// would, as an address or as a search with the default search engine.
++void PageHandler::HandleSearch(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 1u);
++  content::WebContents* contents = web_ui()->GetWebContents();
++  AutocompleteClassifier* classifier =
++      AutocompleteClassifierFactory::GetForProfile(profile_);
++  if (!args[0].is_string() || !classifier ||
++      !tabs::TabInterface::MaybeGetFromContents(contents) ||
++      !AiServiceFactory::GetForProfile(profile_)) {
++    return;
++  }
++  std::string text;
++  base::TruncateUTF8ToByteSize(args[0].GetString(), kMaxSearchBytes, &text);
++  const std::u16string query = std::u16string(
++      base::TrimWhitespace(base::UTF8ToUTF16(text), base::TRIM_ALL));
++  if (query.empty()) {
++    return;
++  }
++  AutocompleteMatch match;
++  classifier->Classify(query, /*in_keyword_mode=*/false,
++                       /*allow_exact_keyword_match=*/false,
++                       metrics::OmniboxEventProto::OTHER, &match, nullptr);
++  const GURL url = match.destination_url;
++  // A page here must not become a way to run script or reach local files.
++  if (!url.is_valid() ||
++      !(url.SchemeIsHTTPOrHTTPS() || url.SchemeIs(content::kChromeUIScheme))) {
++    return;
++  }
++  const ui::PageTransition transition =
++      AutocompleteMatch::IsSearchType(match.type)
++          ? ui::PAGE_TRANSITION_GENERATED
++          : ui::PAGE_TRANSITION_TYPED;
++  // Leave this handler before the page it belongs to is replaced.
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(
++                     [](base::WeakPtr<content::WebContents> contents, GURL url,
++                        ui::PageTransition transition) {
++                       if (!contents) {
++                         return;
++                       }
++                       content::NavigationController::LoadURLParams params(url);
++                       params.transition_type = transition;
++                       contents->GetController().LoadURLWithParams(params);
++                     },
++                     contents->GetWeakPtr(), url, transition));
++}
++
+ void PageHandler::HandleGetModels(const base::ListValue& args) {
+   CHECK_EQ(args.size(), 1u);
+   AllowJavascript();
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+@@ -75,6 +75,7 @@ class PageHandler : public content::WebU
+   void HandleOpenSettings(const base::ListValue& args);
+   void HandleClosePanel(const base::ListValue& args);
+   void HandleTakeAsk(const base::ListValue& args);
++  void HandleSearch(const base::ListValue& args);
+   void OnAskPosted();
+   void HandleHistoryList(const base::ListValue& args);
+   void HandleHistoryGet(const base::ListValue& args);
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+@@ -78,6 +78,16 @@ constexpr Str kStrings[] = {
+     {"deleteItem", "Delete"},
+     {"chooseModel", "Choose a model"},
+     {"loadingModels", "Looking for models\u2026"},
++    {"modeSearch", "Search"},
++    {"modeAsk", "Ask"},
++    {"modeOpen", "Open"},
++    {"modeSwitchLabel", "Ask the assistant instead of searching"},
++    {"modeSwitchToAsk", "Switch to Ask (Tab)"},
++    {"modeSwitchToSearch", "Switch to Search (Tab)"},
++    {"willSearch", "Will search"},
++    {"willAsk", "Will ask"},
++    {"ntpPlaceholder", "Search or ask anything\u2026"},
++    {"ntpPlaceholderSearch", "Search or type a URL"},
+ };
+ 
+ }  // namespace
