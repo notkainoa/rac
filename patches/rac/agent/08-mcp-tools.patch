@@ -1,0 +1,397 @@
+--- a/chrome/browser/rac/agent/BUILD.gn
++++ b/chrome/browser/rac/agent/BUILD.gn
+@@ -5,6 +5,8 @@ import("//testing/test.gni")
+ 
+ source_set("core") {
+   sources = [
++    "agent_mcp_convert.cc",
++    "agent_mcp_convert.h",
+     "mcp_tool_provider.h",
+     "action_guard.cc",
+     "action_guard.h",
+@@ -116,6 +118,7 @@ source_set("agent") {
+ test("rac_agent_unittests") {
+   sources = [
+     "action_guard_unittest.cc",
++    "agent_mcp_tools_unittest.cc",
+     "critic_protocol_unittest.cc",
+     "ref_table_unittest.cc",
+     "snapshot_serializer_unittest.cc",
+@@ -139,8 +142,13 @@ source_set("controller") {
+   sources = [
+     "agent_controller.cc",
+     "agent_controller.h",
++    "agent_mcp_tools.cc",
++    "agent_mcp_tools.h",
++  ]
++  public_deps = [
++    ":browser",
++    ":core",
+   ]
+-  public_deps = [ ":browser" ]
+   deps = [
+     "//chrome/browser/rac/ai:browser",
+     "//chrome/browser/ui/browser_window",
+--- a/chrome/browser/rac/agent/agent_controller.cc
++++ b/chrome/browser/rac/agent/agent_controller.cc
+@@ -634,8 +634,9 @@ void AgentController::Respond(const std:
+   if (id != approval_id_ || !done_ || approval_id_.empty()) {
+     return;
+   }
++  // confirm = allow_once (WP8 cards); skip = deny.
+   if (decision != "stop" && decision != "allow" && decision != "allow_once" &&
+-      decision != "deny" && decision != "skip") {
++      decision != "confirm" && decision != "deny" && decision != "skip") {
+     return;
+   }
+   approval_id_.clear();
+@@ -643,7 +644,8 @@ void AgentController::Respond(const std:
+     Cancel();
+     return;
+   }
+-  if (decision != "allow" && decision != "allow_once") {
++  if (decision != "allow" && decision != "allow_once" &&
++      decision != "confirm") {
+     Finish(
+         Error("declined", "The user declined this action. Do not retry it."));
+     return;
+--- /dev/null
++++ b/chrome/browser/rac/agent/agent_mcp_tools.cc
+@@ -0,0 +1,48 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/agent/agent_mcp_tools.h"
++
++#include <utility>
++
++#include "base/uuid.h"
++
++namespace rac::agent {
++
++AgentMcpTools::AgentMcpTools(base::WeakPtr<AgentController> controller)
++    : controller_(std::move(controller)) {}
++
++AgentMcpTools::~AgentMcpTools() = default;
++
++std::vector<McpToolSpec> AgentMcpTools::ListTools() {
++  std::vector<McpToolSpec> specs;
++  if (!controller_) {
++    return specs;
++  }
++  for (const ToolDefinition& tool : controller_->AvailableTools()) {
++    specs.push_back(ToolDefinitionToMcpSpec(tool));
++  }
++  return specs;
++}
++
++void AgentMcpTools::CallTool(const std::string& name,
++                             base::DictValue args,
++                             base::OnceCallback<void(McpToolResult)> done) {
++  if (!controller_) {
++    std::move(done).Run(MissingControllerMcpResult());
++    return;
++  }
++  ToolCall call;
++  call.id = base::Uuid::GenerateRandomV4().AsLowercaseString();
++  call.name = name;
++  call.arguments = std::move(args);
++  controller_->HandleToolCall(
++      call, ToolCallSource::kMcp,
++      base::BindOnce(
++          [](base::OnceCallback<void(McpToolResult)> done, ToolResult result) {
++            std::move(done).Run(ToolResultToMcpResult(result));
++          },
++          std::move(done)));
++}
++
++}  // namespace rac::agent
+--- /dev/null
++++ b/chrome/browser/rac/agent/agent_mcp_tools.h
+@@ -0,0 +1,32 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_AGENT_AGENT_MCP_TOOLS_H_
++#define CHROME_BROWSER_RAC_AGENT_AGENT_MCP_TOOLS_H_
++
++#include "base/memory/weak_ptr.h"
++#include "chrome/browser/rac/agent/agent_controller.h"
++#include "chrome/browser/rac/agent/agent_mcp_convert.h"
++#include "chrome/browser/rac/agent/mcp_tool_provider.h"
++
++namespace rac::agent {
++
++// McpToolProvider backed by a live AgentController turn. Holds only a
++// WeakPtr; if the turn ends, CallTool returns an error and never crashes.
++class AgentMcpTools : public McpToolProvider {
++ public:
++  explicit AgentMcpTools(base::WeakPtr<AgentController> controller);
++  ~AgentMcpTools() override;
++
++  std::vector<McpToolSpec> ListTools() override;
++  void CallTool(const std::string& name,
++                base::DictValue args,
++                base::OnceCallback<void(McpToolResult)> done) override;
++
++ private:
++  base::WeakPtr<AgentController> controller_;
++};
++
++}  // namespace rac::agent
++
++#endif  // CHROME_BROWSER_RAC_AGENT_AGENT_MCP_TOOLS_H_
+--- /dev/null
++++ b/chrome/browser/rac/agent/agent_mcp_tools_unittest.cc
+@@ -0,0 +1,74 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/agent/agent_mcp_convert.h"
++#include "chrome/browser/rac/agent/tool_registry.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::agent {
++namespace {
++
++TEST(AgentMcpToolsTest, SpecConversionMarksReadOnly) {
++  ToolDefinition read;
++  read.name = "snapshot";
++  read.description = "Read the page";
++  read.kind = ToolKind::kRead;
++  read.parameters = base::DictValue()
++                        .Set("type", "object")
++                        .Set("properties", base::DictValue());
++
++  ToolDefinition action;
++  action.name = "click";
++  action.description = "Click an element";
++  action.kind = ToolKind::kAction;
++  action.parameters = base::DictValue().Set("type", "object");
++
++  McpToolSpec read_spec = ToolDefinitionToMcpSpec(read);
++  EXPECT_EQ(read_spec.name, "snapshot");
++  EXPECT_EQ(read_spec.description, "Read the page");
++  EXPECT_TRUE(read_spec.read_only);
++  EXPECT_EQ(*read_spec.input_schema.FindString("type"), "object");
++
++  McpToolSpec action_spec = ToolDefinitionToMcpSpec(action);
++  EXPECT_EQ(action_spec.name, "click");
++  EXPECT_FALSE(action_spec.read_only);
++}
++
++TEST(AgentMcpToolsTest, DeclinedResultIsErrorWithPlainText) {
++  ToolResult declined;
++  declined.ok = false;
++  declined.error_code = "declined";
++  declined.error = "The user declined this action. Do not retry it.";
++
++  McpToolResult mcp = ToolResultToMcpResult(declined);
++  EXPECT_TRUE(mcp.is_error);
++  ASSERT_EQ(mcp.content.size(), 1u);
++  const std::string* text = mcp.content[0].GetDict().FindString("text");
++  ASSERT_TRUE(text);
++  EXPECT_NE(text->find("declined"), std::string::npos);
++  EXPECT_NE(text->find("Do not retry"), std::string::npos);
++}
++
++TEST(AgentMcpToolsTest, OkResultIsNotError) {
++  ToolResult ok;
++  ok.ok = true;
++  ok.data.Set("ref", "e1");
++
++  McpToolResult mcp = ToolResultToMcpResult(ok);
++  EXPECT_FALSE(mcp.is_error);
++  ASSERT_EQ(mcp.content.size(), 1u);
++  const std::string* text = mcp.content[0].GetDict().FindString("text");
++  ASSERT_TRUE(text);
++  EXPECT_NE(text->find("\"ok\":true"), std::string::npos);
++}
++
++TEST(AgentMcpToolsTest, TurnGoneReturnsError) {
++  McpToolResult got = MissingControllerMcpResult();
++  EXPECT_TRUE(got.is_error);
++  ASSERT_EQ(got.content.size(), 1u);
++  EXPECT_EQ(*got.content[0].GetDict().FindString("text"),
++            "Browser control ended.");
++}
++
++}  // namespace
++}  // namespace rac::agent
+--- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
++++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+@@ -20,6 +20,8 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/rac/agent/agent_controller.h"
+ #include "chrome/browser/rac/agent/agent_debug.h"
++#include "chrome/browser/rac/agent/agent_mcp_tools.h"
++#include "chrome/browser/rac/agent/mcp_tool_provider.h"
+ #include "chrome/browser/rac/ai/acp/acp_service.h"
+ #include "chrome/browser/rac/ai/acp/agent_recipes.h"
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+@@ -276,13 +278,24 @@ void PageHandler::OnJavascriptDisallowed
+   StopSession();
+ }
+ 
++void PageHandler::ClearAgentToolTurn() {
++  if (AiService* service = AiServiceFactory::GetForProfile(profile_)) {
++    if (AcpService* acp = service->acp_service_if_created()) {
++      acp->SetToolProvider(nullptr);
++      acp->SetToolApprovalCallback(rac::agent::ToolApprovalCallback());
++    }
++  }
++  agent_mcp_tools_.reset();
++  agent_controller_.reset();
++}
++
+ void PageHandler::StopSession() {
+   reading_factory_.InvalidateWeakPtrs();
+   session_.reset();
+   if (agent_controller_) {
+     agent_controller_->Cancel();
+   }
+-  agent_controller_.reset();
++  ClearAgentToolTurn();
+   if (AiService* service = AiServiceFactory::GetForProfile(profile_)) {
+     if (AcpService* acp = service->acp_service_if_created()) {
+       // Cancel the prompt, then tear down pipes/process so Stop always kills.
+@@ -714,6 +727,73 @@ void PageHandler::StartSession(std::uniq
+   session_->Start();
+ }
+ 
++void PageHandler::BeginAgentToolTurn(const PendingSend& send, int send_id) {
++  auto* controller = rac::agent::AgentController::GetOrCreate(profile_);
++  if (!controller) {
++    return;
++  }
++  std::vector<content::WebContents*> attached;
++  BrowserWindowInterface* browser = GetBrowser();
++  for (int id : send.control_tab_ids) {
++    auto* tab = tabs::TabHandle(id).Get();
++    if (tab && tab->GetBrowserWindowInterface() == browser &&
++        IsAttachable(tab)) {
++      attached.push_back(tab->GetContents());
++    }
++  }
++  std::vector<std::string> user_messages;
++  for (const auto& message : send.request.messages) {
++    if (message.role == ChatMessage::Role::kUser) {
++      user_messages.push_back(message.text);
++    }
++  }
++  const std::string goal = send.request.messages.empty()
++                               ? std::string()
++                               : send.request.messages.back().text;
++  controller->BeginTurn(
++      browser, conversation_id_, goal, user_messages, attached,
++      base::BindRepeating(
++          [](base::WeakPtr<PageHandler> handler, int send_id,
++             base::DictValue event) {
++            if (!handler || !handler->IsJavascriptAllowed() ||
++                handler->active_send_id_ != send_id) {
++              return;
++            }
++            if (event.FindString("type") &&
++                *event.FindString("type") == "run_state" &&
++                event.FindString("state") &&
++                *event.FindString("state") == "stopped") {
++              base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++                  FROM_HERE,
++                  base::BindOnce(
++                      [](base::WeakPtr<PageHandler> handler, int id) {
++                        if (handler && handler->active_send_id_ == id) {
++                          handler->StopSession();
++                        }
++                      },
++                      handler, send_id));
++            }
++            event.Set("sendId", send_id);
++            handler->FireWebUIListener("racAiAgentEvent", event);
++          },
++          weak_factory_.GetWeakPtr(), send_id));
++  agent_controller_ = controller->GetWeakPtr();
++  agent_mcp_tools_ =
++      std::make_unique<rac::agent::AgentMcpTools>(agent_controller_);
++  if (AiService* service = AiServiceFactory::GetForProfile(profile_)) {
++    if (AcpService* acp = service->acp_service_if_created()) {
++      // Auto-allow at the MCP approval layer; plan/confirm/critic live in
++      // AgentController::HandleToolCall and must not be bypassed here.
++      acp->SetToolApprovalCallback(
++          base::BindRepeating([](const rac::agent::McpToolCallInfo&,
++                                 base::OnceCallback<void(bool allow)> decide) {
++            std::move(decide).Run(true);
++          }));
++      acp->SetToolProvider(agent_mcp_tools_.get());
++    }
++  }
++}
++
+ void PageHandler::StartAgentSession(std::unique_ptr<PendingSend> send,
+                                     const std::string& agent_id) {
+   AiService* service = AiServiceFactory::GetForProfile(profile_);
+@@ -738,13 +818,25 @@ void PageHandler::StartAgentSession(std:
+     prompt.append(message.text);
+   }
+   const int send_id = send->send_id;
++  BeginAgentToolTurn(*send, send_id);
+   service->acp_service()->Prompt(
+       agent_id, std::move(prompt),
+       base::BindRepeating(&PageHandler::OnUpdate, weak_factory_.GetWeakPtr(),
+                           send_id),
+       base::BindRepeating(&PageHandler::OnAgentEvent,
+                           weak_factory_.GetWeakPtr(), send_id),
+-      base::DoNothing());
++      base::BindOnce(
++          [](base::WeakPtr<PageHandler> handler, int send_id,
++             std::string error) {
++            if (!handler || handler->active_send_id_ != send_id) {
++              return;
++            }
++            if (handler->agent_controller_) {
++              handler->agent_controller_->EndTurn(std::move(error));
++            }
++            handler->ClearAgentToolTurn();
++          },
++          weak_factory_.GetWeakPtr(), send_id));
+ }
+ 
+ void PageHandler::OnAgentEvent(int send_id, base::DictValue update) {
+@@ -879,6 +971,7 @@ void PageHandler::OnUpdate(int send_id,
+   if (send_id == active_send_id_ && agent_controller_ &&
+       (update.done || update.error)) {
+     agent_controller_->EndTurn(update.error.value_or(""));
++    ClearAgentToolTurn();
+   }
+   if (!IsJavascriptAllowed() ||
+       (send_id != active_send_id_ && active_send_id_ != 0)) {
+--- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
++++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+@@ -36,7 +36,8 @@ class TabInterface;
+ 
+ namespace rac::agent {
+ class AgentController;
+-}
++class AgentMcpTools;
++}  // namespace rac::agent
+ 
+ namespace rac::ai {
+ 
+@@ -138,6 +139,10 @@ class PageHandler : public content::WebU
+   void StartSession(std::unique_ptr<PendingSend> send);
+   void StartAgentSession(std::unique_ptr<PendingSend> send,
+                          const std::string& agent_id);
++  // When browser control is on, begins an AgentController turn and installs
++  // AgentMcpTools on the ACP MCP server for this prompt.
++  void BeginAgentToolTurn(const PendingSend& send, int send_id);
++  void ClearAgentToolTurn();
+   void OnUpdate(int send_id, StreamUpdate update);
+   void OnAgentEvent(int send_id, base::DictValue update);
+   void OnAgentsListed(base::Value callback_id, base::ListValue agents);
+@@ -150,6 +155,7 @@ class PageHandler : public content::WebU
+   std::string conversation_id_;
+   std::unique_ptr<ChatSession> session_;
+   base::WeakPtr<rac::agent::AgentController> agent_controller_;
++  std::unique_ptr<rac::agent::AgentMcpTools> agent_mcp_tools_;
+   std::unique_ptr<network::SimpleURLLoader> model_loader_;
+   int active_send_id_ = 0;
+   // Names a finished chat. Separate from `session_`, so the next message
