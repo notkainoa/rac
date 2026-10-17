@@ -1,0 +1,1396 @@
+Index: src/chrome/browser/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/BUILD.gn
++++ src/chrome/browser/BUILD.gn
+@@ -2093,6 +2093,7 @@ source_set("browser") {
+     "//chrome/browser/ai:impl",
+     "//chrome/browser/rac/ai:ai",
+     "//chrome/browser/rac/ai:browser",
++    "//chrome/browser/rac/agent:agent",
+     "//chrome/browser/autocomplete",
+     "//chrome/browser/autocomplete:impl",
+     "//chrome/browser/autofill",
+Index: src/chrome/browser/rac/agent/BUILD.gn
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/BUILD.gn
+@@ -0,0 +1,54 @@
++# Copyright 2026 The rac Authors
++# Use of this source code is governed by a GPL-3.0 license.
++
++import("//testing/test.gni")
++
++# Deps-light types: serializers, ref table, tool schemas (later patches).
++source_set("core") {
++  sources = [
++    "ref_table.cc",
++    "ref_table.h",
++    "snapshot_serializer.cc",
++    "snapshot_serializer.h",
++  ]
++  public_deps = [
++    "//base",
++    "//components/optimization_guide/proto:optimization_guide_proto",
++    "//ui/gfx/geometry",
++    "//url",
++  ]
++}
++
++# Browser-process APC extraction and (later) action runner.
++source_set("browser") {
++  sources = [
++    "apc_extract.cc",
++    "apc_extract.h",
++  ]
++  public_deps = [
++    ":core",
++    "//base",
++    "//components/optimization_guide/content/browser:browser",
++    "//content/public/browser",
++  ]
++}
++
++# Chat page_context uses the shared actionable extraction helper.
++source_set("agent") {
++  public_deps = [ ":browser" ]
++}
++
++test("rac_agent_unittests") {
++  sources = [
++    "ref_table_unittest.cc",
++    "snapshot_serializer_unittest.cc",
++  ]
++  deps = [
++    ":core",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//components/optimization_guide/proto:optimization_guide_proto",
++    "//testing/gtest",
++  ]
++}
+Index: src/chrome/browser/rac/agent/apc_extract.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/apc_extract.cc
+@@ -0,0 +1,27 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/agent/apc_extract.h"
++
++#include <utility>
++
++#include "content/public/browser/web_contents.h"
++#include "third_party/blink/public/mojom/content_extraction/ai_page_content.mojom.h"
++
++namespace rac::agent {
++
++void ExtractAnnotatedPageContent(
++    content::WebContents* contents,
++    optimization_guide::OnAIPageContentDone callback) {
++  if (!contents) {
++    std::move(callback).Run(base::unexpected("No page to read"));
++    return;
++  }
++  optimization_guide::GetAIPageContent(
++      contents,
++      optimization_guide::ActionableAIPageContentOptions(
++          /*on_critical_path=*/true),
++      std::move(callback));
++}
++
++}  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/apc_extract.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/apc_extract.h
+@@ -0,0 +1,26 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_AGENT_APC_EXTRACT_H_
++#define CHROME_BROWSER_RAC_AGENT_APC_EXTRACT_H_
++
++#include "base/functional/callback.h"
++#include "components/optimization_guide/content/browser/page_content_proto_provider.h"
++
++namespace content {
++class WebContents;
++}
++
++namespace rac::agent {
++
++// Shared APC extraction for chat and the agent. Always uses actionable
++// options so geometry / aria-hidden are present for the hidden-text filter
++// and for agent refs. Call only on explicit user/agent request — never on a
++// timer.
++void ExtractAnnotatedPageContent(
++    content::WebContents* contents,
++    optimization_guide::OnAIPageContentDone callback);
++
++}  // namespace rac::agent
++
++#endif  // CHROME_BROWSER_RAC_AGENT_APC_EXTRACT_H_
+Index: src/chrome/browser/rac/agent/ref_table.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/ref_table.cc
+@@ -0,0 +1,140 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/agent/ref_table.h"
++
++#include <algorithm>
++#include <limits>
++
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++
++namespace rac::agent {
++
++RefTable::RefTable() : RefTable(kDefaultMaxEntries) {}
++
++RefTable::RefTable(size_t max_entries) : max_entries_(max_entries) {}
++
++RefTable::~RefTable() = default;
++
++std::string RefTable::AllocateRef() {
++  CHECK_LT(next_number_, std::numeric_limits<uint64_t>::max());
++  return "e" + base::NumberToString(next_number_++);
++}
++
++std::string RefTable::GetOrCreate(const RefKey& key, RefEntry meta) {
++  if (auto it = by_key_.find(key); it != by_key_.end()) {
++    RefEntry* existing = LookupMutable(it->second);
++    CHECK(existing);
++    const std::string ref = existing->ref;
++    meta.ref = ref;
++    meta.key = key;
++    meta.snapshot_generation = existing->snapshot_generation;
++    *existing = std::move(meta);
++    existing->present_in_latest = true;
++    return ref;
++  }
++  EvictIfNeeded();
++  std::string ref = AllocateRef();
++  meta.ref = ref;
++  meta.key = key;
++  meta.present_in_latest = true;
++  by_key_[key] = ref;
++  by_ref_[ref] = std::move(meta);
++  return ref;
++}
++
++const RefEntry* RefTable::Lookup(std::string_view ref) const {
++  auto it = by_ref_.find(std::string(ref));
++  return it == by_ref_.end() ? nullptr : &it->second;
++}
++
++RefEntry* RefTable::LookupMutable(std::string_view ref) {
++  auto it = by_ref_.find(std::string(ref));
++  return it == by_ref_.end() ? nullptr : &it->second;
++}
++
++void RefTable::BeginSnapshot(std::string_view tab_id, uint64_t generation) {
++  for (auto& [ref, entry] : by_ref_) {
++    if (entry.key.tab_id == tab_id) {
++      entry.present_in_latest = false;
++      entry.in_viewport = false;
++      entry.snapshot_generation = generation;
++    }
++  }
++}
++
++void RefTable::MarkSeen(std::string_view ref, bool in_viewport) {
++  if (RefEntry* entry = LookupMutable(ref)) {
++    entry->present_in_latest = true;
++    entry->last_seen_generation = entry->snapshot_generation;
++    entry->in_viewport = in_viewport;
++  }
++}
++
++void RefTable::EndSnapshot(std::string_view tab_id) {
++  // Absent entries keep their refs but are not actionable until re-seen.
++}
++
++void RefTable::InvalidateDocument(std::string_view tab_id,
++                                  std::string_view document_token) {
++  std::vector<std::string> dead;
++  for (const auto& [ref, entry] : by_ref_) {
++    if (entry.key.tab_id == tab_id &&
++        entry.key.document_token == document_token) {
++      dead.push_back(ref);
++    }
++  }
++  for (const std::string& ref : dead) {
++    auto it = by_ref_.find(ref);
++    if (it == by_ref_.end()) {
++      continue;
++    }
++    by_key_.erase(it->second.key);
++    by_ref_.erase(it);
++  }
++}
++
++void RefTable::InvalidateTab(std::string_view tab_id) {
++  std::vector<std::string> dead;
++  for (const auto& [ref, entry] : by_ref_) {
++    if (entry.key.tab_id == tab_id) {
++      dead.push_back(ref);
++    }
++  }
++  for (const std::string& ref : dead) {
++    auto it = by_ref_.find(ref);
++    if (it == by_ref_.end()) {
++      continue;
++    }
++    by_key_.erase(it->second.key);
++    by_ref_.erase(it);
++  }
++}
++
++void RefTable::Clear() {
++  by_ref_.clear();
++  by_key_.clear();
++  next_number_ = 1;
++}
++
++void RefTable::EvictIfNeeded() {
++  while (by_ref_.size() >= max_entries_) {
++    auto oldest = by_ref_.end();
++    for (auto it = by_ref_.begin(); it != by_ref_.end(); ++it) {
++      if (!it->second.present_in_latest &&
++          (oldest == by_ref_.end() ||
++           it->second.last_seen_generation <
++               oldest->second.last_seen_generation)) {
++        oldest = it;
++      }
++    }
++    if (oldest == by_ref_.end()) {
++      oldest = by_ref_.begin();
++    }
++    by_key_.erase(oldest->second.key);
++    by_ref_.erase(oldest);
++  }
++}
++
++}  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/ref_table.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/ref_table.h
+@@ -0,0 +1,104 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_AGENT_REF_TABLE_H_
++#define CHROME_BROWSER_RAC_AGENT_REF_TABLE_H_
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/containers/flat_map.h"
++#include "ui/gfx/geometry/rect.h"
++
++namespace rac::agent {
++
++// Stable agent-visible element id ("e12") for one session. Keyed on
++// (tab_id, document_token, dom_node_id). Numbers never recycle.
++struct RefKey {
++  std::string tab_id;
++  std::string document_token;
++  int32_t dom_node_id = 0;
++
++  bool operator<(const RefKey& o) const {
++    if (tab_id != o.tab_id) {
++      return tab_id < o.tab_id;
++    }
++    if (document_token != o.document_token) {
++      return document_token < o.document_token;
++    }
++    return dom_node_id < o.dom_node_id;
++  }
++  bool operator==(const RefKey& o) const {
++    return tab_id == o.tab_id && document_token == o.document_token &&
++           dom_node_id == o.dom_node_id;
++  }
++};
++
++struct RefEntry {
++  std::string ref;  // e1, e2, …
++  RefKey key;
++  uint64_t snapshot_generation = 0;
++  uint64_t last_seen_generation = 0;
++  std::string role;
++  std::string name;
++  std::string control_type;
++  std::string frame_origin;
++  std::string main_origin;
++  std::string link_url;
++  std::string policy_fingerprint;
++  gfx::Rect outer_box;
++  gfx::Rect visible_box;
++  bool disabled = false;
++  bool readonly = false;
++  bool sensitive = false;
++  bool password = false;
++  bool present_in_latest = false;
++  bool in_viewport = false;
++};
++
++class RefTable {
++ public:
++  static constexpr size_t kDefaultMaxEntries = 4096;
++
++  RefTable();
++  explicit RefTable(size_t max_entries);
++  RefTable(const RefTable&) = delete;
++  RefTable& operator=(const RefTable&) = delete;
++  ~RefTable();
++
++  // Returns an existing ref or allocates e{N+1}. Eviction marks the oldest
++  // unused entry invalid; numbers are never reused.
++  std::string GetOrCreate(const RefKey& key, RefEntry meta);
++
++  const RefEntry* Lookup(std::string_view ref) const;
++  RefEntry* LookupMutable(std::string_view ref);
++
++  // Call at the start of a snapshot pass for `tab_id`.
++  void BeginSnapshot(std::string_view tab_id, uint64_t generation);
++  void MarkSeen(std::string_view ref, bool in_viewport);
++  void EndSnapshot(std::string_view tab_id);
++
++  void InvalidateDocument(std::string_view tab_id,
++                          std::string_view document_token);
++  void InvalidateTab(std::string_view tab_id);
++  void Clear();
++
++  size_t size() const { return by_ref_.size(); }
++  uint64_t next_ref_number() const { return next_number_; }
++
++ private:
++  std::string AllocateRef();
++  void EvictIfNeeded();
++
++  size_t max_entries_;
++  uint64_t next_number_ = 1;
++  base::flat_map<std::string, RefEntry> by_ref_;
++  base::flat_map<RefKey, std::string> by_key_;
++};
++
++}  // namespace rac::agent
++
++#endif  // CHROME_BROWSER_RAC_AGENT_REF_TABLE_H_
+Index: src/chrome/browser/rac/agent/ref_table_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/ref_table_unittest.cc
+@@ -0,0 +1,61 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/agent/ref_table.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::agent {
++
++TEST(RefTableTest, StableAcrossSnapshots) {
++  RefTable refs;
++  RefKey key{.tab_id = "t1", .document_token = "docA", .dom_node_id = 12};
++  RefEntry meta;
++  meta.role = "button";
++  meta.name = "Sign in";
++  refs.BeginSnapshot("t1", 1);
++  const std::string r1 = refs.GetOrCreate(key, meta);
++  EXPECT_EQ(r1, "e1");
++  refs.MarkSeen(r1, true);
++  refs.EndSnapshot("t1");
++
++  meta.name = "Sign in (moved)";
++  refs.BeginSnapshot("t1", 2);
++  const std::string r2 = refs.GetOrCreate(key, meta);
++  EXPECT_EQ(r2, "e1");
++  EXPECT_EQ(refs.Lookup(r2)->name, "Sign in (moved)");
++}
++
++TEST(RefTableTest, NewDocumentGetsNewRefs) {
++  RefTable refs;
++  RefEntry meta;
++  meta.role = "button";
++  const std::string a = refs.GetOrCreate(
++      {.tab_id = "t1", .document_token = "doc1", .dom_node_id = 1}, meta);
++  const std::string b = refs.GetOrCreate(
++      {.tab_id = "t1", .document_token = "doc2", .dom_node_id = 1}, meta);
++  EXPECT_EQ(a, "e1");
++  EXPECT_EQ(b, "e2");
++  refs.InvalidateDocument("t1", "doc1");
++  EXPECT_EQ(refs.Lookup(a), nullptr);
++  EXPECT_NE(refs.Lookup(b), nullptr);
++}
++
++TEST(RefTableTest, NeverRecyclesNumbers) {
++  RefTable refs(2);
++  RefEntry meta;
++  const std::string a = refs.GetOrCreate(
++      {.tab_id = "t1", .document_token = "d", .dom_node_id = 1}, meta);
++  const std::string b = refs.GetOrCreate(
++      {.tab_id = "t1", .document_token = "d", .dom_node_id = 2}, meta);
++  EXPECT_EQ(a, "e1");
++  EXPECT_EQ(b, "e2");
++  refs.BeginSnapshot("t1", 1);
++  // Neither marked seen → both eligible for eviction once a third arrives.
++  const std::string c = refs.GetOrCreate(
++      {.tab_id = "t1", .document_token = "d", .dom_node_id = 3}, meta);
++  EXPECT_EQ(c, "e3");
++  EXPECT_EQ(refs.next_ref_number(), 4u);
++}
++
++}  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/snapshot_serializer.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/snapshot_serializer.cc
+@@ -0,0 +1,612 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/agent/snapshot_serializer.h"
++
++#include <algorithm>
++#include <cmath>
++#include <ranges>
++#include <utility>
++
++#include "base/hash/sha1.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "components/optimization_guide/proto/features/common_quality_data.pb.h"
++#include "url/gurl.h"
++
++namespace rac::agent {
++namespace {
++namespace proto = optimization_guide::proto;
++constexpr int kMaxDepth = 128;
++
++std::string Clean(std::string_view text) {
++  std::string repaired = base::IsStringUTF8(text)
++                             ? std::string(text)
++                             : base::UTF16ToUTF8(base::UTF8ToUTF16(text));
++  return base::CollapseWhitespaceASCII(repaired, false);
++}
++
++bool HasVisibleBox(const proto::ContentNode& node) {
++  const auto& a = node.content_attributes();
++  if (!a.has_geometry() || !a.geometry().has_visible_bounding_box()) {
++    return false;
++  }
++  const auto& box = a.geometry().visible_bounding_box();
++  return box.width() > 0 && box.height() > 0;
++}
++
++bool HasHitBox(const proto::ContentNode& node) {
++  const auto& a = node.content_attributes();
++  if (!a.has_geometry() || !a.geometry().has_outer_bounding_box()) {
++    return false;
++  }
++  const auto& box = a.geometry().outer_bounding_box();
++  return box.width() > 0 && box.height() > 0;
++}
++
++// Agent walks must keep offscreen (empty visible box) nodes so full:true and
++// stable refs work. Chat's IsPageNodeHidden treats empty visible as hidden.
++bool IsAgentNodeExcluded(const proto::ContentNode& node) {
++  const auto& a = node.content_attributes();
++  if (std::ranges::find(a.annotated_roles(),
++                        proto::ANNOTATED_ROLE_CONTENT_HIDDEN) !=
++      a.annotated_roles().end()) {
++    return true;
++  }
++  if (a.has_interaction_info()) {
++    const auto& reasons = a.interaction_info().interaction_disabled_reasons();
++    if (std::ranges::find(reasons,
++                          proto::INTERACTION_DISABLED_REASON_ARIA_HIDDEN) !=
++        reasons.end()) {
++      return true;
++    }
++  }
++  if (a.has_geometry() && a.geometry().has_outer_bounding_box()) {
++    const auto& box = a.geometry().outer_bounding_box();
++    if (box.width() <= 0 || box.height() <= 0) {
++      return true;
++    }
++  }
++  return false;
++}
++
++gfx::Rect ToRect(const proto::BoundingRect& box) {
++  return gfx::Rect(box.x(), box.y(), box.width(), box.height());
++}
++
++std::string CollectText(const proto::ContentNode& node, int depth = 0) {
++  if (depth > kMaxDepth || IsAgentNodeExcluded(node)) {
++    return {};
++  }
++  const auto& a = node.content_attributes();
++  if (a.has_text_data()) {
++    return Clean(a.text_data().text_content());
++  }
++  if (a.has_image_data()) {
++    return Clean(a.image_data().image_caption());
++  }
++  std::string out;
++  for (const auto& child : node.children_nodes()) {
++    std::string part = CollectText(child, depth + 1);
++    if (part.empty()) {
++      continue;
++    }
++    if (!out.empty()) {
++      out += ' ';
++    }
++    out += part;
++  }
++  return out;
++}
++
++bool IsPasswordControl(const proto::FormControlData& control) {
++  return control.form_control_type() == proto::FORM_CONTROL_TYPE_INPUT_PASSWORD;
++}
++
++bool IsRedactedDecision(proto::RedactionDecision d) {
++  switch (d) {
++    case proto::REDACTION_DECISION_REDACTED_HAS_BEEN_PASSWORD:
++    case proto::REDACTION_DECISION_REDACTED_IS_SENSITIVE_PAYMENT_FIELD:
++    case proto::REDACTION_DECISION_REDACTED_CUSTOM_PASSWORD_CSS:
++    case proto::REDACTION_DECISION_REDACTED_CUSTOM_PASSWORD_JS:
++    case proto::REDACTION_DECISION_REDACTED_IS_OTP:
++      return true;
++    default:
++      return false;
++  }
++}
++
++bool IsSensitiveControl(const proto::ContentAttributes& a) {
++  if (a.has_redaction_decision() &&
++      IsRedactedDecision(a.redaction_decision())) {
++    return true;
++  }
++  if (!a.has_form_control_data()) {
++    return false;
++  }
++  const auto& c = a.form_control_data();
++  if (IsPasswordControl(c)) {
++    return true;
++  }
++  for (int t : c.coarse_autofill_field_type()) {
++    if (t == proto::COARSE_AUTOFILL_FIELD_TYPE_CREDIT_CARD ||
++        t == proto::COARSE_AUTOFILL_FIELD_TYPE_OTP) {
++      return true;
++    }
++  }
++  return false;
++}
++
++std::string FormControlRole(const proto::FormControlData& control) {
++  switch (control.form_control_type()) {
++    case proto::FORM_CONTROL_TYPE_INPUT_CHECKBOX:
++      return "checkbox";
++    case proto::FORM_CONTROL_TYPE_INPUT_RADIO:
++      return "radio";
++    case proto::FORM_CONTROL_TYPE_SELECT_ONE:
++    case proto::FORM_CONTROL_TYPE_SELECT_MULTIPLE:
++      return "combobox";
++    case proto::FORM_CONTROL_TYPE_TEXT_AREA:
++      return "textbox";
++    case proto::FORM_CONTROL_TYPE_BUTTON_BUTTON:
++    case proto::FORM_CONTROL_TYPE_BUTTON_RESET:
++    case proto::FORM_CONTROL_TYPE_BUTTON_POPOVER:
++    case proto::FORM_CONTROL_TYPE_INPUT_BUTTON:
++    case proto::FORM_CONTROL_TYPE_INPUT_IMAGE:
++      return "button";
++    case proto::FORM_CONTROL_TYPE_BUTTON_SUBMIT:
++    case proto::FORM_CONTROL_TYPE_INPUT_SUBMIT:
++      return "button";
++    case proto::FORM_CONTROL_TYPE_INPUT_FILE:
++      return "button";
++    case proto::FORM_CONTROL_TYPE_INPUT_PASSWORD:
++      return "textbox";
++    case proto::FORM_CONTROL_TYPE_FIELDSET:
++      return {};
++    case proto::FORM_CONTROL_TYPE_INPUT_HIDDEN:
++      return {};
++    default:
++      return "textbox";
++  }
++}
++
++std::string ControlTypeName(const proto::FormControlData& control) {
++  return base::NumberToString(static_cast<int>(control.form_control_type()));
++}
++
++std::string ControlName(const proto::ContentAttributes& a,
++                        const proto::ContentNode& node) {
++  std::string name = Clean(a.label());
++  if (!name.empty()) {
++    return name;
++  }
++  if (a.has_form_control_data()) {
++    const auto& c = a.form_control_data();
++    name = Clean(c.field_name());
++    if (name.empty()) {
++      name = Clean(c.placeholder());
++    }
++  }
++  if (name.empty()) {
++    name = CollectText(node);
++  }
++  return name;
++}
++
++std::string SafeFieldValue(const proto::ContentAttributes& a) {
++  if (!a.has_form_control_data() || IsSensitiveControl(a) ||
++      (a.has_form_control_data() && IsPasswordControl(a.form_control_data()))) {
++    return {};
++  }
++  return Clean(a.form_control_data().field_value());
++}
++
++bool IsActionable(const proto::ContentNode& node) {
++  if (IsAgentNodeExcluded(node) || !HasHitBox(node)) {
++    return false;
++  }
++  const auto& a = node.content_attributes();
++  if (!a.has_common_ancestor_dom_node_id()) {
++    return false;
++  }
++  switch (a.attribute_type()) {
++    case proto::CONTENT_ATTRIBUTE_ANCHOR:
++    case proto::CONTENT_ATTRIBUTE_FORM_CONTROL:
++      return true;
++    case proto::CONTENT_ATTRIBUTE_HEADING:
++    case proto::CONTENT_ATTRIBUTE_LIST_ITEM:
++      return true;
++    default:
++      break;
++  }
++  if (a.has_interaction_info()) {
++    const auto& info = a.interaction_info();
++    if (info.is_focusable() || info.is_clickable() ||
++        !info.clickability_reasons().empty()) {
++      return true;
++    }
++  }
++  return false;
++}
++
++struct WalkContext {
++  RefTable* refs = nullptr;
++  SnapshotOptions options;
++  uint64_t generation = 0;
++  std::string document_token;
++  std::string frame_origin;
++  std::string main_origin;
++  std::vector<SnapshotLine>* lines = nullptr;
++  size_t used_chars = 0;
++};
++
++bool AppendLine(WalkContext& ctx, SnapshotLine line) {
++  const size_t need = line.text.size() + (ctx.lines->empty() ? 0 : 1);
++  if (ctx.used_chars + need > ctx.options.max_chars) {
++    return false;
++  }
++  ctx.used_chars += need;
++  ctx.lines->push_back(std::move(line));
++  return true;
++}
++
++std::string SemanticHash(std::string_view line_text) {
++  return base::SHA1HashString(std::string(line_text));
++}
++
++void EmitInteractive(WalkContext& ctx,
++                     const proto::ContentNode& node,
++                     std::string_view role,
++                     std::string_view name,
++                     std::string_view extra) {
++  const auto& a = node.content_attributes();
++  if (!a.has_common_ancestor_dom_node_id()) {
++    return;
++  }
++  const bool in_viewport = HasVisibleBox(node);
++  if (!ctx.options.full && !in_viewport) {
++    // Still register the ref so scroll doesn't renumber.
++  }
++
++  RefKey key;
++  key.tab_id = ctx.options.tab_id;
++  key.document_token = ctx.document_token;
++  key.dom_node_id = a.common_ancestor_dom_node_id();
++
++  RefEntry meta;
++  meta.role = std::string(role);
++  meta.name = std::string(name);
++  meta.frame_origin = ctx.frame_origin;
++  meta.main_origin = ctx.main_origin;
++  meta.disabled =
++      a.has_interaction_info() && a.interaction_info().is_disabled();
++  if (a.has_form_control_data()) {
++    meta.control_type = ControlTypeName(a.form_control_data());
++    meta.password = IsPasswordControl(a.form_control_data());
++    meta.readonly = a.form_control_data().is_readonly();
++  }
++  meta.sensitive = IsSensitiveControl(a);
++  if (a.has_anchor_data()) {
++    meta.link_url = a.anchor_data().url();
++  }
++  if (a.has_geometry()) {
++    if (a.geometry().has_outer_bounding_box()) {
++      meta.outer_box = ToRect(a.geometry().outer_bounding_box());
++    }
++    if (a.geometry().has_visible_bounding_box()) {
++      meta.visible_box = ToRect(a.geometry().visible_bounding_box());
++    }
++  }
++  meta.policy_fingerprint =
++      MakePolicyFingerprint(meta.role, meta.name, meta.control_type,
++                            meta.password, meta.sensitive, meta.link_url);
++  meta.snapshot_generation = ctx.generation;
++  meta.last_seen_generation = ctx.generation;
++  meta.in_viewport = in_viewport;
++
++  const std::string ref = ctx.refs->GetOrCreate(key, std::move(meta));
++  ctx.refs->MarkSeen(ref, in_viewport);
++
++  if (!ctx.options.full && !in_viewport) {
++    return;
++  }
++
++  std::string line = base::StrCat(
++      {"- ", role, " \"", EscapeSnapshotText(name), "\" [ref=", ref, "]"});
++  if (!extra.empty()) {
++    line = base::StrCat({line, extra});
++  }
++  if (a.has_interaction_info() && a.interaction_info().is_disabled()) {
++    line += " [disabled]";
++  }
++
++  SnapshotLine snap;
++  snap.ref = ref;
++  snap.text = std::move(line);
++  snap.semantic_hash = SemanticHash(snap.text);
++  AppendLine(ctx, std::move(snap));
++}
++
++void Walk(WalkContext& ctx, const proto::ContentNode& node, int depth);
++
++void WalkChildren(WalkContext& ctx, const proto::ContentNode& node, int depth) {
++  for (const auto& child : node.children_nodes()) {
++    Walk(ctx, child, depth + 1);
++  }
++}
++
++void Walk(WalkContext& ctx, const proto::ContentNode& node, int depth) {
++  if (depth > kMaxDepth || IsAgentNodeExcluded(node)) {
++    return;
++  }
++  const auto& a = node.content_attributes();
++
++  if (a.attribute_type() == proto::CONTENT_ATTRIBUTE_IFRAME) {
++    if (a.has_iframe_data() && a.iframe_data().has_frame_data() &&
++        a.iframe_data().frame_data().has_document_identifier()) {
++      WalkContext child = ctx;
++      child.document_token =
++          a.iframe_data().frame_data().document_identifier().serialized_token();
++      if (a.iframe_data().frame_data().has_url()) {
++        const GURL frame_url(a.iframe_data().frame_data().url());
++        if (frame_url.is_valid()) {
++          child.frame_origin = frame_url.GetWithEmptyPath().spec();
++          while (!child.frame_origin.empty() &&
++                 child.frame_origin.back() == '/') {
++            child.frame_origin.pop_back();
++          }
++        }
++      }
++      WalkChildren(child, node, depth);
++      return;
++    }
++    // Redacted / unavailable iframe: no refs inside.
++    SnapshotLine line;
++    line.text = "- iframe [redacted]";
++    line.semantic_hash = SemanticHash(line.text);
++    AppendLine(ctx, std::move(line));
++    return;
++  }
++
++  if (a.attribute_type() == proto::CONTENT_ATTRIBUTE_HEADING) {
++    const std::string name = CollectText(node);
++    if (!name.empty() && a.has_common_ancestor_dom_node_id() &&
++        (ctx.options.full || HasVisibleBox(node))) {
++      EmitInteractive(ctx, node, "heading", name, {});
++    }
++    WalkChildren(ctx, node, depth);
++    return;
++  }
++
++  if (a.attribute_type() == proto::CONTENT_ATTRIBUTE_ORDERED_LIST ||
++      a.attribute_type() == proto::CONTENT_ATTRIBUTE_UNORDERED_LIST) {
++    WalkChildren(ctx, node, depth);
++    return;
++  }
++
++  if (a.attribute_type() == proto::CONTENT_ATTRIBUTE_LIST_ITEM) {
++    const std::string name = CollectText(node);
++    if (!name.empty() && a.has_common_ancestor_dom_node_id() &&
++        (ctx.options.full || HasVisibleBox(node)) && IsActionable(node)) {
++      EmitInteractive(ctx, node, "listitem", name, {});
++    } else {
++      WalkChildren(ctx, node, depth);
++    }
++    return;
++  }
++
++  if (a.attribute_type() == proto::CONTENT_ATTRIBUTE_ANCHOR) {
++    const std::string name = ControlName(a, node);
++    std::string extra;
++    if (a.has_anchor_data()) {
++      const GURL url(a.anchor_data().url());
++      if (url.SchemeIsHTTPOrHTTPS()) {
++        std::string target = base::StrCat({url.host(), url.path()});
++        base::TruncateUTF8ToByteSize(target, 100, &target);
++        extra = base::StrCat({" -> ", EscapeSnapshotText(target, 100)});
++      }
++    }
++    if (IsActionable(node)) {
++      EmitInteractive(ctx, node, "link", name.empty() ? "link" : name, extra);
++    }
++    return;
++  }
++
++  if (a.attribute_type() == proto::CONTENT_ATTRIBUTE_FORM_CONTROL &&
++      a.has_form_control_data()) {
++    const auto& control = a.form_control_data();
++    const std::string role = FormControlRole(control);
++    if (role.empty() || !IsActionable(node)) {
++      WalkChildren(ctx, node, depth);
++      return;
++    }
++    const std::string name = ControlName(a, node);
++    std::string extra;
++    if (role == "textbox") {
++      if (IsPasswordControl(control) || IsSensitiveControl(a)) {
++        extra = ": [redacted]";
++      } else {
++        const std::string value = SafeFieldValue(a);
++        if (!value.empty()) {
++          extra = base::StrCat({": ", EscapeSnapshotText(value)});
++        }
++      }
++    } else if (role == "checkbox" || role == "radio") {
++      extra = control.is_checked() ? " [checked]" : " [unchecked]";
++    } else if (role == "combobox") {
++      std::vector<std::string> opts;
++      for (const auto& opt : control.select_options()) {
++        if (opt.is_disabled()) {
++          continue;
++        }
++        std::string label = Clean(opt.text());
++        if (label.empty()) {
++          label = Clean(opt.value());
++        }
++        if (opt.is_selected()) {
++          opts.push_back("*" + EscapeSnapshotText(label, 40));
++        } else {
++          opts.push_back(EscapeSnapshotText(label, 40));
++        }
++        if (opts.size() >= 8) {
++          opts.push_back("…");
++          break;
++        }
++      }
++      if (!opts.empty()) {
++        extra = base::StrCat({": [", base::JoinString(opts, "|"), "]"});
++      }
++    } else if (control.form_control_type() ==
++                   proto::FORM_CONTROL_TYPE_BUTTON_SUBMIT ||
++               control.form_control_type() ==
++                   proto::FORM_CONTROL_TYPE_INPUT_SUBMIT) {
++      extra = " [submit]";
++    }
++    EmitInteractive(ctx, node, role, name.empty() ? role : name, extra);
++    return;
++  }
++
++  // Generic clickable containers with a DOM id.
++  if (IsActionable(node) && a.has_interaction_info() &&
++      (a.interaction_info().is_clickable() ||
++       !a.interaction_info().clickability_reasons().empty()) &&
++      a.attribute_type() != proto::CONTENT_ATTRIBUTE_ROOT &&
++      a.attribute_type() != proto::CONTENT_ATTRIBUTE_CONTAINER &&
++      a.attribute_type() != proto::CONTENT_ATTRIBUTE_FORM &&
++      a.attribute_type() != proto::CONTENT_ATTRIBUTE_PARAGRAPH) {
++    const std::string name = CollectText(node);
++    EmitInteractive(ctx, node, "button", name.empty() ? "clickable" : name, {});
++    return;
++  }
++
++  WalkChildren(ctx, node, depth);
++}
++
++std::string JoinLines(const std::vector<SnapshotLine>& lines) {
++  std::vector<std::string> texts;
++  texts.reserve(lines.size());
++  for (const auto& line : lines) {
++    texts.push_back(line.text);
++  }
++  return base::JoinString(texts, "\n");
++}
++
++std::string BuildDelta(const AgentSnapshot& previous,
++                       const std::vector<SnapshotLine>& current) {
++  base::flat_map<std::string, std::string> prev_by_ref;
++  for (const auto& line : previous.lines) {
++    if (!line.ref.empty()) {
++      prev_by_ref[line.ref] = line.semantic_hash;
++    }
++  }
++  std::vector<std::string> out;
++  bool any_change = false;
++  for (const auto& line : current) {
++    if (!line.ref.empty()) {
++      auto it = prev_by_ref.find(line.ref);
++      if (it != prev_by_ref.end() && it->second == line.semantic_hash) {
++        out.push_back(base::StrCat({"- unchanged [ref=", line.ref, "]"}));
++        continue;
++      }
++    }
++    any_change = true;
++    out.push_back(line.text);
++  }
++  if (!any_change && current.size() == previous.lines.size()) {
++    return "unchanged";
++  }
++  return base::JoinString(out, "\n");
++}
++
++}  // namespace
++
++std::string EscapeSnapshotText(std::string_view text, size_t max_len) {
++  std::string cleaned = Clean(text);
++  std::string out;
++  out.reserve(cleaned.size());
++  for (char c : cleaned) {
++    if (c == '"' || c == '\\') {
++      out.push_back('\\');
++      out.push_back(c);
++    } else if (c == '\n' || c == '\r' || c == '\t') {
++      out.push_back(' ');
++    } else if (static_cast<unsigned char>(c) < 0x20) {
++      continue;
++    } else {
++      out.push_back(c);
++    }
++  }
++  base::TruncateUTF8ToByteSize(out, max_len, &out);
++  return out;
++}
++
++std::string MakePolicyFingerprint(std::string_view role,
++                                  std::string_view name,
++                                  std::string_view control_type,
++                                  bool password,
++                                  bool sensitive,
++                                  std::string_view link_url) {
++  return base::SHA1HashString(base::StrCat(
++      {role, "\n", name, "\n", control_type, "\n", password ? "1" : "0",
++       sensitive ? "1" : "0", "\n", link_url}));
++}
++
++AgentSnapshot SerializeAgentSnapshot(const proto::AnnotatedPageContent& page,
++                                     RefTable& refs,
++                                     const SnapshotOptions& options,
++                                     uint64_t snapshot_id,
++                                     const AgentSnapshot* previous) {
++  AgentSnapshot result;
++  result.snapshot_id = snapshot_id;
++  if (page.has_main_frame_data()) {
++    if (page.main_frame_data().has_title()) {
++      result.title = Clean(page.main_frame_data().title());
++    }
++    if (page.main_frame_data().has_url()) {
++      result.url = page.main_frame_data().url();
++    }
++  }
++
++  refs.BeginSnapshot(options.tab_id, snapshot_id);
++
++  WalkContext ctx;
++  ctx.refs = &refs;
++  ctx.options = options;
++  ctx.generation = snapshot_id;
++  ctx.lines = &result.lines;
++  if (page.has_main_frame_data() &&
++      page.main_frame_data().has_document_identifier()) {
++    ctx.document_token =
++        page.main_frame_data().document_identifier().serialized_token();
++  }
++  ctx.main_origin = options.main_origin;
++  if (ctx.main_origin.empty() && !result.url.empty()) {
++    const GURL url(result.url);
++    if (url.is_valid()) {
++      ctx.main_origin = url.GetWithEmptyPath().spec();
++      while (!ctx.main_origin.empty() && ctx.main_origin.back() == '/') {
++        ctx.main_origin.pop_back();
++      }
++    }
++  }
++  ctx.frame_origin = ctx.main_origin;
++
++  if (page.has_root_node()) {
++    Walk(ctx, page.root_node(), 0);
++  }
++  refs.EndSnapshot(options.tab_id);
++
++  result.line_count = result.lines.size();
++  if (previous && previous->snapshot_id != 0 && previous->url == result.url) {
++    result.text = BuildDelta(*previous, result.lines);
++    result.is_delta = true;
++  } else {
++    result.text = JoinLines(result.lines);
++  }
++  result.approximate_tokens = (result.text.size() + 3) / 4;
++  return result;
++}
++
++}  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/snapshot_serializer.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/snapshot_serializer.h
+@@ -0,0 +1,70 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_AGENT_SNAPSHOT_SERIALIZER_H_
++#define CHROME_BROWSER_RAC_AGENT_SNAPSHOT_SERIALIZER_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "chrome/browser/rac/agent/ref_table.h"
++
++namespace optimization_guide::proto {
++class AnnotatedPageContent;
++}  // namespace optimization_guide::proto
++
++namespace rac::agent {
++
++inline constexpr size_t kDefaultSnapshotChars = 48 * 1024;
++
++struct SnapshotOptions {
++  bool full = false;  // Include offscreen actionable nodes.
++  size_t max_chars = kDefaultSnapshotChars;
++  std::string tab_id = "t1";
++  std::string main_origin;
++};
++
++struct SnapshotLine {
++  std::string ref;
++  std::string text;  // Full line including "- role … [ref=eN]"
++  std::string semantic_hash;
++};
++
++struct AgentSnapshot {
++  uint64_t snapshot_id = 0;
++  std::string title;
++  std::string url;
++  std::string text;  // Joined lines (or delta form).
++  bool is_delta = false;
++  size_t line_count = 0;
++  size_t approximate_tokens = 0;
++  std::vector<SnapshotLine> lines;
++};
++
++// Playwright-style accessibility lines from an actionable APC proto.
++// Updates `refs`. Password / payment values are never emitted.
++AgentSnapshot SerializeAgentSnapshot(
++    const optimization_guide::proto::AnnotatedPageContent& page,
++    RefTable& refs,
++    const SnapshotOptions& options,
++    uint64_t snapshot_id,
++    const AgentSnapshot* previous = nullptr);
++
++// Escape model-visible strings: quotes, newlines, control chars.
++std::string EscapeSnapshotText(std::string_view text, size_t max_len = 120);
++
++// Role + name fingerprint used for approval / delta identity (no geometry).
++std::string MakePolicyFingerprint(std::string_view role,
++                                  std::string_view name,
++                                  std::string_view control_type,
++                                  bool password,
++                                  bool sensitive,
++                                  std::string_view link_url);
++
++}  // namespace rac::agent
++
++#endif  // CHROME_BROWSER_RAC_AGENT_SNAPSHOT_SERIALIZER_H_
+Index: src/chrome/browser/rac/agent/snapshot_serializer_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/snapshot_serializer_unittest.cc
+@@ -0,0 +1,196 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/agent/snapshot_serializer.h"
++
++#include "base/strings/string_util.h"
++#include "components/optimization_guide/proto/features/common_quality_data.pb.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::agent {
++namespace {
++namespace proto = optimization_guide::proto;
++
++proto::ContentNode* Node(proto::ContentNode* parent,
++                         proto::ContentAttributeType type) {
++  auto* node = parent->add_children_nodes();
++  node->mutable_content_attributes()->set_attribute_type(type);
++  return node;
++}
++
++void DomId(proto::ContentNode* node, int32_t id) {
++  node->mutable_content_attributes()->set_common_ancestor_dom_node_id(id);
++}
++
++void Visible(proto::ContentNode* node) {
++  auto* box = node->mutable_content_attributes()
++                  ->mutable_geometry()
++                  ->mutable_visible_bounding_box();
++  box->set_x(0);
++  box->set_y(0);
++  box->set_width(120);
++  box->set_height(24);
++  auto* outer = node->mutable_content_attributes()
++                    ->mutable_geometry()
++                    ->mutable_outer_bounding_box();
++  *outer = *box;
++}
++
++void Offscreen(proto::ContentNode* node) {
++  auto* outer = node->mutable_content_attributes()
++                    ->mutable_geometry()
++                    ->mutable_outer_bounding_box();
++  outer->set_x(0);
++  outer->set_y(2000);
++  outer->set_width(120);
++  outer->set_height(24);
++  auto* box = node->mutable_content_attributes()
++                  ->mutable_geometry()
++                  ->mutable_visible_bounding_box();
++  box->set_width(0);
++  box->set_height(0);
++}
++
++proto::AnnotatedPageContent MakePage() {
++  proto::AnnotatedPageContent page;
++  page.mutable_main_frame_data()->set_title("Login");
++  page.mutable_main_frame_data()->set_url("https://example.com/login");
++  page.mutable_main_frame_data()
++      ->mutable_document_identifier()
++      ->set_serialized_token("doc-login");
++  page.mutable_root_node()->mutable_content_attributes()->set_attribute_type(
++      proto::CONTENT_ATTRIBUTE_ROOT);
++  return page;
++}
++}  // namespace
++
++TEST(SnapshotSerializerTest, ButtonsTextboxesLinksAndPasswordRedaction) {
++  auto page = MakePage();
++  auto* root = page.mutable_root_node();
++
++  auto* email = Node(root, proto::CONTENT_ATTRIBUTE_FORM_CONTROL);
++  DomId(email, 3);
++  Visible(email);
++  email->mutable_content_attributes()->set_label("Email");
++  auto* email_ctl =
++      email->mutable_content_attributes()->mutable_form_control_data();
++  email_ctl->set_form_control_type(proto::FORM_CONTROL_TYPE_INPUT_EMAIL);
++  email_ctl->set_field_value("a@b.com");
++
++  auto* password = Node(root, proto::CONTENT_ATTRIBUTE_FORM_CONTROL);
++  DomId(password, 4);
++  Visible(password);
++  password->mutable_content_attributes()->set_label("Password");
++  auto* pw_ctl =
++      password->mutable_content_attributes()->mutable_form_control_data();
++  pw_ctl->set_form_control_type(proto::FORM_CONTROL_TYPE_INPUT_PASSWORD);
++  pw_ctl->set_field_value("s3cret-value");
++  password->mutable_content_attributes()->set_redaction_decision(
++      proto::REDACTION_DECISION_REDACTED_HAS_BEEN_PASSWORD);
++
++  auto* button = Node(root, proto::CONTENT_ATTRIBUTE_FORM_CONTROL);
++  DomId(button, 12);
++  Visible(button);
++  button->mutable_content_attributes()->set_label("Sign in");
++  auto* btn_ctl =
++      button->mutable_content_attributes()->mutable_form_control_data();
++  btn_ctl->set_form_control_type(proto::FORM_CONTROL_TYPE_BUTTON_SUBMIT);
++
++  auto* link = Node(root, proto::CONTENT_ATTRIBUTE_ANCHOR);
++  DomId(link, 7);
++  Visible(link);
++  link->mutable_content_attributes()->mutable_anchor_data()->set_url(
++      "https://example.com/docs");
++  auto* link_text = Node(link, proto::CONTENT_ATTRIBUTE_TEXT);
++  link_text->mutable_content_attributes()
++      ->mutable_text_data()
++      ->set_text_content("Docs");
++
++  RefTable refs;
++  SnapshotOptions opts;
++  opts.tab_id = "t1";
++  const AgentSnapshot snap =
++      SerializeAgentSnapshot(page, refs, opts, /*snapshot_id=*/1);
++  EXPECT_NE(snap.text.find("- textbox \"Email\" [ref=e1]: a@b.com"),
++            std::string::npos);
++  EXPECT_NE(snap.text.find("- textbox \"Password\" [ref=e2]: [redacted]"),
++            std::string::npos);
++  EXPECT_EQ(snap.text.find("s3cret"), std::string::npos);
++  EXPECT_NE(snap.text.find("- button \"Sign in\" [ref=e3] [submit]"),
++            std::string::npos);
++  EXPECT_NE(snap.text.find("- link \"Docs\" [ref=e4] -> example.com/docs"),
++            std::string::npos);
++
++  // Same document + nodes keep refs across snapshots.
++  const AgentSnapshot again =
++      SerializeAgentSnapshot(page, refs, opts, /*snapshot_id=*/2, &snap);
++  EXPECT_TRUE(again.is_delta);
++  EXPECT_EQ(again.text, "unchanged");
++  EXPECT_EQ(refs.Lookup("e1")->key.dom_node_id, 3);
++  EXPECT_EQ(refs.Lookup("e3")->key.dom_node_id, 12);
++}
++
++TEST(SnapshotSerializerTest, ViewportFiltersOffscreenUnlessFull) {
++  auto page = MakePage();
++  auto* root = page.mutable_root_node();
++  auto* visible = Node(root, proto::CONTENT_ATTRIBUTE_FORM_CONTROL);
++  DomId(visible, 1);
++  Visible(visible);
++  visible->mutable_content_attributes()->set_label("Visible");
++  visible->mutable_content_attributes()
++      ->mutable_form_control_data()
++      ->set_form_control_type(proto::FORM_CONTROL_TYPE_BUTTON_BUTTON);
++
++  auto* hidden = Node(root, proto::CONTENT_ATTRIBUTE_FORM_CONTROL);
++  DomId(hidden, 2);
++  Offscreen(hidden);
++  hidden->mutable_content_attributes()->set_label("Hidden");
++  hidden->mutable_content_attributes()
++      ->mutable_form_control_data()
++      ->set_form_control_type(proto::FORM_CONTROL_TYPE_BUTTON_BUTTON);
++
++  RefTable refs;
++  SnapshotOptions opts;
++  AgentSnapshot viewport =
++      SerializeAgentSnapshot(page, refs, opts, /*snapshot_id=*/1);
++  EXPECT_NE(viewport.text.find("Visible"), std::string::npos);
++  EXPECT_EQ(viewport.text.find("Hidden"), std::string::npos);
++  EXPECT_NE(refs.Lookup("e2"), nullptr);  // Registered, just not emitted.
++
++  opts.full = true;
++  AgentSnapshot full =
++      SerializeAgentSnapshot(page, refs, opts, /*snapshot_id=*/2);
++  EXPECT_NE(full.text.find("Hidden"), std::string::npos);
++  EXPECT_EQ(refs.Lookup("e2")->ref, "e2");
++}
++
++TEST(SnapshotSerializerTest, EscapeAndFingerprint) {
++  EXPECT_EQ(EscapeSnapshotText("say \"hi\"\nthere"), "say \\\"hi\\\" there");
++  const std::string fp = MakePolicyFingerprint("button", "Buy", "SUBMIT", false,
++                                               false, "https://x/y");
++  EXPECT_FALSE(fp.empty());
++  EXPECT_EQ(fp, MakePolicyFingerprint("button", "Buy", "SUBMIT", false, false,
++                                      "https://x/y"));
++}
++
++TEST(SnapshotSerializerTest, HiddenAnnotatedRoleExcluded) {
++  auto page = MakePage();
++  auto* root = page.mutable_root_node();
++  auto* decoy = Node(root, proto::CONTENT_ATTRIBUTE_FORM_CONTROL);
++  DomId(decoy, 9);
++  Visible(decoy);
++  decoy->mutable_content_attributes()->set_label("Ignore me");
++  decoy->mutable_content_attributes()->add_annotated_roles(
++      proto::ANNOTATED_ROLE_CONTENT_HIDDEN);
++  decoy->mutable_content_attributes()
++      ->mutable_form_control_data()
++      ->set_form_control_type(proto::FORM_CONTROL_TYPE_BUTTON_BUTTON);
++
++  RefTable refs;
++  AgentSnapshot snap =
++      SerializeAgentSnapshot(page, refs, {}, /*snapshot_id=*/1);
++  EXPECT_EQ(snap.text.find("Ignore me"), std::string::npos);
++  EXPECT_EQ(refs.Lookup("e1"), nullptr);
++}
++
++}  // namespace rac::agent
+Index: src/chrome/browser/rac/ai/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/ai/BUILD.gn
++++ src/chrome/browser/rac/ai/BUILD.gn
+@@ -13,6 +13,7 @@ source_set("ai") {
+   deps = [
+     ":core",
+     "//base",
++    "//chrome/browser/rac/agent:browser",
+     "//components/optimization_guide/content/browser:browser",
+     "//components/optimization_guide/proto:optimization_guide_proto",
+     "//content/public/browser",
+Index: src/chrome/browser/rac/ai/page_context.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/page_context.cc
++++ src/chrome/browser/rac/ai/page_context.cc
+@@ -3,15 +3,12 @@
+ 
+ #include "chrome/browser/rac/ai/page_context.h"
+ 
+-#include <algorithm>
+-#include <string>
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
++#include "chrome/browser/rac/agent/apc_extract.h"
+ #include "components/optimization_guide/content/browser/page_content_proto_provider.h"
+-#include "components/optimization_guide/proto/features/common_quality_data.pb.h"
+ #include "content/public/browser/web_contents.h"
+-#include "third_party/blink/public/mojom/content_extraction/ai_page_content.mojom.h"
+ 
+ namespace rac::ai {
+ namespace {
+@@ -33,11 +30,10 @@ void ExtractPageText(content::WebContent
+     std::move(callback).Run(base::unexpected("No page to read"));
+     return;
+   }
+-  optimization_guide::GetAIPageContent(
+-      contents,
+-      optimization_guide::DefaultAIPageContentOptions(
+-          /*on_critical_path=*/true),
+-      base::BindOnce(&OnPageContent, std::move(callback)));
++  // Actionable options carry geometry / aria-hidden so the hidden-text filter
++  // in SerializePageContent works. Extraction runs only on attach/send.
++  rac::agent::ExtractAnnotatedPageContent(
++      contents, base::BindOnce(&OnPageContent, std::move(callback)));
+ }
+ 
+ }  // namespace rac::ai
