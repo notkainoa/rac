@@ -1,0 +1,216 @@
+Index: src/chrome/browser/rac/agent/agent_controller.cc
+===================================================================
+--- src.orig/chrome/browser/rac/agent/agent_controller.cc
++++ src/chrome/browser/rac/agent/agent_controller.cc
+@@ -138,7 +138,7 @@ void AgentController::BeginTurn(
+   current_->snapshots.clear();
+   goal_ = std::move(goal);
+   turn_started_ = base::TimeTicks::Now();
+-  steps_ = confirmed_ = 0;
++  steps_ = failed_ = successful_actions_ = confirmed_ = 0;
+   paused_ = false;
+   active_ = true;
+   current_->log.clear();
+@@ -873,6 +873,11 @@ void AgentController::Finish(ToolResult
+   if (!done_) {
+     return;
+   }
++  if (!result.ok) {
++    ++failed_;
++  } else if (FindToolDefinition(pending_.name)->kind == ToolKind::kAction) {
++    ++successful_actions_;
++  }
+   auto event =
+       StepEvent(true, step_id_, pending_.name, Label(), TargetAlias(),
+                 TargetTab() ? base::UTF16ToUTF8(TargetTab()->GetTitle()) : "",
+@@ -944,6 +949,7 @@ void AgentController::Cancel() {
+     current_->runner.reset();
+   }
+   if (was_active && done_) {
++    ++failed_;
+     Emit(StepEvent(
+         true, step_id_, pending_.name, Label(), TargetAlias(),
+         TargetTab() ? base::UTF16ToUTF8(TargetTab()->GetTitle()) : "",
+@@ -955,7 +961,7 @@ void AgentController::Cancel() {
+     State("stopped");
+     Emit(SummaryEvent("Stopped after " + base::NumberToString(steps_) +
+                           (steps_ == 1 ? " step" : " steps"),
+-                      steps_, confirmed_,
++                      steps_, failed_, confirmed_,
+                       base::TimeTicks::Now() - turn_started_));
+   }
+   auto done = std::move(done_);
+@@ -982,8 +988,11 @@ void AgentController::EndTurn(std::strin
+   if (current_) {
+     current_->runner.reset();
+   }
++  if (error.empty() && failed_ > 0 && successful_actions_ == 0) {
++    error = "Couldn't finish";
++  }
+   State(error.empty() ? "done" : "error");
+-  Emit(SummaryEvent(error.empty() ? "Done" : error, steps_, confirmed_,
++  Emit(SummaryEvent(error.empty() ? "Done" : error, steps_, failed_, confirmed_,
+                     base::TimeTicks::Now() - turn_started_));
+ }
+ }  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/agent_controller.h
+===================================================================
+--- src.orig/chrome/browser/rac/agent/agent_controller.h
++++ src/chrome/browser/rac/agent/agent_controller.h
+@@ -113,6 +113,8 @@ class AgentController : public base::Sup
+   std::string state_ = "done";
+   int next_id_ = 0;
+   int steps_ = 0;
++  int failed_ = 0;
++  int successful_actions_ = 0;
+   int confirmed_ = 0;
+   bool paused_ = false;
+   bool active_ = false;
+Index: src/chrome/browser/rac/agent/agent_events.cc
+===================================================================
+--- src.orig/chrome/browser/rac/agent/agent_events.cc
++++ src/chrome/browser/rac/agent/agent_events.cc
+@@ -131,12 +131,14 @@ base::DictValue RunStateEvent(const std:
+ 
+ base::DictValue SummaryEvent(const std::string& text,
+                              int steps,
++                             int failed,
+                              int confirmed,
+                              base::TimeDelta duration) {
+   return base::DictValue()
+       .Set("type", "summary")
+       .Set("text", text)
+       .Set("steps", steps)
++      .Set("failed", failed)
+       .Set("confirmed", confirmed)
+       .Set("durationMs", static_cast<double>(duration.InMilliseconds()));
+ }
+Index: src/chrome/browser/rac/agent/agent_events.h
+===================================================================
+--- src.orig/chrome/browser/rac/agent/agent_events.h
++++ src/chrome/browser/rac/agent/agent_events.h
+@@ -60,6 +60,7 @@ base::DictValue RunStateEvent(const std:
+                               const std::string& tab_id);
+ base::DictValue SummaryEvent(const std::string& text,
+                              int steps,
++                             int failed,
+                              int confirmed,
+                              base::TimeDelta duration);
+ 
+Index: src/chrome/browser/rac/agent/agent_events_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/rac/agent/agent_events_unittest.cc
++++ src/chrome/browser/rac/agent/agent_events_unittest.cc
+@@ -34,7 +34,7 @@ std::set<std::string> ReadByUi(const std
+     return {"state"};
+   }
+   if (type == "summary") {
+-    return {"text", "steps", "confirmed", "durationMs"};
++    return {"text", "steps", "failed", "confirmed", "durationMs"};
+   }
+   return {};
+ }
+@@ -87,7 +87,7 @@ TEST(AgentEventsTest, CriticNoteIsNested
+ 
+ TEST(AgentEventsTest, SummaryReportsDurationInMilliseconds) {
+   const base::DictValue event =
+-      SummaryEvent("Done", 5, 1, base::Milliseconds(61500));
++      SummaryEvent("Done", 5, 0, 1, base::Milliseconds(61500));
+   ExpectReadable(event);
+   EXPECT_EQ(event.FindDouble("durationMs"), 61500.0);
+   EXPECT_EQ(event.FindInt("steps"), 5);
+@@ -115,6 +115,18 @@ TEST(AgentEventsTest, OtherEventsHaveWha
+   EXPECT_EQ(*ResumedEvent().FindString("type"), "resumed");
+ }
+ 
++TEST(AgentEventsTest, SummaryReportsFailedSteps) {
++  const auto failed =
++      SummaryEvent("Couldn't finish", 3, 3, 0, base::Seconds(2));
++  ExpectReadable(failed);
++  EXPECT_EQ(failed.FindInt("failed"), 3);
++  EXPECT_EQ(failed.FindInt("steps"), 3);
++  EXPECT_EQ(*failed.FindString("text"), "Couldn't finish");
++  const auto partial = SummaryEvent("Done", 4, 1, 1, base::Seconds(3));
++  EXPECT_EQ(partial.FindInt("failed"), 1);
++  EXPECT_EQ(partial.FindInt("confirmed"), 1);
++}
++
+ TEST(AgentEventsTest, NoEventCarriesTypedText) {
+   ActionMetadata action = Click("Password");
+   action.risk.tool_name = "type";
+Index: src/chrome/browser/resources/rac_ai/agent_cards.ts
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/agent_cards.ts
++++ src/chrome/browser/resources/rac_ai/agent_cards.ts
+@@ -405,6 +405,12 @@ export function taskFooter(task: AgentTa
+   }
+   const steps = task.summary?.steps || stepCount(task);
+   const confirmed = task.summary?.confirmed || task.confirmedCount;
++  const failed = task.summary?.failed || 0;
++  const failureText =
++      failed === 1 ? str('oneStepFailed') : str('nStepsFailed', String(failed));
++  if (task.state === 'error') {
++    return str('couldntFinish') + (failed ? ' \u00b7 ' + failureText : '');
++  }
+   if (task.state !== 'done') {
+     return steps === 0 ? str('stopped') :
+         steps === 1    ? str('stoppedAfterOne') :
+@@ -419,5 +425,8 @@ export function taskFooter(task: AgentTa
+   if (confirmed > 0) {
+     parts.push(str('nConfirmed', String(confirmed)));
+   }
++  if (failed > 0) {
++    parts.push(failureText);
++  }
+   return parts.join(' \u00b7 ');
+ }
+Index: src/chrome/browser/resources/rac_ai/agent_events.ts
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/agent_events.ts
++++ src/chrome/browser/resources/rac_ai/agent_events.ts
+@@ -48,6 +48,7 @@ export type AgentEvent = {
+   type: 'summary',
+   text: string,
+   steps: number,
++  failed: number,
+   confirmed: number,
+   durationMs: number,
+ };
+@@ -131,6 +132,7 @@ export function parseAgentEvent(raw: unk
+         type: 'summary',
+         text: text(event['text'], 20000),
+         steps: count(event['steps']),
++        failed: count(event['failed']),
+         confirmed: count(event['confirmed']),
+         durationMs: count(event['durationMs']),
+       };
+@@ -185,6 +187,7 @@ export interface ConfirmCard {
+ export interface TaskSummary {
+   text: string;
+   steps: number;
++  failed: number;
+   confirmed: number;
+   durationMs: number;
+ }
+@@ -428,6 +431,7 @@ export function applyEvent(task: AgentTa
+       task.summary = {
+         text: event.text,
+         steps: event.steps,
++        failed: event.failed,
+         confirmed: event.confirmed,
+         durationMs: event.durationMs,
+       };
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+@@ -157,6 +157,9 @@ constexpr Str kStrings[] = {
+     {"oneStep", "1 step"},
+     {"nSteps", "$1 steps"},
+     {"doneIn", "Done in $1"},
++    {"couldntFinish", "Couldn't finish"},
++    {"oneStepFailed", "1 step didn't work"},
++    {"nStepsFailed", "$1 steps didn't work"},
+     {"nConfirmed", "$1 confirmed"},
+     {"stoppedAfter", "Stopped after $1 steps"},
+     {"stoppedAfterOne", "Stopped after 1 step"},
