@@ -1,0 +1,1749 @@
+--- a/chrome/browser/rac/ai/BUILD.gn
++++ b/chrome/browser/rac/ai/BUILD.gn
+@@ -23,6 +23,12 @@ source_set("ai") {
+ # can be tested without a browser.
+ source_set("core") {
+   sources = [
++    "acp/acp_client.cc",
++    "acp/acp_client.h",
++    "acp/acp_transport.cc",
++    "acp/acp_transport.h",
++    "acp/agent_path.cc",
++    "acp/agent_path.h",
+     "ai_prefs.cc",
+     "ai_prefs.h",
+     "chat_prompt.cc",
+@@ -95,6 +101,7 @@ source_set("browser") {
+ #   out/Default/rac_ai_unittests
+ test("rac_ai_unittests") {
+   sources = [
++    "acp/acp_client_unittest.cc",
+     "ai_prefs_unittest.cc",
+     "chat_history_unittest.cc",
+     "chat_prompt_unittest.cc",
+--- /dev/null
++++ b/chrome/browser/rac/ai/acp/acp_client.cc
+@@ -0,0 +1,456 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/ai/acp/acp_client.h"
++
++#include <limits>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/strings/string_util.h"
++
++namespace rac::ai {
++namespace {
++
++bool ValidId(const base::Value& id) {
++  // Reject non-exact numeric IDs rather than rounding an int64 through double.
++  return id.is_int() || id.is_string() || id.is_none();
++}
++
++base::DictValue Envelope() {
++  return base::DictValue().Set("jsonrpc", "2.0");
++}
++
++void MergeTool(base::DictValue& target, const base::DictValue& source) {
++  for (const auto [key, value] : source) {
++    if (!value.is_none()) {
++      target.Set(key, value.Clone());
++    }
++  }
++}
++
++}  // namespace
++
++bool AcpFramer::Feed(std::string_view bytes,
++                     std::vector<base::DictValue>& frames) {
++  if (failed_) {
++    return false;
++  }
++  while (!bytes.empty()) {
++    const size_t end = bytes.find('\n');
++    const size_t count = end == std::string_view::npos ? bytes.size() : end;
++    if (buffer_.size() + count > kAcpMaxFrameBytes) {
++      failed_ = true;
++      return false;
++    }
++    buffer_.append(bytes.substr(0, count));
++    bytes.remove_prefix(count);
++    if (end == std::string_view::npos) {
++      break;
++    }
++    bytes.remove_prefix(1);
++    if (!buffer_.empty() && buffer_.back() == '\r') {
++      buffer_.pop_back();
++    }
++    if (!base::IsStringUTF8(buffer_)) {
++      failed_ = true;
++      return false;
++    }
++    auto parsed = base::JSONReader::ReadAndReturnValueWithError(
++        buffer_, base::JSON_PARSE_RFC);
++    if (!parsed.has_value() || !parsed->is_dict()) {
++      failed_ = true;
++      return false;
++    }
++    auto dict = std::move(*parsed).TakeDict();
++    const std::string* version = dict.FindString("jsonrpc");
++    const base::Value* id = dict.Find("id");
++    const base::Value* method = dict.Find("method");
++    const bool response = dict.contains("result") != dict.contains("error");
++    if (!version || *version != "2.0" || (id && !ValidId(*id)) ||
++        (method && (!method->is_string() || method->GetString().empty() ||
++                    dict.contains("result") || dict.contains("error"))) ||
++        (!method && (!id || !response))) {
++      failed_ = true;
++      return false;
++    }
++    frames.push_back(std::move(dict));
++    buffer_.clear();
++  }
++  return true;
++}
++
++bool AcpFramer::Finish() {
++  failed_ = failed_ || !buffer_.empty();
++  return !failed_;
++}
++
++AcpClient::AcpClient(Write write, base::RepeatingClosure close, Update update)
++    : write_(std::move(write)),
++      close_(std::move(close)),
++      update_(std::move(update)) {}
++
++AcpClient::~AcpClient() {
++  Stop();
++}
++
++void AcpClient::SetPermissionPolicy(PermissionPolicy policy) {
++  policy_ = std::move(policy);
++}
++
++void AcpClient::ArmDeadline(base::TimeDelta timeout) {
++  deadline_.Start(FROM_HERE, timeout,
++                  base::BindOnce(&AcpClient::Fail, weak_factory_.GetWeakPtr(),
++                                 "The agent timed out."));
++}
++
++void AcpClient::Start(base::DictValue session_params, Completion ready) {
++  CHECK_EQ(state_, State::kStopped);
++  session_params_ = std::move(session_params);
++  ready_ = std::move(ready);
++  state_ = State::kInitializing;
++  ArmDeadline(base::Seconds(45));
++  Send(Request::kInitialize, "initialize",
++       base::DictValue()
++           .Set("protocolVersion", 1)
++           .Set("clientInfo",
++                base::DictValue().Set("name", "rac").Set("version", "0.1"))
++           .Set("clientCapabilities",
++                base::DictValue()
++                    .Set("fs", base::DictValue()
++                                   .Set("readTextFile", false)
++                                   .Set("writeTextFile", false))
++                    .Set("terminal", false)));
++}
++
++void AcpClient::Send(Request request,
++                     std::string method,
++                     base::DictValue params) {
++  if (next_id_ == std::numeric_limits<int>::max()) {
++    Fail("The agent connection needs to restart.");
++    return;
++  }
++  const int id = next_id_++;
++  pending_.emplace(id, request);
++  write_.Run(Envelope()
++                 .Set("id", id)
++                 .Set("method", std::move(method))
++                 .Set("params", std::move(params)));
++}
++
++void AcpClient::Notify(std::string method, base::DictValue params) {
++  write_.Run(Envelope()
++                 .Set("method", std::move(method))
++                 .Set("params", std::move(params)));
++}
++
++void AcpClient::CreateSession() {
++  state_ = State::kCreating;
++  Send(Request::kNew, "session/new", session_params_.Clone());
++}
++
++void AcpClient::Authenticate(std::string method_id, Completion ready) {
++  if (state_ != State::kNeedsAuth) {
++    std::move(ready).Run("The agent is not waiting for sign-in.");
++    return;
++  }
++  const base::ListValue* methods = initialize_result_.FindList("authMethods");
++  bool found = false;
++  if (methods) {
++    for (const auto& method : *methods) {
++      if (method.is_dict() && method.GetDict().FindString("id") &&
++          *method.GetDict().FindString("id") == method_id) {
++        found = true;
++      }
++    }
++  }
++  if (!found) {
++    std::move(ready).Run("The agent did not offer that sign-in method.");
++    return;
++  }
++  ready_ = std::move(ready);
++  state_ = State::kInitializing;
++  ArmDeadline(base::Minutes(5));
++  Send(Request::kAuthenticate, "authenticate",
++       base::DictValue().Set("methodId", std::move(method_id)));
++}
++
++void AcpClient::Prompt(std::string text, Completion done) {
++  if (state_ != State::kReady) {
++    std::move(done).Run("The agent is not ready for another message.");
++    return;
++  }
++  idle_.Stop();
++  tools_.clear();
++  tool_bytes_ = 0;
++  done_ = std::move(done);
++  state_ = State::kPrompting;
++  ArmDeadline(base::Minutes(10));
++  Send(Request::kPrompt, "session/prompt",
++       base::DictValue()
++           .Set("sessionId", session_id_)
++           .Set("prompt",
++                base::ListValue().Append(base::DictValue()
++                                             .Set("type", "text")
++                                             .Set("text", std::move(text)))));
++}
++
++void AcpClient::Receive(base::DictValue message) {
++  if (state_ == State::kFailed || state_ == State::kStopped) {
++    return;
++  }
++  const std::string* method = message.FindString("method");
++  const base::Value* id = message.Find("id");
++  if (!method) {
++    const std::optional<int> number = message.FindInt("id");
++    if (!number) {
++      return;
++    }
++    const auto it = pending_.find(*number);
++    if (it == pending_.end()) {
++      return;
++    }
++    const Request request = it->second;
++    pending_.erase(it);
++    OnResponse(request, message);
++    return;
++  }
++  const base::DictValue* params = message.FindDict("params");
++  if (id) {
++    if (*method == "session/request_permission" && params) {
++      OnPermission(id->Clone(), *params);
++    } else {
++      write_.Run(Envelope()
++                     .Set("id", id->Clone())
++                     .Set("error",
++                          base::DictValue()
++                              .Set("code", params ? -32601 : -32602)
++                              .Set("message", "Method not supported by rac")));
++    }
++    return;
++  }
++  if (*method != "session/update") {
++    return;
++  }
++  const std::string* session =
++      params ? params->FindString("sessionId") : nullptr;
++  const base::DictValue* update = params ? params->FindDict("update") : nullptr;
++  const std::string* kind =
++      update ? update->FindString("sessionUpdate") : nullptr;
++  if (!session || !update || !kind) {
++    Fail("Invalid agent session update.");
++    return;
++  }
++  if (*session != session_id_ || state_ == State::kCancelling) {
++    return;
++  }
++  if (*kind == "tool_call" || *kind == "tool_call_update") {
++    const std::string* tool_id = update->FindString("toolCallId");
++    if (!tool_id || tool_id->empty()) {
++      Fail("Invalid agent tool update.");
++      return;
++    }
++    tool_bytes_ += base::WriteJson(*update).value_or("").size();
++    if (tools_.size() >= 1024 || tool_bytes_ > kAcpMaxFrameBytes) {
++      Fail("Agent tool state is too large.");
++      return;
++    }
++    MergeTool(tools_[*tool_id], *update);
++  }
++  update_.Run(update->Clone());
++}
++
++void AcpClient::OnResponse(Request request, const base::DictValue& message) {
++  const base::DictValue* error = message.FindDict("error");
++  if (error) {
++    const std::string* text = error->FindString("message");
++    std::string reason = text ? *text : "The agent reported an error.";
++    if (request == Request::kNew && error->FindInt("code") == -32000) {
++      state_ = State::kNeedsAuth;
++      deadline_.Stop();
++      if (ready_) {
++        std::move(ready_).Run(reason);
++      }
++      return;
++    }
++    Fail(std::move(reason));
++    return;
++  }
++  const base::DictValue* result = message.FindDict("result");
++  if (!result) {
++    Fail("Invalid agent response.");
++    return;
++  }
++  switch (request) {
++    case Request::kInitialize:
++      if (result->FindInt("protocolVersion") != 1) {
++        Fail("The agent does not support ACP v1.");
++        return;
++      }
++      initialize_result_ = result->Clone();
++      CreateSession();
++      break;
++    case Request::kAuthenticate:
++      CreateSession();
++      break;
++    case Request::kNew: {
++      const std::string* session = result->FindString("sessionId");
++      if (!session || session->empty()) {
++        Fail("The agent did not create a session.");
++        return;
++      }
++      session_id_ = *session;
++      session_info_ = result->Clone();
++      state_ = State::kReady;
++      deadline_.Stop();
++      idle_.Start(FROM_HERE, base::Seconds(120), this, &AcpClient::Stop);
++      if (ready_) {
++        std::move(ready_).Run("");
++      }
++      break;
++    }
++    case Request::kPrompt:
++      if (!result->FindString("stopReason")) {
++        Fail("Invalid agent prompt result.");
++        return;
++      }
++      state_ = State::kReady;
++      deadline_.Stop();
++      CancelPermissions();
++      idle_.Start(FROM_HERE, base::Seconds(120), this, &AcpClient::Stop);
++      FinishTurn("");
++      break;
++  }
++}
++
++void AcpClient::OnPermission(base::Value id, const base::DictValue& params) {
++  const base::DictValue* tool = params.FindDict("toolCall");
++  const std::string* tool_id = tool ? tool->FindString("toolCallId") : nullptr;
++  const base::ListValue* options = params.FindList("options");
++  const std::string* session = params.FindString("sessionId");
++  if (!tool_id || !options || !session || *session != session_id_ ||
++      state_ != State::kPrompting) {
++    ReplyPermission(std::move(id), "");
++    return;
++  }
++  Permission permission{.id = std::move(id)};
++  for (const auto& value : *options) {
++    const base::DictValue* option = value.GetIfDict();
++    const std::string* kind = option ? option->FindString("kind") : nullptr;
++    const std::string* option_id =
++        option ? option->FindString("optionId") : nullptr;
++    if (!kind || !option_id || option_id->empty()) {
++      continue;
++    }
++    if (*kind == "allow_once") {
++      permission.allow = *option_id;
++    }
++    if (*kind == "reject_once" ||
++        (*kind == "reject_always" && permission.reject.empty())) {
++      permission.reject = *option_id;
++    }
++  }
++  if (permissions_.size() >= 64) {
++    ReplyPermission(std::move(permission.id), "");
++    Cancel();
++    return;
++  }
++  const int token = next_permission_++;
++  permissions_.emplace(token, std::move(permission));
++  base::DictValue merged;
++  if (auto it = tools_.find(*tool_id); it != tools_.end()) {
++    merged = it->second.Clone();
++  }
++  MergeTool(merged, *tool);
++  if (!policy_) {
++    DecidePermission(token, false);
++    return;
++  }
++  policy_.Run(merged, base::BindOnce(&AcpClient::DecidePermission,
++                                     weak_factory_.GetWeakPtr(), token));
++}
++
++void AcpClient::ReplyPermission(base::Value id, std::string option_id) {
++  base::DictValue outcome;
++  if (option_id.empty()) {
++    outcome.Set("outcome", "cancelled");
++  } else {
++    outcome.Set("outcome", "selected");
++    outcome.Set("optionId", std::move(option_id));
++  }
++  write_.Run(
++      Envelope()
++          .Set("id", std::move(id))
++          .Set("result", base::DictValue().Set("outcome", std::move(outcome))));
++}
++
++void AcpClient::DecidePermission(int token, bool allow) {
++  auto it = permissions_.find(token);
++  if (it == permissions_.end()) {
++    return;
++  }
++  Permission permission = std::move(it->second);
++  permissions_.erase(it);
++  std::string option = allow ? permission.allow : permission.reject;
++  const bool cancel = option.empty();
++  ReplyPermission(std::move(permission.id), std::move(option));
++  if (cancel) {
++    Cancel();
++  }
++}
++
++void AcpClient::CancelPermissions() {
++  auto permissions = std::move(permissions_);
++  permissions_.clear();
++  for (auto& [token, permission] : permissions) {
++    ReplyPermission(std::move(permission.id), "");
++  }
++}
++
++void AcpClient::FinishTurn(std::string error) {
++  if (done_) {
++    std::move(done_).Run(std::move(error));
++  }
++}
++
++void AcpClient::Cancel() {
++  if (state_ != State::kPrompting) {
++    return;
++  }
++  state_ = State::kCancelling;
++  Notify("session/cancel", base::DictValue().Set("sessionId", session_id_));
++  CancelPermissions();
++  ArmDeadline(base::Seconds(3));
++  FinishTurn("Cancelled");
++}
++
++void AcpClient::TearDown(State next, std::string error, bool send_cancel) {
++  if (state_ == State::kFailed || state_ == State::kStopped) {
++    return;
++  }
++  if (send_cancel && state_ == State::kPrompting && !session_id_.empty()) {
++    Notify("session/cancel", base::DictValue().Set("sessionId", session_id_));
++  }
++  CancelPermissions();
++  state_ = next;
++  deadline_.Stop();
++  idle_.Stop();
++  pending_.clear();
++  close_.Run();
++  if (ready_) {
++    std::move(ready_).Run(error.empty() ? "Cancelled" : error);
++  }
++  FinishTurn(std::move(error));
++}
++
++void AcpClient::Stop() {
++  TearDown(State::kStopped, "Cancelled", /*send_cancel=*/true);
++}
++
++void AcpClient::Fail(std::string error) {
++  TearDown(State::kFailed, std::move(error), /*send_cancel=*/true);
++}
++
++}  // namespace rac::ai
+--- /dev/null
++++ b/chrome/browser/rac/ai/acp/acp_client.h
+@@ -0,0 +1,121 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_AI_ACP_ACP_CLIENT_H_
++#define CHROME_BROWSER_RAC_AI_ACP_ACP_CLIENT_H_
++
++#include <map>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
++#include "base/values.h"
++
++namespace rac::ai {
++
++inline constexpr size_t kAcpMaxFrameBytes = 8 * 1024 * 1024;
++
++// Fatal on any malformed frame, including an incomplete final line.
++class AcpFramer {
++ public:
++  bool Feed(std::string_view bytes, std::vector<base::DictValue>& frames);
++  bool Finish();
++  bool failed() const { return failed_; }
++
++ private:
++  std::string buffer_;
++  bool failed_ = false;
++};
++
++// Sequence-confined protocol state machine. Write and close must not delete
++// the client synchronously. No process or thread is created by this class.
++class AcpClient {
++ public:
++  enum class State {
++    kStopped,
++    kInitializing,
++    kNeedsAuth,
++    kCreating,
++    kReady,
++    kPrompting,
++    kCancelling,
++    kFailed,
++  };
++
++  using Write = base::RepeatingCallback<void(base::DictValue)>;
++  using Update = base::RepeatingCallback<void(base::DictValue)>;
++  using Completion = base::OnceCallback<void(std::string error)>;
++  // Merged tool state is untrusted metadata. Only approve an identified rac
++  // tool; the MCP server must authorize every browser action independently.
++  using PermissionPolicy = base::RepeatingCallback<void(
++      const base::DictValue& tool,
++      base::OnceCallback<void(bool allow)> decision)>;
++
++  AcpClient(Write write, base::RepeatingClosure close, Update update);
++  ~AcpClient();
++
++  void Start(base::DictValue session_params, Completion ready);
++  void Authenticate(std::string method_id, Completion ready);
++  void Prompt(std::string text, Completion done);
++  void Cancel();
++  void Stop();
++  void Receive(base::DictValue message);
++  void Fail(std::string error);
++  void SetPermissionPolicy(PermissionPolicy policy);
++
++  State state() const { return state_; }
++  const std::string& session_id() const { return session_id_; }
++  const base::DictValue& session_info() const { return session_info_; }
++  const base::DictValue& initialize_result() const {
++    return initialize_result_;
++  }
++
++ private:
++  enum class Request { kInitialize, kAuthenticate, kNew, kPrompt };
++
++  void Send(Request request, std::string method, base::DictValue params);
++  void CreateSession();
++  void OnResponse(Request request, const base::DictValue& message);
++  void OnPermission(base::Value id, const base::DictValue& params);
++  void DecidePermission(int token, bool allow);
++  void ReplyPermission(base::Value id, std::string option_id);
++  void CancelPermissions();
++  void Notify(std::string method, base::DictValue params);
++  void ArmDeadline(base::TimeDelta timeout);
++  void FinishTurn(std::string error);
++  void TearDown(State next, std::string error, bool send_cancel);
++
++  struct Permission {
++    base::Value id;
++    std::string allow;
++    std::string reject;
++  };
++
++  Write write_;
++  base::RepeatingClosure close_;
++  Update update_;
++  PermissionPolicy policy_;
++  State state_ = State::kStopped;
++  int next_id_ = 1;
++  int next_permission_ = 1;
++  std::map<int, Request> pending_;
++  std::map<int, Permission> permissions_;
++  std::map<std::string, base::DictValue> tools_;
++  size_t tool_bytes_ = 0;
++  std::string session_id_;
++  base::DictValue session_params_;
++  base::DictValue initialize_result_;
++  base::DictValue session_info_;
++  Completion ready_;
++  Completion done_;
++  base::OneShotTimer deadline_;
++  base::OneShotTimer idle_;
++  base::WeakPtrFactory<AcpClient> weak_factory_{this};
++};
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_ACP_ACP_CLIENT_H_
+--- /dev/null
++++ b/chrome/browser/rac/ai/acp/acp_client_unittest.cc
+@@ -0,0 +1,254 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/ai/acp/acp_client.h"
++
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/json/json_reader.h"
++#include "base/test/bind.h"
++#include "base/test/task_environment.h"
++#include "chrome/browser/rac/ai/acp/agent_path.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::ai {
++namespace {
++
++base::DictValue Line(std::string_view json) {
++  auto value = base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  CHECK(value);
++  CHECK(value->is_dict());
++  return std::move(*value).TakeDict();
++}
++
++class AcpFramerTest : public testing::Test {};
++
++TEST_F(AcpFramerTest, SplitsAcrossChunksAndStripsCr) {
++  AcpFramer framer;
++  std::vector<base::DictValue> frames;
++  EXPECT_TRUE(framer.Feed(R"({"jsonrpc":"2.0","id":1,"result":{})", frames));
++  EXPECT_TRUE(frames.empty());
++  EXPECT_TRUE(framer.Feed("}\r\n", frames));
++  ASSERT_EQ(frames.size(), 1u);
++  EXPECT_EQ(frames[0].FindInt("id"), 1);
++  EXPECT_TRUE(framer.Finish());
++}
++
++TEST_F(AcpFramerTest, MalformedLineIsFatal) {
++  AcpFramer framer;
++  std::vector<base::DictValue> frames;
++  EXPECT_FALSE(framer.Feed("not-json\n", frames));
++  EXPECT_TRUE(framer.failed());
++  EXPECT_FALSE(
++      framer.Feed("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n", frames));
++}
++
++TEST_F(AcpFramerTest, IncompleteEofIsFatal) {
++  AcpFramer framer;
++  std::vector<base::DictValue> frames;
++  EXPECT_TRUE(framer.Feed("{\"jsonrpc\":\"2.0\"", frames));
++  EXPECT_FALSE(framer.Finish());
++}
++
++TEST_F(AcpFramerTest, OversizedFrameIsFatal) {
++  AcpFramer framer;
++  std::vector<base::DictValue> frames;
++  std::string big(kAcpMaxFrameBytes + 1, 'x');
++  EXPECT_FALSE(framer.Feed(big, frames));
++}
++
++class AcpClientTest : public testing::Test {
++ public:
++  AcpClientTest() {
++    client_ = std::make_unique<AcpClient>(
++        base::BindLambdaForTesting([&](base::DictValue message) {
++          written_.push_back(std::move(message));
++        }),
++        base::BindLambdaForTesting([&] { ++closes_; }),
++        base::BindLambdaForTesting([&](base::DictValue update) {
++          updates_.push_back(std::move(update));
++        }));
++  }
++
++  void Deliver(std::string_view json) { client_->Receive(Line(json)); }
++
++  base::test::TaskEnvironment env_;
++  std::unique_ptr<AcpClient> client_;
++  std::vector<base::DictValue> written_;
++  std::vector<base::DictValue> updates_;
++  int closes_ = 0;
++};
++
++TEST_F(AcpClientTest, InitializeAdvertisesNoFsOrTerminal) {
++  bool ready = false;
++  client_->Start(base::DictValue().Set("cwd", "/tmp/scratch"),
++                 base::BindLambdaForTesting([&](std::string error) {
++                   EXPECT_TRUE(error.empty());
++                   ready = true;
++                 }));
++  ASSERT_EQ(written_.size(), 1u);
++  EXPECT_EQ(*written_[0].FindString("method"), "initialize");
++  const base::DictValue* caps =
++      written_[0].FindDict("params")->FindDict("clientCapabilities");
++  ASSERT_TRUE(caps);
++  EXPECT_EQ(caps->FindBool("terminal"), std::optional<bool>(false));
++  const base::DictValue* fs = caps->FindDict("fs");
++  ASSERT_TRUE(fs);
++  EXPECT_EQ(fs->FindBool("readTextFile"), std::optional<bool>(false));
++  EXPECT_EQ(fs->FindBool("writeTextFile"), std::optional<bool>(false));
++
++  Deliver(R"({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,
++      "agentInfo":{"name":"fake","version":"1"},
++      "agentCapabilities":{},"authMethods":[]}})");
++  ASSERT_EQ(written_.size(), 2u);
++  EXPECT_EQ(*written_[1].FindString("method"), "session/new");
++  Deliver(R"({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}})");
++  EXPECT_TRUE(ready);
++  EXPECT_EQ(client_->state(), AcpClient::State::kReady);
++}
++
++TEST_F(AcpClientTest, StreamsChunksAndRejectsPermissionsByDefault) {
++  client_->Start(base::DictValue().Set("cwd", "/tmp"),
++                 base::BindLambdaForTesting([](std::string) {}));
++  Deliver(R"({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}})");
++  Deliver(R"({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}})");
++
++  std::string done_error = "unset";
++  client_->Prompt("hi", base::BindLambdaForTesting(
++                            [&](std::string error) { done_error = error; }));
++  Deliver(
++      R"({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1",
++      "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text",
++      "text":"Hello"}}}})");
++  Deliver(
++      R"({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1",
++      "update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Shell",
++      "kind":"execute","status":"pending"}}})");
++  Deliver(
++      R"({"jsonrpc":"2.0","id":"permission-1","method":"session/request_permission",
++      "params":{"sessionId":"s1","toolCall":{"toolCallId":"t1"},
++      "options":[{"optionId":"yes","name":"Allow","kind":"allow_once"},
++                 {"optionId":"no","name":"Reject","kind":"reject_once"}]}})");
++
++  ASSERT_FALSE(updates_.empty());
++  EXPECT_EQ(*updates_[0].FindString("sessionUpdate"), "agent_message_chunk");
++  const base::DictValue* reply = nullptr;
++  for (const auto& message : written_) {
++    if (message.FindString("id") &&
++        *message.FindString("id") == "permission-1") {
++      reply = &message;
++    }
++  }
++  ASSERT_TRUE(reply);
++  EXPECT_EQ(
++      *reply->FindDict("result")->FindDict("outcome")->FindString("optionId"),
++      "no");
++
++  Deliver(R"({"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}})");
++  EXPECT_EQ(done_error, "");
++}
++
++TEST_F(AcpClientTest, CancelAnswersPendingPermissionAndFinishes) {
++  client_->Start(base::DictValue().Set("cwd", "/tmp"),
++                 base::BindLambdaForTesting([](std::string) {}));
++  Deliver(R"({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}})");
++  Deliver(R"({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}})");
++  // Hold the permission open until Cancel replies with outcome:cancelled.
++  client_->SetPermissionPolicy(base::BindLambdaForTesting(
++      [](const base::DictValue&, base::OnceCallback<void(bool)>) {}));
++
++  std::string done_error;
++  client_->Prompt("hi", base::BindLambdaForTesting(
++                            [&](std::string error) { done_error = error; }));
++  Deliver(
++      R"({"jsonrpc":"2.0","id":"p1","method":"session/request_permission",
++      "params":{"sessionId":"s1","toolCall":{"toolCallId":"t1"},
++      "options":[{"optionId":"no","name":"Reject","kind":"reject_once"}]}})");
++  client_->Cancel();
++  EXPECT_EQ(done_error, "Cancelled");
++  bool saw_cancel_outcome = false;
++  bool saw_session_cancel = false;
++  for (const auto& message : written_) {
++    if (const std::string* method = message.FindString("method");
++        method && *method == "session/cancel") {
++      saw_session_cancel = true;
++    }
++    if (const std::string* id = message.FindString("id"); id && *id == "p1") {
++      const base::DictValue* outcome =
++          message.FindDict("result")
++              ? message.FindDict("result")->FindDict("outcome")
++              : nullptr;
++      if (outcome && outcome->FindString("outcome") &&
++          *outcome->FindString("outcome") == "cancelled") {
++        saw_cancel_outcome = true;
++      }
++    }
++  }
++  EXPECT_TRUE(saw_session_cancel);
++  EXPECT_TRUE(saw_cancel_outcome);
++}
++
++TEST_F(AcpClientTest, PermissionPolicyCanAllowRacTool) {
++  client_->Start(base::DictValue().Set("cwd", "/tmp"),
++                 base::BindLambdaForTesting([](std::string) {}));
++  Deliver(R"({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}})");
++  Deliver(R"({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}})");
++  client_->SetPermissionPolicy(base::BindLambdaForTesting(
++      [](const base::DictValue& tool, base::OnceCallback<void(bool)> decide) {
++        const std::string* name = tool.FindString("name");
++        std::move(decide).Run(name && *name == "mcp__rac__rac_echo");
++      }));
++  client_->Prompt("hi", base::BindLambdaForTesting([](std::string) {}));
++  Deliver(
++      R"({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1",
++      "update":{"sessionUpdate":"tool_call","toolCallId":"t1",
++      "title":"rac: rac_echo","name":"mcp__rac__rac_echo","status":"pending"}}})");
++  Deliver(
++      R"({"jsonrpc":"2.0","id":"p1","method":"session/request_permission",
++      "params":{"sessionId":"s1","toolCall":{"toolCallId":"t1"},
++      "options":[{"optionId":"allow-once","name":"Allow","kind":"allow_once"},
++                 {"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}})");
++  const base::DictValue* reply = nullptr;
++  for (const auto& message : written_) {
++    if (const std::string* id = message.FindString("id"); id && *id == "p1") {
++      reply = &message;
++    }
++  }
++  ASSERT_TRUE(reply);
++  EXPECT_EQ(
++      *reply->FindDict("result")->FindDict("outcome")->FindString("optionId"),
++      "allow-once");
++}
++
++TEST(AgentPathTest, ParsesLoginShellMarkers) {
++  const std::string out =
++      "banner\nRAC_PATH_abc_BEGIN\n/opt/homebrew/bin:/usr/bin\n"
++      "RAC_PATH_abc_END\ntrailer\n";
++  auto path = ParseLoginShellPath(out, "abc");
++  ASSERT_TRUE(path);
++  EXPECT_EQ(*path, "/opt/homebrew/bin:/usr/bin");
++  EXPECT_FALSE(ParseLoginShellPath(out, "nope"));
++  EXPECT_FALSE(
++      ParseLoginShellPath("RAC_PATH_abc_BEGIN\nx\nRAC_PATH_abc_END\n"
++                          "RAC_PATH_abc_BEGIN\ny\nRAC_PATH_abc_END\n",
++                          "abc"));
++}
++
++TEST(AgentPathTest, MergeSearchPathDropsRelativeAndDuplicates) {
++  EXPECT_EQ(MergeSearchPath("/opt/homebrew/bin:.", "/usr/bin:/opt/homebrew/bin",
++                            "/Users/me"),
++            "/opt/homebrew/bin:/usr/bin");
++  EXPECT_EQ(MergeSearchPath("~/bin", "", "/Users/me"), "/Users/me/bin");
++}
++
++TEST(AgentPathTest, LoginShellScriptOnlySubstitutesNonce) {
++  EXPECT_EQ(
++      LoginShellPathScript("deadbeef"),
++      "printf '\\nRAC_PATH_deadbeef_BEGIN\\n%s\\nRAC_PATH_deadbeef_END\\n' "
++      "\"$PATH\"");
++}
++
++}  // namespace
++}  // namespace rac::ai
+--- /dev/null
++++ b/chrome/browser/rac/ai/acp/acp_transport.cc
+@@ -0,0 +1,336 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/ai/acp/acp_transport.h"
++
++#include <signal.h>
++#include <unistd.h>
++
++#include <utility>
++
++#include "base/files/file_descriptor_watcher_posix.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/json/json_writer.h"
++#include "base/logging.h"
++#include "base/posix/eintr_wrapper.h"
++#include "base/process/kill.h"
++#include "base/process/launch.h"
++#include "base/strings/string_util.h"
++
++namespace rac::ai {
++namespace {
++
++constexpr size_t kReadChunk = 64 * 1024;
++constexpr size_t kStderrRing = 64 * 1024;
++
++void AppendRing(std::string& ring, std::string_view chunk, size_t max) {
++  if (chunk.size() >= max) {
++    ring.assign(chunk.data() + (chunk.size() - max), max);
++    return;
++  }
++  if (ring.size() + chunk.size() > max) {
++    ring.erase(0, ring.size() + chunk.size() - max);
++  }
++  ring.append(chunk);
++}
++
++}  // namespace
++
++AcpTransport::AcpTransport() {
++  DETACH_FROM_SEQUENCE(sequence_checker_);
++}
++
++AcpTransport::~AcpTransport() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  kill_timer_.Stop();
++  ClosePipes();
++  if (process_.IsValid() && launch_pid_ > 1) {
++    kill(-launch_pid_, SIGKILL);
++  }
++  ReapChild();
++  closed_ = true;
++  on_closed_.Reset();
++  on_message_.Reset();
++}
++
++bool AcpTransport::running() const {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  return process_.IsValid() && !closed_;
++}
++
++void AcpTransport::Start(AcpLaunchSpec spec,
++                         MessageCallback on_message,
++                         StatusCallback on_closed) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  CHECK(!process_.IsValid());
++  on_message_ = std::move(on_message);
++  on_closed_ = std::move(on_closed);
++
++  if (spec.argv.empty() || spec.argv[0].empty() || spec.cwd.empty()) {
++    Fail("The agent command is incomplete.");
++    return;
++  }
++
++  base::ScopedFD child_stdin_read;
++  base::ScopedFD parent_stdin_write;
++  base::ScopedFD parent_stdout_read;
++  base::ScopedFD child_stdout_write;
++  base::ScopedFD parent_stderr_read;
++  base::ScopedFD child_stderr_write;
++  if (!base::CreatePipe(&child_stdin_read, &parent_stdin_write,
++                        /*non_blocking=*/false) ||
++      !base::CreatePipe(&parent_stdout_read, &child_stdout_write,
++                        /*non_blocking=*/false) ||
++      !base::CreatePipe(&parent_stderr_read, &child_stderr_write,
++                        /*non_blocking=*/false)) {
++    Fail("Could not create pipes for the agent.");
++    return;
++  }
++
++  base::LaunchOptions options;
++  options.current_directory = spec.cwd;
++  options.new_process_group = true;
++#if BUILDFLAG(IS_MAC)
++  options.disclaim_responsibility = true;
++#endif
++  options.clear_environment = spec.clear_environment;
++  for (const auto& [key, value] : spec.environment) {
++    options.environment[key] = value;
++  }
++  options.fds_to_remap.emplace_back(child_stdin_read.get(), STDIN_FILENO);
++  options.fds_to_remap.emplace_back(child_stdout_write.get(), STDOUT_FILENO);
++  options.fds_to_remap.emplace_back(child_stderr_write.get(), STDERR_FILENO);
++
++  process_ = base::LaunchProcess(spec.argv, options);
++  child_stdin_read.reset();
++  child_stdout_write.reset();
++  child_stderr_write.reset();
++  if (!process_.IsValid()) {
++    Fail("Could not start the agent.");
++    return;
++  }
++  launch_pid_ = process_.Pid();
++  if (launch_pid_ <= 1) {
++    Fail("The agent process id is invalid.");
++    return;
++  }
++
++  if (!base::SetNonBlocking(parent_stdin_write.get()) ||
++      !base::SetNonBlocking(parent_stdout_read.get()) ||
++      !base::SetNonBlocking(parent_stderr_read.get())) {
++    Fail("Could not configure agent pipes.");
++    return;
++  }
++
++  stdin_write_ = std::move(parent_stdin_write);
++  stdout_read_ = std::move(parent_stdout_read);
++  stderr_read_ = std::move(parent_stderr_read);
++  WatchPipes();
++}
++
++void AcpTransport::WatchPipes() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  stdout_watcher_ = base::FileDescriptorWatcher::WatchReadable(
++      stdout_read_.get(), base::BindRepeating(&AcpTransport::OnStdoutReadable,
++                                              weak_factory_.GetWeakPtr()));
++  stderr_watcher_ = base::FileDescriptorWatcher::WatchReadable(
++      stderr_read_.get(), base::BindRepeating(&AcpTransport::OnStderrReadable,
++                                              weak_factory_.GetWeakPtr()));
++}
++
++void AcpTransport::Write(base::DictValue message) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (closed_ || !stdin_write_.is_valid()) {
++    return;
++  }
++  auto json = base::WriteJson(message);
++  if (!json || json->size() > kAcpMaxFrameBytes) {
++    Fail("Could not encode an agent message.");
++    return;
++  }
++  json->push_back('\n');
++  outbox_.push_back(std::move(*json));
++  EnqueueWrite();
++}
++
++void AcpTransport::EnqueueWrite() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!stdin_write_.is_valid() || outbox_.empty()) {
++    stdin_watcher_.reset();
++    return;
++  }
++  while (!outbox_.empty()) {
++    const std::string& frame = outbox_.front();
++    const char* data = frame.data() + outbox_offset_;
++    const size_t remaining = frame.size() - outbox_offset_;
++    const ssize_t wrote =
++        HANDLE_EINTR(write(stdin_write_.get(), data, remaining));
++    if (wrote < 0) {
++      if (errno == EAGAIN || errno == EWOULDBLOCK) {
++        if (!stdin_watcher_) {
++          stdin_watcher_ = base::FileDescriptorWatcher::WatchWritable(
++              stdin_write_.get(),
++              base::BindRepeating(&AcpTransport::OnStdinWritable,
++                                  weak_factory_.GetWeakPtr()));
++        }
++        return;
++      }
++      Fail("Lost the agent stdin pipe.");
++      return;
++    }
++    outbox_offset_ += static_cast<size_t>(wrote);
++    if (outbox_offset_ < frame.size()) {
++      continue;
++    }
++    outbox_.pop_front();
++    outbox_offset_ = 0;
++  }
++  stdin_watcher_.reset();
++}
++
++void AcpTransport::OnStdinWritable() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  EnqueueWrite();
++}
++
++void AcpTransport::OnStdoutReadable() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  ReadPipe(stdout_read_.get(), /*is_stdout=*/true);
++}
++
++void AcpTransport::OnStderrReadable() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  ReadPipe(stderr_read_.get(), /*is_stdout=*/false);
++}
++
++void AcpTransport::ReadPipe(int fd, bool is_stdout) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  char buffer[kReadChunk];
++  for (;;) {
++    const ssize_t got = HANDLE_EINTR(read(fd, buffer, sizeof(buffer)));
++    if (got < 0) {
++      if (errno == EAGAIN || errno == EWOULDBLOCK) {
++        return;
++      }
++      Fail(is_stdout ? "Lost the agent stdout pipe."
++                     : "Lost the agent stderr pipe.");
++      return;
++    }
++    if (got == 0) {
++      if (is_stdout) {
++        if (!framer_.Finish()) {
++          Fail("The agent closed stdout on a partial message.");
++        } else {
++          Fail(stopping_ ? "" : "The agent exited.");
++        }
++      }
++      return;
++    }
++    const std::string_view chunk(buffer, static_cast<size_t>(got));
++    if (is_stdout) {
++      std::vector<base::DictValue> frames;
++      if (!framer_.Feed(chunk, frames)) {
++        Fail("The agent sent a malformed message.");
++        return;
++      }
++      for (auto& frame : frames) {
++        if (on_message_) {
++          on_message_.Run(std::move(frame));
++        }
++      }
++    } else {
++      AppendRing(stderr_tail_, chunk, kStderrRing);
++    }
++  }
++}
++
++void AcpTransport::Stop() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (closed_) {
++    return;
++  }
++  stopping_ = true;
++  stdin_watcher_.reset();
++  stdin_write_.reset();
++  outbox_.clear();
++  outbox_offset_ = 0;
++  TerminateGroup(/*force_kill=*/false);
++}
++
++void AcpTransport::Kill() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  stopping_ = true;
++  TerminateGroup(/*force_kill=*/true);
++}
++
++void AcpTransport::TerminateGroup(bool force_kill) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!process_.IsValid() || launch_pid_ <= 1) {
++    ClosePipes();
++    ReapChild();
++    return;
++  }
++  const int signal = force_kill ? SIGKILL : SIGTERM;
++  if (kill(-launch_pid_, signal) != 0 && errno != ESRCH) {
++    DVLOG(1) << "rac ACP kill(" << -launch_pid_ << ", " << signal
++             << ") failed: " << errno;
++  }
++  if (!force_kill) {
++    kill_timer_.Start(FROM_HERE, base::Seconds(1),
++                      base::BindOnce(&AcpTransport::OnKillEscalate,
++                                     weak_factory_.GetWeakPtr()));
++    return;
++  }
++  kill_timer_.Stop();
++  ClosePipes();
++  ReapChild();
++}
++
++void AcpTransport::OnKillEscalate() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  TerminateGroup(/*force_kill=*/true);
++}
++
++void AcpTransport::ClosePipes() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  stdin_watcher_.reset();
++  stdout_watcher_.reset();
++  stderr_watcher_.reset();
++  stdin_write_.reset();
++  stdout_read_.reset();
++  stderr_read_.reset();
++}
++
++void AcpTransport::ReapChild() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (process_.IsValid()) {
++    int exit_code = 0;
++    process_.WaitForExitWithTimeout(base::Seconds(2), &exit_code);
++    process_.Close();
++  }
++  launch_pid_ = base::kNullProcessId;
++}
++
++void AcpTransport::Fail(std::string error) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (closed_) {
++    return;
++  }
++  closed_ = true;
++  kill_timer_.Stop();
++  ClosePipes();
++  if (process_.IsValid() && launch_pid_ > 1) {
++    kill(-launch_pid_, SIGTERM);
++    kill_timer_.Start(FROM_HERE, base::Seconds(1),
++                      base::BindOnce(&AcpTransport::OnKillEscalate,
++                                     weak_factory_.GetWeakPtr()));
++  } else {
++    ReapChild();
++  }
++  if (on_closed_) {
++    std::move(on_closed_).Run(std::move(error));
++  }
++}
++
++}  // namespace rac::ai
+--- /dev/null
++++ b/chrome/browser/rac/ai/acp/acp_transport.h
+@@ -0,0 +1,98 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_AI_ACP_ACP_TRANSPORT_H_
++#define CHROME_BROWSER_RAC_AI_ACP_ACP_TRANSPORT_H_
++
++#include <deque>
++#include <map>
++#include <string>
++#include <vector>
++
++#include "base/files/file_descriptor_watcher_posix.h"
++#include "base/files/file_path.h"
++#include "base/files/scoped_file.h"
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++#include "base/process/process.h"
++#include "base/process/process_handle.h"
++#include "base/sequence_checker.h"
++#include "base/timer/timer.h"
++#include "base/values.h"
++#include "chrome/browser/rac/ai/acp/acp_client.h"
++
++namespace rac::ai {
++
++struct AcpLaunchSpec {
++  std::vector<std::string> argv;
++  base::FilePath cwd;
++  std::map<std::string, std::string> environment;
++  // When true, clear the inherited environment first and only apply
++  // `environment`. When false, overlay `environment` on the current process.
++  bool clear_environment = false;
++};
++
++// Owns one ACP child process and its stdio pipes. Construct and use only on a
++// MayBlock sequenced task runner. Frames are newline-delimited JSON objects.
++class AcpTransport {
++ public:
++  using MessageCallback = base::RepeatingCallback<void(base::DictValue)>;
++  using StatusCallback = base::OnceCallback<void(std::string error)>;
++
++  AcpTransport();
++  AcpTransport(const AcpTransport&) = delete;
++  AcpTransport& operator=(const AcpTransport&) = delete;
++  ~AcpTransport();
++
++  // Launch the child. `on_message` and completion callbacks are posted by the
++  // caller if they need another sequence; this class invokes them on its own.
++  void Start(AcpLaunchSpec spec,
++             MessageCallback on_message,
++             StatusCallback on_closed);
++
++  void Write(base::DictValue message);
++  // Graceful stop: close stdin, then TERM/KILL the process group.
++  void Stop();
++  // Immediate process-group escalation without waiting for protocol cancel.
++  void Kill();
++
++  bool running() const;
++  std::string stderr_tail() const { return stderr_tail_; }
++
++ private:
++  void WatchPipes();
++  void OnStdoutReadable();
++  void OnStderrReadable();
++  void OnStdinWritable();
++  void ReadPipe(int fd, bool is_stdout);
++  void EnqueueWrite();
++  void Fail(std::string error);
++  void ClosePipes();
++  void TerminateGroup(bool force_kill);
++  void OnKillEscalate();
++  void ReapChild();
++
++  MessageCallback on_message_;
++  StatusCallback on_closed_;
++  base::Process process_;
++  base::ProcessId launch_pid_ = base::kNullProcessId;
++  base::ScopedFD stdin_write_;
++  base::ScopedFD stdout_read_;
++  base::ScopedFD stderr_read_;
++  std::unique_ptr<base::FileDescriptorWatcher::Controller> stdin_watcher_;
++  std::unique_ptr<base::FileDescriptorWatcher::Controller> stdout_watcher_;
++  std::unique_ptr<base::FileDescriptorWatcher::Controller> stderr_watcher_;
++  AcpFramer framer_;
++  std::deque<std::string> outbox_;
++  size_t outbox_offset_ = 0;
++  std::string stderr_tail_;
++  bool stopping_ = false;
++  bool closed_ = false;
++  base::OneShotTimer kill_timer_;
++  SEQUENCE_CHECKER(sequence_checker_);
++  base::WeakPtrFactory<AcpTransport> weak_factory_{this};
++};
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_ACP_ACP_TRANSPORT_H_
+--- /dev/null
++++ b/chrome/browser/rac/ai/acp/agent_path.cc
+@@ -0,0 +1,366 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/ai/acp/agent_path.h"
++
++#include <signal.h>
++#include <unistd.h>
++
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/containers/span.h"
++#include "base/environment.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/posix/eintr_wrapper.h"
++#include "base/process/kill.h"
++#include "base/process/launch.h"
++#include "base/rand_util.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
++#include "base/task/thread_pool.h"
++#include "base/time/time.h"
++#include "build/build_config.h"
++
++namespace rac::ai {
++namespace {
++
++constexpr char kCommonDirs[] =
++    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
++
++void AppendUnique(std::vector<std::string>& out,
++                  std::string_view entry,
++                  std::string_view home) {
++  if (entry.empty()) {
++    return;
++  }
++  std::string path(entry);
++  if (base::StartsWith(path, "~/")) {
++    if (home.empty()) {
++      return;
++    }
++    path = std::string(home) + path.substr(1);
++  } else if (path == "~") {
++    if (home.empty()) {
++      return;
++    }
++    path = std::string(home);
++  }
++  if (path.empty() || path[0] != '/') {
++    return;
++  }
++  for (const std::string& existing : out) {
++    if (existing == path) {
++      return;
++    }
++  }
++  out.push_back(std::move(path));
++}
++
++void AppendColonList(std::vector<std::string>& out,
++                     std::string_view list,
++                     std::string_view home) {
++  for (std::string_view part : base::SplitStringPiece(
++           list, ":", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL)) {
++    AppendUnique(out, part, home);
++  }
++}
++
++std::string JoinColon(const std::vector<std::string>& parts) {
++  return base::JoinString(parts, ":");
++}
++
++struct ProbeResult {
++  std::string path;
++  std::string error;
++};
++
++ProbeResult ProbeLoginShellPath() {
++  ProbeResult result;
++  auto env = base::Environment::Create();
++  std::string home = env->GetVar("HOME").value_or("");
++  std::string inherited = env->GetVar("PATH").value_or("");
++  std::string shell = env->GetVar("SHELL").value_or("/bin/zsh");
++  if (shell.empty() || shell[0] != '/' || access(shell.c_str(), X_OK) != 0) {
++    shell = "/bin/zsh";
++  }
++
++  const std::string nonce =
++      base::HexEncode(base::as_byte_span(base::RandBytesAsVector(8)));
++  const std::string script = LoginShellPathScript(nonce);
++
++  base::ScopedFD parent_stdout_read;
++  base::ScopedFD child_stdout_write;
++  base::ScopedFD parent_stderr_read;
++  base::ScopedFD child_stderr_write;
++  if (!base::CreatePipe(&parent_stdout_read, &child_stdout_write, false) ||
++      !base::CreatePipe(&parent_stderr_read, &child_stderr_write, false)) {
++    result.error = "Could not create pipes for PATH discovery.";
++    return result;
++  }
++
++  base::FilePath scratch;
++  if (!base::GetTempDir(&scratch)) {
++    result.error = "Could not find a temporary directory.";
++    return result;
++  }
++
++  base::LaunchOptions options;
++  options.current_directory = scratch;
++  options.new_process_group = true;
++  options.fds_to_remap.emplace_back(child_stdout_write.get(), STDOUT_FILENO);
++  options.fds_to_remap.emplace_back(child_stderr_write.get(), STDERR_FILENO);
++#if BUILDFLAG(IS_MAC)
++  options.disclaim_responsibility = true;
++#endif
++
++  std::vector<std::string> argv = {shell, "-ilc", script};
++  base::Process process = base::LaunchProcess(argv, options);
++  child_stdout_write.reset();
++  child_stderr_write.reset();
++  if (!process.IsValid() || process.Pid() <= 1) {
++    result.error = "Could not start the login shell.";
++    return result;
++  }
++
++  const base::ProcessId pid = process.Pid();
++  std::string stdout_text;
++  std::string stderr_text;
++  char buffer[4096];
++  bool timed_out = false;
++  const base::TimeTicks deadline = base::TimeTicks::Now() + base::Seconds(5);
++  for (;;) {
++    bool progressed = false;
++    for (base::ScopedFD* fd : {&parent_stdout_read, &parent_stderr_read}) {
++      if (!fd->is_valid()) {
++        continue;
++      }
++      const ssize_t got = HANDLE_EINTR(read(fd->get(), buffer, sizeof(buffer)));
++      if (got > 0) {
++        progressed = true;
++        std::string* target =
++            fd == &parent_stdout_read ? &stdout_text : &stderr_text;
++        if (target->size() < 64 * 1024) {
++          target->append(buffer, static_cast<size_t>(got));
++        }
++      } else if (got == 0) {
++        fd->reset();
++        progressed = true;
++      }
++    }
++    if (!parent_stdout_read.is_valid() && !parent_stderr_read.is_valid()) {
++      break;
++    }
++    if (base::TimeTicks::Now() >= deadline) {
++      timed_out = true;
++      break;
++    }
++    if (!progressed) {
++      usleep(20 * 1000);
++    }
++  }
++
++  if (timed_out) {
++    kill(-pid, SIGTERM);
++  }
++  if (!process.WaitForExitWithTimeout(base::Seconds(1), nullptr)) {
++    kill(-pid, SIGKILL);
++    process.WaitForExitWithTimeout(base::Seconds(1), nullptr);
++  }
++  process.Close();
++
++  std::optional<std::string> parsed =
++      timed_out ? std::nullopt : ParseLoginShellPath(stdout_text, nonce);
++  if (!parsed) {
++    std::string launchctl_out;
++    int exit_code = 0;
++    if (base::GetAppOutputWithExitCode({"/bin/launchctl", "getenv", "PATH"},
++                                       &launchctl_out, &exit_code) &&
++        exit_code == 0 && !launchctl_out.empty() &&
++        launchctl_out.find('\0') == std::string::npos) {
++      base::TrimString(launchctl_out, "\r\n", &launchctl_out);
++      parsed = launchctl_out;
++    }
++  }
++  if (!parsed) {
++    parsed = inherited;
++  }
++
++  result.path = MergeSearchPath(*parsed, inherited, home);
++  if (result.path.empty()) {
++    result.error = "No executable search path is available.";
++  }
++
++  const base::FilePath npm = FindExecutableOnPath("npm", result.path);
++  if (!npm.empty()) {
++    std::string prefix;
++    int exit_code = 0;
++    if (base::GetAppOutputWithExitCode({npm.value(), "prefix", "--global"},
++                                       &prefix, &exit_code) &&
++        exit_code == 0) {
++      base::TrimString(prefix, "\r\n", &prefix);
++      if (!prefix.empty() && prefix[0] == '/') {
++        result.path = MergeSearchPath(prefix + "/bin", result.path, home);
++      }
++    }
++  }
++
++  // Common user bins that may be missing from a restricted shell.
++  std::string extras;
++  if (!home.empty()) {
++    extras =
++        home + "/.local/bin:" + home + "/.bun/bin:" + home + "/.npm-global/bin";
++  }
++  result.path = MergeSearchPath(result.path, extras, home);
++  result.path = MergeSearchPath(result.path, kCommonDirs, home);
++  return result;
++}
++
++}  // namespace
++
++std::string MergeSearchPath(std::string_view discovered,
++                            std::string_view inherited,
++                            std::string_view home_dir) {
++  std::vector<std::string> parts;
++  AppendColonList(parts, discovered, home_dir);
++  AppendColonList(parts, inherited, home_dir);
++  return JoinColon(parts);
++}
++
++std::optional<std::string> ParseLoginShellPath(std::string_view stdout_text,
++                                               std::string_view nonce) {
++  if (nonce.empty() || stdout_text.find('\0') != std::string_view::npos) {
++    return std::nullopt;
++  }
++  const std::string begin_tag =
++      base::StringPrintf("RAC_PATH_%s_BEGIN", std::string(nonce).c_str());
++  const std::string end_tag =
++      base::StringPrintf("RAC_PATH_%s_END", std::string(nonce).c_str());
++  const size_t first_begin = stdout_text.find(begin_tag);
++  if (first_begin == std::string_view::npos) {
++    return std::nullopt;
++  }
++  if (stdout_text.find(begin_tag, first_begin + begin_tag.size()) !=
++      std::string_view::npos) {
++    return std::nullopt;
++  }
++  const size_t after_begin = first_begin + begin_tag.size();
++  if (after_begin >= stdout_text.size() || stdout_text[after_begin] != '\n') {
++    return std::nullopt;
++  }
++  const size_t path_start = after_begin + 1;
++  const size_t end_pos = stdout_text.find(end_tag, path_start);
++  if (end_pos == std::string_view::npos) {
++    return std::nullopt;
++  }
++  if (stdout_text.find(end_tag, end_pos + end_tag.size()) !=
++      std::string_view::npos) {
++    return std::nullopt;
++  }
++  if (end_pos == 0 || stdout_text[end_pos - 1] != '\n') {
++    return std::nullopt;
++  }
++  std::string_view path =
++      stdout_text.substr(path_start, end_pos - 1 - path_start);
++  if (path.find('\n') != std::string_view::npos ||
++      path.find('\r') != std::string_view::npos) {
++    return std::nullopt;
++  }
++  return std::string(path);
++}
++
++std::string LoginShellPathScript(std::string_view nonce) {
++  return base::StringPrintf(
++      "printf '\\nRAC_PATH_%s_BEGIN\\n%%s\\nRAC_PATH_%s_END\\n' \"$PATH\"",
++      std::string(nonce).c_str(), std::string(nonce).c_str());
++}
++
++base::FilePath FindExecutableOnPath(std::string_view name,
++                                    std::string_view search_path) {
++  if (name.empty() || name.find('/') != std::string_view::npos) {
++    return base::FilePath();
++  }
++  for (std::string_view dir :
++       base::SplitStringPiece(search_path, ":", base::KEEP_WHITESPACE,
++                              base::SPLIT_WANT_NONEMPTY)) {
++    if (dir.empty() || dir[0] != '/') {
++      continue;
++    }
++    base::FilePath candidate =
++        base::FilePath(dir).Append(base::FilePath::FromUTF8Unsafe(name));
++    if (access(candidate.value().c_str(), X_OK) == 0) {
++      return candidate;
++    }
++  }
++  return base::FilePath();
++}
++
++AgentPathCache::AgentPathCache() = default;
++AgentPathCache::~AgentPathCache() = default;
++
++void AgentPathCache::Invalidate() {
++  search_path_.clear();
++  probing_ = false;
++  waiters_.clear();
++}
++
++void AgentPathCache::SetOverride(std::string name,
++                                 base::FilePath absolute_path) {
++  if (name.empty()) {
++    return;
++  }
++  if (absolute_path.empty()) {
++    overrides_.erase(name);
++    return;
++  }
++  overrides_[std::move(name)] = std::move(absolute_path);
++}
++
++base::FilePath AgentPathCache::Resolve(std::string_view name) const {
++  if (auto it = overrides_.find(std::string(name)); it != overrides_.end()) {
++    return it->second;
++  }
++  if (search_path_.empty()) {
++    return base::FilePath();
++  }
++  return FindExecutableOnPath(name, search_path_);
++}
++
++void AgentPathCache::Ensure(ReadyCallback done) {
++  if (!search_path_.empty()) {
++    std::move(done).Run(search_path_, "");
++    return;
++  }
++  waiters_.push_back(std::move(done));
++  if (probing_) {
++    return;
++  }
++  probing_ = true;
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&ProbeLoginShellPath),
++      base::BindOnce(
++          [](base::WeakPtr<AgentPathCache> self, ProbeResult result) {
++            if (!self) {
++              return;
++            }
++            self->OnProbed(std::move(result.path), std::move(result.error));
++          },
++          weak_factory_.GetWeakPtr()));
++}
++
++void AgentPathCache::OnProbed(std::string search_path, std::string error) {
++  probing_ = false;
++  search_path_ = std::move(search_path);
++  auto waiters = std::move(waiters_);
++  waiters_.clear();
++  for (auto& waiter : waiters) {
++    std::move(waiter).Run(search_path_, error);
++  }
++}
++
++}  // namespace rac::ai
+--- /dev/null
++++ b/chrome/browser/rac/ai/acp/agent_path.h
+@@ -0,0 +1,74 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_AI_ACP_AGENT_PATH_H_
++#define CHROME_BROWSER_RAC_AI_ACP_AGENT_PATH_H_
++
++#include <map>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++
++namespace rac::ai {
++
++// Pure helpers for login-shell PATH discovery. No process is launched here.
++std::string MergeSearchPath(std::string_view discovered,
++                            std::string_view inherited,
++                            std::string_view home_dir);
++
++// Extracts PATH from login-shell stdout that used markers with `nonce`.
++// Rejects missing/duplicate markers, NULs, or embedded newlines in PATH.
++std::optional<std::string> ParseLoginShellPath(std::string_view stdout_text,
++                                               std::string_view nonce);
++
++// Builds the argv script fragment for `shell -ilc`. Only `nonce` is
++// substituted.
++std::string LoginShellPathScript(std::string_view nonce);
++
++// Resolves `name` against a colon-separated PATH of absolute directories.
++base::FilePath FindExecutableOnPath(std::string_view name,
++                                    std::string_view search_path);
++
++// Cached probe of the login-shell PATH. Callers must only start a probe when
++// AI is enabled and an agent UI asks. Blocking work runs on a MayBlock runner.
++class AgentPathCache {
++ public:
++  using ReadyCallback =
++      base::OnceCallback<void(std::string search_path, std::string error)>;
++
++  AgentPathCache();
++  AgentPathCache(const AgentPathCache&) = delete;
++  AgentPathCache& operator=(const AgentPathCache&) = delete;
++  ~AgentPathCache();
++
++  bool has_value() const { return !search_path_.empty(); }
++  const std::string& search_path() const { return search_path_; }
++
++  // Returns the cached path immediately when present. Otherwise starts at most
++  // one probe and invokes `done` on the calling sequence.
++  void Ensure(ReadyCallback done);
++
++  // Absolute override for one executable name, or empty to clear.
++  void SetOverride(std::string name, base::FilePath absolute_path);
++  base::FilePath Resolve(std::string_view name) const;
++
++  void Invalidate();
++
++ private:
++  void OnProbed(std::string search_path, std::string error);
++
++  std::string search_path_;
++  bool probing_ = false;
++  std::vector<ReadyCallback> waiters_;
++  std::map<std::string, base::FilePath> overrides_;
++  base::WeakPtrFactory<AgentPathCache> weak_factory_{this};
++};
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_ACP_AGENT_PATH_H_
