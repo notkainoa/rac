@@ -1,0 +1,792 @@
+Index: src/chrome/browser/rac/ai/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/ai/BUILD.gn
++++ src/chrome/browser/rac/ai/BUILD.gn
+@@ -91,6 +91,7 @@ source_set("browser") {
+ #   out/Default/rac_ai_unittests
+ test("rac_ai_unittests") {
+   sources = [
++    "ai_prefs_unittest.cc",
+     "chat_history_unittest.cc",
+     "chat_prompt_unittest.cc",
+     "chat_protocol_unittest.cc",
+Index: src/chrome/browser/rac/ai/ai_prefs.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_prefs.cc
++++ src/chrome/browser/rac/ai/ai_prefs.cc
+@@ -11,6 +11,10 @@
+ 
+ namespace rac::ai {
+ 
++bool IsAiEnabled(const PrefService* prefs) {
++  return prefs && prefs->GetBoolean(kEnabled);
++}
++
+ void RegisterProfilePrefs(PrefRegistrySimple* registry) {
+   registry->RegisterBooleanPref(kEnabled, false);
+   registry->RegisterStringPref(kProvider, kDefaultProviderId);
+Index: src/chrome/browser/rac/ai/ai_prefs.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_prefs.h
++++ src/chrome/browser/rac/ai/ai_prefs.h
+@@ -34,6 +34,8 @@ inline constexpr char kSaveHistory[] = "
+ // List of {id, title, text}: prompts the user saved to reuse.
+ inline constexpr char kSavedPrompts[] = "rac.ai.saved_prompts";
+ 
++bool IsAiEnabled(const PrefService* prefs);
++
+ void RegisterProfilePrefs(PrefRegistrySimple* registry);
+ 
+ struct ProviderSettings {
+Index: src/chrome/browser/rac/ai/ai_prefs_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/ai/ai_prefs_unittest.cc
+@@ -0,0 +1,24 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/ai/ai_prefs.h"
++
++#include "chrome/browser/rac/ai/new_tab_page.h"
++#include "components/prefs/testing_pref_service.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::ai {
++TEST(RacAiPrefsTest, MasterSwitchGatesEntryPoints) {
++  TestingPrefServiceSimple prefs;
++  RegisterProfilePrefs(prefs.registry());
++  EXPECT_FALSE(IsAiEnabled(nullptr));
++  EXPECT_FALSE(IsAiEnabled(&prefs));
++  EXPECT_FALSE(ShouldUseAssistantNewTabPage(&prefs));
++  prefs.SetBoolean(kEnabled, true);
++  EXPECT_TRUE(IsAiEnabled(&prefs));
++  EXPECT_TRUE(ShouldUseAssistantNewTabPage(&prefs));
++  prefs.SetBoolean(kEnabled, false);
++  EXPECT_FALSE(IsAiEnabled(&prefs));
++  EXPECT_FALSE(ShouldUseAssistantNewTabPage(&prefs));
++}
++}  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/ai_service.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_service.cc
++++ src/chrome/browser/rac/ai/ai_service.cc
+@@ -6,6 +6,10 @@
+ 
+ #include <utility>
+ 
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
++
+ namespace rac::ai {
+ 
+ AiService::AiService(
+@@ -15,8 +19,27 @@ AiService::AiService(
+     scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory)
+     : prefs_(prefs),
+       key_store_(prefs, os_crypt),
+-      history_store_(profile_path.AppendASCII("rac_ai_history.json")),
+-      url_loader_factory_(std::move(url_loader_factory)) {}
++      history_path_(profile_path.AppendASCII("rac_ai_history.json")),
++      url_loader_factory_(std::move(url_loader_factory)) {
++  VLOG(1) << "rac AI service created";
++  pref_registrar_.Init(prefs);
++  pref_registrar_.Add(kEnabled, base::BindRepeating(
++                                    [](AiService* self) {
++                                      if (!IsAiEnabled(self->prefs_)) {
++                                        self->history_store_.reset();
++                                      }
++                                    },
++                                    base::Unretained(this)));
++}
++
++HistoryStore& AiService::history_store() {
++  CHECK(IsAiEnabled(prefs_));
++  if (!history_store_) {
++    VLOG(1) << "rac AI history store created";
++    history_store_ = std::make_unique<HistoryStore>(history_path_);
++  }
++  return *history_store_;
++}
+ 
+ AiService::~AiService() = default;
+ 
+Index: src/chrome/browser/rac/ai/ai_service.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_service.h
++++ src/chrome/browser/rac/ai/ai_service.h
+@@ -14,6 +14,7 @@
+ #include "chrome/browser/rac/ai/history_store.h"
+ #include "chrome/browser/rac/ai/key_store.h"
+ #include "components/keyed_service/core/keyed_service.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "services/network/public/cpp/shared_url_loader_factory.h"
+ 
+ class PrefService;
+@@ -39,7 +40,7 @@ class AiService : public KeyedService {
+ 
+   PrefService* prefs() { return prefs_; }
+   KeyStore& key_store() { return key_store_; }
+-  HistoryStore& history_store() { return history_store_; }
++  HistoryStore& history_store();
+   network::SharedURLLoaderFactory* url_loader_factory() {
+     return url_loader_factory_.get();
+   }
+@@ -47,7 +48,9 @@ class AiService : public KeyedService {
+  private:
+   raw_ptr<PrefService> prefs_;
+   KeyStore key_store_;
+-  HistoryStore history_store_;
++  base::FilePath history_path_;
++  std::unique_ptr<HistoryStore> history_store_;
++  PrefChangeRegistrar pref_registrar_;
+   scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory_;
+ };
+ 
+Index: src/chrome/browser/rac/ai/ai_service_factory.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_service_factory.cc
++++ src/chrome/browser/rac/ai/ai_service_factory.cc
+@@ -16,7 +16,7 @@ namespace rac::ai {
+ // static
+ AiService* AiServiceFactory::GetForProfile(Profile* profile) {
+   if (!profile || !profile->IsRegularProfile() ||
+-      !profile->GetPrefs()->GetBoolean(kEnabled)) {
++      !IsAiEnabled(profile->GetPrefs())) {
+     return nullptr;
+   }
+   return static_cast<AiService*>(
+@@ -39,6 +39,9 @@ std::unique_ptr<KeyedService>
+ AiServiceFactory::BuildServiceInstanceForBrowserContext(
+     content::BrowserContext* context) const {
+   Profile* profile = Profile::FromBrowserContext(context);
++  if (!profile->IsRegularProfile() || !IsAiEnabled(profile->GetPrefs())) {
++    return nullptr;
++  }
+   return std::make_unique<AiService>(
+       profile->GetPrefs(), g_browser_process->os_crypt_async(),
+       profile->GetPath(),
+Index: src/chrome/browser/rac/ai/chat_session.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/chat_session.cc
++++ src/chrome/browser/rac/ai/chat_session.cc
+@@ -23,6 +23,10 @@ ChatSession::ChatSession(AiService* serv
+ ChatSession::~ChatSession() = default;
+ 
+ void ChatSession::Start() {
++  if (!IsAiEnabled(service_->prefs())) {
++    Fail("The assistant is turned off.");
++    return;
++  }
+   provider_id_ = service_->prefs()->GetString(kProvider);
+   const ProviderInfo* info = FindProvider(provider_id_);
+   if (!info) {
+@@ -39,6 +43,10 @@ void ChatSession::Start() {
+ }
+ 
+ void ChatSession::OnKey(std::optional<std::string> key) {
++  if (!IsAiEnabled(service_->prefs())) {
++    Fail("The assistant is turned off.");
++    return;
++  }
+   const ProviderInfo* info = FindProvider(provider_id_);
+   if (!info || !key) {
+     Fail("Add an API key in Settings > Privacy and security > Assistant.");
+Index: src/chrome/browser/rac/ai/key_store.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/key_store.cc
++++ src/chrome/browser/rac/ai/key_store.cc
+@@ -24,7 +24,8 @@ void StoreEncrypted(base::WeakPtr<KeySto
+                     KeyStore::SetCallback callback,
+                     scoped_refptr<os_crypt_async::Encryptor> encryptor) {
+   std::string ciphertext;
+-  if (!store || !encryptor || !encryptor->IsEncryptionAvailable() ||
++  if (!store || !IsAiEnabled(prefs) || !encryptor ||
++      !encryptor->IsEncryptionAvailable() ||
+       !encryptor->EncryptString(key, &ciphertext)) {
+     std::move(callback).Run(false);
+     return;
+@@ -34,11 +35,14 @@ void StoreEncrypted(base::WeakPtr<KeySto
+   std::move(callback).Run(true);
+ }
+ 
+-void DecryptStored(KeyStore::GetCallback callback,
++void DecryptStored(base::WeakPtr<KeyStore> store,
++                   PrefService* prefs,
++                   KeyStore::GetCallback callback,
+                    std::string ciphertext,
+                    scoped_refptr<os_crypt_async::Encryptor> encryptor) {
+   std::string key;
+-  if (!encryptor || !encryptor->IsDecryptionAvailable() ||
++  if (!store || !IsAiEnabled(prefs) || !encryptor ||
++      !encryptor->IsDecryptionAvailable() ||
+       !encryptor->DecryptString(ciphertext, &key) || key.empty()) {
+     std::move(callback).Run(std::nullopt);
+     return;
+@@ -64,10 +68,9 @@ void KeyStore::SetKey(const std::string&
+     std::move(callback).Run(false);
+     return;
+   }
+-  os_crypt_->GetInstance(base::BindOnce(&StoreEncrypted,
+-                                        weak_factory_.GetWeakPtr(),
+-                                        prefs_.get(), provider_id, key,
+-                                        std::move(callback)));
++  os_crypt_->GetInstance(
++      base::BindOnce(&StoreEncrypted, weak_factory_.GetWeakPtr(), prefs_.get(),
++                     provider_id, key, std::move(callback)));
+ }
+ 
+ void KeyStore::ClearKey(const std::string& provider_id) {
+@@ -84,7 +87,8 @@ void KeyStore::GetKey(const std::string&
+     return;
+   }
+   os_crypt_->GetInstance(
+-      base::BindOnce(&DecryptStored, std::move(callback), std::move(ciphertext)));
++      base::BindOnce(&DecryptStored, weak_factory_.GetWeakPtr(), prefs_.get(),
++                     std::move(callback), std::move(ciphertext)));
+ }
+ 
+ }  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/model_list.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/model_list.cc
++++ src/chrome/browser/rac/ai/model_list.cc
+@@ -52,8 +52,7 @@ constexpr net::NetworkTrafficAnnotationT
+         policy_exception_justification: "Not implemented."
+       })");
+ 
+-void OnBody(std::unique_ptr<network::SimpleURLLoader> loader,
+-            base::OnceCallback<void(std::vector<std::string>)> callback,
++void OnBody(base::OnceCallback<void(std::vector<std::string>)> callback,
+             std::optional<std::string> body) {
+   std::move(callback).Run(body ? ParseModelList(*body)
+                                : std::vector<std::string>());
+@@ -61,17 +60,16 @@ void OnBody(std::unique_ptr<network::Sim
+ 
+ }  // namespace
+ 
+-void FetchModelList(
++std::unique_ptr<network::SimpleURLLoader> FetchModelList(
+     network::SharedURLLoaderFactory* factory,
+     const std::string& base_url,
+     base::OnceCallback<void(std::vector<std::string>)> callback) {
+   std::string_view trimmed =
+       base::TrimString(base_url, "/", base::TRIM_TRAILING);
+   const GURL url(std::string(trimmed) + "/models");
+-  if (!factory || !IsAcceptableBaseUrl(url) ||
+-      !net::IsLocalhost(url)) {
++  if (!factory || !IsAcceptableBaseUrl(url) || !net::IsLocalhost(url)) {
+     std::move(callback).Run({});
+-    return;
++    return nullptr;
+   }
+   auto request = std::make_unique<network::ResourceRequest>();
+   request->url = url;
+@@ -82,9 +80,9 @@ void FetchModelList(
+       network::SimpleURLLoader::Create(std::move(request), kTrafficAnnotation);
+   loader->SetTimeoutDuration(kTimeout);
+   network::SimpleURLLoader* raw = loader.get();
+-  raw->DownloadToString(
+-      factory, base::BindOnce(&OnBody, std::move(loader), std::move(callback)),
+-      kMaxBodyBytes);
++  raw->DownloadToString(factory, base::BindOnce(&OnBody, std::move(callback)),
++                        kMaxBodyBytes);
++  return loader;
+ }
+ 
+ }  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/model_list.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/model_list.h
++++ src/chrome/browser/rac/ai/model_list.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_RAC_AI_MODEL_LIST_H_
+ #define CHROME_BROWSER_RAC_AI_MODEL_LIST_H_
+ 
++#include <memory>
+ #include <string>
+ #include <vector>
+ 
+@@ -12,14 +13,15 @@
+ 
+ namespace network {
+ class SharedURLLoaderFactory;
+-}
++class SimpleURLLoader;
++}  // namespace network
+ 
+ namespace rac::ai {
+ 
+ // Asks the OpenAI-compatible server at `base_url` which models it has. Only
+ // for servers on this computer, which need no key. Runs `callback` with an
+ // empty list if the server can't be reached or answers with something else.
+-void FetchModelList(
++std::unique_ptr<network::SimpleURLLoader> FetchModelList(
+     network::SharedURLLoaderFactory* factory,
+     const std::string& base_url,
+     base::OnceCallback<void(std::vector<std::string>)> callback);
+Index: src/chrome/browser/rac/ai/new_tab_page.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/new_tab_page.cc
++++ src/chrome/browser/rac/ai/new_tab_page.cc
+@@ -10,7 +10,7 @@
+ namespace rac::ai {
+ 
+ bool ShouldUseAssistantNewTabPage(const PrefService* prefs) {
+-  return prefs->GetBoolean(kEnabled) && prefs->GetBoolean(kNewTabPage);
++  return IsAiEnabled(prefs) && prefs->GetBoolean(kNewTabPage);
+ }
+ 
+ bool IsAssistantNewTabPageUrl(const GURL& url) {
+Index: src/chrome/browser/ui/views/rac/ai/assistant_actions.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/ai/assistant_actions.cc
++++ src/chrome/browser/ui/views/rac/ai/assistant_actions.cc
+@@ -7,6 +7,8 @@
+ #include <iterator>
+ #include <type_traits>
+ 
++#include "base/callback_list.h"
++#include "base/functional/bind.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/ui/actions/chrome_action_id.h"
+@@ -16,6 +18,7 @@
+ #include "chrome/browser/ui/side_panel/side_panel_entry_key.h"
+ #include "chrome/browser/ui/side_panel/side_panel_enums.h"
+ #include "chrome/browser/ui/side_panel/side_panel_ui.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "components/prefs/pref_service.h"
+ #include "ui/actions/actions.h"
+ #include "ui/base/models/image_model.h"
+@@ -98,7 +101,7 @@ void ToggleAssistant(BrowserWindowInterf
+   if (!profile->IsRegularProfile()) {
+     return;
+   }
+-  if (!profile->GetPrefs()->GetBoolean(kEnabled)) {
++  if (!IsAiEnabled(profile->GetPrefs())) {
+     browser->OpenGURL(GURL("chrome://settings/assistant"),
+                       WindowOpenDisposition::NEW_FOREGROUND_TAB);
+     return;
+@@ -109,12 +112,9 @@ void ToggleAssistant(BrowserWindowInterf
+   }
+ }
+ 
+-void AddAssistantAction(actions::ActionItem* root,
+-                        BrowserWindowInterface* browser) {
+-  if (!browser->GetProfile()->IsRegularProfile()) {
+-    return;
+-  }
+-  root->AddChild(
++actions::ActionItem* CreateAssistantAction(actions::ActionItem* root,
++                                           BrowserWindowInterface* browser) {
++  return root->AddChild(
+       actions::ActionItem::Builder(
+           CreateToggleSidePanelActionCallback(
+               SidePanelEntryKey(SidePanelEntryId::kRacAi), browser))
+@@ -129,4 +129,43 @@ void AddAssistantAction(actions::ActionI
+           .Build());
+ }
+ 
++namespace {
++class ActionRegistration {
++ public:
++  ActionRegistration(actions::ActionItem* root, BrowserWindowInterface* browser)
++      : root_(root), browser_(browser) {
++    close_ = browser_->RegisterBrowserDidClose(base::BindRepeating(
++        [](ActionRegistration* self, BrowserWindowInterface*) { delete self; },
++        base::Unretained(this)));
++    prefs_.Init(browser_->GetProfile()->GetPrefs());
++    prefs_.Add(kEnabled, base::BindRepeating(&ActionRegistration::Update,
++                                             base::Unretained(this)));
++    Update();
++  }
++
++ private:
++  void Update() {
++    if (IsAiEnabled(prefs_.prefs())) {
++      if (!action_) {
++        action_ = CreateAssistantAction(root_, browser_);
++      }
++    } else if (action_) {
++      root_->RemoveChild(action_.get());
++      action_ = nullptr;
++    }
++  }
++  raw_ptr<actions::ActionItem> root_;
++  raw_ptr<BrowserWindowInterface> browser_;
++  raw_ptr<actions::ActionItem> action_ = nullptr;
++  PrefChangeRegistrar prefs_;
++  base::CallbackListSubscription close_;
++};
++}  // namespace
++
++void AddAssistantAction(actions::ActionItem* root,
++                        BrowserWindowInterface* browser) {
++  if (browser->GetProfile()->IsRegularProfile()) {
++    new ActionRegistration(root, browser);
++  }
++}
+ }  // namespace rac::ai
+Index: src/chrome/browser/ui/views/rac/ai/assistant_edge_handle.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/ai/assistant_edge_handle.cc
++++ src/chrome/browser/ui/views/rac/ai/assistant_edge_handle.cc
+@@ -7,6 +7,8 @@
+ #include <algorithm>
+ #include <memory>
+ 
++#include "base/callback_list.h"
++#include "base/functional/bind.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -22,6 +24,7 @@
+ #include "chrome/browser/ui/views/frame/multi_contents_view.h"
+ #include "chrome/browser/ui/views/rac/ai/assistant_actions.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "components/prefs/pref_service.h"
+ #include "ui/base/cursor/cursor.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+@@ -151,8 +154,7 @@ class AssistantEdgeHandle : public views
+     // The top bar layout has the Chat button instead.
+     const PrefService* prefs =
+         browser_view_->browser()->GetProfile()->GetPrefs();
+-    if (rac::GetLayout(prefs) == rac::Layout::kTopBar ||
+-        !prefs->GetBoolean(kEnabled)) {
++    if (rac::GetLayout(prefs) == rac::Layout::kTopBar || !IsAiEnabled(prefs)) {
+       return gfx::Rect();
+     }
+     const MultiContentsView* page = browser_view_->multi_contents_view();
+@@ -203,6 +205,38 @@ class AssistantEdgeHandle : public views
+ BEGIN_METADATA(AssistantEdgeHandle)
+ END_METADATA
+ 
++class EdgeHandleRegistration {
++ public:
++  explicit EdgeHandleRegistration(BrowserView* view) : view_(view) {
++    close_subscription_ = view_->browser()->RegisterBrowserDidClose(
++        base::BindRepeating([](EdgeHandleRegistration* self,
++                               BrowserWindowInterface*) { delete self; },
++                            base::Unretained(this)));
++    prefs_.Init(view_->browser()->GetProfile()->GetPrefs());
++    prefs_.Add(kEnabled, base::BindRepeating(&EdgeHandleRegistration::Update,
++                                             base::Unretained(this)));
++    Update();
++  }
++
++ private:
++  void Update() {
++    if (IsAiEnabled(prefs_.prefs())) {
++      if (!handle_) {
++        handle_ =
++            view_->AddChildView(std::make_unique<AssistantEdgeHandle>(view_));
++        handle_->SetBoundsRect(view_->GetLocalBounds());
++      }
++    } else if (handle_) {
++      view_->RemoveChildViewT(handle_.get());
++      handle_ = nullptr;
++    }
++  }
++  raw_ptr<BrowserView> view_;
++  raw_ptr<AssistantEdgeHandle> handle_ = nullptr;
++  PrefChangeRegistrar prefs_;
++  base::CallbackListSubscription close_subscription_;
++};
++
+ }  // namespace
+ 
+ void AddAssistantEdgeHandle(BrowserView* browser_view) {
+@@ -210,9 +244,7 @@ void AddAssistantEdgeHandle(BrowserView*
+       !browser_view->browser()->GetProfile()->IsRegularProfile()) {
+     return;
+   }
+-  browser_view
+-      ->AddChildView(std::make_unique<AssistantEdgeHandle>(browser_view))
+-      ->SetBoundsRect(browser_view->GetLocalBounds());
++  new EdgeHandleRegistration(browser_view);
+ }
+ 
+ }  // namespace rac::ai
+Index: src/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
++++ src/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
+@@ -291,7 +291,6 @@ class EntryRegistrar : public SidePanelE
+  public:
+   EntryRegistrar(BrowserWindowInterface* browser, SidePanelRegistry* registry)
+       : browser_(browser), registry_(registry) {
+-    AssistantPanelState::GetOrCreate(browser_);
+     close_subscription_ = browser_->RegisterBrowserDidClose(base::BindRepeating(
+         [](EntryRegistrar* self, BrowserWindowInterface*) { delete self; },
+         base::Unretained(this)));
+@@ -314,10 +313,10 @@ class EntryRegistrar : public SidePanelE
+ 
+   void Update() {
+     const SidePanelEntry::Key key(SidePanelEntry::Id::kRacAi);
+-    const bool enabled =
+-        browser_->GetProfile()->GetPrefs()->GetBoolean(kEnabled);
++    const bool enabled = IsAiEnabled(browser_->GetProfile()->GetPrefs());
+     const bool registered = registry_->GetEntryForKey(key) != nullptr;
+     if (enabled && !registered) {
++      AssistantPanelState::GetOrCreate(browser_);
+       auto entry = std::make_unique<SidePanelEntry>(
+           key, base::BindRepeating(&CreateView),
+           base::BindRepeating([] { return kDefaultWidth; }));
+Index: src/chrome/browser/ui/views/rac/top_bar.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/top_bar.cc
++++ src/chrome/browser/ui/views/rac/top_bar.cc
+@@ -13,6 +13,7 @@
+ #include "cc/paint/paint_flags.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+@@ -187,15 +188,23 @@ class ChatButtonHost : public views::Vie
+     pref_change_registrar_.Add(
+         kLayout, base::BindRepeating(&ChatButtonHost::OnLayoutChanged,
+                                      base::Unretained(this)));
+-    panel_subscription_ = ai::AddAssistantPanelOpenCallback(
+-        browser_, base::BindRepeating(&ChatButtonHost::OnLayoutChanged,
+-                                      base::Unretained(this)));
++    pref_change_registrar_.Add(
++        ai::kEnabled, base::BindRepeating(&ChatButtonHost::OnLayoutChanged,
++                                          base::Unretained(this)));
+     OnLayoutChanged();
+   }
+ 
+  private:
+   void OnLayoutChanged() {
+-    if (IsTopBar(browser_)) {
++    const bool enabled = ai::IsAiEnabled(browser_->GetProfile()->GetPrefs());
++    if (enabled && !panel_subscription_) {
++      panel_subscription_ = ai::AddAssistantPanelOpenCallback(
++          browser_, base::BindRepeating(&ChatButtonHost::OnLayoutChanged,
++                                        base::Unretained(this)));
++    } else if (!enabled) {
++      panel_subscription_ = {};
++    }
++    if (enabled && IsTopBar(browser_)) {
+       if (children().empty()) {
+         AddChildView(std::make_unique<ChatButton>(browser_));
+       }
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+@@ -35,11 +35,13 @@
+ #include "chrome/browser/ui/webui/webui_embedding_context.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/render_widget_host_view.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_observer.h"
+ #include "content/public/browser/web_ui.h"
++#include "services/network/public/cpp/simple_url_loader.h"
+ #include "third_party/blink/public/mojom/frame/user_activation_notification_type.mojom.h"
+ #include "ui/base/window_open_disposition.h"
+ #include "ui/gfx/geometry/rect_conversions.h"
+@@ -210,6 +212,7 @@ void PageHandler::RegisterMessages() {
+ 
+ void PageHandler::OnJavascriptDisallowed() {
+   CloseMenu();
++  model_loader_.reset();
+   title_session_.reset();
+   title_callback_ = base::Value();
+   pref_registrar_.RemoveAll();
+@@ -304,8 +307,7 @@ base::Value PageHandler::DescribeTheme()
+       browser ? SpacesWindowManager::From(browser) : nullptr;
+   const std::optional<SpaceId> active =
+       manager ? manager->GetActiveSpaceId(browser) : std::nullopt;
+-  const Space* space =
+-      active ? manager->spaces()->FindSpace(*active) : nullptr;
++  const Space* space = active ? manager->spaces()->FindSpace(*active) : nullptr;
+   if (!space) {
+     return base::Value();
+   }
+@@ -373,7 +375,7 @@ void PageHandler::HandleInit(const base:
+   BrowserWindowInterface* browser = GetBrowser();
+   if (SpacesWindowManager* manager =
+           browser ? SpacesWindowManager::From(browser) : nullptr;
+-      manager && !spaces_observation_.IsObserving()) {
++      service && manager && !spaces_observation_.IsObserving()) {
+     spaces_observation_.Observe(manager);
+   }
+   state.Set("theme", DescribeTheme());
+@@ -555,9 +557,32 @@ void PageHandler::OnUpdate(int send_id,
+ }
+ 
+ void PageHandler::OnEnabledChanged() {
+-  if (!profile_->GetPrefs()->GetBoolean(kEnabled)) {
++  if (!IsAiEnabled(profile_->GetPrefs())) {
+     StopSession();
++    title_session_.reset();
++    FinishTitle(base::Value());
++    model_loader_.reset();
++    CloseMenu();
++    spaces_observation_.Reset();
++    active_tab_subscription_ = {};
++    tab_observer_.reset();
+     FireWebUIListener("rac-ai-disabled");
++    content::WebContents* contents = web_ui()->GetWebContents();
++    if (tabs::TabInterface::MaybeGetFromContents(contents)) {
++      // Leave this handler before replacing an assistant tab's document.
++      base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(
++                         [](base::WeakPtr<content::WebContents> contents) {
++                           if (!contents) {
++                             return;
++                           }
++                           content::NavigationController::LoadURLParams params(
++                               GURL("chrome://newtab/"));
++                           params.should_replace_current_entry = true;
++                           contents->GetController().LoadURLWithParams(params);
++                         },
++                         contents->GetWeakPtr()));
++    }
+   }
+ }
+ 
+@@ -586,17 +611,16 @@ void PageHandler::HandleClosePanel(const
+   }
+   // Closing without animation deletes this page, so leave its message first.
+   base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+-      FROM_HERE,
+-      base::BindOnce(
+-          [](base::WeakPtr<BrowserWindowInterface> browser) {
+-            SidePanelUI* ui = browser ? SidePanelUI::From(browser.get())
+-                                      : nullptr;
+-            if (ui && ui->IsSidePanelEntryShowing(
+-                          SidePanelEntryKey(SidePanelEntryId::kRacAi))) {
+-              ui->Close();
+-            }
+-          },
+-          browser->GetWeakPtr()));
++      FROM_HERE, base::BindOnce(
++                     [](base::WeakPtr<BrowserWindowInterface> browser) {
++                       SidePanelUI* ui =
++                           browser ? SidePanelUI::From(browser.get()) : nullptr;
++                       if (ui && ui->IsSidePanelEntryShowing(SidePanelEntryKey(
++                                     SidePanelEntryId::kRacAi))) {
++                         ui->Close();
++                       }
++                     },
++                     browser->GetWeakPtr()));
+ }
+ 
+ void PageHandler::HandleGetModels(const base::ListValue& args) {
+@@ -638,10 +662,10 @@ void PageHandler::ListNextModels(std::un
+   while (service && query->next < query->entries.size()) {
+     if (query->entries[query->next].local) {
+       const std::string base_url = query->entries[query->next].base_url;
+-      FetchModelList(service->url_loader_factory(), base_url,
+-                     base::BindOnce(&PageHandler::OnModelsListed,
+-                                    weak_factory_.GetWeakPtr(),
+-                                    std::move(query)));
++      model_loader_ = FetchModelList(
++          service->url_loader_factory(), base_url,
++          base::BindOnce(&PageHandler::OnModelsListed,
++                         weak_factory_.GetWeakPtr(), std::move(query)));
+       return;
+     }
+     ++query->next;
+@@ -687,8 +711,7 @@ void PageHandler::HandleSelectModel(cons
+   CHECK_EQ(args.size(), 2u);
+   const std::string* provider_id = args[0].GetIfString();
+   const std::string* model = args[1].GetIfString();
+-  const ProviderInfo* info =
+-      provider_id ? FindProvider(*provider_id) : nullptr;
++  const ProviderInfo* info = provider_id ? FindProvider(*provider_id) : nullptr;
+   if (!AiServiceFactory::GetForProfile(profile_) || !info || !model ||
+       model->empty() || model->size() > kMaxModelChars ||
+       !base::IsStringUTF8(*model)) {
+@@ -716,15 +739,13 @@ void PageHandler::HandleMakeTitle(const
+   }
+   std::string cut_question;
+   std::string cut_answer;
+-  base::TruncateUTF8ToByteSize(*question, kMaxTitleSourceChars,
+-                               &cut_question);
++  base::TruncateUTF8ToByteSize(*question, kMaxTitleSourceChars, &cut_question);
+   base::TruncateUTF8ToByteSize(*answer, kMaxTitleSourceChars, &cut_answer);
+   ChatRequest request;
+   request.system_prompt = kTitlePrompt;
+   request.messages.push_back(
+-      {ChatMessage::Role::kUser,
+-       base::StrCat({"Question:\n", cut_question, "\n\nAnswer:\n",
+-                     cut_answer})});
++      {ChatMessage::Role::kUser, base::StrCat({"Question:\n", cut_question,
++                                               "\n\nAnswer:\n", cut_answer})});
+   title_text_.clear();
+   title_session_ = std::make_unique<ChatSession>(
+       service, std::move(request),
+@@ -768,6 +789,9 @@ void PageHandler::HandleShowMenu(const b
+   if (!args[0].is_int() || !args[1].is_dict()) {
+     return;
+   }
++  if (!IsAiEnabled(profile_->GetPrefs())) {
++    return;
++  }
+   CloseMenu();
+   std::unique_ptr<MenuRequest> request = ParseMenu(args[1].GetDict());
+   content::WebContents* contents = web_ui()->GetWebContents();
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+@@ -26,6 +26,10 @@
+ class BrowserWindowInterface;
+ class Profile;
+ 
++namespace network {
++class SimpleURLLoader;
++}
++
+ namespace tabs {
+ class TabInterface;
+ }
+@@ -125,6 +129,7 @@ class PageHandler : public content::WebU
+   raw_ptr<Profile> profile_;
+   PrefChangeRegistrar pref_registrar_;
+   std::unique_ptr<ChatSession> session_;
++  std::unique_ptr<network::SimpleURLLoader> model_loader_;
+   int active_send_id_ = 0;
+   // Names a finished chat. Separate from `session_`, so the next message
+   // doesn't cancel it.
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+@@ -87,8 +87,7 @@ RacAiUIConfig::RacAiUIConfig()
+ 
+ bool RacAiUIConfig::IsWebUIEnabled(content::BrowserContext* browser_context) {
+   Profile* profile = Profile::FromBrowserContext(browser_context);
+-  return profile->IsRegularProfile() &&
+-         profile->GetPrefs()->GetBoolean(kEnabled);
++  return profile->IsRegularProfile() && IsAiEnabled(profile->GetPrefs());
+ }
+ 
+ RacAiUI::RacAiUI(content::WebUI* web_ui) : content::WebUIController(web_ui) {
+Index: src/chrome/browser/rac/ai/history_store.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/history_store.cc
++++ src/chrome/browser/rac/ai/history_store.cc
+@@ -34,7 +34,11 @@ HistoryStore::HistoryStore(const base::F
+            base::TaskShutdownBehavior::BLOCK_SHUTDOWN})),
+       writer_(path, task_runner_, "RacAiHistory") {}
+ 
+-HistoryStore::~HistoryStore() = default;
++HistoryStore::~HistoryStore() {
++  if (writer_.HasPendingWrite()) {
++    writer_.DoScheduledWrite();
++  }
++}
+ 
+ void HistoryStore::WhenLoaded(base::OnceClosure task) {
+   if (loaded_) {
