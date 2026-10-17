@@ -1,0 +1,274 @@
+Index: src/chrome/browser/rac/ai/page_text.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/page_text.cc
++++ src/chrome/browser/rac/ai/page_text.cc
+@@ -30,13 +30,18 @@ std::string Clean(std::string_view text)
+   return base::CollapseWhitespaceASCII(repaired, false);
+ }
+ 
+-bool InViewport(const proto::ContentNode& node) {
++bool InViewport(const proto::ContentNode& node, int depth = 0) {
++  if (depth > kMaxDepth || IsPageNodeHidden(node)) {
++    return false;
++  }
+   const auto& a = node.content_attributes();
+   if (a.has_geometry() && a.geometry().has_visible_bounding_box()) {
+     const auto& box = a.geometry().visible_bounding_box();
+     return box.width() > 0 && box.height() > 0;
+   }
+-  return std::ranges::any_of(node.children_nodes(), &InViewport);
++  return std::ranges::any_of(node.children_nodes(), [depth](const auto& child) {
++    return InViewport(child, depth + 1);
++  });
+ }
+ 
+ // APC groups H2/H3 in one font-size bucket and doesn't expose HTML levels.
+@@ -70,7 +75,7 @@ int HeadingLevel(const proto::ContentNod
+ }
+ 
+ std::string Inline(const proto::ContentNode& node, int depth = 0) {
+-  if (depth > kMaxDepth) {
++  if (depth > kMaxDepth || IsPageNodeHidden(node)) {
+     return {};
+   }
+   const auto& a = node.content_attributes();
+@@ -141,7 +146,7 @@ struct Block {
+ void Collect(const proto::ContentNode& node,
+              std::vector<Block>& blocks,
+              int depth = 0) {
+-  if (depth > kMaxDepth) {
++  if (depth > kMaxDepth || IsPageNodeHidden(node)) {
+     return;
+   }
+   const auto& attributes = node.content_attributes();
+@@ -239,7 +244,7 @@ void Selections(const proto::FrameData&
+ void FrameSelections(const proto::ContentNode& node,
+                      std::vector<Block>& blocks,
+                      int depth = 0) {
+-  if (depth > kMaxDepth) {
++  if (depth > kMaxDepth || IsPageNodeHidden(node)) {
+     return;
+   }
+   if (node.content_attributes().has_iframe_data()) {
+@@ -251,6 +256,57 @@ void FrameSelections(const proto::Conten
+ }
+ }  // namespace
+ 
++bool IsPageNodeHidden(const proto::ContentNode& node) {
++  const auto& a = node.content_attributes();
++  if (std::ranges::find(a.annotated_roles(),
++                        proto::ANNOTATED_ROLE_CONTENT_HIDDEN) !=
++      a.annotated_roles().end()) {
++    return true;
++  }
++  const auto& reasons = a.interaction_info().interaction_disabled_reasons();
++  if (std::ranges::find(reasons,
++                        proto::INTERACTION_DISABLED_REASON_ARIA_HIDDEN) !=
++      reasons.end()) {
++    return true;
++  }
++  if (a.has_geometry()) {
++    const auto& geometry = a.geometry();
++    if (geometry.has_visible_bounding_box()) {
++      const auto& box = geometry.visible_bounding_box();
++      if (box.width() <= 0 || box.height() <= 0) {
++        return true;
++      }
++    }
++    if (geometry.has_outer_bounding_box()) {
++      const auto& box = geometry.outer_bounding_box();
++      if (box.width() <= 0 || box.height() <= 0) {
++        return true;
++      }
++      // Scale-independent checks; APC's viewport size uses a different scale.
++      if (static_cast<int64_t>(box.x()) + box.width() <= 0 ||
++          static_cast<int64_t>(box.y()) + box.height() <= 0) {
++        return true;
++      }
++      // XS alone also describes legible footnotes. Suppress it only when the
++      // actual rendered line is at most four captured pixels tall.
++      if (a.has_text_data() &&
++          a.text_data().text_style().text_size() == proto::TEXT_SIZE_XS &&
++          box.height() <= 4) {
++        return true;
++      }
++    }
++  }
++  if (a.has_text_data()) {
++    const auto& style = a.text_data().text_style();
++    // Blink's RGBA32 packs alpha in the high byte. This is text color, not
++    // CSS opacity; opacity on an ancestor is not exposed by APC.
++    if (style.has_color() && (style.color() >> 24) == 0) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ std::string HashPageText(std::string_view title,
+                          std::string_view url,
+                          std::string_view text) {
+Index: src/chrome/browser/rac/ai/page_text.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/page_text.h
++++ src/chrome/browser/rac/ai/page_text.h
+@@ -10,7 +10,8 @@
+ 
+ namespace optimization_guide::proto {
+ class AnnotatedPageContent;
+-}
++class ContentNode;
++}  // namespace optimization_guide::proto
+ 
+ namespace rac::ai {
+ inline constexpr size_t kDefaultPageTokens = 8192;
+@@ -29,6 +30,10 @@ std::string HashPageText(std::string_vie
+                          std::string_view url,
+                          std::string_view text);
+ 
++// Filters only signals APC actually supplies. Callers must also skip children
++// of hidden ancestors. Default APC omits most geometry and interaction data.
++bool IsPageNodeHidden(const optimization_guide::proto::ContentNode& node);
++
+ // Selection, then visible blocks, then remaining blocks in document order.
+ // Missing geometry is unknown, never evidence that a node is hidden.
+ PageText SerializePageContent(
+Index: src/chrome/browser/rac/ai/page_text_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/page_text_unittest.cc
++++ src/chrome/browser/rac/ai/page_text_unittest.cc
+@@ -205,4 +205,134 @@ TEST(RacAiPageTextTest, Utf8IsRepairedAn
+   Text(page.mutable_root_node(), std::string("bad\xFF"));
+   EXPECT_TRUE(base::IsStringUTF8(SerializePageContent(page).text));
+ }
++TEST(RacAiPageTextTest, HiddenRolesAndAriaHiddenSuppressSubtrees) {
++  proto::AnnotatedPageContent page;
++  auto* root = page.mutable_root_node();
++  auto* hidden = Node(root, proto::CONTENT_ATTRIBUTE_CONTAINER);
++  hidden->mutable_content_attributes()->add_annotated_roles(
++      proto::ANNOTATED_ROLE_CONTENT_HIDDEN);
++  Paragraph(hidden, "Hidden until found");
++  auto* aria = Node(root, proto::CONTENT_ATTRIBUTE_CONTAINER);
++  aria->mutable_content_attributes()
++      ->mutable_interaction_info()
++      ->add_interaction_disabled_reasons(
++          proto::INTERACTION_DISABLED_REASON_ARIA_HIDDEN);
++  Paragraph(aria, "ARIA hidden");
++  auto* disabled = Paragraph(root, "Disabled but visible");
++  disabled->mutable_content_attributes()
++      ->mutable_interaction_info()
++      ->add_interaction_disabled_reasons(
++          proto::INTERACTION_DISABLED_REASON_ARIA_DISABLED);
++  EXPECT_EQ(SerializePageContent(page).text, "Disabled but visible");
++}
++
++TEST(RacAiPageTextTest, EmptyGeometrySuppressesEvenVisibleChildren) {
++  for (const bool outer : {true, false}) {
++    proto::AnnotatedPageContent page;
++    auto* container =
++        Node(page.mutable_root_node(), proto::CONTENT_ATTRIBUTE_CONTAINER);
++    auto* geometry =
++        container->mutable_content_attributes()->mutable_geometry();
++    auto* box = outer ? geometry->mutable_outer_bounding_box()
++                      : geometry->mutable_visible_bounding_box();
++    box->set_width(0);
++    box->set_height(20);
++    Visible(Paragraph(container, "Hidden child"));
++    EXPECT_TRUE(SerializePageContent(page).text.empty());
++    box->set_width(20);
++    box->set_height(0);
++    EXPECT_TRUE(IsPageNodeHidden(*container));
++  }
++}
++
++TEST(RacAiPageTextTest, OffscreenAndFullyClippedContentIsDropped) {
++  proto::AnnotatedPageContent page;
++  auto* root = page.mutable_root_node();
++  for (const int position : {-200, 20000}) {
++    auto* offscreen = Paragraph(root, "Offscreen");
++    auto* geometry =
++        offscreen->mutable_content_attributes()->mutable_geometry();
++    auto* outer = geometry->mutable_outer_bounding_box();
++    outer->set_y(position);
++    outer->set_width(100);
++    outer->set_height(20);
++    geometry->mutable_visible_bounding_box();
++    EXPECT_TRUE(IsPageNodeHidden(*offscreen));
++  }
++  auto* partially = Paragraph(root, "Partially visible");
++  auto* geometry = partially->mutable_content_attributes()->mutable_geometry();
++  auto* outer = geometry->mutable_outer_bounding_box();
++  outer->set_x(-10);
++  outer->set_y(-10);
++  outer->set_width(100);
++  outer->set_height(20);
++  Visible(partially);
++  EXPECT_EQ(SerializePageContent(page).text, "Partially visible");
++  outer->set_x(-100);
++  geometry->clear_visible_bounding_box();
++  EXPECT_TRUE(IsPageNodeHidden(*partially));
++}
++
++TEST(RacAiPageTextTest, TinyTextNeedsGeometrySoLegibleFootnotesRemain) {
++  proto::AnnotatedPageContent page;
++  auto* text = Text(page.mutable_root_node(), "Footnote");
++  text->mutable_content_attributes()
++      ->mutable_text_data()
++      ->mutable_text_style()
++      ->set_text_size(proto::TEXT_SIZE_XS);
++  EXPECT_FALSE(IsPageNodeHidden(*text));
++  auto* box = text->mutable_content_attributes()
++                  ->mutable_geometry()
++                  ->mutable_outer_bounding_box();
++  box->set_width(100);
++  box->set_height(12);
++  EXPECT_FALSE(IsPageNodeHidden(*text));
++  box->set_height(4);
++  EXPECT_TRUE(IsPageNodeHidden(*text));
++  EXPECT_TRUE(SerializePageContent(page).text.empty());
++}
++
++TEST(RacAiPageTextTest, TransparentTextColorIsDroppedButMissingColorIsNot) {
++  proto::AnnotatedPageContent page;
++  auto* transparent = Text(page.mutable_root_node(), "Transparent");
++  auto* style = transparent->mutable_content_attributes()
++                    ->mutable_text_data()
++                    ->mutable_text_style();
++  EXPECT_FALSE(IsPageNodeHidden(*transparent));
++  style->set_color(0x00ffffff);
++  EXPECT_TRUE(IsPageNodeHidden(*transparent));
++  style->set_color(0xff000000);
++  EXPECT_FALSE(IsPageNodeHidden(*transparent));
++}
++
++TEST(RacAiPageTextTest, InlineHiddenTextAndHiddenFrameSelectionsAreDropped) {
++  proto::AnnotatedPageContent page;
++  auto* paragraph =
++      Node(page.mutable_root_node(), proto::CONTENT_ATTRIBUTE_PARAGRAPH);
++  Text(paragraph, "Before");
++  auto* hidden = Text(paragraph, "Injected instruction");
++  hidden->mutable_content_attributes()->add_annotated_roles(
++      proto::ANNOTATED_ROLE_CONTENT_HIDDEN);
++  Text(paragraph, "After");
++  auto* frame = Node(page.mutable_root_node(), proto::CONTENT_ATTRIBUTE_IFRAME);
++  frame->mutable_content_attributes()->add_annotated_roles(
++      proto::ANNOTATED_ROLE_CONTENT_HIDDEN);
++  frame->mutable_content_attributes()
++      ->mutable_iframe_data()
++      ->mutable_frame_data()
++      ->mutable_frame_interaction_info()
++      ->mutable_selection()
++      ->set_selected_text("Hidden selection");
++  EXPECT_EQ(SerializePageContent(page).text, "Before After");
++}
++
++TEST(RacAiPageTextTest, MissingGeometryDoesNotDiscardDefaultModeContent) {
++  proto::AnnotatedPageContent page;
++  Paragraph(page.mutable_root_node(), "Unknown geometry");
++  auto* node = Paragraph(page.mutable_root_node(), "Empty geometry message");
++  node->mutable_content_attributes()->mutable_geometry();
++  EXPECT_EQ(SerializePageContent(page).text,
++            "Unknown geometry\n\nEmpty geometry message");
++}
++
+ }  // namespace rac::ai
