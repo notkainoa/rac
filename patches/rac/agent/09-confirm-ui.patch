@@ -1,0 +1,2099 @@
+Index: src/chrome/browser/rac/agent/agent_ui_delegate.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/agent_ui_delegate.cc
+@@ -0,0 +1,67 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/agent/agent_ui_delegate.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/memory/raw_ptr.h"
++#include "base/supports_user_data.h"
++#include "content/public/browser/browser_context.h"
++
++namespace rac::agent {
++namespace {
++
++const char kUserDataKey[] = "rac.agent.ui_delegate";
++
++class Hub : public base::SupportsUserData::Data {
++ public:
++  static Hub* Get(content::BrowserContext* context, bool create) {
++    auto* hub = static_cast<Hub*>(context->GetUserData(kUserDataKey));
++    if (!hub && create) {
++      auto owned = std::make_unique<Hub>();
++      hub = owned.get();
++      context->SetUserData(kUserDataKey, std::move(owned));
++    }
++    return hub;
++  }
++
++  raw_ptr<AgentUiDelegate> delegate;
++  base::RepeatingCallbackList<void(const base::DictValue&)> callbacks;
++};
++
++}  // namespace
++
++bool IsAgentDebugEnabled() {
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(kAgentDebugSwitch);
++}
++
++void SetAgentUiDelegate(content::BrowserContext* context,
++                        AgentUiDelegate* delegate) {
++  if (Hub* hub = Hub::Get(context, /*create=*/delegate != nullptr)) {
++    hub->delegate = delegate;
++  }
++}
++
++AgentUiDelegate* GetAgentUiDelegate(content::BrowserContext* context) {
++  Hub* hub = Hub::Get(context, /*create=*/false);
++  return hub ? hub->delegate.get() : nullptr;
++}
++
++void DispatchAgentEvent(content::BrowserContext* context,
++                        base::DictValue event) {
++  if (Hub* hub = Hub::Get(context, /*create=*/false)) {
++    hub->callbacks.Notify(event);
++  }
++}
++
++base::CallbackListSubscription AddAgentEventCallback(
++    content::BrowserContext* context,
++    AgentEventCallback callback) {
++  return Hub::Get(context, /*create=*/true)->callbacks.Add(std::move(callback));
++}
++
++}  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/agent_ui_delegate.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/agent_ui_delegate.h
+@@ -0,0 +1,67 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AGENT_AGENT_UI_DELEGATE_H_
++#define CHROME_BROWSER_RAC_AGENT_AGENT_UI_DELEGATE_H_
++
++#include <string>
++
++#include "base/callback_list.h"
++#include "base/functional/callback.h"
++#include "base/values.h"
++
++namespace content {
++class BrowserContext;
++}  // namespace content
++
++namespace rac::agent {
++
++// Starts the agent's debug hooks: the sidebar and the tab indicator accept
++// made-up events, so their look can be checked without a model.
++inline constexpr char kAgentDebugSwitch[] = "rac-agent-debug";
++
++bool IsAgentDebugEnabled();
++
++// What the sidebar's plan card, confirm cards and Stop and Resume buttons do.
++// The agent controller implements it. The sidebar never acts on its own.
++class AgentUiDelegate {
++ public:
++  virtual ~AgentUiDelegate() = default;
++
++  // The user answered the card `id`. `decision` is "allow" (the plan card),
++  // "confirm" or "skip" (a confirm card), or "stop" (either card).
++  virtual void Respond(const std::string& id, const std::string& decision) = 0;
++
++  // Ends the task. Safe to call when none is running.
++  virtual void Stop() = 0;
++
++  // Lets a paused task go on.
++  virtual void Resume() = 0;
++};
++
++// The delegate for `context`, or null. The caller keeps ownership and clears
++// it (passing null) before it goes away.
++void SetAgentUiDelegate(content::BrowserContext* context,
++                        AgentUiDelegate* delegate);
++AgentUiDelegate* GetAgentUiDelegate(content::BrowserContext* context);
++
++// Shows `event` in every assistant page of `context` that has a reply
++// running. The dictionary is what the page's single parser reads: a `type`
++// of step_started, step_finished, plan_request, confirm_request, paused,
++// resumed, run_state or summary, and that type's fields. Does nothing when
++// no page is listening.
++void DispatchAgentEvent(content::BrowserContext* context,
++                        base::DictValue event);
++
++using AgentEventCallback =
++    base::RepeatingCallback<void(const base::DictValue&)>;
++
++// For the assistant page: runs `callback` for each DispatchAgentEvent().
++base::CallbackListSubscription AddAgentEventCallback(
++    content::BrowserContext* context,
++    AgentEventCallback callback);
++
++}  // namespace rac::agent
++
++#endif  // CHROME_BROWSER_RAC_AGENT_AGENT_UI_DELEGATE_H_
+Index: src/chrome/browser/resources/rac_ai/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/BUILD.gn
++++ src/chrome/browser/resources/rac_ai/BUILD.gn
+@@ -15,8 +15,11 @@ build_webui("build") {
+   ]
+ 
+   ts_files = [
++    "agent_cards.ts",
++    "agent_events.ts",
+     "app.ts",
+     "browser_proxy.ts",
++    "fold.ts",
+     "intent.ts",
+     "markdown.ts",
+   ]
+Index: src/chrome/browser/resources/rac_ai/agent_cards.ts
+===================================================================
+--- /dev/null
++++ src/chrome/browser/resources/rac_ai/agent_cards.ts
+@@ -0,0 +1,423 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// The plan card, the confirm cards, the step log and the end-of-task line
++// for an agent that works in the user's tabs.
++
++import {loadTimeData} from 'chrome://resources/js/load_time_data.js';
++
++import {isActive, pastLabel, presentLabel, stepCount} from './agent_events.js';
++import type {AgentTask, ConfirmCard, Decision, LogRow, PlanCard, TaskStep} from './agent_events.js';
++import {makeChevron, makeFold} from './fold.js';
++import {makeIcon} from './markdown.js';
++
++export interface CardContext {
++  respond: (id: string, decision: Decision) => void;
++  resume: () => void;
++  stop: () => void;
++  openSettings: () => void;
++  // Draws the thread again after the page changed a card.
++  redraw: () => void;
++  // Whether a plan card may take focus when it appears.
++  mayTakeFocus: () => boolean;
++  announce: (text: string, assertive: boolean) => void;
++}
++
++// Steps past this many fold into one row.
++const MAX_OPEN_ROWS = 3;
++const MAX_SITE_CHIPS = 6;
++const MAX_TAB_TITLE = 32;
++const INFO_ICON = 'M10 3.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zM10 9v4.5' +
++    'M10 6.5v.01';
++
++function str(key: string, ...args: string[]): string {
++  return args.length > 0 ? loadTimeData.getStringF(key, ...args) :
++                           loadTimeData.getString(key);
++}
++
++function make<K extends keyof HTMLElementTagNameMap>(
++    tag: K, className = '', text = ''): HTMLElementTagNameMap[K] {
++  const element = document.createElement(tag);
++  if (className) {
++    element.className = className;
++  }
++  if (text) {
++    element.textContent = text;
++  }
++  return element;
++}
++
++function makeButton(
++    label: string, onClick: () => void, primary = false): HTMLButtonElement {
++  const button =
++      make('button', primary ? 'pill-action primary' : 'pill-action');
++  button.type = 'button';
++  button.textContent = label;
++  button.addEventListener('click', onClick);
++  return button;
++}
++
++// New cards slide in once. They keep their element afterwards, so drawing the
++// thread again doesn't replay it.
++function enter(card: HTMLElement) {
++  card.classList.add('entering');
++  card.addEventListener(
++      'animationend', () => card.classList.remove('entering'), {once: true});
++  setTimeout(() => card.classList.remove('entering'), 400);
++}
++
++function makeFavicon(host: string): HTMLImageElement {
++  const image = make('img');
++  image.alt = '';
++  image.src = `chrome://favicon2/?size=16&pageUrl=${
++      encodeURIComponent(`https://${host}`)}`;
++  image.addEventListener('error', () => image.remove());
++  return image;
++}
++
++function makeSiteChip(host: string): HTMLElement {
++  const chip = make('span', 'site-chip');
++  chip.append(makeFavicon(host), host);
++  return chip;
++}
++
++function allowedText(plan: PlanCard): string {
++  if (plan.status === 'stopped') {
++    return str('stopped');
++  }
++  const [first, ...rest] = plan.hosts;
++  if (!first) {
++    return str('allowedAnywhere');
++  }
++  return rest.length === 0 ? str('allowedOn', first) :
++                             str('allowedOnMore', first, String(rest.length));
++}
++
++function buildPlanCard(
++    task: AgentTask, plan: PlanCard, ctx: CardContext): HTMLElement {
++  const base = `plan-${task.uid}`;
++  const card = make('div', 'agent-card plan-card');
++  card.setAttribute('role', 'group');
++  card.tabIndex = -1;
++  card.dataset['planId'] = plan.id;
++
++  const line = make('button', 'step-row agent-line');
++  line.type = 'button';
++  line.setAttribute('aria-controls', `${base}-body`);
++  const label = make('span', 'step-label');
++  line.append(makeChevron(), label);
++  line.addEventListener('click', () => {
++    plan.open = !plan.open;
++    ctx.redraw();
++  });
++
++  const collapse = make('div', 'agent-collapse');
++  collapse.id = `${base}-body`;
++  const inner = make('div', 'agent-collapse-inner');
++  const title = make('h3', 'agent-title', str('planTitle'));
++  title.id = `${base}-title`;
++  const list = make('ul', 'agent-steps');
++  list.id = `${base}-steps`;
++  for (const step of plan.steps) {
++    list.appendChild(make('li', '', step));
++  }
++  card.setAttribute('aria-labelledby', title.id);
++  card.setAttribute('aria-describedby', list.id);
++  inner.append(title, list);
++  if (plan.hosts.length > 0) {
++    inner.appendChild(make('div', 'agent-label', str('planSites')));
++    const chips = make('div', 'site-chips');
++    for (const host of plan.hosts.slice(0, MAX_SITE_CHIPS)) {
++      chips.appendChild(makeSiteChip(host));
++    }
++    if (plan.hosts.length > MAX_SITE_CHIPS) {
++      chips.appendChild(make(
++          'span', 'site-more',
++          str('moreSites', String(plan.hosts.length - MAX_SITE_CHIPS))));
++    }
++    inner.appendChild(chips);
++  }
++  const actions = make('div', 'error-actions agent-actions');
++  const allow =
++      makeButton(str('planAllow'), () => ctx.respond(plan.id, 'allow'), true);
++  allow.title = str('planAllowTip');
++  allow.setAttribute('aria-keyshortcuts', 'Meta+Enter');
++  actions.append(
++      allow, makeButton(str('stop'), () => ctx.respond(plan.id, 'stop')));
++  inner.append(actions, make('div', 'agent-note', str('planNote')));
++  collapse.appendChild(inner);
++  card.append(line, collapse);
++
++  enter(card);
++  ctx.announce(str('announcePlan'), false);
++  if (ctx.mayTakeFocus()) {
++    requestAnimationFrame(() => card.focus({preventScroll: true}));
++  }
++  return card;
++}
++
++function updatePlanCard(card: HTMLElement, plan: PlanCard) {
++  const pending = plan.status === 'pending';
++  const open = pending || plan.open;
++  card.dataset['state'] = open ? 'open' : 'collapsed';
++  card.dataset['status'] = plan.status;
++  const line = card.querySelector<HTMLButtonElement>('.agent-line')!;
++  line.hidden = pending;
++  line.setAttribute('aria-expanded', String(open));
++  line.querySelector('.step-label')!.textContent = allowedText(plan);
++  card.querySelector<HTMLElement>('.agent-collapse')!.inert = !open;
++  card.querySelector<HTMLElement>('.agent-actions')!.hidden = !pending;
++  card.querySelector<HTMLElement>('.agent-note')!.hidden = !pending;
++}
++
++function whyText(note: string): string {
++  const trimmed = note.trim().replace(/[.\s]+$/, '');
++  return trimmed ? str('pausedBecause', trimmed) : str('pausedFallback');
++}
++
++function buildConfirmCard(
++    task: AgentTask, confirm: ConfirmCard, ctx: CardContext): HTMLElement {
++  const base = `confirm-${task.uid}-${confirm.id}`;
++  const card = make('div', 'agent-card confirm-card attn');
++  card.setAttribute('role', 'group');
++  card.tabIndex = -1;
++  card.dataset['confirmId'] = confirm.id;
++  const title = make('h3', 'agent-title', confirm.title);
++  title.id = `${base}-title`;
++  card.setAttribute('aria-labelledby', title.id);
++  card.appendChild(title);
++  if (confirm.critic !== null) {
++    const why = make('div', 'agent-why');
++    why.append(makeIcon(INFO_ICON), make('span', '', whyText(confirm.critic)));
++    card.appendChild(why);
++  }
++  if (confirm.detail) {
++    const detail = make('div', 'agent-detail', confirm.detail);
++    detail.id = `${base}-detail`;
++    card.setAttribute('aria-describedby', detail.id);
++    card.appendChild(detail);
++  }
++  if (confirm.noFastModel) {
++    const note = make('div', 'agent-detail agent-every', str('everyStepNote'));
++    const link = make('button', 'link-button', str('setOneUp'));
++    link.type = 'button';
++    link.addEventListener('click', ctx.openSettings);
++    note.append(' ', link);
++    card.appendChild(note);
++  }
++  const actions = make('div', 'error-actions agent-actions');
++  actions.append(
++      makeButton(
++          str('confirm'), () => ctx.respond(confirm.id, 'confirm'), true),
++      makeButton(str('skip'), () => ctx.respond(confirm.id, 'skip')),
++      makeButton(str('stop'), () => ctx.respond(confirm.id, 'stop')));
++  card.appendChild(actions);
++
++  enter(card);
++  ctx.announce(str('announceConfirm', confirm.title), true);
++  // The card takes focus, but Confirm never does: nothing here is a default.
++  requestAnimationFrame(() => card.focus({preventScroll: true}));
++  return card;
++}
++
++function tabTitle(step: TaskStep): string {
++  const title = step.tabTitle;
++  return title.length > MAX_TAB_TITLE ?
++      `${title.slice(0, MAX_TAB_TITLE - 1)}\u2026` :
++      title;
++}
++
++// What the status line says while the task runs. Null when there's nothing
++// special to say.
++export function taskActivity(task: AgentTask): string|null {
++  if (task.state === 'waiting' || task.plan?.status === 'pending' ||
++      task.confirm) {
++    return str('waitingForYou');
++  }
++  if (task.state === 'paused') {
++    return str('pausedActivity');
++  }
++  if (task.state !== 'working') {
++    return null;
++  }
++  const running = [...task.log].reverse().find(
++      row => row.kind === 'step' && row.step.status === 'running');
++  if (!running || running.kind !== 'step') {
++    return null;
++  }
++  const step = running.step;
++  if (step.host && /navigate|open|goto|visit/i.test(step.tool)) {
++    return str('opening', step.host);
++  }
++  if (step.tabTitle) {
++    return str('workingIn', tabTitle(step));
++  }
++  return step.label ? `${presentLabel(step.label)}\u2026` : str('workingDots');
++}
++
++function stepLabel(step: TaskStep): Node[] {
++  const nodes: Node[] = [];
++  if (step.status === 'running') {
++    nodes.push(document.createTextNode(`${presentLabel(step.label)}\u2026`));
++    return nodes;
++  }
++  const label = pastLabel(step.label) || str('toolFallback');
++  const parts = [label];
++  if (step.host && !label.includes(step.host)) {
++    parts.push(step.host);
++  }
++  nodes.push(document.createTextNode(parts.join(' \u00b7 ')));
++  if (step.status === 'failed') {
++    nodes.push(make('span', 'step-failed', str('stepFailed')));
++  }
++  if (step.confirmed) {
++    nodes.push(make('span', 'step-faint', str('confirmedSuffix')));
++  }
++  return nodes;
++}
++
++function makeLogRow(task: AgentTask, row: LogRow): HTMLElement {
++  if (row.kind === 'decision') {
++    const key = `d-${task.uid}-${row.decision.id}`;
++    const text = str(
++        row.decision.verdict === 'confirmed' ? 'confirmedLine' : 'skippedLine',
++        row.decision.label);
++    return makeFold(
++        task, key, [document.createTextNode(text)], () => {}, false);
++  }
++  const step = row.step;
++  const details: Array<[string, string]> = [];
++  if (step.tabTitle) {
++    details.push([str('stepTab'), step.tabTitle]);
++  }
++  if (step.host) {
++    details.push([str('stepSite'), step.host]);
++  }
++  if (step.error) {
++    details.push([str('stepError'), step.error]);
++  }
++  return makeFold(task, `s-${task.uid}-${step.id}`, stepLabel(step), body => {
++    for (const [key, value] of details) {
++      const line = make('div', 'step-detail');
++      line.append(
++          make('span', 'step-key', `${key}: `),
++          make('span', 'step-value', value));
++      body.appendChild(line);
++    }
++  }, details.length > 0);
++}
++
++function makeLog(task: AgentTask): HTMLElement|null {
++  // A confirmed step carries its own "confirmed" mark, so its card's line
++  // would only repeat it.
++  const confirmedSteps = new Set(task.log.flatMap(
++      row => row.kind === 'step' && row.step.confirmed ? [row.step.id] : []));
++  const rows = task.log.filter(
++      row =>
++          !(row.kind === 'decision' && row.decision.verdict === 'confirmed' &&
++            confirmedSteps.has(row.decision.id)));
++  if (rows.length === 0) {
++    return null;
++  }
++  const list = make('div', 'steps');
++  if (rows.length <= MAX_OPEN_ROWS) {
++    for (const row of rows) {
++      list.appendChild(makeLogRow(task, row));
++    }
++    return list;
++  }
++  const count = Math.max(stepCount(task), 1);
++  list.appendChild(makeFold(
++      task, `log-${task.uid}`,
++      [document.createTextNode(
++          count === 1 ? str('oneStep') : str('nSteps', String(count)))],
++      body => {
++        for (const row of rows) {
++          body.appendChild(makeLogRow(task, row));
++        }
++      }));
++  return list;
++}
++
++function makePausedActions(ctx: CardContext): HTMLElement {
++  const actions = make('div', 'error-actions agent-paused');
++  actions.append(
++      makeButton(str('resume'), ctx.resume, true),
++      makeButton(str('stop'), ctx.stop));
++  return actions;
++}
++
++// The blocks an agent task adds to its reply, in order: the plan, the log of
++// steps, then whatever is waiting for the user.
++export function renderTaskBlocks(
++    task: AgentTask, ctx: CardContext): HTMLElement[] {
++  const blocks: HTMLElement[] = [];
++  const live = new Set<string>();
++  if (task.plan) {
++    const key = `plan:${task.plan.id}`;
++    live.add(key);
++    let card = task.elements.get(key);
++    if (!card) {
++      card = buildPlanCard(task, task.plan, ctx);
++      task.elements.set(key, card);
++    }
++    updatePlanCard(card, task.plan);
++    blocks.push(card);
++  }
++  const log = makeLog(task);
++  if (log) {
++    blocks.push(log);
++  }
++  if (task.confirm) {
++    const key = `confirm:${task.confirm.id}`;
++    live.add(key);
++    let card = task.elements.get(key);
++    if (!card) {
++      card = buildConfirmCard(task, task.confirm, ctx);
++      task.elements.set(key, card);
++    }
++    blocks.push(card);
++  }
++  if (task.state === 'paused') {
++    blocks.push(makePausedActions(ctx));
++  }
++  for (const key of [...task.elements.keys()]) {
++    if (!live.has(key)) {
++      task.elements.delete(key);
++    }
++  }
++  return blocks;
++}
++
++function formatDuration(ms: number): string {
++  const seconds = Math.max(1, Math.round(ms / 1000));
++  return seconds < 60 ?
++      str('durationSeconds', String(seconds)) :
++      str('durationMinutes', String(Math.round(seconds / 60)));
++}
++
++// "Done in 1 min · 12 steps · 2 confirmed", or "Stopped after 5 steps".
++// Empty while the task runs.
++export function taskFooter(task: AgentTask): string {
++  if (isActive(task)) {
++    return '';
++  }
++  const steps = task.summary?.steps || stepCount(task);
++  const confirmed = task.summary?.confirmed || task.confirmedCount;
++  if (task.state !== 'done') {
++    return steps === 0 ? str('stopped') :
++        steps === 1    ? str('stoppedAfterOne') :
++                         str('stoppedAfter', String(steps));
++  }
++  const parts = [str(
++      'doneIn',
++      formatDuration(task.summary?.durationMs || task.endMs - task.startMs))];
++  if (steps > 0) {
++    parts.push(steps === 1 ? str('oneStep') : str('nSteps', String(steps)));
++  }
++  if (confirmed > 0) {
++    parts.push(str('nConfirmed', String(confirmed)));
++  }
++  return parts.join(' \u00b7 ');
++}
+Index: src/chrome/browser/resources/rac_ai/agent_events.ts
+===================================================================
+--- /dev/null
++++ src/chrome/browser/resources/rac_ai/agent_events.ts
+@@ -0,0 +1,499 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// What the browser's agent says to the page, and what the page keeps of it.
++// Every field name the browser sends is read in parseAgentEvent() and
++// nowhere else.
++
++export type TaskState = 'working'|'paused'|'waiting'|'done'|'stopped'|'error';
++
++export type Decision = 'allow'|'stop'|'confirm'|'skip';
++
++export type AgentEvent = {
++  type: 'step_started'|'step_finished',
++  id: string,
++  tool: string,
++  label: string,
++  tabTitle: string,
++  origin: string,
++  ok: boolean,
++  error: string,
++}|{
++  type: 'plan_request',
++  id: string,
++  goal: string,
++  steps: string[],
++  origins: string[],
++}|{
++  type: 'confirm_request',
++  id: string,
++  label: string,
++  risk: string,
++  reason: string,
++  origin: string,
++  detail: string,
++  // Set when the critic held the step back. The note may be empty.
++  critic: string | null,
++  noFastModel: boolean,
++}|{
++  type: 'paused',
++  reason: string,
++}|{
++  type: 'resumed',
++}|{
++  type: 'run_state',
++  state: TaskState,
++}|{
++  type: 'summary',
++  text: string,
++  steps: number,
++  confirmed: number,
++  durationMs: number,
++};
++
++const STATES: TaskState[] =
++    ['working', 'paused', 'waiting', 'done', 'stopped', 'error'];
++
++function text(value: unknown, max = 400): string {
++  return typeof value === 'string' ? value.slice(0, max) : '';
++}
++
++function count(value: unknown): number {
++  return typeof value === 'number' && Number.isFinite(value) ?
++      Math.max(0, Math.round(value)) :
++      0;
++}
++
++function strings(value: unknown, limit: number): string[] {
++  return Array.isArray(value) ?
++      value.map(item => text(item)).filter(Boolean).slice(0, limit) :
++      [];
++}
++
++// Returns null for anything that isn't a well-formed event.
++export function parseAgentEvent(raw: unknown): AgentEvent|null {
++  if (!raw || typeof raw !== 'object') {
++    return null;
++  }
++  const event = raw as Record<string, unknown>;
++  const id = text(event['id'], 120);
++  switch (event['type']) {
++    case 'step_started':
++    case 'step_finished':
++      return id ? {
++        type: event['type'],
++        id,
++        tool: text(event['tool'], 80),
++        label: text(event['label']),
++        tabTitle: text(event['tabTitle']),
++        origin: text(event['origin']),
++        ok: event['ok'] !== false,
++        error: text(event['error']),
++      } :
++                  null;
++    case 'plan_request':
++      return id ? {
++        type: 'plan_request',
++        id,
++        goal: text(event['goal']),
++        steps: strings(event['steps'], 5),
++        origins: strings(event['origins'], 40),
++      } :
++                  null;
++    case 'confirm_request': {
++      const critic = event['critic'];
++      return id ? {
++        type: 'confirm_request',
++        id,
++        label: text(event['label']),
++        risk: text(event['risk'], 40),
++        reason: text(event['reason']),
++        origin: text(event['origin']),
++        detail: text(event['detail']),
++        critic: critic && typeof critic === 'object' ?
++            text((critic as Record<string, unknown>)['note']) :
++            null,
++        noFastModel: event['noFastModel'] === true,
++      } :
++                  null;
++    }
++    case 'paused':
++      return {type: 'paused', reason: text(event['reason'])};
++    case 'resumed':
++      return {type: 'resumed'};
++    case 'run_state': {
++      const state = STATES.find(s => s === event['state']);
++      return state ? {type: 'run_state', state} : null;
++    }
++    case 'summary':
++      return {
++        type: 'summary',
++        text: text(event['text'], 20000),
++        steps: count(event['steps']),
++        confirmed: count(event['confirmed']),
++        durationMs: count(event['durationMs']),
++      };
++    default:
++      return null;
++  }
++}
++
++export interface TaskStep {
++  id: string;
++  label: string;
++  tool: string;
++  tabTitle: string;
++  host: string;
++  status: 'running'|'done'|'failed';
++  error: string;
++  confirmed: boolean;
++}
++
++// What the user decided on a confirm card, kept as a row in the log.
++export interface DecisionRow {
++  id: string;
++  verdict: 'confirmed'|'skipped';
++  label: string;
++}
++
++export type LogRow = {
++  kind: 'step',
++  step: TaskStep
++}|{kind: 'decision', decision: DecisionRow};
++
++export interface PlanCard {
++  id: string;
++  goal: string;
++  steps: string[];
++  hosts: string[];
++  status: 'pending'|'allowed'|'stopped';
++  // The plan shows in full while it waits, and again if the user reopens it.
++  open: boolean;
++}
++
++export interface ConfirmCard {
++  id: string;
++  title: string;
++  risk: string;
++  detail: string;
++  // Why the critic paused the step. Null if it didn't.
++  critic: string|null;
++  noFastModel: boolean;
++}
++
++export interface TaskSummary {
++  text: string;
++  steps: number;
++  confirmed: number;
++  durationMs: number;
++}
++
++// What the page knows about one agent task in a reply.
++export interface AgentTask {
++  // Keeps element ids apart between tasks.
++  uid: number;
++  state: TaskState;
++  plan: PlanCard|null;
++  log: LogRow[];
++  confirm: ConfirmCard|null;
++  summary: TaskSummary|null;
++  confirmedCount: number;
++  startMs: number;
++  endMs: number;
++  // Only one task in a chat gets the "no fast model" note.
++  noFastModelShown: boolean;
++  // Confirmed on the card, so the next step to start carries the mark.
++  confirmNext: boolean;
++  // Rows the user opened, by key.
++  expanded: Set<string>;
++  // The page made this reply for the task, so the task also ends it.
++  standalone: boolean;
++  // The status line says `shown`; it moves to `wanted` once `shown` has been
++  // up long enough to read.
++  wanted: string;
++  shown: string;
++  shownMs: number;
++  activityTimer: number;
++  // Cards keep their elements, so they animate once and keep focus.
++  elements: Map<string, HTMLElement>;
++}
++
++let nextUid = 0;
++
++export function newTask(standalone: boolean): AgentTask {
++  return {
++    uid: nextUid++,
++    state: 'working',
++    plan: null,
++    log: [],
++    confirm: null,
++    summary: null,
++    confirmedCount: 0,
++    startMs: Date.now(),
++    endMs: 0,
++    noFastModelShown: false,
++    confirmNext: false,
++    expanded: new Set(),
++    standalone,
++    wanted: '',
++    shown: '',
++    shownMs: 0,
++    activityTimer: 0,
++    elements: new Map(),
++  };
++}
++
++export function isActive(task: AgentTask|undefined|null): boolean {
++  return !!task &&
++      (task.state === 'working' || task.state === 'paused' ||
++       task.state === 'waiting');
++}
++
++export function hostOfOrigin(origin: string): string {
++  const trimmed = origin.trim();
++  if (!trimmed) {
++    return '';
++  }
++  try {
++    return new URL(trimmed.includes('://') ? trimmed : `https://${trimmed}`)
++        .hostname.replace(/^www\./, '');
++  } catch {
++    return '';
++  }
++}
++
++export function stepCount(task: AgentTask): number {
++  return task.log.filter(row => row.kind === 'step').length;
++}
++
++// The browser words steps as commands ("Click “Sign in”"). The log reads in
++// the past, and the status line in the present.
++const PAST: Record<string, string> = {
++  click: 'Clicked',
++  type: 'Typed',
++  enter: 'Entered',
++  open: 'Opened',
++  scroll: 'Scrolled',
++  wait: 'Waited',
++  select: 'Selected',
++  press: 'Pressed',
++  navigate: 'Opened',
++  go: 'Went',
++  search: 'Searched',
++  fill: 'Filled',
++  submit: 'Submitted',
++  check: 'Checked',
++  choose: 'Chose',
++  hover: 'Hovered',
++  focus: 'Focused',
++  close: 'Closed',
++  switch: 'Switched',
++  upload: 'Uploaded',
++};
++
++const PRESENT: Record<string, string> = {
++  click: 'Clicking',
++  type: 'Typing',
++  enter: 'Entering',
++  open: 'Opening',
++  scroll: 'Scrolling',
++  wait: 'Waiting',
++  select: 'Selecting',
++  press: 'Pressing',
++  navigate: 'Opening',
++  go: 'Going',
++  search: 'Searching',
++  fill: 'Filling',
++  submit: 'Submitting',
++  check: 'Checking',
++  choose: 'Choosing',
++  hover: 'Hovering',
++  focus: 'Focusing',
++  close: 'Closing',
++  switch: 'Switching',
++  upload: 'Uploading',
++};
++
++function recast(label: string, table: Record<string, string>): string {
++  const match = /^(\p{L}+)(.*)$/su.exec(label.trim());
++  const verb = match?.[1] ? table[match[1].toLowerCase()] : undefined;
++  return verb ? verb + (match![2] ?? '') : label.trim();
++}
++
++export function pastLabel(label: string): string {
++  return recast(label, PAST);
++}
++
++export function presentLabel(label: string): string {
++  return recast(label, PRESENT);
++}
++
++// Folds one event into the task. Returns false if the event changes nothing
++// the page shows.
++export function applyEvent(task: AgentTask, event: AgentEvent): boolean {
++  switch (event.type) {
++    case 'step_started':
++    case 'step_finished': {
++      let step = task.log.map(row => row.kind === 'step' ? row.step : null)
++                     .find(s => s?.id === event.id);
++      if (!step) {
++        step = {
++          id: event.id,
++          label: '',
++          tool: '',
++          tabTitle: '',
++          host: '',
++          status: 'running',
++          error: '',
++          confirmed: task.confirmNext,
++        };
++        task.confirmNext = false;
++        task.log.push({kind: 'step', step});
++      }
++      step.label = event.label || step.label;
++      step.tool = event.tool || step.tool;
++      step.tabTitle = event.tabTitle || step.tabTitle;
++      step.host = hostOfOrigin(event.origin) || step.host;
++      if (event.type === 'step_finished') {
++        step.status = event.ok ? 'done' : 'failed';
++        step.error = event.error;
++      }
++      if (task.state === 'waiting' || task.state === 'paused') {
++        task.state = 'working';
++      }
++      return true;
++    }
++    case 'plan_request': {
++      const hosts: string[] = [];
++      for (const origin of event.origins) {
++        const host = hostOfOrigin(origin);
++        if (host && !hosts.includes(host)) {
++          hosts.push(host);
++        }
++      }
++      task.plan = {
++        id: event.id,
++        goal: event.goal,
++        steps: event.steps,
++        hosts,
++        status: 'pending',
++        open: true,
++      };
++      task.state = 'waiting';
++      return true;
++    }
++    case 'confirm_request': {
++      const host = hostOfOrigin(event.origin);
++      let title = event.label || event.reason;
++      if (host && event.risk !== 'cross_origin' &&
++          !title.toLowerCase().includes(host)) {
++        title = `${title} on ${host}`;
++      }
++      // Field values never reach the card, and for a sensitive field the
++      // browser's own detail is left out as well.
++      const detail = event.risk === 'sensitive_field' ?
++          event.reason :
++          event.detail || event.reason;
++      const showNote = event.noFastModel && !task.noFastModelShown;
++      task.noFastModelShown ||= event.noFastModel;
++      task.confirm = {
++        id: event.id,
++        title,
++        risk: event.risk,
++        detail,
++        critic: event.critic,
++        noFastModel: showNote,
++      };
++      task.state = 'waiting';
++      return true;
++    }
++    case 'paused':
++      task.state = 'paused';
++      return true;
++    case 'resumed':
++      task.state = 'working';
++      return true;
++    case 'run_state': {
++      if (event.state === task.state) {
++        return false;
++      }
++      task.state = event.state;
++      if (!isActive(task)) {
++        finish(task);
++      }
++      return true;
++    }
++    case 'summary':
++      task.summary = {
++        text: event.text,
++        steps: event.steps,
++        confirmed: event.confirmed,
++        durationMs: event.durationMs,
++      };
++      if (isActive(task)) {
++        task.state = 'done';
++        finish(task);
++      }
++      return true;
++  }
++}
++
++// The task is over. Nothing is left waiting on the user.
++export function finish(task: AgentTask) {
++  task.endMs ||= Date.now();
++  if (task.plan?.status === 'pending') {
++    task.plan.status = 'stopped';
++  }
++  task.confirm = null;
++  for (const row of task.log) {
++    if (row.kind === 'step' && row.step.status === 'running') {
++      row.step.status = task.state === 'error' ? 'failed' : 'done';
++    }
++  }
++}
++
++// The user answered the plan card or the confirm card. Updates the task to
++// match what the browser is about to do.
++export function applyDecision(task: AgentTask, id: string, decision: Decision) {
++  const plan = task.plan;
++  if (plan && plan.id === id && plan.status === 'pending') {
++    plan.status = decision === 'allow' ? 'allowed' : 'stopped';
++    plan.open = false;
++    task.state = decision === 'allow' ? 'working' : 'stopped';
++    if (decision !== 'allow') {
++      finish(task);
++    }
++    return;
++  }
++  const confirm = task.confirm;
++  if (!confirm || confirm.id !== id) {
++    return;
++  }
++  task.confirm = null;
++  if (decision === 'stop') {
++    task.state = 'stopped';
++    finish(task);
++    return;
++  }
++  const confirmed = decision === 'confirm';
++  task.state = 'working';
++  if (confirmed) {
++    task.confirmedCount++;
++    const step = task.log.map(row => row.kind === 'step' ? row.step : null)
++                     .find(s => s?.id === id);
++    if (step) {
++      step.confirmed = true;
++    } else {
++      task.confirmNext = true;
++    }
++  }
++  task.log.push({
++    kind: 'decision',
++    decision: {
++      id,
++      verdict: confirmed ? 'confirmed' : 'skipped',
++      label: confirm.title,
++    },
++  });
++}
+Index: src/chrome/browser/resources/rac_ai/app.css
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/app.css
++++ src/chrome/browser/resources/rac_ai/app.css
+@@ -1383,3 +1383,204 @@ body[data-mode='panel'] .composer-wrap {
+     transition: none;
+   }
+ }
++
++/* Agent cards: the plan the agent asks to start, and the steps it asks to
++ * confirm. The only attention color in the thread is the bar on a card
++ * that waits for the user. */
++
++.agent-card {
++  --card-border: light-dark(#e3e3e3, #464646);
++  --card-shadow: light-dark(rgb(0 0 0 / 5%), rgb(0 0 0 / 30%));
++  background: var(--surface-raised);
++  border: 1px solid var(--card-border);
++  border-radius: 12px;
++  box-shadow: 0 4px 16px var(--card-shadow);
++  margin: 4px 0 12px;
++  padding: 14px 16px;
++  position: relative;
++}
++
++.agent-card:focus-visible {
++  outline: 2px solid var(--accent);
++  outline-offset: 2px;
++}
++
++.agent-card.entering {
++  animation: agent-card-in 160ms var(--ease-out) both;
++}
++
++@keyframes agent-card-in {
++  from {
++    opacity: 0;
++    translate: 0 4px;
++  }
++}
++
++.agent-card.attn::before {
++  background: var(--accent);
++  border-radius: 2px;
++  bottom: 14px;
++  content: '';
++  left: 0;
++  position: absolute;
++  top: 14px;
++  width: 3px;
++}
++
++.agent-title {
++  font-size: 15px;
++  font-weight: 600;
++  line-height: 1.4;
++  margin: 0;
++  overflow-wrap: anywhere;
++}
++
++.agent-steps {
++  font-size: 14px;
++  line-height: 1.5;
++  margin: 6px 0 0;
++  padding-inline-start: 1.5rem;
++}
++
++.agent-steps li + li {
++  padding-top: 6px;
++}
++
++.agent-label {
++  color: var(--text-muted);
++  font-size: 13px;
++  margin: 12px 0 6px;
++}
++
++.site-chips {
++  align-items: center;
++  display: flex;
++  flex-wrap: wrap;
++  gap: 6px;
++}
++
++.site-chip {
++  align-items: center;
++  background: var(--token);
++  border-radius: 12px;
++  display: inline-flex;
++  font-size: 13px;
++  gap: 6px;
++  height: 24px;
++  padding: 0 10px 0 6px;
++}
++
++.site-chip img {
++  border-radius: 3px;
++  height: 14px;
++  width: 14px;
++}
++
++.site-more {
++  color: var(--text-muted);
++  font-size: 13px;
++}
++
++.agent-actions {
++  margin-top: 14px;
++}
++
++.agent-actions[hidden],
++.agent-note[hidden],
++.agent-line[hidden] {
++  display: none;
++}
++
++.agent-note {
++  color: var(--text-faint);
++  font-size: 12px;
++  margin-top: 10px;
++}
++
++.agent-detail {
++  color: var(--text-muted);
++  font-size: 13px;
++  line-height: 1.5;
++  margin-top: 2px;
++  overflow-wrap: anywhere;
++}
++
++.agent-why {
++  color: var(--text-muted);
++  display: flex;
++  font-size: 13px;
++  gap: 6px;
++  line-height: 1.5;
++  margin-top: 4px;
++}
++
++.agent-why svg {
++  flex: none;
++  height: 14px;
++  margin-top: 3px;
++  width: 14px;
++}
++
++.link-button {
++  background: none;
++  border: 0;
++  color: var(--text);
++  font: inherit;
++  padding: 0;
++  text-decoration: underline;
++}
++
++/* A plan that was answered shrinks to one line. */
++.agent-collapse {
++  display: grid;
++  grid-template-rows: 1fr;
++  transition: grid-template-rows 160ms var(--ease-out);
++}
++
++.agent-collapse-inner {
++  min-height: 0;
++  overflow: hidden;
++}
++
++.plan-card[data-state='open'] .agent-line {
++  margin-bottom: 8px;
++}
++
++.plan-card[data-state='collapsed'] {
++  background: none;
++  border-color: transparent;
++  box-shadow: none;
++  margin: 0;
++  padding: 0;
++}
++
++.plan-card[data-state='collapsed'] .agent-collapse {
++  grid-template-rows: 0fr;
++}
++
++.agent-paused {
++  margin: 0 0 8px;
++}
++
++.task-footer {
++  color: var(--text-faint);
++  font-size: 12px;
++}
++
++.action + .task-footer {
++  margin-inline-start: 8px;
++}
++
++.step-faint {
++  color: var(--text-faint);
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .agent-card.entering {
++    animation: none;
++  }
++
++  .agent-collapse {
++    transition: none;
++  }
++}
+Index: src/chrome/browser/resources/rac_ai/app.ts
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/app.ts
++++ src/chrome/browser/resources/rac_ai/app.ts
+@@ -7,7 +7,12 @@ import '/strings.m.js';
+ import {loadTimeData} from 'chrome://resources/js/load_time_data.js';
+ import {getRequiredElement} from 'chrome://resources/js/util.js';
+ 
++import {renderTaskBlocks, taskActivity, taskFooter} from './agent_cards.js';
++import type {CardContext} from './agent_cards.js';
++import {applyDecision, applyEvent, finish, isActive, newTask, parseAgentEvent} from './agent_events.js';
++import type {AgentTask, Decision} from './agent_events.js';
+ import {addWebUiListener, sendToBrowser, sendWithPromise} from './browser_proxy.js';
++import {makeFold} from './fold.js';
+ import {classify} from './intent.js';
+ import type {Intent, Mode} from './intent.js';
+ import {makeCopyIcon, makeIcon, renderMarkdown} from './markdown.js';
+@@ -149,6 +154,8 @@ interface Message {
+   error?: string;
+   agent?: AgentRun;
+   stopped?: boolean;
++  // What the browser's agent did in this reply, in the user's tabs.
++  task?: AgentTask;
+   activityEl?: HTMLElement;
+   attached?: string[];
+   // Only for messages sent in this page; saved chats keep titles alone.
+@@ -1054,26 +1061,32 @@ function lastAssistant(): Message|null {
+ // Says `text` in the status line, once the current text has been up long
+ // enough to read. Only the newest wish is kept.
+ function setActivity(message: Message, text: string, immediate = false) {
+-  const run = message.agent;
+-  if (!run) {
++  const holder = activityHolder(message);
++  if (!holder) {
+     return;
+   }
+-  run.wanted = text;
+-  clearTimeout(run.activityTimer);
+-  if (run.wanted === run.shown) {
++  holder.wanted = text;
++  clearTimeout(holder.activityTimer);
++  if (holder.wanted === holder.shown) {
+     return;
+   }
+-  const age = performance.now() - run.shownMs;
+-  if (!immediate && run.shown && age < ACTIVITY_MIN_MS) {
+-    run.activityTimer = setTimeout(
+-        () => setActivity(message, run.wanted), ACTIVITY_MIN_MS - age);
++  const age = performance.now() - holder.shownMs;
++  if (!immediate && holder.shown && age < ACTIVITY_MIN_MS) {
++    holder.activityTimer = setTimeout(
++        () => setActivity(message, holder.wanted), ACTIVITY_MIN_MS - age);
+     return;
+   }
+-  run.shown = run.wanted;
+-  run.shownMs = performance.now();
++  holder.shown = holder.wanted;
++  holder.shownMs = performance.now();
+   queueRender();
+ }
+ 
++// Where a reply keeps its status line: with the agent's run, or with the
++// browser agent's task when the reply has no run.
++function activityHolder(message: Message): AgentRun|AgentTask|undefined {
++  return message.agent ?? message.task;
++}
++
+ function toolActivity(step: Step): string {
+   switch (step.toolKind) {
+     case 'read':
+@@ -1093,11 +1106,16 @@ function toolActivity(step: Step): strin
+ 
+ // What the status line should say now.
+ function refreshActivity(message: Message) {
+-  const run = message.agent;
+-  if (!run) {
++  if (!activityHolder(message)) {
+     return;
+   }
+-  const running = [...run.steps].reverse().find(
++  const task = message.task;
++  const taskText = task && isActive(task) ? taskActivity(task) : null;
++  if (taskText !== null) {
++    setActivity(message, taskText, task!.state !== 'working');
++    return;
++  }
++  const running = [...(message.agent?.steps ?? [])].reverse().find(
+       step => step.kind === 'tool' && step.status === 'running');
+   setActivity(
+       message,
+@@ -1145,15 +1163,18 @@ function closeThought(run: AgentRun) {
+ // The reply is over, one way or another.
+ function endRun(message: Message) {
+   const run = message.agent;
+-  if (!run) {
++  if (run) {
++    stopStartTimers(run);
++    closeThought(run);
++  }
++  const holder = activityHolder(message);
++  if (!holder) {
+     return;
+   }
+-  stopStartTimers(run);
+-  closeThought(run);
+-  clearTimeout(run.activityTimer);
+-  run.wanted = '';
+-  if (run.shown) {
+-    run.shown = '';
++  clearTimeout(holder.activityTimer);
++  holder.wanted = '';
++  if (holder.shown) {
++    holder.shown = '';
+     queueRender();
+   }
+ }
+@@ -1276,6 +1297,127 @@ function onAgentUpdate(event: AgentUpdat
+   queueRender();
+ }
+ 
++// The browser's agent: plan, confirm cards, steps. Events carry no chat id;
++// they belong to the reply that is running.
++
++function announce(text: string, assertive: boolean) {
++  const region = getRequiredElement(assertive ? 'agentAlert' : 'agentPolite');
++  region.textContent = '';
++  requestAnimationFrame(() => {
++    region.textContent = text;
++  });
++}
++
++const cardContext: CardContext = {
++  respond: respondToAgent,
++  resume: resumeAgent,
++  stop,
++  openSettings,
++  redraw: queueRender,
++  mayTakeFocus: () => thread.contains(document.activeElement) ||
++      document.activeElement === document.body || input.value === '',
++  announce,
++};
++
++function pendingCardId(): {kind: 'plan'|'confirm', id: string}|null {
++  const task = lastAssistant()?.task;
++  if (!task || !isActive(task)) {
++    return null;
++  }
++  if (task.confirm) {
++    return {kind: 'confirm', id: task.confirm.id};
++  }
++  return task.plan?.status === 'pending' ? {kind: 'plan', id: task.plan.id} :
++                                           null;
++}
++
++// The reply an agent event belongs to. With no reply running, an event that
++// starts work makes one, so the work has somewhere to show.
++function messageForAgentEvent(starts: boolean): Message|null {
++  const last = lastAssistant();
++  if (last && (streaming || isActive(last.task))) {
++    return last;
++  }
++  if (last?.task && !starts) {
++    return last;
++  }
++  if (!starts) {
++    return null;
++  }
++  const reply: Message = {role: 'assistant', text: ''};
++  messages.push(reply);
++  streaming = true;
++  reply.task = newTask(true);
++  return reply;
++}
++
++function settleTask(message: Message) {
++  const task = message.task;
++  if (!task || isActive(task)) {
++    return;
++  }
++  if (task.standalone && message === lastAssistant()) {
++    streaming = false;
++    endRun(message);
++  }
++}
++
++// The one place that reads the browser's agent events.
++function onAgentEvent(raw: unknown) {
++  const event = parseAgentEvent(raw);
++  if (!event) {
++    return;
++  }
++  const starts = event.type === 'step_started' ||
++      event.type === 'step_finished' || event.type === 'plan_request' ||
++      event.type === 'confirm_request';
++  const message = messageForAgentEvent(starts);
++  if (!message) {
++    return;
++  }
++  let task = message.task;
++  if (!task) {
++    task = message.task = newTask(false);
++  } else if (starts && !isActive(task)) {
++    task.state = 'working';
++    task.endMs = 0;
++    task.summary = null;
++  }
++  heardFromAgent(message);
++  if (!applyEvent(task, event)) {
++    return;
++  }
++  if (event.type === 'summary' && event.text && !message.text) {
++    message.text = event.text;
++  }
++  refreshActivity(message);
++  settleTask(message);
++  queueRender();
++}
++
++function respondToAgent(id: string, decision: Decision) {
++  sendToBrowser('racAiAgentRespond', [id, decision]);
++  const message = lastAssistant();
++  if (!message?.task) {
++    return;
++  }
++  applyDecision(message.task, id, decision);
++  refreshActivity(message);
++  settleTask(message);
++  queueRender();
++  input.focus({preventScroll: true});
++}
++
++function resumeAgent() {
++  sendToBrowser('racAiAgentResume');
++  const message = lastAssistant();
++  if (message?.task?.state === 'paused') {
++    message.task.state = 'working';
++    refreshActivity(message);
++    queueRender();
++  }
++}
++
+ function formatSeconds(ms: number): string {
+   const seconds = Math.max(1, Math.round(ms / 1000));
+   return seconds < 60 ? `${seconds}s` :
+@@ -1309,54 +1451,6 @@ function isBlockedCommand(step: Step): b
+       step.status === 'failed';
+ }
+ 
+-function makeChevron(): SVGSVGElement {
+-  const chevron = makeIcon('M6.5 8.25L10 11.75l3.5-3.5');
+-  chevron.classList.add('chevron');
+-  return chevron;
+-}
+-
+-// A row that opens and closes its body in place, so the chevron can turn
+-// without the thread redrawing.
+-function makeFold(
+-    run: AgentRun, key: string, label: Node[],
+-    fill: (body: HTMLElement) => void, hasBody = true): HTMLElement {
+-  const wrap = document.createElement('div');
+-  wrap.className = 'step';
+-  const open = hasBody && run.expanded.has(key);
+-  const button = document.createElement('button');
+-  button.type = 'button';
+-  button.className = 'step-row';
+-  // A step with nothing to show stays a plain line.
+-  button.disabled = !hasBody;
+-  button.dataset['stepKey'] = key;
+-  button.id = `row-${key}`;
+-  button.setAttribute('aria-expanded', String(open));
+-  button.setAttribute('aria-controls', `body-${key}`);
+-  const text = document.createElement('span');
+-  text.className = 'step-label';
+-  text.append(...label);
+-  button.append(makeChevron(), text);
+-  const body = document.createElement('div');
+-  body.className = 'step-body';
+-  body.id = `body-${key}`;
+-  body.setAttribute('role', 'group');
+-  body.setAttribute('aria-labelledby', button.id);
+-  body.hidden = !open;
+-  fill(body);
+-  button.addEventListener('click', () => {
+-    const now = button.getAttribute('aria-expanded') !== 'true';
+-    button.setAttribute('aria-expanded', String(now));
+-    body.hidden = !now;
+-    if (now) {
+-      run.expanded.add(key);
+-    } else {
+-      run.expanded.delete(key);
+-    }
+-  });
+-  wrap.append(button, body);
+-  return wrap;
+-}
+-
+ function makeStepRow(run: AgentRun, step: Step): HTMLElement {
+   const label: Node[] = [document.createTextNode(stepLabel(run, step))];
+   if (step.status === 'failed' && !isBlockedCommand(step)) {
+@@ -1387,11 +1481,11 @@ function makeStepRow(run: AgentRun, step
+   }, hasBody);
+ }
+ 
+-function makeSteps(run: AgentRun): HTMLElement {
++function makeSteps(run: AgentRun, steps: Step[]): HTMLElement {
+   const list = document.createElement('div');
+   list.className = 'steps';
+-  const shown = run.steps.slice(0, MAX_OPEN_STEPS);
+-  const folded = run.steps.slice(MAX_OPEN_STEPS);
++  const shown = steps.slice(0, MAX_OPEN_STEPS);
++  const folded = steps.slice(MAX_OPEN_STEPS);
+   for (const step of shown) {
+     list.appendChild(makeStepRow(run, step));
+   }
+@@ -1760,25 +1854,26 @@ function renderAssistantMessage(message:
+     message.body = document.createElement('div');
+     message.body.className = 'reply';
+     element.append(orb, message.body);
+-    if (run) {
+-      // Made once, so the screen reader sees its text change.
+-      const activity = document.createElement('div');
+-      activity.className = 'activity';
+-      activity.setAttribute('role', 'status');
+-      activity.setAttribute('aria-live', 'polite');
+-      message.activityEl = activity;
+-      element.appendChild(activity);
+-    }
+   }
++  if (activityHolder(message) && !message.activityEl) {
++    // Made once, so the screen reader sees its text change.
++    const activity = document.createElement('div');
++    activity.className = 'activity';
++    activity.setAttribute('role', 'status');
++    activity.setAttribute('aria-live', 'polite');
++    message.activityEl = activity;
++    element.appendChild(activity);
++  }
++  const task = message.task;
+   const generating = streaming && isLast;
+-  const started = !!message.text || !!message.error ||
++  const started = !!message.text || !!message.error || !!task ||
+       (!!run && (run.steps.length > 0 || run.plan.length > 0));
+   element.dataset['state'] = generating && !started ? 'waiting' :
+       generating                                    ? 'streaming' :
+                                                       'done';
+   if (message.activityEl) {
+     const activity = message.activityEl;
+-    const text = run?.shown ?? '';
++    const text = activityHolder(message)?.shown ?? '';
+     if (activity.textContent !== text) {
+       activity.textContent = text;
+       activity.classList.remove('swap');
+@@ -1789,12 +1884,22 @@ function renderAssistantMessage(message:
+   }
+ 
+   const body = message.body;
+-  const focused = body.contains(document.activeElement) ?
+-      (document.activeElement as HTMLElement).dataset['stepKey'] :
+-      undefined;
++  const active = body.contains(document.activeElement) ?
++      document.activeElement as HTMLElement :
++      null;
++  const focused = active?.dataset['stepKey'];
+   body.replaceChildren();
+-  if (run && run.steps.length > 0) {
+-    body.appendChild(makeSteps(run));
++  // Once the browser reports the agent's steps itself, the agent's own rows
++  // for its browser tools would only repeat them.
++  const agentSteps = (run?.steps ?? [])
++                         .filter(
++                             step => !task || step.kind === 'thought' ||
++                                 isBlockedCommand(step));
++  if (run && agentSteps.length > 0) {
++    body.appendChild(makeSteps(run, agentSteps));
++  }
++  if (task) {
++    body.append(...renderTaskBlocks(task, cardContext));
+   }
+   if (run && run.plan.length > 0) {
+     body.appendChild(makePlan(run));
+@@ -1814,7 +1919,7 @@ function renderAssistantMessage(message:
+     note.textContent = message.notice;
+     body.appendChild(note);
+   }
+-  if (message.stopped) {
++  if (message.stopped && !task) {
+     const note = document.createElement('div');
+     note.className = 'message-note';
+     note.textContent = loadTimeData.getString('stopped');
+@@ -1823,17 +1928,30 @@ function renderAssistantMessage(message:
+   if (message.error) {
+     body.appendChild(makeErrorBlock(message, isLast && !streaming));
+   }
+-  if (message.text && !generating) {
++  const footer = task && !generating ? taskFooter(task) : '';
++  if ((message.text && !generating) || footer) {
+     const actions = document.createElement('div');
+     actions.className = 'feedback-row';
+-    actions.appendChild(
+-        makeCopyButton(loadTimeData.getString('copy'), () => message.text));
++    if (message.text && !generating) {
++      actions.appendChild(
++          makeCopyButton(loadTimeData.getString('copy'), () => message.text));
++    }
++    if (footer) {
++      const note = document.createElement('span');
++      note.className = 'task-footer';
++      note.textContent = footer;
++      actions.appendChild(note);
++    }
+     body.appendChild(actions);
+   }
+   if (focused) {
+     body.querySelector<HTMLElement>(`[data-step-key="${focused}"]`)?.focus({
+       preventScroll: true
+     });
++  } else if (
++      active && active.isConnected && active !== document.activeElement) {
++    // A card that had focus was moved, not replaced.
++    active.focus({preventScroll: true});
+   }
+ }
+ 
+@@ -1957,9 +2075,15 @@ function retry() {
+ }
+ 
+ function stop() {
+-  if (!streaming) {
++  const task = lastAssistant()?.task;
++  if (!streaming && !isActive(task)) {
+     return;
+   }
++  if (task && isActive(task)) {
++    sendToBrowser('racAiAgentStop');
++    task.state = 'stopped';
++    finish(task);
++  }
+   sendToBrowser('racAiStop');
+   streaming = false;
+   // The reply it was in the middle of ends as "Cancelled". Leave that
+@@ -1968,7 +2092,7 @@ function stop() {
+   const last = lastAssistant();
+   if (last) {
+     endRun(last);
+-    if (last.agent) {
++    if (last.agent || last.task) {
+       last.stopped = true;
+     } else if (!last.text && !last.error) {
+       last.element?.remove();
+@@ -1980,6 +2104,9 @@ function stop() {
+ }
+ 
+ function resetChat() {
++  if (isActive(lastAssistant()?.task)) {
++    sendToBrowser('racAiAgentStop');
++  }
+   if (streaming) {
+     sendToBrowser('racAiStop');
+   }
+@@ -2089,10 +2216,15 @@ function onUpdate(event: UpdateEvent) {
+     streaming = false;
+   }
+   if (!streaming) {
++    if (last.task && isActive(last.task)) {
++      last.task.state = event.error ? 'error' : 'done';
++      finish(last.task);
++    }
+     endRun(last);
+     noteAgentOutcome(last);
+   }
+-  if (!streaming && !last.text && !last.error && !last.agent?.steps.length) {
++  if (!streaming && !last.text && !last.error && !last.task &&
++      !last.agent?.steps.length) {
+     last.element?.remove();
+     messages.pop();
+   }
+@@ -2241,12 +2373,35 @@ function init() {
+     if (event.key !== 'Escape' || event.isComposing || event.defaultPrevented) {
+       return;
+     }
++    const pending = pendingCardId();
+     if (openMenu) {
+       closeMenus();
+-    } else if (streaming) {
++    } else if (pending) {
++      respondToAgent(pending.id, 'stop');
++    } else if (streaming || isActive(lastAssistant()?.task)) {
+       stop();
+     }
+   });
++  // Return alone never allows anything; the plan card's own shortcut is
++  // ⌘Return, whichever control has focus.
++  document.addEventListener('keydown', (event: KeyboardEvent) => {
++    const plan = pendingCardId();
++    if (event.key === 'Enter' && event.metaKey && !event.isComposing &&
++        plan?.kind === 'plan') {
++      event.preventDefault();
++      event.stopPropagation();
++      respondToAgent(plan.id, 'allow');
++    }
++  }, true);
++  for (const [id, assertive] of [
++           ['agentPolite', false], ['agentAlert', true]]) {
++    const region = document.createElement('div');
++    region.id = id as string;
++    region.className = 'visually-hidden';
++    region.setAttribute('role', assertive ? 'alert' : 'status');
++    region.setAttribute('aria-live', assertive ? 'assertive' : 'polite');
++    getRequiredElement('app').appendChild(region);
++  }
+   addTabButton.addEventListener(
+       'click', () => toggleMenu(addTabButton, openPicker));
+   modelButton.addEventListener(
+@@ -2272,6 +2427,7 @@ function init() {
+ 
+   addWebUiListener('rac-ai-update', onUpdate);
+   addWebUiListener('rac-ai-agent-update', onAgentUpdate);
++  addWebUiListener('racAiAgentEvent', onAgentEvent);
+   addWebUiListener('rac-ai-menu', onMenuEvent);
+   addWebUiListener('rac-ai-ask', askAbout);
+   addWebUiListener('rac-ai-theme', applyTheme);
+Index: src/chrome/browser/resources/rac_ai/fold.ts
+===================================================================
+--- /dev/null
++++ src/chrome/browser/resources/rac_ai/fold.ts
+@@ -0,0 +1,59 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import {makeIcon} from './markdown.js';
++
++// Anything that remembers which rows the user opened. Rows draw again as
++// events arrive, so the page keeps their state here.
++export interface Expander {
++  expanded: Set<string>;
++}
++
++export function makeChevron(): SVGSVGElement {
++  const chevron = makeIcon('M6.5 8.25L10 11.75l3.5-3.5');
++  chevron.classList.add('chevron');
++  return chevron;
++}
++
++// A row that opens and closes its body in place, so the chevron can turn
++// without the thread redrawing.
++export function makeFold(
++    owner: Expander, key: string, label: Node[],
++    fill: (body: HTMLElement) => void, hasBody = true): HTMLElement {
++  const wrap = document.createElement('div');
++  wrap.className = 'step';
++  const open = hasBody && owner.expanded.has(key);
++  const button = document.createElement('button');
++  button.type = 'button';
++  button.className = 'step-row';
++  // A step with nothing to show stays a plain line.
++  button.disabled = !hasBody;
++  button.dataset['stepKey'] = key;
++  button.id = `row-${key}`;
++  button.setAttribute('aria-expanded', String(open));
++  button.setAttribute('aria-controls', `body-${key}`);
++  const text = document.createElement('span');
++  text.className = 'step-label';
++  text.append(...label);
++  button.append(makeChevron(), text);
++  const body = document.createElement('div');
++  body.className = 'step-body';
++  body.id = `body-${key}`;
++  body.setAttribute('role', 'group');
++  body.setAttribute('aria-labelledby', button.id);
++  body.hidden = !open;
++  fill(body);
++  button.addEventListener('click', () => {
++    const now = button.getAttribute('aria-expanded') !== 'true';
++    button.setAttribute('aria-expanded', String(now));
++    body.hidden = !now;
++    if (now) {
++      owner.expanded.add(key);
++    } else {
++      owner.expanded.delete(key);
++    }
++  });
++  wrap.append(button, body);
++  return wrap;
++}
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn
++++ src/chrome/browser/ui/BUILD.gn
+@@ -2530,6 +2530,8 @@ static_library("ui") {
+       "webui/rac_ai/rac_ai_page_handler.h",
+       "webui/rac_ai/rac_ai_ui.cc",
+       "webui/rac_ai/rac_ai_ui.h",
++      "//chrome/browser/rac/agent/agent_ui_delegate.cc",
++      "//chrome/browser/rac/agent/agent_ui_delegate.h",
+     ]
+     deps += [
+       "//chrome/browser/rac/ai",
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+@@ -9,13 +9,16 @@
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
++#include "base/json/json_reader.h"
+ #include "base/location.h"
++#include "base/logging.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "chrome/browser/autocomplete/autocomplete_classifier_factory.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/agent/agent_ui_delegate.h"
+ #include "chrome/browser/rac/ai/acp/acp_service.h"
+ #include "chrome/browser/rac/ai/acp/agent_recipes.h"
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+@@ -168,6 +171,21 @@ void PageHandler::RegisterMessages() {
+       "racAiStop",
+       base::BindRepeating(&PageHandler::HandleStop, base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
++      "racAiAgentRespond", base::BindRepeating(&PageHandler::HandleAgentRespond,
++                                               base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiAgentStop", base::BindRepeating(&PageHandler::HandleAgentStop,
++                                            base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "racAiAgentResume", base::BindRepeating(&PageHandler::HandleAgentResume,
++                                              base::Unretained(this)));
++  if (agent::IsAgentDebugEnabled()) {
++    web_ui()->RegisterMessageCallback(
++        "racAiAgentDebugEvent",
++        base::BindRepeating(&PageHandler::HandleAgentDebugEvent,
++                            base::Unretained(this)));
++  }
++  web_ui()->RegisterMessageCallback(
+       "racAiOpenUrl",
+       base::BindRepeating(&PageHandler::HandleOpenUrl, base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
+@@ -250,6 +268,7 @@ void PageHandler::OnJavascriptDisallowed
+   spaces_observation_.Reset();
+   active_tab_subscription_ = base::CallbackListSubscription();
+   ask_subscription_ = base::CallbackListSubscription();
++  agent_event_subscription_ = base::CallbackListSubscription();
+   tab_observer_.reset();
+   StopSession();
+ }
+@@ -413,6 +432,11 @@ void PageHandler::HandleInit(const base:
+               !agent_mode && info && info->requires_key && !has_key);
+     state.Set("attachCurrentTab", prefs->GetBoolean(kAttachCurrentTab));
+     state.Set("saveHistory", prefs->GetBoolean(kSaveHistory));
++    if (!profile_->IsOffTheRecord() && !agent_event_subscription_) {
++      agent_event_subscription_ = agent::AddAgentEventCallback(
++          profile_, base::BindRepeating(&PageHandler::OnAgentTaskEvent,
++                                        base::Unretained(this)));
++    }
+     WatchTabs();
+     if (tabs::TabInterface* tab = GetAttachableCurrentTab()) {
+       state.Set("currentTab", DescribeTab(tab, true));
+@@ -706,6 +730,54 @@ void PageHandler::HandleStop(const base:
+   StopSession();
+ }
+ 
++void PageHandler::HandleAgentRespond(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 2u);
++  const std::string& id = args[0].GetString();
++  const std::string& decision = args[1].GetString();
++  if (id.size() > 120 || (decision != "allow" && decision != "stop" &&
++                          decision != "confirm" && decision != "skip")) {
++    return;
++  }
++  VLOG(1) << "rac agent: respond id=" << id << " decision=" << decision;
++  if (agent::AgentUiDelegate* delegate = agent::GetAgentUiDelegate(profile_)) {
++    delegate->Respond(id, decision);
++  }
++}
++
++void PageHandler::HandleAgentStop(const base::ListValue& args) {
++  VLOG(1) << "rac agent: stop";
++  if (agent::AgentUiDelegate* delegate = agent::GetAgentUiDelegate(profile_)) {
++    delegate->Stop();
++  }
++}
++
++void PageHandler::HandleAgentResume(const base::ListValue& args) {
++  VLOG(1) << "rac agent: resume";
++  if (agent::AgentUiDelegate* delegate = agent::GetAgentUiDelegate(profile_)) {
++    delegate->Resume();
++  }
++}
++
++void PageHandler::HandleAgentDebugEvent(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 1u);
++  if (!agent::IsAgentDebugEnabled() || !IsJavascriptAllowed()) {
++    return;
++  }
++  std::optional<base::DictValue> event =
++      base::JSONReader::ReadDict(args[0].GetString(), base::JSON_PARSE_RFC);
++  if (event) {
++    FireWebUIListener("racAiAgentEvent", *event);
++  }
++}
++
++void PageHandler::OnAgentTaskEvent(const base::DictValue& event) {
++  // Only a page with a reply running shows the agent's work.
++  if (!IsJavascriptAllowed() || active_send_id_ == 0) {
++    return;
++  }
++  FireWebUIListener("racAiAgentEvent", event);
++}
++
+ void PageHandler::OnUpdate(int send_id, StreamUpdate update) {
+   if (!IsJavascriptAllowed() ||
+       (send_id != active_send_id_ && active_send_id_ != 0)) {
+@@ -735,6 +807,7 @@ void PageHandler::OnEnabledChanged() {
+     spaces_observation_.Reset();
+     active_tab_subscription_ = {};
+     ask_subscription_ = {};
++    agent_event_subscription_ = {};
+     tab_observer_.reset();
+     FireWebUIListener("rac-ai-disabled");
+     content::WebContents* contents = web_ui()->GetWebContents();
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+@@ -71,6 +71,11 @@ class PageHandler : public content::WebU
+   void HandleGetTabs(const base::ListValue& args);
+   void HandleSend(const base::ListValue& args);
+   void HandleStop(const base::ListValue& args);
++  void HandleAgentRespond(const base::ListValue& args);
++  void HandleAgentStop(const base::ListValue& args);
++  void HandleAgentResume(const base::ListValue& args);
++  void HandleAgentDebugEvent(const base::ListValue& args);
++  void OnAgentTaskEvent(const base::DictValue& event);
+   void HandleOpenUrl(const base::ListValue& args);
+   void HandleOpenSettings(const base::ListValue& args);
+   void HandleClosePanel(const base::ListValue& args);
+@@ -151,6 +156,7 @@ class PageHandler : public content::WebU
+   std::string title_text_;
+   base::CallbackListSubscription active_tab_subscription_;
+   base::CallbackListSubscription ask_subscription_;
++  base::CallbackListSubscription agent_event_subscription_;
+   std::unique_ptr<TabObserver> tab_observer_;
+   base::ScopedObservation<SpacesWindowManager, SpacesWindowManager::Observer>
+       spaces_observation_{this};
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+@@ -132,6 +132,45 @@ constexpr Str kStrings[] = {
+     {"errNodeTitle", "$1 needs Node.js."},
+     {"errNodeDetail", "Install Node.js, then try again."},
+     {"errLimitTitle", "$1 hit a usage limit."},
++    {"planTitle", "rac will:"},
++    {"planSites", "On these sites"},
++    {"planAllow", "Allow"},
++    {"planAllowTip", "Allow (\u2318Return)"},
++    {"planNote",
++     "rac will still ask before buying, sending, or deleting anything."},
++    {"allowedOn", "Allowed on $1"},
++    {"allowedOnMore", "Allowed on $1 and $2 more"},
++    {"allowedAnywhere", "Allowed"},
++    {"moreSites", "+$1 more"},
++    {"confirm", "Confirm"},
++    {"skip", "Skip"},
++    {"pausedBecause", "rac paused: $1."},
++    {"pausedFallback",
++     "rac paused: this step looks unusual for what you asked."},
++    {"everyStepNote",
++     "Every step needs your OK because no fast model is set up for safety "
++     "checks."},
++    {"setOneUp", "Set one up"},
++    {"confirmedLine", "Confirmed: $1"},
++    {"skippedLine", "Skipped: $1"},
++    {"confirmedSuffix", " \u00b7 confirmed"},
++    {"oneStep", "1 step"},
++    {"nSteps", "$1 steps"},
++    {"doneIn", "Done in $1"},
++    {"nConfirmed", "$1 confirmed"},
++    {"stoppedAfter", "Stopped after $1 steps"},
++    {"stoppedAfterOne", "Stopped after 1 step"},
++    {"durationSeconds", "$1s"},
++    {"durationMinutes", "$1 min"},
++    {"waitingForYou", "Waiting for you"},
++    {"pausedActivity", "Paused while you use this tab"},
++    {"workingIn", "Working in $1\u2026"},
++    {"resume", "Resume"},
++    {"announcePlan", "rac wants to start. Review the plan."},
++    {"announceConfirm", "rac needs your OK: $1"},
++    {"stepTab", "Tab"},
++    {"stepSite", "Site"},
++    {"stepError", "Error"},
+ };
+ 
+ }  // namespace
