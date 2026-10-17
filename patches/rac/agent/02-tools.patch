@@ -1,0 +1,573 @@
+Index: src/chrome/browser/rac/agent/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/agent/BUILD.gn
++++ src/chrome/browser/rac/agent/BUILD.gn
+@@ -10,6 +10,8 @@ source_set("core") {
+     "ref_table.h",
+     "snapshot_serializer.cc",
+     "snapshot_serializer.h",
++    "tool_registry.cc",
++    "tool_registry.h",
+   ]
+   public_deps = [
+     "//base",
+@@ -42,6 +44,7 @@ test("rac_agent_unittests") {
+   sources = [
+     "ref_table_unittest.cc",
+     "snapshot_serializer_unittest.cc",
++    "tool_registry_unittest.cc",
+   ]
+   deps = [
+     ":core",
+Index: src/chrome/browser/rac/agent/tool_registry.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/tool_registry.cc
+@@ -0,0 +1,382 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/agent/tool_registry.h"
++
++#include <algorithm>
++#include <cmath>
++
++#include "base/no_destructor.h"
++#include "base/strings/string_util.h"
++#include "url/gurl.h"
++
++namespace rac::agent {
++namespace {
++
++base::DictValue StringProp(std::string_view description) {
++  return base::DictValue()
++      .Set("type", "string")
++      .Set("description", std::string(description));
++}
++
++base::DictValue BoolProp(std::string_view description) {
++  return base::DictValue()
++      .Set("type", "boolean")
++      .Set("description", std::string(description));
++}
++
++base::DictValue NumberProp(std::string_view description) {
++  return base::DictValue()
++      .Set("type", "number")
++      .Set("description", std::string(description));
++}
++
++base::DictValue ObjectSchema(base::DictValue properties,
++                            std::vector<std::string> required) {
++  base::ListValue req;
++  for (auto& r : required) {
++    req.Append(std::move(r));
++  }
++  return base::DictValue()
++      .Set("type", "object")
++      .Set("properties", std::move(properties))
++      .Set("required", std::move(req))
++      .Set("additionalProperties", false);
++}
++
++bool HasConsequentialButtonText(std::string_view text) {
++  const std::string lower = base::ToLowerASCII(text);
++  static constexpr const char* kWords[] = {
++      "submit", "send", "buy", "purchase", "order", "checkout", "pay",
++      "delete", "remove", "upload", "sign in", "signin", "log in", "login",
++      "confirm", "transfer", "unsubscribe"};
++  for (const char* w : kWords) {
++    if (lower.find(w) != std::string::npos) {
++      return true;
++    }
++  }
++  return false;
++}
++
++std::optional<std::string> ExpectType(const base::DictValue& args,
++                                      std::string_view key,
++                                      std::string_view type) {
++  const base::Value* v = args.Find(key);
++  if (!v) {
++    return std::nullopt;
++  }
++  if (type == "string" && !v->is_string()) {
++    return std::string(key) + " must be a string";
++  }
++  if (type == "boolean" && !v->is_bool()) {
++    return std::string(key) + " must be a boolean";
++  }
++  if (type == "number" && !v->is_int() && !v->is_double()) {
++    return std::string(key) + " must be a number";
++  }
++  return std::nullopt;
++}
++
++}  // namespace
++
++std::vector<ToolDefinition> GetToolDefinitions() {
++  std::vector<ToolDefinition> tools;
++
++  {
++    ToolDefinition t;
++    t.name = "snapshot";
++    t.description =
++        "Capture a Playwright-style accessibility snapshot of the current "
++        "page with stable element refs (e12). Viewport-only by default.";
++    t.kind = ToolKind::kRead;
++    t.parameters = ObjectSchema(
++        base::DictValue()
++            .Set("full", BoolProp("Include offscreen actionable nodes"))
++            .Set("tab_id", StringProp("Tab alias; defaults to the active tab")),
++        {});
++    tools.push_back(std::move(t));
++  }
++  {
++    ToolDefinition t;
++    t.name = "get_page_text";
++    t.description =
++        "Read compact structured page text for chat-style context "
++        "(headings, lists, links). Prefer snapshot for acting.";
++    t.kind = ToolKind::kRead;
++    t.parameters = ObjectSchema(
++        base::DictValue().Set("tab_id", StringProp("Tab alias")), {});
++    tools.push_back(std::move(t));
++  }
++  {
++    ToolDefinition t;
++    t.name = "list_tabs";
++    t.description = "List tabs in the current window/space the agent may use.";
++    t.kind = ToolKind::kRead;
++    t.parameters = ObjectSchema(base::DictValue(), {});
++    tools.push_back(std::move(t));
++  }
++  {
++    ToolDefinition t;
++    t.name = "find_in_page";
++    t.description = "Find text matches in the current page (count + snippets).";
++    t.kind = ToolKind::kRead;
++    t.parameters = ObjectSchema(
++        base::DictValue()
++            .Set("query", StringProp("Text to find"))
++            .Set("tab_id", StringProp("Tab alias")),
++        {"query"});
++    tools.push_back(std::move(t));
++  }
++  {
++    ToolDefinition t;
++    t.name = "click";
++    t.description = "Click an element by snapshot ref.";
++    t.kind = ToolKind::kAction;
++    t.default_risk = RiskClass::kLow;
++    t.parameters = ObjectSchema(
++        base::DictValue()
++            .Set("ref", StringProp("Element ref from snapshot, e.g. e12"))
++            .Set("tab_id", StringProp("Tab alias")),
++        {"ref"});
++    tools.push_back(std::move(t));
++  }
++  {
++    ToolDefinition t;
++    t.name = "type";
++    t.description =
++        "Type text into an element by ref. Password/payment fields are "
++        "consequential.";
++    t.kind = ToolKind::kAction;
++    t.default_risk = RiskClass::kLow;
++    t.parameters = ObjectSchema(
++        base::DictValue()
++            .Set("ref", StringProp("Element ref"))
++            .Set("text", StringProp("Text to type"))
++            .Set("press_enter", BoolProp("Press Enter after typing"))
++            .Set("tab_id", StringProp("Tab alias")),
++        {"ref", "text"});
++    tools.push_back(std::move(t));
++  }
++  {
++    ToolDefinition t;
++    t.name = "select_option";
++    t.description = "Select an option in a combobox by option value.";
++    t.kind = ToolKind::kAction;
++    t.default_risk = RiskClass::kLow;
++    t.parameters = ObjectSchema(
++        base::DictValue()
++            .Set("ref", StringProp("Element ref"))
++            .Set("value", StringProp("Option value attribute"))
++            .Set("tab_id", StringProp("Tab alias")),
++        {"ref", "value"});
++    tools.push_back(std::move(t));
++  }
++  {
++    ToolDefinition t;
++    t.name = "press_key";
++    t.description = "Press a key (e.g. Enter, Escape, Tab) in the page.";
++    t.kind = ToolKind::kAction;
++    t.default_risk = RiskClass::kLow;
++    t.parameters = ObjectSchema(
++        base::DictValue()
++            .Set("key", StringProp("Key name"))
++            .Set("ref", StringProp("Optional focused element ref"))
++            .Set("tab_id", StringProp("Tab alias")),
++        {"key"});
++    tools.push_back(std::move(t));
++  }
++  {
++    ToolDefinition t;
++    t.name = "scroll";
++    t.description = "Scroll the page or a scrollable element by dx/dy DIPs.";
++    t.kind = ToolKind::kAction;
++    t.default_risk = RiskClass::kLow;
++    t.parameters = ObjectSchema(
++        base::DictValue()
++            .Set("dx", NumberProp("Horizontal delta in DIPs"))
++            .Set("dy", NumberProp("Vertical delta in DIPs"))
++            .Set("ref", StringProp("Optional scroll container ref"))
++            .Set("tab_id", StringProp("Tab alias")),
++        {});
++    tools.push_back(std::move(t));
++  }
++  {
++    ToolDefinition t;
++    t.name = "navigate";
++    t.description =
++        "Navigate the current tab to an http(s) URL. Never chrome://, file, "
++        "or downloads.";
++    t.kind = ToolKind::kAction;
++    t.default_risk = RiskClass::kConsequential;
++    t.parameters = ObjectSchema(
++        base::DictValue()
++            .Set("url", StringProp("http(s) URL"))
++            .Set("tab_id", StringProp("Tab alias")),
++        {"url"});
++    tools.push_back(std::move(t));
++  }
++  {
++    ToolDefinition t;
++    t.name = "go_back";
++    t.description = "Go back in the current tab's history.";
++    t.kind = ToolKind::kAction;
++    t.default_risk = RiskClass::kLow;
++    t.parameters = ObjectSchema(
++        base::DictValue().Set("tab_id", StringProp("Tab alias")), {});
++    tools.push_back(std::move(t));
++  }
++  {
++    ToolDefinition t;
++    t.name = "open_tab";
++    t.description = "Open a new tab to an http(s) URL in the current space.";
++    t.kind = ToolKind::kAction;
++    t.default_risk = RiskClass::kLow;
++    t.parameters =
++        ObjectSchema(base::DictValue().Set("url", StringProp("http(s) URL")),
++                     {"url"});
++    tools.push_back(std::move(t));
++  }
++  {
++    ToolDefinition t;
++    t.name = "switch_tab";
++    t.description = "Activate a tab by alias from list_tabs.";
++    t.kind = ToolKind::kAction;
++    t.default_risk = RiskClass::kLow;
++    t.parameters = ObjectSchema(
++        base::DictValue().Set("tab_id", StringProp("Tab alias")), {"tab_id"});
++    tools.push_back(std::move(t));
++  }
++  {
++    ToolDefinition t;
++    t.name = "close_tab";
++    t.description =
++        "Close a tab the agent opened. Closing a user tab is consequential.";
++    t.kind = ToolKind::kAction;
++    t.default_risk = RiskClass::kLow;
++    t.parameters = ObjectSchema(
++        base::DictValue().Set("tab_id", StringProp("Tab alias")), {"tab_id"});
++    tools.push_back(std::move(t));
++  }
++  {
++    ToolDefinition t;
++    t.name = "wait_for_settle";
++    t.description = "Wait until the page is settled after prior actions.";
++    t.kind = ToolKind::kAction;
++    t.default_risk = RiskClass::kLow;
++    t.parameters = ObjectSchema(
++        base::DictValue()
++            .Set("timeout_ms", NumberProp("Max wait in milliseconds"))
++            .Set("tab_id", StringProp("Tab alias")),
++        {});
++    tools.push_back(std::move(t));
++  }
++
++  return tools;
++}
++
++const ToolDefinition* FindToolDefinition(std::string_view name) {
++  static const base::NoDestructor<std::vector<ToolDefinition>> kTools(
++      GetToolDefinitions());
++  for (const auto& t : *kTools) {
++    if (t.name == name) {
++      return &t;
++    }
++  }
++  return nullptr;
++}
++
++bool IsAllowedAgentUrl(std::string_view url) {
++  const GURL gurl(url);
++  if (!gurl.is_valid() || !gurl.SchemeIsHTTPOrHTTPS()) {
++    return false;
++  }
++  if (gurl.SchemeIsFile() || gurl.SchemeIs("javascript") ||
++      gurl.SchemeIs("data") || gurl.SchemeIs("blob") ||
++      gurl.SchemeIs("chrome") || gurl.SchemeIs("chrome-extension") ||
++      gurl.SchemeIs("devtools")) {
++    return false;
++  }
++  return true;
++}
++
++std::optional<std::string> ValidateToolArguments(const ToolDefinition& def,
++                                                 const base::DictValue& args) {
++  const base::ListValue* required = def.parameters.FindList("required");
++  if (required) {
++    for (const auto& item : *required) {
++      if (!item.is_string()) {
++        continue;
++      }
++      if (!args.Find(item.GetString())) {
++        return "Missing required argument: " + item.GetString();
++      }
++    }
++  }
++  const base::DictValue* props = def.parameters.FindDict("properties");
++  if (props) {
++    for (auto [key, schema] : *props) {
++      if (!schema.is_dict()) {
++        continue;
++      }
++      const std::string* type = schema.GetDict().FindString("type");
++      if (!type) {
++        continue;
++      }
++      if (auto err = ExpectType(args, key, *type)) {
++        return err;
++      }
++    }
++  }
++
++  if (const std::string* url = args.FindString("url")) {
++    if (!IsAllowedAgentUrl(*url)) {
++      return "URL must be http(s); chrome://, file, javascript, and data are "
++             "not allowed";
++    }
++  }
++  if (const std::string* text = args.FindString("text");
++      text && text->size() > 16 * 1024) {
++    return "text is too long";
++  }
++  if (def.name == "scroll") {
++    auto too_big = [](std::optional<double> v) {
++      return v && (std::isnan(*v) || std::abs(*v) > 100000);
++    };
++    if (too_big(args.FindDouble("dx")) || too_big(args.FindDouble("dy"))) {
++      return "scroll delta out of range";
++    }
++  }
++  return std::nullopt;
++}
++
++RiskClass ClassifyActionRisk(const ActionRiskInput& input) {
++  const ToolDefinition* def = FindToolDefinition(input.tool_name);
++  if (!def || def->kind == ToolKind::kRead) {
++    return RiskClass::kNone;
++  }
++  if (input.is_password_field || input.is_payment_field ||
++      input.is_file_input || input.cross_origin) {
++    return RiskClass::kConsequential;
++  }
++  if (input.tool_name == "navigate" || input.tool_name == "open_tab") {
++    return RiskClass::kConsequential;
++  }
++  if (HasConsequentialButtonText(input.button_text) ||
++      HasConsequentialButtonText(input.element_name)) {
++    return RiskClass::kConsequential;
++  }
++  if (base::EqualsCaseInsensitiveASCII(input.input_type, "password") ||
++      base::EqualsCaseInsensitiveASCII(input.control_type, "password")) {
++    return RiskClass::kConsequential;
++  }
++  if (input.tool_name == "type" &&
++      (base::EqualsCaseInsensitiveASCII(input.input_type, "password") ||
++       input.is_password_field)) {
++    return RiskClass::kConsequential;
++  }
++  return def->default_risk == RiskClass::kConsequential
++             ? RiskClass::kConsequential
++             : RiskClass::kLow;
++}
++
++}  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/tool_registry.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/tool_registry.h
+@@ -0,0 +1,79 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++// Draft for patch 02 — will be quilt-added after 01 commits.
++
++#ifndef CHROME_BROWSER_RAC_AGENT_TOOL_REGISTRY_H_
++#define CHROME_BROWSER_RAC_AGENT_TOOL_REGISTRY_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/values.h"
++
++namespace rac::agent {
++
++enum class ToolKind { kRead, kAction };
++
++enum class RiskClass {
++  kNone,           // Read tools.
++  kLow,            // Click/type/scroll inside allowed origins.
++  kConsequential,  // Submit/buy/delete/password/cross-origin/etc.
++};
++
++struct ToolDefinition {
++  std::string name;
++  std::string description;
++  ToolKind kind = ToolKind::kRead;
++  RiskClass default_risk = RiskClass::kNone;
++  // JSON Schema object as a base::DictValue (type/properties/required).
++  base::DictValue parameters;
++};
++
++struct ToolCall {
++  std::string id;
++  std::string name;
++  base::DictValue arguments;
++};
++
++struct ToolResult {
++  bool ok = false;
++  std::string error_code;
++  std::string error;
++  base::DictValue data;
++  bool may_have_acted = false;
++};
++
++struct ActionRiskInput {
++  std::string tool_name;
++  std::string element_role;
++  std::string element_name;
++  std::string control_type;
++  std::string input_type;  // password, text, email, …
++  std::string button_text;
++  std::string current_origin;
++  std::string target_origin;  // Navigate / link destination origin.
++  bool is_password_field = false;
++  bool is_payment_field = false;
++  bool is_file_input = false;
++  bool cross_origin = false;
++};
++
++// Catalog shared by the MCP server and the direct tool loop.
++std::vector<ToolDefinition> GetToolDefinitions();
++const ToolDefinition* FindToolDefinition(std::string_view name);
++
++// Validates arguments against the tool's JSON schema (required keys, types,
++// URL scheme allowlist). Returns nullopt on success.
++std::optional<std::string> ValidateToolArguments(const ToolDefinition& def,
++                                                 const base::DictValue& args);
++
++RiskClass ClassifyActionRisk(const ActionRiskInput& input);
++
++// True for http/https only. Rejects chrome://, file, javascript, data, etc.
++bool IsAllowedAgentUrl(std::string_view url);
++
++}  // namespace rac::agent
++
++#endif  // CHROME_BROWSER_RAC_AGENT_TOOL_REGISTRY_H_
+Index: src/chrome/browser/rac/agent/tool_registry_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/tool_registry_unittest.cc
+@@ -0,0 +1,76 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/agent/tool_registry.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::agent {
++
++TEST(ToolRegistryTest, CatalogContainsReadAndActionTools) {
++  auto tools = GetToolDefinitions();
++  EXPECT_GE(tools.size(), 14u);
++  EXPECT_TRUE(FindToolDefinition("snapshot"));
++  EXPECT_TRUE(FindToolDefinition("click"));
++  EXPECT_TRUE(FindToolDefinition("navigate"));
++  EXPECT_TRUE(FindToolDefinition("wait_for_settle"));
++  EXPECT_EQ(FindToolDefinition("snapshot")->kind, ToolKind::kRead);
++  EXPECT_EQ(FindToolDefinition("click")->kind, ToolKind::kAction);
++}
++
++TEST(ToolRegistryTest, ValidatesUrlSchemes) {
++  EXPECT_TRUE(IsAllowedAgentUrl("https://example.com/a"));
++  EXPECT_TRUE(IsAllowedAgentUrl("http://127.0.0.1:8771/login.html"));
++  EXPECT_FALSE(IsAllowedAgentUrl("chrome://settings"));
++  EXPECT_FALSE(IsAllowedAgentUrl("file:///tmp/x"));
++  EXPECT_FALSE(IsAllowedAgentUrl("javascript:alert(1)"));
++  EXPECT_FALSE(IsAllowedAgentUrl("data:text/html,hi"));
++
++  const ToolDefinition* nav = FindToolDefinition("navigate");
++  ASSERT_TRUE(nav);
++  base::DictValue bad;
++  bad.Set("url", "chrome://version");
++  EXPECT_TRUE(ValidateToolArguments(*nav, bad).has_value());
++  base::DictValue good;
++  good.Set("url", "https://example.com");
++  EXPECT_FALSE(ValidateToolArguments(*nav, good).has_value());
++}
++
++TEST(ToolRegistryTest, RequiresRefForClick) {
++  const ToolDefinition* click = FindToolDefinition("click");
++  ASSERT_TRUE(click);
++  EXPECT_TRUE(ValidateToolArguments(*click, base::DictValue()).has_value());
++  base::DictValue args;
++  args.Set("ref", "e12");
++  EXPECT_FALSE(ValidateToolArguments(*click, args).has_value());
++}
++
++TEST(ToolRegistryTest, RiskClassifier) {
++  ActionRiskInput low;
++  low.tool_name = "click";
++  low.element_role = "button";
++  low.element_name = "Cancel";
++  EXPECT_EQ(ClassifyActionRisk(low), RiskClass::kLow);
++
++  ActionRiskInput buy;
++  buy.tool_name = "click";
++  buy.element_role = "button";
++  buy.button_text = "Buy now";
++  EXPECT_EQ(ClassifyActionRisk(buy), RiskClass::kConsequential);
++
++  ActionRiskInput password;
++  password.tool_name = "type";
++  password.is_password_field = true;
++  EXPECT_EQ(ClassifyActionRisk(password), RiskClass::kConsequential);
++
++  ActionRiskInput cross;
++  cross.tool_name = "click";
++  cross.cross_origin = true;
++  EXPECT_EQ(ClassifyActionRisk(cross), RiskClass::kConsequential);
++
++  ActionRiskInput nav;
++  nav.tool_name = "navigate";
++  EXPECT_EQ(ClassifyActionRisk(nav), RiskClass::kConsequential);
++}
++
++}  // namespace rac::agent
