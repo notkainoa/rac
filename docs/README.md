@@ -20,8 +20,8 @@ them, and traps that are hard to spot from the source.
 - [Overview](internals/overview.md): the layers, repo layout, how patches
   are applied, and how to make a rac change
 - [Glossary](internals/glossary.md): the words rac uses for things
-- [AI (work in progress)](internals/ai.md): ideas collected so far; nothing
-  decided
+- [AI](internals/ai.md): how the assistant and the browser agent work, the
+  safety rules, and the traps
 - [Bangs (work in progress)](internals/bangs.md): editable bangs and a
   better address bar experience; nothing designed yet
 

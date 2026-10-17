@@ -43,16 +43,30 @@ Use these words consistently in code, docs, issues, and PRs.
 - **Theme**: the colors of a space, including gradients.
 - **Split view**: two or more tabs shown side by side in one window.
 
-## AI concepts (provisional)
+## AI concepts
 
-AI design isn't decided yet (see [ai.md](ai.md)). These words are placeholders
-until it is:
+See [ai.md](ai.md) for how these fit together.
 
-- **AI sidebar**: the AI panel on the right side of the window.
-- **Agent**: AI that takes actions in the browser, such as clicking, typing,
-  or opening tabs.
+- **Assistant**: rac's AI chat. It lives in the **AI sidebar**, the panel on
+  the right side of the window, and in the new tab page. The code and the
+  settings page call it "Assistant."
 - **Provider**: where the AI comes from: an API key, a local model, or an
-  existing subscription such as Claude Code or Codex.
+  installed agent.
+- **Agent**: either of two things, so say which. In the UI, an **agent** is a
+  coding agent you already have installed (Claude Code, Codex, Cursor, and
+  others) that rac runs as a provider. In the code and in ai.md, "the agent"
+  is **browser control**: the AI clicking, typing, and opening tabs. A
+  direct provider or an installed agent can do browser control.
+- **ACP**: the Agent Client Protocol rac uses to talk to installed agents.
+- **Plan card**: the card that asks the user to allow the agent to start
+  working on the listed sites.
+- **Confirmation card**: the card that asks before one consequential step,
+  such as a sign-in, a purchase, or sending a form.
+- **Safety check** (the **critic** in code): a quick model call that reviews
+  each low-risk step against the user's request. It never sees the page.
+- **Tab indicator**: the ring and pill on the tab the agent is using, with
+  Resume and Stop.
+- **Summary card**: the small card that summarizes a link without opening it.
 
 ## Project and build
 

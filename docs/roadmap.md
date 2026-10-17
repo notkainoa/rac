@@ -6,7 +6,9 @@ Track active work in GitHub issues, not here.
 Status: **phase 3**. rac has its own name, bundle ID, data directory,
 version, and updater, with Helium's icons and services, and phase 2's
 features are built. When phase 4 is done, rac is ready to release. Phase 5
-is optional and comes after the release.
+is optional and comes after the release. The AI basics (phase 3) and the
+agent (phase 5) are already built; the agent came early because it shares
+its foundation with the AI basics.
 
 ## How the phases work
 
@@ -103,7 +105,7 @@ parallel.
 | Feature | Covers | Code it touches |
 | --- | --- | --- |
 | Space themes | A color, gradient, and icon for each space | Themes and colors |
-| AI basics | The AI sidebar that reads the current page, AI in the new tab page, Cmd+F "Ask", and link hover summaries. Foundation: **AI settings** (the onboarding opt-in, the settings toggle, and providers). Ideas so far are in [internals/ai.md](internals/ai.md) | `rac/ai/`, side panel, new tab page |
+| AI basics (built) | The AI sidebar that reads the current page, AI in the new tab page that picks search or ask as you type, Cmd+F "Ask", and link hover summaries. Providers are your own API key, a local model, or an installed agent such as Claude Code, Codex, or Cursor. Foundation: **AI settings** (the toggle and providers). The onboarding opt-in is part of phase 4. Decisions and traps are in [internals/ai.md](internals/ai.md) | `rac/ai/`, side panel, new tab page, find bar, link hover |
 | Media controls in the sidebar | Built on Chromium's media controls | Bottom of the sidebar |
 | Settings cleanup | Fewer settings: remove or hide what rac decides for the user, in rac's settings layout | Settings pages |
 
@@ -136,7 +138,7 @@ Nothing here blocks a release. Build these after it, in any order.
 | Boosts | Custom CSS and JavaScript for each site, with an editor |
 | Arc import | Bring Arc's spaces, pinned tabs, and favorites into rac's |
 | Dia import | Bring a Dia setup into rac. What it can cover needs research first |
-| Agent | Browser control across tabs, with user confirmation, then a safety check on agent actions. To be designed |
+| Agent (built) | Browser control in the user's tabs, from a direct provider or an installed agent over MCP. The user approves a plan, then confirms each consequential step. A fast safety check reviews the rest, and a tab indicator with Stop shows where the agent is working. Design and traps are in [internals/ai.md](internals/ai.md#the-agent) |
 
 ## Later
 
@@ -147,7 +149,8 @@ No order and no promises:
 - Hosting rac's own copy of Helium's services
 - Automations on a schedule or trigger
 - 1Password integration and a wallet
-- Letting outside agents use rac's browser tools through MCP
+- Letting outside agents, ones rac didn't start, use rac's browser tools
+  through MCP (rac's own MCP server serves only the agent it launched)
 - Cloud agents (exploring)
 - Air Traffic Control (routing links to the right space)
 - Little Arc (a mini window for links opened from other apps)

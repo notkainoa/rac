@@ -3,7 +3,9 @@
 rac is a private, fast, and beautiful macOS browser. It's a fork of
 [helium-macos](https://github.com/imputnet/helium-macos), which packages the
 [Helium](https://github.com/imputnet/helium) browser, with Arc-inspired
-features and design on top. Optional AI is planned but not designed yet.
+features and design on top. It has an optional AI assistant and browser
+agent, off by default. Before changing either, read
+[docs/internals/ai.md](docs/internals/ai.md).
 
 All of rac's changes live in its own patches, applied after Helium's. That's
 what lets rac keep up with every Helium and Chromium release.
@@ -154,8 +156,8 @@ done, go through this list and say which items applied:
 - **Motion.** Reduced motion turned on. Animations never block input.
 - **Way back.** If you added a way in, add the way out. Hide needs show;
   pin needs unpin.
-- **AI off.** Once AI exists, the feature must work, and cost nothing, with
-  AI turned off.
+- **AI off.** The feature must work, and cost nothing, with AI turned off.
+  See [AI off costs nothing](docs/internals/ai.md#ai-off-costs-nothing).
 - **Docs.** Check whether the change makes existing docs wrong.
 - **Proof.** When the change is visible, your reply includes screenshots
   of the surfaces you actually opened. See [Verifying](#verifying).

@@ -22,8 +22,9 @@ Helium.
 - **Beautiful:** Arc's personality with Dia's simplicity.
 - **Arc's best ideas:** spaces, favorites, pinned tabs, a sidebar that gets
   out of the way, a command bar, and boosts.
-- **AI, only if you want it:** off by default, quiet when on. Still being
-  designed.
+- **AI, only if you want it:** off by default, quiet when on. Bring your own
+  API key, a local model, or an agent you already use, such as Claude Code or
+  Codex. It asks before it acts.
 
 Read the full [vision](VISION.md).
 
