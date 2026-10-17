@@ -1,0 +1,1188 @@
+Index: src/chrome/browser/rac/agent/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/agent/BUILD.gn
++++ src/chrome/browser/rac/agent/BUILD.gn
+@@ -11,6 +11,8 @@ source_set("core") {
+     "action_guard.cc",
+     "action_guard.h",
+     "action_types.h",
++    "agent_events.cc",
++    "agent_events.h",
+     "critic_protocol.cc",
+     "critic_protocol.h",
+     "ref_table.cc",
+@@ -129,6 +131,7 @@ source_set("agent") {
+ test("rac_agent_unittests") {
+   sources = [
+     "action_guard_unittest.cc",
++    "agent_events_unittest.cc",
+     "agent_mcp_tools_unittest.cc",
+     "critic_protocol_unittest.cc",
+     "ref_table_unittest.cc",
+Index: src/chrome/browser/rac/agent/agent_controller.cc
+===================================================================
+--- src.orig/chrome/browser/rac/agent/agent_controller.cc
++++ src/chrome/browser/rac/agent/agent_controller.cc
+@@ -13,6 +13,7 @@
+ #include "base/unguessable_token.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/rac/agent/action_runner.h"
++#include "chrome/browser/rac/agent/agent_events.h"
+ #include "chrome/browser/rac/agent/critic_protocol.h"
+ #include "chrome/browser/rac/agent/snapshot_serializer.h"
+ #include "chrome/browser/rac/agent/tab_tools.h"
+@@ -75,6 +76,7 @@ AgentController* AgentController::GetOrC
+ }
+ AgentController::AgentController(Profile* profile) : profile_(profile) {
+   VLOG(1) << "rac AgentController created";
++  SetAgentUiDelegate(profile_, this);
+   prefs_.Init(profile->GetPrefs());
+   for (const char* pref : {rac::ai::kEnabled, rac::ai::kBrowserControl}) {
+     prefs_.Add(pref, base::BindRepeating(&AgentController::OnPrefsChanged,
+@@ -83,6 +85,7 @@ AgentController::AgentController(Profile
+ }
+ AgentController::~AgentController() {
+   Cancel();
++  SetAgentUiDelegate(profile_, nullptr);
+ }
+ base::WeakPtr<AgentController> AgentController::GetWeakPtr() {
+   return operation_factory_.GetWeakPtr();
+@@ -113,8 +116,7 @@ void AgentController::BeginTurn(
+     std::string conversation_id,
+     std::string goal,
+     const std::vector<std::string>& user_messages,
+-    const std::vector<content::WebContents*>& attached_tabs,
+-    EventCallback events) {
++    const std::vector<content::WebContents*>& attached_tabs) {
+   Cancel();
+   if (!IsBrowserControlAllowed(profile_->GetPrefs(), profile_) || !browser ||
+       browser->GetProfile() != profile_) {
+@@ -133,7 +135,6 @@ void AgentController::BeginTurn(
+   current_->snapshots.clear();
+   goal_ = std::move(goal);
+   turn_started_ = base::TimeTicks::Now();
+-  events_ = std::move(events);
+   steps_ = confirmed_ = 0;
+   paused_ = false;
+   active_ = true;
+@@ -170,17 +171,41 @@ void AgentController::BeginTurn(
+   State("working");
+ }
+ void AgentController::Emit(base::DictValue event) {
+-  if (events_) {
+-    events_.Run(std::move(event));
+-  }
++  DispatchAgentEvent(profile_, std::move(event));
+ }
+ void AgentController::State(const std::string& state) {
+   state_ = state;
+-  Emit(base::DictValue()
+-           .Set("type", "run_state")
+-           .Set("state", state)
+-           .Set("tabId", TargetAlias())
+-           .Set("goal", goal_));
++  Emit(RunStateEvent(state, TargetAlias()));
++  if (state == "done" || state == "stopped" || state == "error") {
++    HideIndicator();
++  } else if (done_ || indicator_tab_) {
++    UpdateIndicator(state == "waiting"  ? AgentTabStatus::kWaiting
++                    : state == "paused" ? AgentTabStatus::kPaused
++                                        : AgentTabStatus::kWorking);
++  }
++}
++void AgentController::UpdateIndicator(AgentTabStatus status) {
++  content::WebContents* tab = TargetTab();
++  if (!tab) {
++    tab = indicator_tab_.get();
++  }
++  if (!tab) {
++    return;
++  }
++  if (indicator_tab_ && indicator_tab_.get() != tab) {
++    NotifyAgentTab(profile_, indicator_tab_.get(), AgentTabStatus::kHidden,
++                   std::u16string());
++  }
++  indicator_tab_ = tab->GetWeakPtr();
++  NotifyAgentTab(profile_, tab, status,
++                 done_ ? base::UTF8ToUTF16(Label()) : std::u16string());
++}
++void AgentController::HideIndicator() {
++  if (indicator_tab_) {
++    NotifyAgentTab(profile_, indicator_tab_.get(), AgentTabStatus::kHidden,
++                   std::u16string());
++  }
++  indicator_tab_.reset();
+ }
+ std::string AgentController::TargetAlias() const {
+   if (!current_) {
+@@ -226,9 +251,8 @@ std::string AgentController::Label() con
+     return "Read the page";
+   }
+   if (pending_.name == "navigate" || pending_.name == "open_tab") {
+-    return "Open " +
+-           url::Origin::Create(GURL(String(pending_.arguments, "url")))
+-               .Serialize();
++    const std::string host = DisplayHost(String(pending_.arguments, "url"));
++    return host.empty() ? "Open a page" : "Open " + host;
+   }
+   if (pending_.name == "scroll") {
+     return "Scroll the page";
+@@ -288,15 +312,10 @@ void AgentController::HandleToolCall(con
+   done_ = std::move(done);
+   step_id_ = "step-" + base::NumberToString(++next_id_);
+   ++steps_;
+-  Emit(base::DictValue()
+-           .Set("type", "step_started")
+-           .Set("id", step_id_)
+-           .Set("tool", pending_.name)
+-           .Set("label", Label())
+-           .Set("tabId", TargetAlias())
+-           .Set("tabTitle",
+-                TargetTab() ? base::UTF16ToUTF8(TargetTab()->GetTitle()) : "")
+-           .Set("origin", Origin(TargetTab())));
++  Emit(StepEvent(false, step_id_, pending_.name, Label(), TargetAlias(),
++                 TargetTab() ? base::UTF16ToUTF8(TargetTab()->GetTitle()) : "",
++                 Origin(TargetTab()), true, ""));
++  UpdateIndicator(paused_ ? AgentTabStatus::kPaused : AgentTabStatus::kWorking);
+   if (paused_) {
+     deferred_ = base::BindOnce(&AgentController::ProcessTool,
+                                operation_factory_.GetWeakPtr());
+@@ -507,17 +526,12 @@ void AgentController::Authorize() {
+     for (const auto& origin : planned_origins_) {
+       origins.Append(origin);
+     }
+-    Emit(base::DictValue()
+-             .Set("type", "plan_request")
+-             .Set("id", approval_id_)
+-             .Set("goal", goal_)
+-             .Set("steps", base::ListValue().Append(Label()))
+-             .Set("origins", std::move(origins))
+-             .Set("tabId", TargetAlias()));
++    Emit(
++        PlanRequestEvent(approval_id_, goal_, Label(), origins, TargetAlias()));
+     return;
+   }
+   if (decision.decision == GuardDecision::kConfirm) {
+-    RequestConfirmation(decision.reason);
++    RequestConfirmation(decision.reason, false);
+     return;
+   }
+   CheckCritic();
+@@ -536,10 +550,8 @@ void AgentController::CheckCritic() {
+   critic_note_.clear();
+   auto* service = rac::ai::AiServiceFactory::GetForProfile(profile_);
+   if (!service || !service->HasUsableDirectProvider()) {
+-    critic_note_ =
+-        "Every step needs your OK because no fast model is set up for safety "
+-        "checks.";
+-    RequestConfirmation("No direct provider is configured for safety checks.");
++    RequestConfirmation("No direct provider is configured for safety checks.",
++                        false);
+     return;
+   }
+   rac::ai::ChatRequest request;
+@@ -581,7 +593,7 @@ void AgentController::CriticFinished(boo
+     critic_note_ =
+         failed ? "The safety check couldn't finish. Please review this step."
+                : verdict.note;
+-    RequestConfirmation("The safety check asks you to review this step.");
++    RequestConfirmation("The safety check asks you to review this step.", true);
+   } else if (paused_) {
+     deferred_ = base::BindOnce(&AgentController::RunAllowed,
+                                operation_factory_.GetWeakPtr());
+@@ -589,7 +601,8 @@ void AgentController::CriticFinished(boo
+     RunAllowed();
+   }
+ }
+-void AgentController::RequestConfirmation(std::string reason) {
++void AgentController::RequestConfirmation(std::string reason,
++                                          bool held_by_critic) {
+   awaiting_plan_ = false;
+   approval_origin_ = Origin(TargetTab());
+   approval_id_ = "approval-" + base::NumberToString(++next_id_);
+@@ -599,34 +612,22 @@ void AgentController::RequestConfirmatio
+   }
+   State(paused_ ? "paused" : "waiting");
+   auto* direct = rac::ai::AiServiceFactory::GetForProfile(profile_);
+-  const bool no_direct = !direct || !direct->HasUsableDirectProvider();
+-  if (no_direct && critic_note_.empty()) {
+-    critic_note_ =
+-        "Every step needs your OK because no fast model is set up for safety "
+-        "checks.";
++  const auto meta = Metadata();
++  ConfirmEventInput input;
++  input.id = approval_id_;
++  input.label = Label();
++  input.risk = ConfirmationRisk(meta, held_by_critic);
++  input.reason = std::move(reason);
++  input.origin = !meta.risk.target_origin.empty() ? meta.risk.target_origin
++                 : !meta.frame_origin.empty()     ? meta.frame_origin
++                                                  : Origin(TargetTab());
++  input.detail = ConfirmationDetail(meta);
++  input.tab_id = TargetAlias();
++  if (held_by_critic) {
++    input.critic_note = critic_note_;
+   }
+-  auto event =
+-      base::DictValue()
+-          .Set("type", "confirm_request")
+-          .Set("id", approval_id_)
+-          .Set("action", Label())
+-          .Set("risk", RiskClassName(guard_.Evaluate(Metadata()).risk))
+-          .Set("reason", reason)
+-          .Set("origin",
+-               !Metadata().risk.target_origin.empty()
+-                   ? Metadata().risk.target_origin
+-                   : (!Metadata().frame_origin.empty() ? Metadata().frame_origin
+-                                                       : Origin(TargetTab())))
+-          .Set("currentOrigin", Origin(TargetTab()))
+-          .Set("tabTitle",
+-               TargetTab() ? base::UTF16ToUTF8(TargetTab()->GetTitle()) : "")
+-          .Set("tabId", TargetAlias());
+-  if (!critic_note_.empty()) {
+-    event.Set("critic", base::DictValue()
+-                            .Set("note", critic_note_)
+-                            .Set("noDirectProvider", no_direct));
+-  }
+-  Emit(std::move(event));
++  input.no_fast_model = !direct || !direct->HasUsableDirectProvider();
++  Emit(ConfirmRequestEvent(input));
+   critic_note_.clear();
+ }
+ void AgentController::Respond(const std::string& id,
+@@ -634,18 +635,16 @@ void AgentController::Respond(const std:
+   if (id != approval_id_ || !done_ || approval_id_.empty()) {
+     return;
+   }
+-  // confirm = allow_once (WP8 cards); skip = deny.
+-  if (decision != "stop" && decision != "allow" && decision != "allow_once" &&
+-      decision != "confirm" && decision != "deny" && decision != "skip") {
++  const Decision parsed = ParseDecision(decision);
++  if (parsed == Decision::kUnknown) {
+     return;
+   }
+   approval_id_.clear();
+-  if (decision == "stop") {
++  if (parsed == Decision::kStop) {
+     Cancel();
+     return;
+   }
+-  if (decision != "allow" && decision != "allow_once" &&
+-      decision != "confirm") {
++  if (parsed == Decision::kDeny) {
+     Finish(
+         Error("declined", "The user declined this action. Do not retry it."));
+     return;
+@@ -815,19 +814,9 @@ void AgentController::Finish(ToolResult
+     return;
+   }
+   auto event =
+-      base::DictValue()
+-          .Set("type", "step_finished")
+-          .Set("id", step_id_)
+-          .Set("tool", pending_.name)
+-          .Set("label", Label())
+-          .Set("ok", result.ok)
+-          .Set("origin", Origin(TargetTab()))
+-          .Set("tabId", TargetAlias())
+-          .Set("tabTitle",
+-               TargetTab() ? base::UTF16ToUTF8(TargetTab()->GetTitle()) : "");
+-  if (!result.error.empty()) {
+-    event.Set("error", result.error);
+-  }
++      StepEvent(true, step_id_, pending_.name, Label(), TargetAlias(),
++                TargetTab() ? base::UTF16ToUTF8(TargetTab()->GetTitle()) : "",
++                Origin(TargetTab()), result.ok, result.error);
+   current_->log.Append(event.Clone());
+   Emit(std::move(event));
+   approval_id_.clear();
+@@ -850,10 +839,7 @@ void AgentController::Pause() {
+       }
+     }
+   }
+-  Emit(base::DictValue()
+-           .Set("type", "paused")
+-           .Set("reason", "you're using this tab")
+-           .Set("tabId", TargetAlias()));
++  Emit(PausedEvent("you're using this tab", TargetAlias()));
+   State("paused");
+ }
+ void AgentController::Resume() {
+@@ -873,15 +859,20 @@ void AgentController::Resume() {
+   if (current_ && current_->runner) {
+     current_->runner->Resume();
+   }
+-  Emit(base::DictValue().Set("type", "resumed"));
++  Emit(ResumedEvent());
+   State(approval_id_.empty() ? "working" : "waiting");
+   if (deferred_) {
+     std::move(deferred_).Run();
+   }
+ }
++void AgentController::Stop() {
++  Cancel();
++}
++
+ void AgentController::Cancel() {
+   critic_timeout_.Stop();
+   critic_.reset();
++  const bool was_active = active_;
+   const bool may_have_acted = action_dispatched_ && !!done_;
+   operation_factory_.InvalidateWeakPtrs();
+   deferred_.Reset();
+@@ -891,36 +882,23 @@ void AgentController::Cancel() {
+     current_->runner->Cancel();
+     current_->runner.reset();
+   }
+-  if (events_ && done_) {
+-    Emit(base::DictValue()
+-             .Set("type", "step_finished")
+-             .Set("id", step_id_)
+-             .Set("tool", pending_.name)
+-             .Set("label", Label())
+-             .Set("tabId", TargetAlias())
+-             .Set("tabTitle",
+-                  TargetTab() ? base::UTF16ToUTF8(TargetTab()->GetTitle()) : "")
+-             .Set("origin", Origin(TargetTab()))
+-             .Set("ok", false)
+-             .Set("error",
+-                  may_have_acted
+-                      ? "Stopped. This step may already have taken effect."
+-                      : "Stopped."));
++  if (was_active && done_) {
++    Emit(StepEvent(
++        true, step_id_, pending_.name, Label(), TargetAlias(),
++        TargetTab() ? base::UTF16ToUTF8(TargetTab()->GetTitle()) : "",
++        Origin(TargetTab()), false,
++        may_have_acted ? "Stopped. This step may already have taken effect."
++                       : "Stopped."));
+   }
+-  if (events_) {
++  if (was_active) {
+     State("stopped");
+-    Emit(base::DictValue()
+-             .Set("type", "summary")
+-             .Set("text",
+-                  "Stopped after " + base::NumberToString(steps_) + " steps")
+-             .Set("steps", steps_)
+-             .Set("confirmed", confirmed_)
+-             .Set("elapsedMs",
+-                  (base::TimeTicks::Now() - turn_started_).InMillisecondsF()));
++    Emit(SummaryEvent("Stopped after " + base::NumberToString(steps_) +
++                          (steps_ == 1 ? " step" : " steps"),
++                      steps_, confirmed_,
++                      base::TimeTicks::Now() - turn_started_));
+   }
+   auto done = std::move(done_);
+   action_dispatched_ = false;
+-  events_.Reset();
+   if (done) {
+     auto result =
+         Error("cancelled", "The user stopped the task. Do not continue.");
+@@ -944,13 +922,7 @@ void AgentController::EndTurn(std::strin
+     current_->runner.reset();
+   }
+   State(error.empty() ? "done" : "error");
+-  Emit(base::DictValue()
+-           .Set("type", "summary")
+-           .Set("text", error.empty() ? "Done" : error)
+-           .Set("steps", steps_)
+-           .Set("confirmed", confirmed_)
+-           .Set("elapsedMs",
+-                (base::TimeTicks::Now() - turn_started_).InMillisecondsF()));
+-  events_.Reset();
++  Emit(SummaryEvent(error.empty() ? "Done" : error, steps_, confirmed_,
++                    base::TimeTicks::Now() - turn_started_));
+ }
+ }  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/agent_controller.h
+===================================================================
+--- src.orig/chrome/browser/rac/agent/agent_controller.h
++++ src/chrome/browser/rac/agent/agent_controller.h
+@@ -16,6 +16,7 @@
+ #include "base/values.h"
+ #include "chrome/browser/rac/agent/action_guard.h"
+ #include "chrome/browser/rac/agent/action_types.h"
++#include "chrome/browser/rac/agent/agent_ui_delegate.h"
+ #include "chrome/browser/rac/agent/apc_extract.h"
+ #include "chrome/browser/rac/agent/tool_registry.h"
+ #include "chrome/browser/rac/ai/chat_protocol.h"
+@@ -33,9 +34,9 @@ namespace rac::agent {
+ 
+ enum class ToolCallSource { kDirect, kMcp };
+ 
+-class AgentController : public base::SupportsUserData::Data {
++class AgentController : public base::SupportsUserData::Data,
++                        public AgentUiDelegate {
+  public:
+-  using EventCallback = base::RepeatingCallback<void(base::DictValue)>;
+   using DoneCallback = base::OnceCallback<void(ToolResult)>;
+   static AgentController* GetOrCreate(Profile* profile);
+   static AgentController* GetIfCreated(Profile* profile);
+@@ -45,15 +46,17 @@ class AgentController : public base::Sup
+                  std::string conversation_id,
+                  std::string goal,
+                  const std::vector<std::string>& user_messages,
+-                 const std::vector<content::WebContents*>& attached_tabs,
+-                 EventCallback events);
++                 const std::vector<content::WebContents*>& attached_tabs);
+   void HandleToolCall(const ToolCall& call,
+                       ToolCallSource source,
+                       DoneCallback done);
+   std::vector<ToolDefinition> AvailableTools();
+-  void Respond(const std::string& id, const std::string& decision);
++  // AgentUiDelegate: the sidebar's cards and the tab's pill. Every event of a
++  // turn goes out through DispatchAgentEvent().
++  void Respond(const std::string& id, const std::string& decision) override;
++  void Stop() override;
++  void Resume() override;
+   void Cancel();
+-  void Resume();
+   void EndTurn(std::string error = {});
+   base::WeakPtr<AgentController> GetWeakPtr();
+ 
+@@ -76,7 +79,9 @@ class AgentController : public base::Sup
+   void Pause();
+   void Emit(base::DictValue event);
+   void State(const std::string& state);
+-  void RequestConfirmation(std::string reason);
++  void RequestConfirmation(std::string reason, bool held_by_critic);
++  void UpdateIndicator(AgentTabStatus status);
++  void HideIndicator();
+   content::WebContents* TargetTab() const;
+   std::string TargetAlias() const;
+   std::string Label() const;
+@@ -84,7 +89,7 @@ class AgentController : public base::Sup
+   PrefChangeRegistrar prefs_;
+   std::map<std::string, std::unique_ptr<Conversation>> conversations_;
+   raw_ptr<Conversation> current_ = nullptr;
+-  EventCallback events_;
++  base::WeakPtr<content::WebContents> indicator_tab_;
+   ToolCall pending_;
+   DoneCallback done_;
+   base::OnceClosure deferred_;
+Index: src/chrome/browser/rac/agent/agent_events.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/agent_events.cc
+@@ -0,0 +1,231 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/agent/agent_events.h"
++
++#include <set>
++#include <utility>
++
++#include "base/strings/string_util.h"
++#include "chrome/browser/rac/agent/snapshot_serializer.h"
++#include "url/gurl.h"
++
++namespace rac::agent {
++namespace {
++
++bool HasWord(const std::string& text, const std::set<std::string>& words) {
++  const std::string lower = base::ToLowerASCII(text);
++  size_t start = 0;
++  while (start < lower.size()) {
++    while (start < lower.size() && !base::IsAsciiAlpha(lower[start])) {
++      ++start;
++    }
++    size_t end = start;
++    while (end < lower.size() && base::IsAsciiAlpha(lower[end])) {
++      ++end;
++    }
++    if (end > start && words.contains(lower.substr(start, end - start))) {
++      return true;
++    }
++    start = end;
++  }
++  return false;
++}
++
++std::string Quoted(const std::string& name) {
++  const std::string escaped = EscapeSnapshotText(name, 100);
++  return escaped.empty() ? "" : "“" + escaped + "”";
++}
++
++}  // namespace
++
++std::string DisplayHost(const std::string& url_or_origin) {
++  const GURL url(url_or_origin);
++  if (!url.is_valid() || url.host().empty()) {
++    return "";
++  }
++  std::string host(url.host());
++  if (!url.port().empty()) {
++    host += ":";
++    host += url.port();
++  }
++  return host;
++}
++
++base::DictValue StepEvent(bool finished,
++                          const std::string& id,
++                          const std::string& tool,
++                          const std::string& label,
++                          const std::string& tab_id,
++                          const std::string& tab_title,
++                          const std::string& origin,
++                          bool ok,
++                          const std::string& error) {
++  base::DictValue event;
++  event.Set("type", finished ? "step_finished" : "step_started");
++  event.Set("id", id);
++  event.Set("tool", tool);
++  event.Set("label", label);
++  event.Set("tabId", tab_id);
++  event.Set("tabTitle", tab_title);
++  event.Set("origin", origin);
++  if (finished) {
++    event.Set("ok", ok);
++    if (!error.empty()) {
++      event.Set("error", error);
++    }
++  }
++  return event;
++}
++
++base::DictValue PlanRequestEvent(const std::string& id,
++                                 const std::string& goal,
++                                 const std::string& step,
++                                 const base::ListValue& origins,
++                                 const std::string& tab_id) {
++  return base::DictValue()
++      .Set("type", "plan_request")
++      .Set("id", id)
++      .Set("goal", goal)
++      .Set("steps", base::ListValue().Append(step))
++      .Set("origins", origins.Clone())
++      .Set("tabId", tab_id);
++}
++
++base::DictValue ConfirmRequestEvent(const ConfirmEventInput& input) {
++  base::DictValue event;
++  event.Set("type", "confirm_request");
++  event.Set("id", input.id);
++  event.Set("label", input.label);
++  event.Set("risk", input.risk);
++  event.Set("reason", input.reason);
++  event.Set("origin", input.origin);
++  event.Set("detail", input.detail);
++  event.Set("tabId", input.tab_id);
++  if (input.critic_note) {
++    event.Set("critic", base::DictValue().Set("note", *input.critic_note));
++  }
++  event.Set("noFastModel", input.no_fast_model);
++  return event;
++}
++
++base::DictValue PausedEvent(const std::string& reason,
++                            const std::string& tab_id) {
++  return base::DictValue()
++      .Set("type", "paused")
++      .Set("reason", reason)
++      .Set("tabId", tab_id);
++}
++
++base::DictValue ResumedEvent() {
++  return base::DictValue().Set("type", "resumed");
++}
++
++base::DictValue RunStateEvent(const std::string& state,
++                              const std::string& tab_id) {
++  return base::DictValue()
++      .Set("type", "run_state")
++      .Set("state", state)
++      .Set("tabId", tab_id);
++}
++
++base::DictValue SummaryEvent(const std::string& text,
++                             int steps,
++                             int confirmed,
++                             base::TimeDelta duration) {
++  return base::DictValue()
++      .Set("type", "summary")
++      .Set("text", text)
++      .Set("steps", steps)
++      .Set("confirmed", confirmed)
++      .Set("durationMs", static_cast<double>(duration.InMilliseconds()));
++}
++
++std::string ConfirmationRisk(const ActionMetadata& action,
++                             bool held_by_critic) {
++  const ActionRiskInput& risk = action.risk;
++  if (risk.is_password_field || risk.is_payment_field) {
++    return "sensitive_field";
++  }
++  const std::string words = risk.element_name + " " + risk.button_text;
++  if (HasWord(words, {"buy", "purchase", "order", "pay", "checkout",
++                      "subscribe", "donate"})) {
++    return "purchase";
++  }
++  if (HasWord(words, {"delete", "remove", "erase", "unsubscribe"})) {
++    return "delete";
++  }
++  if (HasWord(words, {"send", "post", "publish", "reply", "share"})) {
++    return "send";
++  }
++  if (risk.is_file_input || HasWord(words, {"upload", "attach"})) {
++    return "upload";
++  }
++  if (action.download || HasWord(words, {"download"})) {
++    return "download";
++  }
++  if (risk.cross_origin || (!action.frame_origin.empty() &&
++                            action.frame_origin != risk.current_origin)) {
++    return "cross_origin";
++  }
++  if (action.submit || action.press_enter) {
++    return "submit";
++  }
++  return held_by_critic ? "critic" : "other";
++}
++
++std::string ConfirmationDetail(const ActionMetadata& action) {
++  const ActionRiskInput& risk = action.risk;
++  const std::string& tool = risk.tool_name;
++  const std::string name = Quoted(risk.element_name);
++  const bool sensitive = risk.is_password_field || risk.is_payment_field;
++  std::string detail;
++  if (tool == "click") {
++    detail = name.empty() ? "Clicks an element on the page."
++                          : "Clicks " + name + ".";
++  } else if (tool == "type") {
++    detail = sensitive ? "Enters text in a password or payment field."
++                       : (name.empty() ? "Enters text in a field."
++                                       : "Enters text in " + name + ".");
++    detail += " The text isn't shown here.";
++  } else if (tool == "select_option") {
++    detail = name.empty() ? "Chooses an option."
++                          : "Chooses an option in " + name + ".";
++  } else if (tool == "navigate" || tool == "open_tab") {
++    const std::string host = DisplayHost(risk.target_origin);
++    detail = "Opens " + (host.empty() ? "a page" : host) +
++             (tool == "open_tab" ? " in a new tab." : ".");
++  } else if (tool == "press_key") {
++    detail = name.empty() ? "Presses Enter." : "Presses Enter in " + name + ".";
++  } else if (tool == "go_back") {
++    detail = "Goes back to the previous page.";
++  } else if (tool == "close_tab") {
++    detail = "Closes a tab.";
++  } else if (tool == "switch_tab") {
++    detail = "Switches to another tab.";
++  }
++  const bool navigates = tool == "navigate" || tool == "open_tab";
++  const std::string target = DisplayHost(risk.target_origin);
++  if (!navigates && (action.submit || action.press_enter) && !target.empty()) {
++    detail += " It sends the form to " + target + ".";
++  } else if (!navigates && risk.cross_origin && !target.empty()) {
++    detail += " It goes to " + target + ".";
++  }
++  return detail;
++}
++
++Decision ParseDecision(const std::string& decision) {
++  if (decision == "allow" || decision == "allow_once" ||
++      decision == "confirm") {
++    return Decision::kAllow;
++  }
++  if (decision == "deny" || decision == "skip") {
++    return Decision::kDeny;
++  }
++  if (decision == "stop") {
++    return Decision::kStop;
++  }
++  return Decision::kUnknown;
++}
++
++}  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/agent_events.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/agent_events.h
+@@ -0,0 +1,82 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_AGENT_AGENT_EVENTS_H_
++#define CHROME_BROWSER_RAC_AGENT_AGENT_EVENTS_H_
++
++#include <optional>
++#include <string>
++
++#include "base/time/time.h"
++#include "base/values.h"
++#include "chrome/browser/rac/agent/action_guard.h"
++
++namespace rac::agent {
++
++// The events the assistant sidebar shows, as dictionaries. The sidebar reads
++// them in one place, chrome/browser/resources/rac_ai/agent_events.ts
++// (parseAgentEvent). A field changes there and here together, or not at all.
++// None of them carries a value the agent typed.
++
++// "example.com" or "127.0.0.1:8772" for a URL or origin, or "" if it has no
++// host.
++std::string DisplayHost(const std::string& url_or_origin);
++
++base::DictValue StepEvent(bool finished,
++                          const std::string& id,
++                          const std::string& tool,
++                          const std::string& label,
++                          const std::string& tab_id,
++                          const std::string& tab_title,
++                          const std::string& origin,
++                          bool ok,
++                          const std::string& error);
++
++base::DictValue PlanRequestEvent(const std::string& id,
++                                 const std::string& goal,
++                                 const std::string& step,
++                                 const base::ListValue& origins,
++                                 const std::string& tab_id);
++
++struct ConfirmEventInput {
++  std::string id;
++  std::string label;
++  std::string risk;
++  std::string reason;
++  std::string origin;
++  std::string detail;
++  std::string tab_id;
++  // Set when the critic held the step back. May be empty.
++  std::optional<std::string> critic_note;
++  // No fast model is set up, so every step is confirmed.
++  bool no_fast_model = false;
++};
++base::DictValue ConfirmRequestEvent(const ConfirmEventInput& input);
++
++base::DictValue PausedEvent(const std::string& reason,
++                            const std::string& tab_id);
++base::DictValue ResumedEvent();
++base::DictValue RunStateEvent(const std::string& state,
++                              const std::string& tab_id);
++base::DictValue SummaryEvent(const std::string& text,
++                             int steps,
++                             int confirmed,
++                             base::TimeDelta duration);
++
++// Why a step needs the user's OK, as the sidebar's confirm card understands
++// it: sensitive_field, purchase, delete, send, upload, download, cross_origin,
++// submit, critic or other. `held_by_critic` marks a step the guard would have
++// let through.
++std::string ConfirmationRisk(const ActionMetadata& action, bool held_by_critic);
++
++// What will happen if the user confirms, in one or two sentences. Never
++// includes the text to type.
++std::string ConfirmationDetail(const ActionMetadata& action);
++
++// What a card's button sends back.
++enum class Decision { kAllow, kDeny, kStop, kUnknown };
++Decision ParseDecision(const std::string& decision);
++
++}  // namespace rac::agent
++
++#endif  // CHROME_BROWSER_RAC_AGENT_AGENT_EVENTS_H_
+Index: src/chrome/browser/rac/agent/agent_events_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/agent_events_unittest.cc
+@@ -0,0 +1,181 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/agent/agent_events.h"
++
++#include <set>
++#include <string>
++
++#include "base/json/json_writer.h"
++#include "base/time/time.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::agent {
++namespace {
++
++// The fields agent_events.ts reads, per event type.
++std::set<std::string> ReadByUi(const std::string& type) {
++  if (type == "step_started") {
++    return {"id", "tool", "label", "tabTitle", "origin"};
++  }
++  if (type == "step_finished") {
++    return {"id", "tool", "label", "tabTitle", "origin", "ok"};
++  }
++  if (type == "plan_request") {
++    return {"id", "goal", "steps", "origins"};
++  }
++  if (type == "confirm_request") {
++    return {"id", "label", "risk", "reason", "origin", "detail", "noFastModel"};
++  }
++  if (type == "paused") {
++    return {"reason"};
++  }
++  if (type == "run_state") {
++    return {"state"};
++  }
++  if (type == "summary") {
++    return {"text", "steps", "confirmed", "durationMs"};
++  }
++  return {};
++}
++
++void ExpectReadable(const base::DictValue& event) {
++  const std::string* type = event.FindString("type");
++  ASSERT_TRUE(type);
++  for (const std::string& field : ReadByUi(*type)) {
++    EXPECT_TRUE(event.contains(field)) << *type << " lacks " << field;
++  }
++}
++
++ActionMetadata Click(const std::string& name) {
++  ActionMetadata action;
++  action.risk.tool_name = "click";
++  action.risk.element_name = name;
++  action.risk.current_origin = "http://127.0.0.1:8771";
++  return action;
++}
++
++TEST(AgentEventsTest, ConfirmRequestHasWhatTheCardReads) {
++  ConfirmEventInput input;
++  input.id = "approval-3";
++  input.label = "Open paypal.com";
++  input.risk = "cross_origin";
++  input.reason = "This step may leave the allowed sites.";
++  input.origin = "https://paypal.com";
++  input.detail = "Opens paypal.com.";
++  input.no_fast_model = true;
++  const base::DictValue event = ConfirmRequestEvent(input);
++  ExpectReadable(event);
++  EXPECT_EQ(*event.FindString("label"), "Open paypal.com");
++  EXPECT_EQ(*event.FindString("risk"), "cross_origin");
++  EXPECT_EQ(event.FindBool("noFastModel"), true);
++  EXPECT_EQ(event.FindDict("critic"), nullptr);
++  EXPECT_EQ(event.Find("action"), nullptr);
++}
++
++TEST(AgentEventsTest, CriticNoteIsNestedAndMayBeEmpty) {
++  ConfirmEventInput input;
++  input.id = "approval-4";
++  input.critic_note = "";
++  const base::DictValue event = ConfirmRequestEvent(input);
++  const base::DictValue* critic = event.FindDict("critic");
++  ASSERT_TRUE(critic);
++  EXPECT_EQ(*critic->FindString("note"), "");
++  EXPECT_EQ(critic->Find("noDirectProvider"), nullptr);
++  EXPECT_EQ(event.FindBool("noFastModel"), false);
++}
++
++TEST(AgentEventsTest, SummaryReportsDurationInMilliseconds) {
++  const base::DictValue event =
++      SummaryEvent("Done", 5, 1, base::Milliseconds(61500));
++  ExpectReadable(event);
++  EXPECT_EQ(event.FindDouble("durationMs"), 61500.0);
++  EXPECT_EQ(event.FindInt("steps"), 5);
++  EXPECT_EQ(event.FindInt("confirmed"), 1);
++  EXPECT_EQ(event.Find("elapsedMs"), nullptr);
++}
++
++TEST(AgentEventsTest, OtherEventsHaveWhatThePageReads) {
++  ExpectReadable(StepEvent(false, "step-1", "click", "Click “Go”", "t1", "Shop",
++                           "http://127.0.0.1:8771", true, ""));
++  const base::DictValue finished =
++      StepEvent(true, "step-1", "click", "Click “Go”", "t1", "Shop",
++                "http://127.0.0.1:8771", false, "Stopped.");
++  ExpectReadable(finished);
++  EXPECT_EQ(finished.FindBool("ok"), false);
++  EXPECT_EQ(*finished.FindString("error"), "Stopped.");
++  base::ListValue origins;
++  origins.Append("http://127.0.0.1:8771");
++  const base::DictValue plan = PlanRequestEvent(
++      "approval-1", "Fill in the form", "Click “Go”", origins, "t1");
++  ExpectReadable(plan);
++  EXPECT_EQ(plan.FindList("steps")->size(), 1u);
++  ExpectReadable(PausedEvent("you're using this tab", "t1"));
++  ExpectReadable(RunStateEvent("waiting", "t1"));
++  EXPECT_EQ(*ResumedEvent().FindString("type"), "resumed");
++}
++
++TEST(AgentEventsTest, NoEventCarriesTypedText) {
++  ActionMetadata action = Click("Password");
++  action.risk.tool_name = "type";
++  action.risk.is_password_field = true;
++  const std::string detail = ConfirmationDetail(action);
++  EXPECT_NE(detail.find("password or payment field"), std::string::npos);
++  EXPECT_NE(detail.find("isn't shown"), std::string::npos);
++  EXPECT_EQ(ConfirmationRisk(action, false), "sensitive_field");
++}
++
++TEST(AgentEventsTest, RiskKindFollowsTheStep) {
++  ActionMetadata purchase = Click("Place order");
++  purchase.submit = true;
++  EXPECT_EQ(ConfirmationRisk(purchase, false), "purchase");
++
++  ActionMetadata card = Click("Card number");
++  card.risk.tool_name = "type";
++  card.risk.is_payment_field = true;
++  EXPECT_EQ(ConfirmationRisk(card, false), "sensitive_field");
++
++  ActionMetadata open;
++  open.risk.tool_name = "navigate";
++  open.risk.current_origin = "http://127.0.0.1:8771";
++  open.risk.target_origin = "http://127.0.0.1:8772";
++  open.risk.cross_origin = true;
++  EXPECT_EQ(ConfirmationRisk(open, false), "cross_origin");
++  EXPECT_EQ(ConfirmationDetail(open), "Opens 127.0.0.1:8772.");
++
++  ActionMetadata sign_in = Click("Sign in");
++  sign_in.submit = true;
++  EXPECT_EQ(ConfirmationRisk(sign_in, false), "submit");
++
++  ActionMetadata upload = Click("Resume");
++  upload.risk.is_file_input = true;
++  EXPECT_EQ(ConfirmationRisk(upload, false), "upload");
++
++  EXPECT_EQ(ConfirmationRisk(Click("Remove item"), false), "delete");
++  EXPECT_EQ(ConfirmationRisk(Click("Send message"), false), "send");
++  EXPECT_EQ(ConfirmationRisk(Click("Next"), true), "critic");
++  EXPECT_EQ(ConfirmationRisk(Click("Next"), false), "other");
++}
++
++TEST(AgentEventsTest, SubmitDetailNamesWhereTheFormGoes) {
++  ActionMetadata action = Click("Sign in");
++  action.submit = true;
++  action.risk.target_origin = "http://127.0.0.1:8772";
++  action.risk.cross_origin = true;
++  EXPECT_EQ(ConfirmationDetail(action),
++            "Clicks “Sign in”. It sends the form to 127.0.0.1:8772.");
++}
++
++TEST(AgentEventsTest, DecisionsFromTheCardsAndTheModelPath) {
++  EXPECT_EQ(ParseDecision("allow"), Decision::kAllow);
++  EXPECT_EQ(ParseDecision("confirm"), Decision::kAllow);
++  EXPECT_EQ(ParseDecision("allow_once"), Decision::kAllow);
++  EXPECT_EQ(ParseDecision("skip"), Decision::kDeny);
++  EXPECT_EQ(ParseDecision("deny"), Decision::kDeny);
++  EXPECT_EQ(ParseDecision("stop"), Decision::kStop);
++  EXPECT_EQ(ParseDecision("ALLOW"), Decision::kUnknown);
++  EXPECT_EQ(ParseDecision(""), Decision::kUnknown);
++}
++
++}  // namespace
++}  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/agent_ui_delegate.cc
+===================================================================
+--- src.orig/chrome/browser/rac/agent/agent_ui_delegate.cc
++++ src/chrome/browser/rac/agent/agent_ui_delegate.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/rac/agent/agent_ui_delegate.h"
+ 
+ #include <memory>
++#include <string>
+ #include <utility>
+ 
+ #include "base/memory/raw_ptr.h"
+@@ -30,6 +31,9 @@ class Hub : public base::SupportsUserDat
+ 
+   raw_ptr<AgentUiDelegate> delegate;
+   base::RepeatingCallbackList<void(const base::DictValue&)> callbacks;
++  base::RepeatingCallbackList<
++      void(content::WebContents*, AgentTabStatus, const std::u16string&)>
++      tab_callbacks;
+ };
+ 
+ }  // namespace
+@@ -59,4 +63,20 @@ base::CallbackListSubscription AddAgentE
+   return Hub::Get(context, /*create=*/true)->callbacks.Add(std::move(callback));
+ }
+ 
++void NotifyAgentTab(content::BrowserContext* context,
++                    content::WebContents* tab,
++                    AgentTabStatus status,
++                    const std::u16string& title) {
++  if (Hub* hub = Hub::Get(context, /*create=*/false)) {
++    hub->tab_callbacks.Notify(tab, status, title);
++  }
++}
++
++base::CallbackListSubscription AddAgentTabCallback(
++    content::BrowserContext* context,
++    AgentTabCallback callback) {
++  return Hub::Get(context, /*create=*/true)
++      ->tab_callbacks.Add(std::move(callback));
++}
++
+ }  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/agent_ui_delegate.h
+===================================================================
+--- src.orig/chrome/browser/rac/agent/agent_ui_delegate.h
++++ src/chrome/browser/rac/agent/agent_ui_delegate.h
+@@ -13,6 +13,7 @@
+ 
+ namespace content {
+ class BrowserContext;
++class WebContents;
+ }  // namespace content
+ 
+ namespace rac::agent {
+@@ -56,6 +57,27 @@ base::CallbackListSubscription AddAgentE
+     content::BrowserContext* context,
+     AgentEventCallback callback);
+ 
++// How the tab the agent works in shows it: a ring and a pill while it works,
++// the pill saying it waits for the user, or the pill offering Resume.
++enum class AgentTabStatus { kWorking, kWaiting, kPaused, kHidden };
++
++using AgentTabCallback = base::RepeatingCallback<
++    void(content::WebContents*, AgentTabStatus, const std::u16string& title)>;
++
++// Tells the views side which tab to mark. `tab` is only valid during the call.
++// `title` is the short text for the pill while the agent works, or empty. Does
++// nothing when nobody listens.
++void NotifyAgentTab(content::BrowserContext* context,
++                    content::WebContents* tab,
++                    AgentTabStatus status,
++                    const std::u16string& title);
++
++// For the code that draws the indicator. Nothing is created or kept until this
++// is called, so a profile with the assistant off never pays for it.
++base::CallbackListSubscription AddAgentTabCallback(
++    content::BrowserContext* context,
++    AgentTabCallback callback);
++
+ }  // namespace rac::agent
+ 
+ #endif  // CHROME_BROWSER_RAC_AGENT_AGENT_UI_DELEGATE_H_
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+@@ -284,6 +284,7 @@ void PageHandler::OnJavascriptDisallowed
+   active_tab_subscription_ = base::CallbackListSubscription();
+   ask_subscription_ = base::CallbackListSubscription();
+   agent_event_subscription_ = base::CallbackListSubscription();
++  agent_tab_subscription_ = base::CallbackListSubscription();
+   tab_observer_.reset();
+   StopSession();
+ }
+@@ -470,6 +471,9 @@ void PageHandler::HandleInit(const base:
+       agent_event_subscription_ = agent::AddAgentEventCallback(
+           profile_, base::BindRepeating(&PageHandler::OnAgentTaskEvent,
+                                         base::Unretained(this)));
++      agent_tab_subscription_ = agent::AddAgentTabCallback(
++          profile_, base::BindRepeating(&PageHandler::OnAgentTab,
++                                        base::Unretained(this)));
+     }
+     WatchTabs();
+     if (tabs::TabInterface* tab = GetAttachableCurrentTab()) {
+@@ -663,10 +667,9 @@ void PageHandler::StartSession(std::uniq
+         user_messages.push_back(message.text);
+       }
+     }
+-    controller->BeginTurn(
+-        browser, conversation_id_, send->request.messages.back().text,
+-        user_messages, attached,
+-        base::BindRepeating(&agent::DispatchAgentEvent, profile_.get()));
++    controller->BeginTurn(browser, conversation_id_,
++                          send->request.messages.back().text, user_messages,
++                          attached);
+     agent_controller_ = controller->GetWeakPtr();
+     agent_turn_send_id_ = send_id;
+     for (auto& tool : controller->AvailableTools()) {
+@@ -743,9 +746,8 @@ void PageHandler::BeginAgentToolTurn(con
+   const std::string goal = send.request.messages.empty()
+                                ? std::string()
+                                : send.request.messages.back().text;
+-  controller->BeginTurn(
+-      browser, conversation_id_, goal, user_messages, attached,
+-      base::BindRepeating(&agent::DispatchAgentEvent, profile_.get()));
++  controller->BeginTurn(browser, conversation_id_, goal, user_messages,
++                        attached);
+   agent_controller_ = controller->GetWeakPtr();
+   agent_turn_send_id_ = send_id;
+   agent_mcp_tools_ =
+@@ -1008,6 +1010,7 @@ void PageHandler::OnAgentTaskEvent(const
+                        [](base::WeakPtr<PageHandler> handler, int send_id) {
+                          if (handler && handler->active_send_id_ == send_id) {
+                            handler->StopSession();
++                           handler->FinishStoppedTurn(send_id);
+                          }
+                        },
+                        weak_factory_.GetWeakPtr(), agent_turn_send_id_));
+@@ -1015,6 +1018,37 @@ void PageHandler::OnAgentTaskEvent(const
+   FireWebUIListener("racAiAgentEvent", event);
+ }
+ 
++void PageHandler::FinishStoppedTurn(int send_id) {
++  if (!IsJavascriptAllowed()) {
++    return;
++  }
++  // The page is still waiting on the reply it started. Nothing else will
++  // finish it now that the session is gone.
++  base::DictValue update;
++  update.Set("id", send_id);
++  update.Set("done", true);
++  FireWebUIListener("rac-ai-update", update);
++}
++
++void PageHandler::OnAgentTab(content::WebContents* contents,
++                             agent::AgentTabStatus status,
++                             const std::u16string& title) {
++  if (status == agent::AgentTabStatus::kHidden) {
++    agent::AgentTabIndicator::Hide(contents);
++    return;
++  }
++  if (agent_turn_send_id_ == 0) {
++    return;
++  }
++  agent::AgentTabIndicator::Show(contents, title);
++  agent::AgentTabIndicator::SetState(contents,
++                                     status == agent::AgentTabStatus::kWaiting
++                                         ? agent::AgentTabState::kWaiting
++                                     : status == agent::AgentTabStatus::kPaused
++                                         ? agent::AgentTabState::kPaused
++                                         : agent::AgentTabState::kWorking);
++}
++
+ void PageHandler::OnUpdate(int send_id, StreamUpdate update) {
+   if (send_id == active_send_id_ && agent_controller_ &&
+       (update.done || update.error)) {
+@@ -1050,6 +1084,7 @@ void PageHandler::OnEnabledChanged() {
+     active_tab_subscription_ = {};
+     ask_subscription_ = {};
+     agent_event_subscription_ = {};
++    agent_tab_subscription_ = {};
+     tab_observer_.reset();
+     FireWebUIListener("rac-ai-disabled");
+     content::WebContents* contents = web_ui()->GetWebContents();
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+@@ -15,6 +15,7 @@
+ #include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "base/values.h"
++#include "chrome/browser/rac/agent/agent_ui_delegate.h"
+ #include "chrome/browser/rac/ai/chat_history.h"
+ #include "chrome/browser/rac/ai/chat_prompt.h"
+ #include "chrome/browser/rac/ai/chat_protocol.h"
+@@ -82,6 +83,10 @@ class PageHandler : public content::WebU
+   void HandleAgentDebugEvent(const base::ListValue& args);
+   void ApplyDebugIndicator(const base::DictValue& event);
+   void OnAgentTaskEvent(const base::DictValue& event);
++  void FinishStoppedTurn(int send_id);
++  void OnAgentTab(content::WebContents* contents,
++                  rac::agent::AgentTabStatus status,
++                  const std::u16string& title);
+   void HandleOpenUrl(const base::ListValue& args);
+   void HandleOpenSettings(const base::ListValue& args);
+   void HandleClosePanel(const base::ListValue& args);
+@@ -173,6 +178,7 @@ class PageHandler : public content::WebU
+   base::CallbackListSubscription active_tab_subscription_;
+   base::CallbackListSubscription ask_subscription_;
+   base::CallbackListSubscription agent_event_subscription_;
++  base::CallbackListSubscription agent_tab_subscription_;
+   std::unique_ptr<TabObserver> tab_observer_;
+   base::ScopedObservation<SpacesWindowManager, SpacesWindowManager::Observer>
+       spaces_observation_{this};
