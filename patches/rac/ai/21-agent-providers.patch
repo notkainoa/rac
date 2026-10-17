@@ -25,7 +25,7 @@
      "chat_prompt_unittest.cc",
 --- /dev/null
 +++ b/chrome/browser/rac/ai/acp/acp_service.cc
-@@ -0,0 +1,397 @@
+@@ -0,0 +1,442 @@
 +// Copyright 2026 The rac Authors
 +// Use of this source code is governed by a GPL-3.0 license.
 +
@@ -82,6 +82,20 @@
 +  shutting_down_ = true;
 +  Stop();
 +  path_cache_.Invalidate();
++  if (io_thread_) {
++    io_thread_->Stop();
++    io_thread_.reset();
++  }
++}
++
++void AcpService::EnsureIoThread() {
++  if (io_thread_) {
++    return;
++  }
++  io_thread_ = std::make_unique<base::Thread>("RacAcpIo");
++  base::Thread::Options options;
++  options.message_pump_type = base::MessagePumpType::IO;
++  CHECK(io_thread_->StartWithOptions(std::move(options)));
 +}
 +
 +base::FilePath AcpService::CacheRoot() const {
@@ -221,16 +235,16 @@
 +    return;
 +  }
 +
-+  AcpLaunchSpec launch;
-+  base::DictValue session_extra;
-+  const base::FilePath scratch = ScratchDirFor(agent_id);
-+  bool ok = false;
++  PreparedLaunch seed;
++  seed.agent_id = agent_id;
++  seed.scratch = ScratchDirFor(agent_id);
++  seed.recipe = recipe;
++  AgentLaunchPaths paths;
++  paths.search_path = search_path;
++  std::vector<std::string> custom_argv;
 +  if (std::string_view(agent_id) == "custom") {
-+    ok = PrepareCustomAgentLaunch(CustomArgv(prefs_), scratch, search_path,
-+                                  launch);
++    custom_argv = CustomArgv(prefs_);
 +  } else {
-+    AgentLaunchPaths paths;
-+    paths.search_path = search_path;
 +    paths.executable = AbsoluteOverride(prefs_, agent_id);
 +    if (paths.executable.empty()) {
 +      for (const char* name : recipe->executables) {
@@ -248,20 +262,46 @@
 +        paths.companion = FindExecutableOnPath(companion, search_path);
 +      }
 +    }
-+    ok = PrepareAgentLaunch(*recipe, paths, scratch, CacheRoot(), launch,
-+                            session_extra);
 +  }
-+  if (!ok || launch.argv.empty()) {
++  const base::FilePath cache_root = CacheRoot();
++
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(
++          [](PreparedLaunch seed, AgentLaunchPaths paths,
++             std::vector<std::string> custom_argv, base::FilePath cache_root) {
++            if (std::string_view(seed.agent_id) == "custom") {
++              seed.ok = PrepareCustomAgentLaunch(
++                  custom_argv, seed.scratch, paths.search_path, seed.launch);
++            } else if (seed.recipe) {
++              seed.ok = PrepareAgentLaunch(*seed.recipe, paths, seed.scratch,
++                                           cache_root, seed.launch,
++                                           seed.session_extra);
++            }
++            return seed;
++          },
++          std::move(seed), std::move(paths), std::move(custom_argv),
++          cache_root),
++      base::BindOnce(&AcpService::ContinueLaunch, weak_factory_.GetWeakPtr(),
++                     std::move(ready)));
++}
++
++void AcpService::ContinueLaunch(DoneCallback ready, PreparedLaunch prepared) {
++  if (shutting_down_ || !IsAiEnabled(prefs_)) {
++    std::move(ready).Run("The assistant is turned off.");
++    return;
++  }
++  if (!prepared.ok || prepared.launch.argv.empty()) {
 +    std::move(ready).Run("That agent is not installed.");
 +    return;
 +  }
 +
++  EnsureIoThread();
 +  auto session = std::make_unique<Session>();
-+  session->agent_id = agent_id;
-+  session->scratch = scratch;
-+  session->transport = base::SequenceBound<AcpTransport>(
-+      base::ThreadPool::CreateSequencedTaskRunner(
-+          {base::MayBlock(), base::TaskPriority::USER_VISIBLE}));
++  session->agent_id = prepared.agent_id;
++  session->scratch = prepared.scratch;
++  session->transport =
++      base::SequenceBound<AcpTransport>(io_thread_->task_runner());
 +
 +  base::WeakPtr<AcpService> self = weak_factory_.GetWeakPtr();
 +  session->client = std::make_unique<AcpClient>(
@@ -284,18 +324,24 @@
 +  session->client->SetPermissionPolicy(
 +      base::BindRepeating(&AcpService::OnPermission, self));
 +
-+  session_extra.Set("cwd", scratch.value());
-+  if (!session_extra.contains("mcpServers")) {
-+    session_extra.Set("mcpServers", base::ListValue());
++  prepared.session_extra.Set("cwd", prepared.scratch.value());
++  if (!prepared.session_extra.contains("mcpServers")) {
++    prepared.session_extra.Set("mcpServers", base::ListValue());
 +  }
 +
 +  VLOG(1) << "rac ACP initialize fs.readTextFile=false "
-+          << "fs.writeTextFile=false terminal=false cwd=" << scratch.value();
++          << "fs.writeTextFile=false terminal=false cwd="
++          << prepared.scratch.value();
++
++  const AgentRecipe* recipe = prepared.recipe;
++  // Publish before any IO so early agent replies are not dropped when
++  // OnTransportMessage runs on the UI thread.
++  session_ = std::move(session);
 +
 +  auto ui = base::SequencedTaskRunner::GetCurrentDefault();
-+  session->transport.AsyncCall(&AcpTransport::Start)
++  session_->transport.AsyncCall(&AcpTransport::Start)
 +      .WithArgs(
-+          std::move(launch),
++          std::move(prepared.launch),
 +          base::BindRepeating(
 +              [](scoped_refptr<base::SequencedTaskRunner> ui,
 +                 base::WeakPtr<AcpService> self, base::DictValue message) {
@@ -313,8 +359,8 @@
 +              },
 +              ui, self));
 +
-+  session->client->Start(
-+      std::move(session_extra),
++  session_->client->Start(
++      std::move(prepared.session_extra),
 +      base::BindOnce(
 +          [](base::WeakPtr<AcpService> self, const AgentRecipe* recipe,
 +             DoneCallback ready, std::string error) {
@@ -335,7 +381,6 @@
 +            std::move(ready).Run(std::move(error));
 +          },
 +          self, recipe, std::move(ready)));
-+  session_ = std::move(session);
 +}
 +
 +void AcpService::OnSessionReady(std::string text, std::string error) {
@@ -425,7 +470,7 @@
 +}  // namespace rac::ai
 --- /dev/null
 +++ b/chrome/browser/rac/ai/acp/acp_service.h
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,110 @@
 +// Copyright 2026 The rac Authors
 +// Use of this source code is governed by a GPL-3.0 license.
 +
@@ -440,10 +485,12 @@
 +#include "base/memory/raw_ptr.h"
 +#include "base/memory/weak_ptr.h"
 +#include "base/threading/sequence_bound.h"
++#include "base/threading/thread.h"
 +#include "base/values.h"
 +#include "chrome/browser/rac/ai/acp/acp_client.h"
 +#include "chrome/browser/rac/ai/acp/acp_transport.h"
 +#include "chrome/browser/rac/ai/acp/agent_path.h"
++#include "chrome/browser/rac/ai/acp/agent_recipes.h"
 +#include "chrome/browser/rac/ai/chat_protocol.h"
 +
 +class PrefService;
@@ -490,9 +537,20 @@
 +  void OnPathReady(AgentListCallback done,
 +                   std::string search_path,
 +                   std::string error);
++  struct PreparedLaunch {
++    bool ok = false;
++    std::string agent_id;
++    base::FilePath scratch;
++    AcpLaunchSpec launch;
++    base::DictValue session_extra;
++    // Non-owning; recipes are static.
++    raw_ptr<const AgentRecipe> recipe = nullptr;
++  };
++
 +  void BeginLaunch(std::string agent_id,
 +                   std::string search_path,
 +                   DoneCallback ready);
++  void ContinueLaunch(DoneCallback ready, PreparedLaunch prepared);
 +  void OnSessionReady(std::string text, std::string error);
 +  void OnTransportMessage(base::DictValue message);
 +  void OnTransportClosed(std::string error);
@@ -504,9 +562,13 @@
 +  base::FilePath ScratchDirFor(std::string_view agent_id) const;
 +  base::FilePath CacheRoot() const;
 +
++  // FileDescriptorWatcher needs an IO pump; ThreadPool cannot host the pipes.
++  void EnsureIoThread();
++
 +  raw_ptr<PrefService> prefs_;
 +  base::FilePath profile_path_;
 +  AgentPathCache path_cache_;
++  std::unique_ptr<base::Thread> io_thread_;
 +  std::unique_ptr<Session> session_;
 +  UpdateCallback on_update_;
 +  AgentEventCallback on_agent_event_;
@@ -521,7 +583,7 @@
 +#endif  // CHROME_BROWSER_RAC_AI_ACP_ACP_SERVICE_H_
 --- /dev/null
 +++ b/chrome/browser/rac/ai/acp/agent_recipes.cc
-@@ -0,0 +1,403 @@
+@@ -0,0 +1,404 @@
 +// Copyright 2026 The rac Authors
 +// Use of this source code is governed by a GPL-3.0 license.
 +
@@ -559,7 +621,7 @@
 +    "--deny-tool=write",
 +    "--deny-tool=url",
 +    "--excluded-tools=bash,powershell,apply_patch,create,edit,web_fetch,task,"
-+    "write_agent",
++    "write_agent",  // NOLINT(bugprone-suspicious-missing-comma)
 +};
 +constexpr const char* kNpxExe[] = {"npx"};
 +constexpr const char* kGooseExe[] = {"goose"};
@@ -639,6 +701,7 @@
 +  PutEnv(env, "PATH", paths.search_path);
 +  PutEnv(env, "TERM", "dumb");
 +  PutEnv(env, "NO_COLOR", "1");
++  PutEnv(env, "PYTHONUNBUFFERED", "1");
 +  base::CreateDirectory(scratch.AppendASCII("tmp"));
 +  base::CreateDirectory(cache_root.AppendASCII("npx"));
 +  PutEnv(env, "npm_config_cache", cache_root.AppendASCII("npx").value());
@@ -1337,19 +1400,21 @@
        "racAiMakeTitle", base::BindRepeating(&PageHandler::HandleMakeTitle,
                                              base::Unretained(this)));
    web_ui()->RegisterMessageCallback(
-@@ -225,6 +242,11 @@ void PageHandler::OnJavascriptDisallowed
+@@ -225,6 +242,13 @@ void PageHandler::OnJavascriptDisallowed
  void PageHandler::StopSession() {
    reading_factory_.InvalidateWeakPtrs();
    session_.reset();
 +  if (AiService* service = AiServiceFactory::GetForProfile(profile_)) {
 +    if (AcpService* acp = service->acp_service_if_created()) {
++      // Cancel the prompt, then tear down pipes/process so Stop always kills.
 +      acp->Cancel();
++      acp->Stop();
 +    }
 +  }
    active_send_id_ = 0;
  }
  
-@@ -360,11 +382,18 @@ void PageHandler::HandleInit(const base:
+@@ -360,11 +384,18 @@ void PageHandler::HandleInit(const base:
      const ProviderSettings settings = GetProviderSettings(prefs, provider_id);
      const bool has_key = info && (!info->requires_key ||
                                    service->key_store().HasKey(provider_id));
@@ -1373,7 +1438,7 @@
      state.Set("attachCurrentTab", prefs->GetBoolean(kAttachCurrentTab));
      state.Set("saveHistory", prefs->GetBoolean(kSaveHistory));
      WatchTabs();
-@@ -535,6 +564,11 @@ void PageHandler::StartSession(std::uniq
+@@ -535,6 +566,11 @@ void PageHandler::StartSession(std::uniq
      FireWebUIListener("rac-ai-attach-failed", event);
    }
    send->request.pages = std::move(send->pages);
@@ -1385,7 +1450,7 @@
    const int send_id = send->send_id;
    session_ = std::make_unique<ChatSession>(
        service, std::move(send->request),
-@@ -544,6 +578,113 @@ void PageHandler::StartSession(std::uniq
+@@ -544,6 +580,113 @@ void PageHandler::StartSession(std::uniq
    session_->Start();
  }
  
@@ -1499,7 +1564,7 @@
  void PageHandler::HandleStop(const base::ListValue& args) {
    StopSession();
  }
-@@ -733,6 +874,7 @@ void PageHandler::HandleSelectModel(cons
+@@ -733,6 +876,7 @@ void PageHandler::HandleSelectModel(cons
    settings.model = *model;
    SetProviderSettings(prefs, info->id, settings);
    prefs->SetString(kProvider, info->id);
@@ -1532,3 +1597,278 @@
    void OnEnabledChanged();
    void StopSession();
  
+--- a/chrome/browser/rac/ai/acp/acp_transport.cc
++++ b/chrome/browser/rac/ai/acp/acp_transport.cc
+@@ -3,7 +3,9 @@
+ 
+ #include "chrome/browser/rac/ai/acp/acp_transport.h"
+ 
++#include <errno.h>
+ #include <signal.h>
++#include <sys/wait.h>
+ #include <unistd.h>
+ 
+ #include <utility>
+@@ -17,6 +19,8 @@
+ #include "base/process/kill.h"
+ #include "base/process/launch.h"
+ #include "base/strings/string_util.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
+ 
+ namespace rac::ai {
+ namespace {
+@@ -127,6 +131,10 @@ void AcpTransport::Start(AcpLaunchSpec s
+   stdout_read_ = std::move(parent_stdout_read);
+   stderr_read_ = std::move(parent_stderr_read);
+   WatchPipes();
++  // Drain anything already buffered before the watcher was armed (edge cases
++  // on kqueue). Harmless when the pipes are still empty.
++  OnStdoutReadable();
++  OnStderrReadable();
+ }
+ 
+ void AcpTransport::WatchPipes() {
+@@ -187,6 +195,10 @@ void AcpTransport::EnqueueWrite() {
+     outbox_offset_ = 0;
+   }
+   stdin_watcher_.reset();
++  // Agents often reply before the next readable edge; drain eagerly.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&AcpTransport::OnStdoutReadable,
++                                weak_factory_.GetWeakPtr()));
+ }
+ 
+ void AcpTransport::OnStdinWritable() {
+@@ -305,8 +317,24 @@ void AcpTransport::ClosePipes() {
+ void AcpTransport::ReapChild() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   if (process_.IsValid()) {
+-    int exit_code = 0;
+-    process_.WaitForExitWithTimeout(base::Seconds(2), &exit_code);
++    const base::ProcessId pid = process_.Pid();
++    if (pid > 1) {
++      const base::TimeTicks deadline =
++          base::TimeTicks::Now() + base::Seconds(2);
++      int status = 0;
++      for (;;) {
++        const pid_t got = HANDLE_EINTR(waitpid(pid, &status, WNOHANG));
++        if (got == pid || (got < 0 && errno == ECHILD)) {
++          break;
++        }
++        if (base::TimeTicks::Now() >= deadline) {
++          kill(pid, SIGKILL);
++          HANDLE_EINTR(waitpid(pid, &status, 0));
++          break;
++        }
++        usleep(20 * 1000);
++      }
++    }
+     process_.Close();
+   }
+   launch_pid_ = base::kNullProcessId;
+--- a/chrome/browser/rac/ai/acp/agent_path.cc
++++ b/chrome/browser/rac/ai/acp/agent_path.cc
+@@ -4,6 +4,7 @@
+ #include "chrome/browser/rac/ai/acp/agent_path.h"
+ 
+ #include <signal.h>
++#include <sys/wait.h>
+ #include <unistd.h>
+ 
+ #include <utility>
+@@ -23,6 +24,7 @@
+ #include "base/strings/string_util.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/task/thread_pool.h"
++#include "base/threading/scoped_blocking_call.h"
+ #include "base/time/time.h"
+ #include "build/build_config.h"
+ 
+@@ -79,7 +81,73 @@ struct ProbeResult {
+   std::string error;
+ };
+ 
++// Reap without Process::WaitForExit (friend-gated on ThreadPool).
++void ReapPid(base::ProcessId pid, base::TimeDelta timeout) {
++  if (pid <= 1) {
++    return;
++  }
++  const base::TimeTicks deadline = base::TimeTicks::Now() + timeout;
++  int status = 0;
++  for (;;) {
++    const pid_t got = HANDLE_EINTR(waitpid(pid, &status, WNOHANG));
++    if (got == pid || (got < 0 && errno == ECHILD)) {
++      return;
++    }
++    if (base::TimeTicks::Now() >= deadline) {
++      kill(pid, SIGKILL);
++      HANDLE_EINTR(waitpid(pid, &status, 0));
++      return;
++    }
++    usleep(20 * 1000);
++  }
++}
++
++std::optional<std::string> RunAndCapture(const std::vector<std::string>& argv,
++                                         base::TimeDelta timeout) {
++  if (argv.empty()) {
++    return std::nullopt;
++  }
++  base::ScopedFD read_fd;
++  base::ScopedFD write_fd;
++  if (!base::CreatePipe(&read_fd, &write_fd, false)) {
++    return std::nullopt;
++  }
++  base::LaunchOptions options;
++  options.fds_to_remap.emplace_back(write_fd.get(), STDOUT_FILENO);
++  options.fds_to_remap.emplace_back(write_fd.get(), STDERR_FILENO);
++  base::Process process = base::LaunchProcess(argv, options);
++  write_fd.reset();
++  if (!process.IsValid()) {
++    return std::nullopt;
++  }
++  std::string out;
++  char buffer[4096];
++  const base::TimeTicks deadline = base::TimeTicks::Now() + timeout;
++  while (read_fd.is_valid()) {
++    const ssize_t got =
++        HANDLE_EINTR(read(read_fd.get(), buffer, sizeof(buffer)));
++    if (got > 0) {
++      if (out.size() < 64 * 1024) {
++        out.append(buffer, static_cast<size_t>(got));
++      }
++    } else {
++      read_fd.reset();
++    }
++    if (base::TimeTicks::Now() >= deadline) {
++      break;
++    }
++  }
++  ReapPid(process.Pid(), base::Seconds(1));
++  process.Close();
++  base::TrimString(out, "\r\n", &out);
++  if (out.empty() || out.find('\0') != std::string::npos) {
++    return std::nullopt;
++  }
++  return out;
++}
++
+ ProbeResult ProbeLoginShellPath() {
++  base::ScopedBlockingCall blocking(FROM_HERE, base::BlockingType::MAY_BLOCK);
+   ProbeResult result;
+   auto env = base::Environment::Create();
+   std::string home = env->GetVar("HOME").value_or("");
+@@ -167,24 +235,14 @@ ProbeResult ProbeLoginShellPath() {
+   if (timed_out) {
+     kill(-pid, SIGTERM);
+   }
+-  if (!process.WaitForExitWithTimeout(base::Seconds(1), nullptr)) {
+-    kill(-pid, SIGKILL);
+-    process.WaitForExitWithTimeout(base::Seconds(1), nullptr);
+-  }
++  ReapPid(pid, base::Seconds(2));
+   process.Close();
+ 
+   std::optional<std::string> parsed =
+       timed_out ? std::nullopt : ParseLoginShellPath(stdout_text, nonce);
+   if (!parsed) {
+-    std::string launchctl_out;
+-    int exit_code = 0;
+-    if (base::GetAppOutputWithExitCode({"/bin/launchctl", "getenv", "PATH"},
+-                                       &launchctl_out, &exit_code) &&
+-        exit_code == 0 && !launchctl_out.empty() &&
+-        launchctl_out.find('\0') == std::string::npos) {
+-      base::TrimString(launchctl_out, "\r\n", &launchctl_out);
+-      parsed = launchctl_out;
+-    }
++    parsed =
++        RunAndCapture({"/bin/launchctl", "getenv", "PATH"}, base::Seconds(2));
+   }
+   if (!parsed) {
+     parsed = inherited;
+@@ -197,14 +255,10 @@ ProbeResult ProbeLoginShellPath() {
+ 
+   const base::FilePath npm = FindExecutableOnPath("npm", result.path);
+   if (!npm.empty()) {
+-    std::string prefix;
+-    int exit_code = 0;
+-    if (base::GetAppOutputWithExitCode({npm.value(), "prefix", "--global"},
+-                                       &prefix, &exit_code) &&
+-        exit_code == 0) {
+-      base::TrimString(prefix, "\r\n", &prefix);
+-      if (!prefix.empty() && prefix[0] == '/') {
+-        result.path = MergeSearchPath(prefix + "/bin", result.path, home);
++    if (std::optional<std::string> prefix = RunAndCapture(
++            {npm.value(), "prefix", "--global"}, base::Seconds(3))) {
++      if (!prefix->empty() && (*prefix)[0] == '/') {
++        result.path = MergeSearchPath(*prefix + "/bin", result.path, home);
+       }
+     }
+   }
+--- a/chrome/browser/rac/ai/acp/acp_client.cc
++++ b/chrome/browser/rac/ai/acp/acp_client.cc
+@@ -3,7 +3,9 @@
+ 
+ #include "chrome/browser/rac/ai/acp/acp_client.h"
+ 
++#include <cmath>
+ #include <limits>
++#include <optional>
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
+@@ -197,6 +199,35 @@ void AcpClient::Prompt(std::string text,
+                                              .Set("text", std::move(text)))));
+ }
+ 
++namespace {
++
++std::optional<int> MessageIdAsInt(const base::DictValue& message) {
++  if (std::optional<int> number = message.FindInt("id")) {
++    return number;
++  }
++  if (std::optional<double> number = message.FindDouble("id");
++      number &&
++      *number >= static_cast<double>(std::numeric_limits<int>::min()) &&
++      *number <= static_cast<double>(std::numeric_limits<int>::max()) &&
++      *number == std::floor(*number)) {
++    return static_cast<int>(*number);
++  }
++  return std::nullopt;
++}
++
++int ProtocolVersion(const base::DictValue& result) {
++  if (std::optional<int> version = result.FindInt("protocolVersion")) {
++    return *version;
++  }
++  if (std::optional<double> version = result.FindDouble("protocolVersion");
++      version && *version == std::floor(*version)) {
++    return static_cast<int>(*version);
++  }
++  return 0;
++}
++
++}  // namespace
++
+ void AcpClient::Receive(base::DictValue message) {
+   if (state_ == State::kFailed || state_ == State::kStopped) {
+     return;
+@@ -204,7 +235,7 @@ void AcpClient::Receive(base::DictValue
+   const std::string* method = message.FindString("method");
+   const base::Value* id = message.Find("id");
+   if (!method) {
+-    const std::optional<int> number = message.FindInt("id");
++    const std::optional<int> number = MessageIdAsInt(message);
+     if (!number) {
+       return;
+     }
+@@ -285,7 +316,7 @@ void AcpClient::OnResponse(Request reque
+   }
+   switch (request) {
+     case Request::kInitialize:
+-      if (result->FindInt("protocolVersion") != 1) {
++      if (ProtocolVersion(*result) != 1) {
+         Fail("The agent does not support ACP v1.");
+         return;
+       }
