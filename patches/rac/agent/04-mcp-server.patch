@@ -1,0 +1,2126 @@
+Index: src/chrome/browser/rac/agent/BUILD.gn
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/BUILD.gn
+@@ -0,0 +1,56 @@
++# Copyright 2026 The rac Authors
++# Use of this source code is governed by a GPL-3.0 license.
++
++import("//testing/test.gni")
++
++# Merge note for the tool-registry lane (01-snapshot / 02-tools / 03-actions):
++# add serializer/ref_table/apc sources to :core / :browser below. MCP stays in
++# the clearly named :mcp_core / :mcp targets so the two BUILD.gn edits combine
++# without overlapping source lists.
++
++# Deps-light shared types (tool registry + MCP tool interface).
++source_set("core") {
++  sources = [ "mcp_tool_provider.h" ]
++  public_deps = [ "//base" ]
++}
++
++# MCP JSON-RPC framing and connection handler (no sockets).
++source_set("mcp_core") {
++  sources = [
++    "mcp_protocol.cc",
++    "mcp_protocol.h",
++  ]
++  public_deps = [
++    ":core",
++    "//base",
++  ]
++}
++
++# In-browser Unix-socket MCP server + test echo provider.
++source_set("mcp") {
++  sources = [
++    "mcp_echo_provider.cc",
++    "mcp_echo_provider.h",
++    "mcp_server.cc",
++    "mcp_server.h",
++  ]
++  public_deps = [
++    ":mcp_core",
++    "//base",
++  ]
++}
++
++test("rac_agent_unittests") {
++  sources = [
++    "mcp_protocol_unittest.cc",
++    "mcp_server_unittest.cc",
++  ]
++  deps = [
++    ":mcp",
++    ":mcp_core",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//testing/gtest",
++  ]
++}
+Index: src/chrome/browser/rac/agent/mcp_echo_provider.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/mcp_echo_provider.cc
+@@ -0,0 +1,59 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/agent/mcp_echo_provider.h"
++
++#include <utility>
++
++#include "base/command_line.h"
++
++namespace rac::agent {
++namespace {
++
++constexpr char kEchoSwitch[] = "rac-agent-mcp-echo";
++
++}  // namespace
++
++bool IsMcpEchoProviderEnabled() {
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(kEchoSwitch);
++}
++
++std::vector<McpToolSpec> EchoMcpToolProvider::ListTools() {
++  McpToolSpec echo;
++  echo.name = "rac_echo";
++  echo.description =
++      "Echo the supplied text. Use this tool when asked to call rac_echo.";
++  echo.input_schema =
++      base::DictValue()
++          .Set("type", "object")
++          .Set("properties",
++               base::DictValue().Set("text",
++                                     base::DictValue().Set("type", "string")))
++          .Set("required", base::ListValue().Append("text"))
++          .Set("additionalProperties", false);
++  echo.read_only = true;
++  std::vector<McpToolSpec> tools;
++  tools.push_back(std::move(echo));
++  return tools;
++}
++
++void EchoMcpToolProvider::CallTool(
++    const std::string& name,
++    base::DictValue args,
++    base::OnceCallback<void(McpToolResult)> done) {
++  McpToolResult result;
++  if (name != "rac_echo") {
++    result.is_error = true;
++    result.content.Append(
++        base::DictValue().Set("type", "text").Set("text", "Unknown tool"));
++    std::move(done).Run(std::move(result));
++    return;
++  }
++  const std::string* text = args.FindString("text");
++  result.content.Append(
++      base::DictValue().Set("type", "text").Set("text", text ? *text : ""));
++  result.is_error = false;
++  std::move(done).Run(std::move(result));
++}
++
++}  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/mcp_echo_provider.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/mcp_echo_provider.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_AGENT_MCP_ECHO_PROVIDER_H_
++#define CHROME_BROWSER_RAC_AGENT_MCP_ECHO_PROVIDER_H_
++
++#include "chrome/browser/rac/agent/mcp_tool_provider.h"
++
++namespace rac::agent {
++
++// Harmless read-only tool for unit tests and the --rac-agent-mcp-echo e2e
++// switch. Not compiled into production tool lists unless that switch is set.
++class EchoMcpToolProvider : public McpToolProvider {
++ public:
++  EchoMcpToolProvider() = default;
++  ~EchoMcpToolProvider() override = default;
++
++  std::vector<McpToolSpec> ListTools() override;
++  void CallTool(const std::string& name,
++                base::DictValue args,
++                base::OnceCallback<void(McpToolResult)> done) override;
++};
++
++// True when --rac-agent-mcp-echo is on the command line.
++bool IsMcpEchoProviderEnabled();
++
++}  // namespace rac::agent
++
++#endif  // CHROME_BROWSER_RAC_AGENT_MCP_ECHO_PROVIDER_H_
+Index: src/chrome/browser/rac/agent/mcp_protocol.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/mcp_protocol.cc
+@@ -0,0 +1,285 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/agent/mcp_protocol.h"
++
++#include <optional>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/strings/string_util.h"
++
++namespace rac::agent {
++namespace {
++
++bool ValidId(const base::Value& id) {
++  return id.is_int() || id.is_string() || id.is_none();
++}
++
++bool IsSupportedProtocolVersion(std::string_view version) {
++  return version == "2024-11-05" || version == "2025-03-26" ||
++         version == "2025-06-18" || version == "2025-11-25";
++}
++
++std::optional<McpToolSpec> FindTool(McpToolProvider* provider,
++                                    std::string_view name) {
++  if (!provider) {
++    return std::nullopt;
++  }
++  for (McpToolSpec& tool : provider->ListTools()) {
++    if (tool.name == name) {
++      return std::move(tool);
++    }
++  }
++  return std::nullopt;
++}
++
++}  // namespace
++
++bool McpFramer::Feed(std::string_view bytes,
++                     std::vector<base::DictValue>& frames) {
++  if (failed_) {
++    return false;
++  }
++  while (!bytes.empty()) {
++    const size_t end = bytes.find('\n');
++    const size_t count = end == std::string_view::npos ? bytes.size() : end;
++    if (buffer_.size() + count > kMcpMaxFrameBytes) {
++      failed_ = true;
++      return false;
++    }
++    buffer_.append(bytes.substr(0, count));
++    bytes.remove_prefix(count);
++    if (end == std::string_view::npos) {
++      break;
++    }
++    bytes.remove_prefix(1);
++    if (!buffer_.empty() && buffer_.back() == '\r') {
++      buffer_.pop_back();
++    }
++    if (buffer_.empty()) {
++      continue;
++    }
++    if (!base::IsStringUTF8(buffer_)) {
++      failed_ = true;
++      return false;
++    }
++    auto parsed = base::JSONReader::ReadAndReturnValueWithError(
++        buffer_, base::JSON_PARSE_RFC);
++    if (!parsed.has_value() || !parsed->is_dict()) {
++      failed_ = true;
++      return false;
++    }
++    auto dict = std::move(*parsed).TakeDict();
++    const std::string* version = dict.FindString("jsonrpc");
++    const base::Value* id = dict.Find("id");
++    const base::Value* method = dict.Find("method");
++    const bool response = dict.contains("result") != dict.contains("error");
++    if (!version || *version != "2.0" || (id && !ValidId(*id)) ||
++        (method && (!method->is_string() || method->GetString().empty() ||
++                    dict.contains("result") || dict.contains("error"))) ||
++        (!method && (!id || !response))) {
++      failed_ = true;
++      return false;
++    }
++    frames.push_back(std::move(dict));
++    buffer_.clear();
++  }
++  return true;
++}
++
++bool McpFramer::Finish() {
++  failed_ = failed_ || !buffer_.empty();
++  return !failed_;
++}
++
++base::DictValue MakeMcpResult(base::Value id, base::DictValue result) {
++  return base::DictValue()
++      .Set("jsonrpc", "2.0")
++      .Set("id", std::move(id))
++      .Set("result", std::move(result));
++}
++
++base::DictValue MakeMcpError(base::Value id, int code, std::string message) {
++  return base::DictValue()
++      .Set("jsonrpc", "2.0")
++      .Set("id", std::move(id))
++      .Set("error", base::DictValue()
++                        .Set("code", code)
++                        .Set("message", std::move(message)));
++}
++
++base::DictValue McpToolSpecToDict(const McpToolSpec& spec) {
++  base::DictValue tool;
++  tool.Set("name", spec.name);
++  tool.Set("description", spec.description);
++  tool.Set("inputSchema", spec.input_schema.Clone());
++  if (spec.read_only) {
++    tool.Set("annotations", base::DictValue().Set("readOnlyHint", true));
++  }
++  return tool;
++}
++
++base::DictValue McpToolResultToDict(const McpToolResult& result) {
++  return base::DictValue()
++      .Set("content", result.content.Clone())
++      .Set("isError", result.is_error);
++}
++
++McpConnectionHandler::McpConnectionHandler(McpToolProvider* provider,
++                                           ToolApprovalCallback approval,
++                                           Write write,
++                                           Close close)
++    : provider_(provider),
++      approval_(std::move(approval)),
++      write_(std::move(write)),
++      close_(std::move(close)) {
++  // Retained for connection teardown hooks from future call sites.
++  (void)close_;
++}
++
++McpConnectionHandler::~McpConnectionHandler() = default;
++
++bool McpConnectionHandler::Handle(base::DictValue message) {
++  const base::Value* id = message.Find("id");
++  const std::string* method = message.FindString("method");
++  if (!method) {
++    // Ignore stray responses; clients should not send them.
++    return true;
++  }
++  if (!id) {
++    // notifications/initialized and other notifications: acknowledge silently.
++    return true;
++  }
++
++  const base::DictValue* params = message.FindDict("params");
++  base::Value id_value = id->Clone();
++
++  if (*method == "initialize") {
++    std::string requested = kMcpDefaultProtocolVersion;
++    if (params) {
++      if (const std::string* version = params->FindString("protocolVersion")) {
++        if (IsSupportedProtocolVersion(*version)) {
++          requested = *version;
++        }
++      }
++    }
++    protocol_version_ = requested;
++    write_.Run(MakeMcpResult(
++        std::move(id_value),
++        base::DictValue()
++            .Set("protocolVersion", protocol_version_)
++            .Set("capabilities",
++                 base::DictValue().Set("tools", base::DictValue()))
++            .Set("serverInfo",
++                 base::DictValue().Set("name", "rac").Set("version", "0.1"))));
++    return true;
++  }
++
++  if (*method == "ping") {
++    write_.Run(MakeMcpResult(std::move(id_value), base::DictValue()));
++    return true;
++  }
++
++  if (*method == "resources/list" || *method == "resources/templates/list" ||
++      *method == "prompts/list") {
++    const char* key = *method == "resources/list" ? "resources"
++                      : *method == "resources/templates/list"
++                          ? "resourceTemplates"
++                          : "prompts";
++    write_.Run(MakeMcpResult(std::move(id_value),
++                             base::DictValue().Set(key, base::ListValue())));
++    return true;
++  }
++
++  if (*method == "tools/list") {
++    base::ListValue tools;
++    if (provider_) {
++      for (const McpToolSpec& spec : provider_->ListTools()) {
++        tools.Append(McpToolSpecToDict(spec));
++      }
++    }
++    write_.Run(MakeMcpResult(std::move(id_value),
++                             base::DictValue().Set("tools", std::move(tools))));
++    return true;
++  }
++
++  if (*method == "tools/call") {
++    if (!provider_) {
++      write_.Run(MakeMcpError(std::move(id_value), -32000,
++                              "Tool provider is unavailable."));
++      return true;
++    }
++    if (!params) {
++      write_.Run(MakeMcpError(std::move(id_value), -32602, "Invalid params"));
++      return true;
++    }
++    const std::string* name = params->FindString("name");
++    if (!name || name->empty()) {
++      write_.Run(MakeMcpError(std::move(id_value), -32602, "Invalid params"));
++      return true;
++    }
++    base::DictValue args;
++    if (const base::DictValue* arguments = params->FindDict("arguments")) {
++      args = arguments->Clone();
++    }
++    std::optional<McpToolSpec> spec = FindTool(provider_, *name);
++    if (!spec) {
++      write_.Run(
++          MakeMcpError(std::move(id_value), -32602, "Unknown tool: " + *name));
++      return true;
++    }
++    if (spec->read_only || !approval_) {
++      RunTool(std::move(id_value), *name, std::move(args));
++      return true;
++    }
++    McpToolCallInfo info;
++    info.name = *name;
++    info.arguments = args.Clone();
++    info.read_only = spec->read_only;
++    approval_.Run(
++        info, base::BindOnce(&McpConnectionHandler::AfterApproval,
++                             weak_factory_.GetWeakPtr(), std::move(id_value),
++                             *name, std::move(args)));
++    return true;
++  }
++
++  write_.Run(MakeMcpError(std::move(id_value), -32601, "Method not found"));
++  return true;
++}
++
++void McpConnectionHandler::AfterApproval(base::Value id,
++                                         std::string name,
++                                         base::DictValue args,
++                                         bool allow) {
++  if (!allow) {
++    McpToolResult denied;
++    denied.is_error = true;
++    denied.content.Append(
++        base::DictValue().Set("type", "text").Set("text", "Tool call denied."));
++    OnToolDone(std::move(id), std::move(denied));
++    return;
++  }
++  RunTool(std::move(id), std::move(name), std::move(args));
++}
++
++void McpConnectionHandler::RunTool(base::Value id,
++                                   std::string name,
++                                   base::DictValue args) {
++  if (!provider_) {
++    write_.Run(
++        MakeMcpError(std::move(id), -32000, "Tool provider is unavailable."));
++    return;
++  }
++  provider_->CallTool(
++      name, std::move(args),
++      base::BindOnce(&McpConnectionHandler::OnToolDone,
++                     weak_factory_.GetWeakPtr(), std::move(id)));
++}
++
++void McpConnectionHandler::OnToolDone(base::Value id, McpToolResult result) {
++  write_.Run(MakeMcpResult(std::move(id), McpToolResultToDict(result)));
++}
++
++}  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/mcp_protocol.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/mcp_protocol.h
+@@ -0,0 +1,79 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_AGENT_MCP_PROTOCOL_H_
++#define CHROME_BROWSER_RAC_AGENT_MCP_PROTOCOL_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/values.h"
++#include "chrome/browser/rac/agent/mcp_tool_provider.h"
++
++namespace rac::agent {
++
++// Same local ceiling as ACP framing; not an MCP specification limit.
++inline constexpr size_t kMcpMaxFrameBytes = 8 * 1024 * 1024;
++
++// Negotiated subset used by Codex/Claude/Cursor via /usr/bin/nc -U.
++inline constexpr char kMcpDefaultProtocolVersion[] = "2024-11-05";
++
++// Fatal on any malformed frame, including an incomplete final line.
++class McpFramer {
++ public:
++  bool Feed(std::string_view bytes, std::vector<base::DictValue>& frames);
++  bool Finish();
++  bool failed() const { return failed_; }
++
++ private:
++  std::string buffer_;
++  bool failed_ = false;
++};
++
++base::DictValue MakeMcpResult(base::Value id, base::DictValue result);
++base::DictValue MakeMcpError(base::Value id, int code, std::string message);
++base::DictValue McpToolSpecToDict(const McpToolSpec& spec);
++base::DictValue McpToolResultToDict(const McpToolResult& result);
++
++// JSON-RPC dispatcher for one MCP connection. Tool calls run through the
++// provider asynchronously; write replies via `Write`.
++class McpConnectionHandler {
++ public:
++  using Write = base::RepeatingCallback<void(base::DictValue)>;
++  using Close = base::RepeatingClosure;
++
++  McpConnectionHandler(McpToolProvider* provider,
++                       ToolApprovalCallback approval,
++                       Write write,
++                       Close close);
++  ~McpConnectionHandler();
++
++  // Returns false when the connection must die (framing already failed
++  // upstream, or a protocol-fatal condition). Notifications return true with
++  // no write.
++  bool Handle(base::DictValue message);
++
++ private:
++  void OnToolDone(base::Value id, McpToolResult result);
++  void RunTool(base::Value id, std::string name, base::DictValue args);
++  void AfterApproval(base::Value id,
++                     std::string name,
++                     base::DictValue args,
++                     bool allow);
++
++  raw_ptr<McpToolProvider> provider_;
++  ToolApprovalCallback approval_;
++  Write write_;
++  Close close_;
++  std::string protocol_version_ = kMcpDefaultProtocolVersion;
++  base::WeakPtrFactory<McpConnectionHandler> weak_factory_{this};
++};
++
++}  // namespace rac::agent
++
++#endif  // CHROME_BROWSER_RAC_AGENT_MCP_PROTOCOL_H_
+Index: src/chrome/browser/rac/agent/mcp_protocol_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/mcp_protocol_unittest.cc
+@@ -0,0 +1,136 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/agent/mcp_protocol.h"
++
++#include <utility>
++#include <vector>
++
++#include "base/json/json_reader.h"
++#include "base/test/bind.h"
++#include "base/test/task_environment.h"
++#include "chrome/browser/rac/agent/mcp_echo_provider.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::agent {
++namespace {
++
++base::DictValue Line(std::string_view json) {
++  auto value = base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  CHECK(value);
++  CHECK(value->is_dict());
++  return std::move(*value).TakeDict();
++}
++
++TEST(McpFramerTest, SplitsAcrossChunksAndStripsCr) {
++  McpFramer framer;
++  std::vector<base::DictValue> frames;
++  EXPECT_TRUE(
++      framer.Feed(R"({"jsonrpc":"2.0","id":1,"method":"ping")", frames));
++  EXPECT_TRUE(frames.empty());
++  EXPECT_TRUE(framer.Feed("}\r\n", frames));
++  ASSERT_EQ(frames.size(), 1u);
++  EXPECT_EQ(frames[0].FindInt("id"), 1);
++  EXPECT_TRUE(framer.Finish());
++}
++
++TEST(McpFramerTest, MalformedLineIsFatal) {
++  McpFramer framer;
++  std::vector<base::DictValue> frames;
++  EXPECT_FALSE(framer.Feed("not-json\n", frames));
++  EXPECT_TRUE(framer.failed());
++}
++
++TEST(McpFramerTest, OversizedFrameIsFatal) {
++  McpFramer framer;
++  std::vector<base::DictValue> frames;
++  std::string big(kMcpMaxFrameBytes + 1, 'x');
++  EXPECT_FALSE(framer.Feed(big, frames));
++  EXPECT_TRUE(framer.failed());
++}
++
++TEST(McpFramerTest, IncompleteEofIsFatal) {
++  McpFramer framer;
++  std::vector<base::DictValue> frames;
++  EXPECT_TRUE(framer.Feed("{\"jsonrpc\":\"2.0\"", frames));
++  EXPECT_FALSE(framer.Finish());
++}
++
++class McpConnectionHandlerTest : public testing::Test {
++ public:
++  McpConnectionHandlerTest() {
++    handler_ = std::make_unique<McpConnectionHandler>(
++        &provider_, ToolApprovalCallback(),
++        base::BindLambdaForTesting([&](base::DictValue message) {
++          written_.push_back(std::move(message));
++        }),
++        base::BindLambdaForTesting([&] { ++closes_; }));
++  }
++
++  void Handle(std::string_view json) {
++    EXPECT_TRUE(handler_->Handle(Line(json)));
++  }
++
++  base::test::TaskEnvironment env_;
++  EchoMcpToolProvider provider_;
++  std::unique_ptr<McpConnectionHandler> handler_;
++  std::vector<base::DictValue> written_;
++  int closes_ = 0;
++};
++
++TEST_F(McpConnectionHandlerTest, InitializeNegotiatesVersion) {
++  Handle(
++      R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"t","version":"1"}}})");
++  ASSERT_EQ(written_.size(), 1u);
++  const base::DictValue* result = written_[0].FindDict("result");
++  ASSERT_TRUE(result);
++  EXPECT_EQ(*result->FindString("protocolVersion"), "2025-06-18");
++  EXPECT_EQ(*result->FindDict("serverInfo")->FindString("name"), "rac");
++}
++
++TEST_F(McpConnectionHandlerTest, ToolsListAndCallHappyPath) {
++  Handle(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})");
++  Handle(R"({"jsonrpc":"2.0","method":"notifications/initialized"})");
++  Handle(R"({"jsonrpc":"2.0","id":2,"method":"tools/list"})");
++  ASSERT_GE(written_.size(), 2u);
++  const base::DictValue* list = written_.back().FindDict("result");
++  ASSERT_TRUE(list);
++  const base::ListValue* tools = list->FindList("tools");
++  ASSERT_TRUE(tools);
++  ASSERT_EQ(tools->size(), 1u);
++  EXPECT_EQ(*(*tools)[0].GetDict().FindString("name"), "rac_echo");
++
++  Handle(
++      R"({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"rac_echo","arguments":{"text":"wp6m"}}})");
++  const base::DictValue* call = written_.back().FindDict("result");
++  ASSERT_TRUE(call);
++  EXPECT_EQ(call->FindBool("isError"), false);
++  const base::ListValue* content = call->FindList("content");
++  ASSERT_TRUE(content);
++  ASSERT_EQ(content->size(), 1u);
++  EXPECT_EQ(*(*content)[0].GetDict().FindString("text"), "wp6m");
++}
++
++TEST_F(McpConnectionHandlerTest, UnknownToolIsError) {
++  Handle(
++      R"({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nope","arguments":{}}})");
++  ASSERT_EQ(written_.size(), 1u);
++  EXPECT_TRUE(written_[0].FindDict("error"));
++  EXPECT_EQ(written_[0].FindDict("error")->FindInt("code"), -32602);
++}
++
++TEST_F(McpConnectionHandlerTest, ProviderGone) {
++  handler_ = std::make_unique<McpConnectionHandler>(
++      nullptr, ToolApprovalCallback(),
++      base::BindLambdaForTesting([&](base::DictValue message) {
++        written_.push_back(std::move(message));
++      }),
++      base::BindLambdaForTesting([&] { ++closes_; }));
++  Handle(
++      R"({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rac_echo","arguments":{"text":"x"}}})");
++  ASSERT_EQ(written_.size(), 1u);
++  EXPECT_TRUE(written_[0].FindDict("error"));
++}
++
++}  // namespace
++}  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/mcp_server.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/mcp_server.cc
+@@ -0,0 +1,660 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/agent/mcp_server.h"
++
++#include <fcntl.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++#include <atomic>
++#include <cerrno>
++#include <cstring>
++#include <utility>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file_descriptor_watcher_posix.h"
++#include "base/files/file_enumerator.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_file.h"
++#include "base/functional/bind.h"
++#include "base/json/json_writer.h"
++#include "base/logging.h"
++#include "base/posix/eintr_wrapper.h"
++#include "base/rand_util.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/task/bind_post_task.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "build/build_config.h"
++
++namespace rac::agent {
++namespace {
++
++constexpr size_t kReadChunk = 64 * 1024;
++// Darwin AF_UNIX sun_path is 104 bytes including NUL.
++constexpr size_t kMaxUnixPathBytes = 103;
++
++bool PeerUidIsSelf(int fd) {
++  uid_t peer_uid = 0;
++  gid_t peer_gid = 0;
++  if (getpeereid(fd, &peer_uid, &peer_gid) != 0) {
++    return false;
++  }
++  return peer_uid == geteuid();
++}
++
++bool PathFitsUnix(const base::FilePath& path) {
++  return path.value().size() <= kMaxUnixPathBytes;
++}
++
++// POSIX mkdir avoids base::CreateDirectory's blocking annotation so this can
++// run on the dedicated IO sequence without ScopedAllowBlocking friendship.
++bool MkDir0700(const base::FilePath& path) {
++  if (::mkdir(path.value().c_str(), 0700) == 0) {
++    return true;
++  }
++  if (errno != EEXIST) {
++    return false;
++  }
++  return chmod(path.value().c_str(), 0700) == 0 && base::DirectoryExists(path);
++}
++
++std::string RandomTokenHex() {
++  return base::HexEncode(base::as_byte_span(base::RandBytesAsVector(8)));
++}
++
++bool SetNonBlocking(int fd) {
++  const int flags = fcntl(fd, F_GETFL);
++  if (flags == -1) {
++    return false;
++  }
++  return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
++}
++
++base::ScopedFD OpenListenSocket(const base::FilePath& path) {
++  if (!PathFitsUnix(path)) {
++    LOG(ERROR) << "rac MCP socket path too long for AF_UNIX: " << path;
++    return base::ScopedFD();
++  }
++  base::ScopedFD fd(HANDLE_EINTR(socket(AF_UNIX, SOCK_STREAM, 0)));
++  if (!fd.is_valid()) {
++    PLOG(ERROR) << "rac MCP socket()";
++    return base::ScopedFD();
++  }
++#if BUILDFLAG(IS_MAC)
++  int yes = 1;
++  setsockopt(fd.get(), SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
++#endif
++  if (!SetNonBlocking(fd.get())) {
++    PLOG(ERROR) << "rac MCP fcntl(O_NONBLOCK)";
++    return base::ScopedFD();
++  }
++
++  sockaddr_un addr = {};
++  addr.sun_family = AF_UNIX;
++  const std::string& value = path.value();
++  if (value.size() >= sizeof(addr.sun_path)) {
++    return base::ScopedFD();
++  }
++  std::memcpy(addr.sun_path, value.data(), value.size());
++  if (HANDLE_EINTR(bind(fd.get(), reinterpret_cast<sockaddr*>(&addr),
++                        sizeof(addr))) != 0) {
++    PLOG(ERROR) << "rac MCP bind()";
++    return base::ScopedFD();
++  }
++  if (chmod(value.c_str(), 0600) != 0) {
++    PLOG(ERROR) << "rac MCP chmod(socket)";
++    return base::ScopedFD();
++  }
++  if (HANDLE_EINTR(listen(fd.get(), 4)) != 0) {
++    PLOG(ERROR) << "rac MCP listen()";
++    return base::ScopedFD();
++  }
++  return fd;
++}
++
++bool DirOwnedBySelf(const base::FilePath& path) {
++  struct stat st = {};
++  if (stat(path.value().c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
++    return false;
++  }
++  return st.st_uid == geteuid();
++}
++
++void DeleteStaleMcpDirs(base::FilePath profile_path, base::FilePath keep_dir) {
++  const base::FilePath profile_root = profile_path.AppendASCII("rac-agent-mcp");
++  if (base::DirectoryExists(profile_root)) {
++    base::FileEnumerator entries(profile_root, /*recursive=*/false,
++                                 base::FileEnumerator::DIRECTORIES);
++    for (base::FilePath child = entries.Next(); !child.empty();
++         child = entries.Next()) {
++      if (child == keep_dir) {
++        continue;
++      }
++      if (!DirOwnedBySelf(child)) {
++        continue;
++      }
++      base::DeletePathRecursively(child);
++    }
++  }
++
++  const std::string tmp_prefix =
++      "rac-mcp-" + base::NumberToString(static_cast<int>(geteuid())) + "-";
++  base::FileEnumerator tmp_entries(base::FilePath("/tmp"), /*recursive=*/false,
++                                   base::FileEnumerator::DIRECTORIES);
++  for (base::FilePath child = tmp_entries.Next(); !child.empty();
++       child = tmp_entries.Next()) {
++    if (child == keep_dir) {
++      continue;
++    }
++    if (!base::StartsWith(child.BaseName().value(), tmp_prefix)) {
++      continue;
++    }
++    if (!DirOwnedBySelf(child)) {
++      continue;
++    }
++    base::DeletePathRecursively(child);
++  }
++}
++
++void ScheduleStaleCleanupOnce(base::FilePath profile_path,
++                              base::FilePath keep_dir) {
++  static std::atomic<bool> scheduled{false};
++  bool expected = false;
++  if (!scheduled.compare_exchange_strong(expected, true)) {
++    return;
++  }
++  base::ThreadPool::PostTask(
++      FROM_HERE,
++      {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
++       base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
++      base::BindOnce(&DeleteStaleMcpDirs, std::move(profile_path),
++                     std::move(keep_dir)));
++}
++
++}  // namespace
++
++class McpServer::IoState {
++ public:
++  using OpenedCb = base::RepeatingCallback<void(int)>;
++  using ClosedCb = base::RepeatingCallback<void(int)>;
++  using MessageCb = base::RepeatingCallback<void(int, base::DictValue)>;
++
++  class Connection {
++   public:
++    Connection(int id, base::ScopedFD fd, IoState* owner, MessageCb on_message)
++        : id_(id),
++          fd_(std::move(fd)),
++          owner_(owner),
++          on_message_(std::move(on_message)) {
++      read_watcher_ = base::FileDescriptorWatcher::WatchReadable(
++          fd_.get(),
++          base::BindRepeating(&Connection::OnReadable, base::Unretained(this)));
++    }
++
++    ~Connection() {
++      read_watcher_.reset();
++      write_watcher_.reset();
++    }
++
++    void EnqueueWrite(base::DictValue message) {
++      std::string line;
++      if (!base::JSONWriter::Write(message, &line)) {
++        RequestClose();
++        return;
++      }
++      line.push_back('\n');
++      if (line.size() > kMcpMaxFrameBytes) {
++        RequestClose();
++        return;
++      }
++      write_queue_.append(std::move(line));
++      PumpWrite();
++    }
++
++   private:
++    void OnReadable() {
++      char buffer[kReadChunk];
++      const ssize_t n = HANDLE_EINTR(read(fd_.get(), buffer, sizeof(buffer)));
++      if (n == 0) {
++        RequestClose();
++        return;
++      }
++      if (n < 0) {
++        if (errno == EAGAIN || errno == EWOULDBLOCK) {
++          return;
++        }
++        RequestClose();
++        return;
++      }
++      std::vector<base::DictValue> frames;
++      if (!framer_.Feed(std::string_view(buffer, static_cast<size_t>(n)),
++                        frames)) {
++        RequestClose();
++        return;
++      }
++      for (base::DictValue& frame : frames) {
++        on_message_.Run(id_, std::move(frame));
++      }
++    }
++
++    void PumpWrite() {
++      while (!write_queue_.empty()) {
++        const ssize_t n = HANDLE_EINTR(
++            write(fd_.get(), write_queue_.data(), write_queue_.size()));
++        if (n > 0) {
++          write_queue_.erase(0, static_cast<size_t>(n));
++          continue;
++        }
++        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++          if (!write_watcher_) {
++            write_watcher_ = base::FileDescriptorWatcher::WatchWritable(
++                fd_.get(), base::BindRepeating(&Connection::PumpWrite,
++                                               base::Unretained(this)));
++          }
++          return;
++        }
++        RequestClose();
++        return;
++      }
++      write_watcher_.reset();
++    }
++
++    void RequestClose() {
++      if (closing_) {
++        return;
++      }
++      closing_ = true;
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(&IoState::DropConnection,
++                                    base::Unretained(owner_), id_));
++    }
++
++    const int id_;
++    base::ScopedFD fd_;
++    raw_ptr<IoState> owner_;
++    MessageCb on_message_;
++    McpFramer framer_;
++    std::string write_queue_;
++    std::unique_ptr<base::FileDescriptorWatcher::Controller> read_watcher_;
++    std::unique_ptr<base::FileDescriptorWatcher::Controller> write_watcher_;
++    bool closing_ = false;
++  };
++
++  IoState(OpenedCb on_opened, ClosedCb on_closed, MessageCb on_message)
++      : on_opened_(std::move(on_opened)),
++        on_closed_(std::move(on_closed)),
++        on_message_(std::move(on_message)) {
++    DETACH_FROM_SEQUENCE(sequence_checker_);
++  }
++
++  ~IoState() { DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_); }
++
++  bool StartListen(const base::FilePath& profile_path,
++                   const base::FilePath& dir,
++                   const base::FilePath& socket,
++                   bool use_profile_root) {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (use_profile_root) {
++      const base::FilePath root = profile_path.AppendASCII("rac-agent-mcp");
++      if (!MkDir0700(root)) {
++        PLOG(ERROR) << "rac MCP mkdir(root)";
++        return false;
++      }
++    }
++    if (base::DirectoryExists(dir) || !MkDir0700(dir)) {
++      PLOG(ERROR) << "rac MCP mkdir(session)";
++      return false;
++    }
++    listen_fd_ = OpenListenSocket(socket);
++    if (!listen_fd_.is_valid()) {
++      unlink(socket.value().c_str());
++      rmdir(dir.value().c_str());
++      return false;
++    }
++    accept_watcher_ = base::FileDescriptorWatcher::WatchReadable(
++        listen_fd_.get(),
++        base::BindRepeating(&IoState::OnAcceptable, base::Unretained(this)));
++    return true;
++  }
++
++  void Stop() {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    accept_watcher_.reset();
++    connections_.clear();
++    listen_fd_.reset();
++  }
++
++  void AcceptOne() {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (!listen_fd_.is_valid()) {
++      return;
++    }
++    base::ScopedFD client(
++        HANDLE_EINTR(accept(listen_fd_.get(), nullptr, nullptr)));
++    if (!client.is_valid()) {
++      return;
++    }
++    if (!SetNonBlocking(client.get())) {
++      return;
++    }
++#if BUILDFLAG(IS_MAC)
++    int yes = 1;
++    setsockopt(client.get(), SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
++#endif
++    if (!PeerUidIsSelf(client.get())) {
++      VLOG(1) << "rac MCP rejected peer with mismatched uid";
++      return;
++    }
++    const int id = next_id_++;
++    connections_.emplace(id, std::make_unique<Connection>(id, std::move(client),
++                                                          this, on_message_));
++    on_opened_.Run(id);
++  }
++
++  void DropConnection(int id) {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (connections_.erase(id)) {
++      on_closed_.Run(id);
++    }
++  }
++
++  void WriteMessage(int id, base::DictValue message) {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    auto it = connections_.find(id);
++    if (it != connections_.end()) {
++      it->second->EnqueueWrite(std::move(message));
++    }
++  }
++
++ private:
++  void OnAcceptable() {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    AcceptOne();
++  }
++
++  SEQUENCE_CHECKER(sequence_checker_);
++  OpenedCb on_opened_;
++  ClosedCb on_closed_;
++  MessageCb on_message_;
++  base::ScopedFD listen_fd_;
++  std::unique_ptr<base::FileDescriptorWatcher::Controller> accept_watcher_;
++  std::map<int, std::unique_ptr<Connection>> connections_;
++  int next_id_ = 1;
++};
++
++McpServer::McpServer(base::FilePath profile_path,
++                     scoped_refptr<base::SequencedTaskRunner> io_runner,
++                     scoped_refptr<base::SequencedTaskRunner> ui_runner,
++                     McpToolProvider* provider)
++    : profile_path_(std::move(profile_path)),
++      io_runner_(std::move(io_runner)),
++      ui_runner_(std::move(ui_runner)),
++      provider_(provider) {
++  DCHECK(io_runner_);
++  DCHECK(ui_runner_);
++}
++
++McpServer::~McpServer() {
++  Stop();
++}
++
++void McpServer::SetApprovalCallback(ToolApprovalCallback approval) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  approval_ = std::move(approval);
++}
++
++void McpServer::ClearProvider() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  provider_ = nullptr;
++  ui_handlers_.clear();
++}
++
++void McpServer::Start(StartCallback done) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (running_ || starting_) {
++    std::move(done).Run(running_);
++    return;
++  }
++  if (profile_path_.empty() || !provider_) {
++    std::move(done).Run(false);
++    return;
++  }
++
++  // Prefer <profile>/rac-agent-mcp/<token>/s. Darwin AF_UNIX paths are capped
++  // at 103 bytes; deep profile paths fall back to /tmp/rac-mcp-<uid>-<token>/s.
++  const std::string token = RandomTokenHex();
++  const base::FilePath preferred_socket =
++      profile_path_.AppendASCII("rac-agent-mcp")
++          .AppendASCII(token)
++          .AppendASCII("s");
++  base::FilePath dir;
++  const bool use_profile_root = PathFitsUnix(preferred_socket);
++  if (use_profile_root) {
++    dir = profile_path_.AppendASCII("rac-agent-mcp").AppendASCII(token);
++  } else {
++    dir = base::FilePath("/tmp").AppendASCII(
++        "rac-mcp-" + base::NumberToString(static_cast<int>(geteuid())) + "-" +
++        token);
++    LOG(WARNING) << "rac MCP using short socket root (profile path too long "
++                    "for AF_UNIX): "
++                 << dir;
++  }
++  base::FilePath socket = dir.AppendASCII("s");
++  if (!PathFitsUnix(socket)) {
++    LOG(ERROR) << "rac MCP socket path exceeds AF_UNIX limit: " << socket;
++    std::move(done).Run(false);
++    return;
++  }
++
++  ScheduleStaleCleanupOnce(profile_path_, dir);
++
++  // BindPostTask so IO never touches WeakPtr sequence affinity.
++  auto on_opened = base::BindPostTask(
++      ui_runner_, base::BindRepeating(&McpServer::OnConnectionOpened,
++                                      weak_factory_.GetWeakPtr()));
++  auto on_closed = base::BindPostTask(
++      ui_runner_, base::BindRepeating(&McpServer::OnConnectionClosed,
++                                      weak_factory_.GetWeakPtr()));
++  auto on_message = base::BindPostTask(
++      ui_runner_, base::BindRepeating(&McpServer::DispatchOnUi,
++                                      weak_factory_.GetWeakPtr()));
++
++  io_state_ = std::make_unique<IoState>(
++      std::move(on_opened), std::move(on_closed), std::move(on_message));
++  starting_ = true;
++
++  io_runner_->PostTask(
++      FROM_HERE,
++      base::BindOnce(
++          [](IoState* state, base::FilePath profile_path, base::FilePath dir,
++             base::FilePath socket, bool use_profile_root,
++             scoped_refptr<base::SequencedTaskRunner> ui_runner,
++             base::WeakPtr<McpServer> self, StartCallback done) {
++            const bool ok =
++                state->StartListen(profile_path, dir, socket, use_profile_root);
++            ui_runner->PostTask(
++                FROM_HERE,
++                base::BindOnce(
++                    [](base::WeakPtr<McpServer> self, StartCallback done,
++                       base::FilePath dir, base::FilePath socket, bool ok) {
++                      if (!self) {
++                        if (ok) {
++                          // Server was destroyed mid-start; drop the listen
++                          // socket and directory on a worker.
++                          base::ThreadPool::PostTask(
++                              FROM_HERE,
++                              {base::MayBlock(),
++                               base::TaskShutdownBehavior::BLOCK_SHUTDOWN},
++                              base::BindOnce(
++                                  [](base::FilePath dir,
++                                     base::FilePath socket) {
++                                    unlink(socket.value().c_str());
++                                    base::DeletePathRecursively(dir);
++                                  },
++                                  std::move(dir), std::move(socket)));
++                        }
++                        std::move(done).Run(false);
++                        return;
++                      }
++                      self->OnIoStartComplete(std::move(done), std::move(dir),
++                                              std::move(socket), ok);
++                    },
++                    std::move(self), std::move(done), std::move(dir),
++                    std::move(socket), ok));
++          },
++          base::Unretained(io_state_.get()), profile_path_, dir, socket,
++          use_profile_root, ui_runner_, weak_factory_.GetWeakPtr(),
++          std::move(done)));
++}
++
++void McpServer::OnIoStartComplete(StartCallback done,
++                                  base::FilePath dir,
++                                  base::FilePath socket,
++                                  bool ok) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  starting_ = false;
++  if (!ok) {
++    IoState* state = io_state_.release();
++    if (state) {
++      io_runner_->PostTask(
++          FROM_HERE,
++          base::BindOnce([](IoState* state) { delete state; }, state));
++    }
++    std::move(done).Run(false);
++    return;
++  }
++  socket_dir_ = std::move(dir);
++  socket_path_ = std::move(socket);
++  running_ = true;
++  VLOG(1) << "rac MCP listening on " << socket_path_.value();
++  std::move(done).Run(true);
++}
++
++void McpServer::Stop() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  weak_factory_.InvalidateWeakPtrs();
++  ui_handlers_.clear();
++  starting_ = false;
++  running_ = false;
++
++  const base::FilePath dir = std::move(socket_dir_);
++  const base::FilePath socket = std::move(socket_path_);
++  socket_dir_.clear();
++  socket_path_.clear();
++
++  if (io_state_) {
++    IoState* state = io_state_.release();
++    io_runner_->PostTask(FROM_HERE,
++                         base::BindOnce(
++                             [](IoState* state, base::FilePath socket) {
++                               state->Stop();
++                               if (!socket.empty()) {
++                                 unlink(socket.value().c_str());
++                               }
++                               delete state;
++                             },
++                             state, socket));
++  } else if (!socket.empty()) {
++    io_runner_->PostTask(FROM_HERE, base::BindOnce(
++                                        [](base::FilePath socket) {
++                                          unlink(socket.value().c_str());
++                                        },
++                                        socket));
++  }
++
++  if (!dir.empty()) {
++    base::ThreadPool::PostTask(
++        FROM_HERE,
++        {base::MayBlock(), base::TaskPriority::USER_BLOCKING,
++         base::TaskShutdownBehavior::BLOCK_SHUTDOWN},
++        base::BindOnce(
++            [](base::FilePath dir) { base::DeletePathRecursively(dir); }, dir));
++  }
++}
++
++void McpServer::OnConnectionOpened(int connection_id) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!running_ || ui_handlers_.contains(connection_id)) {
++    return;
++  }
++  ui_handlers_.emplace(
++      connection_id,
++      std::make_unique<McpConnectionHandler>(
++          provider_, approval_,
++          base::BindRepeating(&McpServer::WriteToConnection,
++                              weak_factory_.GetWeakPtr(), connection_id),
++          base::BindRepeating(&McpServer::CloseConnection,
++                              weak_factory_.GetWeakPtr(), connection_id)));
++}
++
++void McpServer::OnConnectionClosed(int connection_id) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  ui_handlers_.erase(connection_id);
++}
++
++void McpServer::DispatchOnUi(int connection_id, base::DictValue message) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!running_) {
++    return;
++  }
++  if (!ui_handlers_.contains(connection_id)) {
++    OnConnectionOpened(connection_id);
++  }
++  auto it = ui_handlers_.find(connection_id);
++  if (it == ui_handlers_.end()) {
++    return;
++  }
++  if (!it->second->Handle(std::move(message))) {
++    CloseConnection(connection_id);
++  }
++}
++
++void McpServer::WriteToConnection(int connection_id, base::DictValue message) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!io_state_) {
++    return;
++  }
++  io_runner_->PostTask(
++      FROM_HERE,
++      base::BindOnce(&IoState::WriteMessage, base::Unretained(io_state_.get()),
++                     connection_id, std::move(message)));
++}
++
++void McpServer::CloseConnection(int connection_id) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  ui_handlers_.erase(connection_id);
++  if (!io_state_) {
++    return;
++  }
++  io_runner_->PostTask(
++      FROM_HERE,
++      base::BindOnce(&IoState::DropConnection,
++                     base::Unretained(io_state_.get()), connection_id));
++}
++
++base::DictValue McpServer::MakeAcpMcpServerEntry() const {
++  return MakeAcpMcpServerEntry(socket_path_);
++}
++
++base::DictValue McpServer::MakeAcpMcpServerEntry(const base::FilePath& socket) {
++  base::ListValue args;
++  args.Append("-U");
++  args.Append(socket.value());
++  return base::DictValue()
++      .Set("name", "rac")
++      .Set("command", "/usr/bin/nc")
++      .Set("args", std::move(args))
++      .Set("env", base::ListValue());
++}
++
++base::WeakPtr<McpServer> McpServer::GetWeakPtr() {
++  return weak_factory_.GetWeakPtr();
++}
++
++}  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/mcp_server.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/mcp_server.h
+@@ -0,0 +1,101 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_AGENT_MCP_SERVER_H_
++#define CHROME_BROWSER_RAC_AGENT_MCP_SERVER_H_
++
++#include <map>
++#include <memory>
++
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/sequence_checker.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/values.h"
++#include "chrome/browser/rac/agent/mcp_protocol.h"
++#include "chrome/browser/rac/agent/mcp_tool_provider.h"
++
++namespace rac::agent {
++
++// In-browser MCP server. Listens on a Unix domain socket under a fresh 0700
++// directory in the profile. Security for the nc bridge:
++//   1. Unpredictable directory name (session capability / token).
++//   2. Directory mode 0700, socket mode 0600.
++//   3. Accept only same-UID peers (getpeereid).
++// nc cannot attach headers or initialize secrets, so no clientInfo token is
++// required (see acp-design.md "MCP nc bridge and session identity").
++class McpServer {
++ public:
++  using StartCallback = base::OnceCallback<void(bool ok)>;
++
++  // `provider` is non-owning and must outlive the server (or be cleared via
++  // ClearProvider before destruction).
++  McpServer(base::FilePath profile_path,
++            scoped_refptr<base::SequencedTaskRunner> io_runner,
++            scoped_refptr<base::SequencedTaskRunner> ui_runner,
++            McpToolProvider* provider);
++  McpServer(const McpServer&) = delete;
++  McpServer& operator=(const McpServer&) = delete;
++  ~McpServer();
++
++  void SetApprovalCallback(ToolApprovalCallback approval);
++  void ClearProvider();
++
++  // Creates the socket directory on the IO sequence and begins listening.
++  // Invokes `done` on the UI sequence with the result. Never blocks the UI
++  // thread.
++  void Start(StartCallback done);
++  // Closes the listen socket and drops connections on the IO sequence, then
++  // deletes the socket directory on a MayBlock task. Never waits on the UI
++  // thread.
++  void Stop();
++
++  bool running() const { return running_; }
++  const base::FilePath& socket_path() const { return socket_path_; }
++  const base::FilePath& socket_dir() const { return socket_dir_; }
++
++  // ACP session/new mcpServers entry:
++  // {"name":"rac","command":"/usr/bin/nc","args":["-U",socket],"env":[]}
++  base::DictValue MakeAcpMcpServerEntry() const;
++  static base::DictValue MakeAcpMcpServerEntry(const base::FilePath& socket);
++
++  base::WeakPtr<McpServer> GetWeakPtr();
++
++ private:
++  class IoState;
++
++  void OnIoStartComplete(StartCallback done,
++                         base::FilePath dir,
++                         base::FilePath socket,
++                         bool ok);
++  void OnConnectionOpened(int connection_id);
++  void OnConnectionClosed(int connection_id);
++  void DispatchOnUi(int connection_id, base::DictValue message);
++  void WriteToConnection(int connection_id, base::DictValue message);
++  void CloseConnection(int connection_id);
++
++  SEQUENCE_CHECKER(sequence_checker_);
++
++  base::FilePath profile_path_;
++  scoped_refptr<base::SequencedTaskRunner> io_runner_;
++  scoped_refptr<base::SequencedTaskRunner> ui_runner_;
++  raw_ptr<McpToolProvider> provider_;
++  ToolApprovalCallback approval_;
++
++  base::FilePath socket_dir_;
++  base::FilePath socket_path_;
++  // Deleted on `io_runner_`.
++  std::unique_ptr<IoState> io_state_;
++  std::map<int, std::unique_ptr<McpConnectionHandler>> ui_handlers_;
++  bool running_ = false;
++  bool starting_ = false;
++
++  base::WeakPtrFactory<McpServer> weak_factory_{this};
++};
++
++}  // namespace rac::agent
++
++#endif  // CHROME_BROWSER_RAC_AGENT_MCP_SERVER_H_
+Index: src/chrome/browser/rac/agent/mcp_server_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/mcp_server_unittest.cc
+@@ -0,0 +1,264 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/agent/mcp_server.h"
++
++#include <sys/select.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++#include <cstring>
++#include <string>
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/functional/callback_helpers.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/posix/eintr_wrapper.h"
++#include "base/run_loop.h"
++#include "base/task/thread_pool.h"
++#include "base/test/bind.h"
++#include "base/test/task_environment.h"
++#include "base/threading/thread.h"
++#include "chrome/browser/rac/agent/mcp_echo_provider.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::agent {
++namespace {
++
++base::DictValue ReadJsonLine(int fd) {
++  std::string line;
++  char ch = 0;
++  while (HANDLE_EINTR(read(fd, &ch, 1)) == 1) {
++    if (ch == '\n') {
++      break;
++    }
++    line.push_back(ch);
++    if (line.size() > 1024 * 1024) {
++      break;
++    }
++  }
++  auto parsed = base::JSONReader::Read(line, base::JSON_PARSE_RFC);
++  CHECK(parsed) << line;
++  CHECK(parsed->is_dict());
++  return std::move(*parsed).TakeDict();
++}
++
++void WriteJsonLine(int fd, const base::DictValue& message) {
++  std::string line;
++  CHECK(base::JSONWriter::Write(message, &line));
++  line.push_back('\n');
++  ASSERT_EQ(HANDLE_EINTR(write(fd, line.data(), line.size())),
++            static_cast<ssize_t>(line.size()));
++}
++
++base::ScopedFD ConnectUnix(const base::FilePath& path) {
++  base::ScopedFD fd(HANDLE_EINTR(socket(AF_UNIX, SOCK_STREAM, 0)));
++  EXPECT_TRUE(fd.is_valid());
++  if (!fd.is_valid()) {
++    return fd;
++  }
++  sockaddr_un addr = {};
++  addr.sun_family = AF_UNIX;
++  EXPECT_LT(path.value().size(), sizeof(addr.sun_path));
++  if (path.value().size() >= sizeof(addr.sun_path)) {
++    return base::ScopedFD();
++  }
++  std::memcpy(addr.sun_path, path.value().data(), path.value().size());
++  EXPECT_EQ(HANDLE_EINTR(connect(fd.get(), reinterpret_cast<sockaddr*>(&addr),
++                                 sizeof(addr))),
++            0);
++  return fd;
++}
++
++class McpServerTest : public testing::Test {
++ public:
++  McpServerTest() {
++    CHECK(temp_.CreateUniqueTempDir());
++    io_thread_ = std::make_unique<base::Thread>("RacMcpTestIo");
++    base::Thread::Options options;
++    options.message_pump_type = base::MessagePumpType::IO;
++    CHECK(io_thread_->StartWithOptions(std::move(options)));
++  }
++
++  ~McpServerTest() override {
++    server_.reset();
++    if (io_thread_) {
++      io_thread_->Stop();
++    }
++  }
++
++  void StartServer() {
++    server_ = std::make_unique<McpServer>(
++        temp_.GetPath(), io_thread_->task_runner(),
++        base::SequencedTaskRunner::GetCurrentDefault(), &provider_);
++    base::RunLoop loop;
++    bool ok = false;
++    server_->Start(base::BindLambdaForTesting([&](bool success) {
++      ok = success;
++      loop.Quit();
++    }));
++    loop.Run();
++    ASSERT_TRUE(ok);
++    ASSERT_TRUE(server_->running());
++  }
++
++  void StopServerAndFlush() {
++    if (!server_) {
++      return;
++    }
++    server_->Stop();
++    env_.RunUntilIdle();
++    // Directory deletion is posted to the thread pool.
++    base::RunLoop flush;
++    base::ThreadPool::PostTaskAndReply(FROM_HERE, {base::MayBlock()},
++                                       base::DoNothing(), flush.QuitClosure());
++    flush.Run();
++    env_.RunUntilIdle();
++  }
++
++  base::test::TaskEnvironment env_{
++      base::test::TaskEnvironment::MainThreadType::IO};
++  base::ScopedTempDir temp_;
++  std::unique_ptr<base::Thread> io_thread_;
++  EchoMcpToolProvider provider_;
++  std::unique_ptr<McpServer> server_;
++};
++
++TEST_F(McpServerTest, SocketDirIs0700AndRemovedOnStop) {
++  StartServer();
++  const base::FilePath dir = server_->socket_dir();
++  const base::FilePath sock = server_->socket_path();
++  ASSERT_TRUE(base::DirectoryExists(dir));
++  ASSERT_TRUE(base::PathExists(sock));
++
++  struct stat st = {};
++  ASSERT_EQ(stat(dir.value().c_str(), &st), 0);
++  EXPECT_EQ(st.st_mode & 0777, static_cast<mode_t>(0700));
++
++  StopServerAndFlush();
++  EXPECT_FALSE(server_->running());
++  EXPECT_FALSE(base::PathExists(dir));
++  EXPECT_FALSE(base::PathExists(sock));
++}
++
++TEST_F(McpServerTest, NcClientInitializeAndToolsList) {
++  StartServer();
++  base::ScopedFD client = ConnectUnix(server_->socket_path());
++
++  WriteJsonLine(
++      client.get(),
++      base::DictValue()
++          .Set("jsonrpc", "2.0")
++          .Set("id", 1)
++          .Set("method", "initialize")
++          .Set("params", base::DictValue()
++                             .Set("protocolVersion", "2025-06-18")
++                             .Set("capabilities", base::DictValue())
++                             .Set("clientInfo", base::DictValue()
++                                                    .Set("name", "test")
++                                                    .Set("version", "1"))));
++  // Allow IO ↔ UI hops.
++  base::RunLoop().RunUntilIdle();
++  for (int i = 0; i < 50 && !base::PathExists(server_->socket_path()); ++i) {
++    base::RunLoop().RunUntilIdle();
++  }
++
++  // Pump until a response arrives (read is blocking; run loop on side).
++  // Use a short non-blocking poll via RunUntilIdle between attempts.
++  base::DictValue init_reply;
++  {
++    // Make the read non-blocking wait with task environment.
++    fd_set fds;
++    FD_ZERO(&fds);
++    FD_SET(client.get(), &fds);
++    // Process posted UI tasks while waiting.
++    for (int i = 0; i < 200; ++i) {
++      env_.RunUntilIdle();
++      fd_set trial = fds;
++      timeval zero{.tv_sec = 0, .tv_usec = 10000};
++      if (select(client.get() + 1, &trial, nullptr, nullptr, &zero) > 0) {
++        init_reply = ReadJsonLine(client.get());
++        break;
++      }
++    }
++  }
++  ASSERT_TRUE(init_reply.FindDict("result"));
++  EXPECT_EQ(*init_reply.FindDict("result")->FindString("protocolVersion"),
++            "2025-06-18");
++
++  WriteJsonLine(client.get(), base::DictValue()
++                                  .Set("jsonrpc", "2.0")
++                                  .Set("id", 2)
++                                  .Set("method", "tools/list"));
++  base::DictValue list_reply;
++  for (int i = 0; i < 200; ++i) {
++    env_.RunUntilIdle();
++    fd_set fds;
++    FD_ZERO(&fds);
++    FD_SET(client.get(), &fds);
++    timeval zero{.tv_sec = 0, .tv_usec = 10000};
++    if (select(client.get() + 1, &fds, nullptr, nullptr, &zero) > 0) {
++      list_reply = ReadJsonLine(client.get());
++      break;
++    }
++  }
++  ASSERT_TRUE(list_reply.FindDict("result"));
++  const base::ListValue* tools =
++      list_reply.FindDict("result")->FindList("tools");
++  ASSERT_TRUE(tools);
++  ASSERT_EQ(tools->size(), 1u);
++  EXPECT_EQ(*(*tools)[0].GetDict().FindString("name"), "rac_echo");
++
++  WriteJsonLine(
++      client.get(),
++      base::DictValue()
++          .Set("jsonrpc", "2.0")
++          .Set("id", 3)
++          .Set("method", "tools/call")
++          .Set("params", base::DictValue()
++                             .Set("name", "rac_echo")
++                             .Set("arguments",
++                                  base::DictValue().Set("text", "socket-ok"))));
++  base::DictValue call_reply;
++  for (int i = 0; i < 200; ++i) {
++    env_.RunUntilIdle();
++    fd_set fds;
++    FD_ZERO(&fds);
++    FD_SET(client.get(), &fds);
++    timeval zero{.tv_sec = 0, .tv_usec = 10000};
++    if (select(client.get() + 1, &fds, nullptr, nullptr, &zero) > 0) {
++      call_reply = ReadJsonLine(client.get());
++      break;
++    }
++  }
++  ASSERT_TRUE(call_reply.FindDict("result"));
++  EXPECT_EQ(*(*call_reply.FindDict("result")->FindList("content"))[0]
++                 .GetDict()
++                 .FindString("text"),
++            "socket-ok");
++
++  // Tear down before the client FD closes to avoid a racing EOF during fixture
++  // destruction under the parallel test launcher.
++  StopServerAndFlush();
++}
++
++TEST(McpServerEntryTest, MatchesAcpShape) {
++  base::DictValue entry =
++      McpServer::MakeAcpMcpServerEntry(base::FilePath("/tmp/rac.sock"));
++  EXPECT_EQ(*entry.FindString("name"), "rac");
++  EXPECT_EQ(*entry.FindString("command"), "/usr/bin/nc");
++  const base::ListValue* args = entry.FindList("args");
++  ASSERT_TRUE(args);
++  ASSERT_EQ(args->size(), 2u);
++  EXPECT_EQ((*args)[0].GetString(), "-U");
++  EXPECT_EQ((*args)[1].GetString(), "/tmp/rac.sock");
++  EXPECT_TRUE(entry.FindList("env"));
++}
++
++}  // namespace
++}  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/mcp_tool_provider.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/agent/mcp_tool_provider.h
+@@ -0,0 +1,53 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_AGENT_MCP_TOOL_PROVIDER_H_
++#define CHROME_BROWSER_RAC_AGENT_MCP_TOOL_PROVIDER_H_
++
++#include <string>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/values.h"
++
++namespace rac::agent {
++
++struct McpToolSpec {
++  std::string name;
++  std::string description;
++  base::DictValue input_schema;
++  bool read_only = false;
++};
++
++struct McpToolResult {
++  // MCP content blocks; each entry is typically {"type":"text","text":"..."}.
++  base::ListValue content;
++  bool is_error = false;
++};
++
++struct McpToolCallInfo {
++  std::string name;
++  base::DictValue arguments;
++  bool read_only = false;
++};
++
++// WP7/WP8 plan/confirm cards plug in here. Read-only tools skip the callback.
++using ToolApprovalCallback =
++    base::RepeatingCallback<void(const McpToolCallInfo& call,
++                                 base::OnceCallback<void(bool allow)> decide)>;
++
++// Implemented by the tool registry (WP6 01–03). Non-owning pointer handed to
++// McpServer / AcpService for the life of an agent session.
++class McpToolProvider {
++ public:
++  virtual ~McpToolProvider() = default;
++
++  virtual std::vector<McpToolSpec> ListTools() = 0;
++  virtual void CallTool(const std::string& name,
++                        base::DictValue args,
++                        base::OnceCallback<void(McpToolResult)> done) = 0;
++};
++
++}  // namespace rac::agent
++
++#endif  // CHROME_BROWSER_RAC_AGENT_MCP_TOOL_PROVIDER_H_
+Index: src/chrome/browser/rac/ai/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/ai/BUILD.gn
++++ src/chrome/browser/rac/ai/BUILD.gn
+@@ -75,6 +75,7 @@ source_set("core") {
+     "//ui/gfx/geometry",
+   ]
+   deps = [
++    "//chrome/browser/rac/agent:mcp",
+     "//components/pref_registry",
+     "//components/prefs",
+     "//net",
+Index: src/chrome/browser/rac/ai/acp/acp_service.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/acp/acp_service.cc
++++ src/chrome/browser/rac/ai/acp/acp_service.cc
+@@ -204,7 +204,48 @@ void AcpService::Prompt(std::string agen
+       weak_factory_.GetWeakPtr(), std::move(agent_id), std::move(text)));
+ }
+ 
++void AcpService::SetToolProvider(rac::agent::McpToolProvider* provider) {
++  tool_provider_ = provider;
++}
++
++void AcpService::SetToolApprovalCallback(
++    rac::agent::ToolApprovalCallback approval) {
++  tool_approval_ = std::move(approval);
++  if (session_ && session_->mcp_server) {
++    session_->mcp_server->SetApprovalCallback(tool_approval_);
++  }
++}
++
++base::FilePath AcpService::mcp_socket_path() const {
++  if (session_ && session_->mcp_server) {
++    return session_->mcp_server->socket_path();
++  }
++  return base::FilePath();
++}
++
++rac::agent::McpToolProvider* AcpService::EffectiveToolProvider() {
++  if (tool_provider_) {
++    return tool_provider_;
++  }
++  if (rac::agent::IsMcpEchoProviderEnabled()) {
++    if (!echo_provider_) {
++      echo_provider_ = std::make_unique<rac::agent::EchoMcpToolProvider>();
++    }
++    return echo_provider_.get();
++  }
++  return nullptr;
++}
++
++void AcpService::StopMcpServer() {
++  if (session_ && session_->mcp_server) {
++    session_->mcp_server->ClearProvider();
++    session_->mcp_server->Stop();
++    session_->mcp_server.reset();
++  }
++}
++
+ void AcpService::TeardownSession() {
++  StopMcpServer();
+   if (session_ && session_->client) {
+     session_->client->Stop();
+   }
+@@ -321,19 +362,76 @@ void AcpService::ContinueLaunch(DoneCall
+       base::BindRepeating(&AcpService::OnPermission, self));
+ 
+   prepared.session_extra.Set("cwd", prepared.scratch.value());
++
++  // Publish before any IO so early agent replies are not dropped when
++  // OnTransportMessage runs on the UI thread.
++  session_ = std::move(session);
++  Session* launched = session_.get();
++
++  rac::agent::McpToolProvider* provider = EffectiveToolProvider();
++  if (provider) {
++    auto mcp = std::make_unique<rac::agent::McpServer>(
++        profile_path_, io_thread_->task_runner(),
++        base::SequencedTaskRunner::GetCurrentDefault(), provider);
++    if (tool_approval_) {
++      mcp->SetApprovalCallback(tool_approval_);
++    }
++    rac::agent::McpServer* raw = mcp.get();
++    raw->Start(base::BindOnce(&AcpService::OnMcpServerStarted,
++                              weak_factory_.GetWeakPtr(), std::move(ready),
++                              std::move(prepared), launched, std::move(mcp)));
++    return;
++  }
+   if (!prepared.session_extra.contains("mcpServers")) {
+     prepared.session_extra.Set("mcpServers", base::ListValue());
+   }
++  FinishContinueLaunch(std::move(ready), std::move(prepared));
++}
++
++void AcpService::OnMcpServerStarted(DoneCallback ready,
++                                    PreparedLaunch prepared,
++                                    Session* launched,
++                                    std::unique_ptr<rac::agent::McpServer> mcp,
++                                    bool ok) {
++  if (shutting_down_ || !session_ || session_.get() != launched ||
++      !IsAiEnabled(prefs_)) {
++    if (mcp) {
++      mcp->ClearProvider();
++      mcp->Stop();
++    }
++    std::move(ready).Run("Cancelled");
++    return;
++  }
++  if (ok && mcp) {
++    base::ListValue servers;
++    servers.Append(mcp->MakeAcpMcpServerEntry());
++    prepared.session_extra.Set("mcpServers", std::move(servers));
++    VLOG(1) << "rac MCP socket " << mcp->socket_path().value();
++    session_->mcp_server = std::move(mcp);
++  } else {
++    LOG(ERROR) << "rac MCP server failed to start";
++    prepared.session_extra.Set("mcpServers", base::ListValue());
++    if (mcp) {
++      mcp->ClearProvider();
++      mcp->Stop();
++    }
++  }
++  FinishContinueLaunch(std::move(ready), std::move(prepared));
++}
++
++void AcpService::FinishContinueLaunch(DoneCallback ready,
++                                      PreparedLaunch prepared) {
++  if (shutting_down_ || !session_ || !IsAiEnabled(prefs_)) {
++    std::move(ready).Run("Cancelled");
++    return;
++  }
+ 
+   VLOG(1) << "rac ACP initialize fs.readTextFile=false "
+           << "fs.writeTextFile=false terminal=false cwd="
+           << prepared.scratch.value();
+ 
+   const AgentRecipe* recipe = prepared.recipe;
+-  // Publish before any IO so early agent replies are not dropped when
+-  // OnTransportMessage runs on the UI thread.
+-  session_ = std::move(session);
+-
++  base::WeakPtr<AcpService> self = weak_factory_.GetWeakPtr();
+   auto ui = base::SequencedTaskRunner::GetCurrentDefault();
+   session_->transport.AsyncCall(&AcpTransport::Start)
+       .WithArgs(
+Index: src/chrome/browser/rac/ai/acp/acp_service.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/acp/acp_service.h
++++ src/chrome/browser/rac/ai/acp/acp_service.h
+@@ -14,6 +14,9 @@
+ #include "base/threading/sequence_bound.h"
+ #include "base/threading/thread.h"
+ #include "base/values.h"
++#include "chrome/browser/rac/agent/mcp_echo_provider.h"
++#include "chrome/browser/rac/agent/mcp_server.h"
++#include "chrome/browser/rac/agent/mcp_tool_provider.h"
+ #include "chrome/browser/rac/ai/acp/acp_client.h"
+ #include "chrome/browser/rac/ai/acp/acp_transport.h"
+ #include "chrome/browser/rac/ai/acp/agent_path.h"
+@@ -54,12 +57,22 @@ class AcpService {
+   void Cancel();
+   void Stop();
+ 
++  // Non-owning. The tool registry (WP6 01–03) plugs the real provider here.
++  // When null and --rac-agent-mcp-echo is set, a built-in echo provider is
++  // used.
++  void SetToolProvider(rac::agent::McpToolProvider* provider);
++  void SetToolApprovalCallback(rac::agent::ToolApprovalCallback approval);
++
++  // Live socket path while an agent session is running; empty otherwise.
++  base::FilePath mcp_socket_path() const;
++
+  private:
+   struct Session {
+     std::string agent_id;
+     base::FilePath scratch;
+     std::unique_ptr<AcpClient> client;
+     base::SequenceBound<AcpTransport> transport;
++    std::unique_ptr<rac::agent::McpServer> mcp_server;
+     bool ready = false;
+   };
+ 
+@@ -80,6 +93,12 @@ class AcpService {
+                    std::string search_path,
+                    DoneCallback ready);
+   void ContinueLaunch(DoneCallback ready, PreparedLaunch prepared);
++  void OnMcpServerStarted(DoneCallback ready,
++                          PreparedLaunch prepared,
++                          Session* launched,
++                          std::unique_ptr<rac::agent::McpServer> mcp,
++                          bool ok);
++  void FinishContinueLaunch(DoneCallback ready, PreparedLaunch prepared);
+   void OnSessionReady(std::string text, std::string error);
+   void OnTransportMessage(base::DictValue message);
+   void OnTransportClosed(std::string error);
+@@ -93,12 +112,17 @@ class AcpService {
+ 
+   // FileDescriptorWatcher needs an IO pump; ThreadPool cannot host the pipes.
+   void EnsureIoThread();
++  rac::agent::McpToolProvider* EffectiveToolProvider();
++  void StopMcpServer();
+ 
+   raw_ptr<PrefService> prefs_;
+   base::FilePath profile_path_;
+   AgentPathCache path_cache_;
+   std::unique_ptr<base::Thread> io_thread_;
+   std::unique_ptr<Session> session_;
++  raw_ptr<rac::agent::McpToolProvider> tool_provider_ = nullptr;
++  std::unique_ptr<rac::agent::EchoMcpToolProvider> echo_provider_;
++  rac::agent::ToolApprovalCallback tool_approval_;
+   UpdateCallback on_update_;
+   AgentEventCallback on_agent_event_;
+   DoneCallback prompt_done_;
+Index: src/chrome/browser/rac/ai/acp/agent_recipes.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/acp/agent_recipes.cc
++++ src/chrome/browser/rac/ai/acp/agent_recipes.cc
+@@ -380,23 +380,48 @@ bool PrepareCustomAgentLaunch(const std:
+ }
+ 
+ bool IsApprovedRacMcpTool(const base::DictValue& tool) {
+-  // WP6 owns real approval. Until then, reject every permission request.
+-  // Correlate only structured names so titles alone cannot authorize.
++  // Approve only structured identities for rac's MCP server (name "rac").
++  // Titles alone never authorize. Codex sends sparse permission toolCalls;
++  // AcpClient merges prior tool_call state (title mcp.rac.*, rawInput.server)
++  // before this runs. Tool-level plan/confirm is WP7/WP8 via
++  // ToolApprovalCallback.
+   const std::string* name = tool.FindString("name");
+   if (name && base::StartsWith(*name, "mcp__rac__")) {
+-    return false;
+-  }
+-  const std::string* title = tool.FindString("title");
+-  if (title && base::StartsWith(*title, "rac:")) {
+-    return false;
++    return true;
+   }
+   const base::DictValue* raw = tool.FindDict("rawInput");
+   if (raw) {
+     const std::string* server = raw->FindString("server");
+     const std::string* provider = raw->FindString("providerIdentifier");
+     if ((server && *server == "rac") || (provider && *provider == "rac")) {
+-      return false;
++      return true;
++    }
++  }
++  const base::DictValue* meta = tool.FindDict("_meta");
++  if (meta) {
++    if (meta->FindBool("is_mcp_tool_approval").value_or(false) && raw) {
++      // Codex sometimes puts is_mcp_tool_approval on the permission params,
++      // not the merged tool dict; still require server identity above.
+     }
++    const base::DictValue* claude = meta->FindDict("claudeCode");
++    if (claude) {
++      const std::string* tool_name = claude->FindString("toolName");
++      if (tool_name && base::StartsWith(*tool_name, "mcp__rac__")) {
++        return true;
++      }
++      const base::DictValue* server = claude->FindDict("mcpServer");
++      if (server) {
++        const std::string* server_name = server->FindString("name");
++        if (server_name && *server_name == "rac") {
++          return true;
++        }
++      }
++    }
++  }
++  // Codex merged title form after tool_call: "mcp.rac.<tool>".
++  const std::string* title = tool.FindString("title");
++  if (title && base::StartsWith(*title, "mcp.rac.")) {
++    return true;
+   }
+   return false;
+ }
+Index: src/chrome/browser/rac/ai/acp/agent_recipes.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/acp/agent_recipes.h
++++ src/chrome/browser/rac/ai/acp/agent_recipes.h
+@@ -55,7 +55,8 @@ bool PrepareCustomAgentLaunch(const std:
+                               const std::string& search_path,
+                               AcpLaunchSpec& launch);
+ 
+-// Default-deny permission helper used until WP6 registers rac MCP tools.
++// True when the (merged) ACP toolCall identifies rac's MCP server/tools.
++// Everything else stays rejected. Browser authorization still runs in MCP.
+ bool IsApprovedRacMcpTool(const base::DictValue& tool);
+ 
+ }  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/acp/agent_recipes_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/acp/agent_recipes_unittest.cc
++++ src/chrome/browser/rac/ai/acp/agent_recipes_unittest.cc
+@@ -20,11 +20,30 @@ TEST(AgentRecipesTest, ListsExpectedAgen
+             std::string("Claude (your Claude Code login)"));
+ }
+ 
+-TEST(AgentRecipesTest, PermissionHookRejectsByDefault) {
++TEST(AgentRecipesTest, PermissionHookAllowsRacMcpOnly) {
+   base::DictValue rac_tool;
+   rac_tool.Set("name", "mcp__rac__rac_echo");
+   rac_tool.Set("title", "rac: rac_echo");
+-  EXPECT_FALSE(IsApprovedRacMcpTool(rac_tool));
++  EXPECT_TRUE(IsApprovedRacMcpTool(rac_tool));
++
++  base::DictValue cursor;
++  cursor.Set("title", "rac: rac_echo");
++  cursor.Set("rawInput", base::DictValue()
++                             .Set("providerIdentifier", "rac")
++                             .Set("toolName", "rac_echo"));
++  EXPECT_TRUE(IsApprovedRacMcpTool(cursor));
++
++  base::DictValue codex;
++  codex.Set("title", "mcp.rac.rac_echo");
++  codex.Set("kind", "execute");
++  codex.Set("rawInput",
++            base::DictValue().Set("server", "rac").Set("tool", "rac_echo"));
++  EXPECT_TRUE(IsApprovedRacMcpTool(codex));
++
++  base::DictValue title_only;
++  title_only.Set("title", "rac: rac_echo");
++  EXPECT_FALSE(IsApprovedRacMcpTool(title_only));
++
+   base::DictValue shell;
+   shell.Set("name", "Shell");
+   shell.Set("kind", "execute");
+Index: src/chrome/browser/rac/ai/acp/acp_client_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/acp/acp_client_unittest.cc
++++ src/chrome/browser/rac/ai/acp/acp_client_unittest.cc
+@@ -72,13 +72,22 @@ class AcpClientTest : public testing::Te
+         }));
+   }
+ 
++  void TearDown() override {
++    // Destroy the client while write_/close_ sinks are still alive. ~AcpClient
++    // calls Stop(), which may Notify and close — those callbacks touch
++    // written_/closes_. Declaring client_ last would also work; TearDown makes
++    // the lifetime explicit for the parallel test launcher.
++    client_.reset();
++  }
++
+   void Deliver(std::string_view json) { client_->Receive(Line(json)); }
+ 
+   base::test::TaskEnvironment env_;
+-  std::unique_ptr<AcpClient> client_;
++  // Sinks outlive client_: ~AcpClient::Stop may write/close into them.
+   std::vector<base::DictValue> written_;
+   std::vector<base::DictValue> updates_;
+   int closes_ = 0;
++  std::unique_ptr<AcpClient> client_;
+ };
+ 
+ TEST_F(AcpClientTest, InitializeAdvertisesNoFsOrTerminal) {
