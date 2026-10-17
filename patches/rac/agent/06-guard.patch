@@ -1,0 +1,1886 @@
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -167,6 +167,8 @@
+ #include "chrome/browser/profiles/renderer_updater.h"
+ #include "chrome/browser/profiles/renderer_updater_factory.h"
+ #include "chrome/browser/pwc/privileged_web_contents.h"
++#include "chrome/browser/rac/agent/action_context.h"
++#include "chrome/browser/rac/agent/commit_guard.h"
+ #include "chrome/browser/renderer_host/chrome_navigation_ui_data.h"
+ #include "chrome/browser/renderer_preferences_util.h"
+ #include "chrome/browser/safe_browsing/url_checker_delegate_impl.h"
+@@ -4355,6 +4357,11 @@ bool ChromeContentBrowserClient::CanCrea
+ 
+   content::WebContents* web_contents =
+       content::WebContents::FromRenderFrameHost(opener);
++  if (rac::agent::ActionContext::BlockSideEffect(
++          web_contents,
++          "Popups are blocked. Use an explicitly approved open_tab action.")) {
++    return false;
++  }
+   Profile* profile =
+       Profile::FromBrowserContext(web_contents->GetBrowserContext());
+   DCHECK(profile);
+@@ -5539,7 +5546,9 @@ ChromeContentBrowserClient::CreateCommit
+       &conditions);
+ #endif
+ 
+-
++  if (auto condition = rac::agent::CreateCommitGuard(*navigation_handle)) {
++    conditions.push_back(std::move(condition));
++  }
+   return conditions;
+ }
+ 
+@@ -9433,6 +9442,10 @@ bool ChromeContentBrowserClient::ShouldD
+ 
+ bool ChromeContentBrowserClient::IsFileSystemAccessApiFilePickerAllowed(
+     WebContents* web_contents) {
++  if (rac::agent::ActionContext::BlockSideEffect(
++          web_contents, "The agent cannot open file-system pickers.")) {
++    return false;
++  }
+ #if !BUILDFLAG(IS_ANDROID)
+   if (base::FeatureList::IsEnabled(
+           actor::kGlicBlockFileSystemAccessApiFilePicker)) {
+--- a/chrome/browser/download/chrome_download_manager_delegate.cc
++++ b/chrome/browser/download/chrome_download_manager_delegate.cc
+@@ -51,6 +51,7 @@
+ #include "chrome/browser/platform_util.h"
+ #include "chrome/browser/policy/chrome_policy_blocklist_service_factory.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/agent/action_context.h"
+ #include "chrome/browser/tab_group_sync/tab_group_sync_tab_state.h"
+ #include "chrome/browser/ui/chrome_pages.h"
+ #include "chrome/browser/ui/scoped_tabbed_browser_displayer.h"
+@@ -2390,6 +2391,12 @@ void ChromeDownloadManagerDelegate::Chec
+     OnCheckDownloadAllowedFailed(std::move(check_download_allowed_cb));
+     return;
+   }
++
++  if (rac::agent::ActionContext::BlockSideEffect(
++          web_contents, "Downloads are not allowed for browser tools.")) {
++    OnCheckDownloadAllowedFailed(std::move(check_download_allowed_cb));
++    return;
++  }
+ 
+   // Check whether download is restricted for saved tab groups.
+   if (tab_groups::RestrictDownloadOnSyncedTabs() &&
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -230,9 +230,9 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[rac::kLayout] = settings_api::PrefType::kNumber;
+   (*s_allowlist)[rac::ai::kEnabled] = settings_api::PrefType::kBoolean;
++  (*s_allowlist)[rac::ai::kBrowserControl] = settings_api::PrefType::kBoolean;
+   (*s_allowlist)[rac::ai::kNewTabPage] = settings_api::PrefType::kBoolean;
+-  (*s_allowlist)[rac::ai::kAttachCurrentTab] =
+-      settings_api::PrefType::kBoolean;
++  (*s_allowlist)[rac::ai::kAttachCurrentTab] = settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumCenteredLocationBar] =
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumMinimalLocationBar] =
+--- a/chrome/browser/rac/agent/BUILD.gn
++++ b/chrome/browser/rac/agent/BUILD.gn
+@@ -5,6 +5,8 @@ import("//testing/test.gni")
+ 
+ source_set("core") {
+   sources = [
++    "action_guard.cc",
++    "action_guard.h",
+     "action_types.h",
+     "ref_table.cc",
+     "ref_table.h",
+@@ -21,16 +23,28 @@ source_set("core") {
+   ]
+ }
+ 
+-source_set("browser") {
++source_set("context") {
+   sources = [
+     "action_context.cc",
+     "action_context.h",
++  ]
++  public_deps = [
++    "//base",
++    "//content/public/browser",
++    "//url",
++  ]
++}
++
++source_set("browser") {
++  sources = [
+     "action_runner.cc",
+     "action_runner.h",
+     "agent_debug.cc",
+     "agent_debug.h",
+     "apc_extract.cc",
+     "apc_extract.h",
++    "commit_guard.cc",
++    "commit_guard.h",
+     "navigation_throttle.cc",
+     "navigation_throttle.h",
+     "page_settler.cc",
+@@ -41,6 +55,7 @@ source_set("browser") {
+     "tab_tools.h",
+   ]
+   public_deps = [
++    ":context",
+     ":core",
+     "//base",
+     "//chrome/browser/rac/ai:core",
+@@ -49,6 +64,7 @@ source_set("browser") {
+   ]
+   deps = [
+     "//chrome/browser/profiles:profile",
++    "//chrome/browser/rac/spaces:tab_state",
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/navigator",
+     "//chrome/browser/ui/tabs:tab_strip",
+@@ -72,6 +88,7 @@ source_set("agent") {
+ 
+ test("rac_agent_unittests") {
+   sources = [
++    "action_guard_unittest.cc",
+     "ref_table_unittest.cc",
+     "snapshot_serializer_unittest.cc",
+     "tool_registry_unittest.cc",
+--- a/chrome/browser/rac/agent/action_context.cc
++++ b/chrome/browser/rac/agent/action_context.cc
+@@ -3,6 +3,8 @@
+ 
+ #include "chrome/browser/rac/agent/action_context.h"
+ 
++#include "url/origin.h"
++
+ namespace rac::agent {
+ 
+ WEB_CONTENTS_USER_DATA_KEY_IMPL(ActionContext);
+@@ -15,6 +17,20 @@ ActionContext::ActionContext(content::We
+       agent_opened_(agent_opened) {}
+ 
+ ActionContext::~ActionContext() = default;
++bool ActionContext::BlockSideEffect(content::WebContents* contents,
++                                    std::string reason) {
++  auto* context = From(contents);
++  if (!context || !context->enforcing()) {
++    return false;
++  }
++  context->ReportBlocked(std::move(reason));
++  return true;
++}
++bool ActionContext::AllowsNavigation(const GURL& url) const {
++  return !enforcing() ||
++         (url.SchemeIsHTTPOrHTTPS() &&
++          allowed_origins_.contains(url::Origin::Create(url).Serialize()));
++}
+ 
+ // static
+ ActionContext* ActionContext::From(content::WebContents* contents) {
+--- a/chrome/browser/rac/agent/action_context.h
++++ b/chrome/browser/rac/agent/action_context.h
+@@ -4,10 +4,12 @@
+ #ifndef CHROME_BROWSER_RAC_AGENT_ACTION_CONTEXT_H_
+ #define CHROME_BROWSER_RAC_AGENT_ACTION_CONTEXT_H_
+ 
++#include <set>
+ #include <string>
+ #include <unordered_set>
+ 
+ #include "content/public/browser/web_contents_user_data.h"
++#include "url/gurl.h"
+ 
+ namespace content {
+ class WebContents;
+@@ -28,6 +30,19 @@ class ActionContext : public content::We
+ 
+   const std::string& session_id() const { return session_id_; }
+   bool agent_opened() const { return agent_opened_; }
++  void SetAllowedOrigins(std::set<std::string> origins) {
++    allowed_origins_ = std::move(origins);
++    armed_ = true;
++  }
++  bool AllowsNavigation(const GURL& url) const;
++  bool enforcing() const { return armed_ && !paused_; }
++  static bool BlockSideEffect(content::WebContents* contents,
++                              std::string reason);
++  void ReportBlocked(std::string reason) {
++    blocked_reason_ = std::move(reason);
++  }
++  const std::string& blocked_reason() const { return blocked_reason_; }
++  void ClearBlockedReason() { blocked_reason_.clear(); }
+   bool paused() const { return paused_; }
+   void SetPaused(bool paused) { paused_ = paused; }
+ 
+@@ -37,9 +52,12 @@ class ActionContext : public content::We
+                 std::string session_id,
+                 bool agent_opened);
+ 
++  std::set<std::string> allowed_origins_;
+   std::string session_id_;
+   bool agent_opened_ = false;
+   bool paused_ = false;
++  bool armed_ = false;
++  std::string blocked_reason_;
+ 
+   WEB_CONTENTS_USER_DATA_KEY_DECL();
+ };
+--- /dev/null
++++ b/chrome/browser/rac/agent/action_guard.cc
+@@ -0,0 +1,99 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++#include "chrome/browser/rac/agent/action_guard.h"
++
++#include "base/strings/string_util.h"
++#include "url/gurl.h"
++namespace rac::agent {
++void ActionGuard::BeginTurn(const std::vector<std::string>& user_messages,
++                            const std::set<std::string>& origins) {
++  urls_.clear();
++  origins_ = origins;
++  plan_allowed_ = false;
++  for (const auto& message : user_messages) {
++    size_t position = 0;
++    while ((position = message.find("http", position)) != std::string::npos) {
++      size_t end = message.find_first_of(" \t\n\r<>\"'`", position);
++      std::string candidate = message.substr(
++          position, end == std::string::npos ? end : end - position);
++      if (IsAllowedAgentUrl(candidate)) {
++        urls_.insert(GURL(candidate).spec());
++      }
++      while (!candidate.empty() &&
++             (candidate.back() == '.' || candidate.back() == ')' ||
++              candidate.back() == ']')) {
++        candidate.pop_back();
++      }
++      if (IsAllowedAgentUrl(candidate)) {
++        urls_.insert(GURL(candidate).spec());
++      }
++      position = end == std::string::npos ? message.size() : end + 1;
++    }
++  }
++}
++void ActionGuard::RememberPageLink(const std::string& url) {
++  if (IsAllowedAgentUrl(url) && urls_.size() < 4096) {
++    urls_.insert(GURL(url).spec());
++  }
++}
++void ActionGuard::AllowPlan(const std::set<std::string>& additional_origins) {
++  origins_.insert(additional_origins.begin(), additional_origins.end());
++  plan_allowed_ = true;
++}
++
++GuardResult ActionGuard::Evaluate(const ActionMetadata& action) const {
++  const auto* tool = FindToolDefinition(action.risk.tool_name);
++  if (!tool) {
++    return {GuardDecision::kBlock, RiskClass::kConsequential,
++            "Unknown browser tool."};
++  }
++  if (tool->kind == ToolKind::kRead) {
++    return {GuardDecision::kAllow, RiskClass::kNone, ""};
++  }
++  if (action.download ||
++      base::ToLowerASCII(action.risk.element_name).find("download") !=
++          std::string::npos) {
++    return {GuardDecision::kBlock, RiskClass::kConsequential,
++            "Downloads are not allowed."};
++  }
++  if (!action.url.empty()) {
++    if (!IsAllowedAgentUrl(action.url)) {
++      return {GuardDecision::kBlock, RiskClass::kConsequential,
++              "Only http(s) web pages are allowed."};
++    }
++    if (action.requires_url_provenance &&
++        !urls_.contains(GURL(action.url).spec())) {
++      return {GuardDecision::kBlock, RiskClass::kConsequential,
++              "This URL was not supplied by the user or a visible page link."};
++    }
++  }
++  RiskClass risk = ClassifyActionRisk(action.risk);
++  if (action.submit || action.press_enter || action.unknown_target ||
++      action.closing_user_tab ||
++      !origins_.contains(action.risk.current_origin) ||
++      (!action.frame_origin.empty() &&
++       !origins_.contains(action.frame_origin))) {
++    risk = RiskClass::kConsequential;
++  }
++  if (!plan_allowed_) {
++    return {GuardDecision::kPlan, risk,
++            "Review the browser plan before starting."};
++  }
++  if (risk != RiskClass::kLow) {
++    return {GuardDecision::kConfirm, risk,
++            "This step may send information, change an account, or leave the "
++            "allowed sites."};
++  }
++  return {GuardDecision::kAllow, risk, ""};
++}
++std::string RiskClassName(RiskClass risk) {
++  switch (risk) {
++    case RiskClass::kNone:
++      return "read";
++    case RiskClass::kLow:
++      return "low";
++    case RiskClass::kConsequential:
++      return "consequential";
++  }
++}
++}  // namespace rac::agent
+--- /dev/null
++++ b/chrome/browser/rac/agent/action_guard.h
+@@ -0,0 +1,44 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++#ifndef CHROME_BROWSER_RAC_AGENT_ACTION_GUARD_H_
++#define CHROME_BROWSER_RAC_AGENT_ACTION_GUARD_H_
++#include <set>
++#include <string>
++#include <vector>
++
++#include "chrome/browser/rac/agent/tool_registry.h"
++namespace rac::agent {
++struct ActionMetadata {
++  ActionRiskInput risk;
++  std::string url;
++  bool requires_url_provenance = true;
++  std::string frame_origin;
++  bool submit = false;
++  bool press_enter = false;
++  bool unknown_target = false;
++  bool download = false;
++  bool closing_user_tab = false;
++};
++enum class GuardDecision { kAllow, kPlan, kConfirm, kBlock };
++struct GuardResult {
++  GuardDecision decision = GuardDecision::kBlock;
++  RiskClass risk = RiskClass::kConsequential;
++  std::string reason;
++};
++class ActionGuard {
++ public:
++  void BeginTurn(const std::vector<std::string>& user_messages,
++                 const std::set<std::string>& origins);
++  void RememberPageLink(const std::string& url);
++  void AllowPlan(const std::set<std::string>& additional_origins = {});
++  GuardResult Evaluate(const ActionMetadata& action) const;
++  const std::set<std::string>& origins() const { return origins_; }
++
++ private:
++  std::set<std::string> urls_;
++  std::set<std::string> origins_;
++  bool plan_allowed_ = false;
++};
++std::string RiskClassName(RiskClass risk);
++}  // namespace rac::agent
++#endif
+--- /dev/null
++++ b/chrome/browser/rac/agent/action_guard_unittest.cc
+@@ -0,0 +1,124 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++#include "chrome/browser/rac/agent/action_guard.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++namespace rac::agent {
++namespace {
++ActionMetadata Low() {
++  ActionMetadata a;
++  a.risk.tool_name = "type";
++  a.risk.current_origin = "https://example.com";
++  a.risk.element_role = "textbox";
++  a.risk.element_name = "Email";
++  return a;
++}
++}  // namespace
++TEST(ActionGuardTest, ReadsAreFreeAndFirstActionNeedsPlan) {
++  ActionGuard guard;
++  guard.BeginTurn({}, {"https://example.com"});
++  auto a = Low();
++  a.risk.tool_name = "snapshot";
++  EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kAllow);
++  a = Low();
++  EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kPlan);
++  guard.AllowPlan();
++  EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kAllow);
++  guard.BeginTurn({}, {"https://example.com"});
++  EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kPlan);
++}
++TEST(ActionGuardTest, EveryConsequentialStepNeedsConfirmation) {
++  ActionGuard guard;
++  guard.BeginTurn({}, {"https://example.com"});
++  guard.AllowPlan();
++  for (const char* label : {"Submit", "Send", "Buy", "Checkout", "Pay",
++                            "Delete", "Upload", "Sign in"}) {
++    auto a = Low();
++    a.risk.tool_name = "click";
++    a.risk.element_name = label;
++    EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kConfirm) << label;
++  }
++  for (int i = 0; i < 7; ++i) {
++    auto a = Low();
++    if (i == 0) {
++      a.risk.is_password_field = true;
++    }
++    if (i == 1) {
++      a.risk.is_payment_field = true;
++    }
++    if (i == 2) {
++      a.submit = true;
++    }
++    if (i == 3) {
++      a.press_enter = true;
++    }
++    if (i == 4) {
++      a.unknown_target = true;
++    }
++    if (i == 5) {
++      a.frame_origin = "https://other.com";
++    }
++    if (i == 6) {
++      a.closing_user_tab = true;
++    }
++    EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kConfirm) << i;
++  }
++}
++TEST(ActionGuardTest, ProvenanceIsExactAndNeverComesFromPageText) {
++  ActionGuard guard;
++  guard.BeginTurn({"Open https://example.com/start."}, {"https://example.com"});
++  guard.AllowPlan();
++  auto a = Low();
++  a.risk.tool_name = "navigate";
++  a.url = "https://example.com/start";
++  EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kConfirm);
++  a.url = "https://example.com/injection";
++  EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kBlock);
++  guard.RememberPageLink(a.url);
++  EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kConfirm);
++  a.url = "https://forms.example.com/submit";
++  a.submit = true;
++  a.requires_url_provenance = false;
++  EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kConfirm);
++  a.requires_url_provenance = true;
++  a.submit = false;
++  a.url = "https://example.com/injection";
++  a.url += "?different";
++  EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kBlock);
++}
++TEST(ActionGuardTest, SchemesDownloadsAndUnknownToolsStayBlocked) {
++  ActionGuard guard;
++  guard.BeginTurn({}, {"https://example.com"});
++  guard.AllowPlan();
++  auto a = Low();
++  a.risk.tool_name = "navigate";
++  for (const char* url :
++       {"chrome://settings", "chrome-extension://x/a", "file:///tmp/a",
++        "data:text/html,x", "javascript:alert(1)",
++        "blob:https://example.com/a"}) {
++    a.url = url;
++    guard.RememberPageLink(url);
++    EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kBlock) << url;
++  }
++  a = Low();
++  a.download = true;
++  EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kBlock);
++  a = Low();
++  a.risk.tool_name = "shell";
++  EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kBlock);
++}
++TEST(ActionGuardTest, NoGrantForOtherOriginsOrFrames) {
++  ActionGuard guard;
++  guard.BeginTurn({}, {"https://example.com"});
++  guard.AllowPlan({"https://planned.com"});
++  auto planned = Low();
++  planned.risk.current_origin = "https://planned.com";
++  EXPECT_EQ(guard.Evaluate(planned).decision, GuardDecision::kAllow);
++  auto a = Low();
++  a.risk.current_origin = "https://other.com";
++  EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kConfirm);
++  a = Low();
++  a.frame_origin = "https://other.com";
++  EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kConfirm);
++}
++}  // namespace rac::agent
+--- a/chrome/browser/rac/agent/action_runner.cc
++++ b/chrome/browser/rac/agent/action_runner.cc
+@@ -16,6 +16,7 @@
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "components/prefs/pref_service.h"
++#include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/render_widget_host.h"
+ #include "content/public/browser/render_widget_host_observer.h"
+@@ -99,7 +100,7 @@ ActionRunner::ActionRunner(Profile* prof
+                            PrefService* prefs,
+                            RefTable* refs)
+     : profile_(profile),
+-      browser_(browser),
++      browser_(browser ? browser->GetWeakPtr() : nullptr),
+       prefs_(prefs),
+       refs_(refs),
+       tab_tools_(std::make_unique<TabTools>(browser)) {}
+@@ -114,7 +115,8 @@ ActionRunner::~ActionRunner() {
+ }
+ 
+ bool ActionRunner::IsAllowed() const {
+-  return IsBrowserControlAllowed(prefs_, profile_);
++  return browser_ && browser_->GetProfile() == profile_ &&
++         IsBrowserControlAllowed(prefs_, profile_);
+ }
+ 
+ void ActionRunner::AttachTab(const std::string& tab_id,
+@@ -161,8 +163,14 @@ bool ActionRunner::GateOrFail(DoneCallba
+ }
+ 
+ void ActionRunner::Cancel() {
++  auto* contents = running_ ? ResolveTab(pending_request_.tab_id) : nullptr;
++  const auto target =
++      contents ? contents->GetWeakPtr() : base::WeakPtr<content::WebContents>();
+   renderer_tools_.Cancel();
+   settler_.Cancel();
++  if (target && target->GetController().GetPendingEntry()) {
++    target->Stop();
++  }
+   if (running_ && pending_done_) {
+     ActionResult r = Denied("cancelled", "Action cancelled.");
+     r.may_have_acted = true;
+@@ -212,9 +220,13 @@ void ActionRunner::Run(ActionRequest req
+     std::string tab_id;
+     ActionResult r = tab_tools_->OpenTab(a.url, &tab_id);
+     if (r.ok && !tab_id.empty()) {
+-      ownership_.Attach(tab_id, /*agent_opened=*/true);
+       if (content::WebContents* contents = tab_tools_->FindByAlias(tab_id)) {
+-        ActionContext::Ensure(contents, "session", true);
++        AttachTab(tab_id, contents, true);
++        r.tab_id = tab_id;
++        pending_request_.tab_id = tab_id;
++        settler_.Prepare(contents->GetPrimaryMainFrame(), base::Seconds(10));
++        OnToolDone(std::move(r));
++        return;
+       }
+     }
+     Finish(std::move(r));
+@@ -362,9 +374,10 @@ void ActionRunner::Run(ActionRequest req
+         fail(Denied("stale_ref", "stale ref for press_key"));
+         return;
+       }
+-      renderer_tools_.Type(contents, *entry, "", true,
+-                           base::BindOnce(&ActionRunner::OnToolDone,
+-                                          weak_factory_.GetWeakPtr()));
++      renderer_tools_.Type(
++          contents, *entry, "", true,
++          base::BindOnce(&ActionRunner::OnToolDone, weak_factory_.GetWeakPtr()),
++          false);
+       return;
+     }
+     fail(Denied("unsupported",
+@@ -380,7 +393,7 @@ void ActionRunner::OnToolDone(ActionResu
+     return;
+   }
+   content::WebContents* contents = ResolveTab(pending_request_.tab_id);
+-  if (!contents || !result.ok) {
++  if (!contents || (!result.ok && !result.may_have_acted)) {
+     Finish(std::move(result));
+     return;
+   }
+--- a/chrome/browser/rac/agent/action_types.h
++++ b/chrome/browser/rac/agent/action_types.h
+@@ -95,6 +95,7 @@ struct ActionEvent {
+ };
+ 
+ struct ActionResult {
++  std::string tab_id;
+   bool ok = false;
+   std::string error_code;
+   std::string error;
+--- a/chrome/browser/rac/agent/agent_controller.cc
++++ b/chrome/browser/rac/agent/agent_controller.cc
+@@ -19,6 +19,7 @@
+ #include "chrome/browser/rac/ai/chat_protocol.h"
+ #include "chrome/browser/rac/ai/page_text.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "components/optimization_guide/proto/features/common_quality_data.pb.h"
+ #include "components/prefs/pref_service.h"
+ #include "content/public/browser/web_contents.h"
+ #include "url/origin.h"
+@@ -142,7 +143,7 @@ void AgentController::BeginTurn(
+       continue;
+     }
+     const std::string alias = tabs.AliasFor(tab);
+-    if (alias.empty()) {
++    if (alias.empty() || tabs.FindByAlias(alias) != tab) {
+       continue;
+     }
+     current_->tabs[alias] = tab->GetWeakPtr();
+@@ -153,6 +154,13 @@ void AgentController::BeginTurn(
+       current_->runner->AttachTab(alias, tab.get(), false);
+     }
+   }
++  std::set<std::string> origins;
++  for (const auto& [alias, tab] : current_->tabs) {
++    if (tab) {
++      origins.insert(Origin(tab.get()));
++    }
++  }
++  guard_.BeginTurn(user_messages, origins);
+   State("working");
+ }
+ void AgentController::Emit(base::DictValue event) {
+@@ -225,6 +233,9 @@ std::string AgentController::Label() con
+   if (pending_.name == "find_in_page") {
+     return "Find text in the page";
+   }
++  if (pending_.name == "press_key") {
++    return "Press Enter in the field";
++  }
+   if (pending_.name == "go_back") {
+     return "Go back";
+   }
+@@ -350,6 +361,12 @@ void AgentController::OnPageRead(
+   if (!for_action) {
+     previous = snapshot;
+   }
++  for (const auto& line : snapshot.lines) {
++    if (const auto* entry = current_->refs.Lookup(line.ref);
++        entry && entry->in_viewport) {
++      guard_.RememberPageLink(entry->link_url);
++    }
++  }
+   if (for_action) {
+     const auto* entry =
+         current_->refs.Lookup(String(pending_.arguments, "ref"));
+@@ -404,21 +421,125 @@ void AgentController::OnPageRead(
+                        page, base::UnguessableToken::Create().ToString()));
+   Finish(std::move(out));
+ }
++ActionMetadata AgentController::Metadata() const {
++  ActionMetadata meta;
++  meta.risk.tool_name = pending_.name;
++  meta.risk.current_origin = Origin(TargetTab());
++  const RefEntry* entry =
++      current_->refs.Lookup(String(pending_.arguments, "ref"));
++  if (entry) {
++    meta.risk.element_role = entry->role;
++    meta.risk.element_name = entry->name;
++    meta.risk.control_type = entry->control_type;
++    meta.risk.is_password_field = entry->password;
++    meta.risk.is_payment_field = entry->sensitive;
++    meta.frame_origin = entry->frame_origin;
++    using namespace optimization_guide::proto;
++    meta.submit = entry->control_type ==
++                      base::NumberToString(FORM_CONTROL_TYPE_BUTTON_SUBMIT) ||
++                  entry->control_type ==
++                      base::NumberToString(FORM_CONTROL_TYPE_INPUT_SUBMIT);
++    meta.risk.is_file_input =
++        entry->control_type ==
++        base::NumberToString(FORM_CONTROL_TYPE_INPUT_FILE);
++    meta.unknown_target =
++        (pending_.name == "click" && entry->role != "link" &&
++         entry->role != "checkbox" && entry->role != "radio" &&
++         entry->control_type.empty());
++    if ((pending_.name == "type" || pending_.name == "select_option") &&
++        entry->control_type.empty()) {
++      meta.unknown_target = true;
++    }
++    if (pending_.name == "click") {
++      meta.url = entry->link_url;
++    }
++    if ((pending_.name == "click" && meta.submit) ||
++        ((pending_.name == "type" || pending_.name == "press_key") &&
++         (pending_.arguments.FindBool("press_enter").value_or(false) ||
++          pending_.name == "press_key"))) {
++      meta.url = entry->form_action;
++      meta.requires_url_provenance = false;
++    }
++  } else if (pending_.name == "click" || pending_.name == "type" ||
++             pending_.name == "select_option") {
++    meta.unknown_target = true;
++  }
++  meta.press_enter =
++      pending_.arguments.FindBool("press_enter").value_or(false) ||
++      pending_.name == "press_key";
++  if (pending_.name == "navigate" || pending_.name == "open_tab") {
++    meta.url = String(pending_.arguments, "url");
++  }
++  if (!meta.url.empty()) {
++    meta.risk.target_origin = url::Origin::Create(GURL(meta.url)).Serialize();
++    meta.risk.cross_origin =
++        meta.risk.target_origin != meta.risk.current_origin;
++  }
++  meta.unknown_target |= pending_.name == "go_back";
++  meta.closing_user_tab = pending_.name == "close_tab";
++  return meta;
++}
+ void AgentController::Authorize() {
+-  RequestConfirmation("Allow this browser action?");
++  const auto decision = guard_.Evaluate(Metadata());
++  if (decision.decision == GuardDecision::kBlock) {
++    Finish(Error("denied", decision.reason));
++    return;
++  }
++  if (decision.decision == GuardDecision::kPlan) {
++    awaiting_plan_ = true;
++    approval_id_ = "approval-" + base::NumberToString(++next_id_);
++    State(paused_ ? "paused" : "waiting");
++    planned_origins_ = guard_.origins();
++    const auto meta = Metadata();
++    if (!meta.frame_origin.empty()) {
++      planned_origins_.insert(meta.frame_origin);
++    }
++    if (!meta.risk.target_origin.empty()) {
++      planned_origins_.insert(meta.risk.target_origin);
++    }
++    base::ListValue origins;
++    for (const auto& origin : planned_origins_) {
++      origins.Append(origin);
++    }
++    Emit(base::DictValue()
++             .Set("type", "plan_request")
++             .Set("id", approval_id_)
++             .Set("goal", goal_)
++             .Set("steps", base::ListValue().Append(Label()))
++             .Set("origins", std::move(origins))
++             .Set("tabId", TargetAlias()));
++    return;
++  }
++  if (decision.decision == GuardDecision::kConfirm) {
++    RequestConfirmation(decision.reason);
++    return;
++  }
++  RunAllowed();
++}
++void AgentController::RunAllowed() {
++  if (const auto* entry =
++          current_->refs.Lookup(String(pending_.arguments, "ref"))) {
++    approved_fingerprint_ = entry->policy_fingerprint;
++    revalidating_ = true;
++    ReadPage(true);
++  } else {
++    Dispatch();
++  }
+ }
+ void AgentController::RequestConfirmation(std::string reason) {
++  awaiting_plan_ = false;
++  approval_origin_ = Origin(TargetTab());
+   approval_id_ = "approval-" + base::NumberToString(++next_id_);
+   if (const auto* entry =
+           current_->refs.Lookup(String(pending_.arguments, "ref"))) {
+     approved_fingerprint_ = entry->policy_fingerprint;
+   }
+-  State("waiting");
++  State(paused_ ? "paused" : "waiting");
+   Emit(base::DictValue()
+            .Set("type", "confirm_request")
+            .Set("id", approval_id_)
+            .Set("action", Label())
+-           .Set("risk", "consequential")
++           .Set("risk", RiskClassName(guard_.Evaluate(Metadata()).risk))
+            .Set("reason", reason)
+            .Set("origin", Origin(TargetTab()))
+            .Set("tabId", TargetAlias()));
+@@ -428,6 +549,10 @@ void AgentController::Respond(const std:
+   if (id != approval_id_ || !done_ || approval_id_.empty()) {
+     return;
+   }
++  if (decision != "stop" && decision != "allow" && decision != "allow_once" &&
++      decision != "deny" && decision != "skip") {
++    return;
++  }
+   approval_id_.clear();
+   if (decision == "stop") {
+     Cancel();
+@@ -438,7 +563,29 @@ void AgentController::Respond(const std:
+         Error("declined", "The user declined this action. Do not retry it."));
+     return;
+   }
++  if (awaiting_plan_) {
++    awaiting_plan_ = false;
++    guard_.AllowPlan(planned_origins_);
++    State(paused_ ? "paused" : "working");
++    if (paused_) {
++      deferred_ = base::BindOnce(&AgentController::Authorize,
++                                 operation_factory_.GetWeakPtr());
++    } else {
++      Authorize();
++    }
++    return;
++  }
++  if (Origin(TargetTab()) != approval_origin_) {
++    Finish(Error("stale_ref", "The tab navigated while awaiting approval."));
++    return;
++  }
+   ++confirmed_;
++  if (!Metadata().frame_origin.empty()) {
++    guard_.AllowPlan({Metadata().frame_origin});
++  }
++  if (!Metadata().risk.target_origin.empty()) {
++    guard_.AllowPlan({Metadata().risk.target_origin});
++  }
+   State(paused_ ? "paused" : "working");
+   auto continuation = base::BindOnce(
+       [](base::WeakPtr<AgentController> self) {
+@@ -505,12 +652,41 @@ void AgentController::Dispatch() {
+   }
+   published.snapshot_id = current_->snapshot_id;
+   current_->runner->SetLastSnapshot(std::move(published));
++  if (auto* tab = TargetTab()) {
++    if (auto* context = ActionContext::From(tab)) {
++      std::set<std::string> origins;
++      if (Metadata().risk.target_origin.empty()) {
++        origins.insert(Origin(tab));
++      }
++      const auto meta = Metadata();
++      if (!meta.risk.target_origin.empty()) {
++        origins.insert(meta.risk.target_origin);
++      }
++      context->ClearBlockedReason();
++      context->SetAllowedOrigins(std::move(origins));
++    }
++  }
+   action_dispatched_ = true;
+   current_->runner->Run(std::move(request),
+                         base::BindOnce(&AgentController::OnActionDone,
+                                        operation_factory_.GetWeakPtr()));
+ }
+ void AgentController::OnActionDone(ActionResult result) {
++  if (!result.tab_id.empty() && current_->browser) {
++    if (auto* tab =
++            TabTools(current_->browser.get()).FindByAlias(result.tab_id)) {
++      current_->tabs[result.tab_id] = tab->GetWeakPtr();
++      current_->default_tab = result.tab_id;
++    }
++  }
++  if (auto* context = ActionContext::From(TargetTab());
++      context && !context->blocked_reason().empty()) {
++    result.ok = false;
++    result.error_code = "denied";
++    result.error = context->blocked_reason();
++    result.may_have_acted = true;
++    context->ClearBlockedReason();
++  }
+   ToolResult out;
+   out.ok = result.ok;
+   out.error = std::move(result.error);
+@@ -568,6 +744,15 @@ void AgentController::Pause() {
+     return;
+   }
+   paused_ = true;
++  if (current_) {
++    for (const auto& [alias, tab] : current_->tabs) {
++      if (tab) {
++        if (auto* context = ActionContext::From(tab.get())) {
++          context->SetPaused(true);
++        }
++      }
++    }
++  }
+   Emit(base::DictValue()
+            .Set("type", "paused")
+            .Set("reason", "you're using this tab")
+@@ -579,6 +764,15 @@ void AgentController::Resume() {
+     return;
+   }
+   paused_ = false;
++  if (current_) {
++    for (const auto& [alias, tab] : current_->tabs) {
++      if (tab) {
++        if (auto* context = ActionContext::From(tab.get())) {
++          context->SetPaused(false);
++        }
++      }
++    }
++  }
+   if (current_ && current_->runner) {
+     current_->runner->Resume();
+   }
+--- a/chrome/browser/rac/agent/agent_controller.h
++++ b/chrome/browser/rac/agent/agent_controller.h
+@@ -13,6 +13,7 @@
+ #include "base/memory/weak_ptr.h"
+ #include "base/supports_user_data.h"
+ #include "base/values.h"
++#include "chrome/browser/rac/agent/action_guard.h"
+ #include "chrome/browser/rac/agent/action_types.h"
+ #include "chrome/browser/rac/agent/apc_extract.h"
+ #include "chrome/browser/rac/agent/tool_registry.h"
+@@ -59,6 +60,8 @@ class AgentController : public base::Sup
+   void OnPageRead(bool for_action,
+                   optimization_guide::AIPageContentResultOrError result);
+   void Authorize();
++  void RunAllowed();
++  ActionMetadata Metadata() const;
+   void Dispatch();
+   void OnActionDone(ActionResult result);
+   void Finish(ToolResult result);
+@@ -78,6 +81,10 @@ class AgentController : public base::Sup
+   DoneCallback done_;
+   base::OnceClosure deferred_;
+   std::string goal_;
++  ActionGuard guard_;
++  std::set<std::string> planned_origins_;
++  bool awaiting_plan_ = false;
++  std::string approval_origin_;
+   std::string approval_id_;
+   std::string approved_fingerprint_;
+   std::string step_id_;
+--- /dev/null
++++ b/chrome/browser/rac/agent/commit_guard.cc
+@@ -0,0 +1,35 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++#include "chrome/browser/rac/agent/commit_guard.h"
++
++#include "chrome/browser/rac/agent/action_context.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/web_contents.h"
++namespace rac::agent {
++namespace {
++class CommitGuard : public content::CommitDeferringCondition {
++ public:
++  explicit CommitGuard(content::NavigationHandle& handle)
++      : content::CommitDeferringCondition(handle) {}
++  Result WillCommitNavigation(base::OnceClosure resume) override {
++    auto& handle = GetNavigationHandle();
++    auto* context = ActionContext::From(handle.GetWebContents());
++    if (!context || context->AllowsNavigation(handle.GetURL())) {
++      return Result::kProceed;
++    }
++    context->ReportBlocked(
++        "Navigation outside the approved origins was blocked.");
++    handle.GetWebContents()->Stop();
++    return Result::kCancelled;
++  }
++  const char* TraceEventName() const override { return "RacAgentCommitGuard"; }
++};
++}  // namespace
++std::unique_ptr<content::CommitDeferringCondition> CreateCommitGuard(
++    content::NavigationHandle& handle) {
++  if (!ActionContext::From(handle.GetWebContents())) {
++    return nullptr;
++  }
++  return std::make_unique<CommitGuard>(handle);
++}
++}  // namespace rac::agent
+--- /dev/null
++++ b/chrome/browser/rac/agent/commit_guard.h
+@@ -0,0 +1,12 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++#ifndef CHROME_BROWSER_RAC_AGENT_COMMIT_GUARD_H_
++#define CHROME_BROWSER_RAC_AGENT_COMMIT_GUARD_H_
++#include <memory>
++
++#include "content/public/browser/commit_deferring_condition.h"
++namespace rac::agent {
++std::unique_ptr<content::CommitDeferringCondition> CreateCommitGuard(
++    content::NavigationHandle& handle);
++}
++#endif
+--- a/chrome/browser/rac/agent/navigation_throttle.cc
++++ b/chrome/browser/rac/agent/navigation_throttle.cc
+@@ -35,6 +35,15 @@ AgentNavigationThrottle::~AgentNavigatio
+ content::NavigationThrottle::ThrottleCheckResult
+ AgentNavigationThrottle::Check() {
+   const GURL& url = navigation_handle()->GetURL();
++  if (auto* context =
++          ActionContext::From(navigation_handle()->GetWebContents())) {
++    if (!context->AllowsNavigation(url)) {
++      context->ReportBlocked(
++          "Navigation outside the approved origins was blocked. Ask the user "
++          "before opening that site.");
++      return CANCEL;
++    }
++  }
+   if (url.SchemeIsHTTPOrHTTPS() || url.IsAboutBlank()) {
+     // Download responses blocked in WillProcessResponse.
+     return PROCEED;
+@@ -62,6 +71,10 @@ AgentNavigationThrottle::WillRedirectReq
+ 
+ content::NavigationThrottle::ThrottleCheckResult
+ AgentNavigationThrottle::WillProcessResponse() {
++  auto* context = ActionContext::From(navigation_handle()->GetWebContents());
++  if (!context || !context->enforcing()) {
++    return PROCEED;
++  }
+   if (navigation_handle()->IsDownload()) {
+     return CANCEL;
+   }
+--- a/chrome/browser/rac/agent/ref_table.h
++++ b/chrome/browser/rac/agent/ref_table.h
+@@ -56,6 +56,7 @@ struct RefEntry {
+   std::string frame_origin;
+   std::string main_origin;
+   std::string link_url;
++  std::string form_action;
+   std::string policy_fingerprint;
+   gfx::Rect outer_box;
+   gfx::Rect visible_box;
+--- a/chrome/browser/rac/agent/renderer_tools.cc
++++ b/chrome/browser/rac/agent/renderer_tools.cc
+@@ -137,16 +137,19 @@ void RendererTools::Type(content::WebCon
+                          const RefEntry& entry,
+                          const std::string& text,
+                          bool press_enter,
+-                         DoneCallback done) {
++                         DoneCallback done,
++                         bool replace) {
+   Invoke(contents, entry,
+          base::BindOnce(
+-             [](std::string text, bool press_enter, content::RenderFrameHost&) {
++             [](std::string text, bool press_enter, bool replace,
++                content::RenderFrameHost&) {
+                return actor::mojom::ToolAction::NewType(
+                    actor::mojom::TypeAction::New(
+-                       actor::mojom::TypeAction::Mode::kDeleteExisting, text,
+-                       press_enter));
++                       replace ? actor::mojom::TypeAction::Mode::kDeleteExisting
++                               : actor::mojom::TypeAction::Mode::kAppend,
++                       text, press_enter));
+              },
+-             text, press_enter),
++             text, press_enter, replace),
+          std::move(done));
+ }
+ 
+@@ -302,6 +305,9 @@ void RendererTools::Invoke(content::WebC
+   invocation->target =
+       actor::mojom::ToolTarget::NewDomNodeId(entry.key.dom_node_id);
+   invocation->observed_target = MakeObservedTarget(entry, *local_root);
++  invocation->rac_expectation = actor::mojom::RacActionExpectation::New(
++      entry.control_type, entry.name, entry.link_url, entry.form_action,
++      entry.sensitive);
+ 
+   const int generation = cancel_generation_;
+   frame_remote_->InvokeTool(std::move(invocation),
+--- a/chrome/browser/rac/agent/snapshot_serializer.cc
++++ b/chrome/browser/rac/agent/snapshot_serializer.cc
+@@ -130,6 +130,15 @@ bool IsSensitiveControl(const proto::Con
+   if (IsPasswordControl(c)) {
+     return true;
+   }
++  const std::string field = base::ToLowerASCII(
++      c.field_name() + " " + a.label() + " " + c.placeholder());
++  for (const char* word :
++       {"password", "credit card", "card number", "card_number", "cardnumber",
++        "cc-number", "ccnum", "cvv", "cvc", "expiry", "expiration"}) {
++    if (field.find(word) != std::string::npos) {
++      return true;
++    }
++  }
+   for (int t : c.coarse_autofill_field_type()) {
+     if (t == proto::COARSE_AUTOFILL_FIELD_TYPE_CREDIT_CARD ||
+         t == proto::COARSE_AUTOFILL_FIELD_TYPE_OTP) {
+@@ -184,6 +193,16 @@ std::string ControlName(const proto::Con
+   }
+   if (a.has_form_control_data()) {
+     const auto& c = a.form_control_data();
++    if (FormControlRole(c) == "button" &&
++        c.form_control_type() != proto::FORM_CONTROL_TYPE_INPUT_FILE) {
++      name = CollectText(node);
++      if (name.empty()) {
++        name = Clean(c.field_value());
++      }
++      if (!name.empty()) {
++        return name;
++      }
++    }
+     name = Clean(c.field_name());
+     if (name.empty()) {
+       name = Clean(c.placeholder());
+@@ -238,16 +257,17 @@ struct WalkContext {
+   std::string document_token;
+   std::string frame_origin;
+   std::string main_origin;
++  std::string form_action;
+   std::vector<SnapshotLine>* lines = nullptr;
+-  size_t used_chars = 0;
++  size_t* used_chars = nullptr;
+ };
+ 
+ bool AppendLine(WalkContext& ctx, SnapshotLine line) {
+   const size_t need = line.text.size() + (ctx.lines->empty() ? 0 : 1);
+-  if (ctx.used_chars + need > ctx.options.max_chars) {
++  if (*ctx.used_chars + need > ctx.options.max_chars) {
+     return false;
+   }
+-  ctx.used_chars += need;
++  *ctx.used_chars += need;
+   ctx.lines->push_back(std::move(line));
+   return true;
+ }
+@@ -289,6 +309,7 @@ void EmitInteractive(WalkContext& ctx,
+     }
+   }
+   meta.sensitive = IsSensitiveControl(a);
++  meta.form_action = ctx.form_action;
+   if (a.has_anchor_data()) {
+     meta.link_url = a.anchor_data().url();
+   }
+@@ -300,9 +321,16 @@ void EmitInteractive(WalkContext& ctx,
+       meta.visible_box = ToRect(a.geometry().visible_bounding_box());
+     }
+   }
+-  meta.policy_fingerprint =
+-      MakePolicyFingerprint(meta.role, meta.name, meta.control_type,
+-                            meta.password, meta.sensitive, meta.link_url);
++  std::string options_fingerprint;
++  for (const auto& option : meta.select_options) {
++    options_fingerprint += base::NumberToString(option.value.size()) + ":" +
++                           option.value +
++                           base::NumberToString(option.label.size()) + ":" +
++                           option.label + (option.disabled ? "1" : "0");
++  }
++  meta.policy_fingerprint = MakePolicyFingerprint(
++      meta.role, meta.name, meta.control_type, meta.password, meta.sensitive,
++      meta.link_url + "\n" + meta.form_action + "\n" + options_fingerprint);
+   meta.snapshot_generation = ctx.generation;
+   meta.last_seen_generation = ctx.generation;
+   meta.in_viewport = in_viewport;
+@@ -344,10 +372,18 @@ void Walk(WalkContext& ctx, const proto:
+   }
+   const auto& a = node.content_attributes();
+ 
++  if (a.attribute_type() == proto::CONTENT_ATTRIBUTE_FORM &&
++      a.has_form_data()) {
++    WalkContext form = ctx;
++    form.form_action = a.form_data().action_url();
++    WalkChildren(form, node, depth);
++    return;
++  }
+   if (a.attribute_type() == proto::CONTENT_ATTRIBUTE_IFRAME) {
+     if (a.has_iframe_data() && a.iframe_data().has_frame_data() &&
+         a.iframe_data().frame_data().has_document_identifier()) {
+       WalkContext child = ctx;
++      child.form_action.clear();
+       child.document_token =
+           a.iframe_data().frame_data().document_identifier().serialized_token();
+       if (a.iframe_data().frame_data().has_url()) {
+@@ -584,6 +620,8 @@ AgentSnapshot SerializeAgentSnapshot(con
+   refs.BeginSnapshot(options.tab_id, snapshot_id);
+ 
+   WalkContext ctx;
++  size_t used_chars = 0;
++  ctx.used_chars = &used_chars;
+   ctx.refs = &refs;
+   ctx.options = options;
+   ctx.generation = snapshot_id;
+--- a/chrome/browser/rac/agent/tab_tools.cc
++++ b/chrome/browser/rac/agent/tab_tools.cc
+@@ -5,7 +5,10 @@
+ 
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/agent/action_context.h"
+ #include "chrome/browser/rac/agent/tool_registry.h"
++#include "chrome/browser/rac/spaces/space_tab_tag.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+@@ -17,10 +20,12 @@
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/page_transition_types.h"
+ #include "ui/base/window_open_disposition.h"
++#include "url/origin.h"
+ 
+ namespace rac::agent {
+ 
+-TabTools::TabTools(BrowserWindowInterface* browser) : browser_(browser) {}
++TabTools::TabTools(BrowserWindowInterface* browser)
++    : browser_(browser ? browser->GetWeakPtr() : nullptr) {}
+ TabTools::~TabTools() = default;
+ 
+ std::string TabTools::AliasFor(content::WebContents* contents) const {
+@@ -53,7 +58,13 @@ content::WebContents* TabTools::FindByAl
+   }
+   for (int i = 0; i < model->count(); ++i) {
+     content::WebContents* contents = model->GetWebContentsAt(i);
+-    if (AliasFor(contents) == tab_id) {
++    if (AliasFor(contents) == tab_id &&
++        SpaceTabTag::IsVisible(model->GetTabAtIndex(i)) &&
++        contents->GetBrowserContext() == browser_->GetProfile() &&
++        (contents->GetLastCommittedURL().SchemeIsHTTPOrHTTPS() ||
++         (contents->GetLastCommittedURL().IsAboutBlank() &&
++          ActionContext::From(contents) &&
++          ActionContext::From(contents)->agent_opened()))) {
+       return contents;
+     }
+   }
+@@ -71,11 +82,11 @@ std::vector<TabInfo> TabTools::ListTabs(
+   }
+   for (int i = 0; i < model->count(); ++i) {
+     content::WebContents* contents = model->GetWebContentsAt(i);
+-    if (!contents) {
++    if (!contents || !SpaceTabTag::IsVisible(model->GetTabAtIndex(i))) {
+       continue;
+     }
+     const GURL& url = contents->GetLastCommittedURL();
+-    if (!url.is_empty() && !url.SchemeIsHTTPOrHTTPS() && !url.IsAboutBlank()) {
++    if (!url.SchemeIsHTTPOrHTTPS()) {
+       continue;
+     }
+     TabInfo info;
+@@ -95,7 +106,8 @@ ActionResult TabTools::OpenTab(const GUR
+     result.error = "URL not allowed.";
+     return result;
+   }
+-  NavigateParams params(browser_, url, ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
++  NavigateParams params(browser_.get(), GURL("about:blank"),
++                        ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
+   params.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
+   ::Navigate(&params);
+   content::WebContents* created = params.navigated_or_inserted_contents;
+@@ -104,6 +116,11 @@ ActionResult TabTools::OpenTab(const GUR
+     result.error = "Could not open tab.";
+     return result;
+   }
++  auto* context = ActionContext::Ensure(created, "session", true);
++  context->SetAllowedOrigins({url::Origin::Create(url).Serialize()});
++  content::NavigationController::LoadURLParams load(url);
++  load.transition_type = ui::PAGE_TRANSITION_AUTO_TOPLEVEL;
++  created->GetController().LoadURLWithParams(load);
+   if (out_tab_id) {
+     *out_tab_id = AliasFor(created);
+   }
+--- a/chrome/browser/rac/agent/tool_registry.cc
++++ b/chrome/browser/rac/agent/tool_registry.cc
+@@ -348,7 +348,10 @@ std::optional<std::string> ValidateToolA
+ 
+ RiskClass ClassifyActionRisk(const ActionRiskInput& input) {
+   const ToolDefinition* def = FindToolDefinition(input.tool_name);
+-  if (!def || def->kind == ToolKind::kRead) {
++  if (!def) {
++    return RiskClass::kConsequential;
++  }
++  if (def->kind == ToolKind::kRead) {
+     return RiskClass::kNone;
+   }
+   if (input.is_password_field || input.is_payment_field ||
+--- a/chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.cc
++++ b/chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.cc
+@@ -23,6 +23,7 @@
+ #include "chrome/browser/picture_in_picture/picture_in_picture_window_manager.h"
+ #include "chrome/browser/preloading/preloading_prefs.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/agent/action_context.h"
+ #include "chrome/browser/repost_form_warning_controller.h"
+ #include "chrome/browser/search/search.h"
+ #include "chrome/browser/sessions/session_tab_helper_factory.h"
+@@ -72,6 +73,7 @@
+ #include "components/split_tabs/split_tab_id.h"
+ #include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/file_select_listener.h"
+ #include "content/public/browser/keyboard_event_processing_result.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_entry.h"
+@@ -1131,6 +1133,12 @@ void BrowserWebContentsDelegate::RunFile
+     content::RenderFrameHost* render_frame_host,
+     scoped_refptr<content::FileSelectListener> listener,
+     const blink::mojom::FileChooserParams& params) {
++  if (rac::agent::ActionContext::BlockSideEffect(
++          content::WebContents::FromRenderFrameHost(render_frame_host),
++          "Choose files yourself; the agent cannot upload files.")) {
++    listener->FileSelectionCanceled();
++    return;
++  }
+   FileSelectHelper::RunFileChooser(render_frame_host, std::move(listener),
+                                    params);
+ }
+@@ -1139,6 +1147,11 @@ void BrowserWebContentsDelegate::Enumera
+     content::WebContents* web_contents,
+     scoped_refptr<content::FileSelectListener> listener,
+     const base::FilePath& path) {
++  if (rac::agent::ActionContext::BlockSideEffect(
++          web_contents, "The agent cannot read local directories.")) {
++    listener->FileSelectionCanceled();
++    return;
++  }
+   FileSelectHelper::EnumerateDirectory(web_contents, std::move(listener), path);
+ }
+ 
+--- a/chrome/common/actor.mojom
++++ b/chrome/common/actor.mojom
+@@ -149,6 +149,14 @@ union ToolAction {
+   ScrollToAction scroll_to;
+ };
+ 
++struct RacActionExpectation {
++  string control_type;
++  string name;
++  string link_url;
++  string form_action;
++  bool sensitive;
++};
++
+ // All information required to invoke a tool in the renderer.
+ struct ToolInvocation {
+   // The task ID owning this invocation.
+@@ -171,6 +179,7 @@ struct ToolInvocation {
+   // This is optional and is used for checking if the action target has changed
+   // since last observation.
+   ObservedToolTarget? observed_target;
++  RacActionExpectation? rac_expectation;
+ };
+ 
+ struct ScriptToolResponse {
+--- a/chrome/renderer/actor/BUILD.gn
++++ b/chrome/renderer/actor/BUILD.gn
+@@ -6,6 +6,8 @@ import("//chrome/common/features.gni")
+ 
+ source_set("actor") {
+   sources = [
++    "../rac/agent/semantic_validator.cc",
++    "../rac/agent/semantic_validator.h",
+     "chrome_page_stability_monitor_delegate.cc",
+     "chrome_page_stability_monitor_delegate.h",
+     "click_dispatcher.cc",
+--- a/chrome/renderer/actor/tool_executor.cc
++++ b/chrome/renderer/actor/tool_executor.cc
+@@ -27,6 +27,7 @@
+ #include "chrome/renderer/actor/select_tool.h"
+ #include "chrome/renderer/actor/tool_utils.h"
+ #include "chrome/renderer/actor/type_tool.h"
++#include "chrome/renderer/rac/agent/semantic_validator.h"
+ #include "components/actor/core/journal_details_builder.h"
+ #include "components/actor/public/mojom/actor_types.mojom.h"
+ #include "content/public/renderer/render_frame.h"
+@@ -84,6 +85,20 @@ mojom::InitializeToolResultPtr ToolExecu
+         MakeResult(mojom::ActionResultCode::kFrameWentAway));
+   }
+ 
++  rac_expectation_ = std::move(invocation->rac_expectation);
++  if (rac_expectation_) {
++    if (!invocation->target->is_dom_node_id()) {
++      return mojom::InitializeToolResult::NewErrorResult(
++          MakeResult(mojom::ActionResultCode::kObservedTargetElementChanged));
++    }
++    rac_node_id_ = invocation->target->get_dom_node_id();
++    if (!rac::agent::ValidateActionSemantics(frame_.get(), rac_node_id_,
++                                             *rac_expectation_)) {
++      return mojom::InitializeToolResult::NewErrorResult(
++          MakeResult(mojom::ActionResultCode::kObservedTargetElementChanged,
++                     false, "stale_ref: action meaning changed"));
++    }
++  }
+   switch (invocation->action->which()) {
+     case actor::mojom::ToolAction::Tag::kClick: {
+       tool_ = std::make_unique<ClickTool>(
+@@ -169,6 +184,13 @@ mojom::InitializeToolResultPtr ToolExecu
+     performed_scroll_into_view_ = true;
+   }
+ 
++  if (rac_expectation_ && !rac::agent::ValidateActionSemantics(
++                              frame_.get(), rac_node_id_, *rac_expectation_)) {
++    tool_.reset();
++    return mojom::InitializeToolResult::NewErrorResult(
++        MakeResult(mojom::ActionResultCode::kObservedTargetElementChanged,
++                   false, "stale_ref: action meaning changed"));
++  }
+   ValidationResult validation = tool_->Validate();
+ 
+   if (!IsOk(*validation.result)) {
+@@ -207,6 +229,13 @@ void ToolExecutor::ExecuteTool(const act
+   CHECK_EQ(tool_->task_id(), task_id);
+   CHECK(!completion_callback_);
+   completion_callback_ = std::move(callback);
++  if (rac_expectation_ && !rac::agent::ValidateActionSemantics(
++                              frame_.get(), rac_node_id_, *rac_expectation_)) {
++    ToolFinished(
++        MakeResult(mojom::ActionResultCode::kObservedTargetElementChanged,
++                   false, "stale_ref: action meaning changed"));
++    return;
++  }
+   if (is_split_execution_) {
+     tool_->MarkAsRevalidation();
+     ValidationResult revalidation = tool_->Validate();
+--- a/chrome/renderer/actor/tool_executor.h
++++ b/chrome/renderer/actor/tool_executor.h
+@@ -65,6 +65,8 @@ class ToolExecutor {
+   // the same lifetime as RenderFrame.
+   base::raw_ref<content::RenderFrame> frame_;
+   std::unique_ptr<ToolBase> tool_;
++  mojom::RacActionExpectationPtr rac_expectation_;
++  int rac_node_id_ = 0;
+   base::raw_ref<Journal> journal_;
+   ToolExecutorCallback completion_callback_;
+   std::unique_ptr<Journal::PendingAsyncEntry> invoke_journal_entry_;
+--- /dev/null
++++ b/chrome/renderer/rac/agent/semantic_validator.cc
+@@ -0,0 +1,175 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++#include "chrome/renderer/rac/agent/semantic_validator.h"
++
++#include "base/strings/string_util.h"
++#include "chrome/common/actor.mojom.h"
++#include "chrome/renderer/actor/tool_utils.h"
++#include "third_party/blink/public/mojom/forms/form_control_type.mojom.h"
++#include "third_party/blink/public/platform/web_string.h"
++#include "third_party/blink/public/platform/web_url.h"
++#include "third_party/blink/public/web/web_document.h"
++#include "third_party/blink/public/web/web_element.h"
++#include "third_party/blink/public/web/web_form_control_element.h"
++#include "third_party/blink/public/web/web_form_element.h"
++namespace rac::agent {
++namespace {
++std::string Clean(const blink::WebString& text) {
++  return base::CollapseWhitespaceASCII(text.Utf8(), false);
++}
++std::string ControlType(blink::mojom::FormControlType type) {
++  switch (type) {
++    case blink::mojom::FormControlType::kButtonButton:
++      return "16";
++    case blink::mojom::FormControlType::kButtonSubmit:
++      return "17";
++    case blink::mojom::FormControlType::kButtonReset:
++      return "18";
++    case blink::mojom::FormControlType::kButtonPopover:
++      return "19";
++    case blink::mojom::FormControlType::kFieldset:
++      return "20";
++    case blink::mojom::FormControlType::kInputButton:
++      return "21";
++    case blink::mojom::FormControlType::kInputCheckbox:
++      return "2";
++    case blink::mojom::FormControlType::kInputColor:
++      return "22";
++    case blink::mojom::FormControlType::kInputDate:
++      return "23";
++    case blink::mojom::FormControlType::kInputDatetimeLocal:
++      return "24";
++    case blink::mojom::FormControlType::kInputEmail:
++      return "3";
++    case blink::mojom::FormControlType::kInputFile:
++      return "25";
++    case blink::mojom::FormControlType::kInputHidden:
++      return "26";
++    case blink::mojom::FormControlType::kInputImage:
++      return "27";
++    case blink::mojom::FormControlType::kInputMonth:
++      return "4";
++    case blink::mojom::FormControlType::kInputNumber:
++      return "5";
++    case blink::mojom::FormControlType::kInputPassword:
++      return "6";
++    case blink::mojom::FormControlType::kInputRadio:
++      return "7";
++    case blink::mojom::FormControlType::kInputRange:
++      return "28";
++    case blink::mojom::FormControlType::kInputReset:
++      return "29";
++    case blink::mojom::FormControlType::kInputSearch:
++      return "8";
++    case blink::mojom::FormControlType::kInputSubmit:
++      return "30";
++    case blink::mojom::FormControlType::kInputTelephone:
++      return "9";
++    case blink::mojom::FormControlType::kInputText:
++      return "10";
++    case blink::mojom::FormControlType::kInputTime:
++      return "31";
++    case blink::mojom::FormControlType::kInputUrl:
++      return "11";
++    case blink::mojom::FormControlType::kInputWeek:
++      return "32";
++    case blink::mojom::FormControlType::kOutput:
++      return "33";
++    case blink::mojom::FormControlType::kSelectOne:
++      return "12";
++    case blink::mojom::FormControlType::kSelectMultiple:
++      return "13";
++    case blink::mojom::FormControlType::kTextArea:
++      return "15";
++  }
++}
++}  // namespace
++bool ValidateActionSemantics(
++    const content::RenderFrame& frame,
++    int node_id,
++    const actor::mojom::RacActionExpectation& expected) {
++  auto element =
++      actor::GetNodeFromId(frame, node_id).DynamicTo<blink::WebElement>();
++  if (!element) {
++    return false;
++  }
++  auto control = element.DynamicTo<blink::WebFormControlElement>();
++  if (!expected.control_type.empty()) {
++    if (!control ||
++        ControlType(control.FormControlType()) != expected.control_type) {
++      return false;
++    }
++  } else if (control) {
++    return false;
++  }
++  if (!expected.sensitive) {
++    if (control && control.FormControlTypeForAutofill() ==
++                       blink::mojom::FormControlType::kInputPassword) {
++      return false;
++    }
++    const auto autocomplete = base::ToLowerASCII(
++        element.GetAttribute(blink::WebString::FromUtf8("autocomplete"))
++            .Utf8());
++    if (autocomplete.find("cc-") != std::string::npos ||
++        autocomplete.find("one-time-code") != std::string::npos) {
++      return false;
++    }
++    const auto security = element
++                              .GetComputedValue(blink::WebString::FromUtf8(
++                                  "-webkit-text-security"))
++                              .Utf8();
++    if (!security.empty() && security != "none") {
++      return false;
++    }
++  }
++  if (element.HasAttribute(blink::WebString::FromUtf8("download"))) {
++    return false;
++  }
++  std::string link;
++  if (element.HasAttribute(blink::WebString::FromUtf8("href"))) {
++    link = element.GetDocument()
++               .CompleteURL(
++                   element.GetAttribute(blink::WebString::FromUtf8("href")))
++               .GetString()
++               .Utf8();
++  }
++  if (link != expected.link_url) {
++    return false;
++  }
++  const std::string form_action =
++      control && !control.Form().IsNull() ? control.Form().Action().Utf8() : "";
++  if (form_action != expected.form_action) {
++    return false;
++  }
++  std::string name =
++      Clean(element.GetAttribute(blink::WebString::FromUtf8("aria-label")));
++  if (name.empty() &&
++      (element.HasHTMLTagName(blink::WebString::FromUtf8("button")) ||
++       (control && (control.FormControlType() ==
++                        blink::mojom::FormControlType::kInputButton ||
++                    control.FormControlType() ==
++                        blink::mojom::FormControlType::kInputSubmit)))) {
++    name = Clean(element.TextContent());
++    if (name.empty() && control) {
++      name = Clean(control.Value());
++    }
++  }
++  if (name.empty() && control) {
++    name = Clean(control.NameForAutofill());
++  }
++  if (name.empty() && control) {
++    name =
++        Clean(element.GetAttribute(blink::WebString::FromUtf8("placeholder")));
++  }
++  if (name.empty()) {
++    name = Clean(element.TextContent());
++  }
++  std::string expected_name = expected.name;
++  base::RemoveChars(name, base::kWhitespaceASCII, &name);
++  base::RemoveChars(expected_name, base::kWhitespaceASCII, &expected_name);
++  if (!name.empty() && name != expected_name) {
++    return false;
++  }
++  return true;
++}
++}  // namespace rac::agent
+--- /dev/null
++++ b/chrome/renderer/rac/agent/semantic_validator.h
+@@ -0,0 +1,15 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++#ifndef CHROME_RENDERER_RAC_AGENT_SEMANTIC_VALIDATOR_H_
++#define CHROME_RENDERER_RAC_AGENT_SEMANTIC_VALIDATOR_H_
++#include "chrome/common/actor.mojom-forward.h"
++namespace content {
++class RenderFrame;
++}
++namespace rac::agent {
++bool ValidateActionSemantics(
++    const content::RenderFrame& frame,
++    int node_id,
++    const actor::mojom::RacActionExpectation& expected);
++}
++#endif
+--- a/chrome/browser/download/BUILD.gn
++++ b/chrome/browser/download/BUILD.gn
+@@ -202,6 +202,7 @@ source_set("impl") {
+     "//chrome/browser/optimization_guide",
+     "//chrome/browser/profiles:profile",
+     "//chrome/browser/profiles/keep_alive",
++    "//chrome/browser/rac/agent:context",
+     "//chrome/browser/safe_browsing",
+     "//chrome/browser/safe_browsing:metrics_collector",
+     "//chrome/browser/signin",
+--- a/chrome/browser/rac/agent/action_runner.h
++++ b/chrome/browser/rac/agent/action_runner.h
+@@ -72,7 +72,7 @@ class ActionRunner {
+   bool GateOrFail(DoneCallback& done);
+ 
+   raw_ptr<Profile> profile_;
+-  raw_ptr<BrowserWindowInterface> browser_;
++  base::WeakPtr<BrowserWindowInterface> browser_;
+   raw_ptr<PrefService> prefs_;
+   raw_ptr<RefTable> refs_;
+   TabOwnership ownership_;
+--- a/chrome/browser/rac/agent/page_settler.cc
++++ b/chrome/browser/rac/agent/page_settler.cc
+@@ -6,6 +6,9 @@
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/web_contents.h"
+ 
+ namespace rac::agent {
+ namespace {
+@@ -45,49 +48,106 @@ PageSettler::~PageSettler() {
+   Cancel();
+ }
+ 
+-void PageSettler::Prepare(content::RenderFrameHost* local_root,
++void PageSettler::Prepare(content::RenderFrameHost* root,
+                           base::TimeDelta timeout) {
+   Cancel();
+-  if (!local_root) {
++  timed_out_ = false;
++  deadline_ = base::TimeTicks::Now() + timeout;
++  CreateMonitor(root, timeout);
++}
++
++void PageSettler::CreateMonitor(content::RenderFrameHost* root,
++                                base::TimeDelta timeout) {
++  monitor_.reset();
++  if (!root) {
+     return;
+   }
+-  timed_out_ = false;
+   Monitor::PageStabilityConfig config;
+   config.supports_paint_stability = true;
+   config.start_delay = base::TimeDelta();
+-  auto delegate =
+-      std::make_unique<Delegate>(config, timeout, weak_factory_.GetWeakPtr());
+-  monitor_ = std::make_unique<Monitor>(local_root, std::move(delegate));
++  monitor_ = std::make_unique<Monitor>(
++      root,
++      std::make_unique<Delegate>(config, timeout, weak_factory_.GetWeakPtr()));
+ }
+ 
+ void PageSettler::Wait(content::WebContents* contents, DoneCallback done) {
+   if (!monitor_ || !contents) {
+-    SettleResult r;
+-    r.settled = false;
+-    r.timed_out = true;
+-    std::move(done).Run(r);
++    std::move(done).Run({false, true});
++    return;
++  }
++  done_ = std::move(done);
++  Observe(contents);
++  navigation_pending_ = contents->GetController().GetPendingEntry() != nullptr;
++  const auto remaining = deadline_ - base::TimeTicks::Now();
++  if (remaining <= base::TimeDelta()) {
++    OnTimeout();
++    return;
++  }
++  deadline_timer_.Start(
++      FROM_HERE, remaining,
++      base::BindOnce(&PageSettler::OnTimeout, weak_factory_.GetWeakPtr()));
++  StartWait();
++}
++
++void PageSettler::StartWait() {
++  if (!monitor_ || !web_contents()) {
++    OnTimeout();
++    return;
++  }
++  monitor_->Wait(web_contents(),
++                 base::BindOnce(&PageSettler::OnReady,
++                                weak_factory_.GetWeakPtr(), ++generation_));
++}
++
++void PageSettler::DidStartNavigation(content::NavigationHandle* handle) {
++  if (done_ && handle->IsInPrimaryMainFrame() && !handle->IsSameDocument()) {
++    navigation_pending_ = true;
++  }
++}
++
++void PageSettler::DidFinishNavigation(content::NavigationHandle* handle) {
++  if (!done_ || !handle->IsInPrimaryMainFrame() || handle->IsSameDocument()) {
+     return;
+   }
+-  const int generation = ++generation_;
+-  monitor_->Wait(contents, base::BindOnce(&PageSettler::OnReady,
+-                                          weak_factory_.GetWeakPtr(),
+-                                          std::move(done), generation));
++  navigation_pending_ = false;
++  const auto remaining = deadline_ - base::TimeTicks::Now();
++  if (++restarts_ > 3 || remaining <= base::TimeDelta()) {
++    OnTimeout();
++    return;
++  }
++  ++generation_;
++  CreateMonitor(web_contents()->GetPrimaryMainFrame(), remaining);
++  timed_out_ = false;
++  StartWait();
+ }
+ 
+-void PageSettler::OnReady(DoneCallback done, int generation) {
+-  if (generation != generation_) {
++void PageSettler::WebContentsDestroyed() {
++  OnTimeout();
++}
++void PageSettler::OnTimeout() {
++  timed_out_ = true;
++  navigation_pending_ = false;
++  OnReady(++generation_);
++}
++void PageSettler::OnReady(int generation) {
++  if (generation != generation_ || !done_ || navigation_pending_) {
+     return;
+   }
+-  SettleResult r;
+-  r.timed_out = timed_out_;
+-  r.settled = !timed_out_;
++  SettleResult result{!timed_out_, timed_out_};
++  deadline_timer_.Stop();
+   monitor_.reset();
+-  std::move(done).Run(r);
++  Observe(nullptr);
++  std::move(done_).Run(result);
+ }
+ 
+ void PageSettler::Cancel() {
+   ++generation_;
++  deadline_timer_.Stop();
++  done_.Reset();
+   monitor_.reset();
++  Observe(nullptr);
++  navigation_pending_ = false;
++  restarts_ = 0;
+ }
+ 
+ }  // namespace rac::agent
+--- a/chrome/browser/rac/agent/page_settler.h
++++ b/chrome/browser/rac/agent/page_settler.h
+@@ -9,7 +9,9 @@
+ #include "base/functional/callback.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/time/time.h"
++#include "base/timer/timer.h"
+ #include "components/page_content_annotations/content/browser/page_settled_monitor.h"
++#include "content/public/browser/web_contents_observer.h"
+ 
+ namespace content {
+ class RenderFrameHost;
+@@ -25,23 +27,34 @@ struct SettleResult {
+ 
+ // Thin wrapper around PageSettledMonitor with rac timeouts and timeout
+ // reporting (the component callback alone does not distinguish timeout).
+-class PageSettler {
++class PageSettler : public content::WebContentsObserver {
+  public:
+   using DoneCallback = base::OnceCallback<void(SettleResult)>;
+ 
+   PageSettler();
+-  ~PageSettler();
++  ~PageSettler() override;
+ 
+   // Construct the monitor before invoking input; call Wait after completion.
+   void Prepare(content::RenderFrameHost* local_root,
+                base::TimeDelta timeout = base::Seconds(4));
+   void Wait(content::WebContents* contents, DoneCallback done);
+   void Cancel();
++  void DidStartNavigation(content::NavigationHandle* handle) override;
++  void DidFinishNavigation(content::NavigationHandle* handle) override;
++  void WebContentsDestroyed() override;
+ 
+  private:
+   class Delegate;
+-  void OnReady(DoneCallback done, int generation);
+-
++  void OnReady(int generation);
++  void StartWait();
++  void OnTimeout();
++  void CreateMonitor(content::RenderFrameHost* root, base::TimeDelta timeout);
++
++  DoneCallback done_;
++  base::TimeTicks deadline_;
++  base::OneShotTimer deadline_timer_;
++  bool navigation_pending_ = false;
++  int restarts_ = 0;
+   int generation_ = 0;
+   bool timed_out_ = false;
+   std::unique_ptr<page_content_annotations::PageSettledMonitor> monitor_;
+--- a/chrome/browser/rac/agent/renderer_tools.h
++++ b/chrome/browser/rac/agent/renderer_tools.h
+@@ -38,7 +38,8 @@ class RendererTools {
+             const RefEntry& entry,
+             const std::string& text,
+             bool press_enter,
+-            DoneCallback done);
++            DoneCallback done,
++            bool replace = true);
+   void Select(content::WebContents* contents,
+               const RefEntry& entry,
+               const std::string& value,
+--- a/chrome/browser/rac/agent/snapshot_serializer_unittest.cc
++++ b/chrome/browser/rac/agent/snapshot_serializer_unittest.cc
+@@ -200,4 +200,26 @@ TEST(SnapshotSerializerTest, HiddenAnnot
+   EXPECT_EQ(refs.Lookup("e1"), nullptr);
+ }
+ 
++TEST(SnapshotSerializerTest, FormsShareOneSnapshotBudget) {
++  auto page = MakePage();
++  for (int id = 1; id <= 2; ++id) {
++    auto* form = Node(page.mutable_root_node(), proto::CONTENT_ATTRIBUTE_FORM);
++    form->mutable_content_attributes()->mutable_form_data()->set_action_url(
++        "https://example.com/submit");
++    auto* button = Node(form, proto::CONTENT_ATTRIBUTE_FORM_CONTROL);
++    DomId(button, id);
++    Visible(button);
++    button->mutable_content_attributes()->set_label(std::string(32, 'a'));
++    button->mutable_content_attributes()
++        ->mutable_form_control_data()
++        ->set_form_control_type(proto::FORM_CONTROL_TYPE_BUTTON_BUTTON);
++  }
++  RefTable refs;
++  SnapshotOptions options;
++  options.max_chars = 90;
++  auto snapshot = SerializeAgentSnapshot(page, refs, options, 1);
++  EXPECT_EQ(snapshot.lines.size(), 1u);
++  EXPECT_LE(snapshot.text.size(), options.max_chars);
++}
++
+ }  // namespace rac::agent
+--- a/chrome/browser/rac/agent/tab_tools.h
++++ b/chrome/browser/rac/agent/tab_tools.h
+@@ -8,7 +8,7 @@
+ #include <vector>
+ 
+ #include "base/functional/callback.h"
+-#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "chrome/browser/rac/agent/action_types.h"
+ #include "url/gurl.h"
+ 
+@@ -48,7 +48,7 @@ class TabTools {
+   ActionResult GoBack(content::WebContents* contents);
+ 
+  private:
+-  raw_ptr<BrowserWindowInterface> browser_;
++  base::WeakPtr<BrowserWindowInterface> browser_;
+ };
+ 
+ }  // namespace rac::agent
+--- a/chrome/browser/ui/browser_web_contents_delegate/BUILD.gn
++++ b/chrome/browser/ui/browser_web_contents_delegate/BUILD.gn
+@@ -25,6 +25,7 @@ if (!is_android) {
+       "//chrome/browser/headless",
+       "//chrome/browser/picture_in_picture",
+       "//chrome/browser/preloading:prefs",
++      "//chrome/browser/rac/agent:context",
+       "//chrome/browser/search",
+       "//chrome/browser/ui:tab_dialogs",
+       "//chrome/browser/ui:tab_modal_confirm_dialog",
