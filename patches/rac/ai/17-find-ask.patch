@@ -1,0 +1,951 @@
+Index: src/chrome/browser/rac/ai/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/ai/BUILD.gn
++++ src/chrome/browser/rac/ai/BUILD.gn
+@@ -25,6 +25,8 @@ source_set("core") {
+   sources = [
+     "ai_prefs.cc",
+     "ai_prefs.h",
++    "ask_query.cc",
++    "ask_query.h",
+     "chat_prompt.cc",
+     "chat_prompt.h",
+     "chat_protocol.cc",
+@@ -96,6 +98,7 @@ source_set("browser") {
+ test("rac_ai_unittests") {
+   sources = [
+     "ai_prefs_unittest.cc",
++    "ask_query_unittest.cc",
+     "chat_history_unittest.cc",
+     "chat_prompt_unittest.cc",
+     "chat_protocol_unittest.cc",
+Index: src/chrome/browser/rac/ai/ai_service.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_service.cc
++++ src/chrome/browser/rac/ai/ai_service.cc
+@@ -9,6 +9,8 @@
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
+ #include "chrome/browser/rac/ai/ai_prefs.h"
++#include "chrome/browser/rac/ai/providers.h"
++#include "components/prefs/pref_service.h"
+ 
+ namespace rac::ai {
+ 
+@@ -41,6 +43,16 @@ HistoryStore& AiService::history_store()
+   return *history_store_;
+ }
+ 
++bool AiService::HasUsableProvider() const {
++  const std::string provider_id = prefs_->GetString(kProvider);
++  const ProviderInfo* info = FindProvider(provider_id);
++  if (!info || (info->requires_key && !key_store_.HasKey(provider_id))) {
++    return false;
++  }
++  const ProviderSettings settings = GetProviderSettings(prefs_, provider_id);
++  return !settings.model.empty() && !settings.base_url.empty();
++}
++
+ AiService::~AiService() = default;
+ 
+ }  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/ai_service.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_service.h
++++ src/chrome/browser/rac/ai/ai_service.h
+@@ -41,6 +41,9 @@ class AiService : public KeyedService {
+   PrefService* prefs() { return prefs_; }
+   KeyStore& key_store() { return key_store_; }
+   HistoryStore& history_store();
++  // True when the chosen provider has what it needs (a key if it takes one, a
++  // model, an address), so a message can be sent now.
++  bool HasUsableProvider() const;
+   network::SharedURLLoaderFactory* url_loader_factory() {
+     return url_loader_factory_.get();
+   }
+Index: src/chrome/browser/rac/ai/ask_query.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/ai/ask_query.cc
+@@ -0,0 +1,41 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/ask_query.h"
++
++#include "base/strings/string_util.h"
++
++namespace rac::ai {
++namespace {
++
++constexpr size_t kMinWords = 3;
++
++bool IsQuestionMark(char16_t c) {
++  // ASCII, fullwidth (CJK), Arabic and Greek question marks.
++  return c == u'?' || c == u'\uFF1F' || c == u'\u061F' || c == u'\u037E';
++}
++
++}  // namespace
++
++bool IsAskableQuery(std::u16string_view query) {
++  std::u16string_view trimmed = base::TrimWhitespace(query, base::TRIM_ALL);
++  if (trimmed.empty()) {
++    return false;
++  }
++  if (IsQuestionMark(trimmed.back())) {
++    return true;
++  }
++  size_t words = 0;
++  bool in_word = false;
++  for (char16_t c : trimmed) {
++    const bool space = base::IsUnicodeWhitespace(c);
++    if (!space && !in_word) {
++      ++words;
++    }
++    in_word = !space;
++  }
++  return words >= kMinWords;
++}
++
++}  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/ask_query.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/ai/ask_query.h
+@@ -0,0 +1,19 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_ASK_QUERY_H_
++#define CHROME_BROWSER_RAC_AI_ASK_QUERY_H_
++
++#include <string_view>
++
++namespace rac::ai {
++
++// Whether text typed into find in page reads like a question for the
++// assistant rather than a phrase to look for: three or more words, or a
++// trailing question mark. Purely local; never calls a model.
++bool IsAskableQuery(std::u16string_view query);
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_ASK_QUERY_H_
+Index: src/chrome/browser/rac/ai/ask_query_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/ai/ask_query_unittest.cc
+@@ -0,0 +1,30 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/ask_query.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::ai {
++
++TEST(RacAiAskQueryTest, ThreeWordsAsk) {
++  EXPECT_TRUE(IsAskableQuery(u"how do I cancel"));
++  EXPECT_TRUE(IsAskableQuery(u"  how   do\tI  "));
++  EXPECT_FALSE(IsAskableQuery(u"cancel plan"));
++  EXPECT_FALSE(IsAskableQuery(u"cancel"));
++}
++
++TEST(RacAiAskQueryTest, TrailingQuestionMarkAsks) {
++  EXPECT_TRUE(IsAskableQuery(u"why?"));
++  EXPECT_TRUE(IsAskableQuery(u"why? "));
++  EXPECT_TRUE(IsAskableQuery(u"\u4ec0\u4e48\uff1f"));
++  EXPECT_FALSE(IsAskableQuery(u"what? no"));
++}
++
++TEST(RacAiAskQueryTest, EmptyNeverAsks) {
++  EXPECT_FALSE(IsAskableQuery(u""));
++  EXPECT_FALSE(IsAskableQuery(u"   "));
++}
++
++}  // namespace rac::ai
+Index: src/chrome/browser/resources/rac_ai/app.ts
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/app.ts
++++ src/chrome/browser/resources/rac_ai/app.ts
+@@ -942,6 +942,19 @@ function send() {
+   startReply(question);
+ }
+ 
++// A question from elsewhere in the browser (find in page). It starts a new
++// chat about the foreground tab, whatever the attach setting says.
++function askAbout(text: string) {
++  if (!configured || !text.trim()) {
++    return;
++  }
++  resetChat();
++  followCurrent = currentTab !== null;
++  input.value = text.slice(0, 20000);
++  resizeInput();
++  send();
++}
++
+ function retry() {
+   if (streaming) {
+     return;
+@@ -1200,6 +1213,7 @@ function init() {
+ 
+   addWebUiListener('rac-ai-update', onUpdate);
+   addWebUiListener('rac-ai-menu', onMenuEvent);
++  addWebUiListener('rac-ai-ask', askAbout);
+   addWebUiListener('rac-ai-theme', applyTheme);
+   addWebUiListener('rac-ai-current-tab', (tab: TabInfo|null) => {
+     currentTab = tab;
+@@ -1237,6 +1251,13 @@ function init() {
+     } else {
+       input.focus();
+     }
++    if (!pageMode) {
++      sendWithPromise<string|null>('racAiTakeAsk').then(prompt => {
++        if (prompt) {
++          askAbout(prompt);
++        }
++      });
++    }
+   });
+ }
+ 
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn
++++ src/chrome/browser/ui/BUILD.gn
+@@ -2517,6 +2517,8 @@ static_library("ui") {
+       "views/rac/ai/assistant_menu.h",
+       "views/rac/ai/assistant_side_panel.cc",
+       "views/rac/ai/assistant_side_panel.h",
++      "views/rac/ai/find_ask.cc",
++      "views/rac/ai/find_ask.h",
+       "webui/rac_ai/rac_ai_page_handler.cc",
+       "webui/rac_ai/rac_ai_page_handler.h",
+       "webui/rac_ai/rac_ai_ui.cc",
+Index: src/chrome/browser/ui/views/find_bar_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/find_bar_view.cc
++++ src/chrome/browser/ui/views/find_bar_view.cc
+@@ -25,6 +25,7 @@
+ #include "chrome/browser/ui/views/chrome_layout_provider.h"
+ #include "chrome/browser/ui/views/find_bar_host.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/rac/ai/find_ask.h"
+ #include "chrome/browser/user_education/user_education_service.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/find_in_page/find_notification_details.h"
+@@ -420,6 +421,11 @@ void FindBarView::UpdateForResult(
+ 
+   UpdateMatchCountAppearance(result.number_of_matches() == 0 &&
+                              result.final_update());
++  rac::ai::UpdateFindAsk(
++      find_ask_,
++      find_bar_host_ ? find_bar_host_->GetFindBarController() : nullptr,
++      match_count_text_, result.number_of_matches(), result.final_update(),
++      find_text);
+ 
+   // The match_count label may have increased/decreased in size so we need to
+   // do a layout and repaint the dialog so that the find text field doesn't
+@@ -429,6 +435,7 @@ void FindBarView::UpdateForResult(
+ }
+ 
+ void FindBarView::ClearMatchCount() {
++  rac::ai::HideFindAsk(find_ask_);
+   match_count_text_->ClearResult();
+   UpdateMatchCountAppearance(false);
+   DeprecatedLayoutImmediately();
+@@ -506,6 +513,10 @@ bool FindBarView::HandleKeyEvent(views::
+       key_event.type() == ui::EventType::kKeyPressed) {
+     // Pressing Return/Enter starts the search (unless text box is empty).
+     std::u16string find_string(find_text_->GetText());
++    if (!key_event.IsShiftDown() && !find_text_->IsIMEComposing() &&
++        rac::ai::TryFindAsk(find_ask_, find_string)) {
++      return true;
++    }
+     if (!find_string.empty()) {
+       FindBarController* controller = find_bar_host_->GetFindBarController();
+       find_in_page::FindTabHelper* find_tab_helper =
+@@ -607,6 +618,7 @@ void FindBarView::Find(std::u16string_vi
+       find_in_page::FindTabHelper::FromWebContents(web_contents);
+ 
+   last_searched_text_ = std::u16string(search_text);
++  rac::ai::HideFindAsk(find_ask_);
+ 
+   controller->OnUserChangedFindText(search_text);
+ 
+Index: src/chrome/browser/ui/views/find_bar_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/find_bar_view.h
++++ src/chrome/browser/ui/views/find_bar_view.h
+@@ -23,6 +23,10 @@
+ class FindBarHost;
+ class FindBarMatchCountLabel;
+ 
++namespace rac::ai {
++class FindAsk;
++}
++
+ namespace find_in_page {
+ class FindNotificationDetails;
+ }
+@@ -149,6 +153,9 @@ class FindBarView : public views::BoxLay
+   raw_ptr<views::ImageButton> find_previous_button_;
+   raw_ptr<views::ImageButton> find_next_button_;
+   raw_ptr<views::ImageButton> close_button_;
++
++  // Made on the first no-match question while the assistant is on.
++  std::unique_ptr<rac::ai::FindAsk> find_ask_;
+ };
+ 
+ BEGIN_VIEW_BUILDER(/* no export */, FindBarView, views::BoxLayoutView)
+Index: src/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
++++ src/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
+@@ -15,15 +15,20 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "base/time/time.h"
+ #include "cc/paint/paint_flags.h"
+ #include "chrome/browser/file_select_helper.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/rac/ai/ai_prefs.h"
++#include "chrome/browser/rac/ai/ai_service.h"
++#include "chrome/browser/rac/ai/ai_service_factory.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/side_panel/side_panel_entry.h"
+ #include "chrome/browser/ui/side_panel/side_panel_entry_id.h"
++#include "chrome/browser/ui/side_panel/side_panel_entry_key.h"
+ #include "chrome/browser/ui/side_panel/side_panel_entry_observer.h"
+ #include "chrome/browser/ui/side_panel/side_panel_entry_scope.h"
++#include "chrome/browser/ui/side_panel/side_panel_enums.h"
+ #include "chrome/browser/ui/side_panel/side_panel_registry.h"
+ #include "chrome/browser/ui/side_panel/side_panel_ui.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -97,13 +102,35 @@ class AssistantPanelState {
+     return callbacks_.Add(std::move(callback));
+   }
+ 
++  void SetPrompt(std::string prompt) {
++    prompt_ = std::move(prompt);
++    prompt_time_ = base::TimeTicks::Now();
++    prompt_callbacks_.Notify();
++  }
++
++  std::optional<std::string> TakePrompt() {
++    std::optional<std::string> prompt = std::move(prompt_);
++    prompt_.reset();
++    if (!prompt || base::TimeTicks::Now() - prompt_time_ > kPromptLifetime) {
++      return std::nullopt;
++    }
++    return prompt;
++  }
++
++  base::CallbackListSubscription AddPromptCallback(
++      base::RepeatingClosure callback) {
++    return prompt_callbacks_.Add(std::move(callback));
++  }
++
+  private:
++  // A panel that never loads must not send the prompt much later, when the
++  // user opens it for something else.
++  static constexpr base::TimeDelta kPromptLifetime = base::Seconds(15);
++
+   explicit AssistantPanelState(BrowserWindowInterface* browser)
+       : scoped_data_(browser->GetUnownedUserDataHost(), *this) {
+     close_subscription_ = browser->RegisterBrowserDidClose(base::BindRepeating(
+-        [](AssistantPanelState* self, BrowserWindowInterface*) {
+-          delete self;
+-        },
++        [](AssistantPanelState* self, BrowserWindowInterface*) { delete self; },
+         base::Unretained(this)));
+   }
+ 
+@@ -111,6 +138,9 @@ class AssistantPanelState {
+ 
+   bool open_ = false;
+   base::RepeatingClosureList callbacks_;
++  base::RepeatingClosureList prompt_callbacks_;
++  std::optional<std::string> prompt_;
++  base::TimeTicks prompt_time_;
+   base::CallbackListSubscription close_subscription_;
+   ui::ScopedUnownedUserData<AssistantPanelState> scoped_data_;
+ };
+@@ -390,6 +420,42 @@ base::CallbackListSubscription AddAssist
+       std::move(callback));
+ }
+ 
++bool CanAskAssistant(BrowserWindowInterface* browser) {
++  Profile* profile = browser->GetProfile();
++  if (!profile->IsRegularProfile() ||
++      browser->GetType() != BrowserWindowInterface::Type::TYPE_NORMAL) {
++    return false;
++  }
++  AiService* service = AiServiceFactory::GetForProfile(profile);
++  return service && service->HasUsableProvider();
++}
++
++bool AskAssistant(BrowserWindowInterface* browser, std::string prompt) {
++  SidePanelUI* ui = SidePanelUI::From(browser);
++  if (!ui || prompt.empty() || !CanAskAssistant(browser)) {
++    return false;
++  }
++  // A panel already showing is told through the callback; one that opens now
++  // asks for the prompt as it loads.
++  AssistantPanelState::GetOrCreate(browser)->SetPrompt(std::move(prompt));
++  ui->Show(SidePanelEntryKey(SidePanelEntryId::kRacAi),
++           SidePanelOpenTrigger::kToolbarButton);
++  return true;
++}
++
++std::optional<std::string> TakeAssistantPrompt(
++    BrowserWindowInterface* browser) {
++  AssistantPanelState* state = AssistantPanelState::From(browser);
++  return state ? state->TakePrompt() : std::nullopt;
++}
++
++base::CallbackListSubscription AddAssistantPromptCallback(
++    BrowserWindowInterface* browser,
++    base::RepeatingClosure callback) {
++  return AssistantPanelState::GetOrCreate(browser)->AddPromptCallback(
++      std::move(callback));
++}
++
+ bool IsAssistantPanelContent(const views::View& view) {
+   return views::IsViewClass<AssistantWebView>(&view);
+ }
+Index: src/chrome/browser/ui/views/rac/ai/assistant_side_panel.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/ai/assistant_side_panel.h
++++ src/chrome/browser/ui/views/rac/ai/assistant_side_panel.h
+@@ -5,6 +5,9 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_RAC_AI_ASSISTANT_SIDE_PANEL_H_
+ #define CHROME_BROWSER_UI_VIEWS_RAC_AI_ASSISTANT_SIDE_PANEL_H_
+ 
++#include <optional>
++#include <string>
++
+ #include "base/callback_list.h"
+ #include "base/functional/callback_forward.h"
+ 
+@@ -38,6 +41,24 @@ base::CallbackListSubscription AddAssist
+     BrowserWindowInterface* browser,
+     base::RepeatingClosure callback);
+ 
++// Opens the assistant's panel in `browser` and has it send `prompt` as a new
++// chat about the foreground tab. Returns false, doing nothing, if the
++// assistant can't answer in this window: it is off, no provider is set up, or
++// the window is incognito.
++bool AskAssistant(BrowserWindowInterface* browser, std::string prompt);
++
++// True if AskAssistant() would work in `browser`.
++bool CanAskAssistant(BrowserWindowInterface* browser);
++
++// The prompt AskAssistant() left for `browser`'s panel, if it was left a
++// moment ago. Taking it clears it, so only one page sends it.
++std::optional<std::string> TakeAssistantPrompt(BrowserWindowInterface* browser);
++
++// Runs `callback` whenever AskAssistant() leaves a prompt for `browser`.
++base::CallbackListSubscription AddAssistantPromptCallback(
++    BrowserWindowInterface* browser,
++    base::RepeatingClosure callback);
++
+ // True for the view the assistant hosts in the side panel. It is
+ // transparent, so the window's wash shows through it.
+ bool IsAssistantPanelContent(const views::View& view);
+Index: src/chrome/browser/ui/views/rac/ai/find_ask.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/rac/ai/find_ask.cc
+@@ -0,0 +1,299 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/ai/find_ask.h"
++
++#include <string>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/time/time.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
++#include "chrome/browser/rac/ai/ask_query.h"
++#include "chrome/browser/rac/spaces/space.h"
++#include "chrome/browser/rac/spaces/spaces_service.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/find_bar/find_bar_controller.h"
++#include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
++#include "chrome/browser/ui/views/rac/ai/assistant_side_panel.h"
++#include "components/find_in_page/find_types.h"
++#include "components/prefs/pref_service.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/color/color_id.h"
++#include "ui/color/color_provider.h"
++#include "ui/color/color_provider_key.h"
++#include "ui/compositor/layer.h"
++#include "ui/compositor/layer_animator.h"
++#include "ui/compositor/scoped_layer_animation_settings.h"
++#include "ui/gfx/animation/animation.h"
++#include "ui/gfx/animation/tween.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/color_utils.h"
++#include "ui/gfx/font_list.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/animation/ink_drop.h"
++#include "ui/views/border.h"
++#include "ui/views/controls/button/label_button.h"
++#include "ui/views/controls/focus_ring.h"
++#include "ui/views/controls/highlight_path_generator.h"
++#include "ui/views/view_class_properties.h"
++#include "ui/views/widget/widget.h"
++
++namespace rac::ai {
++namespace {
++
++constexpr int kHeight = 22;
++constexpr int kRadius = 11;
++constexpr int kDotSize = 8;
++constexpr int kLeftPadding = 8;
++constexpr int kGap = 6;
++constexpr int kRightPadding = 10;
++constexpr int kFontSize = 12;
++constexpr char16_t kTooltip[] = u"Ask the assistant (Return)";
++constexpr char16_t kAnnouncement[] =
++    u"No results. Press Return to ask the assistant.";
++
++SkColor ParseHex(std::string_view hex) {
++  uint32_t rgb = 0;
++  if (hex.size() != 7 || !base::HexStringToUInt(hex.substr(1), &rgb)) {
++    return SK_ColorTRANSPARENT;
++  }
++  return SkColorSetA(rgb, SK_AlphaOPAQUE);
++}
++
++}  // namespace
++
++class AskButton : public views::LabelButton {
++  METADATA_HEADER(AskButton, views::LabelButton)
++
++ public:
++  AskButton(PressedCallback callback, BrowserWindowInterface* browser)
++      : views::LabelButton(std::move(callback), u"Ask"), browser_(browser) {
++    SetBorder(views::CreateEmptyBorder(gfx::Insets::TLBR(
++        0, kLeftPadding + kDotSize + kGap, 0, kRightPadding)));
++    SetHorizontalAlignment(gfx::ALIGN_LEFT);
++    views::InkDrop::Get(this)->SetMode(views::InkDropHost::InkDropMode::OFF);
++    SetEnabledTextColors(ui::kColorLabelForeground);
++    SetFocusBehavior(FocusBehavior::ALWAYS);
++    SetTooltipText(kTooltip);
++    views::InstallPillHighlightPathGenerator(this);
++    // The pill fades in on its own layer, which isn't opaque.
++    label()->SetSubpixelRenderingEnabled(false);
++    label()->SetFontList(
++        label()
++            ->font_list()
++            .DeriveWithSizeDelta(kFontSize - label()->font_list().GetFontSize())
++            .DeriveWithWeight(gfx::Font::Weight::MEDIUM));
++  }
++
++  ~AskButton() override = default;
++
++  void SetQuery(std::u16string_view query) {
++    GetViewAccessibility().SetName(
++        base::StrCat({u"Ask the assistant: \"", query, u"\""}));
++    UpdateDotColor();
++  }
++
++  void FadeIn() {
++    if (gfx::Animation::PrefersReducedMotion()) {
++      return;
++    }
++    SetPaintToLayer();
++    layer()->SetFillsBoundsOpaquely(false);
++    layer()->SetOpacity(0);
++    ui::ScopedLayerAnimationSettings settings(layer()->GetAnimator());
++    settings.SetTransitionDuration(base::Milliseconds(120));
++    settings.SetTweenType(gfx::Tween::LINEAR);
++    layer()->SetOpacity(1);
++  }
++
++  // views::View:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override {
++    return gfx::Size(
++        views::LabelButton::CalculatePreferredSize(available_size).width(),
++        kHeight);
++  }
++
++  void OnPaintBackground(gfx::Canvas* canvas) override {
++    const ui::ColorProvider* colors = GetColorProvider();
++    if (!colors) {
++      return;
++    }
++    const SkColor text = colors->GetColor(ui::kColorLabelForeground);
++    const bool dark = !color_utils::IsDark(text);
++    // Percent of the text color: a quiet fill that works on either scheme.
++    const int percent = dark ? (GetState() == STATE_PRESSED   ? 18
++                                : GetState() == STATE_HOVERED ? 14
++                                                              : 10)
++                             : (GetState() == STATE_PRESSED   ? 14
++                                : GetState() == STATE_HOVERED ? 10
++                                                              : 6);
++    cc::PaintFlags flags;
++    flags.setAntiAlias(true);
++    flags.setColor(SkColorSetA(text, percent * 255 / 100));
++    canvas->DrawRoundRect(gfx::RectF(GetLocalBounds()), kRadius, flags);
++    flags.setColor(dot_color_);
++    canvas->DrawCircle(
++        gfx::PointF(kLeftPadding + kDotSize / 2.0f, height() / 2.0f),
++        kDotSize / 2.0f, flags);
++  }
++
++  void OnThemeChanged() override {
++    views::LabelButton::OnThemeChanged();
++    UpdateDotColor();
++  }
++
++ private:
++  // The window's space color; neutral gray where there is none (incognito,
++  // or the neutral space).
++  void UpdateDotColor() {
++    const ui::ColorProvider* colors = GetColorProvider();
++    if (!colors) {
++      return;
++    }
++    SkColor color = colors->GetColor(ui::kColorLabelForegroundSecondary);
++    const views::Widget* widget = GetWidget();
++    SpacesWindowManager* manager =
++        browser_ ? SpacesWindowManager::From(browser_) : nullptr;
++    const auto active =
++        manager ? manager->GetActiveSpaceId(browser_) : std::nullopt;
++    const Space* space =
++        active ? manager->spaces()->FindSpace(*active) : nullptr;
++    if (space && widget) {
++      const SpaceTheme neutral = SpaceTheme::Preset(0);
++      if (space->theme.color1 != neutral.color1 ||
++          space->theme.color2 != neutral.color2) {
++        const bool dark =
++            widget->GetColorMode() == ui::ColorProviderKey::ColorMode::kDark;
++        const SkColor themed = ParseHex(space->theme.GetStops(dark).first);
++        if (themed != SK_ColorTRANSPARENT) {
++          color = themed;
++        }
++      }
++    }
++    if (color != dot_color_) {
++      dot_color_ = color;
++      SchedulePaint();
++    }
++  }
++
++  raw_ptr<BrowserWindowInterface> browser_;
++  SkColor dot_color_ = SK_ColorGRAY;
++};
++
++BEGIN_METADATA(AskButton)
++END_METADATA
++
++FindAsk::FindAsk(FindBarController* controller,
++                 BrowserWindowInterface* browser,
++                 views::View* match_count)
++    : controller_(controller), browser_(browser), match_count_(match_count) {
++  views::View* row = match_count->parent();
++  auto button = std::make_unique<AskButton>(
++      base::BindRepeating(base::IgnoreResult(&FindAsk::Run),
++                          base::Unretained(this)),
++      browser);
++  button->SetVisible(false);
++  // Same margins as the match count, so the separator after it stays put.
++  button->SetProperty(views::kMarginsKey,
++                      *match_count->GetProperty(views::kMarginsKey));
++  button_ = row->AddChildViewAt(std::move(button),
++                                row->GetIndexOf(match_count).value() + 1);
++}
++
++FindAsk::~FindAsk() {
++  if (button_) {
++    if (views::View* row = button_->parent()) {
++      row->RemoveChildViewT(button_.ExtractAsDangling());
++    }
++  }
++}
++
++void FindAsk::Show(std::u16string_view query) {
++  query_ = std::u16string(base::TrimWhitespace(query, base::TRIM_ALL));
++  button_->SetQuery(query_);
++  if (visible_) {
++    return;
++  }
++  visible_ = true;
++  match_count_->SetVisible(false);
++  button_->SetVisible(true);
++  button_->FadeIn();
++  button_->GetViewAccessibility().AnnouncePolitely(kAnnouncement);
++}
++
++void FindAsk::Hide() {
++  if (!visible_) {
++    return;
++  }
++  visible_ = false;
++  button_->SetVisible(false);
++  match_count_->SetVisible(true);
++}
++
++bool FindAsk::Run() {
++  if (!visible_ || !AskAssistant(browser_, base::UTF16ToUTF8(query_))) {
++    return false;
++  }
++  // The find bar's job is over once the question has left it.
++  FindBarController* controller = controller_;
++  Hide();
++  controller->EndFindSession(find_in_page::SelectionAction::kKeep,
++                             find_in_page::ResultAction::kClear);
++  return true;
++}
++
++void UpdateFindAsk(std::unique_ptr<FindAsk>& ask,
++                   FindBarController* controller,
++                   views::View* match_count,
++                   int number_of_matches,
++                   bool final_update,
++                   std::u16string_view query) {
++  if (number_of_matches != 0 || !final_update) {
++    HideFindAsk(ask);
++    return;
++  }
++  content::WebContents* contents =
++      controller ? controller->web_contents() : nullptr;
++  if (!contents) {
++    HideFindAsk(ask);
++    return;
++  }
++  Profile* profile = Profile::FromBrowserContext(contents->GetBrowserContext());
++  tabs::TabInterface* tab = tabs::TabInterface::MaybeGetFromContents(contents);
++  BrowserWindowInterface* browser =
++      tab ? tab->GetBrowserWindowInterface() : nullptr;
++  if (!IsAiEnabled(profile->GetPrefs()) || !browser || !IsAskableQuery(query) ||
++      !CanAskAssistant(browser)) {
++    HideFindAsk(ask);
++    return;
++  }
++  if (!ask) {
++    ask = std::make_unique<FindAsk>(controller, browser, match_count);
++  }
++  ask->Show(query);
++}
++
++void HideFindAsk(std::unique_ptr<FindAsk>& ask) {
++  if (ask) {
++    ask->Hide();
++  }
++}
++
++bool TryFindAsk(std::unique_ptr<FindAsk>& ask, std::u16string_view query) {
++  return ask && ask->visible() &&
++         base::TrimWhitespace(query, base::TRIM_ALL) == ask->query() &&
++         ask->Run();
++}
++
++}  // namespace rac::ai
+Index: src/chrome/browser/ui/views/rac/ai/find_ask.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/rac/ai/find_ask.h
+@@ -0,0 +1,75 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_AI_FIND_ASK_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_AI_FIND_ASK_H_
++
++#include <memory>
++#include <string>
++#include <string_view>
++
++#include "base/memory/raw_ptr.h"
++
++class BrowserWindowInterface;
++class FindBarController;
++
++namespace views {
++class View;
++}
++
++namespace rac::ai {
++
++class AskButton;
++
++// The "Ask" pill the find bar shows in place of its match count when the
++// query found nothing but reads like a question. The find bar keeps one of
++// these only after the pill has been wanted once, so with the assistant off
++// it never exists.
++class FindAsk {
++ public:
++  FindAsk(FindBarController* controller,
++          BrowserWindowInterface* browser,
++          views::View* match_count);
++  FindAsk(const FindAsk&) = delete;
++  FindAsk& operator=(const FindAsk&) = delete;
++  ~FindAsk();
++
++  void Show(std::u16string_view query);
++  void Hide();
++  bool visible() const { return visible_; }
++  const std::u16string& query() const { return query_; }
++
++  // Sends the query to the assistant and closes the find bar. False, leaving
++  // everything as it was, if the assistant can't take it.
++  bool Run();
++
++ private:
++  raw_ptr<FindBarController> controller_;
++  raw_ptr<BrowserWindowInterface> browser_;
++  raw_ptr<views::View> match_count_;
++  raw_ptr<AskButton> button_ = nullptr;
++  std::u16string query_;
++  bool visible_ = false;
++};
++
++// Called with each find result. Shows the pill if there were no matches for a
++// question-like `query` and the assistant can answer in this window; hides it
++// otherwise. `ask` is made when first needed.
++void UpdateFindAsk(std::unique_ptr<FindAsk>& ask,
++                   FindBarController* controller,
++                   views::View* match_count,
++                   int number_of_matches,
++                   bool final_update,
++                   std::u16string_view query);
++
++// Hides the pill and brings back the match count. Safe with no pill.
++void HideFindAsk(std::unique_ptr<FindAsk>& ask);
++
++// For Return in the find box: if the pill is showing for `query`, asks and
++// returns true. Otherwise does nothing and returns false.
++bool TryFindAsk(std::unique_ptr<FindAsk>& ask, std::u16string_view query);
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_AI_FIND_ASK_H_
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+@@ -32,6 +32,7 @@
+ #include "chrome/browser/ui/side_panel/side_panel_ui.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/views/rac/ai/assistant_menu.h"
++#include "chrome/browser/ui/views/rac/ai/assistant_side_panel.h"
+ #include "chrome/browser/ui/webui/webui_embedding_context.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/tabs/public/tab_interface.h"
+@@ -203,6 +204,9 @@ void PageHandler::RegisterMessages() {
+       "racAiMakeTitle", base::BindRepeating(&PageHandler::HandleMakeTitle,
+                                             base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
++      "racAiTakeAsk",
++      base::BindRepeating(&PageHandler::HandleTakeAsk, base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
+       "racAiShowMenu", base::BindRepeating(&PageHandler::HandleShowMenu,
+                                            base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
+@@ -218,6 +222,7 @@ void PageHandler::OnJavascriptDisallowed
+   pref_registrar_.RemoveAll();
+   spaces_observation_.Reset();
+   active_tab_subscription_ = base::CallbackListSubscription();
++  ask_subscription_ = base::CallbackListSubscription();
+   tab_observer_.reset();
+   StopSession();
+ }
+@@ -362,8 +367,7 @@ void PageHandler::HandleInit(const base:
+                                   service->key_store().HasKey(provider_id));
+     state.Set("providerName", info ? info->name : "");
+     state.Set("model", settings.model);
+-    state.Set("configured", info && has_key && !settings.model.empty() &&
+-                                !settings.base_url.empty());
++    state.Set("configured", service->HasUsableProvider());
+     state.Set("needsKey", info && info->requires_key && !has_key);
+     state.Set("attachCurrentTab", prefs->GetBoolean(kAttachCurrentTab));
+     state.Set("saveHistory", prefs->GetBoolean(kSaveHistory));
+@@ -576,6 +580,7 @@ void PageHandler::OnEnabledChanged() {
+     CloseMenu();
+     spaces_observation_.Reset();
+     active_tab_subscription_ = {};
++    ask_subscription_ = {};
+     tab_observer_.reset();
+     FireWebUIListener("rac-ai-disabled");
+     content::WebContents* contents = web_ui()->GetWebContents();
+@@ -634,6 +639,36 @@ void PageHandler::HandleClosePanel(const
+                      browser->GetWeakPtr()));
+ }
+ 
++// Only the side panel's page asks: it is the one that sends a prompt posted
++// by AskAssistant().
++void PageHandler::HandleTakeAsk(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 1u);
++  AllowJavascript();
++  BrowserWindowInterface* browser = GetBrowser();
++  if (!browser || !AiServiceFactory::GetForProfile(profile_)) {
++    ResolveJavascriptCallback(args[0], base::Value());
++    return;
++  }
++  if (!ask_subscription_) {
++    ask_subscription_ = AddAssistantPromptCallback(
++        browser,
++        base::BindRepeating(&PageHandler::OnAskPosted, base::Unretained(this)));
++  }
++  std::optional<std::string> prompt = TakeAssistantPrompt(browser);
++  ResolveJavascriptCallback(args[0],
++                            prompt ? base::Value(*prompt) : base::Value());
++}
++
++void PageHandler::OnAskPosted() {
++  BrowserWindowInterface* browser = GetBrowser();
++  if (!IsJavascriptAllowed() || !browser) {
++    return;
++  }
++  if (std::optional<std::string> prompt = TakeAssistantPrompt(browser)) {
++    FireWebUIListener("rac-ai-ask", base::Value(*prompt));
++  }
++}
++
+ void PageHandler::HandleGetModels(const base::ListValue& args) {
+   CHECK_EQ(args.size(), 1u);
+   AllowJavascript();
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+@@ -74,6 +74,8 @@ class PageHandler : public content::WebU
+   void HandleOpenUrl(const base::ListValue& args);
+   void HandleOpenSettings(const base::ListValue& args);
+   void HandleClosePanel(const base::ListValue& args);
++  void HandleTakeAsk(const base::ListValue& args);
++  void OnAskPosted();
+   void HandleHistoryList(const base::ListValue& args);
+   void HandleHistoryGet(const base::ListValue& args);
+   void HandleHistorySave(const base::ListValue& args);
+@@ -139,6 +141,7 @@ class PageHandler : public content::WebU
+   base::Value title_callback_;
+   std::string title_text_;
+   base::CallbackListSubscription active_tab_subscription_;
++  base::CallbackListSubscription ask_subscription_;
+   std::unique_ptr<TabObserver> tab_observer_;
+   base::ScopedObservation<SpacesWindowManager, SpacesWindowManager::Observer>
+       spaces_observation_{this};
