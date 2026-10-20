@@ -71,6 +71,17 @@ process. The result is filtered to chat models, capped, cached per profile
 for a few minutes, and the saved model is always in the list, so a
 provider that can't be reached never leaves the menu empty.
 
+Base URLs are normalized (`NormalizeBaseUrl`) when saved and again when
+read, so an address pasted with its request path, like
+`https://openrouter.ai/api/v1/chat/completions`, works anyway; rac adds
+`/chat/completions` (or `/v1/messages`) itself. Saving provider settings
+also runs a connection check (`CheckProviderConnection`): `GET {base}/models`
+first, and, for servers with no model list, a one-token chat request, so
+the user learns the address or key is wrong in Settings, not from a failed
+chat. A model that rejects the browser tools makes the provider's error
+clear, so the chat retries once without them and says so; a model that
+can't do that at all just chats as plain text.
+
 ### Page context
 
 Chat and the agent read pages through Chromium's AnnotatedPageContent (APC),

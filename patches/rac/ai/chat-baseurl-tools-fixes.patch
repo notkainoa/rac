@@ -1,0 +1,990 @@
+Index: src/chrome/browser/rac/ai/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/ai/BUILD.gn	2026-10-19 17:50:33.058470931 -0700
++++ src/chrome/browser/rac/ai/BUILD.gn	2026-10-19 18:13:53.608439799 -0700
+@@ -139,6 +139,7 @@
+     "model_catalog_unittest.cc",
+     "new_tab_page_unittest.cc",
+     "page_text_unittest.cc",
++    "providers_unittest.cc",
+     "saved_prompts_unittest.cc",
+     "sse_parser_unittest.cc",
+   ]
+Index: src/chrome/browser/rac/ai/ai_prefs.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_prefs.cc	2026-10-19 17:59:24.282452189 -0700
++++ src/chrome/browser/rac/ai/ai_prefs.cc	2026-10-19 18:07:07.231423120 -0700
+@@ -49,7 +49,9 @@
+   if (saved) {
+     if (const std::string* url = saved->FindString("base_url");
+         url && !url->empty()) {
+-      settings.base_url = *url;
++      // Reads normalize too, so a URL saved with a pasted request path
++      // keeps working.
++      settings.base_url = info ? NormalizeBaseUrl(info->type, *url) : *url;
+     }
+     if (const std::string* model = saved->FindString("model");
+         model && !model->empty()) {
+Index: src/chrome/browser/rac/ai/chat_protocol.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/chat_protocol.cc	2026-10-17 08:15:28.971246514 -0700
++++ src/chrome/browser/rac/ai/chat_protocol.cc	2026-10-19 18:07:12.117921743 -0700
+@@ -370,6 +370,18 @@
+   return ErrorFromDict(*dict).value_or(std::string());
+ }
+ 
++bool LooksLikeToolsRejection(std::string_view error) {
++  const std::string lower = base::ToLowerASCII(error);
++  const bool about_tools = lower.find("tool") != std::string::npos ||
++                           lower.find("function call") != std::string::npos;
++  if (!about_tools) {
++    return false;
++  }
++  return lower.find("support") != std::string::npos ||
++         lower.find("no endpoints") != std::string::npos ||
++         lower.find("tool use") != std::string::npos;
++}
++
+ std::vector<std::string> ParseModelList(std::string_view json) {
+   std::vector<std::string> ids;
+   std::optional<base::DictValue> dict =
+Index: src/chrome/browser/rac/ai/chat_protocol.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/chat_protocol.h	2026-10-17 08:15:28.971745843 -0700
++++ src/chrome/browser/rac/ai/chat_protocol.h	2026-10-19 18:07:07.258031612 -0700
+@@ -87,6 +87,8 @@
+   // Set when the stream carries an error. The text is the provider's, so it
+   // may be shown to the user but must not be trusted.
+   std::optional<std::string> error;
++  // A quiet note about this chat, shown once. Not an error.
++  std::string notice;
+ };
+ 
+ // Turns the bytes of a provider's event stream into text.
+@@ -107,6 +109,10 @@
+ // returns an empty string.
+ std::string ExtractErrorMessage(std::string_view body);
+ 
++// True when a provider's error text says the request failed because of the
++// browser tools, so the same request without them would go through.
++bool LooksLikeToolsRejection(std::string_view error);
++
+ inline constexpr size_t kMaxListedModels = 50;
+ 
+ // Model ids from an OpenAI-compatible `GET /models` body, in the server's
+Index: src/chrome/browser/rac/ai/chat_protocol_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/chat_protocol_unittest.cc	2026-10-17 08:15:28.972293090 -0700
++++ src/chrome/browser/rac/ai/chat_protocol_unittest.cc	2026-10-19 18:20:08.073637076 -0700
+@@ -318,4 +318,20 @@
+   EXPECT_FALSE(CompleteToolCalls(partial, offered).has_value());
+ }
+ 
++TEST(RacAiToolProtocolTest, SpotsToolsRejection) {
++  EXPECT_TRUE(LooksLikeToolsRejection("This model does not support tools."));
++  EXPECT_TRUE(
++      LooksLikeToolsRejection("No endpoints found that support tool use."));
++  EXPECT_TRUE(LooksLikeToolsRejection(
++      "The provider returned an error (HTTP 400): Tool use is not "
++      "supported by this model."));
++  EXPECT_FALSE(LooksLikeToolsRejection(
++      "The provider returned an error (HTTP 404): Not Found"));
++  EXPECT_FALSE(LooksLikeToolsRejection(
++      "The provider returned an error (HTTP 401): Invalid API key"));
++  EXPECT_FALSE(LooksLikeToolsRejection(
++      "The provider returned an error (HTTP 429): Rate limit exceeded"));
++  EXPECT_FALSE(LooksLikeToolsRejection(""));
++}
++
+ }  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/chat_session.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/chat_session.cc	2026-10-19 17:16:03.344758840 -0700
++++ src/chrome/browser/rac/ai/chat_session.cc	2026-10-19 18:20:08.093640569 -0700
+@@ -99,6 +99,20 @@
+     return;
+   }
+   if (update.error) {
++    // Some models can't take the browser tools at all. The provider says so
++    // in its error, so the same request without them goes through, and the
++    // chat continues as plain text. Only the first request is retried; a
++    // transcript that already used tools can't drop them halfway.
++    if (tool_count_ == 0 && !retried_without_tools_ &&
++        !request_.tools.empty() && LooksLikeToolsRejection(*update.error)) {
++      retried_without_tools_ = true;
++      request_.tools.clear();
++      stream_.reset();
++      on_update_.Run({.notice = "This model can't control the browser, so this "
++                                "chat continues without browser control."});
++      StartRequest();
++      return;
++    }
+     Fail(*update.error);
+     return;
+   }
+Index: src/chrome/browser/rac/ai/chat_session.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/chat_session.h	2026-10-17 08:15:28.973329166 -0700
++++ src/chrome/browser/rac/ai/chat_session.h	2026-10-19 18:07:21.488917086 -0700
+@@ -62,6 +62,9 @@
+   size_t tool_count_ = 0;
+   bool round_finished_ = false;
+   bool failed_ = false;
++  // Set after the one retry that drops the browser tools, when the provider
++  // rejects the request only because of them.
++  bool retried_without_tools_ = false;
+   base::WeakPtrFactory<ChatSession> weak_factory_{this};
+ };
+ 
+Index: src/chrome/browser/rac/ai/model_list.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/model_list.cc	2026-10-19 17:57:28.921722926 -0700
++++ src/chrome/browser/rac/ai/model_list.cc	2026-10-19 18:20:08.135731849 -0700
+@@ -10,16 +10,22 @@
+ 
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "base/time/time.h"
+ #include "chrome/browser/rac/ai/chat_protocol.h"
+ #include "chrome/browser/rac/ai/model_catalog.h"
+ #include "net/base/load_flags.h"
++#include "net/base/net_errors.h"
+ #include "net/traffic_annotation/network_traffic_annotation.h"
+ #include "services/network/public/cpp/resource_request.h"
+ #include "services/network/public/cpp/shared_url_loader_factory.h"
+ #include "services/network/public/cpp/simple_url_loader.h"
+ #include "services/network/public/mojom/fetch_api.mojom.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
+ #include "url/gurl.h"
+ 
+ namespace rac::ai {
+@@ -86,15 +92,195 @@
+   }
+ }
+ 
+-void OnBody(base::OnceCallback<void(std::vector<std::string>)> callback,
+-            std::optional<std::string> body) {
+-  std::vector<std::string> models;
+-  if (body) {
+-    models = ParseModelList(*body);
++constexpr size_t kMaxCheckBodyBytes = 64 * 1024;
++constexpr base::TimeDelta kCheckTimeout = base::Seconds(8);
++
++std::string DescribeHttpError(int status, std::string_view body) {
++  std::string text = base::StrCat({"The provider returned an error (HTTP ",
++                                   base::NumberToString(status), ")"});
++  std::string message = ExtractErrorMessage(body);
++  if (message.empty()) {
++    switch (status) {
++      case 401:
++      case 403:
++        message = "The key was rejected.";
++        break;
++      case 404:
++        message = "Nothing answers at that address.";
++        break;
++    }
++  }
++  if (!message.empty()) {
++    text += ": " + message.substr(0, 300);
+   }
+-  std::move(callback).Run(std::move(models));
++  return text;
+ }
+ 
++// The save-time connection check. Keeps itself alive until it has run the
++// callback, so the caller doesn't have to hold anything.
++class ConnectionCheck {
++ public:
++  static void Start(scoped_refptr<network::SharedURLLoaderFactory> factory,
++                    const ProviderInfo& info,
++                    const std::string& base_url,
++                    const std::string& api_key,
++                    const std::string& model,
++                    base::OnceCallback<void(ConnectionResult)> callback) {
++    auto check =
++        std::make_shared<ConnectionCheck>(std::move(factory), info, base_url,
++                                          api_key, model, std::move(callback));
++    check->self_ = check;
++    check->CheckModels();
++  }
++
++  ConnectionCheck(scoped_refptr<network::SharedURLLoaderFactory> factory,
++                  const ProviderInfo& info,
++                  const std::string& base_url,
++                  const std::string& api_key,
++                  const std::string& model,
++                  base::OnceCallback<void(ConnectionResult)> callback)
++      : factory_(std::move(factory)),
++        info_(info),
++        base_url_(base_url),
++        api_key_(api_key),
++        model_(model),
++        callback_(std::move(callback)) {}
++  ConnectionCheck(const ConnectionCheck&) = delete;
++  ConnectionCheck& operator=(const ConnectionCheck&) = delete;
++  ~ConnectionCheck() = default;
++
++  void CheckModels() {
++    const GURL url(ModelsUrl(info_, base_url_));
++    if (!factory_ || !IsAcceptableBaseUrl(url)) {
++      Finish({.ok = false, .message = "That address isn't usable."});
++      return;
++    }
++    auto request = std::make_unique<network::ResourceRequest>();
++    request->url = url;
++    request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++    request->redirect_mode = network::mojom::RedirectMode::kError;
++    request->load_flags = net::LOAD_DISABLE_CACHE;
++    AddAuthHeaders(info_, api_key_, request.get());
++    loader_ = network::SimpleURLLoader::Create(std::move(request),
++                                               kTrafficAnnotation);
++    loader_->SetAllowHttpErrorResults(true);
++    loader_->SetTimeoutDuration(kCheckTimeout);
++    loader_->DownloadToString(factory_.get(),
++                              base::BindOnce(
++                                  [](std::shared_ptr<ConnectionCheck> self,
++                                     std::optional<std::string> body) {
++                                    self->OnModelsBody(std::move(body));
++                                  },
++                                  self_),
++                              kMaxCheckBodyBytes);
++  }
++
++ private:
++  void OnModelsBody(std::optional<std::string> body) {
++    const int status = ResponseCode(loader_.get());
++    if (status >= 200 && status < 300) {
++      Finish({.ok = true});
++      return;
++    }
++    // Servers without a model list still answer chats, so ask for one word.
++    if (status == 404 || status == 405) {
++      CheckChat();
++      return;
++    }
++    if (status != 0) {
++      Finish({.ok = false,
++              .message = DescribeHttpError(status, body.value_or(""))});
++      return;
++    }
++    const int net_error = loader_ ? loader_->NetError() : net::ERR_FAILED;
++    Finish(
++        {.ok = false,
++         .message = base::StrCat({"Couldn't reach the provider (",
++                                  net::ErrorToShortString(net_error), ")."})});
++  }
++
++  void CheckChat() {
++    if (model_.empty()) {
++      Finish({.ok = false, .message = "Set a model before checking."});
++      return;
++    }
++    ChatRequest probe;
++    probe.max_output_tokens = 1;
++    probe.messages.push_back({ChatMessage::Role::kUser, "ping"});
++    auto spec = BuildChatRequest(info_, base_url_, model_, api_key_, probe);
++    if (!spec) {
++      Finish({.ok = false, .message = "That address or key isn't usable."});
++      return;
++    }
++    if (auto body =
++            base::JSONReader::ReadDict(spec->body, base::JSON_PARSE_RFC)) {
++      body->Set("stream", false);
++      base::JSONWriter::Write(*body, &spec->body);
++    }
++    auto request = std::make_unique<network::ResourceRequest>();
++    request->url = spec->url;
++    request->method = "POST";
++    request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++    request->redirect_mode = network::mojom::RedirectMode::kError;
++    request->load_flags = net::LOAD_DISABLE_CACHE;
++    for (const auto& [name, value] : spec->headers) {
++      request->headers.SetHeader(name, value);
++    }
++    loader_ = network::SimpleURLLoader::Create(std::move(request),
++                                               kTrafficAnnotation);
++    loader_->SetAllowHttpErrorResults(true);
++    loader_->SetTimeoutDuration(kCheckTimeout);
++    loader_->AttachStringForUpload(spec->body, "application/json");
++    loader_->DownloadToString(factory_.get(),
++                              base::BindOnce(
++                                  [](std::shared_ptr<ConnectionCheck> self,
++                                     std::optional<std::string> body) {
++                                    self->OnChatBody(std::move(body));
++                                  },
++                                  self_),
++                              kMaxCheckBodyBytes);
++  }
++
++  void OnChatBody(std::optional<std::string> body) {
++    const int status = ResponseCode(loader_.get());
++    if (status >= 200 && status < 300) {
++      Finish({.ok = true});
++      return;
++    }
++    if (status != 0) {
++      Finish({.ok = false,
++              .message = DescribeHttpError(status, body.value_or(""))});
++      return;
++    }
++    const int net_error = loader_ ? loader_->NetError() : net::ERR_FAILED;
++    Finish(
++        {.ok = false,
++         .message = base::StrCat({"Couldn't reach the provider (",
++                                  net::ErrorToShortString(net_error), ")."})});
++  }
++
++  static int ResponseCode(network::SimpleURLLoader* loader) {
++    const network::mojom::URLResponseHead* info =
++        loader ? loader->ResponseInfo() : nullptr;
++    return info && info->headers ? info->headers->response_code() : 0;
++  }
++
++  void Finish(ConnectionResult result) {
++    loader_.reset();
++    self_.reset();
++    std::move(callback_).Run(std::move(result));
++  }
++
++  scoped_refptr<network::SharedURLLoaderFactory> factory_;
++  ProviderInfo info_;
++  std::string base_url_;
++  std::string api_key_;
++  std::string model_;
++  base::OnceCallback<void(ConnectionResult)> callback_;
++  std::shared_ptr<ConnectionCheck> self_;
++  std::unique_ptr<network::SimpleURLLoader> loader_;
++};
++
+ }  // namespace
+ 
+ std::unique_ptr<network::SimpleURLLoader> FetchProviderModels(
+@@ -149,4 +335,15 @@
+                           Entry{std::move(models), base::TimeTicks::Now()});
+ }
+ 
++void CheckProviderConnection(
++    scoped_refptr<network::SharedURLLoaderFactory> factory,
++    const ProviderInfo& info,
++    const std::string& base_url,
++    const std::string& api_key,
++    const std::string& model,
++    base::OnceCallback<void(ConnectionResult)> callback) {
++  ConnectionCheck::Start(std::move(factory), info, base_url, api_key, model,
++                         std::move(callback));
++}
++
+ }  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/model_list.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/model_list.h	2026-10-19 17:48:13.400050522 -0700
++++ src/chrome/browser/rac/ai/model_list.h	2026-10-19 18:17:53.753340158 -0700
+@@ -12,6 +12,7 @@
+ #include <vector>
+ 
+ #include "base/functional/callback_forward.h"
++#include "base/memory/scoped_refptr.h"
+ #include "base/time/time.h"
+ #include "chrome/browser/rac/ai/providers.h"
+ 
+@@ -51,6 +52,25 @@
+   std::map<std::string, Entry, std::less<>> cache_;
+ };
+ 
++// What a saved provider's connection check found, in plain words. `ok` with
++// an empty `message` means everything is fine.
++struct ConnectionResult {
++  bool ok = false;
++  std::string message;
++};
++
++// A quick check that the provider answers: `GET {base}/models` with the
++// key and, when a server has no model list, a one-token chat request. Only
++// runs when the user saves provider settings. Keeps itself alive until it
++// runs `callback`.
++void CheckProviderConnection(
++    scoped_refptr<network::SharedURLLoaderFactory> factory,
++    const ProviderInfo& info,
++    const std::string& base_url,
++    const std::string& api_key,
++    const std::string& model,
++    base::OnceCallback<void(ConnectionResult)> callback);
++
+ }  // namespace rac::ai
+ 
+ #endif  // CHROME_BROWSER_RAC_AI_MODEL_LIST_H_
+Index: src/chrome/browser/rac/ai/providers.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/providers.cc	2026-10-16 23:39:27.871475948 -0700
++++ src/chrome/browser/rac/ai/providers.cc	2026-10-19 18:06:39.611417758 -0700
+@@ -6,6 +6,7 @@
+ 
+ #include <iterator>
+ 
++#include "base/strings/string_util.h"
+ #include "net/base/url_util.h"
+ #include "url/gurl.h"
+ 
+@@ -55,4 +56,23 @@
+          (url.SchemeIs("http") && net::IsLocalhost(url));
+ }
+ 
++std::string NormalizeBaseUrl(ProviderType type, const std::string& base_url) {
++  std::string url;
++  base::TrimString(base_url, base::kWhitespaceASCII, &url);
++  while (!url.empty() && url.back() == '/') {
++    url.pop_back();
++  }
++  // A pasted endpoint, like "https://openrouter.ai/api/v1/chat/completions",
++  // would end up doubled, so drop the request path rac adds itself.
++  const std::string_view suffix =
++      type == ProviderType::kAnthropic ? "/v1/messages" : "/chat/completions";
++  if (base::EndsWith(url, suffix) && url.size() > suffix.size()) {
++    url.resize(url.size() - suffix.size());
++  }
++  while (!url.empty() && url.back() == '/') {
++    url.pop_back();
++  }
++  return url;
++}
++
+ }  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/providers.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/providers.h	2026-10-16 23:39:27.871670861 -0700
++++ src/chrome/browser/rac/ai/providers.h	2026-10-19 18:06:33.363299809 -0700
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_RAC_AI_PROVIDERS_H_
+ #define CHROME_BROWSER_RAC_AI_PROVIDERS_H_
+ 
++#include <string>
+ #include <string_view>
+ 
+ #include "base/containers/span.h"
+@@ -42,6 +43,12 @@
+ // Keys are only sent over https, or to this computer.
+ bool IsAcceptableBaseUrl(const GURL& url);
+ 
++// The base URL as rac uses it: trimmed, without a trailing slash, and
++// without a pasted request path ("/chat/completions" for OpenAI-compatible
++// providers, "/v1/messages" for Anthropic), which rac adds itself. Applied
++// when a URL is saved and when one is read back.
++std::string NormalizeBaseUrl(ProviderType type, const std::string& base_url);
++
+ }  // namespace rac::ai
+ 
+ #endif  // CHROME_BROWSER_RAC_AI_PROVIDERS_H_
+Index: src/chrome/browser/rac/ai/providers_unittest.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/providers_unittest.cc	2026-10-19 18:20:08.168250728 -0700
+@@ -0,0 +1,63 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/providers.h"
++
++#include <string>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::ai {
++namespace {
++
++TEST(ProvidersTest, NormalizeTrimsSpacesAndSlashes) {
++  EXPECT_EQ(NormalizeBaseUrl(ProviderType::kOpenAiCompatible,
++                             "  https://openrouter.ai/api/v1/ "),
++            "https://openrouter.ai/api/v1");
++  EXPECT_EQ(NormalizeBaseUrl(ProviderType::kOpenAiCompatible,
++                             "https://openrouter.ai/api/v1//"),
++            "https://openrouter.ai/api/v1");
++}
++
++TEST(ProvidersTest, NormalizeStripsPastedChatCompletions) {
++  EXPECT_EQ(NormalizeBaseUrl(ProviderType::kOpenAiCompatible,
++                             "https://openrouter.ai/api/v1/chat/completions"),
++            "https://openrouter.ai/api/v1");
++  EXPECT_EQ(NormalizeBaseUrl(ProviderType::kOpenAiCompatible,
++                             "https://openrouter.ai/api/v1/chat/completions/"),
++            "https://openrouter.ai/api/v1");
++  // The address the maintainer had saved: doubled before, works after.
++  EXPECT_EQ(NormalizeBaseUrl(ProviderType::kOpenAiCompatible,
++                             "https://openrouter.ai/api/v1/chat/completions"),
++            "https://openrouter.ai/api/v1");
++}
++
++TEST(ProvidersTest, NormalizeStripsPastedAnthropicMessages) {
++  EXPECT_EQ(NormalizeBaseUrl(ProviderType::kAnthropic,
++                             "https://api.anthropic.com/v1/messages"),
++            "https://api.anthropic.com");
++}
++
++TEST(ProvidersTest, NormalizeLeavesOrdinaryAddressesAlone) {
++  EXPECT_EQ(NormalizeBaseUrl(ProviderType::kOpenAiCompatible,
++                             "http://localhost:11434/v1"),
++            "http://localhost:11434/v1");
++  EXPECT_EQ(
++      NormalizeBaseUrl(ProviderType::kAnthropic, "https://api.anthropic.com"),
++      "https://api.anthropic.com");
++  EXPECT_EQ(NormalizeBaseUrl(ProviderType::kOpenAiCompatible, ""), "");
++}
++
++TEST(ProvidersTest, SavedEndpointsSurviveBuildChatRequest) {
++  // A URL saved with the request path still reaches the right endpoint,
++  // because reads normalize it too.
++  const ProviderInfo* info = FindProvider("openai");
++  ASSERT_TRUE(info);
++  const std::string normalized =
++      NormalizeBaseUrl(info->type, "https://api.openai.com/v1");
++  EXPECT_EQ(normalized, info->default_base_url);
++}
++
++}  // namespace
++}  // namespace rac::ai
+Index: src/chrome/browser/resources/rac_ai/app.ts
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/app.ts	2026-10-19 17:57:40.790202377 -0700
++++ src/chrome/browser/resources/rac_ai/app.ts	2026-10-19 19:39:26.603132130 -0700
+@@ -68,6 +68,7 @@
+   delta?: string;
+   done?: boolean;
+   error?: string;
++  notice?: string;
+ }
+ 
+ interface StoredMessage {
+@@ -1648,6 +1649,40 @@
+   };
+ }
+ 
++// What went wrong with a chat, in plain words: a title, one line on what to
++// do, and the buttons that do it. `raw` is the provider's own text.
++function describeChatError(raw: string, hadReply: boolean): ErrorView {
++  const first = raw.split('\n')[0]!.slice(0, 240);
++  // A doubled or wrong server address answers "not found" because the
++  // request lands nowhere. The address is in settings.
++  if (/not found|404/i.test(raw)) {
++    return {
++      title: loadTimeData.getString('errUrlTitle'),
++      detail: loadTimeData.getString('errUrlDetail'),
++      actions: ['retry', 'settings'],
++    };
++  }
++  if (/401|unauthorized|api key|credential/i.test(raw)) {
++    return {
++      title: loadTimeData.getString('errKeyTitle'),
++      detail: loadTimeData.getString('errKeyDetail'),
++      actions: ['retry', 'settings'],
++    };
++  }
++  if (/limit|quota|rate/i.test(raw)) {
++    return {
++      title: loadTimeData.getString('errLimitChatTitle'),
++      detail: first,
++      actions: ['retry'],
++    };
++  }
++  return {
++    title: loadTimeData.getString('errorTitle'),
++    detail: first,
++    actions: hadReply ? ['retry'] : ['retry', 'settings'],
++  };
++}
++
+ function makeAction(
+     label: string, onClick: () => void, primary = false): HTMLElement {
+   const button = document.createElement('button');
+@@ -1664,12 +1699,9 @@
+ 
+ function makeErrorBlock(message: Message, active: boolean): HTMLElement {
+   const run = message.agent;
+-  const view: ErrorView =
+-      run ? describeAgentError(run, message.error!, !!message.text) : {
+-        title: loadTimeData.getString('errorTitle'),
+-        detail: message.error!,
+-        actions: ['retry'],
+-      };
++  const view: ErrorView = run ?
++      describeAgentError(run, message.error!, !!message.text) :
++      describeChatError(message.error!, !!message.text);
+   const error = document.createElement('div');
+   error.className = 'error';
+   const title = document.createElement('p');
+@@ -1703,7 +1735,8 @@
+             makeAction(loadTimeData.getString('retry'), retry, primary));
+       } else if (action === 'settings') {
+         actions.appendChild(makeAction(
+-            loadTimeData.getString('agentSettings'), openSettings, primary));
++            loadTimeData.getString(run ? 'agentSettings' : 'settings'),
++            openSettings, primary));
+       } else {
+         actions.appendChild(makeAction(
+             loadTimeData.getString('chooseProvider'), openProviderMenu,
+@@ -2258,6 +2291,9 @@
+     last.text += event.delta;
+     refreshActivity(last);
+   }
++  if (event.notice) {
++    last.notice = event.notice;
++  }
+   if (event.error) {
+     last.error = event.error;
+     streaming = false;
+Index: src/chrome/browser/resources/settings/privacy_page/rac_ai_page.html
+===================================================================
+--- src.orig/chrome/browser/resources/settings/privacy_page/rac_ai_page.html	2026-10-19 18:03:20.899424138 -0700
++++ src/chrome/browser/resources/settings/privacy_page/rac_ai_page.html	2026-10-19 18:11:45.163517839 -0700
+@@ -245,6 +245,9 @@
+                     error-message="$i18n{racAiBaseUrlInvalid}"
+                     spellcheck="false" maxlength="512">
+                 </cr-input>
++                <div class="cr-secondary-text">
++                  $i18n{racAiBaseUrlHelp}
++                </div>
+                 <div class="cr-secondary-text" hidden$="[[!urlNote_]]">
+                   [[urlNote_]]
+                 </div>
+@@ -295,6 +298,10 @@
+                   </cr-button>
+                 </template>
+               </div>
++              <div class$="[[connectionClass_(connectionChecking_, connectionOk_)]]"
++                  hidden$="[[!connectionVisible_(connectionChecking_, connectionOk_, connectionMessage_)]]">
++                [[connectionText_(connectionChecking_, connectionOk_, connectionMessage_)]]
++              </div>
+               <div class="cr-secondary-text" hidden$="[[!saveNote_]]">
+                 [[saveNote_]]
+               </div>
+Index: src/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts
+===================================================================
+--- src.orig/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts	2026-10-19 18:04:10.054033330 -0700
++++ src/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts	2026-10-19 18:20:08.207873554 -0700
+@@ -111,6 +111,9 @@
+       saveNote_: {type: String, value: ''},
+       urlNote_: {type: String, value: ''},
+       keyNote_: {type: String, value: ''},
++      connectionChecking_: {type: Boolean, value: false},
++      connectionOk_: {type: Boolean, value: false},
++      connectionMessage_: {type: String, value: ''},
+       selectedId_: {type: String, value: ''},
+       selected_: {type: Object, value: null},
+       baseUrlInvalid_: {type: Boolean, value: false},
+@@ -128,6 +131,9 @@
+   declare private saveNote_: string;
+   declare private urlNote_: string;
+   declare private keyNote_: string;
++  declare private connectionChecking_: boolean;
++  declare private connectionOk_: boolean;
++  declare private connectionMessage_: string;
+   declare private selectedId_: string;
+   declare private selected_: RacAiProvider|null;
+   declare private baseUrlInvalid_: boolean;
+@@ -148,6 +154,16 @@
+     super.ready();
+     this.addWebUiListener(
+         'rac-ai-state-changed', (state: RacAiState) => this.applyState_(state));
++    this.addWebUiListener(
++        'rac-ai-connection',
++        (event: {id: string, ok: boolean, message: string}) => {
++          if (!this.selected_ || event.id !== this.selected_.id) {
++            return;
++          }
++          this.connectionChecking_ = false;
++          this.connectionOk_ = event.ok;
++          this.connectionMessage_ = event.message || '';
++        });
+     this.refresh_();
+   }
+ 
+@@ -506,10 +522,29 @@
+     const id = (event.target as HTMLSelectElement).value;
+     this.baseUrlInvalid_ = false;
+     this.keyFailed_ = false;
++    this.clearConnection_();
+     sendWithPromise<RacAiState>('racAiSetProvider', id)
+         .then(state => this.applyState_(state));
+   }
+ 
++  // Saving is the moment to find out the settings are wrong, not the next
++  // chat. Runs after the browser has the new address and key.
++  private checkConnection_() {
++    if (!this.selected_) {
++      return;
++    }
++    this.connectionChecking_ = true;
++    this.connectionOk_ = false;
++    this.connectionMessage_ = '';
++    chrome.send('racAiCheckConnection', [this.selected_.id]);
++  }
++
++  private clearConnection_() {
++    this.connectionChecking_ = false;
++    this.connectionOk_ = false;
++    this.connectionMessage_ = '';
++  }
++
+   private onSaveSettings_() {
+     const baseUrl =
+         this.shadowRoot!.querySelector<HTMLInputElement>('#baseUrl');
+@@ -523,6 +558,7 @@
+         .then(state => {
+           this.applyState_(state);
+           this.flashNote_('urlNote_', this.i18n('racAiSaved'));
++          this.checkConnection_();
+         })
+         .catch((reason: string) => {
+           this.baseUrlInvalid_ = reason === 'invalid_url';
+@@ -540,6 +576,7 @@
+           input.value = '';
+           this.applyState_(state);
+           this.flashNote_('keyNote_', this.i18n('racAiSaved'));
++          this.checkConnection_();
+         })
+         .catch(() => {
+           this.keyFailed_ = true;
+@@ -583,6 +620,22 @@
+   private hasNoKey_(selected: RacAiProvider|null): boolean {
+     return !!selected && selected.requiresKey && !selected.hasKey;
+   }
++
++  private connectionClass_(checking: boolean, ok: boolean): string {
++    return 'status ' + (checking ? 'checking' : ok ? 'ready' : 'error');
++  }
++
++  private connectionVisible_(checking: boolean, ok: boolean, message: string):
++      boolean {
++    return checking || ok || !!message;
++  }
++
++  private connectionText_(checking: boolean, ok: boolean, message: string):
++      string {
++    return checking ? this.i18n('racAiConnectionChecking') :
++        ok          ? this.i18n('racAiConnectionOk') :
++                      message;
++  }
+ }
+ 
+ declare global {
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc	2026-10-19 18:00:20.842391515 -0700
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc	2026-10-19 18:09:56.444254478 -0700
+@@ -1073,6 +1073,9 @@
+   if (update.error) {
+     event.Set("error", *update.error);
+   }
++  if (!update.notice.empty()) {
++    event.Set("notice", update.notice);
++  }
+   if (update.done) {
+     event.Set("done", true);
+   }
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc	2026-10-19 17:50:46.543853427 -0700
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc	2026-10-19 18:13:07.651373586 -0700
+@@ -135,6 +135,14 @@
+     {"errNodeTitle", "$1 needs Node.js."},
+     {"errNodeDetail", "Install Node.js, then try again."},
+     {"errLimitTitle", "$1 hit a usage limit."},
++    {"errUrlTitle", "The provider's server didn't answer."},
++    {"errUrlDetail",
++     "Check the server address in Assistant settings. rac adds the request "
++     "path itself, so the address should end at the API root, like "
++     "https://openrouter.ai/api/v1."},
++    {"errKeyTitle", "The provider rejected the key."},
++    {"errKeyDetail", "Check the API key in Assistant settings."},
++    {"errLimitChatTitle", "The provider hit a usage limit."},
+     {"planTitle", "rac will:"},
+     {"planSites", "On these sites"},
+     {"planAllow", "Allow"},
+Index: src/chrome/browser/ui/webui/settings/rac_ai_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/settings/rac_ai_handler.cc	2026-10-19 18:04:10.267130308 -0700
++++ src/chrome/browser/ui/webui/settings/rac_ai_handler.cc	2026-10-19 18:45:38.401517583 -0700
+@@ -88,6 +88,10 @@
+       "racAiSaveModels", base::BindRepeating(&RacAiHandler::HandleSaveModels,
+                                              base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
++      "racAiCheckConnection",
++      base::BindRepeating(&RacAiHandler::HandleCheckConnection,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
+       "racAiListAgents", base::BindRepeating(&RacAiHandler::HandleListAgents,
+                                              base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
+@@ -142,6 +146,7 @@
+ }
+ 
+ void RacAiHandler::HandleSetProvider(const base::ListValue& args) {
++  AllowJavascript();
+   CHECK_EQ(args.size(), 2u);
+   const std::string& id = args[1].GetString();
+   if (!rac::ai::AiServiceFactory::GetForProfile(profile_) ||
+@@ -154,6 +159,7 @@
+ }
+ 
+ void RacAiHandler::HandleSaveSettings(const base::ListValue& args) {
++  AllowJavascript();
+   CHECK_EQ(args.size(), 4u);
+   const std::string& id = args[1].GetString();
+   const std::string& base_url = args[2].GetString();
+@@ -171,18 +177,91 @@
+     RejectJavascriptCallback(args[0], base::Value("invalid_url"));
+     return;
+   }
+-  // Read-modify-write, so the model chips survive.
++  // Read-modify-write, so the model chips survive. A pasted endpoint, like
++  // "https://openrouter.ai/api/v1/chat/completions", is trimmed to the base
++  // URL rac adds its own request path to.
+   rac::ai::ProviderSettings settings =
+       rac::ai::GetProviderSettings(profile_->GetPrefs(), id);
+-  settings.base_url = base_url;
++  settings.base_url = base_url.empty()
++                          ? std::string()
++                          : rac::ai::NormalizeBaseUrl(info->type, base_url);
+   settings.model = rac::ai::SanitizeModelId(model);
+   rac::ai::SetProviderSettings(profile_->GetPrefs(), id, settings);
+   ResolveJavascriptCallback(args[0], CreateState());
+ }
+ 
++// The save-time connection check. The page hears the answer as a listener
++// event, because a dead provider can take seconds to time out. Fire-and-forget
++// from the page, so `args` carries no callback id.
++void RacAiHandler::HandleCheckConnection(const base::ListValue& args) {
++  AllowJavascript();
++  CHECK_EQ(args.size(), 1u);
++  const std::string& id = args[0].GetString();
++  rac::ai::AiService* service =
++      rac::ai::AiServiceFactory::GetForProfile(profile_);
++  const rac::ai::ProviderInfo* info = rac::ai::FindProvider(id);
++  if (!service || !info) {
++    return;
++  }
++  const rac::ai::ProviderSettings settings =
++      rac::ai::GetProviderSettings(profile_->GetPrefs(), id);
++  if (settings.base_url.empty() ||
++      (info->requires_key && !service->key_store().HasKey(id))) {
++    FireConnectionEvent(id, {.ok = false,
++                             .message = "Add a server address and a key "
++                                        "first."});
++    return;
++  }
++  if (!info->requires_key) {
++    rac::ai::CheckProviderConnection(
++        service->url_loader_factory(), *info, settings.base_url, std::string(),
++        settings.model,
++        base::BindOnce(&RacAiHandler::OnConnectionResult,
++                       weak_factory_.GetWeakPtr(), id));
++    return;
++  }
++  service->key_store().GetKey(id,
++                              base::BindOnce(&RacAiHandler::OnConnectionKey,
++                                             weak_factory_.GetWeakPtr(), id));
++}
++
++void RacAiHandler::OnConnectionKey(std::string provider_id,
++                                   std::optional<std::string> key) {
++  rac::ai::AiService* service =
++      rac::ai::AiServiceFactory::GetForProfile(profile_);
++  const rac::ai::ProviderInfo* info = rac::ai::FindProvider(provider_id);
++  if (!service || !info || !key) {
++    return;
++  }
++  const rac::ai::ProviderSettings settings =
++      rac::ai::GetProviderSettings(profile_->GetPrefs(), provider_id);
++  rac::ai::CheckProviderConnection(
++      service->url_loader_factory(), *info, settings.base_url, *key,
++      settings.model,
++      base::BindOnce(&RacAiHandler::OnConnectionResult,
++                     weak_factory_.GetWeakPtr(), provider_id));
++}
++
++void RacAiHandler::OnConnectionResult(std::string provider_id,
++                                      rac::ai::ConnectionResult result) {
++  FireConnectionEvent(provider_id, std::move(result));
++}
++
++void RacAiHandler::FireConnectionEvent(const std::string& provider_id,
++                                       rac::ai::ConnectionResult result) {
++  if (!IsJavascriptAllowed()) {
++    return;
++  }
++  FireWebUIListener("rac-ai-connection", base::DictValue()
++                                             .Set("id", provider_id)
++                                             .Set("ok", result.ok)
++                                             .Set("message", result.message));
++}
++
+ // The model chips: the whole chosen list at once, with the default model.
+ // An empty `model` means the first chip becomes the default.
+ void RacAiHandler::HandleSaveModels(const base::ListValue& args) {
++  AllowJavascript();
+   CHECK_EQ(args.size(), 4u);
+   const std::string& id = args[1].GetString();
+   const std::string& model = rac::ai::SanitizeModelId(args[2].GetString());
+@@ -217,6 +296,7 @@
+ }
+ 
+ void RacAiHandler::HandleSetKey(const base::ListValue& args) {
++  AllowJavascript();
+   CHECK_EQ(args.size(), 3u);
+   const std::string callback_id = args[0].GetString();
+   const std::string& id = args[1].GetString();
+@@ -243,6 +323,7 @@
+ }
+ 
+ void RacAiHandler::HandleClearKey(const base::ListValue& args) {
++  AllowJavascript();
+   CHECK_EQ(args.size(), 2u);
+   rac::ai::AiService* service =
+       rac::ai::AiServiceFactory::GetForProfile(profile_);
+Index: src/chrome/browser/ui/webui/settings/rac_ai_handler.h
+===================================================================
+--- src.orig/chrome/browser/ui/webui/settings/rac_ai_handler.h	2026-10-19 18:01:11.154135649 -0700
++++ src/chrome/browser/ui/webui/settings/rac_ai_handler.h	2026-10-19 18:20:08.450028138 -0700
+@@ -13,6 +13,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/values.h"
++#include "chrome/browser/rac/ai/model_list.h"
+ #include "chrome/browser/ui/webui/settings/settings_page_ui_handler.h"
+ #include "components/prefs/pref_change_registrar.h"
+ 
+@@ -49,6 +50,13 @@
+   void HandleSetKey(const base::ListValue& args);
+   void HandleClearKey(const base::ListValue& args);
+   void OnKeySaved(const std::string& callback_id, bool success);
++  // The save-time check that the provider answers.
++  void HandleCheckConnection(const base::ListValue& args);
++  void OnConnectionKey(std::string provider_id, std::optional<std::string> key);
++  void OnConnectionResult(std::string provider_id,
++                          rac::ai::ConnectionResult result);
++  void FireConnectionEvent(const std::string& provider_id,
++                           rac::ai::ConnectionResult result);
+   // The models of one provider, fetched from it, for the model picker.
+   void HandleGetProviderModels(const base::ListValue& args);
+   void FetchProviderModels(base::Value callback_id, std::string provider_id);
+Index: src/chrome/browser/ui/webui/settings/rac_ai_strings.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/settings/rac_ai_strings.cc	2026-10-19 18:03:30.619908591 -0700
++++ src/chrome/browser/ui/webui/settings/rac_ai_strings.cc	2026-10-19 18:11:50.705411235 -0700
+@@ -26,6 +26,11 @@
+     {"racAiBaseUrl", "Server address"},
+     {"racAiBaseUrlInvalid",
+      "Use an https address, or http for a server on this computer."},
++    {"racAiBaseUrlHelp",
++     "The API root, like https://openrouter.ai/api/v1. rac adds the request "
++     "path itself, so leave /chat/completions off."},
++    {"racAiConnectionChecking", "Checking the provider…"},
++    {"racAiConnectionOk", "Connected \u2713"},
+     {"racAiModel", "Model"},
+     {"racAiModels", "Models"},
+     {"racAiModelId", "Model id"},
