@@ -64,6 +64,13 @@ the agent's safety check. An agent is a provider for chat, and also a
 source of browser tool calls, but it is never asked to judge its own
 actions.
 
+The model menu asks each set-up provider for its model list when the menu
+opens: OpenAI-compatible servers `GET {base}/models`, Anthropic
+`GET {base}/v1/models`, always with the key, which stays in the browser
+process. The result is filtered to chat models, capped, cached per profile
+for a few minutes, and the saved model is always in the list, so a
+provider that can't be reached never leaves the menu empty.
+
 ### Page context
 
 Chat and the agent read pages through Chromium's AnnotatedPageContent (APC),
