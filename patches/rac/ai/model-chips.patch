@@ -1,0 +1,730 @@
+Index: src/chrome/browser/rac/ai/ai_prefs.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_prefs.cc	2026-10-17 06:07:43.512324322 -0700
++++ src/chrome/browser/rac/ai/ai_prefs.cc	2026-10-19 17:59:24.282452189 -0700
+@@ -4,6 +4,12 @@
+ 
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ 
++#include <algorithm>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "chrome/browser/rac/ai/model_catalog.h"
+ #include "chrome/browser/rac/ai/providers.h"
+ #include "components/prefs/pref_registry_simple.h"
+ #include "components/prefs/pref_service.h"
+@@ -49,17 +55,54 @@
+         model && !model->empty()) {
+       settings.model = *model;
+     }
++    if (const base::ListValue* models = saved->FindList("models")) {
++      for (const base::Value& value : *models) {
++        const std::string* model = value.GetIfString();
++        if (model) {
++          settings.models.push_back(*model);
++        }
++      }
++    }
++  }
++  // Migration: a provider saved before model lists existed keeps its one
++  // model as the whole list.
++  if (settings.models.empty() && !settings.model.empty() &&
++      settings.model != (info ? info->default_model : "")) {
++    settings.models.push_back(settings.model);
+   }
++  settings.models = DedupeModels(std::move(settings.models));
+   return settings;
+ }
+ 
+ void SetProviderSettings(PrefService* prefs,
+                          const std::string& provider_id,
+                          const ProviderSettings& settings) {
++  std::vector<std::string> models = DedupeModels(settings.models);
+   ScopedDictPrefUpdate update(prefs, kProviderSettings);
+-  update->Set(provider_id, base::DictValue()
+-                               .Set("base_url", settings.base_url)
+-                               .Set("model", settings.model));
++  base::DictValue saved;
++  saved.Set("base_url", settings.base_url);
++  saved.Set("model", settings.model);
++  base::ListValue list;
++  for (const std::string& model : models) {
++    list.Append(model);
++  }
++  saved.Set("models", std::move(list));
++  update->Set(provider_id, std::move(saved));
++}
++
++std::vector<std::string> DedupeModels(std::vector<std::string> models) {
++  std::vector<std::string> kept;
++  for (std::string& model : models) {
++    std::string id = SanitizeModelId(model);
++    if (id.empty() || std::ranges::find(kept, id) != kept.end()) {
++      continue;
++    }
++    if (kept.size() >= kMaxChosenModels) {
++      break;
++    }
++    kept.push_back(std::move(id));
++  }
++  return kept;
+ }
+ 
+ }  // namespace rac::ai
+Index: src/chrome/browser/rac/ai/ai_prefs.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_prefs.h	2026-10-17 06:07:43.524625938 -0700
++++ src/chrome/browser/rac/ai/ai_prefs.h	2026-10-19 17:59:18.909644401 -0700
+@@ -6,6 +6,7 @@
+ #define CHROME_BROWSER_RAC_AI_AI_PREFS_H_
+ 
+ #include <string>
++#include <vector>
+ 
+ class PrefRegistrySimple;
+ class PrefService;
+@@ -49,7 +50,11 @@
+ 
+ struct ProviderSettings {
+   std::string base_url;
++  // The provider's default model: the one a chat uses.
+   std::string model;
++  // The models the user pinned for this provider, shown first in the model
++  // menu. Not synced.
++  std::vector<std::string> models;
+ };
+ 
+ // Returns the user's saved settings for `provider_id`, or the provider's
+@@ -60,6 +65,10 @@
+                          const std::string& provider_id,
+                          const ProviderSettings& settings);
+ 
++// Trims, drops empty and repeated ids, caps the count. The one shape every
++// model list takes before it is stored or sent to a page.
++std::vector<std::string> DedupeModels(std::vector<std::string> models);
++
+ }  // namespace rac::ai
+ 
+ #endif  // CHROME_BROWSER_RAC_AI_AI_PREFS_H_
+Index: src/chrome/browser/rac/ai/ai_prefs_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_prefs_unittest.cc	2026-10-17 06:07:43.535016988 -0700
++++ src/chrome/browser/rac/ai/ai_prefs_unittest.cc	2026-10-19 18:04:10.042978280 -0700
+@@ -3,7 +3,13 @@
+ 
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ 
++#include <string>
++#include <vector>
++
++#include "base/values.h"
++#include "chrome/browser/rac/ai/model_catalog.h"
+ #include "chrome/browser/rac/ai/new_tab_page.h"
++#include "chrome/browser/rac/ai/providers.h"
+ #include "components/prefs/testing_pref_service.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+@@ -27,4 +33,52 @@
+   RegisterProfilePrefs(prefs.registry());
+   EXPECT_TRUE(prefs.GetBoolean(kBrowserControl));
+ }
++
++TEST(RacAiPrefsTest, ProviderSettingsRoundTripWithModels) {
++  TestingPrefServiceSimple prefs;
++  RegisterProfilePrefs(prefs.registry());
++  ProviderSettings settings;
++  settings.base_url = "https://example.com/v1";
++  settings.model = "a";
++  settings.models = {"a", "b"};
++  SetProviderSettings(&prefs, "custom", settings);
++  const ProviderSettings read = GetProviderSettings(&prefs, "custom");
++  EXPECT_EQ(read.base_url, "https://example.com/v1");
++  EXPECT_EQ(read.model, "a");
++  EXPECT_EQ(read.models, (std::vector<std::string>{"a", "b"}));
++}
++
++TEST(RacAiPrefsTest, SingleModelPrefMigratesIntoTheList) {
++  TestingPrefServiceSimple prefs;
++  RegisterProfilePrefs(prefs.registry());
++  // The shape saved before model lists existed.
++  prefs.SetDict(kProviderSettings,
++                base::DictValue().Set(
++                    "custom", base::DictValue()
++                                  .Set("base_url", "https://example.com/v1")
++                                  .Set("model", "old-model")));
++  const ProviderSettings read = GetProviderSettings(&prefs, "custom");
++  EXPECT_EQ(read.model, "old-model");
++  EXPECT_EQ(read.models, (std::vector<std::string>{"old-model"}));
++}
++
++TEST(RacAiPrefsTest, UntouchedProviderKeepsNoChosenModels) {
++  TestingPrefServiceSimple prefs;
++  RegisterProfilePrefs(prefs.registry());
++  const ProviderInfo* info = FindProvider("openai");
++  ASSERT_TRUE(info);
++  const ProviderSettings read = GetProviderSettings(&prefs, "openai");
++  EXPECT_EQ(read.model, info->default_model);
++  EXPECT_TRUE(read.models.empty());
++}
++
++TEST(RacAiPrefsTest, DedupeModelsTrimsDedupesAndCaps) {
++  EXPECT_EQ(DedupeModels({" a ", "a", "b", "", std::string(300, 'x')}),
++            (std::vector<std::string>{"a", "b"}));
++  std::vector<std::string> many;
++  for (int i = 0; i < 30; ++i) {
++    many.push_back("m" + std::to_string(i));
++  }
++  EXPECT_EQ(DedupeModels(std::move(many)).size(), kMaxChosenModels);
++}
+ }  // namespace rac::ai
+Index: src/chrome/browser/resources/settings/privacy_page/rac_ai_page.html
+===================================================================
+--- src.orig/chrome/browser/resources/settings/privacy_page/rac_ai_page.html	2026-10-19 17:51:01.116632764 -0700
++++ src/chrome/browser/resources/settings/privacy_page/rac_ai_page.html	2026-10-19 18:03:20.899424138 -0700
+@@ -11,6 +11,67 @@
+     margin-bottom: 6px;
+   }
+ 
++  .chips {
++    display: flex;
++    flex-wrap: wrap;
++    gap: 6px;
++    margin-bottom: 8px;
++  }
++
++  .chip {
++    align-items: center;
++    background: var(--cr-hover-background-color);
++    border: 1px solid transparent;
++    border-radius: 13px;
++    display: inline-flex;
++    gap: 2px;
++    line-height: 26px;
++    max-width: 100%;
++  }
++
++  .chip.default {
++    border-color: var(--cr-linked-text-color, #0b57d0);
++  }
++
++  .chip-model {
++    background: none;
++    border: none;
++    color: var(--cr-primary-text-color);
++    cursor: pointer;
++    font: inherit;
++    font-size: 12px;
++    max-width: 280px;
++    outline: none;
++    overflow: hidden;
++    padding: 0 8px;
++    text-overflow: ellipsis;
++    white-space: nowrap;
++  }
++
++  .chip-default {
++    color: var(--cr-linked-text-color, #0b57d0);
++    font-size: 11px;
++    padding-right: 2px;
++  }
++
++  .chip-remove {
++    background: none;
++    border: none;
++    border-radius: 50%;
++    color: var(--cr-secondary-text-color);
++    cursor: pointer;
++    font: inherit;
++    font-size: 11px;
++    line-height: 18px;
++    margin-right: 6px;
++    padding: 0 4px;
++  }
++
++  .chip-remove:hover {
++    background: var(--cr-hover-background-color);
++    color: var(--cr-primary-text-color);
++  }
++
+   .row-buttons {
+     display: flex;
+     gap: 8px;
+@@ -184,33 +245,58 @@
+                     error-message="$i18n{racAiBaseUrlInvalid}"
+                     spellcheck="false" maxlength="512">
+                 </cr-input>
++                <div class="cr-secondary-text" hidden$="[[!urlNote_]]">
++                  [[urlNote_]]
++                </div>
+               </div>
+             </template>
+             <div class="field">
+-              <cr-input id="model" label="$i18n{racAiModel}"
+-                  value="[[selected_.model]]"
+-                  placeholder="[[selected_.defaultModel]]"
+-                  spellcheck="false" maxlength="512">
+-              </cr-input>
++              <div class="label">$i18n{racAiModels}</div>
++              <div class="chips" role="list" aria-label="$i18n{racAiModels}">
++                <template is="dom-repeat" items="[[chips_]]" as="chip">
++                  <span class$="[[chipClass_(chip)]]" role="listitem">
++                    <button class="chip-model" on-click="onChipClick_"
++                        title$="[[chipTip_(chip)]]">[[chip.model]]</button>
++                    <span class="chip-default"
++                        hidden$="[[!chip.isDefault]]">
++                      $i18n{racAiModelDefault}
++                    </span>
++                    <button class="chip-remove" on-click="onChipRemove_"
++                        aria-label$="[[chipRemoveAria_(chip.model)]]">
++                      ✕
++                    </button>
++                  </span>
++                </template>
++              </div>
+               <template is="dom-if" if="[[modelChoices_.length]]" restamp>
+                 <select class="md-select" id="modelPick"
+-                    aria-label="$i18n{racAiModelPick}}"
++                    aria-label="$i18n{racAiModelPick}"
+                     on-change="onModelPickChange_">
+                   <template is="dom-repeat" items="[[modelChoices_]]">
+-                    <option value="[[item]]"
+-                        selected$="[[isSelected_(item, selected_.model)]]">
+-                      [[item]]
+-                    </option>
++                    <option value="[[item]]">[[item]]</option>
+                   </template>
+                 </select>
+-                <div class="cr-secondary-text">
+-                  $i18n{racAiModelPickHelp}
+-                </div>
+               </template>
++              <cr-input id="model" label="$i18n{racAiModelId}"
++                  placeholder="[[selected_.defaultModel]]"
++                  on-keydown="onModelKeydown_"
++                  spellcheck="false" maxlength="512">
++              </cr-input>
++              <div class="cr-secondary-text">
++                $i18n{racAiModelPickHelp}
++              </div>
+               <div class="row-buttons">
+-                <cr-button on-click="onSaveSettings_">
+-                  $i18n{racAiSaveSettings}
++                <cr-button on-click="onAddModel_">
++                  $i18n{racAiModelAdd}
+                 </cr-button>
++                <template is="dom-if" if="[[canEditUrl_(selected_)]]" restamp>
++                  <cr-button on-click="onSaveSettings_">
++                    $i18n{racAiSaveSettings}
++                  </cr-button>
++                </template>
++              </div>
++              <div class="cr-secondary-text" hidden$="[[!saveNote_]]">
++                [[saveNote_]]
+               </div>
+             </div>
+ 
+@@ -238,6 +324,9 @@
+                     $i18n{racAiRemoveKey}
+                   </cr-button>
+                 </div>
++                <div class="cr-secondary-text" hidden$="[[!keyNote_]]">
++                  [[keyNote_]]
++                </div>
+               </div>
+             </template>
+             <template is="dom-if" if="[[keyNotNeeded_(selected_)]]" restamp>
+Index: src/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts
+===================================================================
+--- src.orig/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts	2026-10-19 17:51:09.965419432 -0700
++++ src/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts	2026-10-19 18:04:10.054033330 -0700
+@@ -30,6 +30,7 @@
+   name: string;
+   baseUrl: string;
+   model: string;
++  models: string[];
+   defaultBaseUrl: string;
+   defaultModel: string;
+   requiresKey: boolean;
+@@ -74,6 +75,12 @@
+   providers?: RacAiProvider[];
+ }
+ 
++// One model chip: a pinned model, marked when it is the provider's default.
++interface ModelChip {
++  model: string;
++  isDefault: boolean;
++}
++
+ const AGENT_ORDER =
+     ['codex', 'claude', 'cursor', 'gemini', 'copilot', 'opencode', 'goose'];
+ 
+@@ -100,6 +107,10 @@
+       available_: {type: Boolean, value: false},
+       providers_: {type: Array, value: () => []},
+       modelChoices_: {type: Array, value: () => []},
++      chips_: {type: Array, value: () => []},
++      saveNote_: {type: String, value: ''},
++      urlNote_: {type: String, value: ''},
++      keyNote_: {type: String, value: ''},
+       selectedId_: {type: String, value: ''},
+       selected_: {type: Object, value: null},
+       baseUrlInvalid_: {type: Boolean, value: false},
+@@ -113,6 +124,10 @@
+   declare private available_: boolean;
+   declare private providers_: RacAiProvider[];
+   declare private modelChoices_: string[];
++  declare private chips_: ModelChip[];
++  declare private saveNote_: string;
++  declare private urlNote_: string;
++  declare private keyNote_: string;
+   declare private selectedId_: string;
+   declare private selected_: RacAiProvider|null;
+   declare private baseUrlInvalid_: boolean;
+@@ -147,12 +162,17 @@
+       this.agentsLoaded_ = false;
+       this.rows_ = [];
+       this.modelChoices_ = [];
++      this.chips_ = [];
+     }
+     this.loadAgentsIfShown_();
+     this.providers_ = state.providers || [];
+     this.selectedId_ = state.provider || '';
+     this.selected_ =
+         this.providers_.find(p => p.id === this.selectedId_) || null;
++    this.chips_ =
++        (this.selected_?.models || [])
++            .map(
++                model => ({model, isDefault: model === this.selected_!.model}));
+     this.loadModelsIfSelected_();
+   }
+ 
+@@ -174,11 +194,105 @@
+   }
+ 
+   private onModelPickChange_(event: Event) {
+-    const model = (event.target as HTMLSelectElement).value;
++    const select = event.target as HTMLSelectElement;
++    this.addModel_(select.value);
++    select.value = '';
++  }
++
++  private onModelKeydown_(event: KeyboardEvent) {
++    if (event.key === 'Enter') {
++      event.preventDefault();
++      this.addFromInput_();
++    }
++  }
++
++  private onAddModel_() {
++    this.addFromInput_();
++  }
++
++  private addFromInput_() {
++    const input = this.shadowRoot!.querySelector<HTMLInputElement>('#model');
++    if (input) {
++      this.addModel_(input.value);
++    }
++  }
++
++  // Adding a model pins it and makes it the default, which is the one a new
++  // chat uses.
++  private addModel_(raw: string) {
++    if (!this.selected_ || !raw.trim()) {
++      return;
++    }
++    const model = raw.trim();
++    const models = [...(this.selected_.models || [])];
++    if (!models.includes(model)) {
++      models.unshift(model);
++    }
++    this.saveModels_(models.slice(0, 12), model);
+     const input = this.shadowRoot!.querySelector<HTMLInputElement>('#model');
+-    if (model && input) {
+-      input.value = model;
++    if (input) {
++      input.value = '';
++    }
++  }
++
++  private onChipClick_(event: Event&{model: {chip: ModelChip}}) {
++    const chip = event.model.chip;
++    if (!this.selected_ || chip.isDefault) {
++      return;
++    }
++    this.saveModels_(this.selected_.models || [], chip.model);
++  }
++
++  private onChipRemove_(event: Event&{model: {chip: ModelChip}}) {
++    if (!this.selected_) {
++      return;
+     }
++    const chip = event.model.chip;
++    const models = (this.selected_.models || []).filter(m => m !== chip.model);
++    const fallbackDefault =
++        chip.isDefault ? (models[0] ?? '') : this.selected_.model;
++    this.saveModels_(models, fallbackDefault);
++  }
++
++  private saveModels_(models: string[], model: string) {
++    if (!this.selected_) {
++      return;
++    }
++    sendWithPromise<RacAiState>(
++        'racAiSaveModels', this.selected_.id, model, models)
++        .then(state => {
++          this.applyState_(state);
++          this.flashNote_('saveNote_', this.i18n('racAiSaved'));
++        })
++        .catch(() => {
++          this.flashNote_('saveNote_', this.i18n('racAiSaveFailed'));
++        });
++  }
++
++  // A short-lived confirmation line. The newest note replaces the old one.
++  private noteTimer_ = 0;
++  private flashNote_(
++      property: 'saveNote_'|'urlNote_'|'keyNote_', text: string) {
++    this[property] = text;
++    window.clearTimeout(this.noteTimer_);
++    this.noteTimer_ = window.setTimeout(() => {
++      this.saveNote_ = '';
++      this.urlNote_ = '';
++      this.keyNote_ = '';
++    }, 4000);
++  }
++
++  private chipClass_(chip: ModelChip): string {
++    return 'chip' + (chip.isDefault ? ' default' : '');
++  }
++
++  private chipTip_(chip: ModelChip): string {
++    return chip.isDefault ? this.i18n('racAiModelDefaultTip') :
++                            this.i18n('racAiModelMakeDefaultTip');
++  }
++
++  private chipRemoveAria_(model: string): string {
++    return this.i18n('racAiModelRemove', model);
+   }
+ 
+   // The login shell is only asked for its PATH once this section is on screen
+@@ -397,18 +511,19 @@
+   }
+ 
+   private onSaveSettings_() {
+-    const baseUrl = this.shadowRoot!.querySelector<HTMLInputElement>(
+-        '#baseUrl');
+-    const model = this.shadowRoot!.querySelector<HTMLInputElement>('#model');
+-    if (!this.selected_ || !model) {
++    const baseUrl =
++        this.shadowRoot!.querySelector<HTMLInputElement>('#baseUrl');
++    if (!this.selected_ || !baseUrl) {
+       return;
+     }
+     this.baseUrlInvalid_ = false;
+     sendWithPromise<RacAiState>(
+-        'racAiSaveSettings', this.selected_.id,
+-        baseUrl && this.selected_.editableBaseUrl ? baseUrl.value.trim() : '',
+-        model.value.trim())
+-        .then(state => this.applyState_(state))
++        'racAiSaveSettings', this.selected_.id, baseUrl.value.trim(),
++        this.selected_.model)
++        .then(state => {
++          this.applyState_(state);
++          this.flashNote_('urlNote_', this.i18n('racAiSaved'));
++        })
+         .catch((reason: string) => {
+           this.baseUrlInvalid_ = reason === 'invalid_url';
+         });
+@@ -424,6 +539,7 @@
+         .then(state => {
+           input.value = '';
+           this.applyState_(state);
++          this.flashNote_('keyNote_', this.i18n('racAiSaved'));
+         })
+         .catch(() => {
+           this.keyFailed_ = true;
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc	2026-10-19 17:57:29.128362143 -0700
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc	2026-10-19 18:00:20.842391515 -0700
+@@ -154,6 +154,8 @@
+     std::string base_url;
+     // The saved or default model, always kept in the list.
+     std::string saved_model;
++    // The models the user pinned, shown before everything else.
++    std::vector<std::string> chosen_models;
+     std::vector<std::string> models;
+   };
+   base::Value callback_id;
+@@ -1250,6 +1252,7 @@
+       entry.name = info.name;
+       entry.base_url = settings.base_url;
+       entry.saved_model = settings.model;
++      entry.chosen_models = settings.models;
+       query->entries.push_back(std::move(entry));
+     }
+   }
+@@ -1264,7 +1267,7 @@
+       if (const std::vector<std::string>* cached =
+               service->model_list_cache().Find(entry.id)) {
+         entry.models = MergeModelChoices(
+-            {}, entry.saved_model, *cached,
++            entry.chosen_models, entry.saved_model, *cached,
+             info->requires_key ? kMaxMenuModelsPerProvider : kMaxListedModels);
+         ++query->next;
+         continue;
+@@ -1342,7 +1345,7 @@
+     service->model_list_cache().Store(entry.id, models);
+     if (const ProviderInfo* info = FindProvider(entry.id)) {
+       entry.models = MergeModelChoices(
+-          {}, entry.saved_model, models,
++          entry.chosen_models, entry.saved_model, models,
+           info->requires_key ? kMaxMenuModelsPerProvider : kMaxListedModels);
+     }
+   }
+@@ -1362,7 +1365,16 @@
+   }
+   PrefService* prefs = profile_->GetPrefs();
+   ProviderSettings settings = GetProviderSettings(prefs, info->id);
+-  settings.model = *model;
++  settings.model = SanitizeModelId(*model);
++  if (settings.model.empty()) {
++    return;
++  }
++  // Picking a model pins it, so it stays at the top of the menu.
++  std::erase(settings.models, settings.model);
++  settings.models.insert(settings.models.begin(), settings.model);
++  if (settings.models.size() > kMaxChosenModels) {
++    settings.models.resize(kMaxChosenModels);
++  }
+   SetProviderSettings(prefs, info->id, settings);
+   prefs->SetString(kProvider, info->id);
+   prefs->SetString(kAgentId, std::string());
+Index: src/chrome/browser/ui/webui/settings/rac_ai_handler.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/settings/rac_ai_handler.cc	2026-10-19 17:57:29.200195569 -0700
++++ src/chrome/browser/ui/webui/settings/rac_ai_handler.cc	2026-10-19 18:04:10.267130308 -0700
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/webui/settings/rac_ai_handler.h"
+ 
++#include <algorithm>
+ #include <string>
+ #include <utility>
+ 
+@@ -84,6 +85,9 @@
+       base::BindRepeating(&RacAiHandler::HandleGetProviderModels,
+                           base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
++      "racAiSaveModels", base::BindRepeating(&RacAiHandler::HandleSaveModels,
++                                             base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
+       "racAiListAgents", base::BindRepeating(&RacAiHandler::HandleListAgents,
+                                              base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
+@@ -111,11 +115,16 @@
+   for (const rac::ai::ProviderInfo& info : rac::ai::GetProviders()) {
+     const rac::ai::ProviderSettings settings =
+         rac::ai::GetProviderSettings(prefs, info.id);
++    base::ListValue models;
++    for (const std::string& model : settings.models) {
++      models.Append(model);
++    }
+     providers.Append(base::DictValue()
+                          .Set("id", info.id)
+                          .Set("name", info.name)
+                          .Set("baseUrl", settings.base_url)
+                          .Set("model", settings.model)
++                         .Set("models", std::move(models))
+                          .Set("defaultBaseUrl", info.default_base_url)
+                          .Set("defaultModel", info.default_model)
+                          .Set("requiresKey", info.requires_key)
+@@ -162,7 +171,48 @@
+     RejectJavascriptCallback(args[0], base::Value("invalid_url"));
+     return;
+   }
+-  rac::ai::SetProviderSettings(profile_->GetPrefs(), id, {base_url, model});
++  // Read-modify-write, so the model chips survive.
++  rac::ai::ProviderSettings settings =
++      rac::ai::GetProviderSettings(profile_->GetPrefs(), id);
++  settings.base_url = base_url;
++  settings.model = rac::ai::SanitizeModelId(model);
++  rac::ai::SetProviderSettings(profile_->GetPrefs(), id, settings);
++  ResolveJavascriptCallback(args[0], CreateState());
++}
++
++// The model chips: the whole chosen list at once, with the default model.
++// An empty `model` means the first chip becomes the default.
++void RacAiHandler::HandleSaveModels(const base::ListValue& args) {
++  CHECK_EQ(args.size(), 4u);
++  const std::string& id = args[1].GetString();
++  const std::string& model = rac::ai::SanitizeModelId(args[2].GetString());
++  const base::ListValue* models = args[3].GetIfList();
++  if (!rac::ai::AiServiceFactory::GetForProfile(profile_) ||
++      !rac::ai::FindProvider(id) || !models) {
++    RejectJavascriptCallback(args[0], base::Value());
++    return;
++  }
++  rac::ai::ProviderSettings settings =
++      rac::ai::GetProviderSettings(profile_->GetPrefs(), id);
++  settings.models.clear();
++  for (const base::Value& value : *models) {
++    const std::string* entry = value.GetIfString();
++    if (entry) {
++      settings.models.push_back(*entry);
++    }
++  }
++  settings.models = rac::ai::DedupeModels(std::move(settings.models));
++  settings.model =
++      model.empty()
++          ? (settings.models.empty() ? std::string() : settings.models[0])
++          : model;
++  if (!settings.model.empty() &&
++      std::ranges::find(settings.models, settings.model) ==
++          settings.models.end()) {
++    settings.models.insert(settings.models.begin(), settings.model);
++    settings.models = rac::ai::DedupeModels(std::move(settings.models));
++  }
++  rac::ai::SetProviderSettings(profile_->GetPrefs(), id, settings);
+   ResolveJavascriptCallback(args[0], CreateState());
+ }
+ 
+Index: src/chrome/browser/ui/webui/settings/rac_ai_handler.h
+===================================================================
+--- src.orig/chrome/browser/ui/webui/settings/rac_ai_handler.h	2026-10-19 17:57:29.211235958 -0700
++++ src/chrome/browser/ui/webui/settings/rac_ai_handler.h	2026-10-19 18:01:11.154135649 -0700
+@@ -45,6 +45,7 @@
+   void HandleGetState(const base::ListValue& args);
+   void HandleSetProvider(const base::ListValue& args);
+   void HandleSaveSettings(const base::ListValue& args);
++  void HandleSaveModels(const base::ListValue& args);
+   void HandleSetKey(const base::ListValue& args);
+   void HandleClearKey(const base::ListValue& args);
+   void OnKeySaved(const std::string& callback_id, bool success);
+Index: src/chrome/browser/ui/webui/settings/rac_ai_strings.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/settings/rac_ai_strings.cc	2026-10-19 17:57:29.218260517 -0700
++++ src/chrome/browser/ui/webui/settings/rac_ai_strings.cc	2026-10-19 18:03:30.619908591 -0700
+@@ -27,8 +27,19 @@
+     {"racAiBaseUrlInvalid",
+      "Use an https address, or http for a server on this computer."},
+     {"racAiModel", "Model"},
++    {"racAiModels", "Models"},
++    {"racAiModelId", "Model id"},
++    {"racAiModelAdd", "Add model"},
++    {"racAiModelDefault", "Default"},
++    {"racAiModelDefaultTip", "The model a new chat uses."},
++    {"racAiModelMakeDefaultTip", "Make this the default model."},
++    {"racAiModelRemove", "Remove $1"},
++    {"racAiSaved", "Saved \u2713"},
++    {"racAiSaveFailed", "That couldn't be saved."},
+     {"racAiModelPick", "Pick a model"},
+-    {"racAiModelPickHelp", "Pick a model from the list, or type a model id."},
++    {"racAiModelPickHelp",
++     "Pick a model from the list, or type a model id. Pinned models show "
++     "first in the assistant's model menu."},
+     {"racAiKey", "API key"},
+     {"racAiKeySaved", "A key is saved, encrypted by your keychain."},
+     {"racAiKeyNone", "No key saved."},
