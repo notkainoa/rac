@@ -1,0 +1,352 @@
+Index: src/chrome/browser/rac/ai/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/ai/BUILD.gn	2026-10-19 17:28:44.708973000 -0700
++++ src/chrome/browser/rac/ai/BUILD.gn	2026-10-19 17:30:53.683806849 -0700
+@@ -125,6 +125,7 @@
+ test("rac_ai_unittests") {
+   sources = [
+     "acp/acp_client_unittest.cc",
++    "acp/agent_path_unittest.cc",
+     "acp/agent_recipes_unittest.cc",
+     "acp/agent_settings_unittest.cc",
+     "ai_prefs_unittest.cc",
+Index: src/chrome/browser/rac/ai/acp/agent_path.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/acp/agent_path.cc	2026-10-19 17:28:44.709080000 -0700
++++ src/chrome/browser/rac/ai/acp/agent_path.cc	2026-10-19 17:30:53.684645581 -0700
+@@ -3,16 +3,20 @@
+ 
+ #include "chrome/browser/rac/ai/acp/agent_path.h"
+ 
++#include <errno.h>
++#include <poll.h>
+ #include <signal.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
+ 
++#include <algorithm>
+ #include <utility>
+ 
+ #include "base/command_line.h"
+ #include "base/containers/span.h"
+ #include "base/environment.h"
+ #include "base/files/file_util.h"
++#include "base/files/scoped_file.h"
+ #include "base/functional/bind.h"
+ #include "base/location.h"
+ #include "base/posix/eintr_wrapper.h"
+@@ -102,6 +106,62 @@
+   }
+ }
+ 
++// Reads `streams` until every one of them closes, the first one contains
++// `done_marker` (if not empty), or `deadline` passes, without ever blocking
++// past the deadline. Returns false on timeout. A child that
++// stops (for example on SIGTTOU) keeps its pipes open, so a blocking read()
++// here would never return.
++bool CollectOutput(
++    std::vector<std::pair<base::ScopedFD*, std::string*>> streams,
++    base::TimeTicks deadline,
++    std::string_view done_marker = {}) {
++  char buffer[4096];
++  for (auto& [fd, out] : streams) {
++    if (fd->is_valid() && !base::SetNonBlocking(fd->get())) {
++      fd->reset();
++    }
++  }
++  for (;;) {
++    std::vector<pollfd> polls;
++    std::vector<size_t> owners;
++    for (size_t i = 0; i < streams.size(); ++i) {
++      if (streams[i].first->is_valid()) {
++        polls.push_back({streams[i].first->get(), POLLIN, 0});
++        owners.push_back(i);
++      }
++    }
++    if (polls.empty() || (!done_marker.empty() &&
++                          streams[0].second->find(done_marker) !=
++                              std::string::npos)) {
++      return true;
++    }
++    const base::TimeDelta left = deadline - base::TimeTicks::Now();
++    if (!left.is_positive()) {
++      return false;
++    }
++    const int ready =
++        poll(polls.data(), polls.size(),
++             static_cast<int>(std::max<int64_t>(1, left.InMilliseconds())));
++    if (ready < 0 && errno != EINTR) {
++      return false;
++    }
++    for (size_t i = 0; ready > 0 && i < polls.size(); ++i) {
++      if (!polls[i].revents) {
++        continue;
++      }
++      auto& [fd, out] = streams[owners[i]];
++      const ssize_t got = HANDLE_EINTR(read(fd->get(), buffer, sizeof(buffer)));
++      if (got > 0) {
++        if (out->size() < 64 * 1024) {
++          out->append(buffer, static_cast<size_t>(got));
++        }
++      } else if (got == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
++        fd->reset();
++      }
++    }
++  }
++}
++
+ std::optional<std::string> RunAndCapture(const std::vector<std::string>& argv,
+                                          base::TimeDelta timeout) {
+   if (argv.empty()) {
+@@ -121,24 +181,16 @@
+     return std::nullopt;
+   }
+   std::string out;
+-  char buffer[4096];
+-  const base::TimeTicks deadline = base::TimeTicks::Now() + timeout;
+-  while (read_fd.is_valid()) {
+-    const ssize_t got =
+-        HANDLE_EINTR(read(read_fd.get(), buffer, sizeof(buffer)));
+-    if (got > 0) {
+-      if (out.size() < 64 * 1024) {
+-        out.append(buffer, static_cast<size_t>(got));
+-      }
+-    } else {
+-      read_fd.reset();
+-    }
+-    if (base::TimeTicks::Now() >= deadline) {
+-      break;
+-    }
++  const bool finished = CollectOutput({{&read_fd, &out}},
++                                      base::TimeTicks::Now() + timeout);
++  if (!finished) {
++    kill(process.Pid(), SIGKILL);
+   }
+   ReapPid(process.Pid(), base::Seconds(1));
+   process.Close();
++  if (!finished) {
++    return std::nullopt;
++  }
+   base::TrimString(out, "\r\n", &out);
+   if (out.empty() || out.find('\0') != std::string::npos) {
+     return std::nullopt;
+@@ -186,8 +238,8 @@
+   options.disclaim_responsibility = true;
+ #endif
+ 
+-  std::vector<std::string> argv = {shell, "-ilc", script};
+-  base::Process process = base::LaunchProcess(argv, options);
++  base::Process process =
++      base::LaunchProcess(LoginShellArgv(shell, script), options);
+   child_stdout_write.reset();
+   child_stderr_write.reset();
+   if (!process.IsValid() || process.Pid() <= 1) {
+@@ -198,48 +250,22 @@
+   const base::ProcessId pid = process.Pid();
+   std::string stdout_text;
+   std::string stderr_text;
+-  char buffer[4096];
+-  bool timed_out = false;
+-  const base::TimeTicks deadline = base::TimeTicks::Now() + base::Seconds(5);
+-  for (;;) {
+-    bool progressed = false;
+-    for (base::ScopedFD* fd : {&parent_stdout_read, &parent_stderr_read}) {
+-      if (!fd->is_valid()) {
+-        continue;
+-      }
+-      const ssize_t got = HANDLE_EINTR(read(fd->get(), buffer, sizeof(buffer)));
+-      if (got > 0) {
+-        progressed = true;
+-        std::string* target =
+-            fd == &parent_stdout_read ? &stdout_text : &stderr_text;
+-        if (target->size() < 64 * 1024) {
+-          target->append(buffer, static_cast<size_t>(got));
+-        }
+-      } else if (got == 0) {
+-        fd->reset();
+-        progressed = true;
+-      }
+-    }
+-    if (!parent_stdout_read.is_valid() && !parent_stderr_read.is_valid()) {
+-      break;
+-    }
+-    if (base::TimeTicks::Now() >= deadline) {
+-      timed_out = true;
+-      break;
+-    }
+-    if (!progressed) {
+-      usleep(20 * 1000);
+-    }
+-  }
+-
++  const bool timed_out = !CollectOutput(
++      {{&parent_stdout_read, &stdout_text},
++       {&parent_stderr_read, &stderr_text}},
++      base::TimeTicks::Now() + base::Seconds(5),
++      base::StringPrintf("RAC_PATH_%s_END\n", nonce.c_str()));
+   if (timed_out) {
+-    kill(-pid, SIGTERM);
++    // A stopped process only acts on SIGKILL.
++    kill(-pid, SIGKILL);
++    kill(pid, SIGKILL);
+   }
+   ReapPid(pid, base::Seconds(2));
+   process.Close();
+ 
+-  std::optional<std::string> parsed =
+-      timed_out ? std::nullopt : ParseLoginShellPath(stdout_text, nonce);
++  // The shell may have printed the markers and still be running (or something
++  // it started holds the pipe open); the markers are enough.
++  std::optional<std::string> parsed = ParseLoginShellPath(stdout_text, nonce);
+   if (!parsed) {
+     parsed =
+         RunAndCapture({"/bin/launchctl", "getenv", "PATH"}, base::Seconds(2));
+@@ -333,6 +359,18 @@
+       std::string(nonce).c_str(), std::string(nonce).c_str());
+ }
+ 
++std::vector<std::string> LoginShellArgv(std::string_view shell,
++                                        std::string_view script) {
++  const std::string name = base::FilePath(shell).BaseName().value();
++  if (name == "zsh" || name == "bash") {
++    // An interactive shell with job control tries to take the terminal rac was
++    // started from. From its own process group it is then stopped by SIGTTOU
++    // or SIGTTIN and never prints. `+m` turns job control off.
++    return {std::string(shell), "-i", "+m", "-l", "-c", std::string(script)};
++  }
++  return {std::string(shell), "-l", "-c", std::string(script)};
++}
++
+ base::FilePath FindExecutableOnPath(std::string_view name,
+                                     std::string_view search_path) {
+   if (name.empty() || name.find('/') != std::string_view::npos) {
+Index: src/chrome/browser/rac/ai/acp/agent_path.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/acp/agent_path.h	2026-10-19 17:28:44.709029000 -0700
++++ src/chrome/browser/rac/ai/acp/agent_path.h	2026-10-19 17:30:53.685179487 -0700
+@@ -26,10 +26,16 @@
+ std::optional<std::string> ParseLoginShellPath(std::string_view stdout_text,
+                                                std::string_view nonce);
+ 
+-// Builds the argv script fragment for `shell -ilc`. Only `nonce` is
++// Builds the argv script fragment for the login shell. Only `nonce` is
+ // substituted.
+ std::string LoginShellPathScript(std::string_view nonce);
+ 
++// The argv that runs `script` in the user's login shell. zsh and bash run
++// interactive (so .zshrc and .bashrc count) with job control off; any other
++// shell runs as a non-interactive login shell.
++std::vector<std::string> LoginShellArgv(std::string_view shell,
++                                        std::string_view script);
++
+ // Resolves `name` against a colon-separated PATH of absolute directories.
+ base::FilePath FindExecutableOnPath(std::string_view name,
+                                     std::string_view search_path);
+Index: src/chrome/browser/rac/ai/acp/agent_path_unittest.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/rac/ai/acp/agent_path_unittest.cc	2026-10-19 17:30:53.685437398 -0700
+@@ -0,0 +1,40 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/ai/acp/agent_path.h"
++
++#include <string>
++#include <vector>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::ai {
++namespace {
++
++using Argv = std::vector<std::string>;
++
++TEST(LoginShellArgvTest, ZshAndBashRunInteractiveWithoutJobControl) {
++  EXPECT_EQ(LoginShellArgv("/bin/zsh", "echo"),
++            (Argv{"/bin/zsh", "-i", "+m", "-l", "-c", "echo"}));
++  EXPECT_EQ(LoginShellArgv("/opt/homebrew/bin/bash", "echo"),
++            (Argv{"/opt/homebrew/bin/bash", "-i", "+m", "-l", "-c", "echo"}));
++}
++
++TEST(LoginShellArgvTest, OtherShellsRunAsPlainLoginShells) {
++  EXPECT_EQ(LoginShellArgv("/opt/homebrew/bin/fish", "echo"),
++            (Argv{"/opt/homebrew/bin/fish", "-l", "-c", "echo"}));
++  EXPECT_EQ(LoginShellArgv("/bin/sh", "echo"),
++            (Argv{"/bin/sh", "-l", "-c", "echo"}));
++}
++
++TEST(LoginShellArgvTest, NeverAsksForJobControl) {
++  for (const char* shell : {"/bin/zsh", "/bin/bash", "/bin/ksh", "/bin/tcsh"}) {
++    for (const std::string& arg : LoginShellArgv(shell, "x")) {
++      EXPECT_NE(arg, "-ilc") << shell;
++      EXPECT_NE(arg, "-m") << shell;
++    }
++  }
++}
++
++}  // namespace
++}  // namespace rac::ai
+Index: src/chrome/browser/resources/rac_ai/app.ts
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/app.ts	2026-10-19 17:28:44.708914000 -0700
++++ src/chrome/browser/resources/rac_ai/app.ts	2026-10-19 17:30:53.686165549 -0700
+@@ -868,7 +868,7 @@
+   }
+   const [choices, agents] = await Promise.all([
+     sendWithPromise<ModelChoices>('racAiGetModels'),
+-    listAgents(),
++    agentsForMenu(),
+   ]);
+   const actions = new Map<string, () => void>();
+   const entries: MenuEntry[] = [];
+@@ -893,8 +893,13 @@
+     entries.push(
+         {type: 'separator'},
+         {type: 'note', label: loadTimeData.getString('noAgentsIncognito')});
+-  } else {
++  } else if (agents) {
+     addAgentEntries(entries, actions, agents);
++  } else {
++    if (entries.length > 0) {
++      entries.push({type: 'separator'});
++    }
++    entries.push({type: 'note', label: loadTimeData.getString('lookingForAgents')});
+   }
+   if (entries.length > 0) {
+     entries.push({type: 'separator'});
+@@ -975,6 +980,22 @@
+   return index < 0 ? AGENT_ORDER.length : index;
+ }
+ 
++// Finding agents asks the login shell for its PATH, which can take seconds.
++// The menu doesn't wait that long for them: provider models show at once, and
++// the agents appear the next time the menu opens.
++const AGENT_WAIT_MS = 600;
++
++async function agentsForMenu(): Promise<AgentInfo[]|null> {
++  const listing = listAgents();
++  if (agentInfos.size > 0) {
++    return [...agentInfos.values()];
++  }
++  return Promise.race([
++    listing,
++    new Promise<null>(resolve => setTimeout(() => resolve(null), AGENT_WAIT_MS)),
++  ]);
++}
++
+ // Looks for installed agents on the PATH (once, then cached) without
+ // starting any of them.
+ async function listAgents(): Promise<AgentInfo[]> {
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc	2026-10-19 17:28:44.708820000 -0700
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc	2026-10-19 17:30:53.686741662 -0700
+@@ -105,6 +105,7 @@
+     {"planLabel", "Plan"},
+     {"agentsHeading", "Agents"},
+     {"modelsLater", "Models load after the first message."},
++    {"lookingForAgents", "Looking for agents…"},
+     {"notInstalledHeading", "Not installed"},
+     {"notInstalledTip",
+      "$1 isn't installed. Install it, or set its path in the assistant "
