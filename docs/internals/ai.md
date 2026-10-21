@@ -243,7 +243,8 @@ call in 90 seconds ends with "didn't answer" (`kAcpFirstAnswerTimeout`).
 
 Agents report failures in different ways, and each is shown as an error with
 the agent's own words, never as a reply that ends "Done": an error response
-(a bare "Internal error" takes the text from its `data`), a stop reason
+(a bare "Internal error" takes the text from its `data`), `-32000`
+(auth_required) on the prompt as well as on `session/new`, a stop reason
 other than `end_turn`, and Codex's `session_info_update` with a
 `systemError` thread status, after which its text is the error. Codex also
 sends its own notices as text with no message id; those wait for the reply
