@@ -18,20 +18,66 @@
    const message = lastAssistant();
    if (!message?.task) {
      return;
-@@ -1659,7 +1666,9 @@ function describeAgentError(
+@@ -1659,7 +1666,14 @@ function describeAgentError(
        actions: ['retry'],
      };
    }
 -  if (/limit|quota|rate/i.test(raw)) {
++  // The browser stopped the task on purpose (another page took over, the
++  // window switched spaces). Nothing went wrong, so say only that.
++  if (raw.startsWith('Stopped because ')) {
++    return {title: raw, detail: '', actions: ['retry']};
++  }
 +  // Word boundaries, so "generate" or "accurate" isn't a rate limit.
 +  if (/\brate[ -]?limit|\bquota\b|\b429\b|\busage limit|too many requests/i
 +          .test(raw)) {
      return {
        title: loadTimeData.getStringF('errLimitTitle', name),
        detail: raw.split('\n')[0]!.slice(0, 240),
+@@ -1677,6 +1691,10 @@ function describeAgentError(
+ // do, and the buttons that do it. `raw` is the provider's own text.
+ function describeChatError(raw: string, hadReply: boolean): ErrorView {
+   const first = raw.split('\n')[0]!.slice(0, 240);
++  // Stopped on purpose, as for an agent (describeAgentError).
++  if (raw.startsWith('Stopped because ')) {
++    return {title: first, detail: '', actions: ['retry']};
++  }
+   // A missing model is also a 404 ("model \"llama3.2\" not found, try
+   // pulling it first", "The model `x` does not exist"), so check it first.
+   if (/\bmodel\b/i.test(raw) &&
 --- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
 +++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
-@@ -441,8 +441,12 @@ void PageHandler::OnSpacesChanged() {
+@@ -97,6 +97,9 @@ constexpr char kSystemPrompt[] =
+     "Markdown only when it helps.";
+ 
+ constexpr char kSettingsUrl[] = "chrome://settings/assistant";
++// What a task that a space switch stopped ends with.
++constexpr char kSpaceSwitchedError[] =
++    "Stopped because the window switched spaces.";
+ 
+ // Only ordinary web pages can be shared. Internal pages and files can't.
+ bool IsAttachable(tabs::TabInterface* tab) {
+@@ -427,8 +430,18 @@ void PageHandler::OnActiveSpaceChanged(B
+                                        const std::optional<SpaceId>& previous,
+                                        const std::optional<SpaceId>& current) {
+   if (browser == GetBrowser()) {
+-    if (previous != current && agent_controller_) {
++    // A window's first space claim can come well after the window opens
++    // (half a minute or more after launch). It isn't a switch: stopping on
++    // it cancelled any task started in this window before the claim.
++    if (previous && previous != current && agent_controller_) {
++      // The page didn't ask for this stop, and StopSession() keeps the run's
++      // own "done" from it, so say here that the reply is over. Otherwise it
++      // waits on "Thinking…" for good.
++      const int send_id = active_send_id_;
+       StopSession();
++      if (send_id) {
++        FinishStoppedTurn(send_id, kSpaceSwitchedError);
++      }
+     }
+     NotifyTheme();
+   }
+@@ -441,8 +454,12 @@ void PageHandler::OnSpacesChanged() {
  void PageHandler::HandleInit(const base::ListValue& args) {
    CHECK_EQ(args.size(), 1u);
    AllowJavascript();
@@ -44,7 +90,7 @@
      pref_registrar_.Add(kEnabled,
                          base::BindRepeating(&PageHandler::OnEnabledChanged,
                                              base::Unretained(this)));
-@@ -900,20 +904,24 @@ void PageHandler::HandleStop(const base:
+@@ -900,20 +917,24 @@ void PageHandler::HandleStop(const base:
  }
  
  void PageHandler::HandleAgentRespond(const base::ListValue& args) {
@@ -104,3 +150,266 @@
      RejectJavascriptCallback(args[0], base::Value());
      return;
    }
+--- a/chrome/browser/rac/agent/ref_table.cc
++++ b/chrome/browser/rac/agent/ref_table.cc
+@@ -74,6 +74,19 @@ void RefTable::MarkSeen(std::string_view
+   }
+ }
+ 
++bool RefTable::Contains(const RefKey& key) const {
++  return by_key_.contains(key);
++}
++
++void RefTable::Remove(std::string_view ref) {
++  auto it = by_ref_.find(std::string(ref));
++  if (it == by_ref_.end()) {
++    return;
++  }
++  by_key_.erase(it->second.key);
++  by_ref_.erase(it);
++}
++
+ void RefTable::EndSnapshot(std::string_view tab_id) {
+   // Absent entries keep their refs but are not actionable until re-seen.
+ }
+--- a/chrome/browser/rac/agent/ref_table.h
++++ b/chrome/browser/rac/agent/ref_table.h
+@@ -92,6 +92,9 @@ class RefTable {
+ 
+   const RefEntry* Lookup(std::string_view ref) const;
+   RefEntry* LookupMutable(std::string_view ref);
++  bool Contains(const RefKey& key) const;
++  // Forgets `ref`. Its number is not reused.
++  void Remove(std::string_view ref);
+ 
+   // Call at the start of a snapshot pass for `tab_id`.
+   void BeginSnapshot(std::string_view tab_id, uint64_t generation);
+--- a/chrome/browser/rac/agent/snapshot_serializer.cc
++++ b/chrome/browser/rac/agent/snapshot_serializer.cc
+@@ -287,6 +287,67 @@ bool IsActionable(const proto::ContentNo
+   return false;
+ }
+ 
++// Clickability reasons that mean a click on the node itself does something.
++// A :hover style, a hover or key listener, or a tabindex (often -1 on a
++// focus-managed wrapper) also mark a node clickable, but on a container they
++// usually just mean a wrapper.
++bool HasActivationSignal(const proto::ContentNode& node) {
++  const auto& a = node.content_attributes();
++  if (!a.has_interaction_info()) {
++    return false;
++  }
++  const auto& info = a.interaction_info();
++  if (info.is_clickable()) {
++    return true;
++  }
++  for (int reason : info.clickability_reasons()) {
++    switch (static_cast<proto::ClickabilityReason>(reason)) {
++      case proto::CLICKABILITY_REASON_CLICKABLE_CONTROL:
++      case proto::CLICKABILITY_REASON_CLICK_HANDLER:
++      case proto::CLICKABILITY_REASON_MOUSE_CLICK:
++      case proto::CLICKABILITY_REASON_CURSOR_POINTER:
++      case proto::CLICKABILITY_REASON_ARIA_ROLE:
++      case proto::CLICKABILITY_REASON_ARIA_HAS_POPUP:
++      case proto::CLICKABILITY_REASON_ARIA_EXPANDED_TRUE:
++      case proto::CLICKABILITY_REASON_ARIA_EXPANDED_FALSE:
++      case proto::CLICKABILITY_REASON_ARIA_TOGGLE:
++      case proto::CLICKABILITY_REASON_ARIA_SELECTABLE:
++        return true;
++      default:
++        break;
++    }
++  }
++  return false;
++}
++
++// Whether something inside `node` gets a line of its own: a link, a form
++// control, a frame, or another click target. A list item or a clickable
++// container holding one is a wrapper, and its children are listed instead.
++// Emitting the wrapper hid every link in an <li> from the model.
++bool HasInteractiveDescendant(const proto::ContentNode& node, int depth = 0) {
++  if (depth > kMaxDepth) {
++    return false;
++  }
++  for (const auto& child : node.children_nodes()) {
++    if (IsAgentNodeExcluded(child)) {
++      continue;
++    }
++    switch (child.content_attributes().attribute_type()) {
++      case proto::CONTENT_ATTRIBUTE_ANCHOR:
++      case proto::CONTENT_ATTRIBUTE_FORM_CONTROL:
++      case proto::CONTENT_ATTRIBUTE_IFRAME:
++        return true;
++      default:
++        break;
++    }
++    if (HasActivationSignal(child) ||
++        HasInteractiveDescendant(child, depth + 1)) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ struct WalkContext {
+   RefTable* refs = nullptr;
+   SnapshotOptions options;
+@@ -400,6 +461,7 @@ void EmitInteractive(WalkContext& ctx,
+   meta.last_seen_generation = ctx.generation;
+   meta.in_viewport = in_viewport;
+ 
++  const bool had_ref = ctx.refs->Contains(key);
+   const std::string ref = ctx.refs->GetOrCreate(key, std::move(meta));
+   ctx.refs->MarkSeen(ref, in_viewport);
+ 
+@@ -429,7 +491,11 @@ void EmitInteractive(WalkContext& ctx,
+   snap.text = std::move(line);
+   snap.semantic_hash =
+       SemanticHash(snap.text + ctx.refs->Lookup(ref)->policy_fingerprint);
+-  AppendLine(ctx, std::move(snap));
++  // A line cut by the budget leaves no ref behind for an element the model
++  // was never shown.
++  if (!AppendLine(ctx, std::move(snap)) && !had_ref) {
++    ctx.refs->Remove(ref);
++  }
+ }
+ 
+ void Walk(WalkContext& ctx, const proto::ContentNode& node, int depth);
+@@ -504,7 +570,8 @@ void Walk(WalkContext& ctx, const proto:
+   if (a.attribute_type() == proto::CONTENT_ATTRIBUTE_LIST_ITEM) {
+     const std::string name = CollectText(node);
+     if (!name.empty() && a.has_common_ancestor_dom_node_id() &&
+-        (ctx.options.full || HasVisibleBox(node)) && IsActionable(node)) {
++        (ctx.options.full || HasVisibleBox(node)) && IsActionable(node) &&
++        !HasInteractiveDescendant(node)) {
+       EmitInteractive(ctx, node, "listitem", name, {});
+     } else {
+       WalkChildren(ctx, node, depth);
+@@ -588,14 +655,18 @@ void Walk(WalkContext& ctx, const proto:
+     return;
+   }
+ 
+-  // Generic clickable containers with a DOM id.
++  // Generic click targets with a DOM id. Blink gives a <div onclick> or a
++  // <span role=button> the container type, so containers count too, but only
++  // with a real activation signal and nothing interactive inside.
++  const bool container =
++      a.attribute_type() == proto::CONTENT_ATTRIBUTE_CONTAINER ||
++      a.attribute_type() == proto::CONTENT_ATTRIBUTE_PARAGRAPH;
+   if (IsActionable(node) && a.has_interaction_info() &&
+-      (a.interaction_info().is_clickable() ||
+-       !a.interaction_info().clickability_reasons().empty()) &&
++      (container ? HasActivationSignal(node) && !HasInteractiveDescendant(node)
++                 : (a.interaction_info().is_clickable() ||
++                    !a.interaction_info().clickability_reasons().empty())) &&
+       a.attribute_type() != proto::CONTENT_ATTRIBUTE_ROOT &&
+-      a.attribute_type() != proto::CONTENT_ATTRIBUTE_CONTAINER &&
+-      a.attribute_type() != proto::CONTENT_ATTRIBUTE_FORM &&
+-      a.attribute_type() != proto::CONTENT_ATTRIBUTE_PARAGRAPH) {
++      a.attribute_type() != proto::CONTENT_ATTRIBUTE_FORM) {
+     const std::string name = ControlName(a, node);
+     EmitInteractive(ctx, node, "button", name.empty() ? "clickable" : name, {},
+                     name.empty());
+--- a/chrome/browser/rac/agent/snapshot_serializer_unittest.cc
++++ b/chrome/browser/rac/agent/snapshot_serializer_unittest.cc
+@@ -368,4 +368,100 @@ TEST(SnapshotSerializerTest, NativeImage
+   SerializeAgentSnapshot(page, refs, options, 2);
+   EXPECT_FALSE(refs.MatchesPublished(ref));
+ }
++
++void AddText(proto::ContentNode* parent, const std::string& text) {
++  Node(parent, proto::CONTENT_ATTRIBUTE_TEXT)
++      ->mutable_content_attributes()
++      ->mutable_text_data()
++      ->set_text_content(text);
++}
++
++void AddReason(proto::ContentNode* node, proto::ClickabilityReason reason) {
++  node->mutable_content_attributes()
++      ->mutable_interaction_info()
++      ->add_clickability_reasons(reason);
++}
++
++TEST(SnapshotSerializerTest, LinksInsideListItemsAreListed) {
++  auto page = MakePage();
++  auto* list =
++      Node(page.mutable_root_node(), proto::CONTENT_ATTRIBUTE_UNORDERED_LIST);
++  auto* item = Node(list, proto::CONTENT_ATTRIBUTE_LIST_ITEM);
++  DomId(item, 51);
++  Visible(item);
++  auto* link = Node(item, proto::CONTENT_ATTRIBUTE_ANCHOR);
++  DomId(link, 52);
++  Visible(link);
++  link->mutable_content_attributes()->mutable_anchor_data()->set_url(
++      "https://example.com/a");
++  AddText(link, "Slash redirect");
++  AddText(item, "(answers 301)");
++  auto* plain = Node(list, proto::CONTENT_ATTRIBUTE_LIST_ITEM);
++  DomId(plain, 53);
++  Visible(plain);
++  AddText(plain, "Second item");
++  RefTable refs;
++  auto snapshot = SerializeAgentSnapshot(page, refs, SnapshotOptions(), 1);
++  EXPECT_NE(snapshot.text.find("- link \"Slash redirect\""), std::string::npos)
++      << snapshot.text;
++  EXPECT_EQ(snapshot.text.find("listitem \"Slash redirect"), std::string::npos)
++      << snapshot.text;
++  // A list item with nothing interactive inside is still a target.
++  EXPECT_NE(snapshot.text.find("- listitem \"Second item\""), std::string::npos)
++      << snapshot.text;
++}
++
++TEST(SnapshotSerializerTest, ClickableContainersAreListed) {
++  auto page = MakePage();
++  auto* root = page.mutable_root_node();
++  // <div onclick>Open details</div>
++  auto* div = Node(root, proto::CONTENT_ATTRIBUTE_CONTAINER);
++  DomId(div, 61);
++  Visible(div);
++  AddReason(div, proto::CLICKABILITY_REASON_CLICK_HANDLER);
++  AddText(div, "Open details");
++  // <span role=button tabindex=0>Star</span>
++  auto* star = Node(root, proto::CONTENT_ATTRIBUTE_CONTAINER);
++  DomId(star, 62);
++  Visible(star);
++  AddReason(star, proto::CLICKABILITY_REASON_ARIA_ROLE);
++  AddReason(star, proto::CLICKABILITY_REASON_TAB_INDEX);
++  AddText(star, "Star");
++  // An empty clickable box.
++  auto* bare = Node(root, proto::CONTENT_ATTRIBUTE_CONTAINER);
++  DomId(bare, 63);
++  Visible(bare);
++  AddReason(bare, proto::CLICKABILITY_REASON_CURSOR_POINTER);
++  // A wrapper that only has a :hover style is not a target.
++  auto* hover = Node(root, proto::CONTENT_ATTRIBUTE_CONTAINER);
++  DomId(hover, 64);
++  Visible(hover);
++  AddReason(hover, proto::CLICKABILITY_REASON_HOVER_PSEUDO_CLASS);
++  AddText(hover, "Just styled");
++  // A clickable wrapper around a link lists the link, not itself.
++  auto* card = Node(root, proto::CONTENT_ATTRIBUTE_CONTAINER);
++  DomId(card, 65);
++  Visible(card);
++  AddReason(card, proto::CLICKABILITY_REASON_CLICK_HANDLER);
++  auto* link = Node(card, proto::CONTENT_ATTRIBUTE_ANCHOR);
++  DomId(link, 66);
++  Visible(link);
++  link->mutable_content_attributes()->mutable_anchor_data()->set_url(
++      "https://example.com/story");
++  AddText(link, "Read the story");
++  RefTable refs;
++  auto snapshot = SerializeAgentSnapshot(page, refs, SnapshotOptions(), 1);
++  EXPECT_NE(snapshot.text.find("- button \"Open details\""), std::string::npos)
++      << snapshot.text;
++  EXPECT_NE(snapshot.text.find("- button \"Star\""), std::string::npos)
++      << snapshot.text;
++  EXPECT_NE(snapshot.text.find("- button \"clickable\""), std::string::npos)
++      << snapshot.text;
++  EXPECT_EQ(snapshot.text.find("Just styled"), std::string::npos)
++      << snapshot.text;
++  EXPECT_NE(snapshot.text.find("- link \"Read the story\""), std::string::npos)
++      << snapshot.text;
++  EXPECT_EQ(snapshot.text.find("button \"Read the story"), std::string::npos)
++      << snapshot.text;
++}
+ }  // namespace rac::agent
