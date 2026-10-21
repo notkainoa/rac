@@ -204,10 +204,24 @@
    }
 --- a/chrome/browser/rac/agent/ref_table.cc
 +++ b/chrome/browser/rac/agent/ref_table.cc
-@@ -74,6 +74,19 @@ void RefTable::MarkSeen(std::string_view
+@@ -61,6 +61,7 @@ void RefTable::BeginSnapshot(std::string
+     if (entry.key.tab_id == tab_id) {
+       entry.present_in_latest = false;
+       entry.in_viewport = false;
++      entry.shown_in_latest = false;
+       entry.snapshot_generation = generation;
+     }
+   }
+@@ -74,6 +75,25 @@ void RefTable::MarkSeen(std::string_view
    }
  }
  
++void RefTable::MarkShown(std::string_view ref) {
++  if (RefEntry* entry = LookupMutable(ref)) {
++    entry->shown_in_latest = true;
++  }
++}
++
 +bool RefTable::Contains(const RefKey& key) const {
 +  return by_key_.contains(key);
 +}
@@ -224,9 +238,46 @@
  void RefTable::EndSnapshot(std::string_view tab_id) {
    // Absent entries keep their refs but are not actionable until re-seen.
  }
+@@ -139,9 +159,10 @@ void RefTable::EvictIfNeeded() {
+   }
+   // Evict a quarter at a time, in one pass, so a big page doesn't rescan and
+   // reshuffle the table for every new ref. Entries in the snapshot being
+-  // built are kept: the model is about to see them. The walk is bounded by
+-  // the snapshot budget, and a hard cap keeps a hostile page from growing the
+-  // table without end.
++  // built are kept: the model is about to see them. Offscreen targets get a
++  // ref without using the budget, so a long page can still reach the hard
++  // cap that keeps a hostile page from growing the table without end. Then
++  // only refs no snapshot printed go: the model may be about to use those.
+   std::vector<std::pair<uint64_t, std::string>> candidates;
+   for (const auto& [ref, entry] : by_ref_) {
+     if (!entry.present_in_latest) {
+@@ -153,7 +174,12 @@ void RefTable::EvictIfNeeded() {
+       return;
+     }
+     for (const auto& [ref, entry] : by_ref_) {
+-      candidates.emplace_back(entry.last_seen_generation, ref);
++      if (!entry.shown_in_latest) {
++        candidates.emplace_back(entry.last_seen_generation, ref);
++      }
++    }
++    if (candidates.empty()) {
++      return;
+     }
+   }
+   const size_t count =
 --- a/chrome/browser/rac/agent/ref_table.h
 +++ b/chrome/browser/rac/agent/ref_table.h
-@@ -92,6 +92,9 @@ class RefTable {
+@@ -74,6 +74,8 @@ struct RefEntry {
+   bool password = false;
+   bool present_in_latest = false;
+   bool in_viewport = false;
++  // The latest snapshot of its tab printed this ref, so the model may use it.
++  bool shown_in_latest = false;
+ };
+ 
+ class RefTable {
+@@ -92,10 +94,15 @@ class RefTable {
  
    const RefEntry* Lookup(std::string_view ref) const;
    RefEntry* LookupMutable(std::string_view ref);
@@ -236,6 +287,12 @@
  
    // Call at the start of a snapshot pass for `tab_id`.
    void BeginSnapshot(std::string_view tab_id, uint64_t generation);
+   void MarkSeen(std::string_view ref, bool in_viewport);
++  // The snapshot printed `ref`. Eviction never drops it.
++  void MarkShown(std::string_view ref);
+   void EndSnapshot(std::string_view tab_id);
+ 
+   void InvalidateDocument(std::string_view tab_id,
 --- a/chrome/browser/rac/agent/snapshot_serializer.cc
 +++ b/chrome/browser/rac/agent/snapshot_serializer.cc
 @@ -287,6 +287,67 @@ bool IsActionable(const proto::ContentNo
@@ -314,20 +371,22 @@
    const std::string ref = ctx.refs->GetOrCreate(key, std::move(meta));
    ctx.refs->MarkSeen(ref, in_viewport);
  
-@@ -429,7 +491,11 @@ void EmitInteractive(WalkContext& ctx,
+@@ -429,7 +491,13 @@ void EmitInteractive(WalkContext& ctx,
    snap.text = std::move(line);
    snap.semantic_hash =
        SemanticHash(snap.text + ctx.refs->Lookup(ref)->policy_fingerprint);
 -  AppendLine(ctx, std::move(snap));
 +  // A line cut by the budget leaves no ref behind for an element the model
 +  // was never shown.
-+  if (!AppendLine(ctx, std::move(snap)) && !had_ref) {
++  if (AppendLine(ctx, std::move(snap))) {
++    ctx.refs->MarkShown(ref);
++  } else if (!had_ref) {
 +    ctx.refs->Remove(ref);
 +  }
  }
  
  void Walk(WalkContext& ctx, const proto::ContentNode& node, int depth);
-@@ -504,7 +570,8 @@ void Walk(WalkContext& ctx, const proto:
+@@ -504,7 +572,8 @@ void Walk(WalkContext& ctx, const proto:
    if (a.attribute_type() == proto::CONTENT_ATTRIBUTE_LIST_ITEM) {
      const std::string name = CollectText(node);
      if (!name.empty() && a.has_common_ancestor_dom_node_id() &&
@@ -337,7 +396,7 @@
        EmitInteractive(ctx, node, "listitem", name, {});
      } else {
        WalkChildren(ctx, node, depth);
-@@ -588,14 +655,22 @@ void Walk(WalkContext& ctx, const proto:
+@@ -588,14 +657,22 @@ void Walk(WalkContext& ctx, const proto:
      return;
    }
  
@@ -368,7 +427,15 @@
                      name.empty());
 --- a/chrome/browser/rac/agent/snapshot_serializer_unittest.cc
 +++ b/chrome/browser/rac/agent/snapshot_serializer_unittest.cc
-@@ -368,4 +368,164 @@ TEST(SnapshotSerializerTest, NativeImage
+@@ -3,6 +3,7 @@
+ 
+ #include "chrome/browser/rac/agent/snapshot_serializer.h"
+ 
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "components/optimization_guide/proto/features/common_quality_data.pb.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+@@ -368,4 +369,201 @@ TEST(SnapshotSerializerTest, NativeImage
    SerializeAgentSnapshot(page, refs, options, 2);
    EXPECT_FALSE(refs.MatchesPublished(ref));
  }
@@ -532,6 +599,43 @@
 +  EXPECT_NE(snapshot.text.find("- button \"Avatar\""), std::string::npos)
 +      << snapshot.text;
 +}
++
++TEST(SnapshotSerializerTest, LongPagesNeverEvictPrintedRefs) {
++  auto page = MakePage();
++  auto* root = page.mutable_root_node();
++  auto add_button = [&](int id, bool visible) {
++    auto* node = Node(root, proto::CONTENT_ATTRIBUTE_FORM_CONTROL);
++    DomId(node, id);
++    if (visible) {
++      Visible(node);
++    } else {
++      Offscreen(node);
++    }
++    node->mutable_content_attributes()->set_label("Item " +
++                                                  base::NumberToString(id));
++    node->mutable_content_attributes()
++        ->mutable_form_control_data()
++        ->set_form_control_type(proto::FORM_CONTROL_TYPE_BUTTON_BUTTON);
++  };
++  for (int id = 1; id <= 5; ++id) {
++    add_button(id, /*visible=*/true);
++  }
++  // Far more offscreen targets than the table's hard cap (4 * 4).
++  for (int id = 6; id <= 80; ++id) {
++    add_button(id, /*visible=*/false);
++  }
++  RefTable refs(4);
++  auto snapshot = SerializeAgentSnapshot(page, refs, SnapshotOptions(), 1);
++  int printed = 0;
++  for (const auto& line : snapshot.lines) {
++    if (line.ref.empty()) {
++      continue;
++    }
++    ++printed;
++    EXPECT_NE(refs.Lookup(line.ref), nullptr) << line.ref;
++  }
++  EXPECT_EQ(printed, 5) << snapshot.text;
++}
  }  // namespace rac::agent
 --- a/chrome/browser/rac/ai/acp/acp_service.cc
 +++ b/chrome/browser/rac/ai/acp/acp_service.cc
@@ -611,3 +715,42 @@
  };
  
  // Turns the bytes of a provider's event stream into text.
+--- a/chrome/browser/rac/agent/ref_table_unittest.cc
++++ b/chrome/browser/rac/agent/ref_table_unittest.cc
+@@ -79,6 +79,36 @@ TEST(RefTableTest, EvictionKeepsTheSnaps
+   EXPECT_LT(refs.size(), 9u);
+ }
+ 
++// A long page gives every offscreen target a ref without using the snapshot
++// budget, so the table can reach its hard cap while every entry is in the
++// snapshot being built. Then the refs already printed must stay.
++TEST(RefTableTest, EvictionAtTheHardCapKeepsPrintedRefs) {
++  RefTable refs(4);  // Hard cap: 16.
++  RefEntry meta;
++  refs.BeginSnapshot("t1", 1);
++  std::vector<std::string> shown;
++  for (int id = 1; id <= 6; ++id) {
++    shown.push_back(refs.GetOrCreate(
++        {.tab_id = "t1", .document_token = "d", .dom_node_id = id}, meta));
++    refs.MarkSeen(shown.back(), /*in_viewport=*/true);
++    refs.MarkShown(shown.back());
++  }
++  for (int id = 7; id <= 60; ++id) {
++    const std::string ref = refs.GetOrCreate(
++        {.tab_id = "t1", .document_token = "d", .dom_node_id = id}, meta);
++    refs.MarkSeen(ref, /*in_viewport=*/false);
++  }
++  for (const auto& ref : shown) {
++    EXPECT_NE(refs.Lookup(ref), nullptr) << ref;
++  }
++  EXPECT_LE(refs.size(), 16u);
++  refs.EndSnapshot("t1");
++
++  // The next snapshot starts over: those refs are no longer protected.
++  refs.BeginSnapshot("t1", 2);
++  EXPECT_FALSE(refs.Lookup(shown[0])->shown_in_latest);
++}
++
+ TEST(RefTableTest, ClearKeepsCounting) {
+   RefTable refs;
+   RefEntry meta;
