@@ -79,8 +79,9 @@ read, so an address pasted with its request path, like
 `https://openrouter.ai/api/v1/chat/completions`, works anyway; rac adds
 `/chat/completions` (or `/v1/messages`) itself. Saving provider settings
 also runs a connection check (`CheckProviderConnection`): `GET {base}/models`
-first (`GET {base}/key` for OpenRouter, whose model list is public and would
-pass with any key), and, for servers with no model list, a one-token chat
+first (`GET {base}/key` for an openrouter.ai address under any provider,
+since its model list is public and would pass with any key; people set it up
+as Custom too), and, for servers with no model list, a one-token chat
 request, so
 the user learns the address or key is wrong in Settings, not from a failed
 chat. A model that rejects the browser tools makes the provider's error
