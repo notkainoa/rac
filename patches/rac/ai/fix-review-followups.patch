@@ -1,0 +1,106 @@
+--- a/chrome/browser/resources/rac_ai/app.ts
++++ b/chrome/browser/resources/rac_ai/app.ts
+@@ -1459,8 +1459,15 @@ function onAgentEvent(raw: unknown) {
+   queueRender();
+ }
+ 
+-function respondToAgent(id: string, decision: Decision) {
+-  sendToBrowser('racAiAgentRespond', [id, decision]);
++async function respondToAgent(id: string, decision: Decision) {
++  // The browser ignores an answer to a card it has moved past, or one that a
++  // navigation outran. Then the card stays as it is; the events that moved
++  // the browser on are what update it.
++  const taken =
++      await sendWithPromise<boolean>('racAiAgentRespond', id, decision);
++  if (!taken) {
++    return;
++  }
+   const message = lastAssistant();
+   if (!message?.task) {
+     return;
+@@ -1659,7 +1666,9 @@ function describeAgentError(
+       actions: ['retry'],
+     };
+   }
+-  if (/limit|quota|rate/i.test(raw)) {
++  // Word boundaries, so "generate" or "accurate" isn't a rate limit.
++  if (/\brate[ -]?limit|\bquota\b|\b429\b|\busage limit|too many requests/i
++          .test(raw)) {
+     return {
+       title: loadTimeData.getStringF('errLimitTitle', name),
+       detail: raw.split('\n')[0]!.slice(0, 240),
+--- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
++++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+@@ -441,8 +441,12 @@ void PageHandler::OnSpacesChanged() {
+ void PageHandler::HandleInit(const base::ListValue& args) {
+   CHECK_EQ(args.size(), 1u);
+   AllowJavascript();
++  // A reload disallows JavaScript, which drops the observer but leaves the
++  // registrar initialized, so look at the observer and not at prefs().
+   if (!pref_registrar_.prefs()) {
+     pref_registrar_.Init(profile_->GetPrefs());
++  }
++  if (!pref_registrar_.IsObserved(kEnabled)) {
+     pref_registrar_.Add(kEnabled,
+                         base::BindRepeating(&PageHandler::OnEnabledChanged,
+                                             base::Unretained(this)));
+@@ -900,20 +904,24 @@ void PageHandler::HandleStop(const base:
+ }
+ 
+ void PageHandler::HandleAgentRespond(const base::ListValue& args) {
+-  if (args.size() != 2 || !args[0].is_string() || !args[1].is_string()) {
++  // [callback id, card id, decision]. The reply says whether the browser took
++  // the decision, so the page marks a card answered only when it was.
++  if (args.size() != 3 || !args[1].is_string() || !args[2].is_string()) {
+     return;
+   }
+-  const std::string& id = args[0].GetString();
+-  const std::string& decision = args[1].GetString();
++  const std::string& id = args[1].GetString();
++  const std::string& decision = args[2].GetString();
+   if (id.size() > 120 ||
+       (decision != "allow" && decision != "allow_once" && decision != "deny" &&
+        decision != "stop" && decision != "confirm" && decision != "skip")) {
++    ResolveJavascriptCallback(args[0], base::Value(false));
+     return;
+   }
+   VLOG(1) << "rac agent: respond id=" << id << " decision=" << decision;
+-  if (agent::AgentUiDelegate* delegate = agent::GetAgentUiDelegate(profile_)) {
+-    delegate->Respond(id, decision);
+-  }
++  rac::agent::AgentController* controller =
++      rac::agent::AgentController::GetIfCreated(profile_);
++  ResolveJavascriptCallback(
++      args[0], base::Value(controller && controller->TryRespond(id, decision)));
+ }
+ 
+ void PageHandler::HandleAgentStop(const base::ListValue& args) {
+--- a/chrome/browser/ui/webui/settings/rac_ai_handler.cc
++++ b/chrome/browser/ui/webui/settings/rac_ai_handler.cc
+@@ -9,6 +9,7 @@
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
++#include "base/strings/string_util.h"
+ #include "base/task/task_traits.h"
+ #include "base/task/thread_pool.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -300,11 +301,16 @@ void RacAiHandler::HandleSetKey(const ba
+   CHECK_EQ(args.size(), 3u);
+   const std::string callback_id = args[0].GetString();
+   const std::string& id = args[1].GetString();
+-  const std::string& key = args[2].GetString();
++  // A pasted key often carries a space or newline at an end. A key is also
++  // sent as an HTTP header value, which must be printable ASCII.
++  std::string key;
++  base::TrimWhitespaceASCII(args[2].GetString(), base::TRIM_ALL, &key);
+   rac::ai::AiService* service =
+       rac::ai::AiServiceFactory::GetForProfile(profile_);
+   if (!service || !rac::ai::FindProvider(id) || key.empty() ||
+-      key.size() > kMaxKeyLength) {
++      key.size() > kMaxKeyLength ||
++      !std::ranges::all_of(key,
++                           [](char c) { return c >= 0x21 && c <= 0x7E; })) {
+     RejectJavascriptCallback(args[0], base::Value());
+     return;
+   }
