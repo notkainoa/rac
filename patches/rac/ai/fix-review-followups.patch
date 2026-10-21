@@ -1,6 +1,26 @@
 --- a/chrome/browser/resources/rac_ai/app.ts
 +++ b/chrome/browser/resources/rac_ai/app.ts
-@@ -1459,8 +1459,15 @@ function onAgentEvent(raw: unknown) {
+@@ -68,6 +68,9 @@ interface UpdateEvent {
+   delta?: string;
+   done?: boolean;
+   error?: string;
++  // The browser stopped the reply on purpose; `error` says why. Only the
++  // browser sets this, so a provider's text can't pass for a stop.
++  stopped?: boolean;
+   notice?: string;
+ }
+ 
+@@ -153,6 +156,9 @@ interface Message {
+   role: 'user'|'assistant';
+   text: string;
+   error?: string;
++  // `error` is the browser's own reason for stopping the reply (another page
++  // took over, the window switched spaces), not a failure.
++  browserStop?: boolean;
+   agent?: AgentRun;
+   stopped?: boolean;
+   // The assistant closed while this reply was still being written.
+@@ -1459,8 +1465,15 @@ function onAgentEvent(raw: unknown) {
    queueRender();
  }
  
@@ -18,33 +38,45 @@
    const message = lastAssistant();
    if (!message?.task) {
      return;
-@@ -1659,7 +1666,14 @@ function describeAgentError(
+@@ -1659,7 +1672,9 @@ function describeAgentError(
        actions: ['retry'],
      };
    }
 -  if (/limit|quota|rate/i.test(raw)) {
-+  // The browser stopped the task on purpose (another page took over, the
-+  // window switched spaces). Nothing went wrong, so say only that.
-+  if (raw.startsWith('Stopped because ')) {
-+    return {title: raw, detail: '', actions: ['retry']};
-+  }
 +  // Word boundaries, so "generate" or "accurate" isn't a rate limit.
 +  if (/\brate[ -]?limit|\bquota\b|\b429\b|\busage limit|too many requests/i
 +          .test(raw)) {
      return {
        title: loadTimeData.getStringF('errLimitTitle', name),
        detail: raw.split('\n')[0]!.slice(0, 240),
-@@ -1677,6 +1691,10 @@ function describeAgentError(
- // do, and the buttons that do it. `raw` is the provider's own text.
- function describeChatError(raw: string, hadReply: boolean): ErrorView {
-   const first = raw.split('\n')[0]!.slice(0, 240);
-+  // Stopped on purpose, as for an agent (describeAgentError).
-+  if (raw.startsWith('Stopped because ')) {
-+    return {title: first, detail: '', actions: ['retry']};
-+  }
-   // A missing model is also a 404 ("model \"llama3.2\" not found, try
-   // pulling it first", "The model `x` does not exist"), so check it first.
-   if (/\bmodel\b/i.test(raw) &&
+@@ -1736,9 +1751,16 @@ function openProviderMenu() {
+ 
+ function makeErrorBlock(message: Message, active: boolean): HTMLElement {
+   const run = message.agent;
+-  const view: ErrorView = run ?
+-      describeAgentError(run, message.error!, !!message.text) :
+-      describeChatError(message.error!, !!message.text);
++  // The browser stopped the reply on purpose. Nothing went wrong, so say only
++  // why.
++  const view: ErrorView = message.browserStop ?
++      {
++        title: message.error!.split('\n')[0]!.slice(0, 240),
++        detail: '',
++        actions: ['retry'],
++      } :
++      run ? describeAgentError(run, message.error!, !!message.text) :
++            describeChatError(message.error!, !!message.text);
+   const error = document.createElement('div');
+   error.className = 'error';
+   const title = document.createElement('p');
+@@ -2339,6 +2361,7 @@ function onUpdate(event: UpdateEvent) {
+   }
+   if (event.error) {
+     last.error = event.error;
++    last.browserStop = !!event.stopped;
+     streaming = false;
+   }
+   if (event.done) {
 --- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
 +++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
 @@ -97,6 +97,9 @@ constexpr char kSystemPrompt[] =
@@ -121,6 +153,26 @@
  }
  
  void PageHandler::HandleAgentStop(const base::ListValue& args) {
+@@ -1018,6 +1039,9 @@ void PageHandler::FinishStoppedTurn(int
+   update.Set("id", send_id);
+   if (!error.empty()) {
+     update.Set("error", std::move(error));
++    // The page shows a browser stop calmly, by this flag and never by the
++    // text.
++    update.Set("stopped", true);
+   }
+   update.Set("done", true);
+   FireWebUIListener("rac-ai-update", update);
+@@ -1059,6 +1083,9 @@ void PageHandler::OnUpdate(int send_id,
+   }
+   if (update.error) {
+     event.Set("error", *update.error);
++    if (update.stopped) {
++      event.Set("stopped", true);
++    }
+   }
+   if (!update.notice.empty()) {
+     event.Set("notice", update.notice);
 --- a/chrome/browser/ui/webui/settings/rac_ai_handler.cc
 +++ b/chrome/browser/ui/webui/settings/rac_ai_handler.cc
 @@ -9,6 +9,7 @@
@@ -481,3 +533,81 @@
 +      << snapshot.text;
 +}
  }  // namespace rac::agent
+--- a/chrome/browser/rac/ai/acp/acp_service.cc
++++ b/chrome/browser/rac/ai/acp/acp_service.cc
+@@ -120,6 +120,8 @@ struct AcpService::Run {
+   UpdateCallback on_update;
+   AgentEventCallback on_agent_event;
+   DoneCallback done;
++  // A newer run replaced this one: the browser stopped it on purpose.
++  bool superseded = false;
+ };
+ 
+ struct AcpService::Session {
+@@ -228,6 +230,7 @@ AcpService::RunId AcpService::Prompt(
+     AgentEventCallback on_agent_event,
+     DoneCallback done) {
+   if (run_) {
++    run_->superseded = true;
+     EndRun(run_->id, kSupersededError);
+   }
+   auto run = std::make_unique<Run>();
+@@ -275,6 +278,7 @@ void AcpService::EndRun(RunId id, std::s
+     if (!error.empty()) {
+       update.error = error;
+     }
++    update.stopped = run->superseded;
+     run->on_update.Run(std::move(update));
+   }
+   if (run->done) {
+--- a/chrome/browser/rac/ai/acp/acp_service_unittest.cc
++++ b/chrome/browser/rac/ai/acp/acp_service_unittest.cc
+@@ -86,6 +86,8 @@ struct Result {
+   bool finished = false;
+   std::string error;
+   std::string text;
++  // The last update said the browser stopped the run on purpose.
++  bool stopped = false;
+ };
+ 
+ class AcpServiceTest : public testing::Test {
+@@ -120,6 +122,7 @@ class AcpServiceTest : public testing::T
+         "custom", std::move(text), std::move(tools),
+         base::BindLambdaForTesting([result](StreamUpdate update) {
+           result->text += update.text_delta;
++          result->stopped = update.stopped;
+         }),
+         base::DoNothing(),
+         base::BindOnce(
+@@ -171,6 +174,7 @@ TEST_F(AcpServiceTest, StopDuringLaunchS
+   service_->Stop(run);
+   EXPECT_TRUE(result.finished);
+   EXPECT_EQ(result.error, "Cancelled");
++  EXPECT_FALSE(result.stopped);
+   // Let every launch stage that was already posted run out.
+   for (int i = 0; i < 50; ++i) {
+     env_.RunUntilIdle();
+@@ -191,8 +195,11 @@ TEST_F(AcpServiceTest, NewerRunEndsTheLa
+   Prompt("second prompt", &second, nullptr, loop.QuitClosure());
+   EXPECT_TRUE(first.finished);
+   EXPECT_EQ(first.error, AcpService::kSupersededError);
++  // The page is told the browser stopped it, apart from the text.
++  EXPECT_TRUE(first.stopped);
+   loop.Run();
+   EXPECT_EQ(second.error, "");
++  EXPECT_FALSE(second.stopped);
+   EXPECT_EQ(second.text, "hi");
+   EXPECT_EQ(first.text, "");
+   const std::string in = ReadLog("in");
+--- a/chrome/browser/rac/ai/chat_protocol.h
++++ b/chrome/browser/rac/ai/chat_protocol.h
+@@ -89,6 +89,9 @@ struct StreamUpdate {
+   std::optional<std::string> error;
+   // A quiet note about this chat, shown once. Not an error.
+   std::string notice;
++  // The browser ended the turn on purpose and `error` says why. Only the
++  // browser sets it, so a provider's or agent's text can't pass for a stop.
++  bool stopped = false;
+ };
+ 
+ // Turns the bytes of a provider's event stream into text.
