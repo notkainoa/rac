@@ -208,6 +208,20 @@ provider's official tool instead of reusing its login.
   user's identity, locale, proxy, and CA settings carry over, so a browser
   started from a terminal doesn't hand its shell's API keys to the agent.
   Telemetry and auto-update are turned off where the agent has a switch.
+- **Agents inherit rac's quarantine flag.** Chromium's Info.plist sets
+  `LSFileQuarantineEnabled`, so every file an agent writes is quarantined,
+  and a child can't clear the flag. A native library the agent unpacks and
+  then loads waits on Gatekeeper, for minutes or for good. OpenCode's
+  single-file build does that for its file finder and file watcher, so its
+  recipe turns both off. Check any new agent for this: a run that hangs
+  before its first word, with the agent's main thread in `dlopen`, is this.
+- **OpenCode uses the user's own directories,** so their login, providers,
+  and `"model"` are used. ACP mode can't use OpenCode's free models (they
+  refuse every client but OpenCode's own), and ACP picks one unless the
+  config names a model, so the page explains that error. Because the user's
+  config can allow tools, the recipe denies them again in a rac-owned primary
+  agent, whose rules OpenCode reads last. Its session database stays in the
+  scratch folder.
 - `initialize` advertises no file reads, no file writes, and no terminal.
   Anything else the agent asks for gets a "method not supported" reply.
 - Codex and Claude run through npx adapters, pinned to exact versions. They
@@ -224,7 +238,8 @@ launches the agent, starts the MCP server, and sends the prompt. When the
 prompt ends for any reason (done, an error, a sign-in request, Stop, a newer
 run, AI off) the run stops the MCP server, kills the agent, and deletes its
 tool provider. Every message therefore starts the agent again; there is no
-idle agent between messages.
+idle agent between messages. A prompt that gets no word, thought, or tool
+call in 90 seconds ends with "didn't answer" (`kAcpFirstAnswerTimeout`).
 
 - **The run owns its tools.** The page hands `Prompt` the run's
   `AgentMcpTools`. Nothing else keeps a pointer to them, and the MCP server

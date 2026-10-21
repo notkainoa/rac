@@ -38,7 +38,30 @@
    const message = lastAssistant();
    if (!message?.task) {
      return;
-@@ -1659,7 +1672,9 @@ function describeAgentError(
+@@ -1642,6 +1655,22 @@ function describeAgentError(
+       actions: ['provider'],
+     };
+   }
++  if (raw === 'The agent started but never answered.') {
++    return {
++      title: loadTimeData.getStringF('errNoAnswerTitle', name),
++      detail: loadTimeData.getStringF('errNoAnswerDetail', cliName()),
++      actions: ['retry', 'settings'],
++    };
++  }
++  // OpenCode's free models refuse every app but OpenCode's own, and ACP
++  // picks one unless the user's config names a model.
++  if (run.id === 'opencode' && /free tier can only be used/i.test(raw)) {
++    return {
++      title: loadTimeData.getString('errOpenCodeFreeTitle'),
++      detail: loadTimeData.getString('errOpenCodeFreeDetail'),
++      actions: ['retry', 'settings'],
++    };
++  }
+   if (/^Could not (start|create|configure|discover)|^The agent (command is|process id)/
+           .test(raw) ||
+       (raw === 'The agent timed out.' && !run.heard)) {
+@@ -1659,7 +1688,9 @@ function describeAgentError(
        actions: ['retry'],
      };
    }
@@ -49,7 +72,7 @@
      return {
        title: loadTimeData.getStringF('errLimitTitle', name),
        detail: raw.split('\n')[0]!.slice(0, 240),
-@@ -1677,6 +1692,18 @@ function describeAgentError(
+@@ -1677,6 +1708,18 @@ function describeAgentError(
  // do, and the buttons that do it. `raw` is the provider's own text.
  function describeChatError(raw: string, hadReply: boolean): ErrorView {
    const first = raw.split('\n')[0]!.slice(0, 240);
@@ -68,7 +91,7 @@
    // A missing model is also a 404 ("model \"llama3.2\" not found, try
    // pulling it first", "The model `x` does not exist"), so check it first.
    if (/\bmodel\b/i.test(raw) &&
-@@ -1690,20 +1717,13 @@ function describeChatError(raw: string,
+@@ -1690,20 +1733,13 @@ function describeChatError(raw: string,
    }
    // A doubled or wrong server address answers "not found" because the
    // request lands nowhere. The address is in settings.
@@ -90,7 +113,7 @@
    // Word boundaries, so "generate" or "accurate" isn't a rate limit.
    if (/\brate[ -]?limit|\bquota\b|\b429\b|\busage limit|too many requests/i
            .test(raw)) {
-@@ -1736,9 +1756,16 @@ function openProviderMenu() {
+@@ -1736,9 +1772,16 @@ function openProviderMenu() {
  
  function makeErrorBlock(message: Message, active: boolean): HTMLElement {
    const run = message.agent;
@@ -110,7 +133,7 @@
    const error = document.createElement('div');
    error.className = 'error';
    const title = document.createElement('p');
-@@ -2339,6 +2366,7 @@ function onUpdate(event: UpdateEvent) {
+@@ -2339,6 +2382,7 @@ function onUpdate(event: UpdateEvent) {
    }
    if (event.error) {
      last.error = event.error;
@@ -960,6 +983,22 @@
      {"planLabel", "Plan"},
      {"agentsHeading", "Agents"},
      {"modelsLater", "Models load after the first message."},
+@@ -134,6 +135,15 @@ constexpr Str kStrings[] = {
+     {"errNodeTitle", "$1 needs Node.js."},
+     {"errNodeDetail", "Install Node.js, then try again."},
+     {"errLimitTitle", "$1 hit a usage limit."},
++    {"errNoAnswerTitle", "$1 didn't answer."},
++    {"errNoAnswerDetail",
++     "It started but sent nothing for 90 seconds. Check that $1 works in "
++     "Terminal, then try again."},
++    {"errOpenCodeFreeTitle",
++     "OpenCode's free models only work in OpenCode's own app."},
++    {"errOpenCodeFreeDetail",
++     "Set \"model\" in your OpenCode config to a model your account can use, "
++     "then try again."},
+     {"errUrlTitle", "The provider's server didn't answer."},
+     {"errUrlDetail",
+      "Check the server address in Assistant settings. rac adds the request "
 --- a/chrome/browser/rac/agent/agent_controller.cc
 +++ b/chrome/browser/rac/agent/agent_controller.cc
 @@ -1073,12 +1073,18 @@ void AgentController::Cancel() {
@@ -983,3 +1022,312 @@
    }
    if (was_active) {
      State("stopped");
+--- a/chrome/browser/rac/ai/acp/agent_recipes.cc
++++ b/chrome/browser/rac/ai/acp/agent_recipes.cc
+@@ -14,6 +14,7 @@
+ #include "base/files/file_util.h"
+ #include "base/json/json_writer.h"
+ #include "base/strings/cstring_view.h"
++#include "base/strings/strcat.h"
+ #include "base/strings/string_util.h"
+ 
+ namespace rac::ai {
+@@ -174,31 +175,41 @@ void BaseEnv(std::map<std::string, std::
+ bool PrepareOpenCode(const AgentLaunchPaths& paths,
+                      const base::FilePath& scratch,
+                      AcpLaunchSpec& launch) {
+-  const std::string config = R"({
+-  "$schema":"https://opencode.ai/config.json",
+-  "share":"disabled",
+-  "autoupdate":false,
+-  "plugin":[],
+-  "permission":{"*":"deny","rac_*":"allow"},
+-  "tools":{"bash":false,"edit":false,"write":false,"patch":false,
+-           "webfetch":false,"websearch":false,"task":false,"read":false,
+-           "glob":false,"grep":false,"list":false}
+-})";
+-  if (!WriteScratchFile(scratch.AppendASCII("opencode.json"), config)) {
+-    return false;
+-  }
++  // OpenCode's own directories stay as they are: the login (auth.json), the
++  // providers and their model catalog, and the "model" setting live there.
++  // ACP mode can't use OpenCode's free models, so without them every run
++  // failed.
++  //
++  // Everything the user's config may allow is denied again here, last: the
++  // global rules list each built-in tool by name, and rac's own primary agent
++  // carries the same rules, because an agent's rules are read after the
++  // global ones.
++  const std::string rules = R"({"*":"deny","bash":"deny","edit":"deny",
++    "read":"deny","glob":"deny","grep":"deny","list":"deny","task":"deny",
++    "webfetch":"deny","websearch":"deny","codesearch":"deny","skill":"deny",
++    "external_directory":"deny","rac_*":"allow"})";
++  const std::string tools = R"({"*":false,"rac_*":true})";
++  const std::string config = base::StrCat(
++      {R"({"$schema":"https://opencode.ai/config.json","share":"disabled",)",
++       R"("autoupdate":false,"default_agent":"rac","permission":)", rules,
++       R"(,"tools":)", tools,
++       R"(,"agent":{"rac":{"mode":"primary","description":"rac","permission":)",
++       rules, R"(,"tools":)", tools, "}}}"});
+   PutEnv(launch.environment, "OPENCODE_CONFIG_CONTENT", config);
++  PutEnv(launch.environment, "OPENCODE_PERMISSION", rules);
+   PutEnv(launch.environment, "OPENCODE_DISABLE_PROJECT_CONFIG", "true");
+   PutEnv(launch.environment, "OPENCODE_DISABLE_AUTOUPDATE", "true");
+   PutEnv(launch.environment, "OPENCODE_DISABLE_DEFAULT_PLUGINS", "true");
+-  PutEnv(launch.environment, "OPENCODE_PERMISSION",
+-         R"({"*":"deny","rac_*":"allow"})");
+-  for (const char* name : {"config", "data", "cache", "state"}) {
+-    base::FilePath dir = scratch.AppendASCII(name);
+-    base::CreateDirectory(dir);
+-    std::string key = std::string("XDG_") + base::ToUpperASCII(name) + "_HOME";
+-    PutEnv(launch.environment, key.c_str(), dir.value());
+-  }
++  // rac's chats stay out of the user's OpenCode history.
++  PutEnv(launch.environment, "OPENCODE_DB",
++         scratch.AppendASCII("opencode.db").value());
++  // Everything rac's process writes carries rac's quarantine flag, so a
++  // native library OpenCode unpacks and loads waits on Gatekeeper, for
++  // minutes or for good. Turn off the two features that load one (the file
++  // finder and the file watcher); rac gives OpenCode no files to look at.
++  PutEnv(launch.environment, "OPENCODE_DISABLE_FFF", "true");
++  PutEnv(launch.environment, "OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER",
++         "true");
+   launch.argv = {paths.executable.value(), "acp"};
+   return true;
+ }
+--- a/chrome/browser/rac/ai/acp/agent_recipes_unittest.cc
++++ b/chrome/browser/rac/ai/acp/agent_recipes_unittest.cc
+@@ -90,6 +90,54 @@ TEST(AgentRecipesTest, PermissionHookReq
+     "server":"rac","tool":"rac_echo"},"_meta":{"is_mcp_tool_call":true}})"));
+ }
+ 
++// OpenCode runs with the user's own login and config (its directories are
++// left alone), keeps rac's chats out of their history, denies every tool but
++// rac's in its own primary agent, and loads no native library.
++TEST(AgentRecipesTest, OpenCodeUsesTheUsersLoginAndDeniesItsTools) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath scratch = temp.GetPath().AppendASCII("opencode");
++  AgentLaunchPaths paths;
++  paths.executable = base::FilePath("/opt/homebrew/bin/opencode");
++  paths.search_path = "/usr/bin:/bin";
++  AcpLaunchSpec launch;
++  base::DictValue extra;
++  ASSERT_TRUE(PrepareAgentLaunch(*FindAgentRecipe("opencode"), paths, scratch,
++                                 temp.GetPath(), launch, extra));
++  const auto& env = launch.environment;
++  for (const auto& [key, value] : env) {
++    if (key.starts_with("XDG_")) {
++      EXPECT_FALSE(value.starts_with(temp.GetPath().value())) << key;
++    }
++  }
++  ASSERT_TRUE(env.contains("OPENCODE_DB"));
++  EXPECT_TRUE(env.at("OPENCODE_DB").starts_with(scratch.value()));
++  EXPECT_EQ(env.at("OPENCODE_DISABLE_FFF"), "true");
++  EXPECT_EQ(env.at("OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER"), "true");
++
++  auto config = base::JSONReader::ReadDict(env.at("OPENCODE_CONFIG_CONTENT"),
++                                           base::JSON_PARSE_RFC);
++  ASSERT_TRUE(config);
++  EXPECT_EQ(*config->FindString("default_agent"), "rac");
++  const base::DictValue* agent = config->FindDictByDottedPath("agent.rac");
++  ASSERT_TRUE(agent);
++  const base::DictValue* global_rules = config->FindDict("permission");
++  for (const base::DictValue* rules :
++       {global_rules, agent->FindDict("permission")}) {
++    ASSERT_TRUE(rules);
++    EXPECT_EQ(*rules->FindString("*"), "deny");
++    EXPECT_EQ(*rules->FindString("bash"), "deny");
++    EXPECT_EQ(*rules->FindString("edit"), "deny");
++    EXPECT_EQ(*rules->FindString("rac_*"), "allow");
++  }
++  auto global = base::JSONReader::ReadDict(env.at("OPENCODE_PERMISSION"),
++                                           base::JSON_PARSE_RFC);
++  ASSERT_TRUE(global);
++  EXPECT_EQ(*global->FindString("bash"), "deny");
++  EXPECT_EQ(launch.argv,
++            std::vector<std::string>({"/opt/homebrew/bin/opencode", "acp"}));
++}
++
+ TEST(AgentRecipesTest, CustomLaunchRequiresAbsoluteExecutable) {
+   base::ScopedTempDir temp;
+   ASSERT_TRUE(temp.CreateUniqueTempDir());
+--- a/chrome/browser/rac/ai/acp/acp_client.cc
++++ b/chrome/browser/rac/ai/acp/acp_client.cc
+@@ -33,6 +33,11 @@ void MergeTool(base::DictValue& target,
+   }
+ }
+ 
++bool IsAnswer(const std::string& kind) {
++  return kind == "agent_message_chunk" || kind == "agent_thought_chunk" ||
++         kind == "tool_call" || kind == "tool_call_update" || kind == "plan";
++}
++
+ }  // namespace
+ 
+ bool AcpFramer::Feed(std::string_view bytes,
+@@ -167,6 +172,10 @@ void AcpClient::Prompt(std::string text,
+   done_ = std::move(done);
+   state_ = State::kPrompting;
+   ArmDeadline(base::Minutes(10));
++  first_answer_.Start(
++      FROM_HERE, kAcpFirstAnswerTimeout,
++      base::BindOnce(&AcpClient::Fail, weak_factory_.GetWeakPtr(),
++                     kAcpNoAnswerError));
+   Send(Request::kPrompt, "session/prompt",
+        base::DictValue()
+            .Set("sessionId", session_id_)
+@@ -254,6 +263,9 @@ void AcpClient::Receive(base::DictValue
+   if (*session != session_id_ || state_ == State::kCancelling) {
+     return;
+   }
++  if (IsAnswer(*kind)) {
++    HeardAnswer();
++  }
+   if (*kind == "tool_call" || *kind == "tool_call_update") {
+     const std::string* tool_id = update->FindString("toolCallId");
+     if (!tool_id || tool_id->empty()) {
+@@ -271,6 +283,9 @@ void AcpClient::Receive(base::DictValue
+ }
+ 
+ void AcpClient::OnResponse(Request request, const base::DictValue& message) {
++  if (request == Request::kPrompt) {
++    HeardAnswer();
++  }
+   const base::DictValue* error = message.FindDict("error");
+   if (error) {
+     const std::string* text = error->FindString("message");
+@@ -328,7 +343,12 @@ void AcpClient::OnResponse(Request reque
+   }
+ }
+ 
++void AcpClient::HeardAnswer() {
++  first_answer_.Stop();
++}
++
+ void AcpClient::OnPermission(base::Value id, const base::DictValue& params) {
++  HeardAnswer();
+   const base::DictValue* tool = params.FindDict("toolCall");
+   const std::string* tool_id = tool ? tool->FindString("toolCallId") : nullptr;
+   const base::ListValue* options = params.FindList("options");
+@@ -423,6 +443,7 @@ void AcpClient::Cancel() {
+     return;
+   }
+   state_ = State::kCancelling;
++  HeardAnswer();
+   Notify("session/cancel", base::DictValue().Set("sessionId", session_id_));
+   CancelPermissions();
+   ArmDeadline(base::Seconds(3));
+@@ -439,6 +460,7 @@ void AcpClient::TearDown(State next, std
+   CancelPermissions();
+   state_ = next;
+   deadline_.Stop();
++  first_answer_.Stop();
+   pending_.clear();
+   close_.Run();
+   if (ready_) {
+--- a/chrome/browser/rac/ai/acp/acp_client.h
++++ b/chrome/browser/rac/ai/acp/acp_client.h
+@@ -11,6 +11,7 @@
+ 
+ #include "base/functional/callback.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
+ #include "base/timer/timer.h"
+ #include "base/values.h"
+ 
+@@ -18,6 +19,12 @@ namespace rac::ai {
+ 
+ inline constexpr size_t kAcpMaxFrameBytes = 8 * 1024 * 1024;
+ 
++// How long a prompt may go without a single word, thought, or tool call
++// from the agent before rac gives up on it.
++inline constexpr base::TimeDelta kAcpFirstAnswerTimeout = base::Seconds(90);
++inline constexpr char kAcpNoAnswerError[] =
++    "The agent started but never answered.";
++
+ // Fatal on any malformed frame, including an incomplete final line.
+ class AcpFramer {
+  public:
+@@ -84,6 +91,7 @@ class AcpClient {
+   void CancelPermissions();
+   void Notify(std::string method, base::DictValue params);
+   void ArmDeadline(base::TimeDelta timeout);
++  void HeardAnswer();
+   void FinishTurn(std::string error);
+   void TearDown(State next, std::string error, bool send_cancel);
+ 
+@@ -111,6 +119,7 @@ class AcpClient {
+   Completion ready_;
+   Completion done_;
+   base::OneShotTimer deadline_;
++  base::OneShotTimer first_answer_;
+   base::WeakPtrFactory<AcpClient> weak_factory_{this};
+ };
+ 
+--- a/chrome/browser/rac/ai/acp/acp_client_unittest.cc
++++ b/chrome/browser/rac/ai/acp/acp_client_unittest.cc
+@@ -7,6 +7,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/functional/callback_helpers.h"
+ #include "base/json/json_reader.h"
+ #include "base/test/bind.h"
+ #include "base/test/task_environment.h"
+@@ -243,6 +244,55 @@ TEST_F(AcpClientTest, PermissionPolicyCa
+       "allow-once");
+ }
+ 
++TEST(AcpClientTimeoutTest, SilentAgentFailsAfterTheFirstAnswerTimeout) {
++  base::test::TaskEnvironment env(
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
++  int closes = 0;
++  AcpClient client(base::BindRepeating([](base::DictValue) {}),
++                   base::BindLambdaForTesting([&] { ++closes; }),
++                   base::BindRepeating([](base::DictValue) {}));
++  client.Start(base::DictValue().Set("cwd", "/tmp"), base::DoNothing());
++  client.Receive(
++      Line(R"({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}})"));
++  client.Receive(
++      Line(R"({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}})"));
++  std::string error = "unset";
++  client.Prompt("hi", base::BindLambdaForTesting(
++                          [&](std::string e) { error = std::move(e); }));
++  // Housekeeping updates are not an answer.
++  client.Receive(Line(R"({"jsonrpc":"2.0","method":"session/update","params":{
++      "sessionId":"s1","update":{"sessionUpdate":"available_commands_update",
++      "availableCommands":[]}}})"));
++  env.FastForwardBy(kAcpFirstAnswerTimeout - base::Seconds(1));
++  EXPECT_EQ(error, "unset");
++  env.FastForwardBy(base::Seconds(2));
++  EXPECT_EQ(error, kAcpNoAnswerError);
++  EXPECT_EQ(closes, 1);
++}
++
++TEST(AcpClientTimeoutTest, AnyAnswerKeepsASlowTurnAlive) {
++  base::test::TaskEnvironment env(
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
++  AcpClient client(base::BindRepeating([](base::DictValue) {}),
++                   base::DoNothing(),
++                   base::BindRepeating([](base::DictValue) {}));
++  client.Start(base::DictValue().Set("cwd", "/tmp"), base::DoNothing());
++  client.Receive(
++      Line(R"({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}})"));
++  client.Receive(
++      Line(R"({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}})"));
++  std::string error = "unset";
++  client.Prompt("hi", base::BindLambdaForTesting(
++                          [&](std::string e) { error = std::move(e); }));
++  env.FastForwardBy(base::Seconds(30));
++  client.Receive(Line(R"({"jsonrpc":"2.0","method":"session/update","params":{
++      "sessionId":"s1","update":{"sessionUpdate":"agent_thought_chunk",
++      "content":{"type":"text","text":"hm"}}}})"));
++  env.FastForwardBy(kAcpFirstAnswerTimeout * 2);
++  EXPECT_EQ(error, "unset");
++  EXPECT_EQ(client.state(), AcpClient::State::kPrompting);
++}
++
+ TEST(AgentPathTest, ParsesLoginShellMarkers) {
+   const std::string out =
+       "banner\nRAC_PATH_abc_BEGIN\n/opt/homebrew/bin:/usr/bin\n"
