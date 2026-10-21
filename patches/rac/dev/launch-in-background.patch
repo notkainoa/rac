@@ -1,0 +1,137 @@
+Index: src/chrome/browser/ui/views/frame/browser_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view.cc
++++ src/chrome/browser/ui/views/frame/browser_view.cc
+@@ -2362,6 +2362,7 @@ void BrowserView::Show() {
+ 
+   // Guard against destruction by platform event handlers called during Show().
+   auto weak_ptr = weak_ptr_factory_.GetWeakPtr();
++  rac::MaybeKeepInBackground(GetWidget());
+   browser_widget_->Show();
+   if (!weak_ptr) {
+     return;
+Index: src/chrome/browser/ui/views/rac/window_screenshot.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/window_screenshot.h
++++ src/chrome/browser/ui/views/rac/window_screenshot.h
+@@ -18,6 +18,12 @@ namespace rac {
+ // another process (and often this one) returns a blank image.
+ void MaybeScheduleWindowScreenshot(views::Widget* widget);
+ 
++// If launched with --rac-launch-in-background, keeps the app from activating
++// so a test browser never takes the keyboard from the app in front, and
++// paints `widget` as active so screenshots match a focused window. Call before
++// the window first shows. No-op otherwise.
++void MaybeKeepInBackground(views::Widget* widget);
++
+ }  // namespace rac
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_RAC_WINDOW_SCREENSHOT_H_
+Index: src/chrome/browser/ui/views/rac/window_screenshot.mm
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/window_screenshot.mm
++++ src/chrome/browser/ui/views/rac/window_screenshot.mm
+@@ -5,7 +5,9 @@
+ #include "chrome/browser/ui/views/rac/window_screenshot.h"
+ 
+ #import <Cocoa/Cocoa.h>
++#include <objc/runtime.h>
+ 
++#include <memory>
+ #include <optional>
+ #include <string>
+ #include <string_view>
+@@ -18,10 +20,11 @@
+ #include "base/functional/callback_helpers.h"
+ #include "base/logging.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
+ #include "base/strings/string_number_conversions.h"
+-#include "base/strings/stringprintf.h"
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+@@ -48,6 +51,7 @@
+ #include "ui/views/view.h"
+ #include "ui/views/view_utils.h"
+ #include "ui/views/widget/widget.h"
++#include "ui/views/widget/widget_observer.h"
+ 
+ namespace rac {
+ namespace {
+@@ -70,6 +74,9 @@ constexpr base::TimeDelta kRequestPollIn
+ // other apps and must not take it.
+ constexpr char kWindowScreenshotActivateSwitch[] =
+     "rac-window-screenshot-activate";
++// Keeps a test browser in the background: it never becomes the active app,
++// so typing meant for the app in front can't land in it.
++constexpr char kLaunchInBackgroundSwitch[] = "rac-launch-in-background";
+ 
+ void WriteBytes(const base::FilePath& path, std::vector<uint8_t> bytes) {
+   if (bytes.empty()) {
+@@ -573,8 +580,62 @@ void RunCommand(base::WeakPtr<views::Wid
+   }
+ }
+ 
++// Holds a paint-as-active lock for a window's lifetime, so an inactive test
++// window draws its frame and tabs like the focused window a user sees.
++class PaintAsActive : public views::WidgetObserver {
++ public:
++  explicit PaintAsActive(views::Widget* widget)
++      : lock_(widget->LockPaintAsActive()) {
++    observation_.Observe(widget);
++  }
++
++  // views::WidgetObserver:
++  void OnWidgetDestroying(views::Widget* widget) override { delete this; }
++
++ private:
++  std::unique_ptr<views::Widget::PaintAsActiveLock> lock_;
++  base::ScopedObservation<views::Widget, views::WidgetObserver> observation_{
++      this};
++};
++
++// Turns NSApp's activation calls into no-ops. Chromium activates the app when
++// a window shows or a tab is activated (also over DevTools), and each would
++// take the keyboard from whatever app the user is typing in.
++void StopAppActivation() {
++  Class app_class = [NSApp class];
++  Method activate_ignoring = class_getInstanceMethod(
++      [NSApplication class], @selector(activateIgnoringOtherApps:));
++  if (activate_ignoring) {
++    class_replaceMethod(app_class, @selector(activateIgnoringOtherApps:),
++                        imp_implementationWithBlock(^(id app, BOOL flag){
++                        }),
++                        method_getTypeEncoding(activate_ignoring));
++  }
++  Method activate =
++      class_getInstanceMethod([NSApplication class], @selector(activate));
++  if (activate) {
++    class_replaceMethod(app_class, @selector(activate),
++                        imp_implementationWithBlock(^(id app){
++                        }),
++                        method_getTypeEncoding(activate));
++  }
++}
++
+ }  // namespace
+ 
++void MaybeKeepInBackground(views::Widget* widget) {
++  if (!widget || !base::CommandLine::ForCurrentProcess()->HasSwitch(
++                     kLaunchInBackgroundSwitch)) {
++    return;
++  }
++  static bool stopped = false;
++  if (!stopped) {
++    stopped = true;
++    StopAppActivation();
++  }
++  new PaintAsActive(widget);
++}
++
+ void MaybeScheduleWindowScreenshot(views::Widget* widget) {
+   const base::FilePath path =
+       base::CommandLine::ForCurrentProcess()->GetSwitchValuePath(
