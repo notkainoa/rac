@@ -30,9 +30,10 @@ Use these words consistently in code, docs, issues, and PRs.
   - **full**: shows titles and icons
   - **compact**: shows icons only (Helium's "collapsed")
   - **hidden**: not shown at all
-- **Frameless mode**: Helium's appearance setting that hides the sidebar and
-  top bar until you hover the window edge. Cmd+S turns it on and off. The
-  code calls it "zen mode" (`helium.browser.zen_mode`).
+- **Frameless mode**: Helium's mode that hides the sidebar until you hover
+  the window edge, while the top bar stays. Cmd+S turns it on and off; it's
+  no longer a setting on the Appearance page. The code calls it "zen mode"
+  (`helium.browser.zen_mode`).
 - **Edge reveal**: moving the mouse to the left edge of the screen to
   temporarily show the full sidebar over the page while it's hidden,
   or to the top edge to show the hidden toolbar.
