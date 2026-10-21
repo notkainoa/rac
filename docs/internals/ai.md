@@ -184,11 +184,13 @@ provider's official tool instead of reusing its login.
   and caches the result. An absolute path override per agent is validated on
   a blocking-allowed thread.
 - The process starts on a dedicated IO thread (file descriptor watchers
-  can't run on the thread pool), in its own process group. Stop sends TERM,
-  then KILL, to the group.
+  can't run on the thread pool), in its own process group. Ending a run
+  kills the group.
 - The working directory is an empty scratch folder under
-  `Cache/rac-agent/scratch/<agent>`. The environment is minimal, with
-  telemetry and auto-update turned off where the agent has a switch.
+  `Cache/rac-agent/scratch/<agent>`. The environment starts empty: only the
+  user's identity, locale, proxy, and CA settings carry over, so a browser
+  started from a terminal doesn't hand its shell's API keys to the agent.
+  Telemetry and auto-update are turned off where the agent has a switch.
 - `initialize` advertises no file reads, no file writes, and no terminal.
   Anything else the agent asks for gets a "method not supported" reply.
 - Codex and Claude run through npx adapters, pinned to exact versions. They
@@ -197,6 +199,29 @@ provider's official tool instead of reusing its login.
   tools with that agent's own config. These restrictions differ by agent and
   change as agents change. Treat them as a second layer. The permission rule
   below is the one that must hold.
+
+### Runs
+
+A run is one prompt, and nothing of it outlives it. `AcpService::Prompt`
+launches the agent, starts the MCP server, and sends the prompt. When the
+prompt ends for any reason (done, an error, a sign-in request, Stop, a newer
+run, AI off) the run stops the MCP server, kills the agent, and deletes its
+tool provider. Every message therefore starts the agent again; there is no
+idle agent between messages.
+
+- **The run owns its tools.** The page hands `Prompt` the run's
+  `AgentMcpTools`. Nothing else keeps a pointer to them, and the MCP server
+  is stopped before they are deleted. A provider owned by the page once
+  outlived the server's raw pointer to it, and a `tools/list` on the old
+  socket crashed the browser.
+- **Every stage checks its run id.** The PATH probe, the launch preparation
+  on the thread pool, the MCP server's start, the agent's replies, and its
+  exit all carry the run id and do nothing once it is not the current run.
+  Stop during a launch therefore sends nothing, not even the page text in
+  the prompt.
+- **A page stops only its own run.** `Stop(run)` ignores an older id. One
+  run per profile: a send from another assistant page ends the current run
+  with "Stopped because another assistant page started a task."
 
 ### Permission rule
 
@@ -241,16 +266,16 @@ serves every agent.
   103-byte limit for socket paths, the directory is `/tmp/rac-mcp-<uid>-<token>/`
   instead.
 - Agents reach it with `/usr/bin/nc -U <socket>`, which ACP's stdio
-  `mcpServers` entry can describe without shipping a helper binary. Because
-  `nc` can't send headers, the secret is the unguessable directory name.
-  The server also checks that the peer has the same user ID.
-- It starts with an agent session when browser control is on, and stops
-  with the session. The tool provider is detached when a prompt finishes, so
-  a call after the turn gets an error. Start and stop are asynchronous.
-  Never wait for them on the UI thread: a synchronous join DCHECKs there.
-  Leftover directories from a crash are deleted the first time a server
-  starts in the next process.
-- Its own approval hook always allows. All real authorization is in
+  `mcpServers` entry can describe without shipping a helper binary. `nc`
+  can't send headers, so there is no secret: the path shows in `ps`. The
+  modes and a same-user-ID check keep other users out. Any process of the
+  same user can connect while a run is live; it gets only that run's tools,
+  through the same guard and cards.
+- It lives exactly as long as its run (see [Runs](#runs)). Start and stop
+  are asynchronous. Never wait for them on the UI thread: a synchronous
+  join DCHECKs there. Before each start it deletes leftover directories
+  whose socket no longer answers.
+- It has no approval hook of its own. All real authorization is in
   `AgentController::HandleToolCall`. Don't add policy at the MCP layer, and
   don't route calls around the controller.
 - With browser control off, incognito, or AI off, no tool provider is set, so
@@ -268,7 +293,12 @@ opens tabs. It runs in two ways, with the same tools and the same gates.
   each call into `HandleToolCall(..., kMcp)`.
 
 Both enter the same `AgentController`. There is one active turn per
-profile, and starting a new turn cancels the old one.
+profile, owned by the assistant page that sent it (`SetAgentRunOwner`).
+Only the owner shows the turn's cards and marks its tab, and only the owner
+stops it, so closing a new tab page can't stop the sidebar's task. A page
+that starts a turn ends the current one first, while its page still owns
+it, so that page hears it stop. A closing page stops its run before it
+stops listening; the ring and pill are taken down by that page's handler.
 
 ### Who may act
 
@@ -422,7 +452,9 @@ runs on the user's direct provider and can only say `allow` or `escalate`.
   tab pill, and the keyboard.
 - **Stop** is the sidebar button, the pill, ⌘., or Esc on a card. It
   cancels the model session and, for an ACP agent, kills the process.
-  Nothing continues afterward.
+  Nothing continues afterward. All of them end in `AgentController::Cancel`,
+  whose `stopped` event makes the owning page stop its chat session or ACP
+  run.
 - **Step cap.** A turn stops after 25 tool calls (`kMaxToolCallsPerTurn`,
   shared by the direct loop and the controller). The user can send another
   message to continue.
@@ -490,7 +522,9 @@ detach is posted.
   loop the server must stream tool calls. For link summaries and the critic
   it only needs plain replies.
 - ACP: pick "Custom ACP command" and give an absolute path to a script that
-  speaks ACP v1 on stdio. rac's own mock servers are not in the repo.
+  speaks ACP v1 on stdio. Quote a path with spaces (`"/My Tools/agent"
+  --acp`). `AcpServiceTest` has a small one in shell. rac's own mock
+  servers are not in the repo.
 - Unit tests: `rac_ai_unittests` and `rac_agent_unittests`. Run only those,
   not Chromium's suites.
 
