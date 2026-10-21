@@ -1,0 +1,306 @@
+--- a/chrome/browser/ui/rac/BUILD.gn
++++ b/chrome/browser/ui/rac/BUILD.gn
+@@ -6,6 +6,8 @@ assert(!is_android)
+ 
+ source_set("sidebar_address_bar_prefs") {
+   sources = [
++    "appearance_locks.cc",
++    "appearance_locks.h",
+     "layout_prefs.cc",
+     "layout_prefs.h",
+     "sidebar_address_bar_prefs.cc",
+@@ -17,7 +19,8 @@ source_set("sidebar_address_bar_prefs")
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/helium:helium_layout_state_controller",
+     "//chrome/common:constants",
++    "//components/bookmarks/common",
+     "//components/pref_registry",
+-    "//components/prefs",
+   ]
++  public_deps = [ "//components/prefs" ]
+ }
+--- /dev/null
++++ b/chrome/browser/ui/rac/appearance_locks.cc
+@@ -0,0 +1,75 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/appearance_locks.h"
++
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
++#include "chrome/common/pref_names.h"
++#include "components/bookmarks/common/bookmark_pref_names.h"
++#include "components/prefs/pref_service.h"
++
++namespace rac {
++
++namespace {
++
++struct BoolLock {
++  const char* pref_name;
++  bool value;
++};
++
++// The Appearance settings rac removed, and the values they are locked at:
++// the layout is vertical, the zoom indicator is shown, the address bar is
++// not centered, frameless mode keeps the top bar pinned and the sidebar
++// unpinned with a rounded frame, and saved tab groups stay out of the
++// bookmarks bar.
++constexpr BoolLock kBoolLocks[] = {
++    {prefs::kShowZoomIndicator, true},
++    {prefs::kHeliumCenteredLocationBar, false},
++    {prefs::kHeliumZenModeSidebarPinned, false},
++    {prefs::kHeliumZenModeTopChromePinned, true},
++    {prefs::kHeliumRoundedFrame, true},
++    {bookmarks::prefs::kShowTabGroupsInBookmarkBar, false},
++};
++
++}  // namespace
++
++AppearanceLocks::AppearanceLocks(PrefService* pref_service)
++    : pref_service_(pref_service) {
++  Lock();
++  registrar_.Init(pref_service_);
++  Observe(prefs::kHeliumLayout);
++  for (const BoolLock& lock : kBoolLocks) {
++    Observe(lock.pref_name);
++  }
++}
++
++AppearanceLocks::~AppearanceLocks() = default;
++
++void AppearanceLocks::Lock() {
++  if (pref_service_->FindPreference(prefs::kHeliumLayout)) {
++    const int locked = std::to_underlying(HeliumLayoutType::kVertical);
++    if (pref_service_->GetInteger(prefs::kHeliumLayout) != locked) {
++      pref_service_->SetInteger(prefs::kHeliumLayout, locked);
++    }
++  }
++
++  for (const BoolLock& lock : kBoolLocks) {
++    if (pref_service_->FindPreference(lock.pref_name) &&
++        pref_service_->GetBoolean(lock.pref_name) != lock.value) {
++      pref_service_->SetBoolean(lock.pref_name, lock.value);
++    }
++  }
++}
++
++void AppearanceLocks::Observe(const char* pref_name) {
++  if (pref_service_->FindPreference(pref_name)) {
++    registrar_.Add(pref_name, base::BindRepeating(&AppearanceLocks::Lock,
++                                                  base::Unretained(this)));
++  }
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/ui/rac/appearance_locks.h
+@@ -0,0 +1,41 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_APPEARANCE_LOCKS_H_
++#define CHROME_BROWSER_UI_RAC_APPEARANCE_LOCKS_H_
++
++#include "base/memory/raw_ptr.h"
++#include "components/prefs/pref_change_registrar.h"
++
++class PrefService;
++
++namespace rac {
++
++// Holds the Appearance settings rac removed at their one locked state.
++// VerticalTabStripStateController creates one before the window reads them.
++// The locked values are applied at construction, and a pref observer reverts
++// stray writes from paths rac did not remove, including a value synced from
++// another copy of the profile.
++class AppearanceLocks {
++ public:
++  explicit AppearanceLocks(PrefService* pref_service);
++  AppearanceLocks(const AppearanceLocks&) = delete;
++  AppearanceLocks& operator=(const AppearanceLocks&) = delete;
++  ~AppearanceLocks();
++
++ private:
++  // Applies every locked value. Prefs this profile doesn't register (a unit
++  // test profile) are skipped.
++  void Lock();
++
++  // Watches a locked pref and re-locks it when it changes.
++  void Observe(const char* pref_name);
++
++  raw_ptr<PrefService> pref_service_;
++  PrefChangeRegistrar registrar_;
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_RAC_APPEARANCE_LOCKS_H_
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
+@@ -23,6 +23,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/helium/helium_layout_state_controller.h"
++#include "chrome/browser/ui/rac/appearance_locks.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/toasts/api/toast_id.h"
+ #include "chrome/browser/ui/toasts/toast_controller.h"
+@@ -80,6 +81,10 @@ VerticalTabStripStateController::Vertica
+                                 *this) {
+   pref_change_registrar_.Init(pref_service_);
+ 
++  // rac: move the Appearance settings rac removed to their locked state
++  // before the window reads them.
++  rac_appearance_locks_ = std::make_unique<rac::AppearanceLocks>(pref_service_);
++
+   is_vertical_tabs_enabled_ =
+       pref_service_->GetInteger(prefs::kHeliumLayout) ==
+       std::to_underlying(HeliumLayoutType::kVertical);
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
+@@ -25,6 +25,10 @@ namespace actions {
+ class ActionItem;
+ }  // namespace actions
+ 
++namespace rac {
++class AppearanceLocks;
++}  // namespace rac
++
+ namespace tabs {
+ 
+ // The collapse state for the vertical tab strip.
+@@ -177,6 +181,8 @@ class VerticalTabStripStateController :
+ 
+   const raw_ptr<PrefService> pref_service_;
+   PrefChangeRegistrar pref_change_registrar_;
++  // rac: keeps the Appearance settings rac removed at their locked state.
++  std::unique_ptr<rac::AppearanceLocks> rac_appearance_locks_;
+   raw_ptr<actions::ActionItem> root_action_item_;
+   raw_ptr<SessionService> session_service_;
+   const SessionID session_id_;
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1913,8 +1913,10 @@ void BrowserView::UpdateZenModeState() {
+   }
+ 
+   zen_mode_enabled_ = zen_mode_enabled;
++  // rac: frameless mode always keeps the top bar shown, so the shortcut and
++  // command that pins or unpins it (Shift+Command+L) does nothing.
+   chrome::BrowserCommandController::From(browser_)->UpdateCommandEnabled(
+-      IDC_TOGGLE_ZEN_MODE_TOP_CHROME_PIN, zen_mode_enabled);
++      IDC_TOGGLE_ZEN_MODE_TOP_CHROME_PIN, false);
+ 
+   if (zen_mode_enabled_) {
+     // When entering zen mode with pinned chrome, snap that chrome fully shown.
+--- a/chrome/browser/ui/views/frame/system_menu_model_builder.cc
++++ b/chrome/browser/ui/views/frame/system_menu_model_builder.cc
+@@ -170,27 +170,10 @@ void SystemMenuModelBuilder::BuildSystem
+   if (!browser()->GetProfile()->IsOffTheRecord()) {
+     model->AddSeparator(ui::NORMAL_SEPARATOR);
+ 
+-    browser_layout_menu_contents_ =
+-        std::make_unique<ui::SimpleMenuModel>(&menu_delegate_);
+-
+-    browser_layout_menu_contents_->AddCheckItemWithStringId(
+-        IDC_BROWSER_LAYOUT_CLASSIC, IDS_BROWSER_LAYOUT_CLASSIC);
+-    browser_layout_menu_contents_->AddCheckItemWithStringId(
+-        IDC_BROWSER_LAYOUT_DYNAMIC, IDS_BROWSER_LAYOUT_DYNAMIC);
+-    browser_layout_menu_contents_->AddCheckItemWithStringId(
+-        IDC_BROWSER_LAYOUT_COMPACT, IDS_BROWSER_LAYOUT_COMPACT);
+-    browser_layout_menu_contents_->AddCheckItemWithStringId(
+-        IDC_BROWSER_LAYOUT_VERTICAL, IDS_BROWSER_LAYOUT_VERTICAL);
+-    auto* layout_controller = HeliumLayoutStateController::From(browser());
+-    if (layout_controller && layout_controller->IsVerticalLayout()) {
+-      browser_layout_menu_contents_->AddSeparator(ui::NORMAL_SEPARATOR);
+-      browser_layout_menu_contents_->AddCheckItemWithStringId(
+-          IDC_BROWSER_LAYOUT_VERTICAL_RIGHT, IDS_BROWSER_LAYOUT_VERTICAL_RIGHT);
+-    }
+-
+-    model->AddSubMenuWithStringId(IDC_BROWSER_LAYOUT_MENU,
+-                                  IDS_BROWSER_LAYOUT_MENU,
+-                                  browser_layout_menu_contents_.get());
++    // rac: the browser layout is locked to vertical, so instead of Helium's
++    // layout submenu there is one item for the side the tabs sit on.
++    model->AddCheckItemWithStringId(IDC_BROWSER_LAYOUT_VERTICAL_RIGHT,
++                                    IDS_BROWSER_LAYOUT_VERTICAL_RIGHT);
+ 
+     model->AddItemWithStringId(IDC_SHOW_CUSTOMIZE_CHROME_SIDE_PANEL,
+                                IDS_SHOW_CUSTOMIZE_CHROME_SIDE_PANEL);
+--- a/chrome/browser/ui/bookmarks/bookmark_context_menu_controller.cc
++++ b/chrome/browser/ui/bookmarks/bookmark_context_menu_controller.cc
+@@ -343,10 +343,9 @@ void BookmarkContextMenuController::Buil
+       AddCheckboxItem(IDC_BOOKMARK_BAR_SHOW_APPS_SHORTCUT,
+                       IDS_BOOKMARK_BAR_SHOW_APPS_SHORTCUT);
+     }
+-    if (tab_groups::SavedTabGroupUtils::IsEnabledForProfile(profile_)) {
+-      AddCheckboxItem(IDC_BOOKMARK_BAR_TOGGLE_SHOW_TAB_GROUPS,
+-                      IDS_BOOKMARK_BAR_SHOW_TAB_GROUPS);
+-    }
++    // rac: no "Show tab groups" item; rac locks bookmark_bar.show_tab_groups
++    // off. Hidden with autoPinNewTabGroups; if either comes back, combine
++    // them into one setting.
+     AddCheckboxItem(IDC_BOOKMARK_BAR_SHOW_MANAGED_BOOKMARKS,
+                     IDS_BOOKMARK_BAR_SHOW_MANAGED_BOOKMARKS_DEFAULT_NAME);
+     AddCheckboxItem(IDC_BOOKMARK_BAR_ALWAYS_SHOW, IDS_SHOW_BOOKMARK_BAR);
+@@ -872,11 +871,7 @@ void BookmarkContextMenuController::AddS
+         IDC_BOOKMARK_BAR_SHOW_APPS_SHORTCUT,
+         IDS_BOOKMARK_BAR_SHOW_APPS_SHORTCUT);
+   }
+-  if (tab_groups::SavedTabGroupUtils::IsEnabledForProfile(profile_)) {
+-    submenu_model_->AddCheckItemWithStringId(
+-        IDC_BOOKMARK_BAR_TOGGLE_SHOW_TAB_GROUPS,
+-        IDS_BOOKMARK_BAR_SHOW_TAB_GROUPS);
+-  }
++  // rac: no "Show tab groups" item, as in AddExtraItems().
+   submenu_model_->AddCheckItemWithStringId(
+       IDC_BOOKMARK_BAR_SHOW_MANAGED_BOOKMARKS,
+       IDS_BOOKMARK_BAR_SHOW_MANAGED_BOOKMARKS_DEFAULT_NAME);
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -1896,9 +1896,11 @@ void BrowserCommandController::InitComma
+ 
+   // Helium layout menu
+   command_updater_->UpdateCommandEnabled(IDC_BROWSER_LAYOUT_MENU, true);
+-  command_updater_->UpdateCommandEnabled(IDC_BROWSER_LAYOUT_CLASSIC, true);
+-  command_updater_->UpdateCommandEnabled(IDC_BROWSER_LAYOUT_DYNAMIC, true);
+-  command_updater_->UpdateCommandEnabled(IDC_BROWSER_LAYOUT_COMPACT, true);
++  // rac: the browser layout is locked to vertical, so the other layouts
++  // can't be chosen.
++  command_updater_->UpdateCommandEnabled(IDC_BROWSER_LAYOUT_CLASSIC, false);
++  command_updater_->UpdateCommandEnabled(IDC_BROWSER_LAYOUT_DYNAMIC, false);
++  command_updater_->UpdateCommandEnabled(IDC_BROWSER_LAYOUT_COMPACT, false);
+   command_updater_->UpdateCommandEnabled(IDC_BROWSER_LAYOUT_VERTICAL, true);
+   command_updater_->UpdateCommandEnabled(IDC_BROWSER_LAYOUT_VERTICAL_RIGHT,
+                                          true);
+@@ -1927,7 +1929,8 @@ void BrowserCommandController::InitComma
+   UpdateTabRestoreCommandState();
+   command_updater_->UpdateCommandEnabled(IDC_EXIT, true);
+   command_updater_->UpdateCommandEnabled(IDC_NAME_WINDOW, true);
+-  command_updater_->UpdateCommandEnabled(IDC_TOGGLE_VERTICAL_TABS, true);
++  // rac: tabs are always vertical, so switching to horizontal tabs is off.
++  command_updater_->UpdateCommandEnabled(IDC_TOGGLE_VERTICAL_TABS, false);
+   command_updater_->UpdateCommandEnabled(IDC_VERTICAL_TABS_SEND_FEEDBACK, true);
+   command_updater_->UpdateCommandEnabled(
+       IDC_TOGGLE_VERTICAL_TABS_EXPAND_ON_HOVER, true);
+--- a/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
++++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
+@@ -55,6 +55,13 @@ bool ShouldHideBrowserShortcutCommand(in
+     case IDC_CONTENT_CONTEXT_REDO:
+     case IDC_CONTENT_CONTEXT_SELECTALL:
+     case IDC_CONTENT_CONTEXT_UNDO:
++    // rac: the layout is locked to vertical and frameless mode always shows
++    // the top bar, so these commands do nothing and can't be bound.
++    case IDC_BROWSER_LAYOUT_CLASSIC:
++    case IDC_BROWSER_LAYOUT_COMPACT:
++    case IDC_BROWSER_LAYOUT_DYNAMIC:
++    case IDC_BROWSER_LAYOUT_VERTICAL:
++    case IDC_TOGGLE_ZEN_MODE_TOP_CHROME_PIN:
+       return true;
+     default:
+       return false;
