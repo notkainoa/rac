@@ -703,16 +703,34 @@
  }  // namespace rac::agent
 --- a/chrome/browser/rac/ai/acp/acp_service.cc
 +++ b/chrome/browser/rac/ai/acp/acp_service.cc
-@@ -120,6 +120,8 @@ struct AcpService::Run {
+@@ -12,6 +12,7 @@
+ #include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
++#include "base/strings/string_util.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/task_traits.h"
+ #include "base/task/thread_pool.h"
+@@ -120,6 +121,18 @@ struct AcpService::Run {
    UpdateCallback on_update;
    AgentEventCallback on_agent_event;
    DoneCallback done;
 +  // A newer run replaced this one: the browser stopped it on purpose.
 +  bool superseded = false;
++  // The agent said the turn failed (Codex: a "systemError" thread status).
++  // The text after that is its error message, not a reply.
++  bool agent_failed = false;
++  std::string failure_text;
++  // Codex's own notices ("Warning: ...") come as text with no message id.
++  // They wait for the reply, and go if the turn fails.
++  std::string held_text;
++  std::string last_message_id;
++  // The reply so far ends a paragraph (or is empty).
++  bool at_paragraph = true;
  };
  
  struct AcpService::Session {
-@@ -228,6 +230,7 @@ AcpService::RunId AcpService::Prompt(
+@@ -228,6 +241,7 @@ AcpService::RunId AcpService::Prompt(
      AgentEventCallback on_agent_event,
      DoneCallback done) {
    if (run_) {
@@ -720,7 +738,7 @@
      EndRun(run_->id, kSupersededError);
    }
    auto run = std::make_unique<Run>();
-@@ -275,6 +278,7 @@ void AcpService::EndRun(RunId id, std::s
+@@ -275,6 +289,7 @@ void AcpService::EndRun(RunId id, std::s
      if (!error.empty()) {
        update.error = error;
      }
@@ -728,9 +746,115 @@
      run->on_update.Run(std::move(update));
    }
    if (run->done) {
+@@ -556,9 +571,36 @@ void AcpService::OnSessionStarted(RunId
+     EndRun(id, std::move(error));
+     return;
+   }
+-  session->client->Prompt(
+-      std::move(run_->text),
+-      base::BindOnce(&AcpService::EndRun, weak_factory_.GetWeakPtr(), id));
++  session->client->Prompt(std::move(run_->text),
++                          base::BindOnce(&AcpService::OnPromptDone,
++                                         weak_factory_.GetWeakPtr(), id));
++}
++
++void AcpService::OnPromptDone(RunId id, std::string error) {
++  if (!IsCurrent(id)) {
++    return;
++  }
++  if (error.empty() && run_->agent_failed) {
++    error = std::string(
++        base::TrimWhitespaceASCII(run_->failure_text, base::TRIM_ALL));
++    if (error.empty()) {
++      error = "The agent reported an error.";
++    }
++  }
++  if (error.empty() && !run_->held_text.empty()) {
++    SendText(*run_, std::exchange(run_->held_text, std::string()));
++  }
++  EndRun(id, std::move(error));
++}
++
++void AcpService::SendText(Run& run, std::string text) {
++  if (text.empty()) {
++    return;
++  }
++  run.at_paragraph = text.ends_with("\n\n");
++  if (run.on_update) {
++    run.on_update.Run(StreamUpdate{.text_delta = std::move(text)});
++  }
+ }
+ 
+ void AcpService::OnTransportMessage(RunId id, base::DictValue message) {
+@@ -583,12 +625,42 @@ void AcpService::OnClientUpdate(RunId id
+   if (!kind) {
+     return;
+   }
++  if (*kind == "session_info_update") {
++    const std::string* status =
++        update.FindStringByDottedPath("_meta.codex.threadStatus.type");
++    if (status && *status == "systemError") {
++      run_->agent_failed = true;
++    }
++  }
+   if (*kind == "agent_message_chunk") {
+     const base::DictValue* content = update.FindDict("content");
+     const std::string* text = content ? content->FindString("text") : nullptr;
+-    if (text && run_->on_update) {
+-      run_->on_update.Run(StreamUpdate{.text_delta = *text});
++    if (!text || text->empty()) {
++      return;
++    }
++    if (run_->agent_failed) {
++      run_->failure_text += *text;
++      return;
++    }
++    const std::string* message_id = update.FindString("messageId");
++    const bool has_id = message_id && !message_id->empty();
++    if (!has_id && run_->agent_id == "codex") {
++      run_->held_text += *text;
++      return;
++    }
++    std::string out = std::exchange(run_->held_text, std::string());
++    // A new message starts a new paragraph, so two of the agent's messages
++    // don't run together ("...changes.You've hit...").
++    if (has_id) {
++      if (!run_->last_message_id.empty() &&
++          *message_id != run_->last_message_id && out.empty() &&
++          !run_->at_paragraph) {
++        out = "\n\n";
++      }
++      run_->last_message_id = *message_id;
+     }
++    out += *text;
++    SendText(*run_, std::move(out));
+     return;
+   }
+   if (run_->on_agent_event) {
 --- a/chrome/browser/rac/ai/acp/acp_service_unittest.cc
 +++ b/chrome/browser/rac/ai/acp/acp_service_unittest.cc
-@@ -86,6 +86,8 @@ struct Result {
+@@ -21,6 +21,7 @@
+ #include "base/files/scoped_temp_dir.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/posix/eintr_wrapper.h"
+ #include "base/run_loop.h"
+@@ -52,10 +53,11 @@ while IFS= read -r line; do
+     *'"method":"session/new"'*)
+       echo '{"id":2,"jsonrpc":"2.0","result":{"sessionId":"s1"}}' ;;
+     *'"method":"session/prompt"'*)
++      if [ -f "$log/reply" ]; then cat "$log/reply"; else
+       printf '%s%s%s\n' '{"jsonrpc":"2.0","method":"session/update",' \
+         '"params":{"sessionId":"s1","update":{"content":{"text":"hi",' \
+         '"type":"text"},"sessionUpdate":"agent_message_chunk"}}}'
+-      echo '{"id":3,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}' ;;
++      echo '{"id":3,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}'; fi ;;
+   esac
+ done
+ )";
+@@ -86,6 +88,8 @@ struct Result {
    bool finished = false;
    std::string error;
    std::string text;
@@ -739,7 +863,7 @@
  };
  
  class AcpServiceTest : public testing::Test {
-@@ -120,6 +122,7 @@ class AcpServiceTest : public testing::T
+@@ -120,6 +124,7 @@ class AcpServiceTest : public testing::T
          "custom", std::move(text), std::move(tools),
          base::BindLambdaForTesting([result](StreamUpdate update) {
            result->text += update.text_delta;
@@ -747,7 +871,7 @@
          }),
          base::DoNothing(),
          base::BindOnce(
-@@ -171,6 +174,7 @@ TEST_F(AcpServiceTest, StopDuringLaunchS
+@@ -171,6 +176,7 @@ TEST_F(AcpServiceTest, StopDuringLaunchS
    service_->Stop(run);
    EXPECT_TRUE(result.finished);
    EXPECT_EQ(result.error, "Cancelled");
@@ -755,7 +879,7 @@
    // Let every launch stage that was already posted run out.
    for (int i = 0; i < 50; ++i) {
      env_.RunUntilIdle();
-@@ -191,8 +195,11 @@ TEST_F(AcpServiceTest, NewerRunEndsTheLa
+@@ -191,8 +197,11 @@ TEST_F(AcpServiceTest, NewerRunEndsTheLa
    Prompt("second prompt", &second, nullptr, loop.QuitClosure());
    EXPECT_TRUE(first.finished);
    EXPECT_EQ(first.error, AcpService::kSupersededError);
@@ -767,6 +891,69 @@
    EXPECT_EQ(second.text, "hi");
    EXPECT_EQ(first.text, "");
    const std::string in = ReadLog("in");
+@@ -214,6 +223,62 @@ TEST_F(AcpServiceTest, StopOfAnOlderRunI
+   EXPECT_EQ(second.error, "");
+ }
+ 
++// The fake agent answers the next prompt with these lines.
++std::string Chunk(std::string_view text, std::string_view message_id) {
++  base::DictValue update;
++  update.Set("sessionUpdate", "agent_message_chunk");
++  update.Set("content",
++             base::DictValue().Set("type", "text").Set("text", text));
++  if (!message_id.empty()) {
++    update.Set("messageId", message_id);
++  }
++  return *base::WriteJson(
++             base::DictValue()
++                 .Set("jsonrpc", "2.0")
++                 .Set("method", "session/update")
++                 .Set("params", base::DictValue()
++                                    .Set("sessionId", "s1")
++                                    .Set("update", std::move(update)))) +
++         "\n";
++}
++
++constexpr char kEndTurn[] =
++    R"({"id":3,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}})"
++    "\n";
++
++// Codex reports a failed turn as a "systemError" thread status, then sends
++// its error as ordinary text and ends the turn normally. That is an error,
++// with the agent's own words, not a reply that ends "Done".
++TEST_F(AcpServiceTest, AgentReportedFailureIsAnError) {
++  ASSERT_TRUE(base::WriteFile(
++      log_.AppendASCII("reply"),
++      Chunk("Looking.", "m1") +
++          R"({"jsonrpc":"2.0","method":"session/update","params":{)"
++          R"("sessionId":"s1","update":{"sessionUpdate":"session_info_update",)"
++          R"("_meta":{"codex":{"threadStatus":{"type":"systemError"}}}}}})"
++          "\n" +
++          Chunk("The 'x' model is not supported.\n\n", "") + kEndTurn));
++  Result result;
++  base::RunLoop loop;
++  Prompt("hello agent", &result, nullptr, loop.QuitClosure());
++  loop.Run();
++  EXPECT_EQ(result.text, "Looking.");
++  EXPECT_EQ(result.error, "The 'x' model is not supported.");
++}
++
++// Two of the agent's messages are two paragraphs, not one run-on line.
++TEST_F(AcpServiceTest, SeparateMessagesStaySeparate) {
++  ASSERT_TRUE(base::WriteFile(log_.AppendASCII("reply"),
++                              Chunk("One", "m1") + Chunk(" more.", "m1") +
++                                  Chunk("Two.", "m2") + kEndTurn));
++  Result result;
++  base::RunLoop loop;
++  Prompt("hello agent", &result, nullptr, loop.QuitClosure());
++  loop.Run();
++  EXPECT_EQ(result.error, "");
++  EXPECT_EQ(result.text, "One more.\n\nTwo.");
++}
++
+ // When a run ends, its MCP server stops listening, its agent exits, and its
+ // tools are deleted. Nothing can reach a provider after its run.
+ TEST_F(AcpServiceTest, RunEndTakesTheServerAgentAndToolsWithIt) {
 --- a/chrome/browser/rac/ai/chat_protocol.h
 +++ b/chrome/browser/rac/ai/chat_protocol.h
 @@ -89,6 +89,9 @@ struct StreamUpdate {
@@ -1154,10 +1341,28 @@
    ASSERT_TRUE(temp.CreateUniqueTempDir());
 --- a/chrome/browser/rac/ai/acp/acp_client.cc
 +++ b/chrome/browser/rac/ai/acp/acp_client.cc
-@@ -33,6 +33,11 @@ void MergeTool(base::DictValue& target,
+@@ -33,8 +33,50 @@ void MergeTool(base::DictValue& target,
    }
  }
  
++// What a turn that ended on its own, without an error, still has to tell
++// the user. ACP's other stop reasons mean the reply is cut short or missing.
++std::string StopReasonError(const std::string& reason) {
++  if (reason == "refusal") {
++    return "The agent declined to answer.";
++  }
++  if (reason == "max_tokens") {
++    return "The reply reached the agent's length limit.";
++  }
++  if (reason == "max_turn_requests") {
++    return "The agent stopped after too many steps.";
++  }
++  if (reason == "cancelled") {
++    return "The agent stopped the reply.";
++  }
++  return "";
++}
++
 +bool IsAnswer(const std::string& kind) {
 +  return kind == "agent_message_chunk" || kind == "agent_thought_chunk" ||
 +         kind == "tool_call" || kind == "tool_call_update" || kind == "plan";
@@ -1165,8 +1370,29 @@
 +
  }  // namespace
  
++std::string AcpErrorMessage(const base::DictValue& error) {
++  constexpr std::string_view kInternal = "Internal error";
++  const std::string* text = error.FindString("message");
++  std::string message = text ? *text : "";
++  const base::DictValue* data = error.FindDict("data");
++  const std::string* data_text = data ? data->FindString("message") : nullptr;
++  if (!data_text) {
++    data_text = error.FindString("data");
++  }
++  if ((message.empty() || message == kInternal) && data_text &&
++      !base::TrimWhitespaceASCII(*data_text, base::TRIM_ALL).empty()) {
++    message = *data_text;
++  } else if (message.starts_with(std::string(kInternal) + ": ")) {
++    message = message.substr(kInternal.size() + 2);
++  }
++  message = std::string(base::TrimWhitespaceASCII(message, base::TRIM_ALL));
++  return message.empty() ? "The agent reported an error." : message;
++}
++
  bool AcpFramer::Feed(std::string_view bytes,
-@@ -167,6 +172,10 @@ void AcpClient::Prompt(std::string text,
+                      std::vector<base::DictValue>& frames) {
+   if (failed_) {
+@@ -167,6 +209,10 @@ void AcpClient::Prompt(std::string text,
    done_ = std::move(done);
    state_ = State::kPrompting;
    ArmDeadline(base::Minutes(10));
@@ -1177,7 +1403,7 @@
    Send(Request::kPrompt, "session/prompt",
         base::DictValue()
             .Set("sessionId", session_id_)
-@@ -254,6 +263,9 @@ void AcpClient::Receive(base::DictValue
+@@ -254,6 +300,9 @@ void AcpClient::Receive(base::DictValue
    if (*session != session_id_ || state_ == State::kCancelling) {
      return;
    }
@@ -1187,7 +1413,7 @@
    if (*kind == "tool_call" || *kind == "tool_call_update") {
      const std::string* tool_id = update->FindString("toolCallId");
      if (!tool_id || tool_id->empty()) {
-@@ -271,6 +283,9 @@ void AcpClient::Receive(base::DictValue
+@@ -271,10 +320,12 @@ void AcpClient::Receive(base::DictValue
  }
  
  void AcpClient::OnResponse(Request request, const base::DictValue& message) {
@@ -1196,8 +1422,31 @@
 +  }
    const base::DictValue* error = message.FindDict("error");
    if (error) {
-     const std::string* text = error->FindString("message");
-@@ -328,7 +343,12 @@ void AcpClient::OnResponse(Request reque
+-    const std::string* text = error->FindString("message");
+-    std::string reason = text ? *text : "The agent reported an error.";
++    std::string reason = AcpErrorMessage(*error);
+     if (request == Request::kNew && error->FindInt("code") == -32000) {
+       state_ = State::kNeedsAuth;
+       deadline_.Stop();
+@@ -315,20 +366,27 @@ void AcpClient::OnResponse(Request reque
+       }
+       break;
+     }
+-    case Request::kPrompt:
+-      if (!result->FindString("stopReason")) {
++    case Request::kPrompt: {
++      const std::string* stop_reason = result->FindString("stopReason");
++      if (!stop_reason) {
+         Fail("Invalid agent prompt result.");
+         return;
+       }
+       state_ = State::kReady;
+       deadline_.Stop();
+       CancelPermissions();
+-      FinishTurn("");
++      FinishTurn(StopReasonError(*stop_reason));
+       break;
++    }
    }
  }
  
@@ -1210,7 +1459,7 @@
    const base::DictValue* tool = params.FindDict("toolCall");
    const std::string* tool_id = tool ? tool->FindString("toolCallId") : nullptr;
    const base::ListValue* options = params.FindList("options");
-@@ -423,6 +443,7 @@ void AcpClient::Cancel() {
+@@ -423,6 +481,7 @@ void AcpClient::Cancel() {
      return;
    }
    state_ = State::kCancelling;
@@ -1218,7 +1467,7 @@
    Notify("session/cancel", base::DictValue().Set("sessionId", session_id_));
    CancelPermissions();
    ArmDeadline(base::Seconds(3));
-@@ -439,6 +460,7 @@ void AcpClient::TearDown(State next, std
+@@ -439,6 +498,7 @@ void AcpClient::TearDown(State next, std
    CancelPermissions();
    state_ = next;
    deadline_.Stop();
@@ -1236,7 +1485,7 @@
  #include "base/timer/timer.h"
  #include "base/values.h"
  
-@@ -18,6 +19,12 @@ namespace rac::ai {
+@@ -18,6 +19,16 @@ namespace rac::ai {
  
  inline constexpr size_t kAcpMaxFrameBytes = 8 * 1024 * 1024;
  
@@ -1246,10 +1495,14 @@
 +inline constexpr char kAcpNoAnswerError[] =
 +    "The agent started but never answered.";
 +
++// The agent's own error text: the message, or for a bare "Internal error"
++// the message in its data. Without the "Internal error: " prefix.
++std::string AcpErrorMessage(const base::DictValue& error);
++
  // Fatal on any malformed frame, including an incomplete final line.
  class AcpFramer {
   public:
-@@ -84,6 +91,7 @@ class AcpClient {
+@@ -84,6 +95,7 @@ class AcpClient {
    void CancelPermissions();
    void Notify(std::string method, base::DictValue params);
    void ArmDeadline(base::TimeDelta timeout);
@@ -1257,7 +1510,7 @@
    void FinishTurn(std::string error);
    void TearDown(State next, std::string error, bool send_cancel);
  
-@@ -111,6 +119,7 @@ class AcpClient {
+@@ -111,6 +123,7 @@ class AcpClient {
    Completion ready_;
    Completion done_;
    base::OneShotTimer deadline_;
@@ -1275,10 +1528,60 @@
  #include "base/json/json_reader.h"
  #include "base/test/bind.h"
  #include "base/test/task_environment.h"
-@@ -243,6 +244,55 @@ TEST_F(AcpClientTest, PermissionPolicyCa
+@@ -243,6 +244,105 @@ TEST_F(AcpClientTest, PermissionPolicyCa
        "allow-once");
  }
  
++class AcpClientTurnTest : public AcpClientTest {
++ public:
++  // Starts a session and sends one prompt; `error_` gets the turn's result.
++  void StartTurn() {
++    client_->Start(base::DictValue().Set("cwd", "/tmp"),
++                   base::BindLambdaForTesting([](std::string) {}));
++    Deliver(R"({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}})");
++    Deliver(R"({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}})");
++    client_->Prompt("hi", base::BindLambdaForTesting([&](std::string error) {
++                      error_ = std::move(error);
++                      ++turns_;
++                    }));
++  }
++
++  std::string error_ = "unset";
++  int turns_ = 0;
++};
++
++TEST_F(AcpClientTurnTest, PromptErrorUsesTheAgentsOwnMessage) {
++  StartTurn();
++  // Codex: a bare "Internal error" with the real text in its data.
++  Deliver(R"({"jsonrpc":"2.0","id":3,"error":{"code":-32603,
++      "message":"Internal error","data":{"message":"You've hit your usage limit.",
++      "codexErrorInfo":"usageLimitExceeded"}}})");
++  EXPECT_EQ(turns_, 1);
++  EXPECT_EQ(error_, "You've hit your usage limit.");
++}
++
++TEST_F(AcpClientTurnTest, PromptErrorDropsTheInternalErrorPrefix) {
++  StartTurn();
++  // OpenCode puts the text in the message itself.
++  Deliver(R"({"jsonrpc":"2.0","id":3,"error":{"code":-32603,
++      "message":"Internal error: OpenCode's free tier can only be used from within OpenCode.",
++      "data":{"service":"session"}}})");
++  EXPECT_EQ(error_,
++            "OpenCode's free tier can only be used from within OpenCode.");
++}
++
++TEST_F(AcpClientTurnTest, StopReasonsOtherThanEndTurnAreErrors) {
++  StartTurn();
++  Deliver(R"({"jsonrpc":"2.0","id":3,"result":{"stopReason":"refusal"}})");
++  EXPECT_EQ(turns_, 1);
++  EXPECT_FALSE(error_.empty());
++  client_->Prompt("again", base::BindLambdaForTesting([&](std::string error) {
++                    error_ = std::move(error);
++                  }));
++  Deliver(R"({"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}})");
++  EXPECT_TRUE(error_.empty());
++}
++
 +TEST(AcpClientTimeoutTest, SilentAgentFailsAfterTheFirstAnswerTimeout) {
 +  base::test::TaskEnvironment env(
 +      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
@@ -1331,3 +1634,14 @@
  TEST(AgentPathTest, ParsesLoginShellMarkers) {
    const std::string out =
        "banner\nRAC_PATH_abc_BEGIN\n/opt/homebrew/bin:/usr/bin\n"
+--- a/chrome/browser/rac/ai/acp/acp_service.h
++++ b/chrome/browser/rac/ai/acp/acp_service.h
+@@ -100,6 +100,8 @@ class AcpService {
+   void OnMcpServerStarted(RunId run, PreparedLaunch prepared, bool ok);
+   void FinishContinueLaunch(RunId run, PreparedLaunch prepared);
+   void OnSessionStarted(RunId run, std::string error);
++  void OnPromptDone(RunId run, std::string error);
++  void SendText(Run& run, std::string text);
+   void OnTransportMessage(RunId run, base::DictValue message);
+   void OnTransportClosed(RunId run, std::string error);
+   void OnClientUpdate(RunId run, base::DictValue update);

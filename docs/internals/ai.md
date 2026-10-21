@@ -241,6 +241,15 @@ tool provider. Every message therefore starts the agent again; there is no
 idle agent between messages. A prompt that gets no word, thought, or tool
 call in 90 seconds ends with "didn't answer" (`kAcpFirstAnswerTimeout`).
 
+Agents report failures in different ways, and each is shown as an error with
+the agent's own words, never as a reply that ends "Done": an error response
+(a bare "Internal error" takes the text from its `data`), a stop reason
+other than `end_turn`, and Codex's `session_info_update` with a
+`systemError` thread status, after which its text is the error. Codex also
+sends its own notices as text with no message id; those wait for the reply
+and are dropped if the turn fails. Text from two different message ids is
+two paragraphs.
+
 - **The run owns its tools.** The page hands `Prompt` the run's
   `AgentMcpTools`. Nothing else keeps a pointer to them, and the MCP server
   is stopped before they are deleted. A provider owned by the page once
