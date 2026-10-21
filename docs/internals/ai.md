@@ -65,18 +65,23 @@ source of browser tool calls, but it is never asked to judge its own
 actions.
 
 The model menu asks each set-up provider for its model list when the menu
-opens: OpenAI-compatible servers `GET {base}/models`, Anthropic
+opens, and Settings asks only while the Assistant page itself is open (a
+settings search renders the section too, and must not send the key):
+OpenAI-compatible servers `GET {base}/models`, Anthropic
 `GET {base}/v1/models`, always with the key, which stays in the browser
 process. The result is filtered to chat models, capped, cached per profile
-for a few minutes, and the saved model is always in the list, so a
-provider that can't be reached never leaves the menu empty.
+and server address for a few minutes (a failed fetch is never cached), and
+the saved model is always in the list, so a provider that can't be reached
+never leaves the menu empty.
 
 Base URLs are normalized (`NormalizeBaseUrl`) when saved and again when
 read, so an address pasted with its request path, like
 `https://openrouter.ai/api/v1/chat/completions`, works anyway; rac adds
 `/chat/completions` (or `/v1/messages`) itself. Saving provider settings
 also runs a connection check (`CheckProviderConnection`): `GET {base}/models`
-first, and, for servers with no model list, a one-token chat request, so
+first (`GET {base}/key` for OpenRouter, whose model list is public and would
+pass with any key), and, for servers with no model list, a one-token chat
+request, so
 the user learns the address or key is wrong in Settings, not from a failed
 chat. A model that rejects the browser tools makes the provider's error
 clear, so the chat retries once without them and says so; a model that
@@ -95,8 +100,16 @@ Things APC can't tell you, which the serializer works around or accepts:
 
 - **Hidden text is filtered after the fact.** `display:none`,
   `visibility:hidden`, `aria-hidden`, content-hidden subtrees, transparent
-  text color, and tiny rendered boxes are dropped. `opacity:0` text is not
-  exposed, so it stays in. Don't describe the filter as complete.
+  text color, tiny rendered boxes, and boxes pushed off the left edge are
+  dropped. `opacity:0` text is not exposed, so it stays in, and so does text
+  pushed above the page, because the boxes are viewport-relative. Don't
+  describe the filter as complete.
+- **The visible box is clipped to the viewport.** An empty one only means
+  "not on screen now", so it orders text (on-screen first) and never hides
+  it. Hiding on it once sent chat and link summaries one screen of a long
+  page, and made a short first screen look like a login wall.
+- **The agent's names use the same rules,** except for empty boxes, so
+  offscreen elements keep their refs.
 - **Heading levels are approximated** from font size. H2 and H3 look the
   same.
 - **A block bigger than the page budget (8192 tokens) is dropped, not
@@ -115,7 +128,10 @@ second copy.
 ### Link summaries
 
 Hold Option over a link for 500 ms, or use "Summarize Link" in the context
-menu. The page is fetched in a hidden tab in a throwaway off-the-record
+menu. Only the pointer counts: Blink also reports keyboard- and
+script-focused links as the link target, so the hover path needs a recent
+mouse move or scroll, more recent than any key, and rac in front.
+Turning AI off stops a running summary and forgets the cached ones. The page is fetched in a hidden tab in a throwaway off-the-record
 profile created for that one fetch, with cookies blocked, JavaScript, images,
 and plugins off, and downloads denied. This is what keeps a summary from
 using the user's logins: a link to a private page gets the login wall, and
@@ -360,7 +376,8 @@ only from the card.
 action before `ActionRunner::Run`. `Dispatch` evaluates it again for blocks
 just before running.
 
-**Block** (nothing overrides it): an unknown tool, a download, a URL that
+**Block** (nothing overrides it): an unknown tool, closing a tab the user
+opened, a download, a URL that
 isn't http(s), or a URL that did not come from a user message or a link in a
 snapshot the model was shown. The URL match is exact. `chrome:`, `file:`,
 `data:`, `javascript:`, and extension URLs are never allowed.
@@ -375,7 +392,8 @@ was allowed:
 - a target the guard can't classify (a generic click target, a text box with
   no known purpose, a select), because the critic has no page text to judge
   it
-- closing a tab the user opened
+- typing text that isn't in the user's messages, in any field, since the
+  critic never sees the text
 - any origin outside the ones the plan allowed
 
 **Plan.** The first action of a turn shows a plan card with the next step
@@ -398,6 +416,11 @@ and after the user answers. A mismatch gives `stale_ref` and the action does
 not happen. Typing that would need Chromium's paste fallback fails instead,
 because that path runs page events with nothing re-checked in between.
 
+The re-read after an answer carries "this was approved" as an argument of
+that one read, and Stop, a new tool call, and a new turn clear every piece
+of approval state. A member flag that survived Stop once let a later click
+on the same ref skip both the plan card and the confirmation.
+
 ### Containment
 
 While an agent action is live, its tab carries an `ActionContext`. Small
@@ -408,6 +431,19 @@ approved URL, method, and target frame. Popups, downloads, and file pickers
 are refused.
 
 The traps here:
+
+- **The exact binding is for the first request only.** By the time a
+  redirect arrives, the approved request has reached the server: a form's
+  POST has already placed the order. So a redirect is checked by site (an
+  approved origin, or the same site as one), which lets http-to-https,
+  `www.`, trailing slashes, and Post/Redirect/Get through. A redirect to
+  another site is still refused, and after a POST the model is told the
+  form was sent. Checking redirects against the exact URL and method once
+  cancelled every such result page after the action had happened.
+- **The agent's own `go_back` is not the user's.** History navigations
+  from the browser look like a user pressing Back, so `TabTools::GoBack`
+  marks its navigation, and the back target's origin goes on the card and
+  into containment.
 
 - **Stopping the agent does not lift containment.** A click can schedule a
   timer or a delayed download. Pause, Stop, the end of a turn, and turning AI
@@ -479,8 +515,8 @@ exactly one parser.
   error), and `summary`. A `confirm_request` carries a `risk` (for example
   `sensitive_field`, `purchase`, `submit`, `cross_origin`, `critic`) and, when
   the critic held the step, its note. A `summary` counts `steps`,
-  `confirmed`, and `failed`. A turn with failures and no successful action
-  ends in `error` ("Couldn't finish"), so the footer never says "Done" when
+  `confirmed`, and `failed`. A turn whose actions all failed ends in
+  `error` ("Couldn't finish"), so the footer never says "Done" when
   nothing worked.
 - Labels, tab titles, origins, errors, and critic notes come from pages or
   the model. Render them as plain text only.
@@ -520,7 +556,9 @@ detach is posted.
 - `--rac-agent-mcp-echo` serves the `rac_echo` tool. Run `nc -U` against
   the socket in the profile to check the protocol by hand.
 - Direct providers: point the Custom provider at any local
-  OpenAI-compatible server. `http://localhost` is allowed. For the agent
+  OpenAI-compatible server. `http://localhost` is allowed (other `http`
+  hosts, including LAN addresses, are not). Custom always asks for a key;
+  any value works for a server that ignores it. For the agent
   loop the server must stream tool calls. For link summaries and the critic
   it only needs plain replies.
 - ACP: pick "Custom ACP command" and give an absolute path to a script that
