@@ -1,0 +1,250 @@
+--- a/chrome/browser/resources/rac_ai/agent_cards.ts
++++ b/chrome/browser/resources/rac_ai/agent_cards.ts
+@@ -28,6 +28,7 @@ export interface CardContext {
+ const MAX_OPEN_ROWS = 3;
+ const MAX_SITE_CHIPS = 6;
+ const MAX_TAB_TITLE = 32;
++const CONFIRM_ARM_MS = 300;
+ const INFO_ICON = 'M10 3.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zM10 9v4.5' +
+     'M10 6.5v.01';
+ 
+@@ -219,15 +220,22 @@ function buildConfirmCard(
+       makeButton(str('skip'), () => ctx.respond(confirm.id, 'skip')),
+       makeButton(str('stop'), () => ctx.respond(confirm.id, 'stop')));
+   card.appendChild(actions);
++  // The card arrives while the thread moves. A click meant for whatever was
++  // under the pointer a moment ago must not land on Confirm.
++  actions.inert = true;
++  setTimeout(() => actions.inert = false, CONFIRM_ARM_MS);
+ 
+   enter(card);
+   ctx.announce(str('announceConfirm', confirm.title), true);
+-  // The card takes focus, but Confirm never does: nothing here is a default.
+-  requestAnimationFrame(() => {
+-    if (card.isConnected && task.confirm?.id === confirm.id) {
+-      card.focus({preventScroll: true});
+-    }
+-  });
++  // The card takes focus unless the user is typing, but Confirm never does:
++  // nothing here is a default.
++  if (ctx.mayTakeFocus()) {
++    requestAnimationFrame(() => {
++      if (card.isConnected && task.confirm?.id === confirm.id) {
++        card.focus({preventScroll: true});
++      }
++    });
++  }
+   return card;
+ }
+ 
+--- a/chrome/browser/resources/rac_ai/app.css
++++ b/chrome/browser/resources/rac_ai/app.css
+@@ -508,6 +508,11 @@ body[data-theme='neutral'] .orb {
+   animation: orb-pulse 1.4s ease-in-out infinite;
+ }
+ 
++/* A reply that waits on a card or a pause could wait for hours. */
++.item-assistant[data-asking] .loader .orb {
++  animation: none;
++}
++
+ @keyframes orb-pulse {
+   50% {
+     filter: brightness(1.12);
+@@ -1503,7 +1508,8 @@ body[data-mode='panel'] .composer-wrap {
+ }
+ 
+ .agent-note {
+-  color: var(--text-faint);
++  /* The one line that says what the plan doesn't cover. */
++  color: var(--text-muted);
+   font-size: 12px;
+   margin-top: 10px;
+ }
+@@ -1579,7 +1585,7 @@ body[data-mode='panel'] .composer-wrap {
+ }
+ 
+ .task-footer {
+-  color: var(--text-faint);
++  color: var(--text-muted);
+   font-size: 12px;
+ }
+ 
+--- a/chrome/browser/resources/rac_ai/app.ts
++++ b/chrome/browser/resources/rac_ai/app.ts
+@@ -1217,6 +1217,26 @@ function endRun(message: Message) {
+ }
+ 
+ const SECRET_KEY = /pass(word|wd)?|secret|token|api[-_]?key/i;
++// What the browser's type and select_option tools put in a field. Cards never
++// show typed text, so the agent's step details don't either.
++const TYPED_KEY = /^(text|value)$/;
++const MASK = '\u2022\u2022\u2022\u2022';
++
++function isHidden(key: string): boolean {
++  return SECRET_KEY.test(key) || TYPED_KEY.test(key);
++}
++
++function maskInput(value: unknown): unknown {
++  if (!value || typeof value !== 'object' || Array.isArray(value)) {
++    return value;
++  }
++  // One level down: Codex wraps the tool's arguments in an envelope.
++  const masked: Record<string, unknown> = {};
++  for (const [key, inner] of Object.entries(value)) {
++    masked[key] = isHidden(key) ? MASK : inner;
++  }
++  return masked;
++}
+ 
+ function plainValue(value: unknown): string {
+   const text = typeof value === 'string' ? value : JSON.stringify(value);
+@@ -1260,12 +1280,10 @@ function applyToolFields(step: Step, upd
+     step.details =
+         Object.entries(input as Record<string, unknown>)
+             .slice(0, 8)
+-            .map(
+-                ([key, value]) =>
+-                    [key,
+-                     SECRET_KEY.test(key) ? '\u2022\u2022\u2022\u2022' :
+-                                            plainValue(value),
+-    ]);
++            .map(([key, value]): [string, string] => [
++              key,
++              isHidden(key) ? MASK : plainValue(maskInput(value)),
++            ]);
+   }
+   const output = outputText(update['content']);
+   if (output) {
+@@ -1402,6 +1420,12 @@ function settleTask(message: Message) {
+ 
+ // The one place that reads the browser's agent events.
+ function onAgentEvent(raw: unknown) {
++  // Events from a reply this page has moved past (New chat, Stop) would
++  // otherwise start a ghost reply.
++  const sendId = (raw as {sendId?: unknown} | null)?.sendId;
++  if (typeof sendId === 'number' && sendId !== activeId) {
++    return;
++  }
+   const event = parseAgentEvent(raw);
+   if (!event) {
+     return;
+@@ -1943,6 +1967,12 @@ function renderAssistantMessage(message:
+   element.dataset['state'] = generating && !started ? 'waiting' :
+       generating                                    ? 'streaming' :
+                                                       'done';
++  // Nothing moves while the reply waits for the user.
++  element.toggleAttribute(
++      'data-asking',
++      !!task && isActive(task) &&
++          (task.state === 'waiting' || task.state === 'paused' ||
++           task.plan?.status === 'pending' || !!task.confirm));
+   if (message.activityEl) {
+     const activity = message.activityEl;
+     const text = activityHolder(message)?.shown ?? '';
+@@ -2482,11 +2512,12 @@ function init() {
+     }
+   });
+   // Return alone never allows anything; the plan card's own shortcut is
+-  // ⌘Return, whichever control has focus.
++  // ⌘Return, unless the user is typing a message, where it means send.
+   document.addEventListener('keydown', (event: KeyboardEvent) => {
+     const plan = pendingCardId();
++    const typing = document.activeElement === input && input.value !== '';
+     if (event.key === 'Enter' && event.metaKey && !event.isComposing &&
+-        plan?.kind === 'plan') {
++        plan?.kind === 'plan' && !typing) {
+       event.preventDefault();
+       event.stopPropagation();
+       respondToAgent(plan.id, 'allow');
+--- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
++++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+@@ -51,7 +51,6 @@
+ #include "components/omnibox/browser/autocomplete_classifier.h"
+ #include "components/omnibox/browser/autocomplete_match.h"
+ #include "components/prefs/pref_service.h"
+-#include "components/prefs/scoped_user_pref_update.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/render_frame_host.h"
+@@ -247,16 +246,11 @@ void PageHandler::RegisterMessages() {
+   web_ui()->RegisterMessageCallback(
+       "racAiSelectAgent", base::BindRepeating(&PageHandler::HandleSelectAgent,
+                                               base::Unretained(this)));
+-  web_ui()->RegisterMessageCallback(
+-      "racAiSetAgentPath", base::BindRepeating(&PageHandler::HandleSetAgentPath,
++  if (agent::IsAgentDebugEnabled()) {
++    web_ui()->RegisterMessageCallback(
++        "racAiAgentDebug", base::BindRepeating(&PageHandler::HandleAgentDebug,
+                                                base::Unretained(this)));
+-  web_ui()->RegisterMessageCallback(
+-      "racAiSetCustomAgentCommand",
+-      base::BindRepeating(&PageHandler::HandleSetCustomAgentCommand,
+-                          base::Unretained(this)));
+-  web_ui()->RegisterMessageCallback(
+-      "racAiAgentDebug", base::BindRepeating(&PageHandler::HandleAgentDebug,
+-                                             base::Unretained(this)));
++  }
+   web_ui()->RegisterMessageCallback(
+       "racAiMakeTitle", base::BindRepeating(&PageHandler::HandleMakeTitle,
+                                             base::Unretained(this)));
+@@ -895,35 +889,6 @@ void PageHandler::HandleSelectAgent(cons
+   profile_->GetPrefs()->SetString(kAgentId, id);
+ }
+ 
+-void PageHandler::HandleSetAgentPath(const base::ListValue& args) {
+-  CHECK_EQ(args.size(), 2u);
+-  AllowJavascript();
+-  const std::string id = args[0].GetString();
+-  const std::string path = args[1].GetString();
+-  if (!FindAgentRecipe(id)) {
+-    return;
+-  }
+-  if (!path.empty() && path[0] != '/') {
+-    return;
+-  }
+-  ScopedDictPrefUpdate update(profile_->GetPrefs(), kAgentPaths);
+-  if (path.empty()) {
+-    update->Remove(id);
+-  } else {
+-    update->Set(id, path);
+-  }
+-}
+-
+-void PageHandler::HandleSetCustomAgentCommand(const base::ListValue& args) {
+-  CHECK_EQ(args.size(), 1u);
+-  AllowJavascript();
+-  const std::string command = args[0].GetString();
+-  if (!command.empty() && command[0] != '/') {
+-    return;
+-  }
+-  profile_->GetPrefs()->SetString(kAgentCustomCommand, command);
+-}
+-
+ void PageHandler::HandleStop(const base::ListValue& args) {
+   StopSession();
+ }
+@@ -1021,7 +986,11 @@ void PageHandler::OnAgentTaskEvent(const
+                        },
+                        weak_factory_.GetWeakPtr(), agent_turn_send_id_));
+   }
+-  FireWebUIListener("racAiAgentEvent", event);
++  // The page drops events for a reply it has moved past, such as the
++  // "Stopped" that follows New chat.
++  base::DictValue tagged = event.Clone();
++  tagged.Set("sendId", agent_turn_send_id_);
++  FireWebUIListener("racAiAgentEvent", tagged);
+ }
+ 
+ void PageHandler::FinishStoppedTurn(int send_id) {
+--- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
++++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+@@ -107,8 +107,6 @@ class PageHandler : public content::WebU
+   void HandleListAgents(const base::ListValue& args);
+   void HandleAgentDebug(const base::ListValue& args);
+   void HandleSelectAgent(const base::ListValue& args);
+-  void HandleSetAgentPath(const base::ListValue& args);
+-  void HandleSetCustomAgentCommand(const base::ListValue& args);
+   void HandleMakeTitle(const base::ListValue& args);
+   void HandleShowMenu(const base::ListValue& args);
+   void HandleCloseMenu(const base::ListValue& args);
