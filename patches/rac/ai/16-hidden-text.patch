@@ -1,7 +1,5 @@
-Index: src/chrome/browser/rac/ai/page_text.cc
-===================================================================
---- src.orig/chrome/browser/rac/ai/page_text.cc
-+++ src/chrome/browser/rac/ai/page_text.cc
+--- a/chrome/browser/rac/ai/page_text.cc
++++ b/chrome/browser/rac/ai/page_text.cc
 @@ -30,13 +30,18 @@ std::string Clean(std::string_view text)
    return base::CollapseWhitespaceASCII(repaired, false);
  }
@@ -50,7 +48,7 @@ Index: src/chrome/browser/rac/ai/page_text.cc
      return;
    }
    if (node.content_attributes().has_iframe_data()) {
-@@ -251,6 +256,57 @@ void FrameSelections(const proto::Conten
+@@ -251,6 +256,56 @@ void FrameSelections(const proto::Conten
  }
  }  // namespace
  
@@ -69,20 +67,19 @@ Index: src/chrome/browser/rac/ai/page_text.cc
 +  }
 +  if (a.has_geometry()) {
 +    const auto& geometry = a.geometry();
-+    if (geometry.has_visible_bounding_box()) {
-+      const auto& box = geometry.visible_bounding_box();
-+      if (box.width() <= 0 || box.height() <= 0) {
-+        return true;
-+      }
-+    }
++    // The visible box is clipped to the viewport, so an empty one only means
++    // "not on screen now". Content below the fold or scrolled past is kept;
++    // the outer box is what tells a hidden element apart.
 +    if (geometry.has_outer_bounding_box()) {
 +      const auto& box = geometry.outer_bounding_box();
 +      if (box.width() <= 0 || box.height() <= 0) {
 +        return true;
 +      }
-+      // Scale-independent checks; APC's viewport size uses a different scale.
-+      if (static_cast<int64_t>(box.x()) + box.width() <= 0 ||
-+          static_cast<int64_t>(box.y()) + box.height() <= 0) {
++      // Pages scroll vertically, so only content pushed off the left edge,
++      // where nobody can scroll to it, is the off-screen hiding trick. The
++      // outer box is viewport-relative, so a negative y is ordinary content
++      // above the current scroll position.
++      if (static_cast<int64_t>(box.x()) + box.width() <= 0) {
 +        return true;
 +      }
 +      // XS alone also describes legible footnotes. Suppress it only when the
@@ -108,10 +105,34 @@ Index: src/chrome/browser/rac/ai/page_text.cc
  std::string HashPageText(std::string_view title,
                           std::string_view url,
                           std::string_view text) {
-Index: src/chrome/browser/rac/ai/page_text.h
-===================================================================
---- src.orig/chrome/browser/rac/ai/page_text.h
-+++ src/chrome/browser/rac/ai/page_text.h
+@@ -272,9 +327,25 @@ PageText SerializePageContent(const prot
+                         [](const Block& block) { return block.visible; });
+   const size_t budget =
+       std::min(max_tokens, std::numeric_limits<size_t>::max() / 4) * 4;
++  // An overflowing block is cut to what's left, then the page stops. Cutting
++  // only when enough room is left keeps a stub from ending the text, and a
++  // first block (a huge selection or <pre>) never empties the attachment.
++  constexpr size_t kMinTruncatedBlock = 256;
+   for (const auto& block : blocks) {
+     const size_t separator = result.text.empty() ? 0 : 2;
+     if (separator + block.text.size() > budget - result.text.size()) {
++      const size_t room = budget - result.text.size();
++      if (room > separator &&
++          (result.text.empty() || room - separator >= kMinTruncatedBlock)) {
++        std::string cut;
++        base::TruncateUTF8ToByteSize(block.text, room - separator, &cut);
++        if (!cut.empty()) {
++          if (separator) {
++            result.text += "\n\n";
++          }
++          result.text += cut;
++        }
++      }
+       break;
+     }
+     if (separator) {
+--- a/chrome/browser/rac/ai/page_text.h
++++ b/chrome/browser/rac/ai/page_text.h
 @@ -10,7 +10,8 @@
  
  namespace optimization_guide::proto {
@@ -133,11 +154,35 @@ Index: src/chrome/browser/rac/ai/page_text.h
  // Selection, then visible blocks, then remaining blocks in document order.
  // Missing geometry is unknown, never evidence that a node is hidden.
  PageText SerializePageContent(
-Index: src/chrome/browser/rac/ai/page_text_unittest.cc
-===================================================================
---- src.orig/chrome/browser/rac/ai/page_text_unittest.cc
-+++ src/chrome/browser/rac/ai/page_text_unittest.cc
-@@ -205,4 +205,134 @@ TEST(RacAiPageTextTest, Utf8IsRepairedAn
+--- a/chrome/browser/rac/ai/page_text_unittest.cc
++++ b/chrome/browser/rac/ai/page_text_unittest.cc
+@@ -182,6 +182,25 @@ TEST(RacAiPageTextTest, BudgetStopsAtBlo
+   EXPECT_TRUE(SerializePageContent(page, 0).text.empty());
+ }
+ 
++TEST(RacAiPageTextTest, OversizedFirstBlockIsCutNotDropped) {
++  proto::AnnotatedPageContent page;
++  page.mutable_main_frame_data()
++      ->mutable_frame_interaction_info()
++      ->mutable_selection()
++      ->set_selected_text(std::string(1000, 'a'));
++  Paragraph(page.mutable_root_node(), "After.");
++  const auto result = SerializePageContent(page, 25);
++  EXPECT_EQ(result.text.size(), 100u);
++  EXPECT_TRUE(result.text.starts_with("Selection: aaa"));
++  // A huge block later in the page is cut too when enough room is left.
++  proto::AnnotatedPageContent later;
++  Paragraph(later.mutable_root_node(), "Intro.");
++  Paragraph(later.mutable_root_node(), std::string(5000, 'b'));
++  const auto cut = SerializePageContent(later, 500);
++  EXPECT_EQ(cut.text.size(), 2000u);
++  EXPECT_TRUE(cut.text.starts_with("Intro.\n\nbbb"));
++}
++
+ TEST(RacAiPageTextTest, HashIgnoresIdsButIncludesContentAndSource) {
+   proto::AnnotatedPageContent page;
+   page.mutable_main_frame_data()->set_title("Title");
+@@ -205,4 +224,143 @@ TEST(RacAiPageTextTest, Utf8IsRepairedAn
    Text(page.mutable_root_node(), std::string("bad\xFF"));
    EXPECT_TRUE(base::IsStringUTF8(SerializePageContent(page).text));
  }
@@ -163,29 +208,29 @@ Index: src/chrome/browser/rac/ai/page_text_unittest.cc
 +}
 +
 +TEST(RacAiPageTextTest, EmptyGeometrySuppressesEvenVisibleChildren) {
-+  for (const bool outer : {true, false}) {
-+    proto::AnnotatedPageContent page;
-+    auto* container =
-+        Node(page.mutable_root_node(), proto::CONTENT_ATTRIBUTE_CONTAINER);
-+    auto* geometry =
-+        container->mutable_content_attributes()->mutable_geometry();
-+    auto* box = outer ? geometry->mutable_outer_bounding_box()
-+                      : geometry->mutable_visible_bounding_box();
-+    box->set_width(0);
-+    box->set_height(20);
-+    Visible(Paragraph(container, "Hidden child"));
-+    EXPECT_TRUE(SerializePageContent(page).text.empty());
-+    box->set_width(20);
-+    box->set_height(0);
-+    EXPECT_TRUE(IsPageNodeHidden(*container));
-+  }
++  proto::AnnotatedPageContent page;
++  auto* container =
++      Node(page.mutable_root_node(), proto::CONTENT_ATTRIBUTE_CONTAINER);
++  auto* box = container->mutable_content_attributes()
++                  ->mutable_geometry()
++                  ->mutable_outer_bounding_box();
++  box->set_width(0);
++  box->set_height(20);
++  Visible(Paragraph(container, "Hidden child"));
++  EXPECT_TRUE(SerializePageContent(page).text.empty());
++  box->set_width(20);
++  box->set_height(0);
++  EXPECT_TRUE(IsPageNodeHidden(*container));
 +}
 +
-+TEST(RacAiPageTextTest, OffscreenAndFullyClippedContentIsDropped) {
++TEST(RacAiPageTextTest, ContentOutsideTheViewportIsKept) {
++  // Actionable APC clips the visible box to the viewport, so a long article
++  // has empty visible boxes below the fold and above the scroll position.
 +  proto::AnnotatedPageContent page;
 +  auto* root = page.mutable_root_node();
 +  for (const int position : {-200, 20000}) {
-+    auto* offscreen = Paragraph(root, "Offscreen");
++    auto* offscreen =
++        Paragraph(root, position < 0 ? "Scrolled past" : "Below the fold");
 +    auto* geometry =
 +        offscreen->mutable_content_attributes()->mutable_geometry();
 +    auto* outer = geometry->mutable_outer_bounding_box();
@@ -193,8 +238,16 @@ Index: src/chrome/browser/rac/ai/page_text_unittest.cc
 +    outer->set_width(100);
 +    outer->set_height(20);
 +    geometry->mutable_visible_bounding_box();
-+    EXPECT_TRUE(IsPageNodeHidden(*offscreen));
++    EXPECT_FALSE(IsPageNodeHidden(*offscreen));
 +  }
++  const std::string text = SerializePageContent(page).text;
++  EXPECT_NE(text.find("Scrolled past"), std::string::npos);
++  EXPECT_NE(text.find("Below the fold"), std::string::npos);
++}
++
++TEST(RacAiPageTextTest, ContentPushedOffTheLeftEdgeIsDropped) {
++  proto::AnnotatedPageContent page;
++  auto* root = page.mutable_root_node();
 +  auto* partially = Paragraph(root, "Partially visible");
 +  auto* geometry = partially->mutable_content_attributes()->mutable_geometry();
 +  auto* outer = geometry->mutable_outer_bounding_box();
@@ -207,6 +260,7 @@ Index: src/chrome/browser/rac/ai/page_text_unittest.cc
 +  outer->set_x(-100);
 +  geometry->clear_visible_bounding_box();
 +  EXPECT_TRUE(IsPageNodeHidden(*partially));
++  EXPECT_TRUE(SerializePageContent(page).text.empty());
 +}
 +
 +TEST(RacAiPageTextTest, TinyTextNeedsGeometrySoLegibleFootnotesRemain) {
