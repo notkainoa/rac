@@ -219,9 +219,7 @@ idle agent between messages.
   exit all carry the run id and do nothing once it is not the current run.
   Stop during a launch therefore sends nothing, not even the page text in
   the prompt.
-- **A page stops only its own run.** `Stop(run)` ignores an older id. One
-  run per profile: a send from another assistant page ends the current run
-  with "Stopped because another assistant page started a task."
+- **A page stops only its own run.** `Stop(run)` ignores an older id.
 
 ### Permission rule
 
@@ -295,10 +293,14 @@ opens tabs. It runs in two ways, with the same tools and the same gates.
 Both enter the same `AgentController`. There is one active turn per
 profile, owned by the assistant page that sent it (`SetAgentRunOwner`).
 Only the owner shows the turn's cards and marks its tab, and only the owner
-stops it, so closing a new tab page can't stop the sidebar's task. A page
-that starts a turn ends the current one first, while its page still owns
-it, so that page hears it stop. A closing page stops its run before it
-stops listening; the ring and pill are taken down by that page's handler.
+stops it, so closing a new tab page can't stop the sidebar's task. With
+browser control on, every send starts a turn, so a send from another page,
+even a plain question on the new tab page, ends the running task. The page
+that loses it says "Stopped because another assistant page started a
+task.", whether either side is an ACP agent or a direct provider:
+`ClaimAgentTurn` marks the handoff in the hub and cancels the old turn while
+its page still owns it. A closing page stops its run before it stops
+listening; the ring and pill are taken down by that page's handler.
 
 ### Who may act
 
@@ -522,8 +524,10 @@ detach is posted.
   loop the server must stream tool calls. For link summaries and the critic
   it only needs plain replies.
 - ACP: pick "Custom ACP command" and give an absolute path to a script that
-  speaks ACP v1 on stdio. Quote a path with spaces (`"/My Tools/agent"
-  --acp`). `AcpServiceTest` has a small one in shell. rac's own mock
+  speaks ACP v1 on stdio. Quote a path with spaces (`'/My Tools/agent'
+  --acp`). Single quotes, double quotes, and backslashes work as in a
+  shell, except that a backslash escapes any character inside double
+  quotes; there is no other shell syntax. `AcpServiceTest` has a small one in shell. rac's own mock
   servers are not in the repo.
 - Unit tests: `rac_ai_unittests` and `rac_agent_unittests`. Run only those,
   not Chromium's suites.

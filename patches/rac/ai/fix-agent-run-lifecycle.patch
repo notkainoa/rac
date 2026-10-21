@@ -8,16 +8,17 @@
  #include <memory>
  #include <string>
  #include <utility>
-@@ -30,6 +31,8 @@ class Hub : public base::SupportsUserDat
+@@ -30,6 +31,9 @@ class Hub : public base::SupportsUserDat
    }
  
    raw_ptr<AgentUiDelegate> delegate;
 +  // An address that is compared, never followed.
 +  uintptr_t run_owner = 0;
++  bool run_handoff = false;
    base::RepeatingCallbackList<void(const base::DictValue&)> callbacks;
    base::RepeatingCallbackList<
        void(content::WebContents*, AgentTabStatus, const std::u16string&)>
-@@ -45,6 +48,17 @@ void SetAgentUiDelegate(content::Browser
+@@ -45,6 +49,28 @@ void SetAgentUiDelegate(content::Browser
    }
  }
  
@@ -32,12 +33,23 @@
 +  return hub ? reinterpret_cast<const void*>(hub->run_owner) : nullptr;
 +}
 +
++void SetAgentRunHandoff(content::BrowserContext* context, bool handoff) {
++  if (Hub* hub = Hub::Get(context, /*create=*/false)) {
++    hub->run_handoff = handoff;
++  }
++}
++
++bool IsAgentRunHandoff(content::BrowserContext* context) {
++  Hub* hub = Hub::Get(context, /*create=*/false);
++  return hub && hub->run_handoff;
++}
++
  AgentUiDelegate* GetAgentUiDelegate(content::BrowserContext* context) {
    Hub* hub = Hub::Get(context, /*create=*/false);
    return hub ? hub->delegate.get() : nullptr;
 --- a/chrome/browser/rac/agent/agent_ui_delegate.h
 +++ b/chrome/browser/rac/agent/agent_ui_delegate.h
-@@ -35,6 +35,12 @@ class AgentUiDelegate {
+@@ -35,6 +35,17 @@ class AgentUiDelegate {
    virtual void Resume() = 0;
  };
  
@@ -46,6 +58,11 @@
 +// stops it. `owner` is only ever compared, never used.
 +void SetAgentRunOwner(content::BrowserContext* context, const void* owner);
 +const void* GetAgentRunOwner(content::BrowserContext* context);
++
++// True while another page is taking the turn over, so the owner can say why
++// its turn stopped.
++void SetAgentRunHandoff(content::BrowserContext* context, bool handoff);
++bool IsAgentRunHandoff(content::BrowserContext* context);
 +
  // The delegate for `context`, or null. The caller keeps ownership and clears
  // it (passing null) before it goes away.
@@ -60,17 +77,17 @@
      "acp/agent_path_unittest.cc",
      "acp/agent_recipes_unittest.cc",
      "acp/agent_settings_unittest.cc",
-@@ -147,6 +148,7 @@ test("rac_ai_unittests") {
-     ":core",
+@@ -148,6 +149,7 @@ test("rac_ai_unittests") {
      "//base",
      "//base/test:run_all_unittests",
-+    "//chrome/browser/rac/agent:mcp",
      "//base/test:test_support",
++    "//chrome/browser/rac/agent:mcp",
      "//components/prefs:test_support",
      "//testing/gtest",
+     "//ui/gfx:test_support",
 --- a/chrome/browser/rac/ai/acp/acp_client.cc
 +++ b/chrome/browser/rac/ai/acp/acp_client.cc
-@@ -153,38 +153,11 @@ void AcpClient::CreateSession() {
+@@ -157,38 +157,11 @@ void AcpClient::CreateSession() {
    Send(Request::kNew, "session/new", session_params_.Clone());
  }
  
@@ -109,7 +126,7 @@
    tools_.clear();
    tool_bytes_ = 0;
    done_ = std::move(done);
-@@ -323,9 +296,6 @@ void AcpClient::OnResponse(Request reque
+@@ -327,9 +300,6 @@ void AcpClient::OnResponse(Request reque
        initialize_result_ = result->Clone();
        CreateSession();
        break;
@@ -119,7 +136,7 @@
      case Request::kNew: {
        const std::string* session = result->FindString("sessionId");
        if (!session || session->empty()) {
-@@ -336,7 +306,6 @@ void AcpClient::OnResponse(Request reque
+@@ -340,7 +310,6 @@ void AcpClient::OnResponse(Request reque
        session_info_ = result->Clone();
        state_ = State::kReady;
        deadline_.Stop();
@@ -127,7 +144,7 @@
        if (ready_) {
          std::move(ready_).Run("");
        }
-@@ -350,7 +319,6 @@ void AcpClient::OnResponse(Request reque
+@@ -354,7 +323,6 @@ void AcpClient::OnResponse(Request reque
        state_ = State::kReady;
        deadline_.Stop();
        CancelPermissions();
@@ -135,7 +152,7 @@
        FinishTurn("");
        break;
    }
-@@ -467,7 +435,6 @@ void AcpClient::TearDown(State next, std
+@@ -471,7 +439,6 @@ void AcpClient::TearDown(State next, std
    CancelPermissions();
    state_ = next;
    deadline_.Stop();
@@ -1068,7 +1085,7 @@
    AcpService(PrefService* prefs, base::FilePath profile_path);
    AcpService(const AcpService&) = delete;
    AcpService& operator=(const AcpService&) = delete;
-@@ -47,86 +58,67 @@ class AcpService {
+@@ -47,86 +58,70 @@ class AcpService {
    // Like ListAgents, but looks for the programs on the login shell PATH again.
    void RefreshAgents(AgentListCallback done);
  
@@ -1106,6 +1123,9 @@
 +  // before the prompt is sent, and the agent and MCP server stop. Does
 +  // nothing for an older run, so a page can only stop its own.
 +  void Stop(RunId run);
++
++  // Whether `run` is the current run and hasn't ended.
++  bool IsRunning(RunId run) const { return IsCurrent(run); }
 +
 +  void SetSearchPathForTesting(std::string search_path) {
 +    path_cache_.SetForTesting(std::move(search_path));
@@ -1199,7 +1219,7 @@
  };
 --- /dev/null
 +++ b/chrome/browser/rac/ai/acp/acp_service_unittest.cc
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,263 @@
 +// Copyright 2026 The rac Authors
 +// Use of this source code is governed by a GPL-3.0 license.
 +
@@ -1254,7 +1274,9 @@
 +    *'"method":"session/new"'*)
 +      echo '{"id":2,"jsonrpc":"2.0","result":{"sessionId":"s1"}}' ;;
 +    *'"method":"session/prompt"'*)
-+      echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"content":{"text":"hi","type":"text"},"sessionUpdate":"agent_message_chunk"}}}'
++      printf '%s%s%s\n' '{"jsonrpc":"2.0","method":"session/update",' \
++        '"params":{"sessionId":"s1","update":{"content":{"text":"hi",' \
++        '"type":"text"},"sessionUpdate":"agent_message_chunk"}}}'
 +      echo '{"id":3,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}' ;;
 +  esac
 +done
@@ -1430,7 +1452,8 @@
 +  const std::string in = ReadLog("in");
 +  for (std::string_view line : base::SplitStringPiece(
 +           in, "\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
-+    std::optional<base::Value> value = base::JSONReader::Read(line, base::JSON_PARSE_RFC);
++    std::optional<base::Value> value =
++        base::JSONReader::Read(line, base::JSON_PARSE_RFC);
 +    const base::DictValue* params = value && value->is_dict()
 +                                        ? value->GetDict().FindDict("params")
 +                                        : nullptr;
@@ -1462,7 +1485,11 @@
 +}  // namespace rac::ai
 --- a/chrome/browser/rac/ai/acp/agent_path.h
 +++ b/chrome/browser/rac/ai/acp/agent_path.h
-@@ -8,6 +8,7 @@
+@@ -4,10 +4,10 @@
+ #ifndef CHROME_BROWSER_RAC_AI_ACP_AGENT_PATH_H_
+ #define CHROME_BROWSER_RAC_AI_ACP_AGENT_PATH_H_
+ 
+-#include <map>
  #include <optional>
  #include <string>
  #include <string_view>
@@ -1470,19 +1497,29 @@
  #include <vector>
  
  #include "base/files/file_path.h"
-@@ -63,6 +64,12 @@ class AgentPathCache {
-   void SetOverride(std::string name, base::FilePath absolute_path);
-   base::FilePath Resolve(std::string_view name) const;
+@@ -59,9 +59,11 @@ class AgentPathCache {
+   // one probe and invokes `done` on the calling sequence.
+   void Ensure(ReadyCallback done);
  
+-  // Absolute override for one executable name, or empty to clear.
+-  void SetOverride(std::string name, base::FilePath absolute_path);
+-  base::FilePath Resolve(std::string_view name) const;
 +  // Uses `search_path` as if a probe had found it, so tests never run the
 +  // user's shell.
 +  void SetForTesting(std::string search_path) {
 +    search_path_ = std::move(search_path);
 +  }
-+
+ 
    // Forgets the cached path. Pending waiters stay queued and get the next
    // probe's answer; dropping them would leave their WebUI promises unsettled.
-   void Invalidate();
+@@ -76,7 +78,6 @@ class AgentPathCache {
+   // invalidation is discarded instead of clobbering the fresh probe.
+   uint64_t generation_ = 0;
+   std::vector<ReadyCallback> waiters_;
+-  std::map<std::string, base::FilePath> overrides_;
+   base::WeakPtrFactory<AgentPathCache> weak_factory_{this};
+ };
+ 
 --- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
 +++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
 @@ -166,10 +166,7 @@ struct PageHandler::ModelQuery {
@@ -1507,7 +1544,7 @@
    CloseMenu();
    model_loader_.reset();
    title_session_.reset();
-@@ -289,17 +289,19 @@ void PageHandler::OnJavascriptDisallowed
+@@ -289,17 +289,22 @@ void PageHandler::OnJavascriptDisallowed
    agent_event_subscription_ = base::CallbackListSubscription();
    agent_tab_subscription_ = base::CallbackListSubscription();
    tab_observer_.reset();
@@ -1516,8 +1553,11 @@
 +
 +void PageHandler::ClaimAgentTurn(rac::agent::AgentController* controller) {
 +  // Ends the current turn while its page still owns it, so that page hears
-+  // it stop and the new turn's events reach only this page.
++  // it stop, and why, and the new turn's events reach only this page.
++  const void* owner = agent::GetAgentRunOwner(profile_);
++  agent::SetAgentRunHandoff(profile_, owner && owner != this);
 +  controller->Cancel();
++  agent::SetAgentRunHandoff(profile_, false);
 +  agent::SetAgentRunOwner(profile_, this);
  }
  
@@ -1534,7 +1574,7 @@
    agent_controller_.reset();
    agent_turn_send_id_ = 0;
  }
-@@ -311,12 +313,15 @@ void PageHandler::StopSession() {
+@@ -311,12 +316,15 @@ void PageHandler::StopSession() {
      agent_controller_->Cancel();
    }
    ClearAgentToolTurn();
@@ -1555,7 +1595,7 @@
    }
    active_send_id_ = 0;
  }
-@@ -670,6 +675,7 @@ void PageHandler::StartSession(std::uniq
+@@ -670,6 +678,7 @@ void PageHandler::StartSession(std::uniq
          user_messages.push_back(message.text);
        }
      }
@@ -1563,7 +1603,7 @@
      controller->BeginTurn(browser, conversation_id_,
                            send->request.messages.back().text, user_messages,
                            attached);
-@@ -726,10 +732,12 @@ void PageHandler::StartSession(std::uniq
+@@ -726,10 +735,12 @@ void PageHandler::StartSession(std::uniq
    session_->Start();
  }
  
@@ -1578,7 +1618,7 @@
    }
    std::vector<content::WebContents*> attached;
    BrowserWindowInterface* browser = GetBrowser();
-@@ -749,26 +757,15 @@ void PageHandler::BeginAgentToolTurn(con
+@@ -749,26 +760,15 @@ void PageHandler::BeginAgentToolTurn(con
    const std::string goal = send.request.messages.empty()
                                 ? std::string()
                                 : send.request.messages.back().text;
@@ -1610,7 +1650,7 @@
  }
  
  void PageHandler::StartAgentSession(std::unique_ptr<PendingSend> send,
-@@ -795,25 +792,27 @@ void PageHandler::StartAgentSession(std:
+@@ -795,25 +795,30 @@ void PageHandler::StartAgentSession(std:
      prompt.append(message.text);
    }
    const int send_id = send->send_id;
@@ -1618,34 +1658,49 @@
 -  service->acp_service()->Prompt(
 -      agent_id, std::move(prompt),
 -      base::BindRepeating(&PageHandler::OnUpdate, weak_factory_.GetWeakPtr(),
-+  std::unique_ptr<rac::agent::McpToolProvider> tools =
-+      BeginAgentToolTurn(*send, send_id);
-+  acp_run_id_ = service->acp_service()->Prompt(
-+      agent_id, std::move(prompt), std::move(tools),
-+      base::BindRepeating(&PageHandler::OnUpdate, run_factory_.GetWeakPtr(),
-+                          send_id),
-+      base::BindRepeating(&PageHandler::OnAgentEvent, run_factory_.GetWeakPtr(),
-                           send_id),
+-                          send_id),
 -      base::BindRepeating(&PageHandler::OnAgentEvent,
 -                          weak_factory_.GetWeakPtr(), send_id),
-       base::BindOnce(
-           [](base::WeakPtr<PageHandler> handler, int send_id,
-              std::string error) {
-             if (!handler || handler->active_send_id_ != send_id) {
-               return;
-             }
-+            handler->acp_run_id_ = 0;
-             if (handler->agent_controller_) {
-               handler->agent_controller_->EndTurn(std::move(error));
-             }
-             handler->ClearAgentToolTurn();
-           },
+-      base::BindOnce(
+-          [](base::WeakPtr<PageHandler> handler, int send_id,
+-             std::string error) {
+-            if (!handler || handler->active_send_id_ != send_id) {
+-              return;
+-            }
+-            if (handler->agent_controller_) {
+-              handler->agent_controller_->EndTurn(std::move(error));
+-            }
+-            handler->ClearAgentToolTurn();
+-          },
 -          weak_factory_.GetWeakPtr(), send_id));
-+          run_factory_.GetWeakPtr(), send_id));
++  std::unique_ptr<rac::agent::McpToolProvider> tools =
++      BeginAgentToolTurn(*send, send_id);
++  AcpService* acp = service->acp_service();
++  const AcpService::RunId run =
++      acp->Prompt(agent_id, std::move(prompt), std::move(tools),
++                  base::BindRepeating(&PageHandler::OnUpdate,
++                                      run_factory_.GetWeakPtr(), send_id),
++                  base::BindRepeating(&PageHandler::OnAgentEvent,
++                                      run_factory_.GetWeakPtr(), send_id),
++                  base::BindOnce(
++                      [](base::WeakPtr<PageHandler> handler, int send_id,
++                         std::string error) {
++                        if (!handler || handler->active_send_id_ != send_id) {
++                          return;
++                        }
++                        handler->acp_run_id_ = 0;
++                        if (handler->agent_controller_) {
++                          handler->agent_controller_->EndTurn(std::move(error));
++                        }
++                        handler->ClearAgentToolTurn();
++                      },
++                      run_factory_.GetWeakPtr(), send_id));
++  // A run can end before Prompt returns (AI off, an unknown agent).
++  acp_run_id_ = acp->IsRunning(run) ? run : 0;
  }
  
  void PageHandler::OnAgentEvent(int send_id, base::DictValue update) {
-@@ -1003,7 +1002,8 @@ void PageHandler::ApplyDebugIndicator(co
+@@ -1003,7 +1008,8 @@ void PageHandler::ApplyDebugIndicator(co
  void PageHandler::OnAgentTaskEvent(const base::DictValue& event) {
    // Only the reply that owns the turn shows the agent's work.
    if (!IsJavascriptAllowed() || agent_turn_send_id_ == 0 ||
@@ -1655,7 +1710,52 @@
      return;
    }
    const std::string* type = event.FindString("type");
-@@ -1043,7 +1043,7 @@ void PageHandler::OnAgentTab(content::We
+@@ -1011,27 +1017,39 @@ void PageHandler::OnAgentTaskEvent(const
+   if (type && *type == "run_state" && state && *state == "stopped") {
+     // The task was stopped from the card, the pill or the keyboard. End the
+     // model's side of it as well.
++    // Another page taking the turn over stops it too; say so.
++    std::string reason = agent::IsAgentRunHandoff(profile_)
++                             ? AcpService::kSupersededError
++                             : std::string();
+     base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+         FROM_HERE, base::BindOnce(
+-                       [](base::WeakPtr<PageHandler> handler, int send_id) {
++                       [](base::WeakPtr<PageHandler> handler, int send_id,
++                          std::string reason) {
+                          if (handler && handler->active_send_id_ == send_id) {
+                            handler->StopSession();
+-                           handler->FinishStoppedTurn(send_id);
++                           handler->FinishStoppedTurn(send_id,
++                                                      std::move(reason));
+                          }
+                        },
+-                       weak_factory_.GetWeakPtr(), agent_turn_send_id_));
++                       weak_factory_.GetWeakPtr(), agent_turn_send_id_,
++                       std::move(reason)));
+   }
+   FireWebUIListener("racAiAgentEvent", event);
+ }
+ 
+-void PageHandler::FinishStoppedTurn(int send_id) {
+-  if (!IsJavascriptAllowed()) {
++void PageHandler::FinishStoppedTurn(int send_id, std::string error) {
++  // An ACP run that a newer one replaced has already said so.
++  if (!IsJavascriptAllowed() || finished_send_id_ == send_id) {
+     return;
+   }
++  finished_send_id_ = send_id;
+   // The page is still waiting on the reply it started. Nothing else will
+   // finish it now that the session is gone.
+   base::DictValue update;
+   update.Set("id", send_id);
++  if (!error.empty()) {
++    update.Set("error", std::move(error));
++  }
+   update.Set("done", true);
+   FireWebUIListener("rac-ai-update", update);
+ }
+@@ -1043,7 +1061,7 @@ void PageHandler::OnAgentTab(content::We
      agent::AgentTabIndicator::Hide(contents);
      return;
    }
@@ -1664,6 +1764,16 @@
      return;
    }
    agent::AgentTabIndicator::Show(contents, title);
+@@ -1079,6 +1097,9 @@ void PageHandler::OnUpdate(int send_id,
+   if (update.done) {
+     event.Set("done", true);
+   }
++  if (update.done || update.error) {
++    finished_send_id_ = send_id;
++  }
+   FireWebUIListener("rac-ai-update", event);
+ }
+ 
 --- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
 +++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
 @@ -37,7 +37,7 @@ class TabInterface;
@@ -1675,7 +1785,18 @@
  }  // namespace rac::agent
  
  namespace rac::ai {
-@@ -151,14 +151,21 @@ class PageHandler : public content::WebU
+@@ -83,7 +83,9 @@ class PageHandler : public content::WebU
+   void HandleAgentDebugEvent(const base::ListValue& args);
+   void ApplyDebugIndicator(const base::DictValue& event);
+   void OnAgentTaskEvent(const base::DictValue& event);
+-  void FinishStoppedTurn(int send_id);
++  // Ends the page's reply `send_id` if nothing else has, with `error` when
++  // it isn't empty.
++  void FinishStoppedTurn(int send_id, std::string error);
+   void OnAgentTab(content::WebContents* contents,
+                   rac::agent::AgentTabStatus status,
+                   const std::u16string& title);
+@@ -151,14 +153,21 @@ class PageHandler : public content::WebU
    void StartSession(std::unique_ptr<PendingSend> send);
    void StartAgentSession(std::unique_ptr<PendingSend> send,
                           const std::string& agent_id);
@@ -1700,7 +1821,7 @@
    void StopSession();
  
    raw_ptr<Profile> profile_;
-@@ -166,8 +173,11 @@ class PageHandler : public content::WebU
+@@ -166,8 +175,13 @@ class PageHandler : public content::WebU
    PagePromptCache page_context_;
    std::string conversation_id_;
    std::unique_ptr<ChatSession> session_;
@@ -1708,12 +1829,14 @@
 +  // page begins invalidates it.
    base::WeakPtr<rac::agent::AgentController> agent_controller_;
 -  std::unique_ptr<rac::agent::AgentMcpTools> agent_mcp_tools_;
-+  // This page's ACP run, or 0.
++  // This page's live ACP run, or 0.
 +  int acp_run_id_ = 0;
++  // The last reply the page was told is over.
++  int finished_send_id_ = 0;
    std::unique_ptr<network::SimpleURLLoader> model_loader_;
    int active_send_id_ = 0;
    // The send that owns the running agent turn, or 0. Only that reply shows
-@@ -190,6 +200,8 @@ class PageHandler : public content::WebU
+@@ -190,6 +204,8 @@ class PageHandler : public content::WebU
    int menu_token_ = 0;
    base::WeakPtrFactory<PageHandler> menu_factory_{this};
    base::WeakPtrFactory<PageHandler> reading_factory_{this};
@@ -1722,3 +1845,94 @@
    base::WeakPtrFactory<PageHandler> weak_factory_{this};
  };
  
+--- a/chrome/browser/rac/agent/mcp_server.cc
++++ b/chrome/browser/rac/agent/mcp_server.cc
+@@ -410,11 +410,6 @@ McpServer::~McpServer() {
+   Stop();
+ }
+ 
+-void McpServer::SetApprovalCallback(ToolApprovalCallback approval) {
+-  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+-  approval_ = std::move(approval);
+-}
+-
+ void McpServer::ClearProvider() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   provider_ = nullptr;
+@@ -604,7 +599,8 @@ void McpServer::OnConnectionOpened(int c
+   ui_handlers_.emplace(
+       connection_id,
+       std::make_unique<McpConnectionHandler>(
+-          provider_, approval_,
++          // No approval hook: every call is authorized by the controller.
++          provider_, ToolApprovalCallback(),
+           base::BindRepeating(&McpServer::WriteToConnection,
+                               weak_factory_.GetWeakPtr(), connection_id)));
+ }
+@@ -673,8 +669,4 @@ base::DictValue McpServer::MakeAcpMcpSer
+       .Set("env", base::ListValue());
+ }
+ 
+-base::WeakPtr<McpServer> McpServer::GetWeakPtr() {
+-  return weak_factory_.GetWeakPtr();
+-}
+-
+ }  // namespace rac::agent
+--- a/chrome/browser/rac/agent/mcp_server.h
++++ b/chrome/browser/rac/agent/mcp_server.h
+@@ -41,7 +41,6 @@ class McpServer {
+   McpServer& operator=(const McpServer&) = delete;
+   ~McpServer();
+ 
+-  void SetApprovalCallback(ToolApprovalCallback approval);
+   // Tool calls get an error from now on. Safe to call from inside a call.
+   void ClearProvider();
+ 
+@@ -63,8 +62,6 @@ class McpServer {
+   base::DictValue MakeAcpMcpServerEntry() const;
+   static base::DictValue MakeAcpMcpServerEntry(const base::FilePath& socket);
+ 
+-  base::WeakPtr<McpServer> GetWeakPtr();
+-
+  private:
+   class IoState;
+ 
+@@ -87,7 +84,6 @@ class McpServer {
+   scoped_refptr<base::SequencedTaskRunner> io_runner_;
+   scoped_refptr<base::SequencedTaskRunner> ui_runner_;
+   raw_ptr<McpToolProvider> provider_;
+-  ToolApprovalCallback approval_;
+ 
+   base::FilePath socket_dir_;
+   base::FilePath socket_path_;
+--- a/chrome/browser/rac/ai/acp/agent_path.cc
++++ b/chrome/browser/rac/ai/acp/agent_path.cc
+@@ -407,28 +407,6 @@ void AgentPathCache::Invalidate() {
+   probing_ = false;
+ }
+ 
+-void AgentPathCache::SetOverride(std::string name,
+-                                 base::FilePath absolute_path) {
+-  if (name.empty()) {
+-    return;
+-  }
+-  if (absolute_path.empty()) {
+-    overrides_.erase(name);
+-    return;
+-  }
+-  overrides_[std::move(name)] = std::move(absolute_path);
+-}
+-
+-base::FilePath AgentPathCache::Resolve(std::string_view name) const {
+-  if (auto it = overrides_.find(std::string(name)); it != overrides_.end()) {
+-    return it->second;
+-  }
+-  if (search_path_.empty()) {
+-    return base::FilePath();
+-  }
+-  return FindExecutableOnPath(name, search_path_);
+-}
+-
+ void AgentPathCache::Ensure(ReadyCallback done) {
+   if (!search_path_.empty()) {
+     std::move(done).Run(search_path_, "");
