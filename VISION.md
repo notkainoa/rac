@@ -97,8 +97,7 @@ and improved continuously. Everyone else is welcome, especially:
 
 ### AI
 
-AI is a core part of where rac is going, but **how it works is not decided
-yet.** These points are settled:
+AI is a core part of where rac is going. These points hold:
 
 - AI is off by default. Onboarding asks whether you want it, and you can
   change your answer in settings at any time.
@@ -107,9 +106,9 @@ yet.** These points are settled:
   servers.
 - The AI never takes an action in your browser without your confirmation.
 
-Everything else, including providers, features, the agent, and safety
-checks, will be designed properly when it's built. Ideas collected so far
-are in [docs/internals/ai.md](docs/internals/ai.md).
+The AI comes from your own API key, a local model, or an agent you already
+use, such as Claude Code or Codex. How it works, including the agent and its
+safety checks, is in [docs/internals/ai.md](docs/internals/ai.md).
 
 ## What rac will never do
 
