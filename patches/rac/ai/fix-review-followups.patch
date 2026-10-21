@@ -866,3 +866,120 @@
    std::string message = ExtractErrorMessage(body);
    if (message.empty()) {
      switch (status) {
+--- a/chrome/browser/resources/rac_ai/agent_events.ts
++++ b/chrome/browser/resources/rac_ai/agent_events.ts
+@@ -19,6 +19,8 @@ export type AgentEvent = {
+   origin: string,
+   ok: boolean,
+   error: string,
++  // The browser stopped the task before this step did anything.
++  stopped: boolean,
+ }|{
+   type: 'plan_request',
+   id: string,
+@@ -91,6 +93,7 @@ export function parseAgentEvent(raw: unk
+         origin: text(event['origin']),
+         ok: event['ok'] !== false,
+         error: text(event['error']),
++        stopped: event['stopped'] === true,
+       } :
+                   null;
+     case 'plan_request':
+@@ -147,7 +150,8 @@ export interface TaskStep {
+   tool: string;
+   tabTitle: string;
+   host: string;
+-  status: 'running'|'done'|'failed';
++  // 'stopped': the task ended before the step did, so it never happened.
++  status: 'running'|'done'|'failed'|'stopped';
+   error: string;
+   confirmed: boolean;
+ }
+@@ -359,7 +363,15 @@ export function applyEvent(task: AgentTa
+       step.tabTitle = event.tabTitle || step.tabTitle;
+       step.host = hostOfOrigin(event.origin) || step.host;
+       if (event.type === 'step_finished') {
+-        step.status = event.ok ? 'done' : 'failed';
++        // A step that the end of the task cut short stays "not done", even
++        // when the browser reports it failed afterward.
++        if (event.ok) {
++          step.status = 'done';
++        } else if (event.stopped || step.status === 'stopped') {
++          step.status = 'stopped';
++        } else {
++          step.status = 'failed';
++        }
+         step.error = event.error;
+       }
+       if (task.state === 'waiting' || task.state === 'paused') {
+@@ -450,9 +462,11 @@ export function finish(task: AgentTask)
+     task.plan.status = 'stopped';
+   }
+   task.confirm = null;
++  // Only the browser's step_finished says a step happened. One still running
++  // now never finished: Stop at the plan card leaves the click undone.
+   for (const row of task.log) {
+     if (row.kind === 'step' && row.step.status === 'running') {
+-      row.step.status = task.state === 'error' ? 'failed' : 'done';
++      row.step.status = task.state === 'error' ? 'failed' : 'stopped';
+     }
+   }
+ }
+--- a/chrome/browser/resources/rac_ai/agent_cards.ts
++++ b/chrome/browser/resources/rac_ai/agent_cards.ts
+@@ -280,7 +280,11 @@ function stepLabel(step: TaskStep): Node
+     nodes.push(document.createTextNode(`${presentLabel(step.label)}\u2026`));
+     return nodes;
+   }
+-  const label = pastLabel(step.label) || str('toolFallback');
++  // A step that never happened keeps the browser's own wording ("Click
++  // “Sign in”"), not the past tense.
++  const label = (step.status === 'stopped' ? step.label.trim() :
++                                             pastLabel(step.label)) ||
++      str('toolFallback');
+   const parts = [label];
+   if (step.host && !label.includes(step.host)) {
+     parts.push(step.host);
+@@ -289,6 +293,9 @@ function stepLabel(step: TaskStep): Node
+   if (step.status === 'failed') {
+     nodes.push(make('span', 'step-failed', str('stepFailed')));
+   }
++  if (step.status === 'stopped') {
++    nodes.push(make('span', 'step-faint', str('stepNotDone')));
++  }
+   if (step.confirmed) {
+     nodes.push(make('span', 'step-faint', str('confirmedSuffix')));
+   }
+--- a/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
++++ b/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+@@ -102,6 +102,7 @@ constexpr Str kStrings[] = {
+     {"thoughtFor", "Thought for $1"},
+     {"thoughtShort", "Thought"},
+     {"stepFailed", " \u00b7 didn't work"},
++    {"stepNotDone", " \u00b7 not done"},
+     {"planLabel", "Plan"},
+     {"agentsHeading", "Agents"},
+     {"modelsLater", "Models load after the first message."},
+--- a/chrome/browser/rac/agent/agent_controller.cc
++++ b/chrome/browser/rac/agent/agent_controller.cc
+@@ -1073,12 +1073,18 @@ void AgentController::Cancel() {
+   EndPauses();
+   if (was_active && done_) {
+     ++failed_;
+-    Emit(StepEvent(
++    auto event = StepEvent(
+         true, step_id_, pending_.name, Label(), TargetAlias(),
+         TargetTab() ? base::UTF16ToUTF8(TargetTab()->GetTitle()) : "",
+         Origin(TargetTab()), false,
+         may_have_acted ? "Stopped. This step may already have taken effect."
+-                       : "Stopped."));
++                       : "Stopped.");
++    // Nothing was sent to the page, so the sidebar says "not done", not
++    // "didn't work".
++    if (!may_have_acted) {
++      event.Set("stopped", true);
++    }
++    Emit(std::move(event));
+   }
+   if (was_active) {
+     State("stopped");

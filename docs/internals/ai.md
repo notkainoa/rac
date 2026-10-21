@@ -518,7 +518,10 @@ exactly one parser.
   the critic held the step, its note. A `summary` counts `steps`,
   `confirmed`, and `failed`. A turn whose actions all failed ends in
   `error` ("Couldn't finish"), so the footer never says "Done" when
-  nothing worked.
+  nothing worked. Only `step_finished` with `ok` says a step happened: a
+  step still running when the task ends, or one finished with `stopped`
+  (Stop before anything reached the page), reads "not done", never in the
+  past tense.
 - Labels, tab titles, origins, errors, and critic notes come from pages or
   the model. Render them as plain text only.
 - Decisions go back with `racAiAgentRespond(id, decision)`. There are two
