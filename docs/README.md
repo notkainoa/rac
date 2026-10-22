@@ -20,6 +20,9 @@ them, and traps that are hard to spot from the source.
 - [Overview](internals/overview.md): the layers, repo layout, how patches
   are applied, and how to make a rac change
 - [Glossary](internals/glossary.md): the words rac uses for things
+- [Favorites and pinned tabs](internals/pinned-tabs.md): how the sidebar's
+  items and each window's tabs stay in step, and the traps; dragging is in
+  [pinned-tabs-drag.md](internals/pinned-tabs-drag.md)
 - [AI](internals/ai.md): how the assistant and the browser agent work, the
   safety rules, and the traps
 - [Bangs (work in progress)](internals/bangs.md): editable bangs and a
