@@ -126,6 +126,10 @@ While the names are applied, string files (`.grd`, `.grdp`, `.xtb`) in
 - **Don't use `he sub` or `he namesub`.** They run only Helium's pass, with
   separate backups.
 
+`sub` also records a hash of every file it changed, and `unsub` refuses to
+overwrite a string file that was edited since. Copy the edit somewhere
+safe, run `dev_names.py unsub --force`, then make it again.
+
 What still connects to Helium's servers:
 
 | What | Status |

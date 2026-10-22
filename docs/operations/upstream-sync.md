@@ -72,7 +72,9 @@ release scripts, `.github/workflows/build.yml`,
 `devutils/generate_sparkle_deltas.py`, and `sign_and_package_app.sh`. If one
 conflicts, take Helium's change and keep rac's file names (`rac_<version>`,
 `rac.app`), rac's version from `rac_version.txt`, and the update feed steps
-(see [Releases](releases.md)).
+(see [Releases](releases.md)). Also keep the ad hoc signing fallback in
+`sign_and_package_app.sh` for when `MACOS_CERTIFICATE_NAME` isn't set: rac
+has no Apple developer account yet, so CI builds depend on it.
 
 Every other helium-macos file stays Helium's. rac-only files (`AGENTS.md`,
 `CLAUDE.md`, `VISION.md`, `CONTRIBUTING.md`, `.github/SECURITY.md`,

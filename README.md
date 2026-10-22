@@ -7,8 +7,9 @@ rac is a fork of [helium-macos](https://github.com/imputnet/helium-macos),
 built on [Helium](https://github.com/imputnet/helium). It tracks Helium's
 releases and adds its own changes as a separate layer of patches on top.
 
-> **Status:** early development. rac has its own name but no rac features
-> yet, and there are no public builds.
+> **Status:** early development. rac has its own name and its first
+> features, such as spaces, pinned tabs, and the optional AI assistant, but
+> there are no public builds yet.
 > See the [roadmap](docs/roadmap.md).
 
 rac is an independent project. It isn't affiliated with or endorsed by

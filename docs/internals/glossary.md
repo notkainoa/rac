@@ -26,10 +26,11 @@ Use these words consistently in code, docs, issues, and PRs.
   reset back to it. They are not favorites.
 - **Open tabs**: the regular, unpinned tabs in a space.
 - **Sidebar**: the vertical panel on the left with favorites, pinned tabs,
-  open tabs, and the space switcher. It has three states:
+  open tabs, and the space switcher. It has two states:
   - **full**: shows titles and icons
-  - **compact**: shows icons only (Helium's "collapsed")
   - **hidden**: not shown at all
+
+  Helium's icons-only sidebar ("collapsed" in code) is turned off in rac.
 - **Frameless mode**: Helium's mode that hides the sidebar until you hover
   the window edge, while the top bar stays. Cmd+S turns it on and off; it's
   no longer a setting on the Appearance page. The code calls it "zen mode"

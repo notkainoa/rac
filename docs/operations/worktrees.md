@@ -31,7 +31,11 @@ devutils/rac/worktree.sh setup
 
 Setup checks out the Helium submodule from the main checkout, merges the
 patches, clones the build tree, points it at the new worktree, and applies
-any patches that differ from the main checkout's. Like every `sync`, it also
+any patches that differ from the main checkout's. To clone another
+checkout's build tree instead, such as a worktree that's newer than the
+main checkout, pass it: `devutils/rac/worktree.sh setup <checkout>`. gn
+needs Xcode, so setup uses `/Applications/Xcode.app` when `xcode-select`
+points at the Command Line Tools. Like every `sync`, it also
 applies rac's names to the dev tree (see
 [Branding](../internals/overview.md#branding-and-helium-services)).
 
@@ -51,6 +55,9 @@ applies rac's names to the dev tree (see
   `he unmerge`, then run `he merge` to keep working.
 - After the branch's patches change outside quilt, such as after a rebase or
   a `git pull`, run `devutils/rac/worktree.sh sync`, then `he build`.
+  Sync stops, and names the file, if popping a patch would throw away an
+  edit that isn't saved in it. Refresh the edit into its patch or discard
+  it, then rerun sync.
 
 If a build in a worktree shows tens of thousands of steps, something
 invalidated the clone. Stop it and find out why before letting it run for
@@ -107,5 +114,8 @@ each one:
   it at the worktree's `patches/`.
 
 `sync` relies on `build/src/.pc/.rac_applied`, which records a hash of each
-applied patch. That's how it can tell which patch files changed since they
-were applied.
+applied patch, and on a copy of each applied version in
+`.pc/.rac_patch_bytes/`. The hashes tell it which patch files changed since
+they were applied. The copies let it replay a patch that's about to be
+popped and check that its files hold nothing else. Don't delete them to get
+past a refusal; that loses the edit sync is protecting.
