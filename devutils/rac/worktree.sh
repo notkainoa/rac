@@ -2,9 +2,10 @@
 # Feature trees: git worktrees that each get a copy-on-write clone of the main
 # checkout's built Chromium tree. See docs/operations/worktrees.md.
 #
-# usage: devutils/rac/worktree.sh <setup [<checkout>]|sync|run|cleanup>
+# usage: devutils/rac/worktree.sh <setup [<checkout>]|sync [--discard]|run|cleanup>
 #   run every command from the root of the worktree
 #   setup clones the main checkout's build tree, or the given checkout's
+#   sync --discard throws away edits that aren't saved in a patch
 set -euo pipefail
 
 die() { echo "rac worktree: $*" >&2; exit 1; }
@@ -40,8 +41,9 @@ pids_matching() {
   ps -axo pid=,command= | P="$1" SELF="$$" awk 'index($0, ENVIRON["P"]) && $1 != ENVIRON["SELF"] { print $1 }'
 }
 
-# Setup sets this: a fresh clone holds no work of its own, so sync may throw
-# away whatever the checkout it came from left unsaved.
+# Setup and sync --discard set this: sync then throws away edits that aren't
+# saved in a patch, including edits to string files. A fresh clone holds no
+# work of its own, so setup may drop whatever its source left unsaved.
 force=0
 
 dev_names() {
@@ -64,10 +66,12 @@ EOF
 # gn and siso run xcodebuild, which fails ("xcodebuild requires Xcode") when
 # xcode-select points at the Command Line Tools. Prints the developer dir to
 # give them: DEVELOPER_DIR or xcode-select's if that's an Xcode, otherwise
-# the first Xcode in $1 (default /Applications).
+# the first Xcode in $1 (default /Applications). Like xcrun, it takes an
+# Xcode's .app path as well as its Contents/Developer.
 xcode_dir() {
   local dir
   for dir in "${DEVELOPER_DIR:-}" "$(xcode-select -p 2>/dev/null || true)"; do
+    case "$dir" in *.app | *.app/) dir="${dir%/}/Contents/Developer" ;; esac
     if [ -n "$dir" ] && [ -x "$dir/usr/bin/xcodebuild" ]; then
       echo "$dir"
       return 0
@@ -111,8 +115,8 @@ cmd_sync() {
   # The check compares each popped patch's files with the version that was
   # applied and with the current patch file (which matches after a refresh).
   if [ "$keep" -lt "$applied" ] && [ "$force" = 0 ]; then
-    stack check "$keep" || die "save or discard those changes, then rerun sync" \
-      "(rac's names stay reverted until sync finishes)"
+    stack check "$keep" \
+      || die "sync stopped before changing any patch; rac's names stay reverted until it finishes"
   fi
 
   if [ "$keep" -lt "$applied" ]; then
@@ -244,8 +248,14 @@ empty_trash() {
 
 case "${1:-}" in
   setup) shift; cmd_setup "$@" ;;
-  sync) cmd_sync ;;
+  sync)
+    case "${2:-}" in
+      "") ;;
+      --discard) force=1 ;;
+      *) die "usage: devutils/rac/worktree.sh sync [--discard]" ;;
+    esac
+    cmd_sync ;;
   run) shift; cmd_run "$@" ;;
   cleanup) cmd_cleanup ;;
-  *) die "usage: devutils/rac/worktree.sh <setup [<checkout>]|sync|run|cleanup>" ;;
+  *) die "usage: devutils/rac/worktree.sh <setup [<checkout>]|sync [--discard]|run|cleanup>" ;;
 esac

@@ -30,6 +30,8 @@ import tempfile
 RECORD = '.rac_applied'
 SAVED = '.rac_patch_bytes'
 QUILT_PATCH_OPTS = '--unified --reject-format=unified'
+# How many committed versions of a patch check() tries before refusing.
+GIT_VERSIONS = 20
 
 
 def digest(data):
@@ -75,8 +77,13 @@ def record(tree, patches):
         if path.exists():
             data = path.read_bytes()
             fingerprint = digest(data)
-            if not (saved / fingerprint).exists():
-                (saved / fingerprint).write_bytes(data)
+            copy = saved / fingerprint
+            # Rewrites a copy that an interrupted record left short. The rename
+            # means a copy is either whole or absent.
+            if file_digest(copy) != fingerprint:
+                temporary = copy.with_name(fingerprint + '.tmp')
+                temporary.write_bytes(data)
+                temporary.replace(copy)
         else:
             fingerprint = 'missing'
         lines.append(f'{fingerprint} {name}\n')
@@ -88,6 +95,28 @@ def record(tree, patches):
     for copy in saved.iterdir():
         if copy.name not in kept:
             copy.unlink()
+
+
+def committed_versions(patches, name):
+    """(commit, bytes) for recent committed versions of a patch file, newest
+    first. --reflog also reaches the side of a rebase that HEAD no longer
+    does, such as a refresh committed before the rebase changed the patch.
+    Helium's patches live in the submodule's repository."""
+    checkout = patches.parent
+    for repo in (checkout, checkout / 'helium-chromium'):
+        path = Path('patches') / name
+        if not (repo / path).exists() and repo != checkout:
+            continue
+        log = subprocess.run(['git', '-C', repo, 'log', '--all', '--reflog', '--format=%H',
+                              f'-n{GIT_VERSIONS}', '--', path.as_posix()],
+                             capture_output=True, text=True, check=False)
+        if log.returncode != 0:
+            continue
+        for commit in log.stdout.split():
+            show = subprocess.run(['git', '-C', repo, 'show', f'{commit}:{path.as_posix()}'],
+                                  capture_output=True, check=False)
+            if show.returncode == 0:
+                yield commit, show.stdout
 
 
 def compare(tree, patches):
@@ -158,12 +187,15 @@ def replay(data, before):
 
 def check(tree, patches, keep):
     """Before sync pops the patches above `keep` with quilt pop -f, checks that
-    each one's files hold exactly what the patch produced, so popping loses
-    nothing. Sync reverts rac's names first, so string files compare cleanly.
-    A missing file counts as empty, as it does for quilt."""
+    each one's files hold exactly what some saved version of the patch
+    produced, so popping loses nothing. Sync reverts rac's names first, so
+    string files compare cleanly. A missing file counts as empty, as it does
+    for quilt."""
     names = applied(tree)[keep:]
     recorded = read_record(tree)
     saved = tree / '.pc' / SAVED
+    # Records written before sync kept copies have no copies folder at all.
+    old_record = not saved.is_dir()
     for index, name in enumerate(names):
         before = preimages(tree, name)
         if not may_have_changed(tree, name, before):
@@ -178,30 +210,52 @@ def check(tree, patches, keep):
                          tree / file)
             expected[file] = later.read_bytes() if later.is_file() else b''
 
-        # The version that was applied, and the current file, which matches
-        # the tree if the edits were saved with quilt refresh.
+        tried = {}
+
+        def produces_tree(data):
+            key = digest(data)
+            if key not in tried:  # an unchanged patch's copy equals its file
+                tried[key] = replay(data, before)
+            return tried[key] == expected
+
+        # The version sync applied, then the current file, which matches the
+        # tree after a quilt refresh.
         fingerprint = recorded.get(name)
         copy = saved / (fingerprint or 'none')
-        has_copy = copy.is_file() and file_digest(copy) == fingerprint
+        has_copy = fingerprint not in (None, 'missing') and file_digest(copy) == fingerprint
         current = patches / name
-        candidates = [copy.read_bytes()] if has_copy else []
-        candidates.append(current.read_bytes() if current.exists() else b'')
-        results = [replay(data, before) for data in candidates]
-        if expected in results:
+        if has_copy and produces_tree(copy.read_bytes()):
+            continue
+        if produces_tree(current.read_bytes() if current.exists() else b''):
+            continue
+        # A refresh that was committed, and then changed again by a rebase
+        # before any sync, is only in git. Popping that loses nothing.
+        commit = next((c for c, data in committed_versions(patches, name) if produces_tree(data)),
+                      None)
+        if commit:
+            print(f'rac worktree: {name} holds the version committed in {commit[:12]}',
+                  file=sys.stderr)
             continue
 
-        # Records written before sync kept copies only have the hash, which
-        # can't rebuild a version that has since changed or been removed.
-        if fingerprint and not has_copy and (fingerprint == 'missing'
-                                             or file_digest(current) != fingerprint):
+        # An old record has only the hash, which can't rebuild a version that
+        # has since changed or been removed.
+        if old_record and fingerprint and (fingerprint == 'missing'
+                                           or file_digest(current) != fingerprint):
             print(f"rac worktree: can't check {name} for unsaved edits; it was "
                   'applied before sync kept copies of applied patches',
                   file=sys.stderr)
             continue
-        result = next((r for r in results if r is not None), before)
+        result = next((r for r in tried.values() if r is not None), before)
         changed = sorted(f for f in before if result.get(f, b'') != expected[f])
-        sys.exit(f"rac worktree: {', '.join(changed) or 'a file'} in {name} has changes that "
-                 "aren't saved in the patch, and popping it would throw them away")
+        sys.exit(
+            f"rac worktree: {', '.join(changed) or 'a file'} in {name} doesn't match "
+            'any saved or committed version of the patch, so popping it would throw '
+            'those edits away.\n'
+            f'  See them with: (cd build/src && quilt diff -z -P {name})\n'
+            '  That diff is against the patch file as it is now. If a rebase or pull '
+            "changed the patch, a quilt refresh would undo that change, so don't refresh "
+            'to keep the edits until you have compared them with git log -p on the patch.\n'
+            '  To throw the edits away instead, run: devutils/rac/worktree.sh sync --discard')
 
 
 def main():

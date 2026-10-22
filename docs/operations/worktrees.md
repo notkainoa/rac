@@ -56,8 +56,11 @@ applies rac's names to the dev tree (see
 - After the branch's patches change outside quilt, such as after a rebase or
   a `git pull`, run `devutils/rac/worktree.sh sync`, then `he build`.
   Sync stops, and names the file, if popping a patch would throw away an
-  edit that isn't saved in it. Refresh the edit into its patch or discard
-  it, then rerun sync.
+  edit that isn't saved in any version of it, applied or committed. It
+  prints the `quilt diff` that shows the edit. Before you `quilt refresh`
+  to keep it, check the patch's `git log -p`: if a rebase or pull changed
+  the patch, a refresh would undo that change. To throw the edit away, run
+  `devutils/rac/worktree.sh sync --discard`.
 
 If a build in a worktree shows tens of thousands of steps, something
 invalidated the clone. Stop it and find out why before letting it run for

@@ -188,6 +188,29 @@ class NamesTest(unittest.TestCase):
                 dev_names.unsub(self.tree)
         self.assertEqual(self.state(), before)
 
+    def test_interrupt_right_after_moving_a_file_rolls_back(self):
+        real_rename = os.rename
+
+        def rename_then_interrupt(source, destination):
+            real_rename(source, destination)
+            raise KeyboardInterrupt
+
+        before = self.state()
+        with mock.patch.object(dev_names.os, 'rename', side_effect=rename_then_interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                dev_names.unsub(self.tree)
+        self.assertEqual(self.state(), before)
+
+    def test_interrupt_before_moving_a_file_rolls_back(self):
+        def interrupt(*_args):
+            raise KeyboardInterrupt
+
+        before = self.state()
+        with mock.patch.object(dev_names.os, 'rename', side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                dev_names.unsub(self.tree)
+        self.assertEqual(self.state(), before)
+
     def test_failed_rollback_keeps_the_recovery_folder(self):
         real_open = open
 

@@ -20,6 +20,9 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
+
+import worktree_state
 
 HERE = Path(__file__).resolve().parent
 QUILT_ENV = {'QUILT_SERIES': 'series.merged', 'QUILT_PATCH_OPTS': '--unified --reject-format=unified'}
@@ -161,7 +164,7 @@ class SyncTest(WorktreeTestCase):
         applied = self.applied()
         result = self.worktree('sync', success=False)
         self.assertIn(f'{file} in ', result.stderr)
-        self.assertIn("aren't saved in the patch", result.stderr)
+        self.assertIn("doesn't match any saved or committed version", result.stderr)
         self.assertEqual(self.applied(), applied)
         # Only the names were reverted (strings.grd), as the message says.
         after = self.snapshot()
@@ -298,6 +301,103 @@ class SyncTest(WorktreeTestCase):
         self.assertIn('strings.grd changed since', result.stderr)
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.applied(), ['a.patch', 's.patch', 'b.patch'])
+
+    def git(self, *args):
+        subprocess.run(['git', '-C', self.root, '-c', 'user.name=t', '-c', 'user.email=t@t',
+                        '-c', 'commit.gpgsign=false', *args],
+                       check=True, capture_output=True)
+
+    def refresh_a_and_commit(self, text):
+        """Pops to a.patch, refreshes it with `text`, pushes the rest again and
+        commits, without a sync: the saved copy stays the old version."""
+        self.names('unsub')
+        self.quilt('pop', 'a.patch')
+        (self.tree / 'one').write_text(text)
+        self.quilt('refresh')
+        self.quilt('push', '-a')
+        self.names('sub')
+        # A later patch on the same file, or unsub rewriting a string file,
+        # makes it newer than the refresh, so check() can't skip the patch.
+        os.utime(self.tree / 'one')
+        self.git('add', 'patches/a.patch')
+        self.git('commit', '-q', '-m', 'refresh a')
+
+    def test_refresh_then_rebase_of_a_lower_patch_is_not_refused(self):
+        self.git('add', 'patches/a.patch')
+        self.git('commit', '-q', '-m', 'base')
+        self.refresh_a_and_commit('refreshed one\n')
+        # A rebase replaces that commit; the refreshed version is only in the
+        # reflog now, and a.patch changes again.
+        self.git('reset', '-q', '--hard', 'HEAD~1')
+        self.write_patch('a.patch', 'one', 'base one\n', 'rebased one\n')
+        self.git('commit', '-q', '-am', 'rebased a')
+        result = self.worktree('sync')
+        self.assertIn('a.patch holds the version committed in', result.stderr)
+        self.assertEqual((self.tree / 'one').read_text(), 'rebased one\n')
+
+    def test_refresh_then_rebase_still_finds_unsaved_edits(self):
+        self.git('add', 'patches/a.patch')
+        self.git('commit', '-q', '-m', 'base')
+        self.refresh_a_and_commit('refreshed one\n')
+        self.write_patch('a.patch', 'one', 'base one\n', 'rebased one\n')
+        self.git('commit', '-q', '-am', 'rebased a')
+        (self.tree / 'one').write_text('refreshed one\nUNSAVED\n')
+        self.refuses('one')
+
+    def test_refusal_never_suggests_refreshing_blindly(self):
+        self.write_patch('b.patch', 'two', 'base two\n', 'incoming two\n')
+        (self.tree / 'two').write_text('UNSAVED\n')
+        result = self.refuses('two')
+        self.assertIn('quilt diff -z -P b.patch', result.stderr)
+        self.assertIn("don't refresh", result.stderr)
+        self.assertIn('sync --discard', result.stderr)
+        self.assertNotIn('save or discard', result.stderr)
+
+    def test_sync_discard_drops_unsaved_edits(self):
+        self.write_patch('b.patch', 'two', 'base two\n', 'incoming two\n')
+        (self.tree / 'two').write_text('UNSAVED\n')
+        self.worktree('sync', '--discard')
+        self.assertEqual((self.tree / 'two').read_text(), 'incoming two\n')
+        self.worktree('sync', '--bogus', success=False)
+
+    def copy_of(self, name):
+        for line in (self.tree / '.pc' / '.rac_applied').read_text().splitlines():
+            fingerprint, patch = line.split(' ', 1)
+            if patch == name:
+                return self.tree / '.pc' / '.rac_patch_bytes' / fingerprint
+        raise AssertionError(name)
+
+    def test_record_repairs_a_truncated_copy(self):
+        copy = self.copy_of('b.patch')
+        whole = copy.read_bytes()
+        copy.write_bytes(whole[:10])
+        self.state('record')
+        self.assertEqual(copy.read_bytes(), whole)
+        self.assertEqual(list((self.tree / '.pc' / '.rac_patch_bytes').glob('*.tmp')), [])
+
+    def test_truncated_copy_refuses_instead_of_skipping(self):
+        copy = self.copy_of('b.patch')
+        copy.write_bytes(copy.read_bytes()[:10])
+        self.write_patch('b.patch', 'two', 'base two\n', 'incoming two\n')
+        (self.tree / 'two').write_text('UNSAVED\n')
+        result = self.refuses('two')
+        self.assertNotIn("can't check", result.stderr)
+
+    def test_unchanged_patch_is_replayed_once(self):
+        self.write_patch('a.patch', 'one', 'base one\n', 'incoming one\n')
+        (self.tree / 'two').write_text('UNSAVED\n')  # b.patch is unchanged
+        self.names('unsub')  # as sync does before the check
+        calls = []
+        real_replay = worktree_state.replay
+
+        def counting(data, before):
+            calls.append(set(before))
+            return real_replay(data, before)
+
+        with mock.patch.object(worktree_state, 'replay', side_effect=counting):
+            with self.assertRaises(SystemExit):
+                worktree_state.check(self.tree, self.patches, 0)
+        self.assertEqual(calls.count({'two'}), 1)
 
     def test_copies_of_old_versions_are_pruned(self):
         self.write_patch('b.patch', 'two', 'base two\n', 'incoming two\n')
@@ -494,6 +594,13 @@ class XcodeDirTest(unittest.TestCase):
         result = self.run_use_xcode(chosen)
         self.assert_picks(result, chosen)
         self.assertEqual(result.stderr, '')
+
+    def test_accepts_developer_dir_that_is_an_app(self):
+        self.make_xcode('Xcode.app')
+        beta = self.make_xcode('Xcode-beta.app')
+        app = beta.parents[1]
+        self.assert_picks(self.run_use_xcode(self.clt, developer_dir=app), beta)
+        self.assert_picks(self.run_use_xcode(self.clt, developer_dir=f'{app}/'), beta)
 
     def test_no_xcode_dies_with_a_message(self):
         result = self.run_use_xcode(self.clt)

@@ -153,8 +153,9 @@ def unsub(tree, force=False):
 
     def move_aside(path, copy):
         copy.parent.mkdir(parents=True, exist_ok=True)
-        os.rename(path, copy)
+        # Noted first, so an interrupt right after the rename can't lose it.
         moved[path] = copy
+        os.rename(path, copy)
 
     try:
         for _, backup in backups:
@@ -179,6 +180,8 @@ def unsub(tree, force=False):
         failed = []
         for path, copy in reversed(moved.items()):
             try:
+                if copy and not copy.exists() and path.exists():
+                    continue  # interrupted before the rename; path is untouched
                 if copy:
                     os.replace(copy, path)
                 else:
