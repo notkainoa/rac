@@ -2,8 +2,9 @@
 # Feature trees: git worktrees that each get a copy-on-write clone of the main
 # checkout's built Chromium tree. See docs/operations/worktrees.md.
 #
-# usage: devutils/rac/worktree.sh <setup|sync|run|cleanup>
+# usage: devutils/rac/worktree.sh <setup [<checkout>]|sync|run|cleanup>
 #   run every command from the root of the worktree
+#   setup clones the main checkout's build tree, or the given checkout's
 set -euo pipefail
 
 die() { echo "rac worktree: $*" >&2; exit 1; }
@@ -22,7 +23,6 @@ root=$(cd "$(git rev-parse --show-toplevel)" && pwd -P)
 base=${REPO_ROOT_PATH:-$(git -C "$root" worktree list --porcelain | sed -n '1s/^worktree //p')}
 base=$(cd "$base" && pwd -P)
 src="$root/build/src"
-base_src="$base/build/src"
 out="$src/out/Default"
 record="$src/.pc/.rac_applied"
 trash="$base/build/.trash"
@@ -40,8 +40,14 @@ pids_matching() {
   ps -axo pid=,command= | P="$1" SELF="$$" awk 'index($0, ENVIRON["P"]) && $1 != ENVIRON["SELF"] { print $1 }'
 }
 
+# Setup sets this: a fresh clone holds no work of its own, so sync may throw
+# away whatever the checkout it came from left unsaved.
+force=0
+
 dev_names() {
-  python3 "$root/devutils/rac/dev_names.py" "$1" -t "$src" >&2 \
+  local args=("$1")
+  [ "$1" != unsub ] || [ "$force" = 0 ] || args+=(--force)
+  python3 "$root/devutils/rac/dev_names.py" "${args[@]}" -t "$src" >&2 \
     || die "dev_names.py $1 failed"
 }
 
@@ -55,53 +61,31 @@ if libc.clonefile(sys.argv[1].encode(), sys.argv[2].encode(), CLONE_NOFOLLOW) !=
 EOF
 }
 
-# The record ($src/.pc/.rac_applied) holds "<sha256> <patch>" for each applied
-# patch, so sync can tell which patch files changed since they were applied.
-#
-#   stack record <patches dir>  write the record, hashing files in that dir
-#   stack compare               print "<keep> <applied> <wanted>
-#                               <top_unchanged>": how many applied patches
-#                               still match the series and the record, how
-#                               many are applied, how many the series lists,
-#                               and whether the top patch is still in the
-#                               series with an unchanged file
-#   stack matches               exit 0 if the applied stack equals the series
+# gn and siso run xcodebuild, which fails ("xcodebuild requires Xcode") when
+# xcode-select points at the Command Line Tools. Prints the developer dir to
+# give them: DEVELOPER_DIR or xcode-select's if that's an Xcode, otherwise
+# the first Xcode in $1 (default /Applications).
+xcode_dir() {
+  local dir
+  for dir in "${DEVELOPER_DIR:-}" "$(xcode-select -p 2>/dev/null || true)"; do
+    if [ -n "$dir" ] && [ -x "$dir/usr/bin/xcodebuild" ]; then
+      echo "$dir"
+      return 0
+    fi
+  done
+  for dir in "${1:-/Applications}"/Xcode.app "${1:-/Applications}"/Xcode*.app; do
+    if [ -x "$dir/Contents/Developer/usr/bin/xcodebuild" ]; then
+      log "using $dir for gn and siso, since xcode-select doesn't point at Xcode"
+      echo "$dir/Contents/Developer"
+      return 0
+    fi
+  done
+  die "gn needs Xcode, and none was found; install Xcode or set DEVELOPER_DIR"
+}
+
+# Patch bookkeeping for sync; see worktree_state.py for the commands.
 stack() {
-  python3 - "$root/patches" "$src/.pc/applied-patches" "$record" "$@" <<'EOF'
-import hashlib, pathlib, sys
-patches, applied_file, record_file = map(pathlib.Path, sys.argv[1:4])
-mode = sys.argv[4]
-
-def digest(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else "missing"
-
-def series():
-    names = []
-    for line in (patches / "series.merged").read_text().split("\n"):
-        line = line.split(" #", 1)[0].strip()
-        if line and not line.startswith("#"):
-            names.append(line)
-    return names
-
-applied = list(filter(None, applied_file.read_text().split("\n")))
-
-if mode == "record":
-    source = pathlib.Path(sys.argv[5])
-    record_file.write_text("".join(f"{digest(source / n)} {n}\n" for n in applied))
-elif mode == "matches":
-    sys.exit(0 if series() == applied else 1)
-elif mode == "compare":
-    wanted = series()
-    recorded = dict(l.split(" ", 1)[::-1] for l in filter(None, record_file.read_text().split("\n")))
-    unchanged = lambda n: (patches / n).exists() and digest(patches / n) == recorded.get(n)
-    keep = 0
-    for i, name in enumerate(applied):
-        if i >= len(wanted) or wanted[i] != name or not unchanged(name):
-            break
-        keep = i + 1
-    top_unchanged = int(bool(applied) and applied[-1] in wanted and unchanged(applied[-1]))
-    print(keep, len(applied), len(wanted), top_unchanged)
-EOF
+  python3 "$root/devutils/rac/worktree_state.py" "$src" "$root/patches" "$@"
 }
 
 # Makes the applied quilt stack match this tree's patches, popping only the
@@ -109,24 +93,26 @@ EOF
 cmd_sync() {
   [ -d "$src/.pc" ] || die "no build tree at $src"
   [ -f "$root/patches/series.merged" ] || die "patches are not merged; run: source dev.sh && he merge"
-  [ -f "$record" ] || stack record "$root/patches"
+  [ -f "$record" ] || stack record || die "couldn't record the applied patches"
 
-  local keep applied wanted top_unchanged
-  read -r keep applied wanted top_unchanged < <(stack compare)
+  local keep applied wanted plan
+  plan=$(stack compare) || die "couldn't compare the applied patches with the series"
+  read -r keep applied wanted <<< "$plan"
 
   # quilt can't pop or push patches on string files that the name passes
   # changed (pop -f would even restore stale copies), so revert the names
-  # first. The end of sync applies them again.
+  # first. The end of sync applies them again. unsub refuses if a string file
+  # changed since the names were applied.
   if [ "$keep" -lt "$applied" ] || [ "$applied" -lt "$wanted" ]; then
     dev_names unsub
   fi
 
   # Popping with -f throws away edits that haven't been saved into a patch.
-  # They can only be detected when the top patch's file is unchanged, because
-  # quilt diff -z compares the sources against the patch file.
-  if [ "$keep" -lt "$applied" ] && [ "$top_unchanged" = 1 ] \
-    && [ -n "$(quilt_ diff -z 2>/dev/null || true)" ]; then
-    die "the top patch has unrefreshed changes; run 'quilt refresh' or discard them first"
+  # The check compares each popped patch's files with the version that was
+  # applied and with the current patch file (which matches after a refresh).
+  if [ "$keep" -lt "$applied" ] && [ "$force" = 0 ]; then
+    stack check "$keep" || die "save or discard those changes, then rerun sync" \
+      "(rac's names stay reverted until sync finishes)"
   fi
 
   if [ "$keep" -lt "$applied" ]; then
@@ -144,18 +130,22 @@ cmd_sync() {
     die "quilt push failed; fix the patch or series, then rerun sync"
   fi
 
-  stack record "$root/patches"
+  stack record
   dev_names sub
   python3 "$root/devutils/rac/rac_version.py" -t "$src" || die "rac_version.py failed"
   log "patch stack is in sync ($(wc -l < "$src/.pc/applied-patches" | tr -d ' ') applied)"
 }
 
 cmd_setup() {
+  local from=$base
+  [ -z "${1:-}" ] || from=$(cd "$1" && pwd -P) || die "no checkout at $1"
+  local from_src="$from/build/src"
   [ "$root" != "$base" ] || die "run setup in a worktree, not in the main checkout"
-  [ -f "$base_src/out/Default/.siso_fs_state" ] || die "the main checkout has no finished build at $base_src"
+  [ "$root" != "$from" ] || die "a worktree can't clone its own build tree"
+  [ -f "$from_src/out/Default/.siso_fs_state" ] || die "$from has no finished build at $from_src"
   [ ! -e "$src" ] || die "$src already exists"
-  if [ -n "$(pids_matching "$base_src/third_party/siso")" ]; then
-    die "a build is running in the main checkout; wait for it to finish"
+  if [ -n "$(pids_matching "$from_src/third_party/siso")" ]; then
+    die "a build is running in $from; wait for it to finish"
   fi
 
   if [ ! -e "$root/helium-chromium/.git" ]; then
@@ -172,21 +162,31 @@ cmd_setup() {
       || { cat "$merge_log" >&2; die "patch merge failed"; }
     rm -f "$merge_log"
   fi
+  local xcode
+  xcode=$(xcode_dir) || exit 1
 
-  log "cloning $base_src (copy-on-write)"
+  log "cloning $from_src (copy-on-write)"
   mkdir -p "$root/build"
-  clone_tree "$base_src" "$src"
+  clone_tree "$from_src" "$src"
 
-  # The clone still points at the main checkout in a few places.
+  # The clone still points at its source checkout in a few places.
   printf '%s\n' "$root/patches" > "$src/.pc/.quilt_patches"
-  [ -f "$record" ] || stack record "$base/patches"
+  # Hash the versions the source checkout applied, from its patches/ (or its
+  # submodule's, for Helium's patches while it's unmerged).
+  [ -f "$record" ] || python3 "$root/devutils/rac/worktree_state.py" "$src" "$from/patches" record \
+    || die "couldn't record the patches $from applied"
   local siso="$src/third_party/siso/cipd/siso"
-  "$siso" fs export -C "$out" \
+  DEVELOPER_DIR=$xcode "$siso" fs export -C "$out" \
     | python3 -c 'import sys; o, n = sys.argv[1:]; sys.stdout.write(sys.stdin.read().replace(o, n))' \
-        "$base_src/" "$src/" \
-    | "$siso" fs import -C "$out"
-  (cd "$src" && buildtools/mac/gn gen out/Default --fail-on-unused-args --export-compile-commands >/dev/null)
+        "$from_src/" "$src/" \
+    | DEVELOPER_DIR=$xcode "$siso" fs import -C "$out" \
+    || die "couldn't move siso's build state to this worktree; see the error above"
+  local gn_log
+  gn_log=$(cd "$src" && DEVELOPER_DIR=$xcode buildtools/mac/gn gen out/Default --fail-on-unused-args \
+    --export-compile-commands 2>&1) \
+    || { printf '%s\n' "$gn_log" >&2; die "gn gen failed in $out"; }
 
+  force=1
   cmd_sync
   empty_trash
 
@@ -239,10 +239,13 @@ empty_trash() {
     "$trash"/tree.* >/dev/null 2>&1 &)
 }
 
+# Tests source this file for its functions.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
+
 case "${1:-}" in
-  setup) cmd_setup ;;
+  setup) shift; cmd_setup "$@" ;;
   sync) cmd_sync ;;
   run) shift; cmd_run "$@" ;;
   cleanup) cmd_cleanup ;;
-  *) die "usage: devutils/rac/worktree.sh <setup|sync|run|cleanup>" ;;
+  *) die "usage: devutils/rac/worktree.sh <setup [<checkout>]|sync|run|cleanup>" ;;
 esac
