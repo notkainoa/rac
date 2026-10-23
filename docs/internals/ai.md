@@ -13,8 +13,8 @@ The AI lives in two patch groups: `patches/rac/ai/` (the assistant) and
 These come from [VISION.md](../../VISION.md) and hold for every change:
 
 - AI is off by default (`rac.ai.enabled`, default false). You can turn it on
-  or off in settings at any time. Onboarding, which isn't built yet, will ask
-  whether you want it.
+  or off in settings at any time. Onboarding asks whether you want it, with
+  "Later" as the default.
 - When AI is off, none of its code does any work: no processes, no network
   calls, no background tasks. See [AI off costs nothing](#ai-off-costs-nothing).
 - rac never sees AI conversations. Only the user and their chosen provider
