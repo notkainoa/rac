@@ -222,6 +222,12 @@ provider's official tool instead of reusing its login.
   config can allow tools, the recipe denies them again in a rac-owned primary
   agent, whose rules OpenCode reads last. Its session database stays in the
   scratch folder.
+- When `session/new` reports a current model that isn't in the agent's own
+  `availableModels`, rac sends `session/set_model` for the first listed
+  model with the same reasoning suffix (or the first listed) before the
+  prompt. Codex on a ChatGPT plan starts on a model the plan can't use and
+  otherwise fails every prompt with "not supported". A refused switch is
+  not an error; the prompt's own failure then says why.
 - `initialize` advertises no file reads, no file writes, and no terminal.
   Anything else the agent asks for gets a "method not supported" reply.
 - Codex and Claude run through npx adapters, pinned to exact versions. They
@@ -249,7 +255,8 @@ other than `end_turn`, and Codex's `session_info_update` with a
 `systemError` thread status, after which its text is the error. Codex also
 sends its own notices as text with no message id; those wait for the reply
 and are dropped if the turn fails. Text from two different message ids is
-two paragraphs.
+two paragraphs, and so is text that follows a tool call, a plan, or a
+thought, which is what keeps Cursor's id-less sentences apart.
 
 - **The run owns its tools.** The page hands `Prompt` the run's
   `AgentMcpTools`. Nothing else keeps a pointer to them, and the MCP server
@@ -601,13 +608,32 @@ detach is posted.
 
 ## Open concerns
 
+Each of these was looked at again in October 2026 when the agent was
+finished. What would close each one is written down so nobody has to work
+it out twice.
+
 - **Page script after an approval.** The guard controls input, navigation,
   popups, downloads, and pickers. It does not control what an approved
-  page's own script does with the click.
-- **Agents without a trusted identity.** Gemini, OpenCode, Copilot, and
-  Goose permission requests for rac's tools are rejected, because none of
-  their verified fields proves the call came from rac's MCP server. Add each
-  one as its adapter's identity fields are verified.
+  page's own script does with the click: a handler can `fetch()`, post a
+  message, or write storage, and rac can't tell a harmless handler from a
+  harmful one. This is the design, not a gap in it: approving a click means
+  running the page's handler. Closing it would take a network policy for
+  the approved document (refusing requests to origins outside the plan
+  while an agent action is live), which is a renderer and network-service
+  change with its own breakage, or a separate profile per agent. Neither
+  belongs in a finishing pass. Until then the plan card's site list is the
+  user's view of what the click may reach.
+- **Agents without a trusted identity.** Gemini, Copilot, and Goose
+  permission requests for rac's tools are rejected, because none of their
+  verified fields proves the call came from rac's MCP server. None of the
+  three is installed on the maintainer's Mac, so nothing could be verified.
+  To close one: install the CLI, run it through rac with
+  `--rac-agent-mcp-echo`, capture its `session/request_permission` for the
+  `rac_echo` call, find the field its adapter sets from the MCP runtime (in
+  the adapter's source, not only in the log), and add it to
+  `IsApprovedRacMcpTool` with a positive test and adversarial ones. Cursor
+  and OpenCode don't need this path: their recipes allow rac's tools in
+  the agent's own config, so they never ask.
 - **Provider terms.** Whether a provider lets its subscription run through
   another app is that provider's call, and it can change. rac runs the
   official tool, not a reused login, and shouldn't depend on any one
@@ -615,16 +641,29 @@ detach is posted.
 - **Setup.** Installing a CLI, installing Node.js for the Codex and Claude
   adapters, and signing in are fine for developers and hard for everyone
   else. Own keys and local models are easier.
-- **Speed.** Starting an agent is slow, so small features (summaries, the new
-  tab choice, Ask, the critic) go through direct providers. The critic uses
-  the user's own direct model. There is no dedicated fast model, so a slow
+- **Speed.** Starting an agent is slow, and by design every message starts it
+  again (see [Runs](#runs)). Measured on the maintainer's Mac in October 2026,
+  from Send to the agent's first tool call: Cursor about 15 seconds, Claude
+  Code about 25 seconds (its adapter runs through npx), a shell-script agent
+  about one second, so nearly all of it is the agent itself. Keeping an agent
+  alive between messages would make follow-ups fast, but an idle agent is a
+  process, a tool server, and a socket that outlive the prompt, which the run
+  model rules out on purpose. Small features (summaries, the new tab choice,
+  Ask, the critic) go through direct providers instead. The critic uses the
+  user's own direct model. There is no dedicated fast model, so a slow
   provider slows every low-risk step.
-- **Agents report no models or modes yet.** The picker shows an agent as one
-  row. Add per-agent models when ACP exposes them.
+- **Agents report models, rac doesn't show them.** Every installed adapter
+  reports its models in the `session/new` result: Codex and Cursor in
+  `models.availableModels` with `currentModelId`, Claude and OpenCode in a
+  `configOptions` entry with id `model`. The picker still shows an agent as
+  one row and the agent uses its own default. Showing them means a
+  per-agent model pref, a `session/set_model` or `session/set_config_option`
+  call between `session/new` and the prompt, and rows in the picker. That is
+  a new capability, so it waits for its own phase.
 - **Rough edges in the tools.** `press_key` is Enter on an element only, and
-  the guard always treats it as a possible submit. Forms that target a named window
-  or a new window are denied. The agent can't close the user's own tabs. A
-  new turn does not keep the agent's tab ownership from the last one.
+  the guard always treats it as a possible submit. Forms that target a named
+  window or a new window are denied. The agent can't close the user's own
+  tabs. A new turn does not keep the agent's tab ownership from the last one.
 
 ## Prior art to study
 

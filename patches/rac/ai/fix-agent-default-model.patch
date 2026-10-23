@@ -1,0 +1,214 @@
+Index: src/chrome/browser/rac/ai/acp/acp_client.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/acp/acp_client.cc
++++ src/chrome/browser/rac/ai/acp/acp_client.cc
+@@ -3,10 +3,12 @@
+ 
+ #include "chrome/browser/rac/ai/acp/acp_client.h"
+ 
++#include <algorithm>
+ #include <cmath>
+ #include <limits>
+ #include <optional>
+ #include <utility>
++#include <vector>
+ 
+ #include "base/functional/bind.h"
+ #include "base/json/json_reader.h"
+@@ -51,6 +53,43 @@ std::string StopReasonError(const std::s
+   return "";
+ }
+ 
++// The model to switch a new session to, or empty when its current model is
++// one it lists as available (or it lists none). Codex on a ChatGPT plan
++// starts with a model the plan can't use and fails the first prompt with
++// "not supported"; the plan's own list is right. The first listed model
++// with the same reasoning suffix ("[medium]") is preferred, then the first.
++std::string FallbackModel(const base::DictValue& session) {
++  const base::DictValue* models = session.FindDict("models");
++  const std::string* current =
++      models ? models->FindString("currentModelId") : nullptr;
++  const base::ListValue* available =
++      models ? models->FindList("availableModels") : nullptr;
++  if (!current || !available || available->empty()) {
++    return "";
++  }
++  std::vector<std::string> ids;
++  for (const base::Value& entry : *available) {
++    const base::DictValue* model = entry.GetIfDict();
++    const std::string* id = model ? model->FindString("modelId") : nullptr;
++    if (id && !id->empty()) {
++      ids.push_back(*id);
++    }
++  }
++  if (ids.empty() || std::ranges::contains(ids, *current)) {
++    return "";
++  }
++  const size_t bracket = current->find('[');
++  if (bracket != std::string::npos) {
++    const std::string suffix = current->substr(bracket);
++    for (const std::string& id : ids) {
++      if (id.ends_with(suffix)) {
++        return id;
++      }
++    }
++  }
++  return ids.front();
++}
++
+ bool IsAnswer(const std::string& kind) {
+   return kind == "agent_message_chunk" || kind == "agent_thought_chunk" ||
+          kind == "tool_call" || kind == "tool_call_update" || kind == "plan";
+@@ -199,6 +238,14 @@ void AcpClient::CreateSession() {
+   Send(Request::kNew, "session/new", session_params_.Clone());
+ }
+ 
++void AcpClient::SessionReady() {
++  state_ = State::kReady;
++  deadline_.Stop();
++  if (ready_) {
++    std::move(ready_).Run("");
++  }
++}
++
+ void AcpClient::Prompt(std::string text, Completion done) {
+   if (state_ != State::kReady) {
+     std::move(done).Run("The agent is not ready for another message.");
+@@ -324,6 +371,13 @@ void AcpClient::OnResponse(Request reque
+     HeardAnswer();
+   }
+   const base::DictValue* error = message.FindDict("error");
++  if (error && request == Request::kSetModel) {
++    // The agent keeps its own model. The prompt may still fail, and then
++    // the agent's words say why.
++    fallback_model_.clear();
++    SessionReady();
++    return;
++  }
+   if (error) {
+     std::string reason = AcpErrorMessage(*error);
+     // ACP's auth_required. Claude Code says it only once the prompt is sent.
+@@ -363,13 +417,20 @@ void AcpClient::OnResponse(Request reque
+       }
+       session_id_ = *session;
+       session_info_ = result->Clone();
+-      state_ = State::kReady;
+-      deadline_.Stop();
+-      if (ready_) {
+-        std::move(ready_).Run("");
++      fallback_model_ = FallbackModel(session_info_);
++      if (fallback_model_.empty()) {
++        SessionReady();
++        break;
+       }
++      Send(Request::kSetModel, "session/set_model",
++           base::DictValue()
++               .Set("sessionId", session_id_)
++               .Set("modelId", fallback_model_));
+       break;
+     }
++    case Request::kSetModel:
++      SessionReady();
++      break;
+     case Request::kPrompt: {
+       const std::string* stop_reason = result->FindString("stopReason");
+       if (!stop_reason) {
+Index: src/chrome/browser/rac/ai/acp/acp_client.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/acp/acp_client.h
++++ src/chrome/browser/rac/ai/acp/acp_client.h
+@@ -79,15 +79,21 @@ class AcpClient {
+   State state() const { return state_; }
+   const std::string& session_id() const { return session_id_; }
+   const base::DictValue& session_info() const { return session_info_; }
++  // The model rac asked the agent to switch to, because the one its session
++  // started with wasn't in its own list of available models. Empty when the
++  // agent's default was fine.
++  const std::string& fallback_model() const { return fallback_model_; }
+   const base::DictValue& initialize_result() const {
+     return initialize_result_;
+   }
+ 
+  private:
+-  enum class Request { kInitialize, kNew, kPrompt };
++  enum class Request { kInitialize, kNew, kSetModel, kPrompt };
+ 
+   void Send(Request request, std::string method, base::DictValue params);
+   void CreateSession();
++  // The session is created and, if it needed one, its model is set.
++  void SessionReady();
+   void OnResponse(Request request, const base::DictValue& message);
+   void OnPermission(base::Value id, const base::DictValue& params);
+   void DecidePermission(int token, bool allow);
+@@ -120,6 +126,7 @@ class AcpClient {
+   base::DictValue session_params_;
+   base::DictValue initialize_result_;
+   base::DictValue session_info_;
++  std::string fallback_model_;
+   Completion ready_;
+   Completion done_;
+   base::OneShotTimer deadline_;
+Index: src/chrome/browser/rac/ai/acp/acp_client_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/acp/acp_client_unittest.cc
++++ src/chrome/browser/rac/ai/acp/acp_client_unittest.cc
+@@ -129,6 +129,59 @@ TEST_F(AcpClientTest, InitializeAdvertis
+   EXPECT_EQ(client_->state(), AcpClient::State::kReady);
+ }
+ 
++// Codex on a ChatGPT plan opens a session on a model the plan can't use.
++// The agent's own list is right, so the session switches to one of those
++// (with the same reasoning suffix) before the prompt.
++TEST_F(AcpClientTest, SessionModelOutsideTheListIsReplaced) {
++  bool ready = false;
++  client_->Start(base::DictValue().Set("cwd", "/tmp"),
++                 base::BindLambdaForTesting([&](std::string error) {
++                   EXPECT_TRUE(error.empty());
++                   ready = true;
++                 }));
++  Deliver(R"({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}})");
++  Deliver(R"({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1","models":{
++      "currentModelId":"gpt-5.6-sol[medium]","availableModels":[
++      {"modelId":"gpt-6-luna[low]"},{"modelId":"gpt-6-luna[medium]"}]}}})");
++  EXPECT_FALSE(ready);
++  ASSERT_EQ(written_.size(), 3u);
++  EXPECT_EQ(*written_[2].FindString("method"), "session/set_model");
++  EXPECT_EQ(*written_[2].FindDict("params")->FindString("modelId"),
++            "gpt-6-luna[medium]");
++  EXPECT_EQ(client_->fallback_model(), "gpt-6-luna[medium]");
++  Deliver(R"({"jsonrpc":"2.0","id":3,"result":{}})");
++  EXPECT_TRUE(ready);
++  EXPECT_EQ(client_->state(), AcpClient::State::kReady);
++}
++
++TEST_F(AcpClientTest, SessionModelInTheListIsKept) {
++  bool ready = false;
++  client_->Start(
++      base::DictValue().Set("cwd", "/tmp"),
++      base::BindLambdaForTesting([&](std::string) { ready = true; }));
++  Deliver(R"({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}})");
++  Deliver(R"({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1","models":{
++      "currentModelId":"a","availableModels":[{"modelId":"a"}]}}})");
++  EXPECT_TRUE(ready);
++  EXPECT_EQ(written_.size(), 2u);
++  EXPECT_EQ(client_->fallback_model(), "");
++}
++
++TEST_F(AcpClientTest, RefusedModelSwitchStillReadiesTheSession) {
++  bool ready = false;
++  client_->Start(
++      base::DictValue().Set("cwd", "/tmp"),
++      base::BindLambdaForTesting([&](std::string) { ready = true; }));
++  Deliver(R"({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}})");
++  Deliver(R"({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1","models":{
++      "currentModelId":"x","availableModels":[{"modelId":"a"}]}}})");
++  EXPECT_FALSE(ready);
++  Deliver(R"({"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"no"}})");
++  EXPECT_TRUE(ready);
++  EXPECT_EQ(client_->fallback_model(), "");
++  EXPECT_EQ(client_->state(), AcpClient::State::kReady);
++}
++
+ TEST_F(AcpClientTest, StreamsChunksAndRejectsPermissionsByDefault) {
+   client_->Start(base::DictValue().Set("cwd", "/tmp"),
+                  base::BindLambdaForTesting([](std::string) {}));
