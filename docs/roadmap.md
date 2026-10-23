@@ -105,7 +105,7 @@ parallel.
 | Feature | Covers | Code it touches |
 | --- | --- | --- |
 | Space themes | A color, gradient, and icon for each space | Themes and colors |
-| AI basics (built) | The AI sidebar that reads the current page, AI in the new tab page that picks search or ask as you type, Cmd+F "Ask", and link hover summaries. Providers are your own API key, a local model, or an installed agent such as Claude Code, Codex, or Cursor. Foundation: **AI settings** (the toggle and providers). The onboarding opt-in is part of phase 4. Decisions and traps are in [internals/ai.md](internals/ai.md) | `rac/ai/`, side panel, new tab page, find bar, link hover |
+| AI basics (built) | The AI sidebar that reads the current page, AI in the new tab page that picks search or ask as you type, Cmd+F "Ask", and link hover summaries. Providers are your own API key, a local model, or an installed agent such as Claude Code, Codex, or Cursor. Foundation: **AI settings** (the toggle and providers). The onboarding opt-in is built with onboarding in phase 4. Decisions and traps are in [internals/ai.md](internals/ai.md) | `rac/ai/`, side panel, new tab page, find bar, link hover |
 | Media controls in the sidebar | Built on Chromium's media controls | Bottom of the sidebar |
 | Settings cleanup | Fewer settings: remove or hide what rac decides for the user, in rac's settings layout | Settings pages |
 
@@ -116,7 +116,7 @@ Finishing everything up. When this phase is done, rac can be released.
 | Feature | Covers |
 | --- | --- |
 | Icons and DMG art | App icon, logos, DMG background, in `resources/` only |
-| Onboarding | rac's own first-run flow, with the AI opt-in, space themes, and sidebar layout choices, using Helium's existing importer |
+| Onboarding (built) | rac's own first-run flow, with the AI opt-in, space themes, and sidebar layout choices, using Helium's existing importer |
 | Bangs | A settings page to view, edit, delete, and add bangs, with edits that survive list updates, and a rethought address bar experience for bangs. Design first; see [internals/bangs.md](internals/bangs.md) |
 | Performance check | Startup, tab switching, scrolling, and typing compared with Helium, with each feature on and off |
 | Micro-interactions | Tasteful motion, one worktree per area (sidebar, spaces, AI) |
