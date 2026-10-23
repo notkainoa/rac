@@ -96,7 +96,16 @@ installed side by side:
   Automation that navigates directly, such as DevTools, must use
   `chrome://`.
 - The Apple team ID is empty until rac has its own developer account.
-- The icons are still Helium's.
+- The logo inside the browser is rac's. Helium ships its logo as images
+  and vector icons in `helium-chromium/resources/branding`, copied in by
+  `helium_resources.txt` after rac's `platform_resources.txt`, so a file
+  listed there loses to Helium's. rac's versions are listed in
+  `resources/branding.txt`, which `devutils/shared.sh` applies last.
+  `devutils/rac/branding.py` builds them from the app icon. The welcome
+  tour draws the logo at 88 pt, larger than any channel logo
+  `chrome://theme` serves, so `rac/branding/tour-logo.patch` gives it the
+  256 px icon as its own `logo.png`. Helium's own setup page still draws
+  Helium's logo, but the tour replaces that page, so nobody sees it.
 
 `devutils/rac/name_pass.py` turns "Helium" into "rac" in user-facing
 strings and translations. It runs in release builds after Helium's own pass
