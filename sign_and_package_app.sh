@@ -51,6 +51,9 @@ if [ "${RAC_DMG_STYLE:-}" = beta ]; then
   _dmg_volume="rac Beta"
   _dmg_background="$_root_dir/resources/dmg_beta_background.png"
   _dmg_dsstore="$_root_dir/resources/dmg_beta_dsstore"
+elif [ -n "${RAC_DMG_STYLE:-}" ]; then
+  echo "error: unknown RAC_DMG_STYLE=$RAC_DMG_STYLE (expected beta or unset)" >&2
+  exit 1
 fi
 
 # Package the app
