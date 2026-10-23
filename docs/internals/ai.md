@@ -19,10 +19,11 @@ These come from [VISION.md](../../VISION.md) and hold for every change:
   calls, no background tasks. See [AI off costs nothing](#ai-off-costs-nothing).
 - rac never sees AI conversations. Only the user and their chosen provider
   do. There is no rac-hosted AI service.
-- The agent never takes an action in the browser without the user's
-  confirmation. In practice that means an approved plan for the first
-  action, and a confirmation for every consequential one. See
-  [The guard](#the-guard).
+- The agent never does anything risky in the browser (sending, buying,
+  deleting, signing in, and the rest of the list in [The guard](#the-guard))
+  without asking first. How much it asks about everything else is the
+  user's permission level: `ask`, `careful`, or `auto` (the default), plus
+  per-site rules. There is no level that skips the risky list.
 - AI is for regular profiles only. Incognito gets no assistant panel, no
   agents, no link summaries, and no find-in-page Ask. Any new AI feature
   must check this itself. Link summaries once ran in Incognito because they
@@ -405,36 +406,65 @@ only from the card.
 
 ### The guard
 
-`ActionGuard::Evaluate` decides plan, confirm, allow, or block for every
-action before `ActionRunner::Run`. `Dispatch` evaluates it again for blocks
-just before running.
+`ActionGuard::Evaluate` decides allow, plan, confirm, or block for every
+action before `ActionRunner::Run`, from a permission level and the user's
+site rules. `Dispatch` evaluates it again for blocks just before running.
+The level is `rac.ai.agent_permission_level`, read once per turn in
+`BeginTurn`, so turning AI off costs nothing extra; it applies to both run
+modes because the direct loop and the MCP tools both enter the controller.
 
-**Block** (nothing overrides it): an unknown tool, closing a tab the user
-opened, a download, a URL that
-isn't http(s), or a URL that did not come from a user message or a link in a
-snapshot the model was shown. The URL match is exact. `chrome:`, `file:`,
+**Block** (no level overrides it): an unknown tool, closing a tab the user
+opened, a download, a URL that isn't http(s), a URL that did not come from a
+user message or a link in a snapshot the model was shown, and any origin
+with a `never` site rule. The URL match is exact. `chrome:`, `file:`,
 `data:`, `javascript:`, and extension URLs are never allowed.
 
-**Always consequential**, and so always a confirmation even after the plan
-was allowed:
+**Risky, at every level.** These always get a confirmation card:
 
 - any native submit control, including image inputs, whatever its label says
 - pressing Enter in a field
 - password and payment fields, and file inputs
-- words like buy, send, delete, sign in
-- a target the guard can't classify (a generic click target, a text box with
-  no known purpose, a select), because the critic has no page text to judge
-  it
-- typing text that isn't in the user's messages, in any field, since the
-  critic never sees the text
-- any origin outside the ones the plan allowed
+- words like buy, send, post, delete, sign in, upload
+- a target the guard can't classify: a click on something that isn't a
+  link, a checkbox, a radio, or a submit control, and `go_back`
+- closing the user's own tab
 
-**Plan.** The first action of a turn shows a plan card with the next step
-and the sites involved. It is not an invented multi-step plan. Allowing it
-adds those origins to the turn. It lets low-risk steps run on those sites.
-It never covers a consequential step.
+**The levels.** "Named" below means an origin the user handed the agent: an
+attached tab, a URL in a message, a site the plan allowed, or an `always`
+site rule.
 
-**Confirm.** One card per consequential action, no default button, no
+| Action | `ask` | `careful` | `auto` |
+| --- | --- | --- | --- |
+| Reads: snapshot, page text, find, tab list | free | free | free |
+| Click or type on a named site | asks | plan card once, then the critic checks each step | free |
+| Navigate or click to a site the user didn't name | asks | asks | free |
+| Typing text that isn't in the user's messages | asks | asks | asks only on a site the user didn't name |
+| A plain text field or a select | asks | asks (the critic can't judge it) | free |
+| Risky (the list above) | asks | asks | asks |
+
+- `ask` is one confirmation per action, no plan card, no critic.
+- `careful` is the original guard: a plan card for the first action, and a
+  fast safety check for low-risk steps on the named sites. Without a direct
+  provider there is no critic, so every action is a card and the card says
+  so.
+- `auto`, the default, decides from the table alone: no plan card, and the
+  critic is neither needed nor started.
+
+**Site rules** (`rac.ai.agent_site_rules`, origin to `always` or `never`)
+sit on top of any level. `always` makes the origin count as named, so the
+`auto` typing rule and `careful`'s site check pass; risky actions still
+ask. `never` blocks every action on the origin with a reason that names
+Settings › Assistant, where the rules are listed and removed. A card that
+is only about the site, not the action, offers "Always allow on <host>";
+answering it writes the rule for the origin the card showed and allows
+the step. A card for a risky action never offers it.
+
+**Plan.** Only `careful` shows one. The first action of a turn shows a
+plan card with the next step and the sites involved. It is not an invented
+multi-step plan. Allowing it adds those origins to the turn. It lets
+low-risk steps run on those sites. It never covers a risky step.
+
+**Confirm.** One card per action that asks, no default button, no
 keyboard shortcut for Confirm. Esc stops the turn. The card's detail text is
 generic ("Clicks Place order. It sends the form to host:port") and never
 includes typed text.
@@ -500,8 +530,9 @@ that ran on an input event the user approved.
 
 ### The critic
 
-A low-risk step that the plan allowed goes to a fast safety check first. It
-runs on the user's direct provider and can only say `allow` or `escalate`.
+Only the `careful` level has one. A low-risk step that the plan allowed
+goes to a fast safety check first. It runs on the user's direct provider
+and can only say `allow` or `escalate`.
 
 - **It never sees the page.** Its input is the user's goal (capped at 4000
   bytes), the tool name, a role from a fixed list, the numeric control type,
@@ -557,8 +588,8 @@ exactly one parser.
 - Labels, tab titles, origins, errors, and critic notes come from pages or
   the model. Render them as plain text only.
 - Decisions go back with `racAiAgentRespond(id, decision)`. There are two
-  spellings: the cards say `allow`, `confirm`, `skip`, `stop`, and the
-  controller says `allow_once` and `deny`. Both are accepted at the bridge
+  spellings: the cards say `allow`, `confirm`, `skip`, `always`, `stop`, and
+  the controller says `allow_once` and `deny`. Both are accepted at the bridge
   and anything else is ignored, as is a stale ID. A bridge that accepted only
   one set once dropped every approval silently.
 - ACP agents' own progress (thoughts, tool calls, plans) arrives separately
