@@ -41,16 +41,28 @@ if [ -z "${OUT_DMG_PATH:-}" ]; then
   OUT_DMG_PATH="$_root_dir/build/rac_${_rac_version}_macos.dmg"
 fi
 
+# RAC_DMG_STYLE=beta packages beta builds with the dark background on a
+# "rac Beta" volume. Each style's .DS_Store names its own volume, so Finder
+# shows the right background when both DMGs are mounted.
+_dmg_volume=rac
+_dmg_background="$_root_dir/resources/dmg_background.png"
+_dmg_dsstore="$_root_dir/resources/dmg_dsstore"
+if [ "${RAC_DMG_STYLE:-}" = beta ]; then
+  _dmg_volume="rac Beta"
+  _dmg_background="$_root_dir/resources/dmg_beta_background.png"
+  _dmg_dsstore="$_root_dir/resources/dmg_beta_dsstore"
+fi
+
 # Package the app
 chrome/installer/mac/pkg-dmg \
   --sourcefile --source "$_app" \
   --target "$OUT_DMG_PATH" \
-  --volname rac --format ULMO \
+  --volname "$_dmg_volume" --format ULMO \
   --icon "$_app/Contents/Resources/app.icns" \
   --symlink /Applications:/Applications \
   --mkdir .background \
-  --copy "$_root_dir/resources/dmg_background.png:/.background/dmg_background.png" \
-  --copy "$_root_dir/resources/dmg_dsstore:/.DS_Store" \
+  --copy "$_dmg_background:/.background/dmg_background.png" \
+  --copy "$_dmg_dsstore:/.DS_Store" \
   --verbosity 2
 
 if [ -n "${MACOS_CERTIFICATE_NAME:-}" ]; then
