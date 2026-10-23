@@ -1,0 +1,171 @@
+Index: src/chrome/app/rac_strings.grdp
+===================================================================
+--- src.orig/chrome/app/rac_strings.grdp
++++ src/chrome/app/rac_strings.grdp
+@@ -14,7 +14,7 @@
+     <message name="IDS_RAC_SETTINGS_WELCOME_TOUR_TITLE" desc="Title of the card on the General settings page that holds the row to show the welcome tour (the first-run flow) again.">
+       Welcome tour
+     </message>
+-    <message name="IDS_RAC_SETTINGS_WELCOME_TOUR_SHOW" desc="Label of the row on the General settings page that opens the welcome tour (the first-run flow) again in a new tab.">
++    <message name="IDS_RAC_SETTINGS_WELCOME_TOUR_SHOW" desc="Label of the row on the General settings page that opens the welcome tour (the first-run flow) again in its own window.">
+       Show the welcome tour
+     </message>
+     <message name="IDS_RAC_SETTINGS_WELCOME_TOUR_DESCRIPTION" desc="Description under the row on the General settings page that opens the welcome tour again. Lists what the tour covers.">
+Index: src/chrome/browser/resources/rac_onboarding/app.ts
+===================================================================
+--- src.orig/chrome/browser/resources/rac_onboarding/app.ts
++++ src/chrome/browser/resources/rac_onboarding/app.ts
+@@ -142,7 +142,8 @@ class Tour {
+   // so the two never overlap. Moving between a full-window step (Welcome,
+   // Done) and a two-pane step swipes the whole window, since the layout
+   // changes under it. A click mid-swipe starts the next one at once.
+-  private show(screen: Screen) {
++  // Resolves once `screen` is on screen, or a newer swipe has taken over.
++  private show(screen: Screen): Promise<void> {
+     const forward =
+         this.screens.indexOf(screen) >= this.screens.indexOf(this.current);
+     this.current = screen;
+@@ -174,7 +175,7 @@ class Tour {
+     };
+     if (!showing.length || alreadyShown) {
+       swap();
+-      return;
++      return Promise.resolve();
+     }
+ 
+     // Reduced motion keeps the sequence but drops the slide.
+@@ -193,7 +194,7 @@ class Tour {
+               fill: 'forwards'
+             }));
+     this.running = out;
+-    Promise.all(out.map(animation => animation.finished))
++    return Promise.all(out.map(animation => animation.finished))
+         .then(() => {
+           if (token !== this.transition) {
+             return;
+@@ -275,11 +276,11 @@ class Tour {
+     }
+   }
+ 
+-  private next() {
++  private async next() {
+     const index = this.screens.indexOf(this.current);
+     const target = this.screens[index + 1];
+     if (target) {
+-      this.show(target);
++      await this.show(target);
+     }
+   }
+ 
+@@ -291,7 +292,8 @@ class Tour {
+ 
+   private async advance() {
+     // A step that waits on the browser (consent, finishing) must not run
+-    // twice from a double click.
++    // twice from a double click, and a second click must not answer the
++    // next step before it has slid in.
+     if (this.advancing) {
+       return;
+     }
+@@ -309,17 +311,17 @@ class Tour {
+         if (this.pendingImports().length) {
+           await this.runImports();
+         }
+-        this.next();
++        await this.next();
+         break;
+       case 'assistant':
+         setAssistant(this.assistant === 'now', this.assistant === 'never');
+-        this.next();
++        await this.next();
+         break;
+       case 'services':
+         // Continuing past this screen is the consent, as in Helium's tour.
+         await setHeliumPref('services.user_consented', true);
+         acceptLatestSchema();
+-        this.next();
++        await this.next();
+         break;
+       case 'done':
+         await setHeliumPref('completed_onboarding', true);
+@@ -336,7 +338,7 @@ class Tour {
+         window.location.replace(NEW_TAB_URL);
+         break;
+       default:
+-        this.next();
++        await this.next();
+         break;
+     }
+   }
+Index: src/chrome/browser/ui/views/rac/onboarding/onboarding_window.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/onboarding/onboarding_window.cc
++++ src/chrome/browser/ui/views/rac/onboarding/onboarding_window.cc
+@@ -5,14 +5,17 @@
+ #include "chrome/browser/ui/rac/onboarding/onboarding_window.h"
+ 
+ #include <memory>
++#include <set>
+ #include <string>
+ #include <utility>
+ 
+ #include "base/command_line.h"
++#include "base/files/file_path.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+ #include "base/location.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/no_destructor.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/profiles/keep_alive/profile_keep_alive_types.h"
+@@ -62,6 +65,13 @@ constexpr char kAssistantSettingsUrl[] =
+ class TourWindow;
+ TourWindow* g_tour = nullptr;
+ 
++// Profiles offered the tour at launch this session. Closing the tour early
++// opens the browser, which must not bring the tour straight back.
++std::set<base::FilePath>& OfferedAtLaunch() {
++  static base::NoDestructor<std::set<base::FilePath>> offered;
++  return *offered;
++}
++
+ // The window's content: the page, filling it.
+ class TourView : public views::View {
+   METADATA_HEADER(TourView, views::View)
+@@ -144,6 +154,10 @@ class TourWindow : public content::WebCo
+ 
+   void set_resume(base::OnceClosure resume) { resume_ = std::move(resume); }
+ 
++  bool has_resume() const { return !resume_.is_null(); }
++
++  Profile* profile() { return profile_; }
++
+   content::WebContents* web_contents() {
+     return view_->web_view()->GetWebContents();
+   }
+@@ -239,12 +253,23 @@ bool ShouldShowWelcomeTourAtLaunch(Profi
+                                    const base::CommandLine& command_line) {
+   return profile && profile->IsRegularProfile() &&
+          !command_line.HasSwitch(switches::kNoFirstRun) &&
++         !OfferedAtLaunch().contains(profile->GetPath()) &&
+          !profile->GetPrefs()->GetBoolean(prefs::kHeliumDidOnboarding);
+ }
+ 
+ void ShowWelcomeTourAtLaunch(Profile* profile, base::OnceClosure resume) {
++  OfferedAtLaunch().insert(profile->GetPath());
++  if (g_tour && g_tour->profile() != profile) {
++    // One tour at a time: another profile opens as usual, and gets its
++    // tour the next time rac starts.
++    std::move(resume).Run();
++    return;
++  }
+   if (g_tour) {
+-    // Already open with its own way to open the browser afterwards.
++    // Opened from Settings, it has no browser launch waiting yet.
++    if (!g_tour->has_resume()) {
++      g_tour->set_resume(std::move(resume));
++    }
+     g_tour->Activate();
+     return;
+   }
