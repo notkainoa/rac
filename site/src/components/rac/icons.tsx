@@ -28,6 +28,8 @@ export const BackIcon = (p: SVGProps<SVGSVGElement>) => line(<path d="M16 10H4.5
 export const ForwardIcon = (p: SVGProps<SVGSVGElement>) => line(<path d="M4 10h11.5M11 5l5 5-5 5" />, p);
 export const ReloadIcon = (p: SVGProps<SVGSVGElement>) =>
   line(<path d="M16 10a6 6 0 1 1-1.8-4.3M16 3.5v3.7h-3.7" />, p);
+export const ChevronIcon = ({ flip, ...p }: SVGProps<SVGSVGElement> & { flip?: boolean }) =>
+  line(<path d={flip ? "M12 4.5 6.5 10l5.5 5.5" : "M8 4.5l5.5 5.5L8 15.5"} />, p);
 export const PlusIcon = (p: SVGProps<SVGSVGElement>) => line(<path d="M10 4v12M4 10h12" />, p);
 export const CloseIcon = (p: SVGProps<SVGSVGElement>) => line(<path d="m5.5 5.5 9 9m0-9-9 9" />, { strokeWidth: 1.9, ...p });
 export const ProfileIcon = (p: SVGProps<SVGSVGElement>) =>
