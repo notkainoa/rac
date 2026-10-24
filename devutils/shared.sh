@@ -64,7 +64,8 @@ write_gn_args() {
     fi
     if [ -n "${PROD_MACOS_SPARKLE_ED_PUB_KEY:-}" ]; then
       echo 'enable_sparkle=true' >> "$args"
-      printf 'sparkle_ed_key="%s"\n' "$PROD_MACOS_SPARKLE_ED_PUB_KEY" >> "$args"
+      # A trailing newline in the pasted secret would break args.gn.
+      printf 'sparkle_ed_key="%s"\n' "$(printf '%s' "$PROD_MACOS_SPARKLE_ED_PUB_KEY" | tr -d '[:space:]')" >> "$args"
     fi
     echo 'symbol_level=1' >> "$args"
   else
