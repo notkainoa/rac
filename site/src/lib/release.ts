@@ -79,7 +79,9 @@ export function getRelease(): Promise<Release> {
 async function fetchLatest(): Promise<Release> {
   const repo = new URL(REPO_URL).pathname.slice(1);
   const headers: Record<string, string> = { Accept: "application/vnd.github+json" };
-  if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  // Optional, but builds without it share GitHub's low anonymous rate limit.
+  const token = (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.GITHUB_TOKEN;
+  if (token) headers.Authorization = `Bearer ${token}`;
   const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, { headers });
   if (!res.ok) throw new Error(`GitHub releases API answered ${res.status}`);
   const data = (await res.json()) as GitHubRelease;

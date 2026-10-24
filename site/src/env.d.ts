@@ -1,3 +1,6 @@
 interface Window {
-  racApplyTheme: () => void;
+  racTheme: {
+    get(): string | null;
+    set(choice: "light" | "dark" | null): void;
+  };
 }

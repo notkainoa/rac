@@ -3,6 +3,7 @@ import react from "@astrojs/react";
 import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig({
+  site: "https://racbrowser.com",
   output: "static",
   // The whole stylesheet is small, so inline it and save a blocking request.
   build: { inlineStylesheets: "always" },
