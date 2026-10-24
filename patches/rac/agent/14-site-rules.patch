@@ -38,19 +38,30 @@ Index: src/chrome/browser/rac/agent/action_guard.cc
  void ActionGuard::RememberPageLink(const std::string& url) {
    if (IsAllowedAgentUrl(url) && urls_.size() < 4096) {
      urls_.insert(GURL(url).spec());
-@@ -65,8 +74,10 @@ void ActionGuard::AllowPlan(const std::s
+@@ -63,13 +72,16 @@ void ActionGuard::AllowPlan(const std::s
+   plan_allowed_ = true;
+ }
  
++bool ActionGuard::IsNamed(const std::string& origin) const {
++  const auto rule = site_rules_.find(origin);
++  return origin.empty() || origin == "null" || origins_.contains(origin) ||
++         named_origins_.contains(origin) ||
++         (rule != site_rules_.end() && rule->second == SiteRule::kAlways);
++}
++
  bool ActionGuard::OnNamedSites(const ActionMetadata& action) const {
-   auto named = [&](const std::string& origin) {
-+    const auto rule = site_rules_.find(origin);
-     return origin.empty() || origin == "null" || origins_.contains(origin) ||
+-  auto named = [&](const std::string& origin) {
+-    return origin.empty() || origin == "null" || origins_.contains(origin) ||
 -           named_origins_.contains(origin);
-+           named_origins_.contains(origin) ||
-+           (rule != site_rules_.end() && rule->second == SiteRule::kAlways);
-   };
-   return named(action.risk.current_origin) && named(action.frame_origin) &&
-          named(action.risk.target_origin);
-@@ -98,27 +109,48 @@ GuardResult ActionGuard::Evaluate(const
+-  };
+-  return named(action.risk.current_origin) && named(action.frame_origin) &&
+-         named(action.risk.target_origin);
++  return IsNamed(action.risk.current_origin) && IsNamed(action.frame_origin) &&
++         IsNamed(action.risk.target_origin);
+ }
+ 
+ GuardResult ActionGuard::Evaluate(const ActionMetadata& action) const {
+@@ -98,27 +110,64 @@ GuardResult ActionGuard::Evaluate(const
                "This URL was not supplied by the user or a visible page link."};
      }
    }
@@ -70,16 +81,32 @@ Index: src/chrome/browser/rac/agent/action_guard.cc
                       action.press_enter || action.unknown_target ||
                       action.closing_user_tab;
    const bool named = OnNamedSites(action);
-+  // A confirmation that is only about the site, not the action, may become
-+  // a standing rule for that site.
-+  const bool may_offer_rule = !risky &&
-+                              action.risk.current_origin.starts_with("http") &&
-+                              !site_rules_.contains(action.risk.current_origin);
 +  auto allowed = [&](const std::string& origin) {
 +    const auto rule = site_rules_.find(origin);
 +    return origin.empty() || origins_.contains(origin) ||
 +           (rule != site_rules_.end() && rule->second == SiteRule::kAlways);
 +  };
++  // Whether the tab's site is the only one the user didn't name, so a rule
++  // for it settles the card. A frame or a destination on another site would
++  // ask again with the rule saved.
++  auto only_tab_unnamed = [&](auto is_named) {
++    const std::string& tab = action.risk.current_origin;
++    auto settled = [&](const std::string& origin) {
++      return origin == tab || is_named(origin);
++    };
++    return !is_named(tab) && settled(action.frame_origin) &&
++           settled(action.risk.target_origin);
++  };
++  // A confirmation that is only about the site, not the action, may become
++  // a standing rule for that site.
++  const bool may_offer_rule =
++      !risky && action.risk.current_origin.starts_with("http") &&
++      !site_rules_.contains(action.risk.current_origin) &&
++      (level_ == PermissionLevel::kCareful
++           ? ClassifyActionRisk(action.risk) == RiskClass::kLow &&
++                 only_tab_unnamed(allowed)
++           : only_tab_unnamed(
++                 [&](const std::string& origin) { return IsNamed(origin); }));
    switch (level_) {
      case PermissionLevel::kAsk:
        return {GuardDecision::kConfirm,
@@ -103,7 +130,7 @@ Index: src/chrome/browser/rac/agent/action_guard.cc
          risk = RiskClass::kConsequential;
        }
        if (!plan_allowed_) {
-@@ -126,9 +158,11 @@ GuardResult ActionGuard::Evaluate(const
+@@ -126,9 +175,11 @@ GuardResult ActionGuard::Evaluate(const
                  "Review the browser plan before starting."};
        }
        if (risk != RiskClass::kLow) {
@@ -118,7 +145,7 @@ Index: src/chrome/browser/rac/agent/action_guard.cc
        }
        return {GuardDecision::kAllow, risk, ""};
      }
-@@ -140,7 +174,8 @@ GuardResult ActionGuard::Evaluate(const
+@@ -140,7 +191,8 @@ GuardResult ActionGuard::Evaluate(const
        if (action.unknown_text && !named) {
          return {GuardDecision::kConfirm, RiskClass::kConsequential,
                  "This types text you didn't write, on a site you didn't "
@@ -165,7 +192,19 @@ Index: src/chrome/browser/rac/agent/action_guard.h
    void RememberPageLink(const std::string& url);
    void AllowPlan(const std::set<std::string>& additional_origins = {});
    GuardResult Evaluate(const ActionMetadata& action) const;
-@@ -62,6 +73,7 @@ class ActionGuard {
+@@ -54,14 +65,17 @@ class ActionGuard {
+   }
+ 
+  private:
+-  // Whether every origin the action touches is one the user named: an
+-  // attached tab, a URL in a message, or a site the plan allowed.
++  // Whether the user named `origin`: an attached tab, a URL in a message, a
++  // site the plan allowed, or an "always" site rule.
++  bool IsNamed(const std::string& origin) const;
++  // Whether every origin the action touches is one the user named.
+   bool OnNamedSites(const ActionMetadata& action) const;
+   PermissionLevel level_ = PermissionLevel::kAuto;
+   std::set<std::string> urls_;
    std::set<std::string> origins_;
    // Origins of the URLs in the user's messages.
    std::set<std::string> named_origins_;
@@ -177,7 +216,7 @@ Index: src/chrome/browser/rac/agent/action_guard_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/rac/agent/action_guard_unittest.cc
 +++ src/chrome/browser/rac/agent/action_guard_unittest.cc
-@@ -270,6 +270,73 @@ TEST(ActionGuardLevelTest, CarefulKeepsT
+@@ -270,6 +270,103 @@ TEST(ActionGuardLevelTest, CarefulKeepsT
    EXPECT_EQ(guard.Evaluate(password).decision, GuardDecision::kConfirm);
  }
  
@@ -223,6 +262,36 @@ Index: src/chrome/browser/rac/agent/action_guard_unittest.cc
 +  read.risk.current_origin = "https://banned.com";
 +  EXPECT_EQ(guard.Evaluate(read).decision, GuardDecision::kAllow)
 +      << "reads are not actions";
++}
++
++// A rule for the tab's site wouldn't settle a card about a frame on another
++// site, so that card doesn't offer one.
++TEST(ActionGuardSiteRuleTest, OffersTheRuleOnlyWhenItSettlesTheCard) {
++  ActionGuard guard;
++  guard.BeginTurn(PermissionLevel::kAuto, {}, {"https://example.com"});
++  auto typing = Low();
++  typing.unknown_text = true;
++  typing.frame_origin = "https://widget.com";
++  const GuardResult frame = guard.Evaluate(typing);
++  EXPECT_EQ(frame.decision, GuardDecision::kConfirm);
++  EXPECT_FALSE(frame.offer_site_rule) << "auto: the frame is unnamed";
++  typing.risk.current_origin = "https://other.com";
++  typing.frame_origin = "https://other.com";
++  EXPECT_TRUE(guard.Evaluate(typing).offer_site_rule);
++
++  ActionGuard careful;
++  careful.BeginTurn(PermissionLevel::kCareful, {}, {"https://example.com"});
++  careful.AllowPlan();
++  auto click = Low();
++  click.risk.tool_name = "click";
++  click.risk.element_role = "link";
++  click.frame_origin = "https://widget.com";
++  const GuardResult careful_frame = careful.Evaluate(click);
++  EXPECT_EQ(careful_frame.decision, GuardDecision::kConfirm);
++  EXPECT_FALSE(careful_frame.offer_site_rule) << "careful: the frame is unnamed";
++  click.risk.current_origin = "https://other.com";
++  click.frame_origin = "";
++  EXPECT_TRUE(careful.Evaluate(click).offer_site_rule);
 +}
 +
 +TEST(ActionGuardSiteRuleTest, NeverBlocksAtEveryLevelAndAlwaysNamesForCareful) {
@@ -311,14 +380,27 @@ Index: src/chrome/browser/rac/agent/agent_controller.cc
    Emit(ConfirmRequestEvent(input));
    critic_note_.clear();
  }
-@@ -778,6 +793,17 @@ bool AgentController::TryRespond(const s
+@@ -765,7 +780,10 @@ bool AgentController::TryRespond(const s
+     return false;
+   }
+   const Decision parsed = ParseDecision(decision);
+-  if (parsed == Decision::kUnknown) {
++  // Only a card that offered "Always allow" can be answered with it; the
++  // card stays up.
++  if (parsed == Decision::kUnknown ||
++      (parsed == Decision::kAlways && always_allow_origin_.empty())) {
+     return false;
+   }
+   approval_id_.clear();
+@@ -778,6 +796,18 @@ bool AgentController::TryRespond(const s
          Error("declined", "The user declined this action. Do not retry it."));
      return true;
    }
 +  if (parsed == Decision::kAlways) {
-+    // Only a card that offered it, and only for the site it showed.
-+    if (always_allow_origin_.empty() ||
-+        always_allow_origin_ != Origin(TargetTab())) {
++    // Only for the site the card showed.
++    if (always_allow_origin_ != Origin(TargetTab())) {
++      always_allow_origin_.clear();
++      Finish(Error("stale_ref", "The tab navigated while awaiting approval."));
 +      return false;
 +    }
 +    ScopedDictPrefUpdate(profile_->GetPrefs(), rac::ai::kAgentSiteRules)
@@ -329,7 +411,7 @@ Index: src/chrome/browser/rac/agent/agent_controller.cc
    if (awaiting_plan_) {
      awaiting_plan_ = false;
      guard_.AllowPlan(planned_origins_);
-@@ -1074,6 +1100,7 @@ void AgentController::Cancel() {
+@@ -1074,6 +1104,7 @@ void AgentController::Cancel() {
    // Nothing from an unfinished approval may carry into a later tool call.
    approved_fingerprint_.clear();
    approval_origin_.clear();

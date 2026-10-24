@@ -427,7 +427,6 @@ with a `never` site rule. The URL match is exact. `chrome:`, `file:`,
 - words like buy, send, post, delete, sign in, upload
 - a target the guard can't classify: a click on something that isn't a
   link, a checkbox, a radio, or a submit control, and `go_back`
-- closing the user's own tab
 
 **The levels.** "Named" below means an origin the user handed the agent: an
 attached tab, a URL in a message, a site the plan allowed, or an `always`
@@ -455,9 +454,10 @@ sit on top of any level. `always` makes the origin count as named, so the
 `auto` typing rule and `careful`'s site check pass; risky actions still
 ask. `never` blocks every action on the origin with a reason that names
 Settings › Assistant, where the rules are listed and removed. A card that
-is only about the site, not the action, offers "Always allow on <host>";
-answering it writes the rule for the origin the card showed and allows
-the step. A card for a risky action never offers it.
+is only about the tab's site, not the action or a frame or destination on
+another site, offers "Always allow on <host>"; answering it writes the rule
+for the origin the card showed and allows the step. A card for a risky
+action never offers it.
 
 **Plan.** Only `careful` shows one. The first action of a turn shows a
 plan card with the next step and the sites involved. It is not an invented
