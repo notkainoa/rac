@@ -39,7 +39,7 @@ function Answer({ kind }: { kind: Kind }) {
       return (
         <>
           <p>Hanaya Inn rents a tatami garden room in Higashiyama, Kyoto, for ¥32,000 a night with breakfast.</p>
-          <ul className="ad-answer-list">
+          <ul className="asst-answer-list">
             <li>Booking needs dates, the number of guests, and a name.</li>
             <li>The page doesn’t mention a cancellation policy.</li>
           </ul>
@@ -172,37 +172,37 @@ export default function AgentDemo() {
   const booker = (
     <>
       {phase === "plan" && (
-        <m.div className="ad-card-ui" role="group" aria-label="Plan" {...cardMotion} transition={{ ...cardMotion.transition, delay: 0.15 }}>
-          <div className="ad-eyebrow">
+        <m.div className="asst-card-ui" role="group" aria-label="Plan" {...cardMotion} transition={{ ...cardMotion.transition, delay: 0.15 }}>
+          <div className="asst-eyebrow">
             <i />
             Waiting for you
           </div>
-          <h4 className="ad-title">rac will:</h4>
-          <ul className="ad-steps">
+          <h4 className="asst-title">rac will:</h4>
+          <ul className="asst-steps">
             {STEPS.map((s) => (
               <li key={s}>{s}</li>
             ))}
           </ul>
-          <div className="ad-label">On these sites</div>
-          <span className="ad-chip">
-            <Favicon glyph="leaf" color="#C1575C" className="ad-chip-icon" />
+          <div className="asst-label">On these sites</div>
+          <span className="asst-chip">
+            <Favicon glyph="leaf" color="#C1575C" className="asst-chip-icon" />
             {HOST}
           </span>
-          <div className="ad-actions">
-            <button type="button" className="ad-pill ad-primary press" onClick={allow} title="Allow (⌘Return)">
+          <div className="asst-actions">
+            <button type="button" className="asst-pill asst-primary press" onClick={allow} title="Allow (⌘Return)">
               Allow
             </button>
-            <button type="button" className="ad-pill ad-quiet press" onClick={stop}>
+            <button type="button" className="asst-pill asst-quiet press" onClick={stop}>
               Stop
             </button>
           </div>
-          <p className="ad-note">rac will still ask before buying, sending, or deleting anything.</p>
+          <p className="asst-note">rac will still ask before buying, sending, or deleting anything.</p>
         </m.div>
       )}
 
       {phase !== "idle" && phase !== "plan" && (
-        <div className="ad-log">
-          <div className="ad-step" data-status={phase === "stopped" && done === 0 ? "stopped" : "done"}>
+        <div className="asst-log">
+          <div className="asst-step" data-status={phase === "stopped" && done === 0 ? "stopped" : "done"}>
             <Mark status={phase === "stopped" && done === 0 ? "stopped" : "done"} />
             {phase === "stopped" && done === 0 ? "Stopped" : `Allowed on ${HOST}`}
           </div>
@@ -212,7 +212,7 @@ export default function AgentDemo() {
             else if (phase === "running" && i === done) status = "running";
             if (!status) return null;
             return (
-              <m.div key={s} className="ad-step" data-status={status} {...cardMotion}>
+              <m.div key={s} className="asst-step" data-status={status} {...cardMotion}>
                 <Mark status={status} />
                 {s}
               </m.div>
@@ -222,21 +222,21 @@ export default function AgentDemo() {
       )}
 
       {phase === "confirm" && (
-        <m.div className="ad-card-ui" role="group" aria-label="Confirm a step" {...cardMotion}>
-          <div className="ad-eyebrow">
+        <m.div className="asst-card-ui" role="group" aria-label="Confirm a step" {...cardMotion}>
+          <div className="asst-eyebrow">
             <i />
             Waiting for you
           </div>
-          <h4 className="ad-title">Clicks Book room</h4>
-          <p className="ad-detail">It sends the form to {HOST}</p>
-          <div className="ad-actions">
-            <button type="button" className="ad-pill ad-primary press" onClick={confirm}>
+          <h4 className="asst-title">Clicks Book room</h4>
+          <p className="asst-detail">It sends the form to {HOST}</p>
+          <div className="asst-actions">
+            <button type="button" className="asst-pill asst-primary press" onClick={confirm}>
               Confirm
             </button>
-            <button type="button" className="ad-pill press" onClick={stop}>
+            <button type="button" className="asst-pill press" onClick={stop}>
               Skip
             </button>
-            <button type="button" className="ad-pill ad-quiet press" onClick={stop}>
+            <button type="button" className="asst-pill asst-quiet press" onClick={stop}>
               Stop
             </button>
           </div>
@@ -244,40 +244,32 @@ export default function AgentDemo() {
       )}
 
       {phase === "done" && (
-        <m.div className="ad-log" {...cardMotion}>
-          <div className="ad-step" data-status="done">
+        <m.div className="asst-log" {...cardMotion}>
+          <div className="asst-step" data-status="done">
             <Mark status="done" />
             Confirmed: Clicks Book room
           </div>
-          <p className="ad-summary">Done in {elapsed}s · 1 confirmed. Your room is booked for March 12 to 14.</p>
+          <p className="asst-summary">Done in {elapsed}s · 1 confirmed. Your room is booked for March 12 to 14.</p>
         </m.div>
       )}
 
-      {phase === "stopped" && <p className="ad-summary">Stopped. Nothing was sent.</p>}
+      {phase === "stopped" && <p className="asst-summary">Stopped. Nothing was sent.</p>}
     </>
   );
 
   return (
     <LazyMotion features={domAnimation} strict>
-      <div className="ad">
-        {/* The whole row flips the switch, like a row in rac's settings. */}
-        <div className="ad-setting" onClick={toggle}>
-          <div>
-            <p className="ad-setting-title" id="ad-setting-title">
-              Turn on the assistant
-            </p>
-            <p className="ad-setting-text">
-              Chat about the page you’re on in a side panel. Nothing runs and nothing is sent anywhere until you turn
-              this on and add your own provider.
-            </p>
-          </div>
-          <button type="button" role="switch" aria-checked={on} aria-labelledby="ad-setting-title" className="ad-switch press">
+      <div className="asst">
+        <button type="button" role="switch" aria-checked={on} className="asst-toggle press" onClick={toggle}>
+          <SparkIcon className="asst-toggle-icon" />
+          Assistant
+          <span className="asst-switch" aria-hidden="true">
             <i />
-          </button>
-        </div>
+          </span>
+        </button>
 
-        <div className="rac ad-rac">
-          <div className="rac-window ad-window" data-assistant={on || undefined} style={style}>
+        <div className="rac asst-rac">
+          <div className="rac-window asst-window" data-assistant={on || undefined} style={style}>
             <div className="rac-tint" data-on="true" />
             <aside className="rac-sidebar" aria-hidden="true">
               <div className="rac-lights">
@@ -329,14 +321,14 @@ export default function AgentDemo() {
               </div>
             </aside>
 
-            <div className="rac-card ad-card" aria-hidden="true">
-              <Toolbar host={HOST} path="/book" />
-              <div className="rac-page">
+            <div className="rac-card asst-card">
+              <Toolbar host={HOST} path="/book" assistant={{ on, toggle }} />
+              <div className="rac-page" aria-hidden="true">
                 <Booking filled={filled} booked={phase === "done"} />
                 <AnimatePresence>
                   {working && (
-                    <m.div className="ad-working" {...cardMotion} exit={{ opacity: 0 }}>
-                      <span className="ad-spin" />
+                    <m.div className="asst-working" {...cardMotion} exit={{ opacity: 0 }}>
+                      <span className="asst-spin" />
                       Working in {HOST}…
                     </m.div>
                   )}
@@ -344,28 +336,28 @@ export default function AgentDemo() {
               </div>
             </div>
 
-            <section className="ad-panel" aria-label="Assistant" inert={!on || undefined}>
-              <header className="ad-head">
-                <SparkIcon className="ad-head-icon" />
+            <section className="asst-panel" aria-label="Assistant" inert={!on || undefined}>
+              <header className="asst-head">
+                <SparkIcon className="asst-head-icon" />
                 Assistant
-                <span className="ad-head-tools">
+                <span className="asst-head-tools">
                   {turns.length > 0 && !busy && (
-                    <button type="button" className="ad-pill ad-quiet press" onClick={reset}>
+                    <button type="button" className="asst-pill asst-quiet press" onClick={reset}>
                       Start over
                     </button>
                   )}
-                  <button type="button" className="ad-close press" aria-label="Turn off the assistant" onClick={toggle}>
+                  <button type="button" className="asst-close press" aria-label="Turn off the assistant" onClick={toggle}>
                     <CloseIcon />
                   </button>
                 </span>
               </header>
-              <div className="ad-thread" ref={thread} aria-live="polite">
+              <div className="asst-thread" ref={thread} aria-live="polite">
                 {turns.length === 0 && (
-                  <div className="ad-empty">
+                  <div className="asst-empty">
                     <p>Ask about this page, or ask rac to do something on it.</p>
-                    <div className="ad-suggest">
+                    <div className="asst-suggest">
                       {SUGGESTIONS.map((t) => (
-                        <button key={t} type="button" className="ad-pill press" onClick={() => send(t)}>
+                        <button key={t} type="button" className="asst-pill press" onClick={() => send(t)}>
                           {t}
                         </button>
                       ))}
@@ -373,26 +365,26 @@ export default function AgentDemo() {
                   </div>
                 )}
                 {turns.map((turn) => (
-                  <div key={turn.id} className="ad-turn">
-                    <m.div className="ad-bubble" {...cardMotion}>
+                  <div key={turn.id} className="asst-turn">
+                    <m.div className="asst-bubble" {...cardMotion}>
                       {turn.q}
                     </m.div>
                     {thinking === turn.id ? (
-                      <m.div className="ad-reply ad-typing" aria-label="Thinking" {...cardMotion}>
+                      <m.div className="asst-reply asst-typing" aria-label="Thinking" {...cardMotion}>
                         <i />
                         <i />
                         <i />
                       </m.div>
                     ) : turn.kind !== "book" ? (
-                      <m.div className="ad-reply" {...cardMotion}>
+                      <m.div className="asst-reply" {...cardMotion}>
                         <Answer kind={turn.kind} />
                       </m.div>
                     ) : (
                       <>
-                        <m.p className="ad-reply" {...cardMotion}>
+                        <m.p className="asst-reply" {...cardMotion}>
                           I’ll fill in the booking form. You’ll see each step here.
                         </m.p>
-                        {turn.id === bookTurn ? booker : <p className="ad-summary">Stopped. Nothing was sent.</p>}
+                        {turn.id === bookTurn ? booker : <p className="asst-summary">Stopped. Nothing was sent.</p>}
                       </>
                     )}
                   </div>
@@ -400,18 +392,18 @@ export default function AgentDemo() {
               </div>
 
               <form
-                className="ad-composer"
+                className="asst-composer"
                 onSubmit={(e) => {
                   e.preventDefault();
                   send(draft);
                 }}
               >
-                <label className="sr-only" htmlFor="ad-input">
+                <label className="sr-only" htmlFor="asst-input">
                   Message the assistant
                 </label>
                 <input
-                  id="ad-input"
-                  className="ad-input"
+                  id="asst-input"
+                  className="asst-input"
                   value={draft}
                   maxLength={140}
                   autoComplete="off"
@@ -428,7 +420,7 @@ export default function AgentDemo() {
                           : "Ask a question about this page…"
                   }
                 />
-                <button type="submit" className="ad-send press" aria-label="Send" disabled={busy || !draft.trim()}>
+                <button type="submit" className="asst-send press" aria-label="Send" disabled={busy || !draft.trim()}>
                   <SendIcon />
                 </button>
               </form>
@@ -441,9 +433,9 @@ export default function AgentDemo() {
 }
 
 function Mark({ status }: { status: "done" | "running" | "stopped" }) {
-  if (status === "running") return <span className="ad-mark ad-spin" />;
-  if (status === "stopped") return <span className="ad-mark ad-ring" />;
-  return <CheckIcon className="ad-mark" />;
+  if (status === "running") return <span className="asst-mark asst-spin" />;
+  if (status === "stopped") return <span className="asst-mark asst-ring" />;
+  return <CheckIcon className="asst-mark" />;
 }
 
 function Booking({ filled, booked }: { filled: number; booked: boolean }) {

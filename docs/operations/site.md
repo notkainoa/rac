@@ -41,6 +41,10 @@ None of these need a Chromium build or `he`.
   `space_tint_background.cc`, and `resources/rac_ai/app.css`), and the
   assistant's card wording is rac's own. When one of those changes in rac,
   update `theme.ts` or `rac-ui.css` so the site keeps telling the truth.
+- **Ad blockers hide some class names.** rac ships uBlock Origin, and its
+  lists hide elements named like ads on every site: `.ad-panel` and
+  `.ad-card` once hid the whole assistant demo. Don't start class names
+  with `ad-`, `ads-`, `banner`, `promo`, or `sponsor`.
 - **Screenshot slots.** Each drawing sits in a `<ProductShot>` whose `name`
   says which real screenshot could replace it later.
 - **Keep it private.** Don't add analytics, embeds, or a font service. When
@@ -50,7 +54,7 @@ None of these need a Chromium build or `he`.
 ## Deploy
 
 Vercel builds the site from GitHub. The project is `rac` in the
-`knewton` team, and production is <https://rac-phi.vercel.app>.
+`knewton` team, and production is <https://racbrowser.com>.
 
 - **Pull requests** get a preview deployment, and Vercel comments the link
   on the PR. Previews sit behind Vercel's login.
