@@ -10,7 +10,7 @@ import { RELEASE_READY, REPO_URL } from "../config";
 // Then every download button and the nav point here.
 const release = await getRelease();
 const [arm] = release.builds;
-const date = new Date(release.date).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
+const date = new Date(release.date).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" });
 const mb = (bytes: number) => `${Math.round(bytes / 1e6)} MB`;
 const hints: Record<string, string> = { arm64: "M1 or later", x86_64: "Older Intel Macs" };
 const data = JSON.stringify({
@@ -28,6 +28,8 @@ const data = JSON.stringify({
         <span data-for="mac">
           Your download will start automatically. If it doesn’t, <a data-retry href={arm.url}>retry here</a>.
         </span>
+        <span data-for="pick">Which Mac do you have? Pick Apple silicon or Intel to download rac.</span>
+        <span data-for="started">Your download has started. If it didn’t, <a data-retry href={arm.url}>retry here</a>.</span>
         <span data-for="other">rac is for Mac, so nothing downloaded. Pick a version to get it anyway.</span>
       </p>
 
@@ -145,66 +147,84 @@ const data = JSON.stringify({
 
   const root = document.querySelector<HTMLElement>(".dl")!;
   const data: Data = JSON.parse(root.dataset.release!);
-  const retry = root.querySelector<HTMLAnchorElement>("[data-retry]")!;
+  const retries = root.querySelectorAll<HTMLAnchorElement>("[data-retry]");
   const label = root.querySelector<HTMLElement>("[data-arch-label]")!;
   const button = root.querySelector<HTMLButtonElement>(".pick-button")!;
   const menu = root.querySelector<HTMLElement>(".pick-menu")!;
+  const items = [...menu.querySelectorAll<HTMLAnchorElement>("a[data-arch]")];
 
-  // A Mac, and which chip. Chromium says outright; other browsers get a guess
-  // from the GPU name, and most Macs sold since 2020 are Apple silicon, so
-  // that's the default. Nothing here leaves the page.
-  async function detect(): Promise<{ mac: boolean; arch: Arch }> {
+  // A Mac, and which chip, or null when the browser won't say. Chromium
+  // reports the architecture. Elsewhere the GPU gives it away: Intel Macs
+  // have Intel or AMD graphics, and only Apple silicon supports ASTC
+  // textures. Nothing here leaves the page.
+  async function detect(): Promise<{ mac: boolean; arch: Arch | null }> {
     const nav = navigator as Navigator & {
       userAgentData?: { platform: string; getHighEntropyValues(h: string[]): Promise<{ architecture?: string }> };
     };
     const platform = nav.userAgentData?.platform ?? navigator.platform;
     // iPads ask for desktop sites and report a Mac, but have a touch screen.
     const mac = /mac/i.test(platform) && navigator.maxTouchPoints < 2;
-    if (!mac) return { mac, arch: "arm64" };
+    if (!mac) return { mac, arch: null };
     try {
       const { architecture } = (await nav.userAgentData?.getHighEntropyValues(["architecture"])) ?? {};
       if (architecture) return { mac, arch: architecture === "x86" ? "x86_64" : "arm64" };
     } catch {}
     try {
       const gl = document.createElement("canvas").getContext("webgl");
-      const info = gl?.getExtension("WEBGL_debug_renderer_info");
-      const gpu = info ? String(gl!.getParameter(info.UNMASKED_RENDERER_WEBGL)) : "";
-      if (/intel|amd|radeon|nvidia/i.test(gpu)) return { mac, arch: "x86_64" };
+      if (gl) {
+        const info = gl.getExtension("WEBGL_debug_renderer_info");
+        const gpu = info ? String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL)) : "";
+        if (/intel|amd|radeon|nvidia/i.test(gpu)) return { mac, arch: "x86_64" };
+        if (/apple m\d/i.test(gpu) || gl.getExtension("WEBGL_compressed_texture_astc")) return { mac, arch: "arm64" };
+      }
     } catch {}
-    return { mac, arch: "arm64" };
+    return { mac, arch: null };
   }
 
-  function choose(arch: Arch) {
-    const build = data.builds.find((b) => b.arch === arch)!;
-    label.textContent = build.label;
-    retry.href = build.url;
-    menu.querySelectorAll("[data-arch]").forEach((a) => a.setAttribute("aria-checked", String(a.getAttribute("data-arch") === arch)));
+  function choose(arch: Arch | null) {
+    const build = data.builds.find((b) => b.arch === arch);
+    label.textContent = build ? build.label : "Which chip?";
+    for (const a of retries) a.href = (build ?? data.builds[0]).url;
+    for (const a of items) a.setAttribute("aria-checked", String(a.dataset.arch === arch));
     return build;
-  }
-
-  // The disk image is served as an attachment, so navigating to it downloads
-  // without leaving the page. The sample release has nothing to download.
-  function start(arch: Arch) {
-    const build = choose(arch);
-    if (!data.sample) location.href = build.url;
   }
 
   const { mac, arch } = await detect();
   choose(arch);
-  root.dataset.state = mac ? "mac" : "other";
-  // Once per visit, so reloading or coming back doesn't download it again.
+  root.dataset.state = !mac ? "other" : arch ? "mac" : "pick";
+
+  // Start the download once per visit, so reloading or coming back doesn't
+  // download it again. The disk image is served as an attachment, so the
+  // page stays put. The sample release has nothing to download.
   const key = `rac-download-${data.version}`;
-  if (mac && !sessionStorage.getItem(key)) {
+  let started = false;
+  try {
+    started = sessionStorage.getItem(key) !== null;
     sessionStorage.setItem(key, "1");
-    setTimeout(() => start(arch), 600);
-  }
+  } catch {}
+  const build = arch && choose(arch);
+  if (mac && build && !started && !data.sample) setTimeout(() => (location.href = build.url), 600);
 
   const setOpen = (open: boolean) => {
     menu.hidden = !open;
     button.setAttribute("aria-expanded", String(open));
-    if (open) menu.querySelector<HTMLElement>('[aria-checked="true"]')?.focus();
+    if (open) (items.find((a) => a.getAttribute("aria-checked") === "true") ?? items[0]).focus();
   };
-  button.addEventListener("click", () => setOpen(menu.hidden));
+  button.addEventListener("click", () => setOpen(menu.hidden !== false));
+  button.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      setOpen(true);
+    }
+  });
+  menu.addEventListener("keydown", (e) => {
+    const i = items.indexOf(document.activeElement as HTMLAnchorElement);
+    const step = e.key === "ArrowDown" ? 1 : e.key === "ArrowUp" ? -1 : 0;
+    if (step) {
+      e.preventDefault();
+      items[(i + step + items.length) % items.length].focus();
+    } else if (e.key === "Tab") setOpen(false);
+  });
   document.addEventListener("click", (e) => {
     if (!menu.hidden && !(e.target as Element).closest(".pick")) setOpen(false);
   });
@@ -215,23 +235,24 @@ const data = JSON.stringify({
     }
   });
 
-  // Picking a version downloads it, here and in the list below.
+  // Picking a version, here or in the list below, follows its link, which
+  // downloads it.
   root.querySelectorAll<HTMLAnchorElement>("a[data-arch]").forEach((a) =>
-    a.addEventListener("click", (e) => {
-      e.preventDefault();
+    a.addEventListener("click", () => {
       setOpen(false);
-      start(a.dataset.arch as Arch);
-      root.dataset.state = "mac";
+      choose(a.dataset.arch as Arch);
+      root.dataset.state = "started";
     }),
   );
-  retry.addEventListener("click", (e) => {
-    if (data.sample) e.preventDefault();
-  });
 
   root.querySelectorAll<HTMLButtonElement>("[data-copy]").forEach((b) =>
     b.addEventListener("click", async () => {
-      await navigator.clipboard.writeText(b.dataset.copy!);
-      b.textContent = "Copied";
+      try {
+        await navigator.clipboard.writeText(b.dataset.copy!);
+        b.textContent = "Copied";
+      } catch {
+        b.textContent = "Couldn’t copy";
+      }
       setTimeout(() => (b.textContent = "Copy"), 1400);
     }),
   );
@@ -244,8 +265,15 @@ const data = JSON.stringify({
 
   .dl[data-state="nojs"] [data-for="nojs"],
   .dl[data-state="mac"] [data-for="mac"],
+  .dl[data-state="pick"] [data-for="pick"],
+  .dl[data-state="started"] [data-for="started"],
   .dl[data-state="other"] [data-for="other"] {
     display: inline;
+  }
+
+  /* The chip menu needs script; without it, "All downloads" has every link. */
+  .dl[data-state="nojs"] .pick {
+    display: none;
   }
 
   /* Dia's note: one quiet line in a capsule. */
