@@ -14,29 +14,14 @@ export default defineConfig({
   fonts: [
     {
       provider: fontProviders.local(),
-      name: "Newsreader",
-      cssVariable: "--font-newsreader",
-      fallbacks: ["Georgia", "serif"],
-      options: {
-        variants: [
-          {
-            // Newsreader's display cut, made by scripts/make-display-font.py.
-            src: ["./src/assets/fonts/newsreader-display.woff2"],
-            weight: "300 600",
-            style: "normal",
-          },
-        ],
-      },
-    },
-    {
-      provider: fontProviders.local(),
       name: "Inter",
       cssVariable: "--font-inter",
       fallbacks: ["system-ui", "sans-serif"],
       options: {
         variants: [
           {
-            src: ["@fontsource-variable/inter/files/inter-latin-wght-normal.woff2"],
+            // Inter with its optical size axis, so headlines get the display cut.
+            src: ["@fontsource-variable/inter/files/inter-latin-opsz-normal.woff2"],
             weight: "100 900",
             style: "normal",
           },
