@@ -1,0 +1,2275 @@
+Index: src/chrome/browser/rac/agent/action_guard.h
+===================================================================
+--- src.orig/chrome/browser/rac/agent/action_guard.h
++++ src/chrome/browser/rac/agent/action_guard.h
+@@ -37,6 +37,9 @@ struct GuardResult {
+   // The confirmation is only about where the action happens, not what it
+   // does, so the card may offer "Always allow on this site".
+   bool offer_site_rule = false;
++  // A few words for the step's detail row: "site you named", "a form
++  // submit", "typing text you didn't write". Empty for reads.
++  std::string why;
+ };
+ // A standing rule for one origin, from the user (see kAgentSiteRules).
+ enum class SiteRule { kAlways, kNever };
+Index: src/chrome/browser/rac/agent/action_guard.cc
+===================================================================
+--- src.orig/chrome/browser/rac/agent/action_guard.cc
++++ src/chrome/browser/rac/agent/action_guard.cc
+@@ -101,6 +101,38 @@ bool ActionGuard::OnNamedSites(const Act
+          IsNamed(action.risk.target_origin);
+ }
+ 
++namespace {
++// What made the action risky, in a few words, or empty.
++std::string RiskyBecause(const ActionMetadata& action) {
++  const ActionRiskInput& risk = action.risk;
++  if (risk.is_password_field) {
++    return "a password field";
++  }
++  if (risk.is_payment_field) {
++    return "a payment field";
++  }
++  if (risk.is_file_input) {
++    return "a file field";
++  }
++  if (action.submit) {
++    return "a form submit";
++  }
++  if (action.press_enter) {
++    return "Enter in a form";
++  }
++  if (action.closing_user_tab) {
++    return "closing your tab";
++  }
++  if (action.unknown_target) {
++    return "a target it can't classify";
++  }
++  if (HasRiskyTarget(risk)) {
++    return "what the control says it does";
++  }
++  return "";
++}
++}  // namespace
++
+ GuardResult ActionGuard::Evaluate(const ActionMetadata& action) const {
+   const auto* tool = FindToolDefinition(action.risk.tool_name);
+   if (!tool) {
+@@ -110,6 +142,7 @@ GuardResult ActionGuard::Evaluate(const
+   if (tool->kind == ToolKind::kRead) {
+     return {GuardDecision::kAllow, RiskClass::kNone, ""};
+   }
++  const std::string risky_because = RiskyBecause(action);
+   if (action.download ||
+       base::ToLowerASCII(action.risk.element_name).find("download") !=
+           std::string::npos) {
+@@ -175,14 +208,16 @@ GuardResult ActionGuard::Evaluate(const
+       if (!risky && (action.risk.tool_name == "scroll" ||
+                      action.risk.tool_name == "wait_for_settle" ||
+                      action.risk.tool_name == "switch_tab")) {
+-        return {GuardDecision::kAllow, RiskClass::kLow, ""};
++        return {GuardDecision::kAllow, RiskClass::kLow, "", false,
++                "it changes nothing on the page"};
+       }
+       return {GuardDecision::kConfirm,
+               risky ? RiskClass::kConsequential : RiskClass::kLow,
+               risky ? "This step may send information, change an account, or "
+                       "leave the allowed sites."
+                     : "You chose to approve every step.",
+-              may_offer_rule};
++              may_offer_rule,
++              risky ? risky_because : "you chose to approve every step"};
+     case PermissionLevel::kCareful: {
+       // Today's guard: the critic never sees typed text or page prose, so a
+       // plain field, a select, text the user didn't write, and any site the
+@@ -195,29 +230,41 @@ GuardResult ActionGuard::Evaluate(const
+       }
+       if (!plan_allowed_) {
+         return {GuardDecision::kPlan, risk,
+-                "Review the browser plan before starting."};
++                "Review the browser plan before starting.", false,
++                "the first step of a task"};
+       }
+       if (risk != RiskClass::kLow) {
+-        return {
+-            GuardDecision::kConfirm, risk,
+-            "This step may send information, change an account, or leave "
+-            "the allowed sites.",
+-            may_offer_rule && !action.unknown_field && !action.unknown_text};
++        std::string why = risky_because;
++        if (why.empty()) {
++          why = action.unknown_text    ? "typing text you didn't write"
++                : action.unknown_field ? "a field the safety check can't judge"
++                : !allowed(action.risk.current_origin) ||
++                        !allowed(action.frame_origin)
++                    ? "a site the plan didn't allow"
++                    : "another site";
++        }
++        return {GuardDecision::kConfirm, risk,
++                "This step may send information, change an account, or leave "
++                "the allowed sites.",
++                may_offer_rule && !action.unknown_field && !action.unknown_text,
++                why};
+       }
+-      return {GuardDecision::kAllow, risk, ""};
++      return {GuardDecision::kAllow, risk, "", false, "site you named"};
+     }
+     case PermissionLevel::kAuto:
+       if (risky) {
+         return {GuardDecision::kConfirm, RiskClass::kConsequential,
+-                "This step may send information or change an account."};
++                "This step may send information or change an account.", false,
++                risky_because};
+       }
+       if (action.unknown_text && !named) {
+         return {GuardDecision::kConfirm, RiskClass::kConsequential,
+                 "This types text you didn't write, on a site you didn't "
+                 "name.",
+-                may_offer_rule};
++                may_offer_rule, "typing text you didn't write"};
+       }
+-      return {GuardDecision::kAllow, RiskClass::kLow, ""};
++      return {GuardDecision::kAllow, RiskClass::kLow, "", false,
++              named ? "site you named" : "auto level"};
+   }
+ }
+ std::string RiskClassName(RiskClass risk) {
+Index: src/chrome/browser/rac/agent/action_guard_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/rac/agent/action_guard_unittest.cc
++++ src/chrome/browser/rac/agent/action_guard_unittest.cc
+@@ -403,6 +403,28 @@ TEST(ActionGuardSiteRuleTest, NeverBlock
+   }
+ }
+ 
++TEST(ActionGuardLevelTest, EveryDecisionSaysWhyInAFewWords) {
++  ActionGuard guard;
++  guard.BeginTurn(PermissionLevel::kAuto, {}, {"https://example.com"});
++  auto click = Low();
++  click.risk.tool_name = "click";
++  click.risk.element_role = "link";
++  EXPECT_EQ(guard.Evaluate(click).why, "site you named");
++  auto submit = Low();
++  submit.submit = true;
++  EXPECT_EQ(guard.Evaluate(submit).why, "a form submit");
++  auto password = Low();
++  password.risk.is_password_field = true;
++  EXPECT_EQ(guard.Evaluate(password).why, "a password field");
++  auto typing = Low();
++  typing.unknown_text = true;
++  typing.risk.current_origin = "https://other.com";
++  EXPECT_EQ(guard.Evaluate(typing).why, "typing text you didn't write");
++  ActionGuard careful;
++  careful.BeginTurn(PermissionLevel::kCareful, {}, {"https://example.com"});
++  EXPECT_EQ(careful.Evaluate(click).why, "the first step of a task");
++}
++
+ TEST(ActionGuardLevelTest, UnknownLevelNameIsAuto) {
+   EXPECT_EQ(ParsePermissionLevel("auto"), PermissionLevel::kAuto);
+   EXPECT_EQ(ParsePermissionLevel("careful"), PermissionLevel::kCareful);
+Index: src/chrome/browser/rac/agent/agent_controller.cc
+===================================================================
+--- src.orig/chrome/browser/rac/agent/agent_controller.cc
++++ src/chrome/browser/rac/agent/agent_controller.cc
+@@ -270,6 +270,44 @@ content::WebContents* AgentController::T
+              ? found->second.get()
+              : nullptr;
+ }
++void AgentController::CaptureStep() {
++  const RefEntry* entry =
++      current_ ? current_->refs.Lookup(String(pending_.arguments, "ref"))
++               : nullptr;
++  step_args_ = base::DictValue();
++  for (const auto [key, value] : pending_.arguments) {
++    if (key == "text" && entry && (entry->password || entry->sensitive)) {
++      step_args_.Set(key, "[redacted]");
++    } else if (const std::string* text = value.GetIfString()) {
++      step_args_.Set(key, EscapeSnapshotText(*text, 200));
++    } else {
++      step_args_.Set(key, value.Clone());
++    }
++  }
++  step_target_role_ = entry ? entry->role : "";
++  step_target_name_ = entry ? EscapeSnapshotText(entry->name, 100) : "";
++  step_target_ref_ = entry ? entry->ref : "";
++}
++StepDetail AgentController::Detail(const ToolResult* result) const {
++  StepDetail detail;
++  detail.args = step_args_.Clone();
++  detail.target_role = step_target_role_;
++  detail.target_name = step_target_name_;
++  detail.target_ref = step_target_ref_;
++  if (result) {
++    detail.duration_ms = static_cast<int>(
++        (base::TimeTicks::Now() - step_started_).InMilliseconds());
++    detail.guard = step_guard_;
++    detail.critic_verdict = step_critic_verdict_;
++    detail.critic_note = step_critic_note_;
++    if (!result->ok) {
++      detail.result = result->error;
++    } else if (const std::string* text = result->data.FindString("text")) {
++      base::TruncateUTF8ToByteSize(*text, 2000, &detail.result);
++    }
++  }
++  return detail;
++}
+ std::string AgentController::Label() const {
+   const RefEntry* entry =
+       current_ ? current_->refs.Lookup(String(pending_.arguments, "ref"))
+@@ -353,9 +391,15 @@ void AgentController::HandleToolCall(con
+   done_ = std::move(done);
+   step_id_ = "step-" + base::NumberToString(++next_id_);
+   ++steps_;
++  step_started_ = base::TimeTicks::Now();
++  step_guard_.clear();
++  step_critic_verdict_.clear();
++  step_critic_note_.clear();
++  step_confirmed_ = false;
++  CaptureStep();
+   Emit(StepEvent(false, step_id_, pending_.name, Label(), TargetAlias(),
+                  TargetTab() ? base::UTF16ToUTF8(TargetTab()->GetTitle()) : "",
+-                 Origin(TargetTab()), true, ""));
++                 Origin(TargetTab()), true, "", Detail(nullptr)));
+   UpdateIndicator(paused_ ? AgentTabStatus::kPaused : AgentTabStatus::kWorking);
+   if (paused_) {
+     deferred_ = base::BindOnce(&AgentController::ProcessTool,
+@@ -469,6 +513,11 @@ void AgentController::OnPageRead(
+       Finish(Error("stale_ref", "The element changed. Take a new snapshot."));
+       return;
+     }
++    // The field may have turned into a password or payment field since
++    // the step started (a "Show password" toggle), so redact again.
++    if ((entry->password || entry->sensitive) && step_args_.contains("text")) {
++      step_args_.Set("text", "[redacted]");
++    }
+     if (revalidate) {
+       if (approved_fingerprint_.empty() ||
+           entry->policy_fingerprint != approved_fingerprint_) {
+@@ -627,9 +676,13 @@ void AgentController::Authorize() {
+   }
+   const auto decision = guard_.Evaluate(Metadata());
+   if (decision.decision == GuardDecision::kBlock) {
++    step_guard_ = "Blocked: " + decision.reason;
+     Finish(Error("denied", decision.reason));
+     return;
+   }
++  step_guard_ =
++      (decision.decision == GuardDecision::kAllow ? "Allowed: " : "Asked: ") +
++      decision.why;
+   if (decision.decision == GuardDecision::kPlan) {
+     awaiting_plan_ = true;
+     approval_id_ = "approval-" + base::NumberToString(++next_id_);
+@@ -724,6 +777,10 @@ void AgentController::CriticFinished(boo
+   critic_timeout_.Stop();
+   critic_.reset();
+   auto verdict = ParseCriticResponse(critic_text_);
++  step_critic_verdict_ = failed             ? "failed"
++                         : verdict.escalate ? "escalate"
++                                            : "allow";
++  step_critic_note_ = failed ? "" : verdict.note;
+   if (failed || verdict.escalate) {
+     critic_note_ =
+         failed ? "The safety check couldn't finish. Please review this step."
+@@ -760,6 +817,7 @@ void AgentController::RequestConfirmatio
+                      ? meta.frame_origin
+                      : Origin(TargetTab());
+   input.detail = ConfirmationDetail(meta);
++  input.destination = ConfirmationDestination(meta);
+   input.tab_id = TargetAlias();
+   if (held_by_critic) {
+     input.critic_note = critic_note_;
+@@ -825,6 +883,7 @@ bool AgentController::TryRespond(const s
+     return false;
+   }
+   ++confirmed_;
++  step_confirmed_ = true;
+   if (const std::string frame = Metadata().frame_origin;
+       !frame.empty() && frame != "null") {
+     guard_.AllowPlan({frame});
+@@ -1030,7 +1089,15 @@ void AgentController::Finish(ToolResult
+   auto event =
+       StepEvent(true, step_id_, pending_.name, Label(), TargetAlias(),
+                 TargetTab() ? base::UTF16ToUTF8(TargetTab()->GetTitle()) : "",
+-                Origin(TargetTab()), result.ok, result.error);
++                Origin(TargetTab()), result.ok, result.error, Detail(&result));
++  // How the user answered the step's card, so the sidebar can say "allowed"
++  // or "not allowed" whichever of this event and the answer arrives first.
++  if (step_confirmed_) {
++    event.Set("confirmed", true);
++  }
++  if (result.error_code == "declined") {
++    event.Set("declined", true);
++  }
+   current_->log.Append(event.Clone());
+   Emit(std::move(event));
+   approval_id_.clear();
+@@ -1116,12 +1183,14 @@ void AgentController::Cancel() {
+   EndPauses();
+   if (was_active && done_) {
+     ++failed_;
+-    auto event = StepEvent(
+-        true, step_id_, pending_.name, Label(), TargetAlias(),
+-        TargetTab() ? base::UTF16ToUTF8(TargetTab()->GetTitle()) : "",
+-        Origin(TargetTab()), false,
+-        may_have_acted ? "Stopped. This step may already have taken effect."
+-                       : "Stopped.");
++    ToolResult stopped = Error(
++        "cancelled", may_have_acted
++                         ? "Stopped. This step may already have taken effect."
++                         : "Stopped.");
++    auto event =
++        StepEvent(true, step_id_, pending_.name, Label(), TargetAlias(),
++                  TargetTab() ? base::UTF16ToUTF8(TargetTab()->GetTitle()) : "",
++                  Origin(TargetTab()), false, stopped.error, Detail(&stopped));
+     // Nothing was sent to the page, so the sidebar says "not done", not
+     // "didn't work".
+     if (!may_have_acted) {
+Index: src/chrome/browser/rac/agent/agent_controller.h
+===================================================================
+--- src.orig/chrome/browser/rac/agent/agent_controller.h
++++ src/chrome/browser/rac/agent/agent_controller.h
+@@ -16,6 +16,7 @@
+ #include "base/values.h"
+ #include "chrome/browser/rac/agent/action_guard.h"
+ #include "chrome/browser/rac/agent/action_types.h"
++#include "chrome/browser/rac/agent/agent_events.h"
+ #include "chrome/browser/rac/agent/agent_ui_delegate.h"
+ #include "chrome/browser/rac/agent/apc_extract.h"
+ #include "chrome/browser/rac/agent/tool_registry.h"
+@@ -101,6 +102,13 @@ class AgentController : public base::Sup
+   content::WebContents* TargetTab() const;
+   std::string TargetAlias() const;
+   std::string Label() const;
++  // Records the step's arguments and target as they are when it starts.
++  // The action's own snapshot replaces the refs before it finishes, so the
++  // finished event can't look them up again.
++  void CaptureStep();
++  // The detail for the current step's events, from what CaptureStep saw and
++  // the decisions made so far.
++  StepDetail Detail(const ToolResult* result) const;
+   raw_ptr<Profile> profile_;
+   PrefChangeRegistrar prefs_;
+   std::map<std::string, std::unique_ptr<Conversation>> conversations_;
+@@ -118,6 +126,19 @@ class AgentController : public base::Sup
+   base::TimeTicks turn_started_;
+   std::string critic_text_;
+   std::string critic_note_;
++  // What the current step's detail row will show (see StepDetail).
++  base::TimeTicks step_started_;
++  // The arguments, with typed text into a password or payment field
++  // replaced by "[redacted]".
++  base::DictValue step_args_;
++  // The user allowed the current step on its card.
++  bool step_confirmed_ = false;
++  std::string step_target_role_;
++  std::string step_target_name_;
++  std::string step_target_ref_;
++  std::string step_guard_;
++  std::string step_critic_verdict_;
++  std::string step_critic_note_;
+   ActionGuard guard_;
+   std::set<std::string> planned_origins_;
+   bool awaiting_plan_ = false;
+Index: src/chrome/browser/rac/agent/agent_events.cc
+===================================================================
+--- src.orig/chrome/browser/rac/agent/agent_events.cc
++++ src/chrome/browser/rac/agent/agent_events.cc
+@@ -60,7 +60,8 @@ base::DictValue StepEvent(bool finished,
+                           const std::string& tab_title,
+                           const std::string& origin,
+                           bool ok,
+-                          const std::string& error) {
++                          const std::string& error,
++                          const StepDetail& detail) {
+   base::DictValue event;
+   event.Set("type", finished ? "step_finished" : "step_started");
+   event.Set("id", id);
+@@ -69,11 +70,34 @@ base::DictValue StepEvent(bool finished,
+   event.Set("tabId", tab_id);
+   event.Set("tabTitle", tab_title);
+   event.Set("origin", origin);
++  if (!detail.args.empty()) {
++    event.Set("args", detail.args.Clone());
++  }
++  if (!detail.target_ref.empty() || !detail.target_name.empty()) {
++    event.Set("target", base::DictValue()
++                            .Set("role", detail.target_role)
++                            .Set("name", detail.target_name)
++                            .Set("ref", detail.target_ref));
++  }
+   if (finished) {
+     event.Set("ok", ok);
+     if (!error.empty()) {
+       event.Set("error", error);
+     }
++    if (!detail.result.empty()) {
++      event.Set("result", detail.result);
++    }
++    if (detail.duration_ms >= 0) {
++      event.Set("durationMs", detail.duration_ms);
++    }
++    if (!detail.guard.empty()) {
++      event.Set("guard", detail.guard);
++    }
++    if (!detail.critic_verdict.empty()) {
++      event.Set("critic", base::DictValue()
++                              .Set("verdict", detail.critic_verdict)
++                              .Set("note", detail.critic_note));
++    }
+   }
+   return event;
+ }
+@@ -101,6 +125,7 @@ base::DictValue ConfirmRequestEvent(cons
+   event.Set("reason", input.reason);
+   event.Set("origin", input.origin);
+   event.Set("detail", input.detail);
++  event.Set("destination", input.destination);
+   event.Set("tabId", input.tab_id);
+   if (input.critic_note) {
+     event.Set("critic", base::DictValue().Set("note", *input.critic_note));
+@@ -212,16 +237,26 @@ std::string ConfirmationDetail(const Act
+   } else if (tool == "switch_tab") {
+     detail = "Switches to another tab.";
+   }
+-  const bool navigates = tool == "navigate" || tool == "open_tab";
+-  const std::string target = DisplayHost(risk.target_origin);
+-  if (!navigates && (action.submit || action.press_enter) && !target.empty()) {
+-    detail += " It sends the form to " + target + ".";
+-  } else if (!navigates && risk.cross_origin && !target.empty()) {
+-    detail += " It goes to " + target + ".";
++  if (const std::string destination = ConfirmationDestination(action);
++      !destination.empty()) {
++    detail += " " + destination;
+   }
+   return detail;
+ }
+ 
++std::string ConfirmationDestination(const ActionMetadata& action) {
++  const ActionRiskInput& risk = action.risk;
++  const std::string target = DisplayHost(risk.target_origin);
++  if (target.empty() || risk.tool_name == "navigate" ||
++      risk.tool_name == "open_tab") {
++    return "";
++  }
++  if (action.submit || action.press_enter) {
++    return "It sends the form to " + target + ".";
++  }
++  return risk.cross_origin ? "It goes to " + target + "." : "";
++}
++
+ Decision ParseDecision(const std::string& decision) {
+   if (decision == "allow" || decision == "allow_once" ||
+       decision == "confirm") {
+Index: src/chrome/browser/rac/agent/agent_events.h
+===================================================================
+--- src.orig/chrome/browser/rac/agent/agent_events.h
++++ src/chrome/browser/rac/agent/agent_events.h
+@@ -22,6 +22,26 @@ namespace rac::agent {
+ // host.
+ std::string DisplayHost(const std::string& url_or_origin);
+ 
++// What a step's detail row shows when the user opens it. Everything here
++// is for the page to render as text; nothing in it is an instruction.
++struct StepDetail {
++  // The arguments the model sent, with typed text into a password or
++  // payment field replaced by "[redacted]".
++  base::DictValue args;
++  // The element the step targeted, when it had one.
++  std::string target_role;
++  std::string target_name;
++  std::string target_ref;
++  // The first part of what the tool returned, or the full error.
++  std::string result;
++  int duration_ms = -1;
++  // "Allowed: site you named", "Asked: a form submit", "Blocked: ...".
++  std::string guard;
++  // The critic's answer for a careful step: allow, escalate, or failed.
++  std::string critic_verdict;
++  std::string critic_note;
++};
++
+ base::DictValue StepEvent(bool finished,
+                           const std::string& id,
+                           const std::string& tool,
+@@ -30,7 +50,8 @@ base::DictValue StepEvent(bool finished,
+                           const std::string& tab_title,
+                           const std::string& origin,
+                           bool ok,
+-                          const std::string& error);
++                          const std::string& error,
++                          const StepDetail& detail = StepDetail());
+ 
+ base::DictValue PlanRequestEvent(const std::string& id,
+                                  const std::string& goal,
+@@ -45,6 +66,8 @@ struct ConfirmEventInput {
+   std::string reason;
+   std::string origin;
+   std::string detail;
++  // Where a submit or a click to another site goes, in a sentence, or empty.
++  std::string destination;
+   std::string tab_id;
+   // Set when the critic held the step back. May be empty.
+   std::optional<std::string> critic_note;
+@@ -76,6 +99,9 @@ std::string ConfirmationRisk(const Actio
+ // What will happen if the user confirms, in one or two sentences. Never
+ // includes the text to type.
+ std::string ConfirmationDetail(const ActionMetadata& action);
++// The last sentence of ConfirmationDetail: where a submit or a click to
++// another site goes ("It sends the form to shop.example."), or empty.
++std::string ConfirmationDestination(const ActionMetadata& action);
+ 
+ // What a card's button sends back.
+ // kAlways: allow, and remember the site (see kAgentSiteRules).
+Index: src/chrome/browser/rac/agent/agent_events_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/rac/agent/agent_events_unittest.cc
++++ src/chrome/browser/rac/agent/agent_events_unittest.cc
+@@ -176,6 +176,13 @@ TEST(AgentEventsTest, SubmitDetailNamesW
+   action.risk.cross_origin = true;
+   EXPECT_EQ(ConfirmationDetail(action),
+             "Clicks “Sign in”. It sends the form to 127.0.0.1:8772.");
++  // The card shows this sentence on its own.
++  EXPECT_EQ(ConfirmationDestination(action),
++            "It sends the form to 127.0.0.1:8772.");
++  action.submit = false;
++  EXPECT_EQ(ConfirmationDestination(action), "It goes to 127.0.0.1:8772.");
++  action.risk.cross_origin = false;
++  EXPECT_EQ(ConfirmationDestination(action), "");
+ }
+ 
+ TEST(AgentEventsTest, DecisionsFromTheCardsAndTheModelPath) {
+@@ -203,4 +210,32 @@ TEST(AgentEventsTest, AlwaysAllowTravels
+       ConfirmRequestEvent(ConfirmEventInput()).contains("alwaysAllow"));
+   EXPECT_EQ(ParseDecision("always"), Decision::kAlways);
+ }
++TEST(AgentEventsTest, StepDetailTravelsOnlyWhenSet) {
++  const base::DictValue bare =
++      StepEvent(false, "step-1", "click", "Click", "t1", "Shop", "", true, "");
++  EXPECT_EQ(bare.Find("args"), nullptr);
++  EXPECT_EQ(bare.Find("target"), nullptr);
++  EXPECT_EQ(bare.Find("durationMs"), nullptr);
++  StepDetail detail;
++  detail.args.Set("ref", "e7");
++  detail.target_role = "button";
++  detail.target_name = "Sign in";
++  detail.target_ref = "e7";
++  detail.result = "ok";
++  detail.duration_ms = 420;
++  detail.guard = "Asked: a form submit";
++  detail.critic_verdict = "allow";
++  const base::DictValue full = StepEvent(true, "step-1", "click", "Click", "t1",
++                                         "Shop", "", true, "", detail);
++  EXPECT_EQ(*full.FindDict("args")->FindString("ref"), "e7");
++  EXPECT_EQ(*full.FindDict("target")->FindString("name"), "Sign in");
++  EXPECT_EQ(full.FindInt("durationMs"), 420);
++  EXPECT_EQ(*full.FindString("guard"), "Asked: a form submit");
++  EXPECT_EQ(*full.FindDict("critic")->FindString("verdict"), "allow");
++  // A started step never carries a result or timing.
++  const base::DictValue started = StepEvent(false, "step-1", "click", "Click",
++                                            "t1", "Shop", "", true, "", detail);
++  EXPECT_EQ(started.Find("result"), nullptr);
++  EXPECT_EQ(started.Find("durationMs"), nullptr);
++}
+ }  // namespace rac::agent
+Index: src/chrome/browser/resources/rac_ai/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/BUILD.gn
++++ src/chrome/browser/resources/rac_ai/BUILD.gn
+@@ -17,6 +17,7 @@ build_webui("build") {
+   ts_files = [
+     "agent_cards.ts",
+     "agent_events.ts",
++    "agent_rows.ts",
+     "app.ts",
+     "browser_proxy.ts",
+     "fold.ts",
+Index: src/chrome/browser/resources/rac_ai/agent_cards.ts
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/agent_cards.ts
++++ src/chrome/browser/resources/rac_ai/agent_cards.ts
+@@ -7,9 +7,11 @@
+ 
+ import {loadTimeData} from 'chrome://resources/js/load_time_data.js';
+ 
+-import {isActive, pastLabel, presentLabel, stepCount} from './agent_events.js';
+-import type {AgentTask, ConfirmCard, Decision, LogRow, PlanCard, TaskStep} from './agent_events.js';
+-import {makeChevron, makeFold, makeMark} from './fold.js';
++import {isActive, pastLabel, presentLabel} from './agent_events.js';
++import type {AgentTask, ConfirmCard, Decision, PlanCard, TaskStep} from './agent_events.js';
++import {makeRun} from './agent_rows.js';
++import type {RowIcon, RowStatus, RunRow} from './agent_rows.js';
++import {makeChevron, makeMark} from './fold.js';
+ import {makeIcon} from './markdown.js';
+ 
+ export interface CardContext {
+@@ -25,43 +27,19 @@ export interface CardContext {
+ }
+ 
+ // Steps past this many fold into one row.
+-const MAX_OPEN_ROWS = 3;
+ const MAX_SITE_CHIPS = 6;
+-const MAX_TAB_TITLE = 32;
+ const CONFIRM_ARM_MS = 300;
+-const INFO_ICON = 'M10 3.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zM10 9v4.5' +
+-    'M10 6.5v.01';
+ const PAUSE_ICON = 'M7.75 5.5v9M12.25 5.5v9';
+ 
+-// Confirmations that can't be taken back say what they may do, above the
+-// title. Routine ones (a submit, another site, the critic) don't.
+-const RISKS = new Map<string, {text: string, icon: string}>(Object.entries({
+-  purchase: {
+-    text: 'riskPurchase',
+-    icon: 'M3 4h2l1.6 8.2a1 1 0 0 0 1 .8h6.6a1 1 0 0 0 1-.76L16.5 7H6' +
+-        'M8.5 16.25v.01M14 16.25v.01',
+-  },
+-  delete: {
+-    text: 'riskDelete',
+-    icon: 'M4.5 6h11M8 6V4.5h4V6M6 6l.7 9.3a1 1 0 0 0 1 .95h4.6a1 1 0 0 0 ' +
+-        '1-.95L14 6',
+-  },
+-  send: {
+-    text: 'riskSend',
+-    icon: 'M16.5 3.5L9 11M16.5 3.5l-4.75 13-2.75-5.5-5.5-2.75z',
+-  },
+-  sensitive_field: {
+-    text: 'riskSensitive',
+-    icon: 'M6.5 9V7a3.5 3.5 0 0 1 7 0v2M5.5 9h9v7h-9z',
+-  },
+-  upload: {
+-    text: 'riskUpload',
+-    icon: 'M10 12.5V4M6.5 7.5L10 4l3.5 3.5M4.5 13v2.5h11V13',
+-  },
+-  download: {
+-    text: 'riskDownload',
+-    icon: 'M10 4v8.5M6.5 9L10 12.5 13.5 9M4.5 13v2.5h11V13',
+-  },
++// Confirmations that can't be taken back say what they may do, under the
++// title. Routine ones (a submit, another site, the critic) say why instead.
++const RISKS = new Map<string, string>(Object.entries({
++  purchase: 'riskPurchase',
++  delete: 'riskDelete',
++  send: 'riskSend',
++  sensitive_field: 'riskSensitive',
++  upload: 'riskUpload',
++  download: 'riskDownload',
+ }));
+ 
+ function str(key: string, ...args: string[]): string {
+@@ -229,38 +207,32 @@ function buildConfirmCard(
+   card.setAttribute('role', 'group');
+   card.tabIndex = -1;
+   card.dataset['confirmId'] = confirm.id;
+-  const describedBy: string[] = [];
+-  const risk = RISKS.get(confirm.risk);
+-  if (risk) {
+-    const eyebrow = make('div', 'agent-eyebrow');
+-    eyebrow.id = `${base}-risk`;
+-    eyebrow.append(makeIcon(risk.icon), make('span', '', str(risk.text)));
+-    card.appendChild(eyebrow);
+-    describedBy.push(eyebrow.id);
+-  } else {
+-    card.appendChild(
+-        make('div', 'agent-eyebrow agent-waiting', str('waitingForYou')));
+-  }
+   const title = make('h3', 'agent-title', confirm.title);
+   title.id = `${base}-title`;
+   card.setAttribute('aria-labelledby', title.id);
+   card.appendChild(title);
+-  if (confirm.critic !== null) {
+-    const why = make('div', 'agent-why');
+-    why.append(makeIcon(INFO_ICON), make('span', '', whyText(confirm.critic)));
+-    card.appendChild(why);
+-  }
+-  if (confirm.detail) {
+-    const detail = make('div', 'agent-detail', confirm.detail);
+-    detail.id = `${base}-detail`;
+-    describedBy.push(detail.id);
+-    card.appendChild(detail);
+-  }
+-  if (describedBy.length > 0) {
+-    card.setAttribute('aria-describedby', describedBy.join(' '));
++  // One plain line under it: what could happen and where, or else why it
++  // asks. A critic's reason, when there is one, says more than either. A
++  // submit or a click to another site always ends by saying where it goes.
++  const risk = RISKS.get(confirm.risk);
++  const riskText = !risk ? '' :
++      confirm.host       ? str('riskOnHost', str(risk), confirm.host) :
++                           str(risk);
++  const why = confirm.critic !== null ?
++      [whyText(confirm.critic), confirm.destination].filter(Boolean).join(' ') :
++      // The risk words have no period; the destination is a sentence.
++      riskText && confirm.destination ?
++      `${riskText}. ${confirm.destination}` :
++      riskText || confirm.destination || confirm.reason || confirm.detail;
++  if (why) {
++    const reason = make('div', 'confirm-reason', why);
++    reason.id = `${base}-reason`;
++    card.setAttribute('aria-describedby', reason.id);
++    card.appendChild(reason);
+   }
+   if (confirm.noFastModel) {
+-    const note = make('div', 'agent-detail agent-every', str('everyStepNote'));
++    const note =
++        make('div', 'confirm-reason agent-every', str('everyStepNote'));
+     const link = make('button', 'link-button', str('setOneUp'));
+     link.type = 'button';
+     link.addEventListener('click', ctx.openSettings);
+@@ -270,19 +242,18 @@ function buildConfirmCard(
+   const actions = make('div', 'error-actions agent-actions');
+   actions.append(
+       makeButton(
+-          str('confirm'), () => ctx.respond(confirm.id, 'confirm'), 'primary'),
+-      makeButton(str('skip'), () => ctx.respond(confirm.id, 'skip')));
++          str('allowStep'), () => ctx.respond(confirm.id, 'confirm'),
++          'primary'),
++      makeButton(str('dontAllowStep'), () => ctx.respond(confirm.id, 'skip')));
+   if (confirm.alwaysAllowHost) {
+     // Only when the card is about the site, never about the action.
+     actions.appendChild(makeButton(
+         str('alwaysAllowOn', confirm.alwaysAllowHost),
+-        () => ctx.respond(confirm.id, 'always')));
++        () => ctx.respond(confirm.id, 'always'), 'quiet'));
+   }
+-  actions.appendChild(
+-      makeButton(str('stop'), () => ctx.respond(confirm.id, 'stop'), 'quiet'));
+   card.appendChild(actions);
+   // The card arrives while the thread moves. A click meant for whatever was
+-  // under the pointer a moment ago must not land on Confirm.
++  // under the pointer a moment ago must not land on Allow.
+   actions.inert = true;
+   setTimeout(() => actions.inert = false, CONFIRM_ARM_MS);
+ 
+@@ -300,12 +271,6 @@ function buildConfirmCard(
+   return card;
+ }
+ 
+-function tabTitle(step: TaskStep): string {
+-  const title = step.tabTitle;
+-  return title.length > MAX_TAB_TITLE ?
+-      `${title.slice(0, MAX_TAB_TITLE - 1)}\u2026` :
+-      title;
+-}
+ 
+ // What the status line says while the task runs. Null when there's nothing
+ // special to say.
+@@ -317,119 +282,190 @@ export function taskActivity(task: Agent
+   if (task.state === 'paused') {
+     return str('pausedActivity');
+   }
+-  if (task.state !== 'working') {
+-    return null;
++  // While it works, the step in progress is its own row under the run
++  // header, so the status line stays quiet.
++  return null;
++}
++
++// The glyph for a browser tool.
++function iconFor(tool: string): RowIcon {
++  switch (tool) {
++    case 'snapshot':
++    case 'get_page_text':
++    case 'find_in_page':
++      return 'read';
++    case 'click':
++    case 'select_option':
++      return 'click';
++    case 'type':
++    case 'press_key':
++      return 'type';
++    case 'navigate':
++    case 'open_tab':
++      return 'open';
++    case 'scroll':
++      return 'scroll';
++    case 'list_tabs':
++    case 'switch_tab':
++    case 'close_tab':
++      return 'tab';
++    case 'go_back':
++      return 'back';
++    default:
++      return 'wait';
+   }
+-  const running = [...task.log].reverse().find(
+-      row => row.kind === 'step' && row.step.status === 'running');
+-  if (!running || running.kind !== 'step') {
+-    return null;
+-  }
+-  const step = running.step;
+-  if (step.host && /navigate|open|goto|visit/i.test(step.tool)) {
+-    return str('opening', step.host);
+-  }
+-  if (step.tabTitle) {
+-    return str('workingIn', tabTitle(step));
+-  }
+-  return step.label ? `${presentLabel(step.label)}\u2026` : str('workingDots');
+ }
+ 
+-function stepLabel(step: TaskStep): Node[] {
+-  const nodes: Node[] = [];
++// A blocked step's one line, from the browser's reason.
++function blockedLabel(error: string): string {
++  if (/not supplied by the user|outside the approved/i.test(error)) {
++    return str('blockedOutsidePlan');
++  }
++  if (/download/i.test(error)) {
++    return str('blockedDownload');
++  }
++  if (/site rules/i.test(error)) {
++    return str('blockedSiteRule');
++  }
++  if (/http\(s\)/i.test(error)) {
++    return str('blockedNotWeb');
++  }
++  return str('blockedGeneric');
++}
++
++function isBlocked(step: TaskStep): boolean {
++  return step.status === 'failed' &&
++      (step.guard.startsWith('Blocked') ||
++       /not allowed|not supplied|site rules|http\(s\)|can't close/i.test(
++           step.error));
++}
++
++// What the collapsed line says. Finished steps read in the past; a failed
++// one says what went wrong and, when the next step is a fresh read, that
++// the agent looked again.
++function rowLabel(step: TaskStep, next: TaskStep|undefined): string {
+   if (step.status === 'running') {
+-    nodes.push(document.createTextNode(`${presentLabel(step.label)}\u2026`));
+-    return nodes;
++    return `${presentLabel(step.label)}\u2026`;
++  }
++  if (step.status === 'stopped') {
++    return step.label.trim() || str('toolFallback');
+   }
+-  // A step that never happened keeps the browser's own wording ("Click
+-  // “Sign in”"), not the past tense.
+-  const label = (step.status === 'stopped' ? step.label.trim() :
+-                                             pastLabel(step.label)) ||
+-      str('toolFallback');
+-  const parts = [label];
+-  if (step.host && !label.includes(step.host)) {
+-    parts.push(step.host);
++  if (step.skipped) {
++    return step.label.trim() || str('toolFallback');
+   }
+-  nodes.push(document.createTextNode(parts.join(' \u00b7 ')));
+   if (step.status === 'failed') {
+-    nodes.push(make('span', 'step-failed', str('stepFailed')));
++    if (isBlocked(step)) {
++      return blockedLabel(step.error);
++    }
++    // A ref that never matched has no name; say "the element" instead of
++    // empty quotes.
++    const verb = step.label.trim().replace(/\u201c\u201d/g, str('theElement'));
++    let line = verb ?
++        str('couldnt', verb.charAt(0).toLowerCase() + verb.slice(1)) :
++        str('rowFailed');
++    if (next && next.tool === 'snapshot' && next.status === 'done') {
++      line += '. ' + str('thenReadAgain');
++    }
++    return line;
++  }
++  return pastLabel(step.label) || str('toolFallback');
++}
++
++function rowStatus(step: TaskStep): RowStatus {
++  if (step.status === 'running') {
++    return 'running';
+   }
+   if (step.status === 'stopped') {
+-    nodes.push(make('span', 'step-faint', str('stepNotDone')));
++    return 'stopped';
++  }
++  if (step.skipped) {
++    return 'skipped';
+   }
+-  if (step.confirmed) {
+-    nodes.push(make('span', 'step-faint', str('confirmedSuffix')));
++  if (step.status === 'failed') {
++    return isBlocked(step) ? 'blocked' : 'failed';
+   }
+-  return nodes;
++  return step.confirmed ? 'confirmed' : 'done';
++}
++
++function formatMs(ms: number): string {
++  return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`;
+ }
+ 
+-function makeLogRow(task: AgentTask, row: LogRow): HTMLElement {
+-  if (row.kind === 'decision') {
+-    const key = `d-${task.uid}-${row.decision.id}`;
+-    const text = str(
+-        row.decision.verdict === 'confirmed' ? 'confirmedLine' : 'skippedLine',
+-        row.decision.label);
+-    return makeFold(
+-        task, key, [document.createTextNode(text)], () => {}, false,
+-        row.decision.verdict === 'confirmed' ? 'done' : 'skipped');
+-  }
+-  const step = row.step;
+-  const details: Array<[string, string]> = [];
+-  if (step.tabTitle) {
+-    details.push([str('stepTab'), step.tabTitle]);
+-  }
+-  if (step.host) {
+-    details.push([str('stepSite'), step.host]);
+-  }
+-  if (step.error) {
+-    details.push([str('stepError'), step.error]);
+-  }
+-  return makeFold(task, `s-${task.uid}-${step.id}`, stepLabel(step), body => {
+-    for (const [key, value] of details) {
+-      const line = make('div', 'step-detail');
+-      line.append(
+-          make('span', 'step-key', `${key}: `),
+-          make('span', 'step-value', value));
+-      body.appendChild(line);
+-    }
+-  }, details.length > 0, step.status);
+-}
+-
+-function makeLog(task: AgentTask): HTMLElement|null {
+-  // A confirmed step carries its own "confirmed" mark, so its card's line
+-  // would only repeat it.
+-  const confirmedSteps = new Set(task.log.flatMap(
+-      row => row.kind === 'step' && row.step.confirmed ? [row.step.id] : []));
+-  const rows = task.log.filter(
+-      row =>
+-          !(row.kind === 'decision' && row.decision.verdict === 'confirmed' &&
+-            confirmedSteps.has(row.decision.id)));
+-  if (rows.length === 0) {
+-    return null;
+-  }
+-  const list = make('div', 'steps');
+-  if (rows.length <= MAX_OPEN_ROWS) {
+-    for (const row of rows) {
+-      list.appendChild(makeLogRow(task, row));
+-    }
+-    return list;
+-  }
+-  const count = Math.max(stepCount(task), 1);
+-  list.appendChild(makeFold(
+-      task, `log-${task.uid}`,
+-      [document.createTextNode(
+-          count === 1 ? str('oneStep') : str('nSteps', String(count)))],
+-      body => {
+-        for (const row of rows) {
+-          body.appendChild(makeLogRow(task, row));
+-        }
+-      }));
+-  return list;
+-}
+-
+-// A plan or confirm card that waits for the user has its own Stop, so the
+-// paused card only adds Resume next to it. The status line says the same
+-// for screen readers, so the text here is hidden from them.
++// The browser's steps of a task as rows, in order.
++export function taskRows(task: AgentTask): RunRow[] {
++  const steps = task.log.flatMap(row => row.kind === 'step' ? [row.step] : []);
++  return steps.map((step, i): RunRow => {
++    const detail: RunRow['detail'] = [];
++    const pairs: Array<[string, string]> = [[str('detailTool'), step.tool]];
++    for (const [key, value] of step.args) {
++      pairs.push([key, value]);
++    }
++    if (step.target) {
++      const parts = [
++        step.target.role, step.target.name && `\u201c${step.target.name}\u201d`,
++        step.target.ref
++      ].filter(Boolean);
++      pairs.push([str('detailTarget'), parts.join(' ')]);
++    }
++    if (step.host) {
++      pairs.push([str('stepSite'), step.host]);
++    }
++    if (step.tabTitle) {
++      pairs.push([str('stepTab'), step.tabTitle]);
++    }
++    if (step.guard) {
++      pairs.push([str('detailGuard'), step.guard]);
++    }
++    if (step.critic) {
++      pairs.push([
++        str('detailCritic'),
++        step.critic.note ? `${step.critic.verdict}: ${step.critic.note}` :
++                           step.critic.verdict,
++      ]);
++    }
++    if (step.durationMs >= 0) {
++      pairs.push([str('detailTime'), formatMs(step.durationMs)]);
++    }
++    detail.push({kind: 'kv', pairs});
++    const text = step.error || step.result;
++    if (text) {
++      detail.push({kind: 'mono', text});
++    }
++    // The step a confirm card waits on is the card's to show.
++    const status: RowStatus =
++        task.confirm && step.status === 'running' ? 'needs' : rowStatus(step);
++    const foldable = status === 'done' && !step.confirmed &&
++        (step.tool === 'scroll' || step.tool === 'snapshot' ||
++         step.tool === 'get_page_text' || step.tool === 'wait_for_settle');
++    return {
++      key: `s-${task.uid}-${step.id}`,
++      icon: isBlocked(step)      ? 'block' :
++          status === 'failed'    ? 'error' :
++          status === 'confirmed' ? 'confirm' :
++                                   iconFor(step.tool),
++      label: rowLabel(step, steps[i + 1]),
++      status,
++      detail,
++      json: JSON.stringify(
++          {tool: step.tool, args: Object.fromEntries(step.args)}, null, 2),
++      foldKey: foldable ? `${step.tool}:${pastLabel(step.label)}` : undefined,
++      at: step.startMs,
++    };
++  });
++}
++
++// The run block: every row of the reply, the browser's and the agent's own,
++// behind one header.
++export function renderRun(
++    owner: {expanded: Set<string>}, key: string, rows: RunRow[],
++    active: boolean, justEnded = false): HTMLElement|null {
++  return makeRun(owner, key, rows, active, justEnded);
++}
++
++// A plan card that waits for the user has its own Stop, so the paused card
++// only adds Resume next to it. A confirm card leaves Stop to the composer. The
++// status line says the same for screen readers, so the text here is hidden from
++// them.
+ function makePausedActions(ctx: CardContext, withStop: boolean): HTMLElement {
+   const card = make('div', 'agent-card agent-paused');
+   const note = make('div', 'agent-paused-note');
+@@ -461,10 +497,6 @@ export function renderTaskBlocks(
+     updatePlanCard(card, task.plan);
+     blocks.push(card);
+   }
+-  const log = makeLog(task);
+-  if (log) {
+-    blocks.push(log);
+-  }
+   if (task.confirm) {
+     const key = `confirm:${task.confirm.id}`;
+     live.add(key);
+@@ -476,8 +508,7 @@ export function renderTaskBlocks(
+     blocks.push(card);
+   }
+   if (task.state === 'paused') {
+-    blocks.push(makePausedActions(
+-        ctx, !task.confirm && task.plan?.status !== 'pending'));
++    blocks.push(makePausedActions(ctx, task.plan?.status !== 'pending'));
+   }
+   for (const key of [...task.elements.keys()]) {
+     if (!live.has(key)) {
+@@ -494,36 +525,19 @@ function formatDuration(ms: number): str
+       str('durationMinutes', String(Math.round(seconds / 60)));
+ }
+ 
+-// "Done in 1 min · 12 steps · 2 confirmed", or "Stopped after 5 steps".
+-// Empty while the task runs.
++// "Done in 1 min", "Couldn't finish", or "Stopped". The run's line above
++// already counts the steps. Empty while the task runs.
+ export function taskFooter(task: AgentTask): string {
+   if (isActive(task)) {
+     return '';
+   }
+-  const steps = task.summary?.steps || stepCount(task);
+-  const confirmed = task.summary?.confirmed || task.confirmedCount;
+-  const failed = task.summary?.failed || 0;
+-  const failureText =
+-      failed === 1 ? str('oneStepFailed') : str('nStepsFailed', String(failed));
+   if (task.state === 'error') {
+-    return str('couldntFinish') + (failed ? ' \u00b7 ' + failureText : '');
++    return str('couldntFinish');
+   }
+   if (task.state !== 'done') {
+-    return steps === 0 ? str('stopped') :
+-        steps === 1    ? str('stoppedAfterOne') :
+-                         str('stoppedAfter', String(steps));
++    return str('stopped');
+   }
+-  const parts = [str(
++  return str(
+       'doneIn',
+-      formatDuration(task.summary?.durationMs || task.endMs - task.startMs))];
+-  if (steps > 0) {
+-    parts.push(steps === 1 ? str('oneStep') : str('nSteps', String(steps)));
+-  }
+-  if (confirmed > 0) {
+-    parts.push(str('nConfirmed', String(confirmed)));
+-  }
+-  if (failed > 0) {
+-    parts.push(failureText);
+-  }
+-  return parts.join(' \u00b7 ');
++      formatDuration(task.summary?.durationMs || task.endMs - task.startMs));
+ }
+Index: src/chrome/browser/resources/rac_ai/agent_events.ts
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/agent_events.ts
++++ src/chrome/browser/resources/rac_ai/agent_events.ts
+@@ -22,6 +22,16 @@ export type AgentEvent = {
+   error: string,
+   // The browser stopped the task before this step did anything.
+   stopped: boolean,
++  // How the user answered the step's card, when it had one.
++  confirmed: boolean,
++  declined: boolean,
++  // What the detail row shows; see StepDetail in agent_events.h.
++  args: Array<[string, string]>,
++  target: {role: string, name: string, ref: string}|null,
++  result: string,
++  durationMs: number,
++  guard: string,
++  critic: {verdict: string, note: string}|null,
+ }|{
+   type: 'plan_request',
+   id: string,
+@@ -36,6 +46,8 @@ export type AgentEvent = {
+   reason: string,
+   origin: string,
+   detail: string,
++  // Where a submit or a click to another site goes, or empty.
++  destination: string,
+   // Set when the critic held the step back. The note may be empty.
+   critic: string | null,
+   noFastModel: boolean,
+@@ -71,6 +83,28 @@ function count(value: unknown): number {
+       0;
+ }
+ 
++// A dictionary's entries as text pairs, capped.
++function pairs(value: unknown, limit = 12): Array<[string, string]> {
++  if (!value || typeof value !== 'object' || Array.isArray(value)) {
++    return [];
++  }
++  return Object.entries(value as Record<string, unknown>)
++      .slice(0, limit)
++      .map(
++          ([key, item]): [string, string] =>
++              [key.slice(0, 40),
++               typeof item === 'string' ?
++                   item.slice(0, 400) :
++                   JSON.stringify(item ?? null).slice(0, 400),
++  ]);
++}
++
++function record(value: unknown): Record<string, unknown>|null {
++  return value && typeof value === 'object' && !Array.isArray(value) ?
++      value as Record<string, unknown>:
++      null;
++}
++
+ function strings(value: unknown, limit: number): string[] {
+   return Array.isArray(value) ?
+       value.map(item => text(item)).filter(Boolean).slice(0, limit) :
+@@ -97,6 +131,25 @@ export function parseAgentEvent(raw: unk
+         ok: event['ok'] !== false,
+         error: text(event['error']),
+         stopped: event['stopped'] === true,
++        confirmed: event['confirmed'] === true,
++        declined: event['declined'] === true,
++        args: pairs(event['args']),
++        target: record(event['target']) ? {
++          role: text(record(event['target'])!['role'], 40),
++          name: text(record(event['target'])!['name'], 120),
++          ref: text(record(event['target'])!['ref'], 20),
++        } :
++                                          null,
++        result: text(event['result'], 2400),
++        durationMs: typeof event['durationMs'] === 'number' ?
++            count(event['durationMs']) :
++            -1,
++        guard: text(event['guard'], 200),
++        critic: record(event['critic']) ? {
++          verdict: text(record(event['critic'])!['verdict'], 20),
++          note: text(record(event['critic'])!['note']),
++        } :
++                                          null,
+       } :
+                   null;
+     case 'plan_request':
+@@ -118,6 +171,7 @@ export function parseAgentEvent(raw: unk
+         reason: text(event['reason']),
+         origin: text(event['origin']),
+         detail: text(event['detail']),
++        destination: text(event['destination']),
+         critic: critic && typeof critic === 'object' ?
+             text((critic as Record<string, unknown>)['note']) :
+             null,
+@@ -161,6 +215,16 @@ export interface TaskStep {
+   status: 'running'|'done'|'failed'|'stopped';
+   error: string;
+   confirmed: boolean;
++  // The user answered Skip on this step's card.
++  skipped: boolean;
++  startMs: number;
++  // The detail row, filled in as the step's events arrive.
++  args: Array<[string, string]>;
++  target: {role: string, name: string, ref: string}|null;
++  result: string;
++  durationMs: number;
++  guard: string;
++  critic: {verdict: string, note: string}|null;
+ }
+ 
+ // What the user decided on a confirm card, kept as a row in the log.
+@@ -188,8 +252,14 @@ export interface PlanCard {
+ export interface ConfirmCard {
+   id: string;
+   title: string;
++  // The host the step acts on, or empty.
++  host: string;
+   risk: string;
++  // Why the browser asks, in one sentence.
++  reason: string;
+   detail: string;
++  // Where a submit or a click to another site goes, or empty.
++  destination: string;
+   // Why the critic paused the step. Null if it didn't.
+   critic: string|null;
+   noFastModel: boolean;
+@@ -218,8 +288,6 @@ export interface AgentTask {
+   endMs: number;
+   // Only one task in a chat gets the "no fast model" note.
+   noFastModelShown: boolean;
+-  // Confirmed on the card, so the next step to start carries the mark.
+-  confirmNext: boolean;
+   // Rows the user opened, by key.
+   expanded: Set<string>;
+   // The page made this reply for the task, so the task also ends it.
+@@ -248,7 +316,6 @@ export function newTask(standalone: bool
+     startMs: Date.now(),
+     endMs: 0,
+     noFastModelShown: false,
+-    confirmNext: false,
+     expanded: new Set(),
+     standalone,
+     wanted: '',
+@@ -361,16 +428,31 @@ export function applyEvent(task: AgentTa
+           host: '',
+           status: 'running',
+           error: '',
+-          confirmed: task.confirmNext,
++          confirmed: false,
++          skipped: false,
++          startMs: Date.now(),
++          args: [],
++          target: null,
++          result: '',
++          durationMs: -1,
++          guard: '',
++          critic: null,
+         };
+-        task.confirmNext = false;
+         task.log.push({kind: 'step', step});
+       }
+       step.label = event.label || step.label;
+       step.tool = event.tool || step.tool;
+       step.tabTitle = event.tabTitle || step.tabTitle;
+       step.host = hostOfOrigin(event.origin) || step.host;
++      if (event.args.length > 0) {
++        step.args = event.args;
++      }
++      step.target = event.target ?? step.target;
+       if (event.type === 'step_finished') {
++        step.result = event.result;
++        step.durationMs = event.durationMs;
++        step.guard = event.guard || step.guard;
++        step.critic = event.critic ?? step.critic;
+         // A step that the end of the task cut short stays "not done", even
+         // when the browser reports it failed afterward.
+         if (event.ok) {
+@@ -381,6 +463,18 @@ export function applyEvent(task: AgentTa
+           step.status = 'failed';
+         }
+         step.error = event.error;
++        // The browser says how the user answered, since the step can finish
++        // before the answer's own reply reaches the page.
++        step.confirmed ||= event.confirmed;
++        step.skipped ||= event.declined;
++        // A card left up belongs to this step, which can no longer use it
++        // (the tab moved on while it waited).
++        if (task.confirm) {
++          task.confirm = null;
++          if (task.state === 'waiting') {
++            task.state = 'working';
++          }
++        }
+       }
+       if (task.state === 'waiting' || task.state === 'paused') {
+         task.state = 'working';
+@@ -408,11 +502,7 @@ export function applyEvent(task: AgentTa
+     }
+     case 'confirm_request': {
+       const host = hostOfOrigin(event.origin);
+-      let title = event.label || event.reason;
+-      if (host && event.risk !== 'cross_origin' &&
+-          !title.toLowerCase().includes(host)) {
+-        title = `${title} on ${host}`;
+-      }
++      const title = event.label || event.reason;
+       // Field values never reach the card, and for a sensitive field the
+       // browser's own detail is left out as well.
+       const detail = event.risk === 'sensitive_field' ?
+@@ -423,8 +513,11 @@ export function applyEvent(task: AgentTa
+       task.confirm = {
+         id: event.id,
+         title,
++        host,
+         risk: event.risk,
++        reason: event.reason,
+         detail,
++        destination: event.destination,
+         critic: event.critic,
+         noFastModel: showNote,
+         alwaysAllowHost: event.alwaysAllowHost,
+@@ -505,15 +598,17 @@ export function applyDecision(task: Agen
+   }
+   const confirmed = decision === 'confirm' || decision === 'always';
+   task.state = 'working';
++  // The card belongs to the step in progress; its id is the approval's.
++  const steps = task.log.map(row => row.kind === 'step' ? row.step : null);
++  const step = steps.find(s => s?.id === id) ??
++      [...steps].reverse().find(s => s?.status === 'running');
+   if (confirmed) {
+     task.confirmedCount++;
+-    const step = task.log.map(row => row.kind === 'step' ? row.step : null)
+-                     .find(s => s?.id === id);
+     if (step) {
+       step.confirmed = true;
+-    } else {
+-      task.confirmNext = true;
+     }
++  } else if (step) {
++    step.skipped = true;
+   }
+   task.log.push({
+     kind: 'decision',
+Index: src/chrome/browser/resources/rac_ai/agent_rows.ts
+===================================================================
+--- /dev/null
++++ src/chrome/browser/resources/rac_ai/agent_rows.ts
+@@ -0,0 +1,323 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Everything an agent does shows as one quiet row, with the full detail one
++// click away. This file draws the rows and the run they belong to; what a
++// row says comes from agent_events.ts (the browser's steps) and app.ts (an
++// ACP agent's own thoughts and tools).
++
++import {loadTimeData} from 'chrome://resources/js/load_time_data.js';
++
++import type {Expander} from './fold.js';
++import {makeChevron} from './fold.js';
++import {makeIcon} from './markdown.js';
++
++// The glyph set: one stroke style, 20-unit grid, all from the same hand.
++export type RowIcon = 'read'|'click'|'type'|'open'|'scroll'|'tab'|'wait'|'back'|
++    'thought'|'tool'|'confirm'|'block'|'error'|'stop'|'plan';
++
++const ICONS: Record<RowIcon, string> = {
++  read: 'M3.5 10s2.5-4.5 6.5-4.5 6.5 4.5 6.5 4.5-2.5 4.5-6.5 4.5S3.5 10 3.5 ' +
++      '10zM10 11.75a1.75 1.75 0 1 0 0-3.5 1.75 1.75 0 0 0 0 3.5z',
++  click: 'M6 4.5l9 3.75-3.9 1.6L9.5 13.75z M11.1 9.85l3.4 3.4',
++  type: 'M4 6.5h12v7H4zM6.5 9h.01M9 9h.01M11.5 9h.01M14 9h.01M7 11.25h6',
++  open: 'M10 4a6 6 0 1 0 0 12 6 6 0 0 0 0-12zM4 10h12M10 4c-2 2-2 10 0 12M10 ' +
++      '4c2 2 2 10 0 12',
++  scroll: 'M10 4.5v11M6.5 8L10 4.5 13.5 8M6.5 12l3.5 3.5 3.5-3.5',
++  tab: 'M4 6.5a1 1 0 0 1 1-1h4l1.5 1.5H15a1 1 0 0 1 1 1V14a1 1 0 0 1-1 ' +
++      '1H5a1 1 0 0 1-1-1z',
++  wait: 'M10 4a6 6 0 1 0 0 12 6 6 0 0 0 0-12zM10 7v3.5l2.5 1.5',
++  back: 'M9 6.5L5.5 10 9 13.5M5.5 10h9',
++  thought: 'M6.5 14.5c-2 0-3-1.5-3-3 0-1.4 1-2.5 2.2-2.8A3.5 3.5 0 0 1 12 ' +
++      '6.5a3 3 0 0 1 4.5 2.7c0 1.7-1.3 3-3 3H6.5z',
++  tool: 'M12.5 4.5a3 3 0 0 0-3.9 3.9L4 13l3 3 4.6-4.6a3 3 0 0 0 3.9-3.9L13.5 ' +
++      '9.5 11 7z',
++  confirm: 'M10 3.5l5.5 2v4.5c0 3-2.3 5-5.5 6.5-3.2-1.5-5.5-3.5-5.5-6.5V5.5z',
++  block: 'M10 4a6 6 0 1 0 0 12 6 6 0 0 0 0-12zM5.8 5.8l8.4 8.4',
++  error: 'M10 4a6 6 0 1 0 0 12 6 6 0 0 0 0-12zM10 7v3.5M10 13v.01',
++  stop: 'M6.5 6.5h7v7h-7z',
++  plan: 'M5 6h10M5 10h10M5 14h6',
++};
++
++export type RowStatus =
++    'running'|'done'|'failed'|'stopped'|'skipped'|'needs'|'confirmed'|'blocked';
++
++// One section of a row's detail: key: value pairs, a line of text, or a
++// monospace block that scrolls past a few lines.
++export type DetailPart = {
++  kind: 'kv',
++  pairs: Array<[string, string]>,
++}|{kind: 'line', text: string}|{kind: 'mono', text: string};
++
++export interface RunRow {
++  key: string;
++  icon: RowIcon;
++  // The plain verb phrase on the collapsed line.
++  label: string;
++  status: RowStatus;
++  detail: DetailPart[];
++  // The raw payload behind "Copy JSON", when there is one.
++  json?: string;
++  // Adjacent rows that fold into this one, as "Scrolled 3 times".
++  members?: RunRow[];
++  // Rows that say the same thing fold together when both have this and it
++  // matches; empty for rows that always stand alone.
++  foldKey?: string;
++  // When the row's step began, to order the browser's rows with an agent's
++  // own.
++  at: number;
++}
++
++function str(key: string, ...args: string[]): string {
++  return args.length > 0 ? loadTimeData.getStringF(key, ...args) :
++                           loadTimeData.getString(key);
++}
++
++function make<K extends keyof HTMLElementTagNameMap>(
++    tag: K, className = '', text = ''): HTMLElementTagNameMap[K] {
++  const element = document.createElement(tag);
++  if (className) {
++    element.className = className;
++  }
++  if (text) {
++    element.textContent = text;
++  }
++  return element;
++}
++
++export function rowIcon(icon: RowIcon): SVGSVGElement {
++  const svg = makeIcon(ICONS[icon]);
++  svg.classList.add('row-icon');
++  return svg;
++}
++
++// Folds runs of rows that say the same thing into one row with a count.
++export function foldSimilar(rows: RunRow[]): RunRow[] {
++  const out: RunRow[] = [];
++  for (const row of rows) {
++    const last = out[out.length - 1];
++    if (last && row.foldKey && last.foldKey === row.foldKey) {
++      const members = last.members ?? [{...last, members: undefined}];
++      members.push(row);
++      const count = members.length;
++      out[out.length - 1] = {
++        ...last,
++        // The same key however many it folds, so an open fold stays open
++        // as it grows.
++        key: `${members[0]!.key}+fold`,
++        label: count === 2 ? str('twice', row.label) :
++                             str('nTimes', row.label, String(count)),
++        detail: [],
++        json: undefined,
++        members,
++      };
++      continue;
++    }
++    out.push(row);
++  }
++  return out;
++}
++
++// What the tiny text at the row's end says. Done rows show the check only.
++function statusWord(status: RowStatus): string {
++  switch (status) {
++    case 'needs':
++      return str('needsYou');
++    case 'stopped':
++      return str('rowStopped');
++    case 'failed':
++      return str('rowFailed');
++    case 'skipped':
++      return str('rowSkipped');
++    case 'confirmed':
++      return str('rowConfirmed');
++    case 'blocked':
++      return str('rowBlocked');
++    default:
++      return '';
++  }
++}
++
++function makeDetail(row: RunRow): HTMLElement {
++  const body = make('div', 'row-detail');
++  for (const part of row.detail) {
++    if (part.kind === 'kv') {
++      const list = make('dl', 'row-kv');
++      for (const [key, value] of part.pairs) {
++        list.append(make('dt', '', key), make('dd', '', value));
++      }
++      body.appendChild(list);
++    } else if (part.kind === 'line') {
++      body.appendChild(make('div', 'row-line-text', part.text));
++    } else {
++      body.appendChild(make('pre', 'row-mono', part.text));
++    }
++  }
++  if (row.json) {
++    const json = row.json;
++    const copy = make('button', 'row-link', str('copyJson'));
++    copy.type = 'button';
++    copy.addEventListener('click', () => {
++      navigator.clipboard.writeText(json).then(() => {
++        copy.textContent = str('copied');
++        setTimeout(() => copy.textContent = str('copyJson'), 1200);
++      });
++    });
++    body.appendChild(copy);
++  }
++  return body;
++}
++
++// A row that opens its detail in place. The body animates height only, so
++// nothing beside it moves.
++export function makeRow(owner: Expander, row: RunRow): HTMLElement {
++  const wrap = make('div', 'row');
++  wrap.dataset['status'] = row.status;
++  const hasBody = row.detail.length > 0 || !!row.json || !!row.members;
++  const open = hasBody && owner.expanded.has(row.key);
++  const line = make('button', 'row-line');
++  line.type = 'button';
++  line.disabled = !hasBody;
++  line.dataset['stepKey'] = row.key;
++  line.id = `row-${row.key}`;
++  line.setAttribute('aria-expanded', String(open));
++  // The chevron keeps its place on every row, shown or not, so the rows
++  // line up and nothing moves when it appears.
++  line.append(
++      makeChevron(), rowIcon(row.icon), make('span', 'row-label', row.label),
++      makeStatus(row.status));
++  const body = make('div', 'row-body');
++  body.id = `body-${row.key}`;
++  body.setAttribute('role', 'group');
++  body.setAttribute('aria-labelledby', line.id);
++  line.setAttribute('aria-controls', body.id);
++  const inner = make('div', 'row-body-inner');
++  if (row.members) {
++    for (const member of row.members) {
++      inner.appendChild(makeRow(owner, member));
++    }
++  } else {
++    inner.appendChild(makeDetail(row));
++  }
++  body.appendChild(inner);
++  wrap.dataset['open'] = String(open);
++  line.addEventListener('click', () => {
++    const now = wrap.dataset['open'] !== 'true';
++    wrap.dataset['open'] = String(now);
++    line.setAttribute('aria-expanded', String(now));
++    if (now) {
++      owner.expanded.add(row.key);
++    } else {
++      owner.expanded.delete(row.key);
++    }
++  });
++  wrap.append(line, body);
++  return wrap;
++}
++
++// How many steps a list of rows stands for, and how many of them failed,
++// counting the ones the browser blocked.
++function tally(rows: RunRow[]): {steps: number, failed: number} {
++  const all = rows.flatMap(row => row.members ?? [row]);
++  // An agent's thoughts aren't steps, unless thinking is all it did.
++  const acts = all.filter(row => row.icon !== 'thought');
++  const steps = acts.length > 0 ? acts : all;
++  return {
++    steps: steps.length,
++    failed:
++        steps.filter(row => row.status === 'failed' || row.status === 'blocked')
++            .length,
++  };
++}
++
++// The status at the end of a row or the run's line.
++function makeStatus(status: RowStatus): HTMLElement {
++  const element = make('span', 'row-status');
++  const word = statusWord(status);
++  if (word) {
++    element.textContent = word;
++  } else if (status === 'done') {
++    element.appendChild(makeIcon('M5.5 10.25l3 3 6-6.5'));
++  } else if (status === 'running') {
++    const spinner = make('span', 'row-spinner');
++    spinner.setAttribute('aria-hidden', 'true');
++    element.appendChild(spinner);
++  }
++  return element;
++}
++
++// The run is one line. While it works, the line is the step in progress and
++// the steps before it unfold above it, first at the top. Once it ends, the
++// line says "7 steps" and the steps unfold below it; opened, it also says
++// how many failed.
++export function makeRun(
++    owner: Expander, key: string, rows: RunRow[], active: boolean,
++    justEnded = false): HTMLElement|null {
++  // A step waiting on the user shows as its confirm card, so while the run
++  // works the line keeps the step before it rather than repeat the card.
++  const shown = active ? rows.filter(row => row.status !== 'needs') : rows;
++  if (shown.length === 0) {
++    return null;
++  }
++  const live = active ?
++      ([...shown].reverse().find(row => row.status === 'running') ??
++       shown[shown.length - 1]) :
++      undefined;
++  const history = live ? shown.filter(row => row !== live) : shown;
++  const open = history.length > 0 && owner.expanded.has(key);
++  const run = make('div', 'run');
++  run.dataset['open'] = String(open);
++  run.dataset['active'] = String(active);
++  const header = make('button', 'run-header');
++  header.type = 'button';
++  header.disabled = history.length === 0;
++  header.dataset['stepKey'] = key;
++  header.setAttribute('aria-expanded', String(open));
++  header.setAttribute('aria-controls', `run-${key}`);
++  let showCount = (_now: boolean) => {};
++  if (live) {
++    header.dataset['status'] = live.status;
++    header.append(
++        makeChevron(), rowIcon(live.icon),
++        make('span', 'run-title', live.label), makeStatus(live.status));
++  } else {
++    const {steps, failed} = tally(rows);
++    const total = steps === 1 ? str('oneStep') : str('nSteps', String(steps));
++    const title = make('span', 'run-title', total);
++    if (justEnded) {
++      title.classList.add('arriving');
++    }
++    // Opened, the line also says how many of the steps failed.
++    showCount = (now: boolean) => {
++      title.textContent =
++          now && failed > 0 ? str('stepsFailed', total, String(failed)) : total;
++    };
++    showCount(open);
++    header.append(makeChevron(), title);
++  }
++  header.addEventListener('click', () => {
++    const now = run.dataset['open'] !== 'true';
++    run.dataset['open'] = String(now);
++    header.setAttribute('aria-expanded', String(now));
++    showCount(now);
++    if (now) {
++      owner.expanded.add(key);
++    } else {
++      owner.expanded.delete(key);
++    }
++  });
++  const body = make('div', 'run-body');
++  body.id = `run-${key}`;
++  const inner = make('div', 'run-body-inner');
++  for (const row of foldSimilar(history)) {
++    inner.appendChild(makeRow(owner, row));
++  }
++  body.appendChild(inner);
++  if (live) {
++    run.append(body, header);
++  } else {
++    run.append(header, body);
++  }
++  return run;
++}
+Index: src/chrome/browser/resources/rac_ai/app.css
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/app.css
++++ src/chrome/browser/resources/rac_ai/app.css
+@@ -2051,3 +2051,328 @@ body[data-mode='panel'] .composer-wrap {
+     opacity: 0;
+   }
+ }
++
++/* The run: every step of a reply behind one quiet line. While it works the
++ * line is the step in progress, with the earlier steps above it; once it
++ * ends the line is the step count, with the steps below. Rows are 13px
++ * lines on an 8px grid, no borders. Chevrons show on hover, and stay while
++ * open. */
++.run {
++  margin: 4px 0 8px;
++}
++
++.run-header,
++.row-line {
++  align-items: center;
++  background: none;
++  border: 0;
++  border-radius: 6px;
++  color: var(--text-muted);
++  display: flex;
++  font: inherit;
++  font-size: 13px;
++  gap: 8px;
++  height: 28px;
++  line-height: 20px;
++  padding: 0 6px 0 4px;
++  text-align: start;
++  width: 100%;
++}
++
++.run-header:hover:not(:disabled),
++.row-line:hover:not(:disabled) {
++  background: var(--token-hover);
++  color: var(--text);
++}
++
++.run-header:focus-visible,
++.row-line:focus-visible {
++  outline: 2px solid color-mix(in srgb, currentcolor 35%, transparent);
++  outline-offset: -2px;
++}
++
++.run-header:disabled,
++.row-line:disabled {
++  cursor: default;
++}
++
++.run-title,
++.row-label {
++  flex: 0 1 auto;
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.run-header .chevron,
++.row-line .chevron {
++  color: var(--text-faint);
++  flex: none;
++  height: 14px;
++  margin-inline-end: -4px;
++  opacity: 0;
++  rotate: -90deg;
++  stroke-width: 2;
++  transition: rotate 150ms var(--ease-out), opacity 120ms ease;
++  width: 14px;
++}
++
++.run[data-open='true'] > .run-header .chevron,
++.row[data-open='true'] > .row-line .chevron {
++  rotate: 0deg;
++}
++
++/* While the run works, its steps open above the line. */
++.run[data-active='true'][data-open='true'] > .run-header .chevron {
++  rotate: 180deg;
++}
++
++/* An open row keeps its chevron, so it shows how to close. */
++:is(.run-header, button.row-line):is(:hover, :focus-visible,
++    [aria-expanded='true']):not(:disabled) .chevron {
++  opacity: 1;
++}
++
++.run-header[data-status] .row-icon {
++  color: var(--text-muted);
++}
++
++.run-title.arriving {
++  animation: run-title-in 150ms ease-out both;
++}
++
++@keyframes run-title-in {
++  from {
++    opacity: 0;
++  }
++}
++
++.row-icon {
++  color: var(--text-faint);
++  flex: none;
++  height: 15px;
++  stroke-width: 1.7;
++  width: 15px;
++}
++
++.row[data-status='running'] .row-icon,
++.row[data-status='needs'] .row-icon {
++  color: var(--text-muted);
++}
++
++.row[data-status='failed'] .row-icon {
++  color: color-mix(in srgb, var(--error) 70%, var(--text-faint));
++}
++
++.row[data-status='blocked'] .row-icon {
++  color: light-dark(#9a5300, #f2b54d);
++}
++
++/* The tiny status at the row's end: a check, a turning arc, or a word. */
++.row-status {
++  align-items: center;
++  color: var(--text-faint);
++  display: inline-flex;
++  flex: none;
++  font-size: 11px;
++  gap: 4px;
++  height: 20px;
++  line-height: 20px;
++  margin-inline-start: auto;
++}
++
++.row-status svg {
++  height: 14px;
++  stroke-width: 2.2;
++  width: 14px;
++}
++
++.row-spinner {
++  animation: step-spin 0.8s linear infinite;
++  border: 1.5px solid var(--spin-track);
++  border-radius: 50%;
++  border-top-color: var(--text);
++  box-sizing: border-box;
++  height: 12px;
++  width: 12px;
++}
++
++.item-assistant[data-asking] .row-spinner {
++  animation: none;
++  background: #fcbf49;
++  border: 0;
++  height: 7px;
++  width: 7px;
++}
++
++.row[data-status='failed'] .row-status {
++  color: color-mix(in srgb, var(--error) 80%, var(--text-muted));
++}
++
++/* Detail opens by height only, so no row beside it shifts. */
++.run-body,
++.row-body {
++  display: grid;
++  grid-template-rows: 0fr;
++  transition: grid-template-rows 150ms ease-out;
++}
++
++.run[data-open='true'] > .run-body,
++.row[data-open='true'] > .row-body {
++  grid-template-rows: 1fr;
++}
++
++.run-body-inner,
++.row-body-inner {
++  min-height: 0;
++  overflow: hidden;
++}
++
++/* A closed row's body stays out of the tab order. */
++.run[data-open='false'] > .run-body,
++.row[data-open='false'] > .row-body {
++  visibility: hidden;
++}
++
++/* Steps sit a little in from the line they open from: under "7 steps",
++ * and under a folded row such as "Read the page twice". While the run
++ * works, the earlier steps open above the step in progress, level with it. */
++.run[data-active='false'] > .run-body > .run-body-inner,
++.row-body-inner > .row {
++  padding-inline-start: 12px;
++}
++
++/* Lines up with the row's label, past the chevron and the icon. */
++.row-detail {
++  color: var(--text-muted);
++  font-size: 12px;
++  line-height: 18px;
++  padding: 2px 6px 8px 45px;
++}
++
++.row-kv {
++  display: grid;
++  gap: 0 10px;
++  grid-template-columns: max-content minmax(0, 1fr);
++  margin: 0;
++}
++
++.row-kv dt {
++  color: var(--text-faint);
++}
++
++.row-kv dd {
++  margin: 0;
++  overflow-wrap: anywhere;
++}
++
++.row-line-text {
++  overflow-wrap: anywhere;
++}
++
++.row-mono {
++  background: var(--token);
++  border-radius: 6px;
++  color: var(--text-muted);
++  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
++  font-size: 11.5px;
++  line-height: 18px;
++  margin: 6px 0 0;
++  max-height: 148px;
++  overflow: auto;
++  overflow-wrap: anywhere;
++  padding: 6px 8px;
++  white-space: pre-wrap;
++}
++
++.row-link {
++  background: none;
++  border: 0;
++  color: var(--text-muted);
++  font: inherit;
++  font-size: 12px;
++  margin-top: 6px;
++  padding: 0;
++  text-decoration: underline;
++  text-decoration-color: color-mix(in srgb, currentcolor 40%, transparent);
++  text-underline-offset: 2px;
++}
++
++.row-link:hover {
++  color: var(--text);
++}
++
++/* The confirm card: a tinted surface, no edge, no shadow. The title asks,
++ * one dim line says what could happen and where, then the buttons. */
++.confirm-card {
++  background: light-dark(rgb(0 0 0 / 4%), rgb(255 255 255 / 6%));
++  border-color: transparent;
++  border-radius: 12px;
++  box-shadow: none;
++  margin: 4px 0 8px;
++  padding: 12px;
++}
++
++/* It takes focus when it arrives; a ring there would read as a border, so
++ * focus deepens the tint instead. */
++.confirm-card:focus-visible {
++  background: light-dark(rgb(0 0 0 / 6%), rgb(255 255 255 / 8%));
++  border-color: transparent;
++  box-shadow: none;
++}
++
++.confirm-card .agent-title {
++  font-size: 13px;
++  line-height: 20px;
++}
++
++.confirm-reason {
++  color: var(--text-muted);
++  font-size: 12px;
++  line-height: 16px;
++  margin-top: 2px;
++  overflow-wrap: anywhere;
++}
++
++.confirm-card .agent-actions {
++  gap: 4px;
++  margin-top: 12px;
++}
++
++.confirm-card .pill-action {
++  font-size: 12px;
++  height: 24px;
++  padding: 0 10px;
++}
++
++/* "Always allow on <host>" follows the buttons, or wraps under them. */
++.confirm-card .pill-action.quiet {
++  display: block;
++  line-height: 24px;
++  max-width: 100%;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .run-body,
++  .row-body,
++  .run-header .chevron,
++  .row-line .chevron {
++    transition: none;
++  }
++
++  .run-title.arriving {
++    animation: none;
++  }
++
++  .row-spinner {
++    animation: none;
++    background: var(--text);
++    border: 0;
++    height: 6px;
++    width: 6px;
++  }
++}
+Index: src/chrome/browser/resources/rac_ai/app.ts
+===================================================================
+--- src.orig/chrome/browser/resources/rac_ai/app.ts
++++ src/chrome/browser/resources/rac_ai/app.ts
+@@ -7,12 +7,13 @@ import '/strings.m.js';
+ import {loadTimeData} from 'chrome://resources/js/load_time_data.js';
+ import {getRequiredElement} from 'chrome://resources/js/util.js';
+ 
+-import {renderTaskBlocks, taskActivity, taskFooter} from './agent_cards.js';
++import {renderRun, renderTaskBlocks, taskActivity, taskFooter, taskRows} from './agent_cards.js';
+ import type {CardContext} from './agent_cards.js';
+ import {applyDecision, applyEvent, finish, isActive, newTask, parseAgentEvent} from './agent_events.js';
+ import type {AgentTask, Decision} from './agent_events.js';
++import type {RunRow} from './agent_rows.js';
+ import {addWebUiListener, sendToBrowser, sendWithPromise} from './browser_proxy.js';
+-import {makeFold, makeShimmer} from './fold.js';
++import {makeShimmer} from './fold.js';
+ import {classify} from './intent.js';
+ import type {Intent, Mode} from './intent.js';
+ import {makeCopyIcon, makeIcon, renderMarkdown} from './markdown.js';
+@@ -135,6 +136,8 @@ interface Step {
+ // What the page knows about one reply from an agent.
+ interface AgentRun {
+   id: string;
++  // Unique to this reply, for row ids.
++  uid: number;
+   name: string;
+   steps: Step[];
+   plan: PlanEntry[];
+@@ -188,7 +191,6 @@ const START_SLOW_MS = 6000;
+ // A status line stays up at least this long before the next replaces it.
+ const ACTIVITY_MIN_MS = 600;
+ // Steps past this many fold into one "Used N more tools" row.
+-const MAX_OPEN_STEPS = 3;
+ 
+ const messages: Message[] = [];
+ let activeId = 0;
+@@ -1083,9 +1085,13 @@ function selectAgent(agent: AgentInfo) {
+ 
+ // Agent replies
+ 
++// Gives each agent reply its own row ids; the agent id repeats per reply.
++let nextRunUid = 0;
++
+ function newRun(id: string, name: string): AgentRun {
+   return {
+     id,
++    uid: nextRunUid++,
+     name,
+     steps: [],
+     plan: [],
+@@ -1533,56 +1539,54 @@ function isBlockedCommand(step: Step): b
+       step.status === 'failed';
+ }
+ 
+-function makeStepRow(run: AgentRun, step: Step): HTMLElement {
+-  const label: Node[] = [document.createTextNode(stepLabel(run, step))];
+-  if (step.status === 'failed' && !isBlockedCommand(step)) {
+-    const failed = document.createElement('span');
+-    failed.className = 'step-failed';
+-    failed.textContent = loadTimeData.getString('stepFailed');
+-    label.push(failed);
+-  }
+-  const hasBody = step.kind === 'thought' ? step.text.trim() !== '' :
+-                                            step.details.length > 0;
+-  return makeFold(run, step.key, label, body => {
++// What "Copy JSON" gives for an agent's tool call: its input apart from what
++// it returned.
++function toolJson(step: Step): string {
++  const output = step.details.find(([key]) => key === 'result')?.[1];
++  return JSON.stringify(
++      {
++        tool: step.title,
++        input: Object.fromEntries(
++            step.details.filter(([key]) => key !== 'result')),
++        ...(output === undefined ? {} : {output}),
++      },
++      null, 2);
++}
++
++// An agent's own thoughts and tool calls as rows, beside the browser's.
++function agentRows(run: AgentRun, steps: Step[]): RunRow[] {
++  return steps.map((step): RunRow => {
++    const detail: RunRow['detail'] = [];
+     if (step.kind === 'thought') {
+-      body.textContent = step.text.trim();
+-      return;
++      if (step.text.trim()) {
++        detail.push({kind: 'mono', text: step.text.trim()});
++      }
++    } else {
++      const pairs = step.details.filter(([key]) => key !== 'result');
++      if (pairs.length > 0) {
++        detail.push({kind: 'kv', pairs});
++      }
++      const result = step.details.find(([key]) => key === 'result');
++      if (result) {
++        detail.push({kind: 'mono', text: result[1]});
++      }
+     }
+-    for (const [key, value] of step.details) {
+-      const row = document.createElement('div');
+-      row.className = 'step-detail';
+-      const name = document.createElement('span');
+-      name.className = 'step-key';
+-      name.textContent = `${key}: `;
+-      const text = document.createElement('span');
+-      text.className = 'step-value';
+-      text.textContent = value;
+-      row.append(name, text);
+-      body.appendChild(row);
+-    }
+-  }, hasBody, step.status);
+-}
+-
+-function makeSteps(run: AgentRun, steps: Step[]): HTMLElement {
+-  const list = document.createElement('div');
+-  list.className = 'steps';
+-  const shown = steps.slice(0, MAX_OPEN_STEPS);
+-  const folded = steps.slice(MAX_OPEN_STEPS);
+-  for (const step of shown) {
+-    list.appendChild(makeStepRow(run, step));
+-  }
+-  if (folded.length > 0) {
+-    const label = loadTimeData.getStringF(
+-        folded.length === 1 ? 'usedMoreTool' : 'usedMoreTools',
+-        String(folded.length));
+-    list.appendChild(
+-        makeFold(run, 'more', [document.createTextNode(label)], body => {
+-          for (const step of folded) {
+-            body.appendChild(makeStepRow(run, step));
+-          }
+-        }));
+-  }
+-  return list;
++    const blocked = isBlockedCommand(step);
++    return {
++      key: `a-${run.uid}-${step.key}`,
++      icon: step.kind === 'thought' ? 'thought' :
++          blocked                   ? 'block' :
++                                      'tool',
++      label: stepLabel(run, step),
++      status: step.status === 'failed' ? (blocked ? 'blocked' : 'failed') :
++                                         step.status,
++      detail,
++      json: step.kind === 'tool' ? toolJson(step) : undefined,
++      foldKey: step.kind === 'thought' && step.status === 'done' ? 'thought' :
++                                                                   undefined,
++      at: step.startMs,
++    };
++  });
+ }
+ 
+ function makePlan(run: AgentRun): HTMLElement {
+@@ -2071,12 +2075,27 @@ function renderAssistantMessage(message:
+                          .filter(
+                              step => !task || step.kind === 'thought' ||
+                                  isBlockedCommand(step));
+-  if (run && agentSteps.length > 0) {
+-    body.appendChild(makeSteps(run, agentSteps));
+-  }
+-  if (task) {
+-    body.append(...renderTaskBlocks(task, cardContext));
++  const rows = [
++    ...(run ? agentRows(run, agentSteps) : []),
++    ...(task ? taskRows(task) : []),
++  ].sort((a, b) => a.at - b.at);
++  const owner = task ?? run;
++  const runActive = task ? isActive(task) : generating;
++  const blocks = task ? renderTaskBlocks(task, cardContext) : [];
++  const planIndex = blocks.findIndex(b => b.classList.contains('plan-card'));
++  // For a moment after the task ends, the run's line fades from the last
++  // step to the step count.
++  const sinceEnd = task && task.endMs ? Date.now() - task.endMs : Infinity;
++  const justEnded = !runActive && sinceEnd < 200;
++  const runBlock = owner ?
++      renderRun(
++          owner, task ? `run-${task.uid}` : `run-a${run!.uid}`, rows, runActive,
++          justEnded) :
++      null;
++  if (runBlock) {
++    blocks.splice(planIndex + 1, 0, runBlock);
+   }
++  body.append(...blocks);
+   if (run && run.plan.length > 0) {
+     body.appendChild(makePlan(run));
+   }
+@@ -2149,8 +2168,10 @@ function renderAssistantMessage(message:
+ function currentLine(element: HTMLElement, message: Message): [number, number]|
+     null {
+   const target = element.hasAttribute('data-asking') ?
+-      lastOf(element, '.agent-eyebrow, .agent-paused-note') :
+-      lastOf(element, '.steps > .step > .step-row[data-status=\'running\']') ??
++      lastOf(
++          element,
++          '.agent-eyebrow, .agent-paused-note, .confirm-card .agent-title') :
++      lastOf(element, '.run-header[data-status=\'running\']') ??
+           (message.activityEl && !message.activityEl.hidden ?
+                message.activityEl :
+                null);
+Index: src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
++++ src/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+@@ -166,9 +166,33 @@ constexpr Str kStrings[] = {
+     {"allowedOnMore", "Allowed on $1 and $2 more"},
+     {"allowedAnywhere", "Allowed"},
+     {"moreSites", "+$1 more"},
+-    {"confirm", "Confirm"},
+-    {"skip", "Skip"},
++    {"allowStep", "Allow"},
++    {"dontAllowStep", "Don't allow"},
+     {"alwaysAllowOn", "Always allow on $1"},
++    {"twice", "$1 twice"},
++    {"nTimes", "$1 $2 times"},
++    {"needsYou", "needs you"},
++    {"rowStopped", "stopped"},
++    {"rowFailed", "failed"},
++    {"rowSkipped", "not allowed"},
++    {"rowConfirmed", "allowed"},
++    {"rowBlocked", "blocked"},
++    {"copyJson", "Copy JSON"},
++    {"detailTime", "Time"},
++    {"theElement", "the element"},
++    {"detailTarget", "Target"},
++    {"detailGuard", "Guard"},
++    {"detailCritic", "Safety check"},
++    {"detailTool", "Tool"},
++    {"detailResult", "Result"},
++    {"couldnt", "Couldn't $1"},
++    {"thenReadAgain", "Read the page again."},
++    {"blockedOutsidePlan", "Blocked: outside the plan"},
++    {"blockedDownload", "Blocked: a download"},
++    {"blockedSiteRule", "Blocked: your site rule"},
++    {"blockedNotWeb", "Blocked: not a web page"},
++    {"blockedGeneric", "Blocked"},
++    {"askedYou", "Asked you to confirm"},
+     {"pausedBecause", "rac paused: $1."},
+     {"pausedFallback",
+      "rac paused: this step looks unusual for what you asked."},
+@@ -181,13 +205,9 @@ constexpr Str kStrings[] = {
+     {"confirmedSuffix", " \u00b7 confirmed"},
+     {"oneStep", "1 step"},
+     {"nSteps", "$1 steps"},
++    {"stepsFailed", "$1, $2 failed"},
+     {"doneIn", "Done in $1"},
+     {"couldntFinish", "Couldn't finish"},
+-    {"oneStepFailed", "1 step didn't work"},
+-    {"nStepsFailed", "$1 steps didn't work"},
+-    {"nConfirmed", "$1 confirmed"},
+-    {"stoppedAfter", "Stopped after $1 steps"},
+-    {"stoppedAfterOne", "Stopped after 1 step"},
+     {"durationSeconds", "$1s"},
+     {"durationMinutes", "$1 min"},
+     {"waitingForYou", "Waiting for you"},
+@@ -205,6 +225,7 @@ constexpr Str kStrings[] = {
+     {"riskSensitive", "Uses a password or payment field"},
+     {"riskUpload", "May upload a file"},
+     {"riskDownload", "May download a file"},
++    {"riskOnHost", "$1 on $2"},
+ };
+ 
+ }  // namespace
