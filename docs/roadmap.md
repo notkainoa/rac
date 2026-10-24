@@ -118,7 +118,7 @@ Finishing everything up. When this phase is done, rac can be released.
 | Icons and DMG art | App icon, logos, DMG background, in `resources/` only |
 | Onboarding (built) | rac's own first-run flow, with the AI opt-in, space themes, and sidebar layout choices, using Helium's existing importer |
 | Bangs | A settings page to view, edit, delete, and add bangs, with edits that survive list updates, and a rethought address bar experience for bangs. Design first; see [internals/bangs.md](internals/bangs.md) |
-| Performance check | Startup, tab switching, scrolling, and typing compared with Helium, with each feature on and off |
+| Performance check | Startup, tab switching, scrolling, and typing compared with Helium, with each feature on and off. Put the results on the website as a speed section with real charts, replacing the one line in its open-source section |
 | Micro-interactions | Tasteful motion, one worktree per area (sidebar, spaces, AI) |
 | CI and releases | Replace Helium's workflows (especially `bump.yml`), signing, notarization, packaging, in `.github/` and the signing scripts |
 
