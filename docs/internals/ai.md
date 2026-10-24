@@ -608,10 +608,6 @@ detach is posted.
 
 ## Open concerns
 
-Each of these was looked at again in October 2026 when the agent was
-finished. What would close each one is written down so nobody has to work
-it out twice.
-
 - **Page script after an approval.** The guard controls input, navigation,
   popups, downloads, and pickers. It does not control what an approved
   page's own script does with the click: a handler can `fetch()`, post a
