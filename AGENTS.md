@@ -88,6 +88,7 @@ separate Arc-style feature.
 | Chromium or Helium behavior | `patches/rac/<area>/<name>.patch`, listed at the end of `patches/series`, after Helium's entries |
 | Icons, logos, other assets | rac-owned files in `resources/`, wired in through the resource lists |
 | Docs | `VISION.md`, `CONTRIBUTING.md`, `docs/` (see [Documentation](#documentation)) |
+| Marketing site | `site/` |
 | Build or CI | Only when necessary; keep it small and isolated |
 
 How patches are applied, and the quilt workflow for making one, are in
