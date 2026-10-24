@@ -90,8 +90,8 @@ skips them, so nobody would get the update.
 
 Dev builds don't include the updater. To try a change to it:
 
-1. Make a throwaway key with `python3 devutils/rac/sparkle.py keygen`
-   (it needs the `cryptography` package, as above).
+1. Make a throwaway key with `/tmp/sparkle-venv/bin/python
+   devutils/rac/sparkle.py keygen` (the venv from the one-time setup).
 2. Add to `build/src/out/Default/args.gn`:
    ```
    enable_sparkle=true
@@ -104,7 +104,7 @@ Dev builds don't include the updater. To try a change to it:
 4. Write a feed for it, with the private key in
    `RAC_SPARKLE_ED_PRIVATE_KEY`:
    ```sh
-   python3 devutils/rac/sparkle.py appcast --arch arm64 --dmg <dmg> \
+   /tmp/sparkle-venv/bin/python devutils/rac/sparkle.py appcast --arch arm64 --dmg <dmg> \
      --base-url http://127.0.0.1:8765/ --version <new version> \
      --out <folder>/appcast-arm64.xml
    ```
