@@ -120,7 +120,7 @@ Finishing everything up. When this phase is done, rac can be released.
 | Bangs | A settings page to view, edit, delete, and add bangs, with edits that survive list updates, and a rethought address bar experience for bangs. Design first; see [internals/bangs.md](internals/bangs.md) |
 | Performance check | Startup, tab switching, scrolling, and typing compared with Helium, with each feature on and off. Put the results on the website as a speed section with real charts, replacing the one line in its open-source section |
 | Micro-interactions | Tasteful motion, one worktree per area (sidebar, spaces, AI) |
-| CI and releases | Replace Helium's workflows (especially `bump.yml`), signing, notarization, packaging, in `.github/` and the signing scripts |
+| CI and releases | Replace Helium's workflows (especially `bump.yml`), signing, notarization, packaging, in `.github/` and the signing scripts. With the first release, turn on the website's download page ([Releases](operations/releases.md#the-website)) |
 
 Needed before the first release:
 

@@ -30,10 +30,18 @@ None of these need a Chromium build or `he`.
 
 ## Things to know before changing it
 
-- **The download button** reads `RELEASE_READY` in `site/src/config.ts`.
-  While it's `false`, every button says "Coming soon, star the repo" and
-  links to the repository. Set it to `true` when the first release is on
-  GitHub, and the buttons link to the latest release.
+- **`RELEASE_READY`** in `site/src/config.ts` decides how the site treats
+  downloads. While it's `false`, every download button says "Coming soon,
+  star the repo" and links to the repository, and `/download` is hidden: no
+  link points to it, search engines skip it, and it shows sample data. Set
+  it to `true` with the first release (see
+  [Releases](releases.md#the-website)).
+- **The download page** detects Apple silicon or Intel, starts that
+  download once per visit, and lists every build below the install steps.
+  It reads the latest GitHub release when the site builds
+  (`site/src/lib/release.ts`), so visitors never contact GitHub's API, only
+  the file they download. If the release is missing a disk image, or GitHub
+  doesn't answer, the build fails and the last good deployment stays live.
 - **The windows are working drawings of rac.** `site/src/components/rac/`
   rebuilds the sidebar, space editor, and assistant panel in HTML. Sizes were
   measured from the running browser; colors and the eight space themes are

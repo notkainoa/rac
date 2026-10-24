@@ -38,6 +38,27 @@ through that release. How updates work, and why, is in
 Never change the signing key once rac is released. Builds only accept updates
 signed with the key they were built with.
 
+## The website
+
+Do this once, when the first release is out. Until then the site's
+download page is hidden and shows sample data.
+
+1. Set `RELEASE_READY` to `true` in `site/src/config.ts`. The download
+   buttons and the nav then go to `/download`, search engines may index it,
+   and it shows the latest release instead of sample data.
+2. Add a `GITHUB_TOKEN` environment variable to the Vercel project: a
+   fine-grained token with no permissions beyond public repositories. The
+   site reads the latest release from GitHub's API at build time, and
+   without a token, builds share a low rate limit and can fail.
+3. Rebuild the site after each release, so the download page shows it. In
+   Vercel, create a deploy hook for `main` (**Settings > Git > Deploy
+   Hooks**), save its URL as the repository secret `VERCEL_DEPLOY_HOOK`,
+   and add a last step to the release job in `.github/workflows/build.yml`:
+   ```yaml
+   - name: Rebuild the website
+     run: curl -fsS -X POST "${{ secrets.VERCEL_DEPLOY_HOOK }}"
+   ```
+
 ## Making a release
 
 1. Raise the version in `rac_version.txt` and commit it. Use a patch bump
@@ -50,6 +71,8 @@ signed with the key they were built with.
 3. When it finishes, check the new release. It should have both disk
    images, `appcast-arm64.xml`, `appcast-x86_64.xml`, and a `.delta` file
    for each recent version. It's tagged with the version, such as `0.1.1`.
+4. Open <https://racbrowser.com/download> and check that it shows the new
+   version.
 
 Installed copies check the feed about once a day, download the update in
 the background, and install it when rac quits. The feed's address
