@@ -1,8 +1,8 @@
 # The website
 
 rac's marketing site lives in `site/`: a static [Astro](https://astro.build)
-site with Tailwind and one React island (the hero's browser window, animated
-with Motion). It has no analytics, cookies, third-party scripts, or fonts
+site with Tailwind and three React islands (the browser window, the space
+editor, and the assistant), animated with Motion. It has no analytics, cookies, third-party scripts, or fonts
 from other servers, because "nothing phones home" applies to the site too.
 
 ## Layout
@@ -34,14 +34,15 @@ None of these need a Chromium build or `he`.
   While it's `false`, every button says "Coming soon, star the repo" and
   links to the repository. Set it to `true` when the first release is on
   GitHub, and the buttons link to the latest release.
-- **Product pictures are drawings.** The browser windows and sidebars are
-  built in code from the real layout, inside `<ProductShot>` slots. Each
-  slot has a `name` saying which screenshot belongs there once rac's UI
-  settles.
-- **Generated assets.** `site/scripts/make-horizon.mjs` draws the dithered
-  horizon behind the hero. `site/scripts/make-display-font.py` makes the
-  trimmed Newsreader file the headlines use. Rerun them rather than editing
-  their output by hand.
+- **The windows are working drawings of rac.** `site/src/components/rac/`
+  rebuilds the sidebar, space editor, and assistant panel in HTML. Sizes were
+  measured from the running browser; colors and the eight space themes are
+  copied from rac's source (`rac_color_mixer.cc`, `space.cc`,
+  `space_tint_background.cc`, and `resources/rac_ai/app.css`), and the
+  assistant's card wording is rac's own. When one of those changes in rac,
+  update `theme.ts` or `rac-ui.css` so the site keeps telling the truth.
+- **Screenshot slots.** Each drawing sits in a `<ProductShot>` whose `name`
+  says which real screenshot could replace it later.
 - **Keep it private.** Don't add analytics, embeds, or a font service. When
   deploying, leave the host's own analytics and script injection off
   (Vercel Web Analytics and Speed Insights, Cloudflare Web Analytics).
