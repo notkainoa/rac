@@ -7,13 +7,13 @@ import { Toolbar } from "./Toolbar";
 import { CheckIcon, CloseIcon, Favicon, MoreIcon, PlusIcon, ProfileIcon, SendIcon, SparkIcon } from "./icons";
 
 // The assistant and its browser control, played out with rac's own cards and
-// wording (resources/rac_ai). AI starts off, as in rac. Turn it on, send the
+// wording (chrome/browser/resources/rac_ai). AI starts off, as in rac. Turn it on, send the
 // request, and answer the cards: Allow for the plan, Confirm for the one step
 // that sends something.
 
 const HOST = "hanaya-inn.jp";
 const REQUEST = "Book the inn for March 12 to 14, two guests";
-const STEPS = ["Choose March 12 to 14", "Set guests to 2", "Fill in your name and email"];
+const STEPS = ["Choose March 12 to 14", "Set guests to 2", "Fill in your name"];
 
 const SUGGESTIONS = ["Summarize this page", "What would two nights cost?", REQUEST];
 
@@ -24,7 +24,7 @@ type Turn = { id: number; q: string; kind: Kind };
 // What the demo answers. It only knows the page in the tab, and says so.
 function classify(text: string, booked: boolean): Kind {
   const t = text.toLowerCase();
-  if (/\b(book|reserve|fill|sign me up)/.test(t)) return booked ? "booked" : "book";
+  if (/\b(book|reserve|fill( it)? (in|out)|sign me up)\b/.test(t)) return booked ? "booked" : "book";
   if (/\b(cancel|refund)/.test(t)) return "cancel";
   if (/\b(cost|costs|price|prices|pay|much|yen|cheap|expensive)\b|¥/.test(t)) return "price";
   if (/\b(breakfast|food|eat|meals?)\b/.test(t)) return "breakfast";
@@ -167,7 +167,7 @@ export default function AgentDemo() {
   } as CSSProperties;
 
   const filled = phase === "idle" || phase === "plan" ? 0 : phase === "running" || phase === "stopped" ? done : STEPS.length;
-  const working = phase === "running" || phase === "confirm";
+  const working = phase === "running";
   const enter = reduce
     ? { initial: { opacity: 0 }, animate: { opacity: 1 } }
     : { initial: { opacity: 0, transform: "translateY(6px) scale(0.98)" }, animate: { opacity: 1, transform: "translateY(0px) scale(1)" } };
@@ -194,7 +194,7 @@ export default function AgentDemo() {
             {HOST}
           </span>
           <div className="asst-actions">
-            <button type="button" className="asst-pill asst-primary press" onClick={allow} title="Allow (⌘Return)">
+            <button type="button" className="asst-pill asst-primary press" onClick={allow}>
               Allow
             </button>
             <button type="button" className="asst-pill asst-quiet press" onClick={stop}>

@@ -5,18 +5,40 @@ import { Page } from "./Pages";
 import { presets, selectedTab, tint, type Mode } from "./theme";
 import { Toolbar } from "./Toolbar";
 import { AutoIcon, Favicon, MoonIcon, MoreIcon, PlusIcon, ProfileIcon, SearchIcon, SunIcon } from "./icons";
+import { onRadioKeys } from "./radioKeys";
 
 // rac's space editor, working: rename the space, pick light, dark or auto,
 // one of the eight colors, and an emoji for the switcher. The window behind
 // it re-tints with the browser's own formula.
 
-const EMOJI = ["🌿", "🌊", "☕️", "📚", "🎨", "🏔️", "🍋", "🌙", "🧭", "🎧", "🪴", "✈️", "🧪", "🍞", "📷", "🛠️"];
+// Each emoji with the words the search box matches.
+const EMOJI: [string, string][] = [
+  ["🌿", "herb leaf plant green nature"],
+  ["🌊", "wave ocean sea water beach"],
+  ["☕️", "coffee cafe tea morning"],
+  ["📚", "books study read school library"],
+  ["🎨", "art paint palette design"],
+  ["🏔️", "mountain snow hike outdoors"],
+  ["🍋", "lemon fruit yellow"],
+  ["🌙", "moon night sleep evening"],
+  ["🧭", "compass travel explore"],
+  ["🎧", "music headphones listen audio"],
+  ["🪴", "plant pot garden home"],
+  ["✈️", "plane travel trip flight vacation"],
+  ["🧪", "lab science test experiment"],
+  ["🍞", "bread food bake kitchen"],
+  ["📷", "camera photo picture"],
+  ["🛠️", "tools work build fix"],
+];
 
 export default function SpaceEditor() {
   const [name, setName] = useState("Garden");
   const [preset, setPreset] = useState(4);
   const [mode, setMode] = useState<Mode>("auto");
   const [icon, setIcon] = useState("");
+  const [query, setQuery] = useState("");
+  const q = query.trim().toLowerCase();
+  const shown = q ? EMOJI.filter(([, words]) => words.split(" ").some((w) => w.startsWith(q))) : EMOJI;
 
   const style = {
     "--t-l": tint(preset, false),
@@ -104,13 +126,14 @@ export default function SpaceEditor() {
               <span className="sr-only">Space name</span>
               <input value={name} maxLength={24} onChange={(e) => setName(e.target.value)} placeholder="Space 2" spellCheck={false} />
             </label>
-            <div className="se-modes" role="radiogroup" aria-label="Appearance">
+            <div className="se-modes" role="radiogroup" aria-label="Appearance" onKeyDown={onRadioKeys}>
               {modes.map(({ id, label, Icon }) => (
                 <button
                   key={id}
                   type="button"
                   role="radio"
                   aria-checked={mode === id}
+                  tabIndex={mode === id ? 0 : -1}
                   aria-label={label}
                   title={label}
                   className="se-mode"
@@ -121,13 +144,14 @@ export default function SpaceEditor() {
               ))}
             </div>
           </div>
-          <div className="se-swatches" role="radiogroup" aria-label="Color">
+          <div className="se-swatches" role="radiogroup" aria-label="Color" onKeyDown={onRadioKeys}>
             {presets.map((p, i) => (
               <button
                 key={p.name}
                 type="button"
                 role="radio"
                 aria-checked={preset === i}
+                tabIndex={preset === i ? 0 : -1}
                 aria-label={p.name}
                 title={p.name}
                 className="se-swatch"
@@ -138,10 +162,18 @@ export default function SpaceEditor() {
           </div>
           <div className="se-emoji-area">
             <div className="se-search">
-              <span className="se-search-field">
+              <label className="se-search-field">
                 <SearchIcon />
-                Search emoji
-              </span>
+                <span className="sr-only">Search emoji</span>
+                <input
+                  type="search"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Search emoji"
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+              </label>
               <button
                 type="button"
                 className="se-nodot"
@@ -152,12 +184,22 @@ export default function SpaceEditor() {
                 <i />
               </button>
             </div>
-            <div className="se-grid" role="radiogroup" aria-label="Emoji">
-              {EMOJI.map((e) => (
-                <button key={e} type="button" role="radio" aria-checked={icon === e} className="se-e" onClick={() => setIcon(e)}>
+            <div className="se-grid" role="radiogroup" aria-label="Emoji" onKeyDown={onRadioKeys}>
+              {shown.map(([e, words], i) => (
+                <button
+                  key={e}
+                  type="button"
+                  role="radio"
+                  aria-checked={icon === e}
+                  aria-label={words.split(" ")[0]}
+                  tabIndex={icon === e || (!shown.some(([x]) => x === icon) && i === 0) ? 0 : -1}
+                  className="se-e"
+                  onClick={() => setIcon(e)}
+                >
                   {e}
                 </button>
               ))}
+              {!shown.length && <p className="se-none">No emoji match “{query.trim()}”</p>}
             </div>
           </div>
         </div>

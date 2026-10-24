@@ -1,6 +1,7 @@
 // rac's space themes, copied from the browser so the drawings tint exactly
 // like the real window. Source: chrome/browser/rac/spaces/space.cc (presets)
-// and ui/views/rac/spaces/space_tint_background.cc (how they're painted).
+// and chrome/browser/ui/views/rac/spaces/space_tint_background.cc (how
+// they're painted), both added by patches/rac/spaces/.
 
 export interface Preset {
   name: string;
