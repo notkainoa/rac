@@ -472,12 +472,16 @@ multi-step plan. Allowing it adds those origins to the turn. It lets
 low-risk steps run on those sites. It never covers a risky step.
 
 **Confirm.** One card per action that asks, answered with Allow or Don't
-allow (the agent carries on without the step). No default button, no
-keyboard shortcut for Allow. Esc stops the turn. Under the title is one
-line: a risk word and host for a purchase, send, delete, or sensitive field,
-or else the critic's reason, or else the guard's reason. A submit or a
-click to another site adds where it goes ("It sends the form to
-host:port"), after the risk words or the critic's reason. None of it includes typed text.
+allow (the agent carries on without the step, and its row says "not
+allowed"). No default button, no keyboard shortcut for Allow. Esc stops the
+turn. Under the title is one line: the critic's reason when the critic held
+the step; otherwise a risk word and host for a purchase, send, delete,
+upload, download, or sensitive field; otherwise the guard's reason. A
+submit or a click to another site adds where it goes ("It sends the form to
+host:port"), and with no critic or risk word that sentence stands in for the
+guard's reason. None of it includes typed text. The finished step's event
+says whether the user allowed or declined it, because the step can finish
+before the answer's own reply reaches the page.
 
 An approval is for the exact thing the user saw. At approval time, rac
 records the element's identity, its target URL, and for a form control the
@@ -608,12 +612,14 @@ exactly one parser.
   progress, with the earlier steps opening above it; once it ends, "7
   steps", with the steps opening below it and the line saying how many
   failed. The step count lives only there, so the footer under the reply
-  says just how it ended ("Done in 9s"). The browser's steps and an ACP
+  says just how it ended ("Done in 9s"). An agent's thoughts don't count
+  as steps unless thinking is all it did. The browser's steps and an ACP
   agent's own thoughts share the rows, ordered by when they began. Once
   the browser reports steps for a reply, the agent's own tool rows are
   left out (they would repeat the browser's), except a command the browser
-  blocked. Adjacent reads and scrolls fold into one row with a count;
-  failures never fold, and a provider failure is one row at the end with
+  blocked. Adjacent rows that say the same thing (two page reads, three
+  scrolls, a run of thoughts) fold into one row with a count, which stays
+  open as it grows; failures never fold, and a provider failure is one row at the end with
   its fix a link away. The confirm card is the only surface, a tint with
   no edge: what it will do, one line on what could happen and where, and
   the buttons. Stop stays in the composer.
