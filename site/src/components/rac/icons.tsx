@@ -83,6 +83,16 @@ export const SearchIcon = (p: SVGProps<SVGSVGElement>) =>
   );
 export const CheckIcon = (p: SVGProps<SVGSVGElement>) => line(<path d="m4.5 10.5 3.5 3.5 7.5-8" />, { strokeWidth: 2, ...p });
 export const SendIcon = (p: SVGProps<SVGSVGElement>) => line(<path d="M10 16V4.5M5 9.5l5-5 5 5" />, { strokeWidth: 1.9, ...p });
+// Chromium's chat icon, which rac's Chat button uses: a speech bubble with
+// three lines of text.
+export const ChatIcon = (p: SVGProps<SVGSVGElement>) =>
+  line(
+    <>
+      <path d="M3.5 2.75h13a.75.75 0 0 1 .75.75v10a.75.75 0 0 1-.75.75H5.4l-2.65 2.65V3.5a.75.75 0 0 1 .75-.75Z" />
+      <path d="M6 6.3h8M6 9h8M6 11.7h5" />
+    </>,
+    { strokeWidth: 1.5, ...p },
+  );
 export const SparkIcon = (p: SVGProps<SVGSVGElement>) => (
   <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" {...p}>
     <path d="M10 2.5c.5 3.6 1.9 5 5.5 5.5-3.6.5-5 1.9-5.5 5.5-.5-3.6-1.9-5-5.5-5.5 3.6-.5 5-1.9 5.5-5.5Z" />

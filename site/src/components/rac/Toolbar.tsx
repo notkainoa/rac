@@ -1,17 +1,17 @@
-import { BackIcon, ForwardIcon, PuzzleIcon, ReloadIcon, ShieldIcon, SidebarIcon, SparkIcon, TuneIcon } from "./icons";
+import { BackIcon, ChatIcon, ForwardIcon, PuzzleIcon, ReloadIcon, ShieldIcon, SidebarIcon, TuneIcon } from "./icons";
 
-// The toolbar inside the page card. Only the sidebar and assistant buttons
-// do anything.
+// The toolbar inside the page card. Only the sidebar and Chat buttons do
+// anything.
 export function Toolbar({
   host,
   path,
   onSidebar,
-  assistant,
+  chat,
 }: {
   host?: string;
   path?: string;
   onSidebar?: () => void;
-  assistant?: { on: boolean; toggle: () => void };
+  chat?: { open: boolean; toggle: () => void };
 }) {
   return (
     <div className="rac-toolbar">
@@ -41,18 +41,6 @@ export function Toolbar({
           </>
         )}
       </div>
-      {assistant && (
-        <button
-          type="button"
-          className="rac-tool rac-tool-assistant"
-          aria-label="Assistant"
-          aria-pressed={assistant.on}
-          title="Assistant"
-          onClick={assistant.toggle}
-        >
-          <SparkIcon />
-        </button>
-      )}
       <span className="rac-tool" aria-hidden="true">
         <TuneIcon />
       </span>
@@ -62,6 +50,13 @@ export function Toolbar({
       <span className="rac-tool" aria-hidden="true">
         <PuzzleIcon />
       </span>
+      {/* rac's Chat pill, shown only while AI is on. */}
+      {chat && (
+        <button type="button" className="rac-chat" aria-expanded={chat.open} onClick={chat.toggle}>
+          <ChatIcon />
+          Chat
+        </button>
+      )}
     </div>
   );
 }
