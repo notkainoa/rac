@@ -15,7 +15,9 @@ const HOST = "hanaya-inn.jp";
 const REQUEST = "Book the inn for March 12 to 14, two guests";
 const STEPS = ["Choose March 12 to 14", "Set guests to 2", "Fill in your name and email"];
 
-type Phase = "idle" | "plan" | "running" | "confirm" | "done" | "stopped";
+const SUMMARY_REQUEST = "Summarize this page";
+
+type Phase = "idle" | "answer" | "plan" | "running" | "confirm" | "done" | "stopped";
 
 export default function AgentDemo() {
   const [on, setOn] = useState(false);
@@ -38,9 +40,14 @@ export default function AgentDemo() {
     setDone(0);
   };
 
-  const send = () => {
+  const [asked, setAsked] = useState(REQUEST);
+
+  const send = (text: string) => {
+    setAsked(text);
     started.current = performance.now();
-    setPhase("plan");
+    // Reading the page changes nothing, so it just answers. Acting in the
+    // tab starts with a plan card.
+    setPhase(text === REQUEST ? "plan" : "answer");
   };
 
   const allow = () => {
@@ -75,7 +82,7 @@ export default function AgentDemo() {
     "--sel-d": selectedTab(preset, true),
   } as CSSProperties;
 
-  const filled = phase === "idle" || phase === "plan" ? 0 : phase === "running" ? done : STEPS.length;
+  const filled = phase === "idle" || phase === "plan" || phase === "answer" ? 0 : phase === "running" ? done : STEPS.length;
   const working = phase === "running" || phase === "confirm";
   const enter = reduce
     ? { initial: { opacity: 0 }, animate: { opacity: 1 } }
@@ -174,15 +181,36 @@ export default function AgentDemo() {
                 Assistant
               </header>
               <div className="ad-thread" aria-live="polite">
-                {phase === "idle" && <p className="ad-empty">Ask about this page, or ask rac to do something on it.</p>}
+                {phase === "idle" && (
+                  <div className="ad-empty">
+                    <p>Ask about this page, or ask rac to do something on it.</p>
+                    <div className="ad-suggest">
+                      {[SUMMARY_REQUEST, REQUEST].map((t) => (
+                        <button key={t} type="button" className="ad-pill press" onClick={() => send(t)}>
+                          {t}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 {phase !== "idle" && (
                   <>
                     <m.div className="ad-bubble" {...cardMotion}>
-                      {REQUEST}
+                      {asked}
                     </m.div>
-                    <m.p className="ad-reply" {...cardMotion} transition={{ ...cardMotion.transition, delay: 0.15 }}>
-                      I’ll fill in the booking form. You’ll see each step here.
-                    </m.p>
+                    {phase === "answer" ? (
+                      <m.div className="ad-reply" {...cardMotion} transition={{ ...cardMotion.transition, delay: 0.15 }}>
+                        <p>Hanaya Inn rents a tatami garden room in Higashiyama, Kyoto, for ¥32,000 a night with breakfast.</p>
+                        <ul className="ad-answer-list">
+                          <li>Booking needs dates, the number of guests, and a name.</li>
+                          <li>The page doesn’t mention a cancellation policy.</li>
+                        </ul>
+                      </m.div>
+                    ) : (
+                      <m.p className="ad-reply" {...cardMotion} transition={{ ...cardMotion.transition, delay: 0.15 }}>
+                        I’ll fill in the booking form. You’ll see each step here.
+                      </m.p>
+                    )}
                   </>
                 )}
 
@@ -215,7 +243,7 @@ export default function AgentDemo() {
                   </m.div>
                 )}
 
-                {phase !== "idle" && phase !== "plan" && (
+                {phase !== "idle" && phase !== "plan" && phase !== "answer" && (
                   <div className="ad-log">
                     <div className="ad-step" data-status={phase === "stopped" && done === 0 ? "stopped" : "done"}>
                       <Mark status={phase === "stopped" && done === 0 ? "stopped" : "done"} />
@@ -276,15 +304,15 @@ export default function AgentDemo() {
               <div className="ad-composer">
                 {phase === "idle" ? (
                   <>
-                    <span className="ad-input">{REQUEST}</span>
-                    <button type="button" className="ad-send press" aria-label="Send" onClick={send}>
+                    <span className="ad-input ad-placeholder">Ask a question about this page…</span>
+                    <button type="button" className="ad-send press" aria-label={`Send: ${REQUEST}`} onClick={() => send(REQUEST)}>
                       <SendIcon />
                     </button>
                   </>
                 ) : (
                   <>
                     <span className="ad-input ad-placeholder">Ask another question…</span>
-                    {(phase === "done" || phase === "stopped") && (
+                    {(phase === "done" || phase === "stopped" || phase === "answer") && (
                       <button type="button" className="ad-pill press" onClick={reset}>
                         Start over
                       </button>

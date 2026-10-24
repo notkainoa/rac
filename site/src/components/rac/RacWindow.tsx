@@ -4,7 +4,7 @@ import "./rac-ui.css";
 import { NEW_TAB, demoSpaces, favorites, sites, type DemoSpace } from "./data";
 import { Page } from "./Pages";
 import { selectedTab, tint } from "./theme";
-import { CloseIcon, Favicon, MoreIcon, PlusIcon, ProfileIcon } from "./icons";
+import { BackIcon, ChevronIcon, CloseIcon, Favicon, ForwardIcon, MoreIcon, PlusIcon, ProfileIcon, ReloadIcon } from "./icons";
 import { Toolbar } from "./Toolbar";
 
 // A working drawing of rac's window, built to the real measurements: a 202pt
@@ -46,6 +46,9 @@ export default function RacWindow({ compact = false }: { compact?: boolean }) {
   const [index, setIndex] = useState(0);
   const [direction, setDirection] = useState(1);
   const [sidebar, setSidebar] = useState<SidebarState>("shown");
+  // rac's Appearance setting that moves the address bar and toolbar buttons
+  // to the top of the sidebar.
+  const [barInSidebar, setBarInSidebar] = useState(false);
   const reduce = useReducedMotion();
   const rootRef = useRef<HTMLDivElement>(null);
   const sidebarRef = useRef<HTMLElement>(null);
@@ -179,8 +182,9 @@ export default function RacWindow({ compact = false }: { compact?: boolean }) {
           }.`}
         </p>
         <div
-          className="rac-window"
+          className="rac-window rac-intro"
           data-sidebar={sidebar}
+          data-bar={barInSidebar ? "sidebar" : undefined}
           style={windowStyle}
           onPointerMove={(e) => {
             if (sidebar !== "peek" || !sidebarRef.current) return;
@@ -214,7 +218,19 @@ export default function RacWindow({ compact = false }: { compact?: boolean }) {
               <i />
               <i />
               <i />
+              {barInSidebar && (
+                <span className="rac-side-nav">
+                  <BackIcon />
+                  <ForwardIcon className="rac-tool-off" />
+                  <ReloadIcon />
+                </span>
+              )}
             </div>
+            {barInSidebar && (
+              <div className="rac-side-url" aria-hidden="true">
+                {site ? site.host : "Search or enter address"}
+              </div>
+            )}
 
             <div className="rac-favs">
               {favorites.map((f) => (
@@ -326,7 +342,7 @@ export default function RacWindow({ compact = false }: { compact?: boolean }) {
           </aside>
 
           <div className="rac-card">
-            <Toolbar host={site?.host} path={site?.path} onSidebar={toggleSidebar} />
+            {!barInSidebar && <Toolbar host={site?.host} path={site?.path} onSidebar={toggleSidebar} />}
             <div className="rac-page" aria-hidden="true">
               <Page id={activeSite} />
             </div>
@@ -335,6 +351,36 @@ export default function RacWindow({ compact = false }: { compact?: boolean }) {
           {sidebar !== "shown" && (
             <div className="rac-edge" onPointerEnter={() => setSidebar("peek")} aria-hidden="true" />
           )}
+        </div>
+
+        <div className="rac-controls" role="group" aria-label="Try rac">
+          <div className="rac-ctl-spaces">
+            <button type="button" className="rac-ctl rac-ctl-icon" aria-label="Previous space" disabled={index === 0} onClick={() => goTo(index - 1)}>
+              <ChevronIcon flip />
+            </button>
+            <span className="rac-ctl-label" aria-live="polite">
+              {space.name}
+            </span>
+            <button
+              type="button"
+              className="rac-ctl rac-ctl-icon"
+              aria-label="Next space"
+              disabled={index === spaces.length - 1}
+              onClick={() => goTo(index + 1)}
+            >
+              <ChevronIcon />
+            </button>
+          </div>
+          <button type="button" className="rac-ctl" aria-pressed={sidebar !== "shown"} onClick={toggleSidebar}>
+            {sidebar === "shown" ? "Hide sidebar" : "Show sidebar"}
+            <kbd>⌘S</kbd>
+          </button>
+          <button type="button" className="rac-ctl" onClick={openNewTab}>
+            New tab
+          </button>
+          <button type="button" className="rac-ctl" aria-pressed={barInSidebar} onClick={() => setBarInSidebar((v) => !v)}>
+            Address bar in sidebar
+          </button>
         </div>
       </div>
     </LazyMotion>
