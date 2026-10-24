@@ -66,6 +66,7 @@ function Answer({ kind }: { kind: Kind }) {
 
 export default function AgentDemo() {
   const [on, setOn] = useState(false);
+  const [open, setOpen] = useState(false);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [thinking, setThinking] = useState<number | null>(null);
   const [bookTurn, setBookTurn] = useState<number | null>(null);
@@ -148,9 +149,13 @@ export default function AgentDemo() {
     setPhase("stopped");
   };
 
+  // The switch is rac's AI setting: on shows the Chat button and opens the
+  // panel; off hides both. Chat and the panel's close button only open and
+  // close the panel.
   const toggle = () => {
     if (on) reset();
     setOn(!on);
+    setOpen(!on);
   };
 
   const preset = 2;
@@ -269,7 +274,7 @@ export default function AgentDemo() {
         </button>
 
         <div className="rac asst-rac">
-          <div className="rac-window asst-window" data-assistant={on || undefined} style={style}>
+          <div className="rac-window asst-window" data-assistant={open || undefined} style={style}>
             <div className="rac-tint" data-on="true" />
             <aside className="rac-sidebar" aria-hidden="true">
               <div className="rac-lights">
@@ -322,7 +327,7 @@ export default function AgentDemo() {
             </aside>
 
             <div className="rac-card asst-card">
-              <Toolbar host={HOST} path="/book" assistant={{ on, toggle }} />
+              <Toolbar host={HOST} path="/book" chat={on ? { open, toggle: () => setOpen(!open) } : undefined} />
               <div className="rac-page" aria-hidden="true">
                 <Booking filled={filled} booked={phase === "done"} />
                 <AnimatePresence>
@@ -336,7 +341,7 @@ export default function AgentDemo() {
               </div>
             </div>
 
-            <section className="asst-panel" aria-label="Assistant" inert={!on || undefined}>
+            <section className="asst-panel" aria-label="Assistant" inert={!open || undefined}>
               <header className="asst-head">
                 <SparkIcon className="asst-head-icon" />
                 Assistant
@@ -346,7 +351,7 @@ export default function AgentDemo() {
                       Start over
                     </button>
                   )}
-                  <button type="button" className="asst-close press" aria-label="Turn off the assistant" onClick={toggle}>
+                  <button type="button" className="asst-close press" aria-label="Close the assistant" onClick={() => setOpen(false)}>
                     <CloseIcon />
                   </button>
                 </span>
