@@ -36,3 +36,5 @@ them, and traps that are hard to spot from the source.
   at once, each with its own build tree
 - [Releases](operations/releases.md): the signing key, publishing a version,
   and testing updates
+- [The website](operations/site.md): running, building, and deploying the
+  marketing site in `site/`
