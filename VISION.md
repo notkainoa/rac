@@ -104,7 +104,9 @@ AI is a core part of where rac is going. These points hold:
 - When AI is off, none of its code does any work.
 - rac never sees your AI conversations, and rac doesn't run its own AI
   servers.
-- The AI never takes an action in your browser without your confirmation.
+- The AI never does anything risky in your browser (sending, buying,
+  deleting, signing in) without asking you first. You choose how much it
+  asks about everything else.
 
 The AI comes from your own API key, a local model, or an agent you already
 use, such as Claude Code or Codex. How it works, including the agent and its
