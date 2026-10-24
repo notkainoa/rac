@@ -459,12 +459,13 @@ ask, and it covers only that exact origin. `never` blocks every action on
 the site, on any scheme or port, with a reason that names Settings ›
 Assistant. Reads stay free there. In Settings › Assistant the user adds a
 rule by typing a site (a bare host means https) and choosing Never or
-Always, and removes any rule from its chip. A card
+Always, and removes any rule from its chip. At `careful` and `auto`, a card
 offers "Always allow on <host>" only when a rule for the tab's site would
 settle it: the tab's site is one the user hasn't named, any frame or
 destination on another site is already named, and, at `careful`, the step
 is otherwise low risk. Answering it writes the rule for the origin the card
-showed and allows the step. A card for a risky action never offers it.
+showed and allows the step. A card for a risky action never offers it, and
+neither does `ask`, where a rule doesn't skip any card.
 
 **Plan.** Only `careful` shows one. The first action of a turn shows a
 plan card with the next step and the sites involved. It is not an invented
