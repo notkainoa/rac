@@ -6,17 +6,19 @@ export function Toolbar({
   host,
   path,
   onSidebar,
+  sidebarShown,
   chat,
 }: {
   host?: string;
   path?: string;
   onSidebar?: () => void;
+  sidebarShown?: boolean;
   chat?: { open: boolean; toggle: () => void };
 }) {
   return (
     <div className="rac-toolbar">
       {onSidebar ? (
-        <button type="button" className="rac-tool" aria-label="Show or hide the sidebar (⌘S)" title="⌘S" onClick={onSidebar}>
+        <button type="button" className="rac-tool" aria-label="Sidebar (⌘S)" aria-expanded={sidebarShown} title="⌘S" onClick={onSidebar}>
           <SidebarIcon />
         </button>
       ) : (

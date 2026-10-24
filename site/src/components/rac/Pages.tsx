@@ -220,7 +220,7 @@ function Moodboard() {
 }
 
 // rac's new tab page with AI off: a calm, empty page with one shortcut slot.
-export function NewTabPage() {
+function NewTabPage() {
   return (
     <div className="pg pg-ntp">
       <span className="pg-ntp-add">

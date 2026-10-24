@@ -38,10 +38,10 @@ function initialSpaces(): SpaceState[] {
   }));
 }
 
-// Names and colors for spaces added with "+", in the order rac picks them.
+// Colors for spaces added with "+", in the order rac picks them.
 const NEXT_PRESETS = [1, 4, 7, 3, 2];
 
-export default function RacWindow({ compact = false }: { compact?: boolean }) {
+export default function RacWindow() {
   const [spaces, setSpaces] = useState(initialSpaces);
   const [index, setIndex] = useState(0);
   const [direction, setDirection] = useState(1);
@@ -78,11 +78,17 @@ export default function RacWindow({ compact = false }: { compact?: boolean }) {
   const closeTab = (key: string) =>
     update((s) => {
       const i = s.open.findIndex((t) => t.key === key);
-      const open = s.open.filter((t) => t.key !== key);
+      let open = s.open.filter((t) => t.key !== key);
       let active = s.active;
       if (active === key) {
         const neighbor = open[Math.min(i, open.length - 1)];
-        active = neighbor ? neighbor.key : `${s.id}-pin-${s.pinned[0]}`;
+        if (neighbor) active = neighbor.key;
+        else if (s.pinned.length) active = `${s.id}-pin-${s.pinned[0]}`;
+        else {
+          // Nothing left to show, so the space gets a fresh new tab.
+          active = newKey();
+          open = [{ key: active, site: NEW_TAB }];
+        }
       }
       return { ...s, open, active };
     });
@@ -175,7 +181,7 @@ export default function RacWindow({ compact = false }: { compact?: boolean }) {
 
   return (
     <LazyMotion features={domAnimation} strict>
-      <div ref={rootRef} className="rac" data-compact={compact || undefined}>
+      <div ref={rootRef} className="rac">
         <p className="sr-only" aria-live="polite">
           {`rac window, ${space.name} space, showing ${site ? site.title : "a new tab"}${
             sidebar === "shown" ? "" : ", sidebar hidden"
@@ -205,6 +211,8 @@ export default function RacWindow({ compact = false }: { compact?: boolean }) {
             ref={sidebarRef}
             className="rac-sidebar"
             aria-label="Sidebar"
+            // Off screen when hidden, so keep keyboard focus out of it too.
+            inert={sidebar === "hidden" || undefined}
             onWheel={onWheel}
             onPointerDown={onPointerDown}
             onPointerUp={onPointerUp}
@@ -254,9 +262,16 @@ export default function RacWindow({ compact = false }: { compact?: boolean }) {
                   key={space.id}
                   className="rac-space"
                   custom={direction}
-                  initial={{ transform: `translateX(${direction * slide}%)`, opacity: reduce ? 0 : 1 }}
-                  animate={{ transform: "translateX(0%)", opacity: 1 }}
-                  exit={{ transform: `translateX(${direction * -slide}%)`, opacity: reduce ? 0 : 1 }}
+                  // Variants read the latest direction, so a space that's
+                  // leaving slides the way the new one is coming from.
+                  variants={{
+                    enter: (d: number) => ({ transform: `translateX(${d * slide}%)`, opacity: reduce ? 0 : 1 }),
+                    center: { transform: "translateX(0%)", opacity: 1 },
+                    exit: (d: number) => ({ transform: `translateX(${d * -slide}%)`, opacity: reduce ? 0 : 1 }),
+                  }}
+                  initial="enter"
+                  animate="center"
+                  exit="exit"
                   transition={{ duration: reduce ? 0.15 : 0.32, ease: [0.32, 0.72, 0, 1] }}
                 >
                   <div className="rac-space-name">
@@ -342,7 +357,7 @@ export default function RacWindow({ compact = false }: { compact?: boolean }) {
           </aside>
 
           <div className="rac-card">
-            {!barInSidebar && <Toolbar host={site?.host} path={site?.path} onSidebar={toggleSidebar} />}
+            {!barInSidebar && <Toolbar host={site?.host} path={site?.path} onSidebar={toggleSidebar} sidebarShown={sidebar === "shown"} />}
             <div className="rac-page" aria-hidden="true">
               <Page id={activeSite} />
             </div>
@@ -371,7 +386,7 @@ export default function RacWindow({ compact = false }: { compact?: boolean }) {
               <ChevronIcon />
             </button>
           </div>
-          <button type="button" className="rac-ctl" aria-pressed={sidebar !== "shown"} onClick={toggleSidebar}>
+          <button type="button" className="rac-ctl" onClick={toggleSidebar}>
             {sidebar === "shown" ? "Hide sidebar" : "Show sidebar"}
             <kbd>⌘S</kbd>
           </button>
