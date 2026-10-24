@@ -49,13 +49,22 @@ None of these need a Chromium build or `he`.
 
 ## Deploy
 
-The build is plain static files, so any static host works. Both of these
-build from the repo root:
+Vercel builds the site from GitHub. The project is `rac` in the
+`knewton` team, and production is <https://rac-phi.vercel.app>.
 
-| Host | Build command | Output directory |
-| --- | --- | --- |
-| Cloudflare Pages | `pnpm site:build` | `site/dist` |
-| Vercel (framework preset: Other) | `pnpm site:build` | `site/dist` |
+- **Pull requests** get a preview deployment, and Vercel comments the link
+  on the PR. Previews sit behind Vercel's login.
+- **Pushes to `main`** deploy to production.
+- **Changes outside the site skip the build.** The project's root directory
+  is `site/`, with "skip deployments when there are no changes to the root
+  directory or its dependencies" turned on. A patch-only PR gets no
+  preview.
 
-The site doesn't need the `helium-chromium` submodule, so turn off
-submodule cloning in the host's settings if it offers that.
+The build settings live in `site/vercel.json`. The project also sets
+`ENABLE_EXPERIMENTAL_COREPACK=1`, so Vercel uses the pnpm version pinned in
+the root `package.json`.
+
+The build is plain static files, so another static host works too: build
+`pnpm site:build` from the repo root and serve `site/dist`. The site
+doesn't need the `helium-chromium` submodule, so turn off submodule cloning
+if the host offers that.
