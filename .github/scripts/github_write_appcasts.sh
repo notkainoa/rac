@@ -8,10 +8,16 @@ _tag="$1"
 _rac_version=$(python3 "$_root_dir/devutils/rac/rac_version.py" --print)
 _base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${_tag}/"
 
-if [ -z "${PROD_MACOS_SPARKLE_ED_PUB_KEY:-}" ]; then
-  echo "warn: PROD_MACOS_SPARKLE_ED_PUB_KEY is not set, so this build can't update itself; skipping feeds" >&2
-  exit 0
+# A release without feeds strands every installed copy until the next good
+# release, so refuse to publish one.
+if [ -z "${PROD_MACOS_SPARKLE_ED_PUB_KEY:-}" ] || [ -z "${RAC_SPARKLE_ED_PRIVATE_KEY:-}" ]; then
+  echo "error: PROD_MACOS_SPARKLE_ED_PUB_KEY and RAC_SPARKLE_ED_PRIVATE_KEY must both be set to write the update feeds" >&2
+  exit 1
 fi
+# Secrets pasted into GitHub sometimes carry a trailing newline.
+PROD_MACOS_SPARKLE_ED_PUB_KEY=$(printf '%s' "$PROD_MACOS_SPARKLE_ED_PUB_KEY" | tr -d '[:space:]')
+export RAC_SPARKLE_ED_PRIVATE_KEY
+RAC_SPARKLE_ED_PRIVATE_KEY=$(printf '%s' "$RAC_SPARKLE_ED_PRIVATE_KEY" | tr -d '[:space:]')
 
 for _arch in arm64 x86_64; do
   _delta_args=()

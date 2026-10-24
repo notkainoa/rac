@@ -11,8 +11,9 @@ through that release. How updates work, and why, is in
 
 1. Make an update signing key:
    ```sh
-   pip install cryptography
-   devutils/rac/sparkle.py keygen
+   python3 -m venv /tmp/sparkle-venv
+   /tmp/sparkle-venv/bin/pip install cryptography
+   /tmp/sparkle-venv/bin/python devutils/rac/sparkle.py keygen
    ```
    Keep a copy of both lines somewhere safe, such as a password manager. If
    the private key is lost, every installed copy of rac stops accepting
@@ -34,6 +35,8 @@ through that release. How updates work, and why, is in
    CI signs ad hoc, and macOS blocks the first launch of the downloaded app
    until it's allowed in **System Settings > Privacy & Security**. Updates
    still work, because Sparkle checks rac's own signature.
+   `PROD_MACOS_SPECIAL_ENTITLEMENTS_PROFILE_B64` (a base64 provisioning
+   profile) is optional; without it the build has no branded entitlements.
 
 Never change the signing key once rac is released. Builds only accept updates
 signed with the key they were built with.
@@ -70,11 +73,13 @@ download page is hidden and shows sample data.
    done**. A full build takes several hours.
 3. When it finishes, check the new release. It should have both disk
    images, `appcast-arm64.xml`, `appcast-x86_64.xml`, and a `.delta` file
-   for each recent version. It's tagged with the version, such as `0.1.1`.
+   from each of the last few releases (none on the first). It's tagged with
+   the version, such as `0.1.1`, on the commit the workflow was started
+   from.
 4. Open <https://racbrowser.com/download> and check that it shows the new
    version.
 
-Installed copies check the feed about once a day, download the update in
+Installed copies check the feed at launch and then hourly, download the update in
 the background, and install it when rac quits. The feed's address
 (`notkainoa/rac`) is built into rac, in `rac/updates/update-feed.patch`.
 
@@ -85,7 +90,8 @@ skips them, so nobody would get the update.
 
 Dev builds don't include the updater. To try a change to it:
 
-1. Make a throwaway key with `devutils/rac/sparkle.py keygen`.
+1. Make a throwaway key with `/tmp/sparkle-venv/bin/python
+   devutils/rac/sparkle.py keygen` (the venv from the one-time setup).
 2. Add to `build/src/out/Default/args.gn`:
    ```
    enable_sparkle=true
@@ -98,7 +104,7 @@ Dev builds don't include the updater. To try a change to it:
 4. Write a feed for it, with the private key in
    `RAC_SPARKLE_ED_PRIVATE_KEY`:
    ```sh
-   devutils/rac/sparkle.py appcast --arch arm64 --dmg <dmg> \
+   /tmp/sparkle-venv/bin/python devutils/rac/sparkle.py appcast --arch arm64 --dmg <dmg> \
      --base-url http://127.0.0.1:8765/ --version <new version> \
      --out <folder>/appcast-arm64.xml
    ```

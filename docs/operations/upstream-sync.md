@@ -54,8 +54,9 @@ git remote set-url --push upstream no_push
 - **If Helium adds something rac also built,** consider dropping the rac
   patch and building on Helium's version.
 - **Helium's CI workflows** in `.github/` come in with every merge. Review
-  them before turning on GitHub Actions for rac. `bump.yml` in particular
-  runs Helium's submodule bump action, which moves the submodule on its own.
+  them before merging. rac deleted `bump.yml`, which runs Helium's submodule
+  bump action and moves the submodule on its own; delete it again if a merge
+  brings it back.
 
 ## Upstream files rac replaces
 
