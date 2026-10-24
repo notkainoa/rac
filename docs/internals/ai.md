@@ -474,10 +474,10 @@ low-risk steps run on those sites. It never covers a risky step.
 **Confirm.** One card per action that asks, answered with Allow or Don't
 allow (the agent carries on without the step). No default button, no
 keyboard shortcut for Allow. Esc stops the turn. Under the title is one
-line: a risk word and host for a purchase, send, delete, or sensitive field;
-otherwise where a submit or a click to another site goes ("It sends the
-form to host:port"), after the critic's reason when there is one; otherwise
-the guard's reason. None of it includes typed text.
+line: a risk word and host for a purchase, send, delete, or sensitive field,
+or else the critic's reason, or else the guard's reason. A submit or a
+click to another site adds where it goes ("It sends the form to
+host:port"), after the risk words or the critic's reason. None of it includes typed text.
 
 An approval is for the exact thing the user saw. At approval time, rac
 records the element's identity, its target URL, and for a form control the
