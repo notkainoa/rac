@@ -386,8 +386,8 @@ export default function RacWindow() {
               <ChevronIcon />
             </button>
           </div>
-          <button type="button" className="rac-ctl" onClick={toggleSidebar}>
-            {sidebar === "shown" ? "Hide sidebar" : "Show sidebar"}
+          <button type="button" className="rac-ctl" aria-pressed={sidebar !== "shown"} onClick={toggleSidebar}>
+            Hide sidebar
             <kbd>⌘S</kbd>
           </button>
           <button type="button" className="rac-ctl" onClick={openNewTab}>
