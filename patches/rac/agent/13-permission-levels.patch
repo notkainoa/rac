@@ -1,0 +1,659 @@
+Index: src/chrome/browser/extensions/api/settings_private/prefs_util.cc
+===================================================================
+--- src.orig/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ src/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -234,9 +234,10 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[rac::ai::kEnabled] = settings_api::PrefType::kBoolean;
+   (*s_allowlist)[rac::ai::kNewTabPage] = settings_api::PrefType::kBoolean;
+-  (*s_allowlist)[rac::ai::kAttachCurrentTab] =
+-      settings_api::PrefType::kBoolean;
++  (*s_allowlist)[rac::ai::kAttachCurrentTab] = settings_api::PrefType::kBoolean;
+   (*s_allowlist)[rac::ai::kBrowserControl] = settings_api::PrefType::kBoolean;
++  (*s_allowlist)[rac::ai::kAgentPermissionLevel] =
++      settings_api::PrefType::kString;
+   (*s_allowlist)[::prefs::kHeliumCenteredLocationBar] =
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumMinimalLocationBar] =
+Index: src/chrome/browser/rac/agent/action_guard.cc
+===================================================================
+--- src.orig/chrome/browser/rac/agent/action_guard.cc
++++ src/chrome/browser/rac/agent/action_guard.cc
+@@ -6,6 +6,7 @@
+ #include "base/strings/string_util.h"
+ #include "components/optimization_guide/proto/features/common_quality_data.pb.h"
+ #include "url/gurl.h"
++#include "url/origin.h"
+ namespace rac::agent {
+ bool IsNativeSubmitControl(std::string_view type) {
+   using namespace optimization_guide::proto;
+@@ -13,10 +14,22 @@ bool IsNativeSubmitControl(std::string_v
+          type == base::NumberToString(FORM_CONTROL_TYPE_INPUT_SUBMIT) ||
+          type == base::NumberToString(FORM_CONTROL_TYPE_INPUT_IMAGE);
+ }
+-void ActionGuard::BeginTurn(const std::vector<std::string>& user_messages,
++PermissionLevel ParsePermissionLevel(std::string_view name) {
++  if (name == "ask") {
++    return PermissionLevel::kAsk;
++  }
++  if (name == "careful") {
++    return PermissionLevel::kCareful;
++  }
++  return PermissionLevel::kAuto;
++}
++void ActionGuard::BeginTurn(PermissionLevel level,
++                            const std::vector<std::string>& user_messages,
+                             const std::set<std::string>& origins) {
++  level_ = level;
+   urls_.clear();
+   origins_ = origins;
++  named_origins_.clear();
+   plan_allowed_ = false;
+   for (const auto& message : user_messages) {
+     size_t position = 0;
+@@ -34,6 +47,7 @@ void ActionGuard::BeginTurn(const std::v
+       }
+       if (IsAllowedAgentUrl(candidate)) {
+         urls_.insert(GURL(candidate).spec());
++        named_origins_.insert(url::Origin::Create(GURL(candidate)).Serialize());
+       }
+       position = end == std::string::npos ? message.size() : end + 1;
+     }
+@@ -49,6 +63,15 @@ void ActionGuard::AllowPlan(const std::s
+   plan_allowed_ = true;
+ }
+ 
++bool ActionGuard::OnNamedSites(const ActionMetadata& action) const {
++  auto named = [&](const std::string& origin) {
++    return origin.empty() || origin == "null" || origins_.contains(origin) ||
++           named_origins_.contains(origin);
++  };
++  return named(action.risk.current_origin) && named(action.frame_origin) &&
++         named(action.risk.target_origin);
++}
++
+ GuardResult ActionGuard::Evaluate(const ActionMetadata& action) const {
+   const auto* tool = FindToolDefinition(action.risk.tool_name);
+   if (!tool) {
+@@ -75,24 +98,59 @@ GuardResult ActionGuard::Evaluate(const
+               "This URL was not supplied by the user or a visible page link."};
+     }
+   }
+-  RiskClass risk = ClassifyActionRisk(action.risk);
+-  if (action.submit || action.press_enter || action.unknown_target ||
+-      action.closing_user_tab ||
+-      !origins_.contains(action.risk.current_origin) ||
+-      (!action.frame_origin.empty() &&
+-       !origins_.contains(action.frame_origin))) {
+-    risk = RiskClass::kConsequential;
+-  }
+-  if (!plan_allowed_) {
+-    return {GuardDecision::kPlan, risk,
+-            "Review the browser plan before starting."};
+-  }
+-  if (risk != RiskClass::kLow) {
+-    return {GuardDecision::kConfirm, risk,
+-            "This step may send information, change an account, or leave the "
+-            "allowed sites."};
++  // Risky at every level: nothing below lets these through unasked.
++  const bool risky = HasRiskyTarget(action.risk) || action.submit ||
++                     action.press_enter || action.unknown_target ||
++                     action.closing_user_tab;
++  const bool named = OnNamedSites(action);
++  switch (level_) {
++    case PermissionLevel::kAsk:
++      // Scrolling, waiting, and switching tabs change nothing, so they are
++      // as free as reads.
++      if (!risky && (action.risk.tool_name == "scroll" ||
++                     action.risk.tool_name == "wait_for_settle" ||
++                     action.risk.tool_name == "switch_tab")) {
++        return {GuardDecision::kAllow, RiskClass::kLow, ""};
++      }
++      return {GuardDecision::kConfirm,
++              risky ? RiskClass::kConsequential : RiskClass::kLow,
++              risky ? "This step may send information, change an account, or "
++                      "leave the allowed sites."
++                    : "You chose to approve every step."};
++    case PermissionLevel::kCareful: {
++      // Today's guard: the critic never sees typed text or page prose, so a
++      // plain field, a select, text the user didn't write, and any site the
++      // plan didn't allow go to the user instead.
++      RiskClass risk = ClassifyActionRisk(action.risk);
++      if (risky || action.unknown_field || action.unknown_text ||
++          !origins_.contains(action.risk.current_origin) ||
++          (!action.frame_origin.empty() &&
++           !origins_.contains(action.frame_origin))) {
++        risk = RiskClass::kConsequential;
++      }
++      if (!plan_allowed_) {
++        return {GuardDecision::kPlan, risk,
++                "Review the browser plan before starting."};
++      }
++      if (risk != RiskClass::kLow) {
++        return {GuardDecision::kConfirm, risk,
++                "This step may send information, change an account, or leave "
++                "the allowed sites."};
++      }
++      return {GuardDecision::kAllow, risk, ""};
++    }
++    case PermissionLevel::kAuto:
++      if (risky) {
++        return {GuardDecision::kConfirm, RiskClass::kConsequential,
++                "This step may send information or change an account."};
++      }
++      if (action.unknown_text && !named) {
++        return {GuardDecision::kConfirm, RiskClass::kConsequential,
++                "This types text you didn't write, on a site you didn't "
++                "name."};
++      }
++      return {GuardDecision::kAllow, RiskClass::kLow, ""};
+   }
+-  return {GuardDecision::kAllow, risk, ""};
+ }
+ std::string RiskClassName(RiskClass risk) {
+   switch (risk) {
+Index: src/chrome/browser/rac/agent/action_guard.h
+===================================================================
+--- src.orig/chrome/browser/rac/agent/action_guard.h
++++ src/chrome/browser/rac/agent/action_guard.h
+@@ -15,7 +15,16 @@ struct ActionMetadata {
+   std::string frame_origin;
+   bool submit = false;
+   bool press_enter = false;
++  // A click on something that isn't a link, a checkbox, a radio, or a
++  // submit control, or a history navigation: the guard can't say what it
++  // does, so it is risky at every level.
+   bool unknown_target = false;
++  // Typing into a plain text field, or choosing in a select. Harmless on
++  // its own; only the careful level asks about it, because its critic has
++  // no page text to judge it with.
++  bool unknown_field = false;
++  // The typed text does not appear in the user's messages.
++  bool unknown_text = false;
+   bool download = false;
+   bool closing_user_tab = false;
+ };
+@@ -25,18 +34,34 @@ struct GuardResult {
+   RiskClass risk = RiskClass::kConsequential;
+   std::string reason;
+ };
++// How much the agent asks. The pref holds the names in ai_prefs.h.
++enum class PermissionLevel { kAsk, kCareful, kAuto };
++// An unknown name reads as kAuto, the default.
++PermissionLevel ParsePermissionLevel(std::string_view name);
+ class ActionGuard {
+  public:
+-  void BeginTurn(const std::vector<std::string>& user_messages,
++  void BeginTurn(PermissionLevel level,
++                 const std::vector<std::string>& user_messages,
+                  const std::set<std::string>& origins);
+   void RememberPageLink(const std::string& url);
+   void AllowPlan(const std::set<std::string>& additional_origins = {});
+   GuardResult Evaluate(const ActionMetadata& action) const;
+   const std::set<std::string>& origins() const { return origins_; }
++  PermissionLevel level() const { return level_; }
++  // Only the careful level shows a plan card and runs the critic.
++  bool uses_plan_and_critic() const {
++    return level_ == PermissionLevel::kCareful;
++  }
+ 
+  private:
++  // Whether every origin the action touches is one the user named: an
++  // attached tab, a URL in a message, or a site the plan allowed.
++  bool OnNamedSites(const ActionMetadata& action) const;
++  PermissionLevel level_ = PermissionLevel::kAuto;
+   std::set<std::string> urls_;
+   std::set<std::string> origins_;
++  // Origins of the URLs in the user's messages.
++  std::set<std::string> named_origins_;
+   bool plan_allowed_ = false;
+ };
+ std::string RiskClassName(RiskClass risk);
+Index: src/chrome/browser/rac/agent/action_guard_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/rac/agent/action_guard_unittest.cc
++++ src/chrome/browser/rac/agent/action_guard_unittest.cc
+@@ -16,7 +16,7 @@ ActionMetadata Low() {
+ }  // namespace
+ TEST(ActionGuardTest, ReadsAreFreeAndFirstActionNeedsPlan) {
+   ActionGuard guard;
+-  guard.BeginTurn({}, {"https://example.com"});
++  guard.BeginTurn(PermissionLevel::kCareful, {}, {"https://example.com"});
+   auto a = Low();
+   a.risk.tool_name = "snapshot";
+   EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kAllow);
+@@ -24,12 +24,12 @@ TEST(ActionGuardTest, ReadsAreFreeAndFir
+   EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kPlan);
+   guard.AllowPlan();
+   EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kAllow);
+-  guard.BeginTurn({}, {"https://example.com"});
++  guard.BeginTurn(PermissionLevel::kCareful, {}, {"https://example.com"});
+   EXPECT_EQ(guard.Evaluate(a).decision, GuardDecision::kPlan);
+ }
+ TEST(ActionGuardTest, EveryConsequentialStepNeedsConfirmation) {
+   ActionGuard guard;
+-  guard.BeginTurn({}, {"https://example.com"});
++  guard.BeginTurn(PermissionLevel::kCareful, {}, {"https://example.com"});
+   guard.AllowPlan();
+   for (const char* label : {"Submit", "Send", "Buy", "Checkout", "Pay",
+                             "Delete", "Upload", "Sign in"}) {
+@@ -66,7 +66,8 @@ TEST(ActionGuardTest, EveryConsequential
+ }
+ TEST(ActionGuardTest, ProvenanceIsExactAndNeverComesFromPageText) {
+   ActionGuard guard;
+-  guard.BeginTurn({"Open https://example.com/start."}, {"https://example.com"});
++  guard.BeginTurn(PermissionLevel::kCareful,
++                  {"Open https://example.com/start."}, {"https://example.com"});
+   guard.AllowPlan();
+   auto a = Low();
+   a.risk.tool_name = "navigate";
+@@ -88,7 +89,7 @@ TEST(ActionGuardTest, ProvenanceIsExactA
+ }
+ TEST(ActionGuardTest, SchemesDownloadsAndUnknownToolsStayBlocked) {
+   ActionGuard guard;
+-  guard.BeginTurn({}, {"https://example.com"});
++  guard.BeginTurn(PermissionLevel::kCareful, {}, {"https://example.com"});
+   guard.AllowPlan();
+   auto a = Low();
+   a.risk.tool_name = "navigate";
+@@ -109,7 +110,7 @@ TEST(ActionGuardTest, SchemesDownloadsAn
+ }
+ TEST(ActionGuardTest, NoGrantForOtherOriginsOrFrames) {
+   ActionGuard guard;
+-  guard.BeginTurn({}, {"https://example.com"});
++  guard.BeginTurn(PermissionLevel::kCareful, {}, {"https://example.com"});
+   guard.AllowPlan({"https://planned.com"});
+   auto planned = Low();
+   planned.risk.current_origin = "https://planned.com";
+@@ -123,7 +124,7 @@ TEST(ActionGuardTest, NoGrantForOtherOri
+ }
+ TEST(ActionGuardTest, PlanAllowNeverBypassesPasswordOrBuy) {
+   ActionGuard guard;
+-  guard.BeginTurn({}, {"https://example.com"});
++  guard.BeginTurn(PermissionLevel::kCareful, {}, {"https://example.com"});
+   guard.AllowPlan();
+   auto password = Low();
+   password.risk.is_password_field = true;
+@@ -139,7 +140,7 @@ TEST(ActionGuardTest, PlanAllowNeverBypa
+ }
+ TEST(ActionGuardTest, EveryNativeSubmitControlNeedsConfirmation) {
+   ActionGuard guard;
+-  guard.BeginTurn({}, {"https://example.com"});
++  guard.BeginTurn(PermissionLevel::kCareful, {}, {"https://example.com"});
+   guard.AllowPlan();
+   for (const char* control : {"17", "27", "30"}) {
+     auto action = Low();
+@@ -153,4 +154,132 @@ TEST(ActionGuardTest, EveryNativeSubmitC
+   EXPECT_FALSE(IsNativeSubmitControl("16"));
+   EXPECT_FALSE(IsNativeSubmitControl("21"));
+ }
++
++// The ask level confirms every action, risky or not, and never shows a plan.
++TEST(ActionGuardLevelTest, AskConfirmsEveryActionButReads) {
++  ActionGuard guard;
++  guard.BeginTurn(PermissionLevel::kAsk, {}, {"https://example.com"});
++  auto read = Low();
++  read.risk.tool_name = "snapshot";
++  EXPECT_EQ(guard.Evaluate(read).decision, GuardDecision::kAllow);
++  for (const char* still : {"scroll", "wait_for_settle", "switch_tab"}) {
++    auto move = Low();
++    move.risk.tool_name = still;
++    EXPECT_EQ(guard.Evaluate(move).decision, GuardDecision::kAllow) << still;
++  }
++  auto click = Low();
++  click.risk.tool_name = "click";
++  click.risk.element_role = "link";
++  EXPECT_EQ(guard.Evaluate(click).decision, GuardDecision::kConfirm);
++  EXPECT_EQ(guard.Evaluate(click).risk, RiskClass::kLow);
++  auto navigate = Low();
++  navigate.risk.tool_name = "navigate";
++  navigate.url = "https://other.com/";
++  navigate.requires_url_provenance = false;
++  navigate.risk.target_origin = "https://other.com";
++  EXPECT_EQ(guard.Evaluate(navigate).decision, GuardDecision::kConfirm);
++  auto typing = Low();
++  typing.unknown_text = true;
++  EXPECT_EQ(guard.Evaluate(typing).decision, GuardDecision::kConfirm);
++  auto submit = Low();
++  submit.submit = true;
++  EXPECT_EQ(guard.Evaluate(submit).decision, GuardDecision::kConfirm);
++  EXPECT_EQ(guard.Evaluate(submit).risk, RiskClass::kConsequential);
++  auto password = Low();
++  password.risk.is_password_field = true;
++  EXPECT_EQ(guard.Evaluate(password).decision, GuardDecision::kConfirm);
++}
++
++// The auto level runs free on sites the user named and on new sites, asks
++// about typing its own words on a site the user didn't name, and still asks
++// about every risky action. It never shows a plan.
++TEST(ActionGuardLevelTest, AutoAsksOnlyForRiskAndForeignTyping) {
++  ActionGuard guard;
++  guard.BeginTurn(PermissionLevel::kAuto, {"Use https://named.com/ please"},
++                  {"https://example.com"});
++  auto click = Low();
++  click.risk.tool_name = "click";
++  click.risk.element_role = "link";
++  EXPECT_EQ(guard.Evaluate(click).decision, GuardDecision::kAllow);
++  auto navigate = Low();
++  navigate.risk.tool_name = "navigate";
++  navigate.url = "https://other.com/";
++  navigate.requires_url_provenance = false;
++  navigate.risk.target_origin = "https://other.com";
++  navigate.risk.cross_origin = true;
++  EXPECT_EQ(guard.Evaluate(navigate).decision, GuardDecision::kAllow);
++  auto typing = Low();
++  typing.unknown_text = true;
++  typing.unknown_field = true;
++  EXPECT_EQ(guard.Evaluate(typing).decision, GuardDecision::kAllow)
++      << "attached tab";
++  typing.risk.current_origin = "https://named.com";
++  EXPECT_EQ(guard.Evaluate(typing).decision, GuardDecision::kAllow)
++      << "site named in a message";
++  typing.risk.current_origin = "https://other.com";
++  EXPECT_EQ(guard.Evaluate(typing).decision, GuardDecision::kConfirm)
++      << "site the user never named";
++  typing.unknown_text = false;
++  EXPECT_EQ(guard.Evaluate(typing).decision, GuardDecision::kAllow)
++      << "the user's own words";
++  auto submit = Low();
++  submit.submit = true;
++  EXPECT_EQ(guard.Evaluate(submit).decision, GuardDecision::kConfirm);
++  auto enter = Low();
++  enter.press_enter = true;
++  EXPECT_EQ(guard.Evaluate(enter).decision, GuardDecision::kConfirm);
++  auto password = Low();
++  password.risk.is_password_field = true;
++  EXPECT_EQ(guard.Evaluate(password).decision, GuardDecision::kConfirm);
++  auto buy = Low();
++  buy.risk.tool_name = "click";
++  buy.risk.element_name = "Buy now";
++  EXPECT_EQ(guard.Evaluate(buy).decision, GuardDecision::kConfirm);
++  auto plain = Low();
++  plain.risk.tool_name = "click";
++  plain.unknown_target = true;
++  EXPECT_EQ(guard.Evaluate(plain).decision, GuardDecision::kConfirm);
++  auto download = Low();
++  download.download = true;
++  EXPECT_EQ(guard.Evaluate(download).decision, GuardDecision::kBlock);
++}
++
++// The careful level is the old guard: a plan first, then everything the
++// critic can't judge goes to the user.
++TEST(ActionGuardLevelTest, CarefulKeepsThePlanAndAsksWhatTheCriticCannotJudge) {
++  ActionGuard guard;
++  guard.BeginTurn(PermissionLevel::kCareful, {}, {"https://example.com"});
++  auto click = Low();
++  click.risk.tool_name = "click";
++  click.risk.element_role = "link";
++  EXPECT_EQ(guard.Evaluate(click).decision, GuardDecision::kPlan);
++  guard.AllowPlan();
++  EXPECT_EQ(guard.Evaluate(click).decision, GuardDecision::kAllow);
++  auto navigate = Low();
++  navigate.risk.tool_name = "navigate";
++  navigate.url = "https://other.com/";
++  navigate.requires_url_provenance = false;
++  navigate.risk.target_origin = "https://other.com";
++  EXPECT_EQ(guard.Evaluate(navigate).decision, GuardDecision::kConfirm);
++  auto typing = Low();
++  typing.unknown_text = true;
++  EXPECT_EQ(guard.Evaluate(typing).decision, GuardDecision::kConfirm);
++  auto field = Low();
++  field.unknown_field = true;
++  EXPECT_EQ(guard.Evaluate(field).decision, GuardDecision::kConfirm);
++  auto submit = Low();
++  submit.submit = true;
++  EXPECT_EQ(guard.Evaluate(submit).decision, GuardDecision::kConfirm);
++  auto password = Low();
++  password.risk.is_password_field = true;
++  EXPECT_EQ(guard.Evaluate(password).decision, GuardDecision::kConfirm);
++}
++
++TEST(ActionGuardLevelTest, UnknownLevelNameIsAuto) {
++  EXPECT_EQ(ParsePermissionLevel("auto"), PermissionLevel::kAuto);
++  EXPECT_EQ(ParsePermissionLevel("careful"), PermissionLevel::kCareful);
++  EXPECT_EQ(ParsePermissionLevel("ask"), PermissionLevel::kAsk);
++  EXPECT_EQ(ParsePermissionLevel("bypass"), PermissionLevel::kAuto);
++  EXPECT_EQ(ParsePermissionLevel(""), PermissionLevel::kAuto);
++}
+ }  // namespace rac::agent
+Index: src/chrome/browser/rac/agent/agent_controller.cc
+===================================================================
+--- src.orig/chrome/browser/rac/agent/agent_controller.cc
++++ src/chrome/browser/rac/agent/agent_controller.cc
+@@ -190,7 +190,9 @@ void AgentController::BeginTurn(
+       origins.insert(Origin(tab.get()));
+     }
+   }
+-  guard_.BeginTurn(user_messages, origins);
++  guard_.BeginTurn(ParsePermissionLevel(profile_->GetPrefs()->GetString(
++                       rac::ai::kAgentPermissionLevel)),
++                   user_messages, origins);
+   State("working");
+ }
+ void AgentController::Emit(base::DictValue event) {
+@@ -548,8 +550,9 @@ ActionMetadata AgentController::Metadata
+           entry->control_type ==
+               base::NumberToString(FORM_CONTROL_TYPE_TEXT_AREA)))) {
+       // A generic field or select has no native purpose. Without page prose
+-      // the critic cannot tell whether it matches the goal, so ask the user.
+-      meta.unknown_target = true;
++      // the critic cannot tell whether it matches the goal, so the careful
++      // level asks the user.
++      meta.unknown_field = true;
+     }
+     if (pending_.name == "type") {
+       // The critic never sees typed text. Text the user didn't write (an
+@@ -558,7 +561,7 @@ ActionMetadata AgentController::Metadata
+       const std::string text = base::ToLowerASCII(base::TrimWhitespaceASCII(
+           String(pending_.arguments, "text"), base::TRIM_ALL));
+       if (!text.empty() && user_text_.find(text) == std::string::npos) {
+-        meta.unknown_target = true;
++        meta.unknown_text = true;
+       }
+     }
+     if (pending_.name == "click") {
+@@ -662,6 +665,12 @@ void AgentController::RevalidateAndDispa
+ }
+ void AgentController::CheckCritic() {
+   critic_note_.clear();
++  if (!guard_.uses_plan_and_critic()) {
++    // The ask level never gets here, and the auto level decides from the
++    // guard's table alone.
++    RunAllowed();
++    return;
++  }
+   auto* service = rac::ai::AiServiceFactory::GetForProfile(profile_);
+   if (!service || !service->HasUsableDirectProvider()) {
+     RequestConfirmation("No direct provider is configured for safety checks.",
+@@ -741,7 +750,8 @@ void AgentController::RequestConfirmatio
+   if (held_by_critic) {
+     input.critic_note = critic_note_;
+   }
+-  input.no_fast_model = !direct || !direct->HasUsableDirectProvider();
++  input.no_fast_model = guard_.uses_plan_and_critic() &&
++                        (!direct || !direct->HasUsableDirectProvider());
+   Emit(ConfirmRequestEvent(input));
+   critic_note_.clear();
+ }
+Index: src/chrome/browser/rac/agent/critic_protocol.cc
+===================================================================
+--- src.orig/chrome/browser/rac/agent/critic_protocol.cc
++++ src/chrome/browser/rac/agent/critic_protocol.cc
+@@ -48,7 +48,7 @@ std::string BuildCriticPrompt(std::strin
+           .Set("payment", action.risk.is_payment_field)
+           .Set("submit", action.submit)
+           .Set("enter", action.press_enter)
+-          .Set("unknown", action.unknown_target)
++          .Set("unknown", action.unknown_target || action.unknown_field)
+           .Set("cross_origin", action.risk.cross_origin);
+   std::string json;
+   base::JSONWriter::Write(metadata, &json);
+Index: src/chrome/browser/rac/agent/tool_registry.cc
+===================================================================
+--- src.orig/chrome/browser/rac/agent/tool_registry.cc
++++ src/chrome/browser/rac/agent/tool_registry.cc
+@@ -359,6 +359,14 @@ std::optional<std::string> ValidateToolA
+   return std::nullopt;
+ }
+ 
++bool HasRiskyTarget(const ActionRiskInput& input) {
++  return input.is_password_field || input.is_payment_field ||
++         input.is_file_input || HasConsequentialButtonText(input.button_text) ||
++         HasConsequentialButtonText(input.element_name) ||
++         base::EqualsCaseInsensitiveASCII(input.input_type, "password") ||
++         base::EqualsCaseInsensitiveASCII(input.control_type, "password");
++}
++
+ RiskClass ClassifyActionRisk(const ActionRiskInput& input) {
+   const ToolDefinition* def = FindToolDefinition(input.tool_name);
+   if (!def) {
+@@ -367,26 +375,12 @@ RiskClass ClassifyActionRisk(const Actio
+   if (def->kind == ToolKind::kRead) {
+     return RiskClass::kNone;
+   }
+-  if (input.is_password_field || input.is_payment_field ||
+-      input.is_file_input || input.cross_origin) {
++  if (HasRiskyTarget(input) || input.cross_origin) {
+     return RiskClass::kConsequential;
+   }
+   if (input.tool_name == "navigate" || input.tool_name == "open_tab") {
+     return RiskClass::kConsequential;
+   }
+-  if (HasConsequentialButtonText(input.button_text) ||
+-      HasConsequentialButtonText(input.element_name)) {
+-    return RiskClass::kConsequential;
+-  }
+-  if (base::EqualsCaseInsensitiveASCII(input.input_type, "password") ||
+-      base::EqualsCaseInsensitiveASCII(input.control_type, "password")) {
+-    return RiskClass::kConsequential;
+-  }
+-  if (input.tool_name == "type" &&
+-      (base::EqualsCaseInsensitiveASCII(input.input_type, "password") ||
+-       input.is_password_field)) {
+-    return RiskClass::kConsequential;
+-  }
+   return def->default_risk == RiskClass::kConsequential
+              ? RiskClass::kConsequential
+              : RiskClass::kLow;
+Index: src/chrome/browser/rac/agent/tool_registry.h
+===================================================================
+--- src.orig/chrome/browser/rac/agent/tool_registry.h
++++ src/chrome/browser/rac/agent/tool_registry.h
+@@ -69,6 +69,10 @@ std::optional<std::string> ValidateToolA
+                                                  const base::DictValue& args);
+ 
+ RiskClass ClassifyActionRisk(const ActionRiskInput& input);
++// The part of ClassifyActionRisk that is about the element itself: a
++// password, payment, or file field, or a control whose words say it buys,
++// sends, deletes, signs in, or uploads. Risky at every permission level.
++bool HasRiskyTarget(const ActionRiskInput& input);
+ 
+ // True for http/https only. Rejects chrome://, file, javascript, data, etc.
+ bool IsAllowedAgentUrl(std::string_view url);
+Index: src/chrome/browser/rac/ai/ai_prefs.cc
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_prefs.cc
++++ src/chrome/browser/rac/ai/ai_prefs.cc
+@@ -34,6 +34,7 @@ void RegisterProfilePrefs(PrefRegistrySi
+   registry->RegisterDictionaryPref(kAgentPaths);
+   registry->RegisterStringPref(kAgentCustomCommand, std::string());
+   registry->RegisterBooleanPref(kBrowserControl, true);
++  registry->RegisterStringPref(kAgentPermissionLevel, kAgentPermissionAuto);
+ }
+ 
+ ProviderSettings GetProviderSettings(const PrefService* prefs,
+Index: src/chrome/browser/rac/ai/ai_prefs.h
+===================================================================
+--- src.orig/chrome/browser/rac/ai/ai_prefs.h
++++ src/chrome/browser/rac/ai/ai_prefs.h
+@@ -43,6 +43,13 @@ inline constexpr char kAgentCustomComman
+ // Lets the assistant open pages, click and type in tabs. Only read while the
+ // assistant is on, and never in Incognito.
+ inline constexpr char kBrowserControl[] = "rac.ai.browser_control";
++// How much the agent asks before acting: "ask" (every action), "careful"
++// (a plan, then a safety check per step), or "auto" (only risky actions).
++// Read only by the guard, at the start of each turn.
++inline constexpr char kAgentPermissionLevel[] = "rac.ai.agent_permission_level";
++inline constexpr char kAgentPermissionAsk[] = "ask";
++inline constexpr char kAgentPermissionCareful[] = "careful";
++inline constexpr char kAgentPermissionAuto[] = "auto";
+ 
+ bool IsAiEnabled(const PrefService* prefs);
+ 
+Index: src/chrome/browser/resources/settings/privacy_page/rac_ai_page.html
+===================================================================
+--- src.orig/chrome/browser/resources/settings/privacy_page/rac_ai_page.html
++++ src/chrome/browser/resources/settings/privacy_page/rac_ai_page.html
+@@ -219,6 +219,36 @@
+             label="$i18n{racAiUseBrowser}"
+             sub-label="$i18n{racAiUseBrowserDescription}">
+         </settings-toggle-button>
++        <div class="section" id="permissionSection"
++            hidden$="[[!prefs.rac.ai.browser_control.value]]">
++          <div class="field">
++            <div class="label">$i18n{racAiPermissionLevel}</div>
++            <settings-radio-group id="permissionLevel"
++                pref="{{prefs.rac.ai.agent_permission_level}}">
++              <controlled-radio-button id="permissionAsk" name="ask"
++                  pref="[[prefs.rac.ai.agent_permission_level]]"
++                  label="$i18n{racAiPermissionAsk}">
++                <div class="secondary">
++                  $i18n{racAiPermissionAskDescription}
++                </div>
++              </controlled-radio-button>
++              <controlled-radio-button id="permissionCareful" name="careful"
++                  pref="[[prefs.rac.ai.agent_permission_level]]"
++                  label="$i18n{racAiPermissionCareful}">
++                <div class="secondary">
++                  $i18n{racAiPermissionCarefulDescription}
++                </div>
++              </controlled-radio-button>
++              <controlled-radio-button id="permissionAuto" name="auto"
++                  pref="[[prefs.rac.ai.agent_permission_level]]"
++                  label="$i18n{racAiPermissionAuto}">
++                <div class="secondary">
++                  $i18n{racAiPermissionAutoDescription}
++                </div>
++              </controlled-radio-button>
++            </settings-radio-group>
++          </div>
++        </div>
+ 
+         <div class="section">
+           <div class="field">
+Index: src/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts
+===================================================================
+--- src.orig/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts
++++ src/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts
+@@ -2,6 +2,8 @@
+ // You can use, redistribute, and/or modify this source code under
+ // the terms of the GPL-3.0 license that can be found in the LICENSE file.
+ 
++import '../controls/controlled_radio_button.js';
++import '../controls/settings_radio_group.js';
+ import '../controls/settings_toggle_button.js';
+ import '../settings_page/settings_section.js';
+ import 'chrome://resources/cr_elements/cr_button/cr_button.js';
+Index: src/chrome/browser/ui/webui/settings/rac_ai_strings.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/settings/rac_ai_strings.cc
++++ src/chrome/browser/ui/webui/settings/rac_ai_strings.cc
+@@ -66,6 +66,18 @@ constexpr Str kStrings[] = {
+     {"racAiUseBrowserDescription",
+      "The assistant can open pages, click, and type for you. It always asks "
+      "before anything important, like buying or sending."},
++    {"racAiPermissionLevel", "How much the AI asks"},
++    {"racAiPermissionAsk", "Ask every step"},
++    {"racAiPermissionAskDescription",
++     "Confirms every click, keystroke, and page it opens. Reading is free."},
++    {"racAiPermissionCareful", "Careful"},
++    {"racAiPermissionCarefulDescription",
++     "Shows a plan first, then a fast safety check reviews each step on the "
++     "sites you named."},
++    {"racAiPermissionAuto", "Auto"},
++    {"racAiPermissionAutoDescription",
++     "Runs on its own. Still asks before sending, buying, deleting, signing "
++     "in, and typing on sites you didn't name."},
+     {"racAiAgents", "Agents"},
+     {"racAiAgentsDescription",
+      "Use an AI agent you already have installed, with your own login."},
