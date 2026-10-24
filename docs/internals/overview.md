@@ -104,7 +104,9 @@ installed side by side:
   `devutils/rac/branding.py` builds them from the app icon. The welcome
   tour draws the logo at 88 pt, larger than any channel logo
   `chrome://theme` serves, so `rac/branding/tour-logo.patch` gives it the
-  256 px icon as its own `logo.png`. Helium's own setup page still draws
+  256 px icon as its own `logo.png`. The default browser bar would draw a
+  flat vector icon, so `rac/branding/default-browser-bar-icon.patch` makes
+  it show the app icon instead. Helium's own setup page still draws
   Helium's logo, but the tour replaces that page, so nobody sees it.
 
 `devutils/rac/name_pass.py` turns "Helium" into "rac" in user-facing
