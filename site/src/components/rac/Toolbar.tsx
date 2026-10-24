@@ -1,7 +1,18 @@
-import { BackIcon, ForwardIcon, PuzzleIcon, ReloadIcon, ShieldIcon, SidebarIcon, TuneIcon } from "./icons";
+import { BackIcon, ForwardIcon, PuzzleIcon, ReloadIcon, ShieldIcon, SidebarIcon, SparkIcon, TuneIcon } from "./icons";
 
-// The toolbar inside the page card. Only the sidebar button does anything.
-export function Toolbar({ host, path, onSidebar }: { host?: string; path?: string; onSidebar?: () => void }) {
+// The toolbar inside the page card. Only the sidebar and assistant buttons
+// do anything.
+export function Toolbar({
+  host,
+  path,
+  onSidebar,
+  assistant,
+}: {
+  host?: string;
+  path?: string;
+  onSidebar?: () => void;
+  assistant?: { on: boolean; toggle: () => void };
+}) {
   return (
     <div className="rac-toolbar">
       {onSidebar ? (
@@ -30,6 +41,18 @@ export function Toolbar({ host, path, onSidebar }: { host?: string; path?: strin
           </>
         )}
       </div>
+      {assistant && (
+        <button
+          type="button"
+          className="rac-tool rac-tool-assistant"
+          aria-label="Assistant"
+          aria-pressed={assistant.on}
+          title="Assistant"
+          onClick={assistant.toggle}
+        >
+          <SparkIcon />
+        </button>
+      )}
       <span className="rac-tool" aria-hidden="true">
         <TuneIcon />
       </span>
