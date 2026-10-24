@@ -16,7 +16,7 @@ of the browser tooling reads them.
 
 ## Run and build
 
-From the repo root, with Node 22 or later and the pnpm version pinned in
+From the repo root, with Node 22.23.4 or later and the pnpm version pinned in
 `package.json` (`corepack enable` picks it up):
 
 ```sh
@@ -31,24 +31,29 @@ None of these need a Chromium build or `he`.
 ## Things to know before changing it
 
 - **`RELEASE_READY`** in `site/src/config.ts` decides how the site treats
-  downloads. While it's `false`, every download button says "Coming soon,
-  star the repo" and links to the repository, and `/download` is hidden: no
+  downloads. While it's `false`, the download buttons say "Coming soon, star
+  the repo" and link to the repository, and `/download` is hidden: no
   link points to it, search engines skip it, and it shows sample data. Set
   it to `true` with the first release (see
   [Releases](releases.md#the-website)).
 - **The download page** detects Apple silicon or Intel, starts that
   download once per visit, and lists every build below the install steps.
-  It reads the latest GitHub release when the site builds
+  When the browser won't say which chip it's on (Safari often won't), the
+  page asks instead of guessing, so an Intel Mac never gets the wrong disk
+  image. It reads the latest GitHub release when the site builds
   (`site/src/lib/release.ts`), so visitors never contact GitHub's API, only
   the file they download. If the release is missing a disk image, or GitHub
   doesn't answer, the build fails and the last good deployment stays live.
 - **The windows are working drawings of rac.** `site/src/components/rac/`
   rebuilds the sidebar, space editor, and assistant panel in HTML. Sizes were
-  measured from the running browser; colors and the eight space themes are
-  copied from rac's source (`rac_color_mixer.cc`, `space.cc`,
-  `space_tint_background.cc`, and `resources/rac_ai/app.css`), and the
-  assistant's card wording is rac's own. When one of those changes in rac,
-  update `theme.ts` or `rac-ui.css` so the site keeps telling the truth.
+  measured from the running browser. Colors and the eight space themes are
+  copied from rac's patches in `patches/rac/` (`rac_color_mixer.cc`,
+  `space.cc`, `space_tint_background.cc`, and
+  `chrome/browser/resources/rac_ai/app.css`), and the assistant's card
+  wording is rac's own. When one of those changes in rac, update `theme.ts`
+  or `rac-ui.css` so the site keeps telling the truth.
+- **Link previews** use `site/public/og.png`, a 1200×630 capture of the
+  home page's headline and window. Retake it when the hero changes.
 - **Ad blockers hide some class names.** rac ships uBlock Origin, and its
   lists hide elements named like ads on every site: `.ad-panel` and
   `.ad-card` once hid the whole assistant demo. Don't start class names
