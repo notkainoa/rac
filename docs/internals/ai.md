@@ -453,11 +453,12 @@ site rule.
 sit on top of any level. `always` makes the origin count as named, so the
 `auto` typing rule and `careful`'s site check pass; risky actions still
 ask. `never` blocks every action on the origin with a reason that names
-Settings › Assistant, where the rules are listed and removed. A card that
-is only about the tab's site, not the action or a frame or destination on
-another site, offers "Always allow on <host>"; answering it writes the rule
-for the origin the card showed and allows the step. A card for a risky
-action never offers it.
+Settings › Assistant, where the rules are listed and removed. A card
+offers "Always allow on <host>" only when a rule for the tab's site would
+settle it: the tab's site is one the user hasn't named, any frame or
+destination on another site is already named, and, at `careful`, the step
+is otherwise low risk. Answering it writes the rule for the origin the card
+showed and allows the step. A card for a risky action never offers it.
 
 **Plan.** Only `careful` shows one. The first action of a turn shows a
 plan card with the next step and the sites involved. It is not an invented
