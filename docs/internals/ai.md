@@ -473,10 +473,11 @@ low-risk steps run on those sites. It never covers a risky step.
 
 **Confirm.** One card per action that asks, answered with Allow or Don't
 allow (the agent carries on without the step). No default button, no
-keyboard shortcut for Allow. Esc stops the turn. When the card has no risk
-word or reason to show, it falls back to the browser's detail text, which is
-generic ("Clicks Place order. It sends the form to host:port") and never
-includes typed text.
+keyboard shortcut for Allow. Esc stops the turn. Under the title is one
+line: a risk word and host for a purchase, send, delete, or sensitive field;
+otherwise where a submit or a click to another site goes ("It sends the
+form to host:port"), after the critic's reason when there is one; otherwise
+the guard's reason. None of it includes typed text.
 
 An approval is for the exact thing the user saw. At approval time, rac
 records the element's identity, its target URL, and for a form control the
@@ -608,8 +609,10 @@ exactly one parser.
   steps", with the steps opening below it and the line saying how many
   failed. The step count lives only there, so the footer under the reply
   says just how it ended ("Done in 9s"). The browser's steps and an ACP
-  agent's own thoughts and tool calls share the rows, ordered by when they
-  began. Adjacent reads and scrolls fold into one row with a count;
+  agent's own thoughts share the rows, ordered by when they began. Once
+  the browser reports steps for a reply, the agent's own tool rows are
+  left out (they would repeat the browser's), except a command the browser
+  blocked. Adjacent reads and scrolls fold into one row with a count;
   failures never fold, and a provider failure is one row at the end with
   its fix a link away. The confirm card is the only surface, a tint with
   no edge: what it will do, one line on what could happen and where, and
