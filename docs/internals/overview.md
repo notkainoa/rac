@@ -102,11 +102,12 @@ installed side by side:
   listed there loses to Helium's. rac's versions are listed in
   `resources/branding.txt`, which `devutils/shared.sh` applies last.
   `devutils/rac/branding.py` builds them from the app icon. The welcome
-  tour draws the logo at 88 pt, larger than any channel logo
-  `chrome://theme` serves, so `rac/branding/tour-logo.patch` gives it the
-  256 px icon as its own `logo.png`. The default browser bar would draw a
-  flat vector icon, so `rac/branding/default-browser-bar-icon.patch` makes
-  it show the app icon instead. Helium's own setup page still draws
+  tour draws the logo at 88 px, larger than any channel logo
+  `chrome://theme` serves, so `rac/branding/tour-logo.patch` serves
+  `IDR_PRODUCT_LOGO_256` (rac's 256 px `product_logo_256.png` from
+  `branding.txt`) to the tour as `logo.png`. The default browser bar would
+  draw a flat vector icon, so `rac/branding/default-browser-bar-icon.patch`
+  makes it show the app icon instead. Helium's own setup page still draws
   Helium's logo, but the tour replaces that page, so nobody sees it.
 
 `devutils/rac/name_pass.py` turns "Helium" into "rac" in user-facing
