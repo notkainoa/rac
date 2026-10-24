@@ -464,10 +464,13 @@ plan card with the next step and the sites involved. It is not an invented
 multi-step plan. Allowing it adds those origins to the turn. It lets
 low-risk steps run on those sites. It never covers a risky step.
 
-**Confirm.** One card per action that asks, no default button, no
-keyboard shortcut for Confirm. Esc stops the turn. The card's detail text is
-generic ("Clicks Place order. It sends the form to host:port") and never
-includes typed text.
+**Confirm.** One card per action that asks, answered with Allow or Don't
+allow (the agent carries on without the step). No default button, no
+keyboard shortcut for Allow. Esc stops the turn. Under the title is one
+line: a risk word and host for a purchase, send, delete, or sensitive field;
+otherwise where a submit or a click to another site goes ("It sends the
+form to host:port"), after the critic's reason when there is one; otherwise
+the guard's reason. None of it includes typed text.
 
 An approval is for the exact thing the user saw. At approval time, rac
 records the element's identity, its target URL, and for a form control the
@@ -576,9 +579,15 @@ exactly one parser.
   `applyEvent`. Nothing else should look inside an event.
 - Events: `step_started`, `step_finished`, `plan_request`, `confirm_request`,
   `paused`, `resumed`, `run_state` (working, paused, waiting, done, stopped,
-  error), and `summary`. A `confirm_request` carries a `risk` (for example
-  `sensitive_field`, `purchase`, `submit`, `cross_origin`, `critic`) and, when
-  the critic held the step, its note. A `summary` counts `steps`,
+  error), and `summary`. A step carries what its detail row shows
+  (`StepDetail`): the arguments the model sent, with typed text into a
+  password or payment field replaced by `[redacted]`, the element it
+  targeted, and on finish the first 2000 bytes of the result or the error,
+  the time it took, the guard's decision in a few words ("Allowed: site you
+  named"), and the critic's verdict for a careful step. A
+  `confirm_request` carries a `risk` (for example `sensitive_field`,
+  `purchase`, `submit`, `cross_origin`, `critic`) and, when the critic held
+  the step, its note. A `summary` counts `steps`,
   `confirmed`, and `failed`. A turn whose actions all failed ends in
   `error` ("Couldn't finish"), so the footer never says "Done" when
   nothing worked. Only `step_finished` with `ok` says a step happened: a
@@ -587,6 +596,20 @@ exactly one parser.
   past tense.
 - Labels, tab titles, origins, errors, and critic notes come from pages or
   the model. Render them as plain text only.
+- Everything a reply does is one quiet row, with the detail a click away
+  (`agent_rows.ts`). A run is one line: while it works, the step in
+  progress, with the earlier steps opening above it; once it ends, "7
+  steps", with the steps opening below it and the line saying how many
+  failed. The step count lives only there, so the footer under the reply
+  says just how it ended ("Done in 9s"). The browser's steps and an ACP
+  agent's own thoughts share the rows, ordered by when they began. Once
+  the browser reports steps for a reply, the agent's own tool rows are
+  left out (they would repeat the browser's), except a command the browser
+  blocked. Adjacent reads and scrolls fold into one row with a count;
+  failures never fold, and a provider failure is one row at the end with
+  its fix a link away. The confirm card is the only surface, a tint with
+  no edge: what it will do, one line on what could happen and where, and
+  the buttons. Stop stays in the composer.
 - Decisions go back with `racAiAgentRespond(id, decision)`. There are two
   spellings: the cards say `allow`, `confirm`, `skip`, `always`, `stop`, and
   the controller says `allow_once` and `deny`. Both are accepted at the bridge
