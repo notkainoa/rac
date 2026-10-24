@@ -38,13 +38,30 @@ Index: src/chrome/browser/rac/agent/action_guard.cc
  void ActionGuard::RememberPageLink(const std::string& url) {
    if (IsAllowedAgentUrl(url) && urls_.size() < 4096) {
      urls_.insert(GURL(url).spec());
-@@ -63,13 +72,16 @@ void ActionGuard::AllowPlan(const std::s
+@@ -63,13 +72,33 @@ void ActionGuard::AllowPlan(const std::s
    plan_allowed_ = true;
  }
  
++bool ActionGuard::NeverOn(const std::string& origin) const {
++  // A "never" rule covers the site on any scheme or port, so a rule saved
++  // for https://bank.example also stops http://bank.example:8080.
++  const GURL url(origin);
++  if (!url.is_valid() || url.host().empty()) {
++    return false;
++  }
++  for (const auto& [rule_origin, rule] : site_rules_) {
++    if (rule == SiteRule::kNever && GURL(rule_origin).host() == url.host()) {
++      return true;
++    }
++  }
++  return false;
++}
++
 +bool ActionGuard::IsNamed(const std::string& origin) const {
 +  const auto rule = site_rules_.find(origin);
-+  return origin.empty() || origin == "null" || origins_.contains(origin) ||
++  // An opaque frame ("null": about:blank, srcdoc, data:) was built by a
++  // page's script, not named by the user.
++  return origin.empty() || origins_.contains(origin) ||
 +         named_origins_.contains(origin) ||
 +         (rule != site_rules_.end() && rule->second == SiteRule::kAlways);
 +}
@@ -61,15 +78,14 @@ Index: src/chrome/browser/rac/agent/action_guard.cc
  }
  
  GuardResult ActionGuard::Evaluate(const ActionMetadata& action) const {
-@@ -98,27 +110,64 @@ GuardResult ActionGuard::Evaluate(const
+@@ -98,11 +127,47 @@ GuardResult ActionGuard::Evaluate(const
                "This URL was not supplied by the user or a visible page link."};
      }
    }
 +  for (const std::string* origin :
 +       {&action.risk.current_origin, &action.frame_origin,
 +        &action.risk.target_origin}) {
-+    const auto rule = site_rules_.find(*origin);
-+    if (rule != site_rules_.end() && rule->second == SiteRule::kNever) {
++    if (NeverOn(*origin)) {
 +      return {GuardDecision::kBlock, RiskClass::kConsequential,
 +              "The user's site rules never allow the assistant on " +
 +                  DisplayHost(*origin) +
@@ -109,7 +125,8 @@ Index: src/chrome/browser/rac/agent/action_guard.cc
 +                 [&](const std::string& origin) { return IsNamed(origin); }));
    switch (level_) {
      case PermissionLevel::kAsk:
-       return {GuardDecision::kConfirm,
+       // Scrolling, waiting, and switching tabs change nothing, so they are
+@@ -116,16 +181,16 @@ GuardResult ActionGuard::Evaluate(const
                risky ? RiskClass::kConsequential : RiskClass::kLow,
                risky ? "This step may send information, change an account, or "
                        "leave the allowed sites."
@@ -130,7 +147,7 @@ Index: src/chrome/browser/rac/agent/action_guard.cc
          risk = RiskClass::kConsequential;
        }
        if (!plan_allowed_) {
-@@ -126,9 +175,11 @@ GuardResult ActionGuard::Evaluate(const
+@@ -133,9 +198,11 @@ GuardResult ActionGuard::Evaluate(const
                  "Review the browser plan before starting."};
        }
        if (risk != RiskClass::kLow) {
@@ -145,7 +162,7 @@ Index: src/chrome/browser/rac/agent/action_guard.cc
        }
        return {GuardDecision::kAllow, risk, ""};
      }
-@@ -140,7 +191,8 @@ GuardResult ActionGuard::Evaluate(const
+@@ -147,7 +214,8 @@ GuardResult ActionGuard::Evaluate(const
        if (action.unknown_text && !named) {
          return {GuardDecision::kConfirm, RiskClass::kConsequential,
                  "This types text you didn't write, on a site you didn't "
@@ -192,12 +209,14 @@ Index: src/chrome/browser/rac/agent/action_guard.h
    void RememberPageLink(const std::string& url);
    void AllowPlan(const std::set<std::string>& additional_origins = {});
    GuardResult Evaluate(const ActionMetadata& action) const;
-@@ -54,14 +65,17 @@ class ActionGuard {
+@@ -54,14 +65,19 @@ class ActionGuard {
    }
  
   private:
 -  // Whether every origin the action touches is one the user named: an
 -  // attached tab, a URL in a message, or a site the plan allowed.
++  // Whether a "never" rule covers `origin`'s host.
++  bool NeverOn(const std::string& origin) const;
 +  // Whether the user named `origin`: an attached tab, a URL in a message, a
 +  // site the plan allowed, or an "always" site rule.
 +  bool IsNamed(const std::string& origin) const;
@@ -216,7 +235,7 @@ Index: src/chrome/browser/rac/agent/action_guard_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/rac/agent/action_guard_unittest.cc
 +++ src/chrome/browser/rac/agent/action_guard_unittest.cc
-@@ -270,6 +270,104 @@ TEST(ActionGuardLevelTest, CarefulKeepsT
+@@ -275,6 +275,134 @@ TEST(ActionGuardLevelTest, CarefulKeepsT
    EXPECT_EQ(guard.Evaluate(password).decision, GuardDecision::kConfirm);
  }
  
@@ -266,6 +285,36 @@ Index: src/chrome/browser/rac/agent/action_guard_unittest.cc
 +
 +// A rule for the tab's site wouldn't settle a card about a frame on another
 +// site, so that card doesn't offer one.
++// A "never" rule covers its site on any scheme or port.
++TEST(ActionGuardSiteRuleTest, NeverCoversTheSiteOnAnySchemeOrPort) {
++  ActionGuard guard;
++  guard.BeginTurn(PermissionLevel::kAuto, {}, {"https://example.com"});
++  guard.SetSiteRules({{"https://bank.example", SiteRule::kNever}});
++  auto click = Low();
++  click.risk.tool_name = "click";
++  click.risk.element_role = "link";
++  for (const char* origin : {"https://bank.example", "http://bank.example",
++                             "http://bank.example:8080"}) {
++    click.risk.current_origin = origin;
++    EXPECT_EQ(guard.Evaluate(click).decision, GuardDecision::kBlock) << origin;
++  }
++  click.risk.current_origin = "https://www.bank.example";
++  EXPECT_EQ(guard.Evaluate(click).decision, GuardDecision::kAllow)
++      << "another host is another site";
++}
++
++// Text the user didn't write still asks in a frame a page's script built.
++TEST(ActionGuardLevelTest, OpaqueFramesAreNotNamed) {
++  ActionGuard guard;
++  guard.BeginTurn(PermissionLevel::kAuto, {}, {"https://example.com"});
++  auto typing = Low();
++  typing.unknown_text = true;
++  typing.frame_origin = "null";
++  EXPECT_EQ(guard.Evaluate(typing).decision, GuardDecision::kConfirm);
++  typing.unknown_text = false;
++  EXPECT_EQ(guard.Evaluate(typing).decision, GuardDecision::kAllow);
++}
++
 +TEST(ActionGuardSiteRuleTest, OffersTheRuleOnlyWhenItSettlesTheCard) {
 +  ActionGuard guard;
 +  guard.BeginTurn(PermissionLevel::kAuto, {}, {"https://example.com"});
@@ -412,7 +461,16 @@ Index: src/chrome/browser/rac/agent/agent_controller.cc
    if (awaiting_plan_) {
      awaiting_plan_ = false;
      guard_.AllowPlan(planned_origins_);
-@@ -1074,6 +1104,7 @@ void AgentController::Cancel() {
+@@ -968,6 +998,8 @@ void AgentController::Finish(ToolResult
+   if (!done_) {
+     return;
+   }
++  // A card's "Always allow" belongs to its step alone.
++  always_allow_origin_.clear();
+   if (current_ && (action_dispatched_ || pending_.name == "snapshot") &&
+       result.data.contains("snapshot_id") && result.data.contains("text")) {
+     const auto found = current_->snapshots.find(TargetAlias());
+@@ -1074,6 +1106,7 @@ void AgentController::Cancel() {
    // Nothing from an unfinished approval may carry into a later tool call.
    approved_fingerprint_.clear();
    approval_origin_.clear();
@@ -629,16 +687,35 @@ Index: src/chrome/browser/resources/settings/privacy_page/rac_ai_page.html
 ===================================================================
 --- src.orig/chrome/browser/resources/settings/privacy_page/rac_ai_page.html
 +++ src/chrome/browser/resources/settings/privacy_page/rac_ai_page.html
-@@ -248,6 +248,27 @@
+@@ -72,6 +72,17 @@
+     color: var(--cr-primary-text-color);
+   }
+ 
++  .site-rule-add {
++    align-items: flex-end;
++    display: flex;
++    gap: 8px;
++    margin-top: 8px;
++  }
++
++  .site-rule-add cr-input {
++    flex: 1;
++  }
++
+   .row-buttons {
+     display: flex;
+     gap: 8px;
+@@ -248,6 +259,44 @@
                </controlled-radio-button>
              </settings-radio-group>
            </div>
-+          <div class="field" hidden$="[[!siteRules_.length]]">
++          <div class="field">
 +            <div class="label">$i18n{racAiSiteRules}</div>
 +            <div class="cr-secondary-text">
 +              $i18n{racAiSiteRulesDescription}
 +            </div>
-+            <div class="chips" role="list" aria-label="$i18n{racAiSiteRules}">
++            <div class="chips" role="list" aria-label="$i18n{racAiSiteRules}"
++                hidden$="[[!siteRules_.length]]">
 +              <template is="dom-repeat" items="[[siteRules_]]" as="rule">
 +                <span class="chip" role="listitem">
 +                  <span class="chip-model" title="[[rule.origin]]">
@@ -646,12 +723,28 @@ Index: src/chrome/browser/resources/settings/privacy_page/rac_ai_page.html
 +                  </span>
 +                  <span class="chip-default">[[rule.label]]</span>
 +                  <button class="chip-remove" type="button"
-+                      aria-label="$i18n{racAiSiteRemove}"
-+                      title="$i18n{racAiSiteRemove}"
++                      aria-label$="[[siteRemoveAria_(rule.host)]]"
++                      title$="[[siteRemoveAria_(rule.host)]]"
 +                      data-origin$="[[rule.origin]]"
 +                      on-click="onRemoveSiteRule_">✕</button>
 +                </span>
 +              </template>
++            </div>
++            <div class="site-rule-add">
++              <cr-input id="siteRuleInput" label="$i18n{racAiSiteAddLabel}"
++                  placeholder="example.com" on-keydown="onSiteRuleKeydown_"
++                  invalid="[[siteRuleInvalid_]]"
++                  error-message="$i18n{racAiSiteInvalid}"
++                  spellcheck="false" maxlength="2048">
++              </cr-input>
++              <select class="md-select" id="siteRuleKind"
++                  aria-label="$i18n{racAiSiteKind}">
++                <option value="never">$i18n{racAiSiteNever}</option>
++                <option value="always">$i18n{racAiSiteAlways}</option>
++              </select>
++              <cr-button on-click="onAddSiteRule_">
++                $i18n{racAiSiteAdd}
++              </cr-button>
 +            </div>
 +          </div>
          </div>
@@ -661,7 +754,7 @@ Index: src/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts
 ===================================================================
 --- src.orig/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts
 +++ src/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts
-@@ -91,6 +91,12 @@ function agentOrder(id: string): number
+@@ -91,6 +91,30 @@ function agentOrder(id: string): number
    return index < 0 ? AGENT_ORDER.length : index;
  }
  
@@ -671,13 +764,32 @@ Index: src/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts
 +  label: string;
 +}
 +
++// The origin a typed site stands for: a bare host means https. Null when it
++// isn't an http(s) address.
++function siteOrigin(raw: string): string|null {
++  const text = raw.trim();
++  if (!text) {
++    return null;
++  }
++  try {
++    const url = new URL(text.includes('://') ? text : `https://${text}`);
++    return (url.protocol === 'https:' || url.protocol === 'http:') &&
++            url.hostname ?
++        url.origin :
++        null;
++  } catch {
++    return null;
++  }
++}
++
  const SettingsRacAiPageElementBase = RouteObserverMixin(
      WebUiListenerMixin(I18nMixin(PrefsMixin(PolymerElement))));
  
-@@ -123,9 +129,48 @@ export class SettingsRacAiPageElement ex
+@@ -123,9 +147,80 @@ export class SettingsRacAiPageElement ex
        rows_: {type: Array, value: () => []},
        agentsLoading_: {type: Boolean, value: false},
        missingOpen_: {type: Boolean, value: false},
++      siteRuleInvalid_: {type: Boolean, value: false},
 +      siteRules_: {
 +        type: Array,
 +        computed: 'computeSiteRules_(prefs.rac.ai.agent_site_rules.value.*)',
@@ -686,6 +798,7 @@ Index: src/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts
    }
  
 +  declare private siteRules_: SiteRule[];
++  declare private siteRuleInvalid_: boolean;
 +
 +  private computeSiteRules_(): SiteRule[] {
 +    if (!this.prefs) {
@@ -718,6 +831,36 @@ Index: src/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts
 +    if (origin) {
 +      this.deletePrefDictEntry('rac.ai.agent_site_rules', origin);
 +    }
++  }
++
++  private siteRemoveAria_(host: string): string {
++    return this.i18n('racAiSiteRemove', host);
++  }
++
++  private onSiteRuleKeydown_(event: KeyboardEvent) {
++    this.siteRuleInvalid_ = false;
++    if (event.key === 'Enter') {
++      this.onAddSiteRule_();
++    }
++  }
++
++  // The rule replaces any rule the site already has. The guard reads the
++  // rules when a turn starts.
++  private onAddSiteRule_() {
++    const input =
++        this.shadowRoot!.querySelector<HTMLInputElement>('#siteRuleInput');
++    const kind =
++        this.shadowRoot!.querySelector<HTMLSelectElement>('#siteRuleKind');
++    if (!input || !kind || !input.value.trim()) {
++      return;
++    }
++    const origin = siteOrigin(input.value);
++    this.siteRuleInvalid_ = !origin;
++    if (!origin) {
++      return;
++    }
++    this.setPrefDictEntry('rac.ai.agent_site_rules', origin, kind.value);
++    input.value = '';
 +  }
 +
    declare private available_: boolean;
@@ -753,17 +896,21 @@ Index: src/chrome/browser/ui/webui/settings/rac_ai_strings.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/webui/settings/rac_ai_strings.cc
 +++ src/chrome/browser/ui/webui/settings/rac_ai_strings.cc
-@@ -78,6 +78,13 @@ constexpr Str kStrings[] = {
+@@ -78,6 +78,17 @@ constexpr Str kStrings[] = {
      {"racAiPermissionAutoDescription",
       "Runs on its own. Still asks before sending, buying, deleting, signing "
       "in, and typing on sites you didn't name."},
 +    {"racAiSiteRules", "Site rules"},
 +    {"racAiSiteRulesDescription",
-+     "Sites you answered \"Always allow\" for, and sites where the AI may "
-+     "never act. Risky actions still ask on every site."},
++     "Sites the AI may act on without asking, and sites where it may never "
++     "act. Risky actions still ask on every site."},
 +    {"racAiSiteAlways", "Always allow"},
 +    {"racAiSiteNever", "Never act here"},
-+    {"racAiSiteRemove", "Remove"},
++    {"racAiSiteRemove", "Remove $1"},
++    {"racAiSiteAddLabel", "Add a site"},
++    {"racAiSiteKind", "Rule for the site"},
++    {"racAiSiteAdd", "Add rule"},
++    {"racAiSiteInvalid", "Enter a web address, like example.com"},
      {"racAiAgents", "Agents"},
      {"racAiAgentsDescription",
       "Use an AI agent you already have installed, with your own login."},

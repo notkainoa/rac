@@ -430,18 +430,21 @@ with a `never` site rule. The URL match is exact. `chrome:`, `file:`,
 
 **The levels.** "Named" below means an origin the user handed the agent: an
 attached tab, a URL in a message, a site the plan allowed, or an `always`
-site rule.
+site rule. A frame a page's script built (about:blank, srcdoc, `data:`)
+never counts as named.
 
 | Action | `ask` | `careful` | `auto` |
 | --- | --- | --- | --- |
 | Reads: snapshot, page text, find, tab list | free | free | free |
+| Scroll, wait for the page, switch tabs | free | like a click | free |
 | Click or type on a named site | asks | plan card once, then the critic checks each step | free |
 | Navigate or click to a site the user didn't name | asks | asks | free |
 | Typing text that isn't in the user's messages | asks | asks | asks only on a site the user didn't name |
 | A plain text field or a select | asks | asks (the critic can't judge it) | free |
 | Risky (the list above) | asks | asks | asks |
 
-- `ask` is one confirmation per action, no plan card, no critic.
+- `ask` is one confirmation per action that can change something, no plan
+  card, no critic.
 - `careful` is the original guard: a plan card for the first action, and a
   fast safety check for low-risk steps on the named sites. Without a direct
   provider there is no critic, so every action is a card and the card says
@@ -452,8 +455,11 @@ site rule.
 **Site rules** (`rac.ai.agent_site_rules`, origin to `always` or `never`)
 sit on top of any level. `always` makes the origin count as named, so the
 `auto` typing rule and `careful`'s site check pass; risky actions still
-ask. `never` blocks every action on the origin with a reason that names
-Settings › Assistant, where the rules are listed and removed. A card
+ask, and it covers only that exact origin. `never` blocks every action on
+the site, on any scheme or port, with a reason that names Settings ›
+Assistant. Reads stay free there. In Settings › Assistant the user adds a
+rule by typing a site (a bare host means https) and choosing Never or
+Always, and removes any rule from its chip. A card
 offers "Always allow on <host>" only when a rule for the tab's site would
 settle it: the tab's site is one the user hasn't named, any frame or
 destination on another site is already named, and, at `careful`, the step
