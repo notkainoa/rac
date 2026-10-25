@@ -21,6 +21,8 @@ if ! env | grep -q SCCACHE; then
 fi
 
 export SCCACHE_WEBDAV_KEY_PREFIX="$_target_cpu"
+# A cache that can't be reached must slow the build down, not fail it.
+export SCCACHE_IGNORE_SERVER_IO_ERROR=1
 
 _error_code=0
 timeout -k 7m -s SIGTERM "${_remaining_time}s" \
