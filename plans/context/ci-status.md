@@ -10,8 +10,14 @@
   and re-fetched everything from cache (96% hit rate in phase 3), finishing only
   ~58k of ~130k steps per phase on x86_64 (remaining: 92,369 → 51,130 → 52,312).
   Upstream Helium has the same reset but its WebDAV sccache is ~3x faster, so it
-  finishes in three phases. Root cause investigation is running; findings will be
-  in /tmp/rac-siso-checkpoint.md.
+  finishes in three phases.
+- ROOT CAUSE FOUND (2026-10-25, details in /tmp/rac-siso-checkpoint.md): the
+  checkpoint tar uses bsdtar's default "restricted pax" format, which drops
+  sub-second mtimes for files without xattrs (183,538 of 183,578 files in
+  out/Default). siso compares mtimes to the nanosecond, so it reruns nearly
+  everything. Fix: `tar --format pax` in github_prepare_artifacts.sh (PR #20,
+  about +1% archive size). Reproduced locally. A build-only CI run on that branch
+  (run 40222453249) is validating that phase 2 resumes where phase 1 stopped.
 - CI never compiles rac's unit tests. "Sanity" applies patches and does a short
   build that passes on timeout.
 - Fallback idea (needs maintainer approval): build and sign 0.1.0 locally on the
