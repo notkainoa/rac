@@ -24,8 +24,10 @@ in SCRUB_REPORT.txt, so the output can be checked in a minute before it is
 shared or committed.
 
 Read, never written: StorableSidebar.json, StorableLinkRouting.json, the
-names of the files in SidebarItemsFaviconCache (not their contents), and
-"extensions.pinned_extensions" in each "User Data/<profile>/Preferences".
+names of the files in SidebarItemsFaviconCache (not their contents),
+"extensions.pinned_extensions" in each "User Data/<profile>/Preferences", and
+which profile folders have a name in "User Data/Local State" (the names
+themselves become placeholders).
 Never read: cookies, passwords, history, the Keychain, or anything else.
 
 The output folder is laid out like Arc's, so rac's dev switch
@@ -410,6 +412,32 @@ def scrub_into(arc_dir, dest):
                 }
             }
             write_json(dest / USER_DATA / profile.name / 'Preferences', value)
+
+    # Only whether each Arc profile has a name, from Local State. The names
+    # become placeholders; nothing else in the file is copied.
+    local_state = user_data / 'Local State'
+    if local_state.is_file():
+        try:
+            cache = read_json(local_state)['profile']['info_cache']
+        except (ScrubError, KeyError, TypeError):
+            cache = None
+        if isinstance(cache, dict):
+            names = {}
+            for folder, info in sorted(cache.items()):
+                if not PROFILE_DIR_RE.fullmatch(folder):
+                    continue
+                name = info.get('name') if isinstance(info, dict) else None
+                names[folder] = ({
+                    'name': scrubber.string(name, 'name')
+                } if isinstance(name, str) else {})
+            write_json(dest / USER_DATA / 'Local State',
+                       {'profile': {
+                           'info_cache': names
+                       }})
+        else:
+            scrubber.warnings.append(
+                'Could not read profile names in "Local State". The copy '
+                'leaves them out.')
 
     write_private(dest / REPORT, scrubber.report().encode('utf-8'))
     return scrubber

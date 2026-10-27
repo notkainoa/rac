@@ -223,6 +223,19 @@ class ArcScrubTest(unittest.TestCase):
                 },
             }))
         (prefs / 'Cookies').write_text('never read')
+        (self.arc / arc_scrub.USER_DATA / 'Local State').write_text(
+            json.dumps({
+                'profile': {
+                    'info_cache': {
+                        'Default': {'name': 'Kainoa Personal',
+                                    'gaia_name': 'Kainoa Newton'},
+                        'Profile 1': {'name': 'Taxes 2026'},
+                        'System Profile': {'name': 'Diary'},
+                    },
+                    'last_used': 'Profile 1',
+                },
+                'os_crypt': {'encrypted_key': 'my private note'},
+            }))
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -297,11 +310,24 @@ class ArcScrubTest(unittest.TestCase):
         profile = self.out / arc_scrub.USER_DATA / 'Profile 1'
         self.assertEqual(sorted(p.name for p in profile.iterdir()),
                          ['Preferences'])
+        self.assertEqual(
+            sorted(p.name for p in (self.out / arc_scrub.USER_DATA).iterdir()),
+            ['Local State', 'Profile 1'])
         prefs = json.loads((profile / 'Preferences').read_text())
         self.assertEqual(list(prefs), ['extensions'])
         (fake, ) = prefs['extensions']['pinned_extensions']
         self.assertRegex(fake, r'^[a-p]{32}$')
         self.assertNotEqual(fake, EXT)
+
+    def test_profile_names_are_placeholders(self):
+        self.run_scrub()
+        state = json.loads(
+            (self.out / arc_scrub.USER_DATA / 'Local State').read_text())
+        self.assertEqual(list(state), ['profile'])
+        cache = state['profile']['info_cache']
+        self.assertEqual(sorted(cache), ['Default', 'Profile 1'])
+        self.assertEqual(list(cache['Default']), ['name'])
+        self.assertRegex(cache['Profile 1']['name'], r'^Title [0-9]+$')
 
     def test_favicons_are_placeholders(self):
         self.run_scrub()
