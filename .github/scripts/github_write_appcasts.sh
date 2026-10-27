@@ -19,7 +19,12 @@ PROD_MACOS_SPARKLE_ED_PUB_KEY=$(printf '%s' "$PROD_MACOS_SPARKLE_ED_PUB_KEY" | t
 export RAC_SPARKLE_ED_PRIVATE_KEY
 RAC_SPARKLE_ED_PRIVATE_KEY=$(printf '%s' "$RAC_SPARKLE_ED_PRIVATE_KEY" | tr -d '[:space:]')
 
+# RAC_ARCHES lists the architectures this run built. A feed is written only for
+# those, so an arm64-only release has no appcast-x86_64.xml.
+_arches="${RAC_ARCHES:?RAC_ARCHES must list the architectures that were built}"
+
 for _arch in arm64 x86_64; do
+  case " $_arches " in *" $_arch "*) ;; *) continue ;; esac
   _delta_args=()
   for _delta in ./release_asset/*-"$_arch".delta; do
     if [ -e "$_delta" ]; then

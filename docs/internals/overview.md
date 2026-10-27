@@ -192,7 +192,8 @@ that case.
 Updates use Helium's Sparkle integration, pointed at rac's own feed:
 
 - **The feed is a GitHub release asset.** Each release uploads
-  `appcast-arm64.xml` and `appcast-x86_64.xml`, and rac reads
+  `appcast-<arch>.xml` for the architectures it built (arm64 by default),
+  and rac reads
   `releases/latest/download/appcast-<arch>.xml` from this repo. GitHub's
   `latest` skips prereleases, so releases must not be marked as
   prereleases. rac runs no update server.
