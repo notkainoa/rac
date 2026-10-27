@@ -1,11 +1,11 @@
 # Releases
 
 rac is released from GitHub Actions with the **Build macOS binaries of
-Helium** workflow (`.github/workflows/build.yml`). It builds both
-architectures, packages and signs each disk image, writes the update feeds,
-and publishes a GitHub release. Installed copies of rac find the new version
-through that release. How updates work, and why, is in
-[internals/overview.md](../internals/overview.md#versions-and-updates).
+Helium** workflow (`.github/workflows/build.yml`). It builds Apple Silicon
+by default (Intel or both are options), packages and signs each disk image,
+writes the update feeds, and publishes a GitHub release. Installed copies
+of rac find the new version through that release. How updates work, and why,
+is in [internals/overview.md](../internals/overview.md#versions-and-updates).
 
 ## One-time setup
 
@@ -70,12 +70,17 @@ download page is hidden and shows sample data.
    release.
 2. In GitHub, open **Actions > Build macOS binaries of Helium > Run
    workflow**, choose `main`, and check **Create a release after build is
-   done**. A full build takes several hours.
-3. When it finishes, check the new release. It should have both disk
-   images, `appcast-arm64.xml`, `appcast-x86_64.xml`, and a `.delta` file
-   from each of the last few releases (none on the first). It's tagged with
-   the version, such as `0.1.1`, on the commit the workflow was started
-   from.
+   done**. **Architectures** defaults to `arm64`; choose `x86_64` or `both`
+   to build Intel too. A full build takes several hours per architecture. One
+   architecture failing doesn't cancel the other. If a build phase can't
+   download the previous phase's checkpoint, it retries twice before failing.
+3. When it finishes, check the new release. It should have a disk image and
+   `appcast-<arch>.xml` for each architecture you built, and a `.delta` file
+   from each of the last few releases (none on the first). A release only
+   has the feeds of the architectures it built, so installed copies of an
+   architecture that was left out stop seeing updates until a release
+   includes it again. It's tagged with the version, such as `0.1.1`, on the
+   commit the workflow was started from.
 4. Open <https://racbrowser.com/download> and check that it shows the new
    version.
 

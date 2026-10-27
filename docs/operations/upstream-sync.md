@@ -40,7 +40,10 @@ git remote set-url --push upstream no_push
      (using `quilt edit` / `quilt add`), run `quilt refresh`, and continue.
    - If a Helium patch fails, the submodule or `patches/` didn't update
      correctly. Don't edit Helium patches to fix it.
-5. Finish setup and verify: `he configure`, then `he build && he run`.
+5. Finish setup and verify: `he configure`, then build through the queue
+   with the maintainer's approval for a full build,
+   `devutils/rac/build-queue.sh --full "<approval>" --priority he build`
+   (plus `--allow-main` in the main checkout), and run it.
    Check that rac's features still work.
 6. Pop and unmerge (`he pop`, `he unmerge`), then check consistency with
    `he validate series` and `he validate config`.

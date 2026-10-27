@@ -7,8 +7,8 @@ _helium_version=$(python3 "$_main_repo/utils/helium_version.py" --tree "$_main_r
 _rac_version=$(python3 "$_root_dir/devutils/rac/rac_version.py" --print)
 
 _base_hash_name="rac_${_rac_version}"
-_x64_hash_name="${_base_hash_name}_x86_64-macos.dmg.hashes.md"
-_arm64_hash_name="${_base_hash_name}_arm64-macos.dmg.hashes.md"
+# RAC_ARCHES lists the architectures this run built.
+_arches="${RAC_ARCHES:?RAC_ARCHES must list the architectures that were built}"
 
 _gh_run_href="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
@@ -25,9 +25,11 @@ if [ -f $_root_dir/announcements.md ]; then
     printf '### Release Assets Info %s\n\n' | tee -a ./github_release_note.md
 fi
 
-cat $_arm64_hash_name | tee -a ./github_release_note.md
-printf '\n' | tee -a ./github_release_note.md
-cat $_x64_hash_name | tee -a ./github_release_note.md
+for _arch in arm64 x86_64; do
+    case " $_arches " in *" $_arch "*) ;; *) continue ;; esac
+    cat "${_base_hash_name}_${_arch}-macos.dmg.hashes.md" | tee -a ./github_release_note.md
+    printf '\n' | tee -a ./github_release_note.md
+done
 
 submodule_commit_at() {
     git ls-tree "$1" helium-chromium | awk '{print $3}'
