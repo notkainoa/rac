@@ -277,9 +277,9 @@ class ArcScrubTest(unittest.TestCase):
         self.assertEqual(main['spaces'][3]['customInfo']['iconType']['emoji'],
                          127881)
         self.assertEqual(main['items'][3]['createdAt'], 783000000.5)
-        # Not a known enum word, so it is replaced even though it looks safe.
-        self.assertRegex(main['items'][3]['data']['tab']['savedMuteStatus'],
-                         r'^s[0-9]+$')
+        # An enum field: its identifier value is kept, and listed.
+        self.assertEqual(main['items'][3]['data']['tab']['savedMuteStatus'],
+                         'allowAudio')
 
     def test_placeholders_are_stable(self):
         self.run_scrub()
@@ -350,7 +350,7 @@ class ArcScrubTest(unittest.TestCase):
         self.assertIn('Profile 1', report)
         self.assertIn('👩🏽\u200d💻', report)
         self.assertIn('byHost', report)  # Not a known Arc field: listed.
-        self.assertNotIn('allowAudio', report)
+        self.assertIn('allowAudio', report)
         self.assertNotIn('jira', report)
 
     def test_source_is_not_changed(self):
@@ -438,6 +438,38 @@ class ArcScrubTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.run_scrub()
         self.assertFalse(self.out.exists())
+
+
+class ScrubDetailsTest(unittest.TestCase):
+
+    def test_enum_fields_are_kept_but_only_identifiers(self):
+        s = arc_scrub.Scrubber()
+        self.assertEqual(s.string('displayP3', 'colorSpace'), 'displayP3')
+        self.assertEqual(s.string('star.fill', 'icon'), 'star.fill')
+        self.assertNotEqual(s.string('my secret icon', 'icon'),
+                            'my secret icon')
+        self.assertNotEqual(s.string('https://a.example/x', 'colorSpace'),
+                            'https://a.example/x')
+        self.assertIn('displayP3', s.report())
+
+    def test_favicon_of_non_uuid_id_follows_its_placeholder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc, out = Path(tmp) / 'Arc', Path(tmp) / 'out'
+            arc.mkdir()
+            (arc / arc_scrub.SIDEBAR).write_text(
+                json.dumps({'items': ['tab-secret-1', {'id': 'tab-secret-1'}]}))
+            icons = arc / arc_scrub.FAVICONS
+            icons.mkdir()
+            (icons / md5('tab-secret-1')).write_bytes(b'icon')
+            with contextlib.redirect_stdout(io.StringIO()):
+                arc_scrub.main(['--arc-dir', str(arc), '--out', str(out)])
+            copy = json.loads((out / arc_scrub.SIDEBAR).read_text())
+            new_id = copy['items'][1]['id']
+            self.assertEqual(copy['items'][0], new_id)
+            self.assertNotIn('secret', new_id)
+            self.assertEqual(
+                [p.name for p in (out / arc_scrub.FAVICONS).iterdir()],
+                [md5(new_id)])
 
 
 class StringRulesTest(unittest.TestCase):

@@ -13,8 +13,9 @@ importer can be tested against a real layout. Every title becomes
 stay duplicates.
 
 A string is kept only when it is provably harmless: a UUID, a "#rrggbb"
-color, a single emoji, a profile folder name such as "Profile 1", or one of a
-fixed list of Arc's enum words such as "pinned". Strings that merely look
+color, a single emoji, a profile folder name such as "Profile 1", one of a
+fixed list of Arc's enum words such as "pinned", or a single identifier under
+a field that only ever holds Arc's own enum names, such as "colorSpace". Strings that merely look
 like numbers are replaced, since phone numbers and IP addresses look like
 numbers too. JSON numbers (dates, colors, sizes) are kept.
 
@@ -71,6 +72,15 @@ KNOWN_TOKENS = frozenset({
     'light', 'dark', 'system', 'default', 'custom', 'mostRecent', 'littleArc',
     'space', 'tab', 'list', 'none',
 })
+
+# Fields whose values are Arc's own enum names (a color space, a style, an
+# icon picked from Arc's set), never typed by the user. A value under one of
+# these keys is kept if it is a single identifier, and listed in the report.
+ENUM_KEYS = frozenset({
+    'colorSpace', 'translucencyStyle', 'contentOverBackgroundAppearance',
+    'overlay', 'icon', 'savedMuteStatus',
+})
+ENUM_VALUE_RE = re.compile(r'[A-Za-z][A-Za-z0-9._-]{0,47}')
 
 # Arc field names the importer reads. Kept keys outside this set are listed
 # in the report, because a key can also be user data in a map.
@@ -178,7 +188,9 @@ class Scrubber:
         self.kept_words = {}
         self.kept_emoji = {}
         self.unknown_keys = set()
-        self.ids = set()
+        # Original id -> id in the copy. UUIDs are kept; other ids become
+        # placeholders, and their favicons are renamed to match.
+        self.id_map = {}
         self.warnings = []
         self.replaced = 0
 
@@ -215,6 +227,12 @@ class Scrubber:
         return f'{scheme}://placeholder/{n}'
 
     def string(self, value, key, match_text=False):
+        out = self._string(value, key, match_text)
+        if key == 'id':
+            self.id_map[value] = out
+        return out
+
+    def _string(self, value, key, match_text):
         if value == '':
             return value
         if key in URL_KEYS:
@@ -224,7 +242,10 @@ class Scrubber:
         if match_text and not UUID_RE.fullmatch(value):
             return self._placeholder('text', value)
         if UUID_RE.fullmatch(value):
-            self.ids.add(value)
+            self.id_map[value] = value
+            return value
+        if key in ENUM_KEYS and ENUM_VALUE_RE.fullmatch(value):
+            self.kept_words[value] = self.kept_words.get(value, 0) + 1
             return value
         if HEX_COLOR_RE.fullmatch(value):
             return value
@@ -241,7 +262,7 @@ class Scrubber:
     def key(self, name):
         """Keeps field-like keys; replaces keys that look like user data."""
         if UUID_RE.fullmatch(name):
-            self.ids.add(name)
+            self.id_map[name] = name
             return name
         if (ENUM_PAYLOAD_KEY_RE.fullmatch(name) or name in KNOWN_KEYS
                 or PROFILE_DIR_RE.fullmatch(name)):
@@ -286,8 +307,13 @@ class Scrubber:
         return self._placeholder('text', str(value))
 
     def favicon_names(self):
-        """md5(id) for every id seen, which is how Arc names its icons."""
-        return {hashlib.md5(i.encode('utf-8')).hexdigest() for i in self.ids}
+        """Arc names each icon md5(item id). Maps the original icon's name to
+        the name it gets in the copy, md5 of the id the copy uses."""
+
+        def md5(text):
+            return hashlib.md5(text.encode('utf-8')).hexdigest()
+
+        return {md5(old): md5(new) for old, new in self.id_map.items()}
 
     def report(self):
         c = self._counts
@@ -382,10 +408,11 @@ def scrub_into(arc_dir, dest):
     # copy the icons themselves.
     favicons = arc_dir / FAVICONS
     if favicons.is_dir():
-        wanted = scrubber.favicon_names()
+        renames = scrubber.favicon_names()
         for entry in sorted(favicons.iterdir()):
-            if entry.name in wanted and entry.is_file():
-                write_private(dest / FAVICONS / entry.name, PLACEHOLDER_PNG)
+            if entry.name in renames and entry.is_file():
+                write_private(dest / FAVICONS / renames[entry.name],
+                              PLACEHOLDER_PNG)
 
     # Only the pinned extension list, from each profile's Preferences.
     user_data = arc_dir / USER_DATA
