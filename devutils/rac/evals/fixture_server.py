@@ -111,10 +111,10 @@ class FixtureServer:
             self.servers[name] = server
             self.ports[name] = server.server_address[1]
             self.base[name] = origin_base(name, spec, self.ports[name], self.host_mode)
-            threading.Thread(target=server.serve_forever, daemon=True).start()
+            threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         self.control = ThreadingHTTPServer((self.host, 0), self._control_handler())
         self.control.daemon_threads = True
-        threading.Thread(target=self.control.serve_forever, daemon=True).start()
+        threading.Thread(target=self.control.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         return self
 
     def stop(self):

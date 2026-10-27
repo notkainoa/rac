@@ -127,9 +127,9 @@ class Context:
         return None
 
     def snapshot_lines(self):
-        """Lines carrying a ref, newest result first, newest line first."""
+        """Lines carrying a ref: newest result first, document order within one."""
         for _n, text, _p in reversed(self.tool_results):
-            for line in reversed(text.splitlines()):
+            for line in text.splitlines():
                 if "[ref=" in line:
                     yield line
 

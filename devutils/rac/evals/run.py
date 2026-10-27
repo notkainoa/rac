@@ -98,7 +98,7 @@ class Rig:
         self.variant = variant
         self.fixtures = fixture_server.FixtureServer(variant, host_mode).start()
         self.model, self.model_state = fake_model.serve(0)
-        threading.Thread(target=self.model.serve_forever, daemon=True).start()
+        threading.Thread(target=self.model.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         with open(variant["model_path"]) as f:
             self.model_state.script = json.load(f)
         self.model_state.origins = self.fixtures.base
@@ -168,11 +168,13 @@ def build_preferences(variant, origins, model_base_url, download_dir):
 
 
 def make_profile(base_dir=None):
-    """A throwaway profile. Refuses anything that could be a real one."""
-    base = base_dir or os.path.join(ROOT, "build")
+    """A throwaway profile, only ever under <worktree>/build or a temp dir."""
+    base = os.path.realpath(base_dir or os.path.join(ROOT, "build"))
+    allowed = [os.path.realpath(os.path.join(ROOT, "build")), os.path.realpath(tempfile.gettempdir())]
+    assert "Application Support" not in base and any(
+        base == a or base.startswith(a + os.sep) for a in allowed), f"refusing profile folder {base}"
     os.makedirs(base, exist_ok=True)
     path = tempfile.mkdtemp(prefix="rac-evals-", dir=base)
-    assert "Application Support" not in os.path.realpath(path), "refusing a real profile folder"
     os.makedirs(os.path.join(path, "Default"))
     return path
 
