@@ -128,6 +128,9 @@ ___helium_build() {
 }
 
 ___helium_run() {
+    # Keeps the crash database out of the real me.kainoa.rac folder; Chromium
+    # doesn't follow --user-data-dir for it.
+    BREAKPAD_DUMP_LOCATION="$HOME/Library/Application Support/me.kainoa.rac.dev/Crashpad" \
     "$_out_dir/rac.app/Contents/MacOS/rac" \
     --user-data-dir="$HOME/Library/Application Support/me.kainoa.rac.dev" \
     --enable-ui-devtools \
