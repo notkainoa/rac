@@ -108,14 +108,17 @@ the maintainer when they ask how to work on features in parallel.
   `git worktree add -b feat/<name> <path> main`, then
   `devutils/rac/worktree.sh setup` from the new worktree. Setup takes
   about 30 seconds.
-- **Building and running.** Build with `source dev.sh && he build` and run
+- **Building and running.** Build with
+  `devutils/rac/build-queue.sh he build`, never a bare `he build`: several
+  agents share each Mac, and the queue runs at most two builds at once (see
+  [the build queue](docs/operations/worktrees.md#the-build-queue)). Run
   with `devutils/rac/worktree.sh run`. Never use `he run` in a worktree.
   It shares one profile with every other build, so the second browser only
   opens a window in the first.
 - **Committing.** Run `he unmerge`, commit the patch with its
   `patches/series` change, then run `he merge` to keep working.
 - **After a rebase or pull.** Run `devutils/rac/worktree.sh sync`, then
-  `he build`.
+  build through the queue.
 - **String files.** Dev trees show rac's names, which changes the `.grd`,
   `.grdp`, and `.xtb` files in `build/src`. Run
   `devutils/rac/dev_names.py unsub` before a patch edits one, and

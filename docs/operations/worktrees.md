@@ -41,7 +41,8 @@ applies rac's names to the dev tree (see
 
 ## Working in a worktree
 
-- Build with `source dev.sh && he build`, the same as in the main checkout.
+- Build with `devutils/rac/build-queue.sh he build`. See
+  [the build queue](#the-build-queue).
 - Run with `devutils/rac/worktree.sh run`, not `he run`. `he run` uses
   one shared dev profile. If two builds launch with the same profile, the
   second one only opens a window in the browser that's already running.
@@ -65,6 +66,38 @@ applies rac's names to the dev tree (see
 If a build in a worktree shows tens of thousands of steps, something
 invalidated the clone. Stop it and find out why before letting it run for
 hours.
+
+## The build queue
+
+Several agents share each Mac, and a 16 GB Mac swaps hard with more than two
+Chromium builds at once. So every local build goes through
+`devutils/rac/build-queue.sh` instead of a bare `he build`:
+
+```sh
+devutils/rac/build-queue.sh he build     # waits for a slot, builds, frees it
+devutils/rac/build-queue.sh status       # who holds a slot, who waits
+devutils/rac/build-queue.sh log          # recent starts, ends, and refusals
+```
+
+- **Slots.** Each Mac has two build slots and two run slots, as directories
+  under `~/.rac-build-queue/`. Screenshot-harness and eval runs take a run
+  slot with `--run`; `build-queue.sh devutils/rac/worktree.sh run` does it
+  on its own. A slot is freed when its build ends, fails, or is
+  interrupted, and the next queue user frees a slot whose process died.
+- **Order.** First come, first served. Sync and launch-gate work may pass
+  `--priority` to go ahead of other waiters.
+- **Full builds.** A full build the maintainer approved takes both build
+  slots: `build-queue.sh --full "D6 item 2: sync cold build" he build`.
+- **Guards.** The queue refuses to start a build with less than 20 GB free,
+  and waits while memory pressure is critical. It stops a build that shows
+  more than 20,000 steps, since that means something invalidated the tree.
+  It refuses to build in the main checkout.
+- **Batches.** Don't build after every edit. Collect a batch of changes,
+  build once, then run every test and screenshot the batch needs. Never
+  hold a slot while you think or fix; let the build end and queue again.
+- **The manual lock.** `mkdir ~/.rac-build-queue/manual` holds both build
+  slots until you `rmdir` it. The queue also counts a siso build it didn't
+  start as holding a slot.
 
 ## Updating the base
 
