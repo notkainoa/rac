@@ -222,6 +222,9 @@ class SyncTest(WorktreeTestCase):
         self.worktree('sync')
         self.assertEqual((self.tree / 'three').read_text(), 'saved three\n')
 
+    # Homebrew's quilt 0.69 pushes a new patch whose file doesn't exist yet as
+    # empty; Ubuntu's 0.67 refuses. worktree.sh only runs on macOS.
+    @unittest.skipUnless(sys.platform == 'darwin', 'needs quilt 0.69 (Homebrew)')
     def test_sync_with_new_empty_patch(self):
         self.quilt('new', 'c.patch')
         self.quilt('add', 'two')
