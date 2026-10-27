@@ -86,6 +86,17 @@ gsync --file-system "$_src_dir"
 # phase would rebuild almost everything.
 tar --format pax -C build -c -f - src | zstd -vv -11 -T0 -o build_src.tar.zst
 
+# A short or damaged archive should fail here, in the job that made it, and not
+# in the next phase after it has been uploaded and downloaded. A real checkpoint
+# holds the whole source tree, far above this floor.
+zstd -t build_src.tar.zst
+_archive_bytes=$(wc -c < build_src.tar.zst)
+_min_archive_bytes="${RAC_MIN_CHECKPOINT_BYTES:-268435456}"
+if [ "$_archive_bytes" -lt "$_min_archive_bytes" ]; then
+  echo "::error::build_src.tar.zst is only $_archive_bytes bytes (expected at least $_min_archive_bytes); the archive is incomplete"
+  exit 1
+fi
+
 sha256sum ./build_src.tar.zst | tee ./sums.txt
 
 mkdir -p upload_part_build
