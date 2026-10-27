@@ -63,7 +63,7 @@ Other plans decide Chromium's debugging ports (05-D6), moving rac's own files in
 
 **JSON parsing is memory-safe.** `base::JSONReader` is backed by Rust `serde_json_lenient` (FACT, `CR:base/json/json_reader.cc:14-20`). rac's MCP, ACP and chat code use it (FACT, grep of `CR:chrome/browser/rac`).
 
-**Debugging doors.** `--remote-debugging-port` on the real profile is refused only in Google-branded builds (FACT, `CR:chrome/browser/devtools/remote_debugging_server.cc:160-180`). Remote debugging from `chrome://inspect` is off by default. The user must turn it on, and each connection needs approval (FACT, same file, as summarized in `plans/research/long-tail.md:630`). Plan 05 decides both (05-D6). The Core thread builds the refusal inside 05 M0, on 156 after the sync.
+**Debugging doors.** `--remote-debugging-port` on the real profile is refused only in Google-branded builds (FACT, `CR:chrome/browser/devtools/remote_debugging_server.cc:160-180`). Remote debugging from `chrome://inspect` is off by default. The user must turn it on, and each connection needs approval (FACT, same file, as summarized in `plans/research/long-tail.md:630`). Plan 05 decides both (05-D6). The Core thread builds the refusal inside 05 M0, on the 156 base from day 4 (D62).
 
 **Patch surface.** rac carries 180 patches with 871 stacked hunks in 217 upstream files. 320 hunks are in `ui/views`. 76% sit in files that Helium or ungoogled also patch (FACT, `digests/rac-baseline.md`; per-group recount from a one-off hunk count over `patches/rac`). A dry run to Helium 0.20.1.1 fails 104 hunks at fuzz 2, 46 of them first failures (FACT, `digests/helium.md`).
 
@@ -144,7 +144,7 @@ A future helper is justified only by a named feature that must run without openi
 1. **Net-diff hunks.** Hunks in the diff between the Helium-patched tree and rac's final tree, in upstream files, reported separately for the files Helium also touches.
 2. **First-failure hunks** in each sync's fuzz-0 dry run. Today that is 46 at two majors behind.
 
-Plan 06 M0 builds the counter and reports the net-diff baseline. Until Ship's counter reports a net-diff baseline in W1, the stacked counts below stand in, and hold stacked hunks at 630 or fewer, aiming for 550.
+Plan 06 M0 builds the counter and reports the net-diff baseline. Until Ship's counter reports a net-diff baseline, about day 2, the stacked counts below stand in, and hold stacked hunks at 630 or fewer, aiming for 550.
 
 | Group | Stacked hunks today | Target | How |
 | --- | --- | --- | --- |
@@ -169,11 +169,11 @@ Ardia, with no AI and a native shell, sits at 492 (FACT, `digests/ardia.md`). So
 
 ## Recommended plan
 
-Calendar rules (`plans/rulings.md`, ruling 1). Weeks count from the maintainer's approval. Plan 06 owns the sync (06 M2), the launch build (hard stop 2026-12-15), and the weeks. Work in rac-owned files may start on Chromium 154 and be rebased. Work in hot files shared with Helium waits for the sync to 156 and for each worktree's base-tree rebuild.
+Calendar rules (`plans/rulings.md`, ruling 1). Days count from the maintainer's approval (day 0, Wed 10-28). Plan 06 owns the sync (06 M2), the launch build (day 13 to 15, launch on day 19), and the calendar. The master plan's closing table owns the timing. Work in rac-owned files may start on Chromium 154 and be rebased. Hooks in files shared with Helium are written on the 156 base, tagged about day 4 (D62), and rebased onto `main` when the sync merges, about day 7.
 
-**Before 2026-12-22.** Nothing here gates launch or helps Arc refugees directly. M0, and M1's rac-owned parts, may run in parallel if they don't slow plan 06. The door, the warm agent, and M4 come after launch.
+**Before 2026-12-22.** Nothing here gates launch or helps Arc refugees directly. M0 and M1's table run from day 0 and 1, in parallel with plan 06. The door and the warm agent start on days 14 and 22 and ship in a point release. M4 is day 40 on.
 
-### M0. Spikes (weeks 1 to 2; Chromium 154; 2 to 3 agent-days)
+### M0. Spikes (days 0 to 2; Chromium 154; 2 to 3 agent-days)
 
 - **Goal.** Replace the unknowns behind M2 and M3 with measurements.
 - **Agent startup (half a day).** Time where Claude Code's 25 s goes: `npx` resolve, Node start, adapter init, `session/new`, first model token. If `session/new` plus the first token dominate, warmth saves less, and M3's target changes.
@@ -190,10 +190,10 @@ Calendar rules (`plans/rulings.md`, ruling 1). Weeks count from the maintainer's
 - **Acceptance.** Both tables committed in the M2 PR description. HTTP is in or out of the plan.
 - **Patch surface.** None.
 
-### M1. Action table and the rac core split (weeks 2 to 5; 10 to 14 agent-days)
+### M1. Action table and the rac core split (table on days 1 to 16, split on days 13 to 22; 10 to 14 agent-days)
 
 - **Goal.** One list of actions, and agent pieces that no longer depend on the AI switch.
-- **Build slots.** Per the master plan's build-slot rule, launch-gate work gets slots first. This milestone writes code and waits for a free slot.
+- **Build slots.** Builds go through the D63 build queue, and launch-gate work gets slots first. This milestone writes code and waits for a free slot.
 - **Tasks.**
   1. **Static table** `rac_actions.{h,cc}`. It is compiled-in data, with no service. Fields: id, label, default shortcut and availability (plan 07's fields), JSON schema, MCP annotations (read-only, destructive, idempotent, open-world), rac's risk class, and surfaces. The sidebar, command bar (Views, plan 01), and shortcuts call handlers directly. That is one function call, and plan 01 measures the one-frame open. AI-only actions are marked "AI on" and never show with AI off.
   2. **`RacCoreService`**, built only when the assistant's browser control or the door needs it. Move `AgentController`, the guard, containment, and the MCP server under it. `AiService` becomes one client. Lifetime rule: the service owns the controller. Each run or warm session owns its `AgentMcpTools`. The MCP server stops before its tool provider is deleted, which is the crash in `docs/internals/ai.md`, "Runs". Cost: 5 to 7 days of the 10 to 14.
@@ -208,10 +208,10 @@ Calendar rules (`plans/rulings.md`, ruling 1). Weeks count from the maintainer's
 - **Chromium.** Tasks 1 to 3 on 154, in rac-owned files. Task 4 on 156.
 - **Patch surface.** Net −1 hunk. Plan 07's shortcut hook also removes the per-command hunks.
 
-### M2. The outside-agent door (after launch; Chromium 156; 9 to 13 agent-days)
+### M2. The outside-agent door (days 14 to 30; ships in a point release; Chromium 156; 9 to 13 agent-days)
 
 - **Gate.** Plan 05's `auto` fix and injection evals are green (05 M0).
-- **One milestone with plan 05 M1.** This milestone and plan 05's M1 (the read-only door) are one piece of work, after launch (W7 or later). It may be built on a branch from W4 if a build slot is free. M1's split may still land before launch.
+- **One milestone with plan 05 M1.** This milestone and plan 05's M1 (the read-only door) are one piece of work, on days 14 to 30, shipping in a point release. M1's split runs on days 13 to 22 and ships after launch.
 - **Tasks.**
   1. **Relay.** `rac.app/Contents/Helpers/rac`, a small GN C++ program that copies bytes between stdio and the socket. It holds no state. Commands are `rac mcp`, `rac skill`, and verbs that map one-to-one to table actions (plan 05 picks them).
   2. **Socket.** One per profile, existing only while `rac.agents.outside_access` is on for that profile. Folder mode 0700, socket mode 0600, on the path M0 chose. Incognito and guest profiles are never reachable.
@@ -235,7 +235,7 @@ Calendar rules (`plans/rulings.md`, ruling 1). Weeks count from the maintainer's
 - **Verification.** Screenshots of the Settings switch, the client list, and the "Outside agents: on" label beside the AI switch, in light and dark. A video of Claude Code in Terminal driving a background tab with AI off.
 - **Patch surface.** About 4 to 6 hunks here, plus about 2 in plan 05 for prefs and strings.
 
-### M3. Warm agent (03-D3; after M1; ships after launch; 4 to 6 agent-days)
+### M3. Warm agent (03-D3; after M1; days 22 to 30; ships in a point release; 4 to 6 agent-days)
 
 - **Model.**
   - One warm ACP agent per profile, kept alive while its panel is open.
@@ -252,7 +252,7 @@ Calendar rules (`plans/rulings.md`, ruling 1). Weeks count from the maintainer's
 - **Verification.** A side-by-side video, cold versus warm, and a `ps` listing after close.
 - **Patch surface.** 0 hunks.
 
-### M4. Thin the hooks (after launch and the sync; Chromium 156 or later; 25 to 35 agent-days)
+### M4. Thin the hooks (day 40 on; Chromium 156 or later; 25 to 35 agent-days)
 
 - **Goal.** Reach the per-group targets above.
 - **Order.** settings, look, spaces, pinned, sidebar-address-bar, ai, then agent. sidebar-reveal is done in plan 06's sync.
@@ -295,7 +295,7 @@ Calendar rules (`plans/rulings.md`, ruling 1). Weeks count from the maintainer's
 - **02 visual-design-and-motion.** Styles the new settings rows and supplies the Views spring helper. Owns token names.
 - **04 data-storage-import-sync.** Owns the history schema, encryption migration, retention, and sync files.
 - **05 agents-and-ai.** Owns door policy, pairing UX, tool list, levels, evals (the gate for M2), the debug doors (05-D6), routines (D59), and the agent workspace rendering spike. It refers to 03-D3 for the warm agent.
-- **06 engineering-and-shipping.** Owns the sync, the launch calendar, the base-tree rebuild, the benchmark, the hunk counter and ratchet using 03-D5's metric, signed builds (gating M2's signed acceptance), and the plain-folder move (06-D12). That move needs a throwaway-worktree spike on copy versus link, because copies change mtimes.
+- **06 engineering-and-shipping.** Owns the sync, the launch calendar, the 156 base, the benchmark, the hunk counter and ratchet using 03-D5's metric, signed builds (gating M2's signed acceptance), and the plain-folder move (06-D12). That move needs a throwaway-worktree spike on copy versus link, because copies change mtimes.
 - **07 power-features.** Adds shortcut and label fields to the table, and keeps only its site-pattern matcher.
 
 ## Risks and unknowns

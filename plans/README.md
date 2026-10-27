@@ -1,27 +1,33 @@
 # Start here
 
 These plans take rac from today, when nobody can install it, to a launch for
-Arc users before Arc shuts down on 2026-12-22, and past it.
+Arc users about two and a half weeks after you approve, and past it. Arc's
+shutdown on 2026-12-22 is now a safety margin, not the schedule.
 
 ## The conclusions
 
-1. **Ship first.** A signed release, the catch-up to Helium, and proof that
-   updates work come before the redesign. Release builds compile on paid
-   Depot machines, where Helium's take about 7 hours.
-2. **No separate server.** The browser is its own server. After launch,
+1. **Ship first, with everything else in parallel.** A signed release, the
+   catch-up to Helium, and proof that updates work come first. Every other
+   thread starts the same day, in 20 parallel streams.
+2. **Builds are rare and nobody waits on them.** Three release builds before
+   launch, on free GitHub runners, about 1.5 days each. Depot is asked to
+   sponsor, and paid only if both fail. Local builds go through a queue on
+   each Mac, and you approve five named builds.
+3. **No separate server.** The browser is its own server. After launch,
    outside agents get a private door with its own switch, off by default.
-3. **Safety before reach.** Close the agent's `auto` hole and add attack tests
+4. **Safety before reach.** Close the agent's `auto` hole and add attack tests
    before any outside agent can act.
-4. **Arc import is the launch feature.** It brings spaces, pins, favorites,
+5. **Arc import is the launch feature.** It brings spaces, pins, favorites,
    and themes, plus sign-ins if they're ready. Each Arc profile becomes a rac
    profile.
-5. **Stay on Chromium's Views UI and edit Chromium less.** There is no new
+6. **Stay on Chromium's Views UI and edit Chromium less.** There is no new
    shell. The command bar is native and reads from one shared action table.
-6. **One calm design system.** It has shared values, springs for things that
+7. **One calm design system.** It has shared values, springs for things that
    move, and nothing that repaints while idle. With AI off, no AI appears
    anywhere.
 
-If you approve by 11-02, rac launches the week of 11-30.
+If you approve on Wed 10-28, rac launches on Mon 11-16 (day 19). Each day
+later moves launch one day.
 
 ## What to read
 
@@ -32,8 +38,8 @@ Required, in this order:
    one page.
 3. [00-master-plan.md](00-master-plan.md). It has the order of work, the
    calendar, the threads, and the launch gates.
-4. Group A of [decisions.md](decisions.md). These are the 16 decisions needed
-   in week 1, in one table.
+4. Group A of [decisions.md](decisions.md). These are the 20 decisions needed
+   on day 0, in one table. The ones marked "Again" changed on 2026-10-27.
 5. The first two sections of each plan, "In plain English" and "What you need
    to decide":
    [01 UI shell](01-ui-shell.md),
@@ -52,12 +58,25 @@ The research behind the plans is in [research/](research/).
 
 ## Words used here
 
-- **W1 to W6:** the weeks after you approve.
+- **Day N:** N calendar days after you approve. Day 0 is assumed to be Wed
+  2026-10-28. **P1** is the first point release, about day 26.
 - **M0, M1, and so on:** a plan's milestones.
-- **D1 to D60:** decisions in decisions.md. **G1 to G15:** launch gates in the
+- **D1 to D64:** decisions in decisions.md. **G1 to G15:** launch gates in the
   master plan.
 - **The sync:** catching up to Helium 0.20.1.1 on Chromium 156. **The
-  freeze:** nothing under `patches/` merges until the sync does.
+  freeze:** nothing under `patches/` merges until the sync does, about a
+  week.
+- **The 156 base:** the sync's first commit that compiles, about day 4.
+  Streams clone its built tree and keep working on 156 before the sync
+  merges.
+- **Stream:** one worktree with one lead agent, inside a thread.
+- **Light worktree:** a git worktree with no Chromium build tree yet.
+- **Cold build:** a build from nothing, which takes most of a night.
+  **Incremental build:** one that redoes only what changed.
+- **The build queue:** a script that lets each Mac run one or two builds at a
+  time, so many agents can share it.
+- **Fire-and-forget:** a build is started and the thread keeps working.
+  Nothing waits on it except publishing.
 - **Hunk:** one edited block in a Chromium file. Fewer hunks make Helium
   updates cheaper.
 - **Action table:** one list of everything rac can do, shared by the sidebar,
@@ -75,13 +94,14 @@ The research behind the plans is in [research/](research/).
 ## What happens next
 
 1. You fast-forward your main checkout, which is 71 commits behind
-   `origin/main`, and approve one incremental build there. The master plan's
-   "After your review" has the commands.
+   `origin/main`, and start one incremental build there. Nobody waits for
+   it. The master plan's "After your review" has the commands, and its
+   "Builds you approve" lists the five builds you sign off.
 2. You edit the plans and answer group A.
 3. VISION.md, AGENTS.md, and the roadmap change only where you sign off.
-4. The build threads launch from their briefs in [threads/](threads/): Ship,
-   UI, Core, and Data now, and Power after launch. Nothing launches before you
-   approve.
+4. All five build threads launch on day 0 from their briefs in
+   [threads/](threads/). Power writes pure logic until Core's table lands.
+   Nothing launches before you approve.
 
 ## Your questions, answered
 
@@ -116,4 +136,4 @@ shows in `ps`. The door works with rac's AI off (D12a).
 **What about the Arc-refugee wishlist tweet?** Two lessons are now rules in
 every plan. With AI off, no AI button, row, or label appears anywhere (gate
 G15). Installed web apps (PWAs) must work, so plan 01 tests them in its first
-two weeks and they join every screenshot check (gate G8).
+five days and they join every screenshot check (gate G8).

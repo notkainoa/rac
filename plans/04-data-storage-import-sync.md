@@ -37,7 +37,7 @@ flowchart LR
 | 04-D7 (D47) | After launch, how are AI chats and agent runs stored? | Encrypt today's JSON files; one encrypted SQLite database with retention | One encrypted SQLite database |
 | 04-D8 (D55) | Sync between Macs? | None; an export file; encrypted folder sync; Helium's vault | An export file after launch |
 
-- 04-D1. If sign-ins slip, or approval comes after 11-02, launch with the sidebar only.
+- 04-D1. If sign-ins aren't merged by day 13, or approval comes after about 12-02, launch with the sidebar only.
 - 04-D2. It is the cheapest correct path before 12-22. Two Arc profiles mean two windows.
 - 04-D3. A plaintext file on the SSD needs your sign-off.
 - 04-D4. The script swaps every title and URL for a placeholder. You run it, and agents never read your real Arc data.
@@ -111,7 +111,7 @@ This is Arc's real model: one window, with spaces backed by separate cookie jars
 
 - **Details.** It needs storage partitions per space, restore hooks, and clear-data reach before launch (see After launch, part 2). Those edit hot files shared with Helium, so they wait for the sync.
 - **Pros.** The truest copy of Arc.
-- **Cons.** L effort, with hunks in `browser_navigator.cc` and session restore. It cannot fit between the sync and 2026-12-15.
+- **Cons.** L effort, with hunks in `browser_navigator.cc` and session restore. It cannot fit between the sync (about day 7) and the launch build (day 13).
 - **Effort.** L, 15-25 agent-days. **Risk.** High for the date. **Locks in.** The partition design, untested.
 
 ### Recommendation
@@ -120,24 +120,24 @@ This is Arc's real model: one window, with spaces backed by separate cookie jars
 
 ## Recommended plan
 
-**Calendar rules (`plans/rulings.md`, ruling 1).** Weeks count from plan approval. Plan 06 owns the sync and the launch calendar. Work in rac-owned new files may be built on Chromium 154 and rebased later. Work touching files Helium also patches waits for the sync. The fixed anchors are the launch build's hard stop on **2026-12-15** and Arc's shutdown on **2026-12-22**.
+**Calendar rules (`plans/rulings.md`, ruling 1).** Days count from approval (day 0, Wed 10-28). Plan 06 owns the sync and the launch calendar, and the master plan's closing table owns the timing. Work in rac-owned new files may be built on Chromium 154 and rebased later. Hooks in files Helium also patches are written on the 156 base, tagged about day 4 (D62). The launch build starts on day 13 and launch is day 19. The launch build's hard stop on **2026-12-15** and Arc's shutdown on **2026-12-22** are now safety margins.
 
-**Dependencies.** In W1 to W3 (slack to W4), plan 06 M2 syncs to Helium 0.20.1.1 (Chromium 156). Nothing under `patches/` merges until the sync does (plan 06's default list, D11 in decisions.md). After that merge, the base tree must be rebuilt before any import worktree can build on 156 (plan 06 risks: the shared Air is the bottleneck). There is no hop to Chromium 157 before launch (plan 06). Every milestone below targets Chromium 156.
+**Dependencies.** On days 0 to 7 (slack to day 10), plan 06 M2 syncs to Helium 0.20.1.1 (Chromium 156). Nothing under `patches/` merges until the sync does, about day 7 (D11 and D62 in decisions.md: a one-week freeze, not a long one). About day 4, Ship tags the compiling sync as the 156 base, and import worktrees clone its built tree (plan 06; builds go through the D63 queue). There is no hop to Chromium 157 before launch (plan 06). Every milestone below targets Chromium 156.
 
 **Test status.** Fixture tests report through the worktree-posted test status (06 M4 task 2), not CI. CI does not compile C++ tests before launch.
 
 **Critical path.**
 
-| Weeks after approval | Work | Chromium | Merges? |
+| Days after approval | Work | Chromium | Merges? |
 |---|---|---|---|
-| W1 to W3 (during the sync, slack to W4) | M0a snapshot service; M1a reader, import plan, scrub script, fixtures. All new files | 154, rebased later | No (freeze) |
-| After the sync and base rebuild | M0b Keychain fix; M1b applier, hooks, plan 01's screens | 156 | Yes |
-| Next 1-2 weeks | M2 profiles and sign-ins | 156 | Yes |
-| By the start of W5 | M1 must be merged for the launch build (hard stop 12-15); M2 should be | 156 | Launch (06 M5) |
+| 0 to 6 (M0a), 0 to 5 (M1a) | M0a snapshot service; M1a reader, import plan, scrub script, fixtures. All new files | 154, rebased later | After the sync (about day 7) |
+| 4 to 8 (M0b), 3 to 11 (M1b) | M0b Keychain fix; M1b applier, hooks, plan 01's screens | 156 base | After the sync, in Ship's merge order |
+| 0 to 14 (M2) | M2 profiles and sign-ins | 154, then 156 | After the sync |
+| By the start of day 13 | M0 and M1 must be merged for the launch build; M2 should be | 156 | Launch (06 M5, day 19) |
 
-**If it slips.** If M2 isn't merged by the start of W5, launch with sidebar-only import. Ship sign-ins in a point release only if `update-smoke` passes (06 M1) and it lands before 12-22. Otherwise ship it after. Arc's files stay on disk after shutdown, so import still works (INFERENCE). The budget is 16-21 agent-days before launch. If approval comes after 11-02, plan sidebar-only.
+**If it slips.** If M2 isn't merged by the start of day 13, launch with sidebar-only import. Ship sign-ins in the first point release, about day 26, only if `update-smoke` passes (06 M1). Otherwise ship it after. Arc's files stay on disk after shutdown, so import still works (INFERENCE). The budget is 16-21 agent-days before launch. Each day approval comes after 10-28 moves every day here one day later (D1). If approval comes after about 12-02, plan sidebar-only.
 
-### M0. Minimal safety net (S, 3-4 agent-days)
+### M0. Minimal safety net (S, 3-4 agent-days; M0a days 0 to 6, M0b days 4 to 8)
 
 **Goal.** An import can't destroy a user's sidebar or their encrypted data.
 
@@ -148,7 +148,7 @@ This is Arc's real model: one window, with spaces backed by separate cookie jars
    - The pre-import snapshot is deleted when the 7-day Undo window ends. Open-tab URLs are not kept longer than that (minor 14).
    - Files are 0600, written by `ImportantFileWriter` on a background sequence.
 2. **M0a.** If `Preferences.bad` exists and `rac.spaces` is empty, offer "Restore your spaces from <date>." Never restore silently.
-3. **M0b, Chromium 156, Opus, 1-2 days.** Fix the Keychain silent reset. On `errSecItemNotFound`, retry before adding. Never overwrite an item that appears in the meantime. Rewrite Ardia's idea; don't copy its 554-line patch (`research/ardia.md:546-553`). Add a unit test with a fake keychain that returns not-found, then found. This is a plan 06 launch gate (cross-plan ruling 13). It waits for the sync because Helium's macOS patch edits the same file.
+3. **M0b, Chromium 156, Opus, 1-2 days.** Fix the Keychain silent reset. On `errSecItemNotFound`, retry before adding. Never overwrite an item that appears in the meantime. Rewrite Ardia's idea; don't copy its 554-line patch (`research/ardia.md:546-553`). Add a unit test with a fake keychain that returns not-found, then found. This is a plan 06 launch gate (cross-plan ruling 13). It is written on the 156 base (days 4 to 8) because Helium's macOS patch edits the same file.
 
 **Acceptance.** Corrupting `Preferences` in a test profile restores spaces and pins after one click. The Keychain test proves no second key is written. Startup reads no backup when the live data is fine.
 
@@ -156,7 +156,7 @@ This is Arc's real model: one window, with spaces backed by separate cookie jars
 
 **Patch surface.** One keyed-service registration and one `BUILD.gn` line, plus 1-2 hunks in `keychain_password_mac.mm` (INFERENCE).
 
-### M1. Arc sidebar import (M, 7-9 agent-days)
+### M1. Arc sidebar import (M, 7-9 agent-days; M1a days 0 to 5, M1b days 3 to 11)
 
 **Goal.** An Arc user sees their spaces in rac within a minute.
 
@@ -199,7 +199,7 @@ This is Arc's real model: one window, with spaces backed by separate cookie jars
 
 **Patch surface.** New files, plus `BUILD.gn`, rac's onboarding handler, and one call that turns off Arc bookmarks. About 2-4 upstream hunks (INFERENCE). No edits to Helium's importer.
 
-### M2. Arc profiles and sign-ins (M, 6-8 agent-days)
+### M2. Arc profiles and sign-ins (M, 6-8 agent-days; days 0 to 14)
 
 **Goal.** Each Arc profile arrives as a rac profile, still signed in.
 
@@ -236,7 +236,7 @@ This is Arc's real model: one window, with spaces backed by separate cookie jars
 
 ### After the launch
 
-None of this blocks 2026-12-22. Order follows the master plan, with item 2's partition spike and in-memory variant first, right after launch.
+None of this blocks 2026-12-22. Order follows the master plan: partitions on days 14 to 28 (item 2's spike and in-memory variant first), the AI store on days 20 to 35.
 
 **1. Full safety net (S, 2-3 agent-days).**
 - Grow to 14 daily backups (still no open tabs).
@@ -282,7 +282,7 @@ None of this blocks 2026-12-22. Order follows the master plan, with item 2's par
 - **Private.** Import reads local files only and makes zero network requests. Rolling backups hold no open-tab URLs, and the pre-import snapshot expires with Undo. Export never holds secrets. **Bent, pending 04-D3:** passwords exist briefly as a readable file, on a RAM volume rather than the SSD, and only with the maintainer's sign-off for any fallback that writes to disk. After launch, separate sign-ins must make Clear Browsing Data reach every partition before shipping.
 - **Never slower than Helium.** Backups write at most once a day, on a background sequence. Startup reads nothing extra. Profile mapping adds no hooks to hot paths.
 - **AI off costs nothing.** Import and backups never touch AI data. `rac_ai.db` exists only with AI on. No AI labels appear in import screens.
-- **Cheap to update.** Before launch, about 4-8 upstream hunks, mostly hooks. No Helium importer files are edited. **Bent:** the Keychain fix edits a file Helium also patches. It is small, and it is the reason M0b waits for the sync. After launch, separate sign-ins add hot-file hunks.
+- **Cheap to update.** Before launch, about 4-8 upstream hunks, mostly hooks. No Helium importer files are edited. **Bent:** the Keychain fix edits a file Helium also patches. It is small, and it is the reason M0b is written on the 156 base. After launch, separate sign-ins add hot-file hunks.
 - **Calm UI.** One flow, owned by plan 01, with honest result text and scoped Undo.
 - **GPL.** Ports from Cra (MIT) and Ardia's own files (Apache-2.0) keep their notices. Stedding and Brave inform the design only. Arc's text and assets are not copied.
 
@@ -292,13 +292,13 @@ None of this blocks 2026-12-22. Order follows the master plan, with item 2's par
 - **02 visual-design-and-motion.** Better theme fidelity, if wanted.
 - **03 core-architecture.** All stores live in the browser process, with no helper (03-D1, 03-D2). Plan 04 owns the history schema and retention (after-launch item 3).
 - **05 agents-and-ai.** Agent runs use the AI store. Plan 05 M2 (its outside write tier) and M3 build on the partition primitive. Chat encryption is counted once, here.
-- **06 engineering-and-shipping.** The sync and the freeze (06 M2, plan 06's default list, D11 in decisions.md), the base rebuild, no hop to 157 before launch, launch gates (06 M5) including the Keychain fix, posted test status (06 M4 task 2), and `update-smoke` for any point release.
+- **06 engineering-and-shipping.** The sync and the one-week freeze (06 M2, plan 06's default list, D11 and D62 in decisions.md), the 156 base, no hop to 157 before launch, launch gates (06 M5) including the Keychain fix, posted test status (06 M4 task 2), and `update-smoke` for any point release.
 - **07 power-features.** Arc routing rules are handed over in the import record.
 
 ## Risks and unknowns
 
 - **Real Arc data.** Without the scrubbed sample (04-D4), tests only prove the reader matches Cra's notes.
-- **The calendar.** Pre-launch work fits only if approval comes early enough. Nothing merges during the sync, and the base rebuild on the shared Air takes an unknown time.
+- **The calendar.** Pre-launch work fits only if approval comes early enough. Nothing merges during the sync (about a week, D62), and builds on the shared Air go through the D63 queue.
 - **Prompts.** The Keychain and macOS data-access prompts may confuse users or be denied.
 - **Cookies.** Device-bound sessions, schema drift, and prefix rules may make some sign-ins fail.
 - **Passwords.** RAM-volume behavior with Spotlight, Time Machine, and the target apps is unknown until the spike.

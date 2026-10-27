@@ -8,7 +8,7 @@ Today each part of rac picks its own sizes, corners, and speeds. The space swipe
 
 This plan gives rac one list of design values and one set of motion rules. Moving things use springs, which start fast and settle without a hard stop. Actions you repeat all day get little or no motion. Nothing animates while you're idle. Under Reduce Motion, slides become short fades. Spaces gain custom colors, so imported Arc spaces keep theirs in light and dark mode.
 
-Press states, calmer hovers, quieter AI animations, and custom colors come first. A faster AI panel, tab motion, and springs for Cmd+S wait for the Helium catch-up, and reach the launch only if they merge by week 5.
+Press states, calmer hovers, quieter AI animations, and custom colors come first. A faster AI panel, tab motion, and springs for Cmd+S wait for the Helium catch-up. They are built on 156 on days 7 to 20 and ship in the first point release, about day 26.
 
 ## What you need to decide
 
@@ -303,15 +303,16 @@ button. Ideas that need sign-off: a 0.97 press scale on favorites tiles, and Dia
 
 ### Milestones
 
-Weeks count from plan approval. Hot files shared with Helium wait for plan 06's sync (its M2) and the base-tree
-rebuild that follows. rac-owned files are built on Chromium 154 and rebased onto 156. The launch hard stop is
-2026-12-15 (plan 06 M5). Launch merges close at the start of W5 (plan 06). Anything not merged by then waits until after launch.
+Days count from approval (day 0, Wed 10-28). The master plan's closing table owns the timing. Hot files shared with
+Helium get their hooks on the 156 base (D62), which Ship tags about day 4. rac-owned files are built on Chromium 154
+and rebased onto 156. Launch is day 19. Launch merges close at the start of day 13 (plan 06 M5). Anything not merged
+by then waits for the first point release, about day 26.
 
 Upstream hunks are counted in plan 03's metric: net-diff hunks in upstream files.
 
-Build slots follow the master plan's rule: launch-gate work gets slots first. M2 and M3 write code and wait for a free slot.
+Builds go through the D63 build queue: launch-gate work gets slots first. M2 and M3 write code and wait for a free slot.
 
-**M0. Baseline, rig, and wash spike** (week 1; Chromium 154; 4 to 5 agent-days)
+**M0. Baseline, rig, and wash spike** (days 0 to 4; Chromium 154; 4 to 5 agent-days)
 
 - Tasks:
   1. Dev patch `patches/rac/dev/frame-log.patch`. `--rac-frame-log=PATH` writes the time of each presented
@@ -331,7 +332,7 @@ Build slots follow the master plan's rule: launch-gate work gets slots first. M2
 - Patch surface: dev patches, and one hook next to the existing screenshot hook. This milestone builds the frame log and the video tool. Plan 01 M0 adds only the window,
   profile, and incognito capture verbs, in the same UI worktree, one after the other.
 
-**M1. Token and spring foundation** (weeks 1 to 2; Chromium 154; 6 to 8 agent-days)
+**M1. Token and spring foundation** (days 0 to 5; Chromium 154; 6 to 8 agent-days)
 
 - Tasks:
   1. `chrome/browser/ui/views/rac/rac_tokens.h`.
@@ -356,7 +357,7 @@ Build slots follow the master plan's rule: launch-gate work gets slots first. M2
 - Patch surface: new files, plus about 2 to 3 BUILD hunks. After the plain-folder move (06-D12),
   `motion/` moves with `ui/views/rac/**`.
 
-**M2. Visible polish in rac-owned files** (weeks 2 to 4; Chromium 154; 9 to 13 agent-days)
+**M2. Visible polish in rac-owned files** (days 3 to 12; Chromium 154; 9 to 13 agent-days)
 
 - Tasks:
   1. Press and hover (S8, S9). Pressed color ids, and fixes for buttons in at least four patches.
@@ -376,7 +377,7 @@ Build slots follow the master plan's rule: launch-gate work gets slots first. M2
   - With AI off, no AI rows or buttons appear.
 - Patch surface: rac-owned files, plus the existing color hooks.
 
-**M3. Custom space colors, T-B** (weeks 2 to 3; Chromium 154; 4 to 6 agent-days)
+**M3. Custom space colors, T-B** (days 3 to 9; Chromium 154; 4 to 6 agent-days)
 
 - Tasks:
   1. A picker that writes `color1` and `color2`.
@@ -387,7 +388,7 @@ Build slots follow the master plan's rule: launch-gate work gets slots first. M2
   the derivation and the contrast floor.
 - Patch surface: rac-owned spaces files. No model change.
 
-**M4. After the sync** (Chromium 156; starts when plan 06's sync and base rebuild land; 8 to 13 agent-days)
+**M4. After the sync** (Chromium 156; days 7 to 20; starts on the 156 base; 8 to 13 agent-days)
 
 - Tasks:
   1. AI panel S10: two one-line hooks, in `ui_features.cc` (a file Helium also touches) and
@@ -396,8 +397,8 @@ Build slots follow the master plan's rule: launch-gate work gets slots first. M2
   3. Cmd+S and edge reveal motion (S1, S2) on plan 06's port of sidebar-reveal onto Helium 0.20's overlay, with
      plan 01's dwell and grace times (ruling 6). Includes the A/B video for 02-D1 and the S1 resize
      choice from the frame gate.
-- Cutoff: if the sync hasn't merged by the start of W5, M4 ships after launch, and Cmd+S ships as it is (matching
-  plan 01's rule). If M0 shows that show snaps, list it as a known issue in the launch notes.
+- Cutoff: M4 ships in the first point release, about day 26. If it isn't merged by then, it waits for the next one,
+  and Cmd+S ships as it is (matching plan 01's rule). If M0 shows that show snaps, list it as a known issue in the launch notes.
 - Acceptance: both directions trace to their tokens, pass the gate, and fade under Reduce Motion. A pointer
   reversal mid-slide is smooth.
 - Patch surface: about 4 to 6 hunks, plus the motion hooks into plan 06's ported frameless code. This plan owns
@@ -409,8 +410,8 @@ plan 01 wants them, and the AI panel moving onto `kSpringDock`.
 **What Arc refugees see by 2026-12-22.**
 
 - For certain: press states, calmer hovers, quieter assistant loops, contrast support, and custom space colors.
-- If the sync is merged by the start of W5: the quick AI panel, Dia-style tab open and close, and Cmd+S and edge reveal on
-  springs.
+- From the first point release (about day 26), if M4 is merged by day 20: the quick AI panel, Dia-style tab open and
+  close, and Cmd+S and edge reveal on springs.
 
 ## Fit with the non-negotiables
 
@@ -445,7 +446,7 @@ plan 01 wants them, and the AI panel moving onto `kSpringDock`.
 - **Nothing was run.** M0 confirms "show snaps", opaque-by-default, and loop gating.
 - **Arc and Dia numbers are CLAIM, and the sources disagree** (Arc peek 66 vs 85 ms). So decisions go by video.
 - **The wash cross-fade may be bigger than estimated.** The M0 spike bounds it, and S3 can ship without it.
-- **The sync date drives M4.** If it slips, the most-used motions miss launch.
+- **The sync date drives M4.** If it slips, the most-used motions miss the first point release (about day 26).
 - **The capture rig perturbs timing.** Shape runs and timing runs stay separate.
 - **Display rates differ.** The MacBook Air runs at 60 Hz, so test at 60 and at 120 Hz.
 - **Stepped CSS loops may still wake every frame** (INFERENCE). The frame log settles it.

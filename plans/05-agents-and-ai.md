@@ -114,17 +114,17 @@ Every option starts with the safety floor (M0). The costs below are plan-05 agen
 
 ## Recommended plan
 
-**Calendar.** Weeks are counted from the maintainer's approval (`plans/rulings.md`, ruling 1). Fixed anchors: the launch build must start by 2026-12-15 (launch merges close at the start of W5), and Arc shuts down on 2026-12-22. Plan 06 owns the Helium sync to Chromium 156 (its M2) and the launch (its M5).
+**Calendar.** Days are counted from the maintainer's approval (day 0, Wed 10-28; `plans/rulings.md`, ruling 1). The master plan's closing table owns the timing. The launch build starts on day 13 (launch merges close at the start of day 13), and launch is day 19. The 12-15 hard stop and Arc's shutdown on 2026-12-22 are safety margins. Plan 06 owns the Helium sync to Chromium 156 (its M2) and the launch (its M5).
 
 - Only M0 is a launch gate.
 - Work in rac-owned files may be built on 154 and rebased.
-- Hunks in hot upstream files wait for the sync and the base-tree rebuild.
+- Hunks in hot upstream files are written on the 156 base, tagged about day 4 (D62), and rebased onto `main` when the sync merges, about day 7.
 
 Every UI item ships screenshots from `devutils/rac/worktree.sh run`, in light and dark, with the sidebar full and hidden. Motion gets a video and a reduced-motion check.
 
 **AI-off check** (ruling 16). With AI off, no AI button, row, or label appears anywhere. That includes the command bar. The door's UI is labelled "Outside agents", never "AI".
 
-### M0. Safety floor (weeks 1–4; launch gate; guard on 154, then rebased onto 156)
+### M0. Safety floor (days 0–12; launch gate; guard on 154, then rebased onto 156)
 
 **Goal:** no tested variant of the exfiltration chain gets through `auto`, and every default fails closed.
 
@@ -148,7 +148,7 @@ Every UI item ships screenshots from `devutils/rac/worktree.sh run`, in light an
    - Outside-client levels parse to read only.
    - Add a test for each.
 4. **Mark page text for every model, 1–2 days.** Use tool-named boundaries, escape fake markers, and neutralize role tags (including spaced letters). Never skip this for "strong" models (`digests/aside.md`, take 6).
-5. **Debug doors (05-D6).** The Core thread builds this inside M0, on 156 after the sync (week 4).
+5. **Debug doors (05-D6).** The Core thread builds this inside M0, on 156, on days 4–10 (the 156 base).
    - Refuse `--remote-debugging-port` and `--remote-debugging-pipe` on the default profile.
    - Turn the `chrome://inspect` approval feature off, with no new setting.
    - Verify on a build first. Dev runs pass `--user-data-dir` (`dev.sh:132`, `worktree.sh:206`), so the maintainer's DevTools-port screenshot flow should keep working.
@@ -163,13 +163,13 @@ Every UI item ships screenshots from `devutils/rac/worktree.sh run`, in light an
 - Unit tests cover every fail-closed default.
 - The worktree posts green `rac/unit-tests` and `rac/agent-evals` statuses (plan 06 M4 task 2).
 
-**Budget.** About 18–25 days, about 2–3 weeks with two threads. It needs one worktree build on 154, after step 0 in the master plan brings the base tree up to date. After the sync it needs the base-tree rebuild.
+**Budget.** About 18–25 days, spread over the guard, evals, and doors streams on days 0–12. It needs one worktree build on 154, after step 0 in the master plan brings the base tree up to date. Doors move to the 156 base from day 4. All builds go through the D63 queue.
 
 **Patch surface:** rac-owned files only. This milestone adds about 2 hunks for the doors.
 
-### M1. Read-only door (after launch, W7 or later; Chromium 156; not a launch gate)
+### M1. Read-only door (days 14–30; ships in a point release; Chromium 156; not a launch gate)
 
-**Goal:** Claude Code, Codex, Cursor, or OpenCode can read the tabs you share, with rac's AI off. This milestone and plan 03 M2 are one milestone: the door. It may be built on a branch from W4 if a build slot is free. Plan 03 M2 provides the relay, socket, tokens, and listener lifecycle. Plan 03 M1 splits the controller and guard out of `AiService`, and may land before launch.
+**Goal:** Claude Code, Codex, Cursor, or OpenCode can read the tabs you share, with rac's AI off. This milestone and plan 03 M2 are one milestone: the door. Plan 03 M2 provides the relay, socket, tokens, and listener lifecycle. Plan 03 M1 splits the controller and guard out of `AiService`. That split runs on days 13–22 and lands after launch.
 
 **The trust root for outside clients** (ruling 8). rac never sees an outside agent's prompt. These rules replace the chat-message signals:
 
@@ -211,9 +211,9 @@ Under these rules, outside `auto` means: free on named origins and in no-login t
 
 **Budget:** about 19–27 days. M1 slips if plan 01's Settings > Outside agents isn't ready; otherwise M1 ships a minimal page.
 
-### M2. Agent workspace and the write tier (weeks 8–15; Chromium 156)
+### M2. Agent workspace and the write tier (days 25–45; Chromium 156)
 
-**Goal:** an outside agent, or rac's own, acts in background tabs that never move your tabs or take focus. You can watch it, take over, or stop it. Plan 01 draws the Agents section in the same weeks (ruling 5).
+**Goal:** an outside agent, or rac's own, acts in background tabs that never move your tabs or take focus. You can watch it, take over, or stop it. Plan 01 designs the Agents section by day 3 and builds it in the same days (ruling 5).
 
 **Tasks:**
 
@@ -267,7 +267,7 @@ Under these rules, outside `auto` means: free on named origins and in no-login t
 | Always asks | Move a tab to a space, pin or unpin, archive, create or edit a Boost, a route, or a bang override (plan 07's rule) |
 | Never | Change settings, site rules, or levels; install extensions; clear history or data; delete a space |
 
-### M3. Secrets and the optional script mode (weeks 16–18)
+### M3. Secrets and the optional script mode (days 45–55)
 
 - **Payments and passwords are the user's step.** A hand-off card says "Fill this yourself, then give it back", with no Allow button (Nanobrowser's rule). 2–3 days.
 - **"Agent's own logins":** a persistent identity from plan 04's partition work (after-launch item 2), chosen per client. 1–2 days.
@@ -372,7 +372,7 @@ Plan 06's bench measures startup, tab switching, scrolling, and typing against H
 - **Plan 04's in-memory partition** may arrive late (after-launch item 2), which holds back the outside write tier.
 - **Sandboxed agents** may not reach the socket (ego #188). M1 tests this.
 - **Peer identity is weak.** Same-user is the boundary.
-- **Effort:** about 87–126 days for M0–M3, plus later items. Only M0 must be merged for the launch build (cutoff: the start of W5).
+- **Effort:** about 87–126 days for M0–M3, plus later items. Only M0 must be merged for the launch build (cutoff: the start of day 13).
 
 ## Open questions
 

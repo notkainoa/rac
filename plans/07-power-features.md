@@ -92,16 +92,16 @@ Build one local rules engine before any feature. Every per-site customization be
 
 ## Recommended plan
 
-Code goes in new files under `chrome/browser/rac/<feature>/` and `chrome/browser/ui/rac/<feature>/`. Upstream files get hooks only. Patch groups are `patches/rac/power/`, `boosts/`, `routing/`, and `bangs/`. Weeks count from plan approval. Plan 06 owns the Helium 0.20.1.1 sync (Chromium 156), the base-tree rebuild after it, and the launch calendar (hard stop for the launch build: 2026-12-15). Work in hot files shared with Helium waits for the sync plus that rebuild. Work in rac-owned files may start on Chromium 154 and be rebased. Effort is in agent-days for one maintainer directing agents (INFERENCE).
+Code goes in new files under `chrome/browser/rac/<feature>/` and `chrome/browser/ui/rac/<feature>/`. Upstream files get hooks only. Patch groups are `patches/rac/power/`, `boosts/`, `routing/`, and `bangs/`. Days count from approval (day 0, Wed 10-28). The master plan's closing table owns the timing. Plan 06 owns the Helium 0.20.1.1 sync (Chromium 156) and the launch calendar (launch is day 19). Hooks in files shared with Helium are written on the 156 base (D62) and wait for plan 03's action table, about day 16. Pure logic and unit tests (the `logic` stream) start on day 1, on 154, and are rebased. Effort is in agent-days for one maintainer directing agents (INFERENCE).
 
 | Milestone | Starts | Chromium | Target |
 |---|---|---|---|
-| M0 Matcher and table fields | after plan 03 M1 and the sync | 156 | before M1 hooks |
-| M1 Arc habits | logic beforehand (unit tests only); hooks after launch | 156 | first update after launch |
-| M2 Boosts basics | spike after launch; build after the sync | 156 | about 3 to 5 weeks after launch |
-| M3 Air Traffic Control | after plan 01's little-window hook | 156 | early January |
-| M4 Bangs editor | after the sync | 156 | January |
-| M5 Bangs address-bar label | go or no-go after M4 | 156 or 157 (plan 06) | February, if approved |
+| M0 Matcher and table fields | matcher on days 1 to 6 (unit tests only); table fields on days 16 to 20, after plan 03 M1 | 154, then 156 | first point release (about day 26) |
+| M1 Arc habits | logic on days 1 to 6 (unit tests only); hooks on days 16 to 24 | 156 | first point release (about day 26) |
+| M2 Boosts basics | spike on days 10 to 14; build on days 20 to 40 | 156 | later |
+| M3 Air Traffic Control | days 24 to 35, after plan 01's little-window hook | 156 | later |
+| M4 Bangs editor | days 16 to 26 | 156 | later |
+| M5 Bangs address-bar label | go or no-go about day 35, after M4 | 156 or 157 (plan 06) | later, if approved |
 
 ### M0. Matcher and action-table fields (3 to 5 agent-days)
 
@@ -203,7 +203,7 @@ Code goes in new files under `chrome/browser/rac/<feature>/` and `chrome/browser
   - (a) Say in the import summary that JavaScript Boosts are not imported.
   - (b) Add a spike to find Arc's local Boost files, and convert CSS-only ones if they parse.
 - **05 agents-and-ai.** It owns routines, recipes, the outside-agent door, and debug doors. On debug doors (ruling 7): `chrome://inspect` remote debugging is off by default, needs a user toggle, and each connection needs approval. Add to plan 05's card list: an agent never creates or edits a Boost, route, or bang without a card, and "Describe a change" always shows its CSS first.
-- **06 engineering-and-shipping.** The sync, the base-tree rebuild, the calendar, the perf bench (startup with zero Boosts, typing with bangs), and CI for the unit tests.
+- **06 engineering-and-shipping.** The sync, the 156 base, the calendar, the perf bench (startup with zero Boosts, typing with bangs), and CI for the unit tests.
 
 ## Risks and unknowns
 

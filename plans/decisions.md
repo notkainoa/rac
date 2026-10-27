@@ -1,8 +1,9 @@
 # Decisions
 
 Every open choice from the seven plans, each with a recommendation. Group A
-is needed in week 1. Groups B and C wait until their thread reaches that
-milestone. The D-numbers never change. The id after each D-number is the
+is needed on day 0, the day you approve. Groups B and C wait until their
+thread reaches that milestone. Days count from approval, assumed on Wed
+2026-10-28. The D-numbers never change. The id after each D-number is the
 plan's own, such as 06-D5. Ids that start with M come from fitting the plans
 together.
 
@@ -11,30 +12,32 @@ written into the plans.
 
 ## Your answers (2026-10-27)
 
-Group A is accepted as recommended, except two:
+Group A is accepted as recommended, with these changes:
 
-- D4 is open. You asked whether a free route exists. The free options are listed under D4 below.
-- D5 has no answer yet. The Air runs the sync until you give the Pro's RAM and free disk.
+- **D4 is answered: free first.** Free GitHub runners for Apple Silicon only, with fail-fast off, the checkpoint download retried, and PR #20 merged. You ask Depot for open-source sponsorship at the same time. Paid Depot only if both fail.
+- **D5 has no answer yet.** It now also decides D61, the second build Mac. The Air does everything until you give the Pro's RAM and free disk.
+- **New direction: much shorter and more parallel.** You expect the work to take a couple of weeks. Full builds are rare and run in the background, and nobody waits on them. More work runs in parallel. So D1, D6, D8, D9a, D11, and D16 are rewritten, every date-tied decision now names a day, and D61 to D64 are new. The rewritten and new ones need your answer again.
 
 You also set a rule for every thread: when a feature in a worktree is done, the agent posts before and after screenshots in the chat, plus a video when the change has an animation or an interaction. See [threads/README.md](threads/README.md).
 
 ## Group A at a glance
 
-These are the 16 week-1 decisions. D9 has three parts.
+These are the 20 day-0 decisions. D9 has three parts. Rows marked **Again**
+changed on 2026-10-27 and need your answer again.
 
 | D | Question | Recommended | Flag |
 | --- | --- | --- | --- |
-| D1 | By when do you approve the plans? | By Mon 11-02, which leaves one spare week | |
-| D2 | In what order does the work happen? | A stable track ships while the revamp builds on branches | |
-| D4 | How are release builds compiled, and for how much? | Depot with a $300 monthly cap, plus one free attempt | Money |
+| D1 | By when do you approve the plans? | Wed 10-28, for a launch on Mon 11-16 (day 19) | Again |
+| D2 | In what order does the work happen? | A stable track ships while the revamp runs in parallel streams | |
+| D4 | How are release builds compiled, and for how much? | Answered: free GitHub runners first, Depot sponsorship asked in parallel, paid Depot only if both fail | Money |
 | D5 | What are the MacBook Pro's RAM and free disk? | The Pro syncs if it has 32 GB and 150 GB free | |
-| D6 | Which full builds do you approve now? | The W1 cold build, then clone the sync tree if it works | AGENTS |
-| D9a | Which threads launch? | Ship, UI, Core, and Data now, and Power after launch | |
+| D6 | Which full builds do you approve now? | The five named in the master plan, and no others | AGENTS, Again |
+| D9a | Which threads launch? | All five on day 0. Power writes pure logic only until Core's table lands | Again |
 | D9b | May threads open PRs without asking each time? | Yes. You still approve every merge | AGENTS |
 | D9c | May threads drive rac through the test tools? | Yes, on throwaway profiles only | AGENTS |
-| D11 | Accept plan 06's default list, including the freeze? | Accept all | |
+| D11 | Accept plan 06's default list? | Accept all, with the freeze replaced by D62 | Again |
 | D14 | Build Peek, and does it enter history? | Yes, and history only once a Peek is expanded | VISION |
-| D16 | Is the command bar a launch gate? | No. It ships if merged by W5, else in W6 | |
+| D16 | Is the command bar a launch gate? | No. It ships if merged by day 13, else in the first point release, about day 26 | Again |
 | D17 | Which patch-size number do the plans hold to? | Net-diff hunks plus first failures per sync | |
 | D19 | How do we close the agent's `auto` hole? | The taint rule, with `auto` kept as the default | |
 | D20 | What happens to Chromium's debug doors? | Refuse them on the real profile, with no new setting | |
@@ -42,67 +45,86 @@ These are the 16 week-1 decisions. D9 has three parts.
 | D22 | How do we shrink rac's Chromium edits? | Stay on Views and thin the hooks | |
 | D41 | What real Arc data can we test on? | You scrub your own Arc now, volunteers after beta | Real data |
 | D42 | How big is the safety net before launch? | A snapshot, one rolling backup, and the Keychain fix | |
+| D61 | Does the MacBook Pro become a second build Mac? | Yes if D5 qualifies: it hosts the sync and a 156 base | New, AGENTS |
+| D62 | What replaces the three-week freeze? | A one-week freeze, with streams stacked on the 156 base from day 4 | New |
+| D63 | How do many agents share one Mac's builds? | A build queue with two slots, and verification in batches | New, AGENTS |
+| D64 | How many release builds before launch? | Three: 0.1.0, 0.2.0 to prove updates, and the launch | New |
 
 Reply with the D-numbers you disagree with; everything else is accepted.
 
-## A. Needed in week 1
+## A. Needed on day 0
 
-**D1 (M-1). By when do you approve the plans?** By Mon 11-02, by Mon 11-09,
-or later.
-**Recommended: by 11-02.** That leaves one spare week before the 12-15 hard
-stop. 11-09 leaves none, and later means launching on Chromium 154 (D8).
+**D1 (M-1). By when do you approve the plans?** Wed 10-28, or later.
+**Recommended: Wed 10-28.** Launch is then Mon 11-16 (day 19), with room for
+one retry of the launch build. Each day later moves launch one day. The 12-15
+hard stop still holds for approval by about 12-02.
 [06 critical path](06-engineering-and-shipping.md#critical-path)
 
 **D2 (06-D5). In what order does the work happen?** (a) Ship, sync, and
 launch, and only then revamp. (b) Revamp first and launch later. (c) A stable
 track ships 0.1, the sync, and the launch, while the revamp is built on
 branches in rac-owned files and merged after the sync.
-**Recommended: (c).** It hits 12-22 with no thread waiting idle. Plan 06's
+**Recommended: (c).** No thread waits idle. The revamp runs in parallel
+streams and stacks on the 156 base once the sync compiles (D62). Plan 06's
 sequencing section calls this C1 plus ruling 1.
 [Master plan](00-master-plan.md#order-of-work)
 
-**D4 (06-D2). How are release builds compiled, and for how much?** Depot paid
-runners, free GitHub runners, or a local Mac.
-**Recommended: Depot with a $300 monthly cap, plus one free attempt in W1.**
-Free runners have never finished a build, and a local build would put the
-signing keys on a laptop. You create the Depot account on day 1, which takes
-about an hour. Depot only compiles. Signing and notarizing run on a
-GitHub-hosted runner.
+**D4 (06-D2). How are release builds compiled, and for how much?** Free
+GitHub runners, Depot runners (sponsored or paid), or a local Mac.
+**Answered on 2026-10-27: free first.** Free GitHub runners build Apple
+Silicon only, with fail-fast off, the flaky checkpoint download retried, and
+PR #20's pax fix merged. You ask Depot for open-source sponsorship on day 0.
+Each free build takes about 1.5 days, which is fine because nothing waits on
+it. Signing and notarizing still run on GitHub's own runner, so the keys
+never leave GitHub.
+**Trigger for paid Depot:** build 1 fails twice in a row, or can't finish its
+framework link inside a 6-hour phase, and Depot hasn't offered sponsorship by
+day 5. Then you decide on paid Depot with a $300 monthly cap, about $35 to
+$70 a build.
 [06 build route](06-engineering-and-shipping.md#build-route-a1-to-a3)
 
-Free routes, asked about on 2026-10-27:
+The routes considered on 2026-10-27:
 
 1. Free GitHub runners, Apple Silicon only. It costs nothing but time: a build is a chain of 6-hour jobs that takes about 1.5 days. It has never finished. In the last run the Apple Silicon chain had about 3,400 steps left when the Intel chain failed and cancelled it. Turning off that cancel and retrying the flaky download may be enough.
 2. Ask Depot for free open-source runners. Helium's Depot runners are sponsored. Only you can ask.
 3. A self-hosted runner on one of your Macs. The keys stay in GitHub, but the job runs on your Mac and uses it for hours. On the 16 GB Air it competes with every worktree build.
 4. Build and sign on your Mac by hand. It is free, but the signing keys sit on a laptop.
 
-If free matters more than speed: run route 1 now, ask Depot (route 2) at the same time, and pay for Depot only if both fail.
+You chose routes 1 and 2 together, with paid Depot as the fallback.
 
 **D5 (06-D1). What are the MacBook Pro's RAM and free disk?** Tell us both,
 or let an agent read them with
 `ssh knewton@kainoas-macbook-pro 'sysctl -n hw.memsize; df -h ~'`.
 **Rule: with at least 32 GB of RAM and 150 GB free, the Pro runs the sync and
-holds the 156 base. Otherwise the Air does.** The Air has 16 GB and 101 GB
+holds a 156 base (D61). Otherwise the Air does.** The Air has 16 GB and 101 GB
 free. The Pro is your main machine, so long builds will slow it.
 [06](06-engineering-and-shipping.md#what-you-need-to-decide)
 
-**D6 (M-2). Which full builds do you approve now?** (a) The W1 cold 156 build,
-the base rebuild with `he reset` in W3 or W4, and one rebuild per later sync.
-(b) The W1 cold build only. After the sync, worktrees clone the sync
-worktree's built tree with `worktree.sh setup <sync worktree>`, and the main
-checkout's rebuild waits for a quiet night or the next sync. (c) Ask each time.
-**Recommended: (b), if Ship's W3 test of the clone path passes. If it fails,
-(a)'s rebuild is approved too.** AGENTS.md requires your approval for full
-builds. This also covers the one incremental build in your main checkout
-after its fast-forward.
-[06 M2](06-engineering-and-shipping.md#m2-sync-to-helium-02011--chromium-156-w1-w3-slack-to-w4)
+**D6 (M-2). Which full builds do you approve now?** The named list below, or
+ask each time.
+**Recommended: these, and no others, before launch.** AGENTS.md requires your
+approval for full builds and `he reset`.
+1. Day 0: one incremental `he build` in your main checkout, after you pull it.
+2. Day 0: one cold 156 build in the sync worktree. Helium's patches build
+   first, overnight, then rac's build on top, incrementally.
+3. From day 4: worktrees on the same Mac clone the sync worktree's built
+   tree with `worktree.sh setup <sync worktree>`. No new full build.
+4. Only if D61 puts the sync on the Pro: one cold 156 build on the Air, in a
+   `base-156` worktree, on day 4, overnight. This is the one base rebuild.
+5. The CI release builds in D64.
 
-**D9a (M-3). Which threads launch?** Four now (Ship, UI, Core, Data) and Power
-after launch, three now with Data folded into Core, or all five now.
-**Recommended: four now, Power after launch.** Power needs Core's action
-table and UI's link router first.
-[Master plan](00-master-plan.md#threads)
+Not approved: `he reset` in the main checkout before launch. It stays on 154
+until after launch. Its one 156 rebuild then is optional, and asked for
+separately. Removing a stream's old 154 worktree once its branch is on 156
+also needs your OK, under AGENTS.md.
+[06 M2](06-engineering-and-shipping.md#m2-sync-to-helium-02011--chromium-156-days-0-7-slack-to-day-10)
+
+**D9a (M-3). Which threads launch?** All five on day 0, or four now and Power
+after launch.
+**Recommended: all five on day 0.** You asked for this on 2026-10-27. Power
+writes pure logic with unit tests until Core's action table lands, about day
+16. Its hooks also wait for UI's link router.
+[Master plan](00-master-plan.md#thread-map)
 
 **D9b (M-3). May threads open PRs without asking each time?** Yes, or ask for
 each PR. You approve every merge either way.
@@ -121,28 +143,30 @@ list?** The list has one jump to Helium 0.20.1.1, the freeze, C++ tests in
 worktrees first, no Chromium 157 before launch, and the beta channel and
 crash reports after launch, and publishing speed numbers against Helium
 (D60).
-**Recommended: accept all.** The freeze stops anything under `patches/` from
-merging until the sync does, because every new patch edits `patches/series`,
-the one file the sync conflicts on. Docs, the site, CI, and plans may merge.
+**Recommended: accept all, with the freeze replaced by D62.** Nothing under
+`patches/` merges until the sync does, because every new patch edits
+`patches/series`, the one file the sync conflicts on. Docs, the site, CI, and
+plans may merge. Under D62 that wait is about a week, and nobody stops
+working during it.
 [06](06-engineering-and-shipping.md#what-you-need-to-decide)
 
 **D14 (01-D4). Build Peek, and does it enter history?** Yes with history only
 once expanded, yes and always in history, or no.
 **Recommended: yes, history only once expanded.** VISION.md lists Peek as
-"not planned". It is needed in W1 because a "no" cancels a 2 to 3 day spike.
+"not planned". It is needed on day 0 because a "no" cancels a 2 to 3 day spike.
 [01](01-ui-shell.md#what-you-need-to-decide)
 
 **D16 (M-5). Is the command bar a launch gate?** It could be a gate, ship
 only if it merges in time, or wait for January.
 **Recommended: not a gate. It ships in the launch if merged by the start of
-W5. Otherwise it ships in a W6 point release before 12-22, only if
-`update-smoke` passes.**
+day 13. Otherwise it ships in the first point release, about day 26, only if
+`update-smoke` passes.** Day 13 is tight for it, so plan on the point
+release.
 [01 M2](01-ui-shell.md#milestones)
 
 **D17 (03-D5). Which patch-size number do the plans hold to?** Net-diff hunks
 plus first failures per sync, or raw stacked hunks.
-**Recommended: net-diff hunks plus first failures per sync.** Until Ship's
-counter reports a baseline in W1, stacked hunks stay at 630 or fewer, aiming
+**Recommended: net-diff hunks plus first failures per sync.** Until Ship's counter reports a baseline, about day 2, stacked hunks stay at 630 or fewer, aiming
 for 550. Every plan's new hunks count against this budget.
 [03](03-core-architecture.md#how-to-shrink-the-patch-surface-03-d4-03-d5)
 
@@ -168,7 +192,7 @@ either, so local models stay on Ollama and LM Studio.
 **D22 (03-D4). How do we shrink rac's Chromium edits?** Stay on Views and thin
 the hooks, or build a native AppKit shell now.
 **Recommended: Views.** Spike a native shell only if D17's target is missed
-after the second sync. UI's plan assumes Views, so this is needed in W1.
+after the second sync. UI's plan assumes Views, so this is needed on day 0.
 [03](03-core-architecture.md#what-you-need-to-decide)
 
 **D41 (04-D4). What real Arc data can we test on?** You run a scrubbing script
@@ -184,61 +208,126 @@ and a Restore UI now.
 **Recommended: the minimal set now, the rest after launch.**
 [04](04-data-storage-import-sync.md#what-you-need-to-decide)
 
+**D61 (M-7). Does the MacBook Pro become a second build Mac?** (a) Yes: it
+hosts the sync and a 156 base from day 0, with its own build queue. (b) No:
+the Air does everything. (c) Only after launch.
+**Recommended: (a) if D5 shows at least 32 GB and 150 GB free, otherwise
+(b).** It roughly doubles build capacity in the busiest week. It keeps the
+sync's overnight cold build off the Air, so the Air's two slots stay with
+the feature streams. The costs:
+- About half an agent-day to set it up: a clone of rac, Xcode, and the
+  Homebrew tools.
+- One extra cold build on the Air (D6, item 4), because clones work only
+  inside one Mac.
+- A slower Pro while it builds. It runs one build at a time and pauses when
+  you ask.
+
+Approving (a) is asking agents to SSH to the Pro for this work only. Runs
+there use `--rac-launch-in-background` and throwaway profiles, and never
+take the foreground.
+[Master plan](00-master-plan.md#machine-rules)
+
+**D62 (M-8). What replaces the three-week freeze?** (a) Features build on
+154 and rebase once onto 156 after the sync. (b) The sync worktree rebases
+each feature patch as it lands on `main`. (c) A one-week freeze, with
+streams stacked on the 156 base.
+**Recommended: (c).** Before the sync compiles, streams write rac-owned files
+on 154 and check every API they call against the 156 sources, read from the
+sync worktree. About day 4, Ship tags the compiling sync as the 156 base.
+Streams clone its built tree and write their hooks in Helium-shared files on
+156. When the sync merges, about day 7, they rebase onto `main` with almost
+nothing to fix, and merge in Ship's order: the harness, then launch gates,
+then the rest.
+- (a) finds hot-file conflicts and compile breaks late, and every worktree
+  still needs a 156 tree.
+- (b) puts every rebase on the sync, the one serial thread, and verifies each
+  feature twice, on 154 and again on 156.
+- (c) moves hooks onto 156 about three days earlier than (a). Its cost is
+  rebasing stacked worktrees on late sync fixes. Those are small changes late
+  in the series, so they rebuild little.
+
+[Master plan](00-master-plan.md#order-of-work)
+
+**D63 (M-9). How do many agents share one Mac's builds?** (a) A build queue
+on each Mac, with verification in batches. (b) Leads agree on slots by
+message. (c) No limit.
+**Recommended: (a).** `devutils/rac/build-queue.sh` wraps `he build`. It has
+two build slots, and a full build takes both. Two run slots cover harness and
+eval runs. It refuses below 20 GB free or under critical memory pressure, and
+stops an incremental build that shows more than 20,000 steps. Agents write
+code, tests, and reviews without building, then build once per batch and run
+every check that build allows. Ship writes it on day 0. It changes AGENTS.md's
+"Build with `source dev.sh && he build`".
+[06 build queue](06-engineering-and-shipping.md#build-queue-d63)
+
+**D64 (M-10). How many release builds before launch?** (a) Two: 0.1.0 and the
+launch build, which proves the update after a quiet publish. (b) Three: add
+0.2.0 from the synced `main` on day 7. (c) More, as needed.
+**Recommended: (b).** Build 2 proves the new 156 pipeline and the update from
+0.1.0 six days before the launch build. It costs nothing on free runners, and
+nothing waits on it. If it fails, the launch build is the retry, with fixes.
+With (a), the first 156 build is the launch build, and a pipeline failure
+costs 1.5 days at launch. After launch, at most one point release a week,
+plus security fixes.
+[06 M3](06-engineering-and-shipping.md#m3-020-the-update-proof-days-7-10-build-2)
+
 ## B. Needed later, by thread
 
 ### Ship (plan 06)
 
 **D3 (06-D4). Publish a quiet 0.1.0 on Chromium 154 first?** Yes, labeled
-"Preview", or wait for the synced build. Needed by W2.
+"Preview", or wait for the synced build. Needed on day 0, before build 1.
 **Recommended: yes.** It proves signing now, and 0.1.0 to 0.2.0 proves
-updates.
+updates (D64).
 
 **D7 (06-D3). Support Intel Macs at launch?** (Money) Yes, at about $99 a
-build on Depot, or no. Needed by W3.
+build on Depot, or no. Needed on day 0, before the `arches` input.
 **Recommended: no, Apple Silicon only for 0.x.**
 [06](06-engineering-and-shipping.md#intel-b1-b2)
 
-**D8 (06-D6). What if the sync isn't merged by the end of W4?** Launch on 154
-as a labeled preview, hold the launch, or hold one week and then launch on
-154.
-**Recommended: hold one week, then launch on 154.** The 154 fallback must
+**D8 (06-D6). What if the sync isn't merged by day 10?** Launch on 154 as a
+labeled preview, or hold the launch.
+**Recommended: hold.** Arc's shutdown is a month after the target, so holding
+is cheap, and the other streams keep working on the 156 base. Decide on a 154
+launch only if the sync isn't merged by day 30 (11-27). That fallback must
 start by 12-15.
 
 **D10 (plan 06 default). Protect `main` and add a `rac-bot` machine user?**
 Yes, or no. With yes, PRs need Linux checks and your approval, and agents push
-as `rac-bot` while commits stay authored by Kainoa Newton. Needed by W2.
-**Recommended: yes, in W2 to W5.** It adds a short PR-flow section to
+as `rac-bot` while commits stay authored by Kainoa Newton. Needed by day 5,
+before the merge window.
+**Recommended: yes, by day 5.** It adds a short PR-flow section to
 AGENTS.md.
-[06 M4](06-engineering-and-shipping.md#m4-checks-protection-and-evidence-w2-w5)
+[06 M4](06-engineering-and-shipping.md#m4-checks-protection-and-evidence-days-0-10)
 
 **D18 (06-D7). How often does rac sync after launch?** Every Chromium major
 within 14 days, or every other major. Security fixes go out in 7 days if
-exploited, otherwise 14. Needed by W6.
+exploited, otherwise 14. Needed by launch, day 19.
 **Recommended: every major, reviewed after three cycles.**
 [06](06-engineering-and-shipping.md#cadence-e1-e2)
 
 **D60 (plan 06 default). If speed numbers against Helium aren't ready, does
 the site soften "never slower"?** (VISION) Yes until the numbers are
-published, or keep the line and delay the site. Needed by W4.
+published, or keep the line and delay the site. Needed by day 10.
 **Recommended: yes.** It is launch gate G11.
 
 ### UI (plans 01 and 02)
 
 **D13 (01-D1). Does Cmd+T open the command bar?** (VISION) Yes with one
 setting to get the new tab page back, yes with no setting, or no. Needed by
-W2.
+day 2.
 **Recommended: yes, plus one setting.** VISION.md makes the command bar a
 choice today.
 
 **D15 (M-4). Move the command bar and the little window ahead of
 `docs/roadmap.md`'s order?** Yes and rewrite the roadmap, or keep the order.
-Needed by W4.
+Needed by day 10.
 **Recommended: yes.** The roadmap puts the command bar in phase 5 and the
 little window in "Later".
 
 **D28 (01-D2). What do Cmd+L and a click on the address bar do?** Both open
 the command bar, Cmd+L opens it and a click edits in place, or both edit in
-place. Needed in W1 for 01 M2.
+place. Needed on day 0 for 01 M2.
 **Recommended: Cmd+L opens it, and a click edits in place.**
 
 **D29 (01-D3). When do command bar queries reach the search engine?** Same as
@@ -258,11 +347,11 @@ only inside Peek and the little window.** Taking Opt+Cmd+N moves Helium's
 split-view shortcut, so it needs your OK under AGENTS.md.
 
 **D32 (02-D2). Glass or solid?** Solid as today, or blur behind the window by
-default. Needed by W2.
+default. Needed by day 3.
 **Recommended: solid.**
 
 **D33 (02-D3). Which space themes?** Eight presets, presets plus custom
-colors, or a full gradient editor. Needed by W2.
+colors, or a full gradient editor. Needed by day 3.
 **Recommended: presets plus custom colors.** This also fixes dark mode for
 imported Arc spaces.
 
@@ -284,7 +373,7 @@ or yes with a fade on release.
 **Recommended: yes.**
 
 **D38 (01-D5). Do links from other apps open in a little window?** Yes by
-default, opt-in, or not built. Needed for 01 M3, after the sync.
+default, opt-in, or not built. Needed by day 5, before 01 M3's build.
 **Recommended: yes by default, in the last-used space, keeping nothing when
 closed.** Testing it touches your real data (see below).
 
@@ -295,7 +384,7 @@ off by default, and keeps an imported Arc user's own setting.**
 [01 Clear](01-ui-shell.md#clear-and-archive-owned-here-ruling-4)
 
 **D40 (02-D1). How springy is Cmd+S?** Dia's spring with about 3.4 px of
-bounce, a calmer 1.2 px, or none. Needed for 02 M4, after the sync.
+bounce, a calmer 1.2 px, or none. Needed by day 7, for 02 M4.
 **Recommended: the calmer spring, confirmed by a side-by-side video.**
 
 Links for this group: [01](01-ui-shell.md#what-you-need-to-decide) and
@@ -304,7 +393,7 @@ Links for this group: [01](01-ui-shell.md#what-you-need-to-decide) and
 ### Core (plans 03 and 05)
 
 **D12a (03-D6 and 05-D7). Does the outside-agent door work with rac's AI
-off?** Yes, or no. Needed by the door milestone, after launch.
+off?** Yes, or no. Needed by day 14, when the door starts.
 **Recommended: yes.** "AI off costs nothing" still holds, because the door
 has its own switch, off by default, and nothing listens while it's off.
 
@@ -316,7 +405,7 @@ while it's off, and "Outside agents: on" shows next to the AI switch.
 [05 fit](05-agents-and-ai.md#fit-with-the-non-negotiables)
 
 **D23 (05-D3). What is an agent's workspace?** An Agents section in the
-sidebar, its own space, or an off-screen window. Needed by W2, when UI designs
+sidebar, its own space, or an off-screen window. Needed by day 3, when UI designs
 the rows.
 **Recommended: the Agents section, with one group per client, shown only
 while it has tabs.** The off-screen window is the fallback if the rendering
@@ -335,11 +424,11 @@ spike shows a client needs it.
 **D26 (05-D2). What does a newly connected outside agent get?** Read the tabs
 you share, act in its own no-login tabs, or act in your tabs at your level.
 **Recommended: it reads the tabs you share. You can raise it to act in its
-own tabs.** The door is one milestone, 03 M2 with 05 M1, after launch.
+own tabs.** The door is one milestone, 03 M2 with 05 M1, days 14 to 30.
 
 **D27 (03-D3). Keep rac's own agent warm between messages?** Restart for
 every message, or keep one warm agent per profile with a 5-minute idle cap.
-Needed before 03 M3, after launch.
+Needed by day 22, before 03 M3.
 **Recommended: warm, one per profile, 5-minute cap.** This changes `ai.md`'s
 "a run is one prompt".
 
@@ -349,10 +438,11 @@ and [05](05-agents-and-ai.md#what-you-need-to-decide).
 ### Data (plan 04)
 
 **D43 (04-D1). What does the pre-launch import bring?** The sidebar only, the
-sidebar plus sign-ins, or those plus passwords. Needed for 04 M2 in W4.
-**Recommended: the sidebar plus sign-ins, from Arc only. If sign-ins slip,
-launch with the sidebar.** If approval comes after 11-02, plan for the sidebar
-only.
+sidebar plus sign-ins, or those plus passwords. Needed by day 8, when sign-ins either chase the launch or move to
+the first point release.
+**Recommended: the sidebar plus sign-ins, from Arc only. If sign-ins aren't
+merged by day 13, launch with the sidebar and ship sign-ins in the first
+point release.**
 
 **D44 (04-D2). How do Arc profiles map?** Everything into one profile, each
 Arc profile to a rac profile, or per-space sign-ins in one window.
@@ -464,13 +554,18 @@ These change AGENTS.md:
 1. D9b and D9c let threads open PRs and drive rac through the test tools
    without asking each time.
 2. D10 protects `main`, adds `rac-bot`, and adds a PR-flow section.
-3. D6 gives standing approval for the named full builds and `he reset`.
-4. D58 moves rac-owned source out of patches. This rewrites "All of rac's
+3. D6 gives standing approval for the five named builds, and no `he reset`
+   before launch.
+4. D63 routes every build through `devutils/rac/build-queue.sh`, in place of
+   a bare `he build`.
+5. D61 and D62 change "The main checkout is the base". After the sync, new
+   worktrees clone the 156 base, and the Pro may host worktrees.
+6. D58 moves rac-owned source out of patches. This rewrites "All of rac's
    changes live in its own patches", the "Where changes go" table, and the
    quilt workflow.
-5. D12a adds the door checks to the "AI off" item in "Cover every surface".
-6. D31 takes Opt+Cmd+N from Helium's split view.
-7. Some plans edit files Helium also edits, which bends "Cheap to update".
+7. D12a adds the door checks to the "AI off" item in "Cover every surface".
+8. D31 takes Opt+Cmd+N from Helium's split view.
+9. Some plans edit files Helium also edits, which bends "Cheap to update".
    These are plan 02 M4, plan 05 M2 (6 to 12 hunks), plan 04's Keychain and
    partition hooks, and plan 07 M5's omnibox. All count against D17's budget.
 
@@ -482,9 +577,9 @@ the agent it launched".
 
 | Item | Cost | Decision |
 | --- | --- | --- |
-| Depot runners | About $20 a month for the plan, about $35 per warm arm64 build and maybe $70 cold. About $150 to $300 a month, capped at $300 | D4 |
+| Depot runners | $0 if sponsored. Paid only on D4's trigger: about $20 a month for the plan, about $35 per warm arm64 build and maybe $70 cold. About $150 a month at three builds before launch and one a week after, capped at $300 | D4, D64 |
 | Intel builds | About $99 per two-architecture build on Depot | D7 |
-| Free GitHub attempt | $0, about 30 to 40 hours, and it has never finished | D4 |
+| Free GitHub runners | $0, about 30 to 40 hours a build, and it has never finished. The chosen first route | D4 |
 | Tier 2 agent evals before each release | Your API keys. 30 to 50 pages, 4 models, 2 modes, 3 runs. Likely tens to a few hundred dollars a release (estimate) | 05 M0, M2 |
 | ego(lite) benchmark | Your API keys. 31 tasks, 3 runs. About $150 per model per pass at ego's claimed $1.64 a task (estimate) | 05 M2 |
 | Larger GitHub runners | Rejected. They need a paid organization, which moves the update feed path | 06 |
@@ -510,8 +605,11 @@ the agent it launched".
   accounts only.
 - **Local signing (06, emergency path only).** The signing keys and the
   Sparkle key would sit on a Mac next to your real profile.
-- **Bench (06 M4).** The release-gate run needs an idle real Mac, so other
-  agents pause. It uses throwaway profiles.
+- **Bench (06 M4).** The release-gate run needs an idle real Mac, so it runs
+  at night when the queue is empty. It uses throwaway profiles.
+- **Your MacBook Pro (D61).** Builds and runs there sit next to your daily
+  data. Agents use throwaway profiles only, never `open` rac.app, and never
+  take the foreground. They SSH there only because D61 asks for it.
 
 ## Open questions
 

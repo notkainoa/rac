@@ -13,7 +13,7 @@ rac gets four Arc habits before Arc shuts down on 2026-12-22.
 
 The window keeps its sidebar, page card, and assistant panel. With AI off, no AI button, row, or label appears anywhere.
 
-The command bar ships at launch if it merges by the start of week 5. Otherwise an update brings it before 12-22. Peek, the little window, and Clear follow if they pass review in time, or slip to January.
+The command bar ships at launch (day 19) if it merges by day 13. Otherwise the first point release brings it, about day 26. Clear follows the same rule. Peek and the little window are built on days 5 to 24 and ship in the first point release or later.
 
 ```mermaid
 flowchart LR
@@ -136,9 +136,9 @@ Full comparisons are in `plans/research/matrices/features.md` and
 rac-owned files on today's shell. Hooks into hot upstream files land after
 plan 06's sync. Plan 03 (M4) and plan 06 (I2) thin the old hunks afterwards.
 
-- Pros: Arc users get the command bar before 12-22. rac-owned code can be
-  written on Chromium 154 now and rebased.
-- Cons: the old `look` and `settings` hunks stay heavy until January.
+- Pros: Arc users get the command bar by the first point release, about
+  day 26. rac-owned code can be written on Chromium 154 now and rebased.
+- Cons: the old `look` and `settings` hunks stay heavy until thinning (day 40 on).
 - Effort: about 38 to 55 agent-days before 12-22 (table below).
 - Risk: medium. Locks in Views for at least a year.
 
@@ -349,16 +349,20 @@ This overrides plan 02's S2 note to keep the 300 ms grace.
 
 ### Milestones
 
-Weeks count from plan approval. Anchors: launch build hard stop 2026-12-15
-(plan 06), Arc shutdown 2026-12-22. Plan 06 owns the calendar.
+Days count from approval (day 0, Wed 10-28). Anchors: launch day 19 (Mon
+11-16), launch merges close at the start of day 13, the first point release
+is about day 26. The 12-15 hard stop and Arc's shutdown on 12-22 are safety
+margins. The master plan's closing table owns the timing. Plan 06 owns the
+calendar.
 
-**Dependency for every worktree after the sync:** the main checkout's
-`build/src` is rebuilt on Chromium 156 first. Then worktrees are cloned
-from it again, so each one doesn't need a near-full build of its own.
-AGENTS.md says to ask the maintainer before any build of tens of thousands
-of steps. Plan 06 lists the rebuild time as unknown.
+**Dependency for every worktree after the sync (D62):** about day 4, Ship
+tags the compiling sync as the 156 base. A stream makes a new worktree with
+`worktree.sh setup <sync worktree>` and writes its hooks on 156. It rebases
+onto `main` when the sync merges, about day 7. That avoids a near-full build
+per worktree. AGENTS.md says to ask the maintainer before any build of tens
+of thousands of steps.
 
-#### M0. Prove the tools, run the spikes (weeks 1 to 2; Chromium 154; dev and rac-owned files only)
+#### M0. Prove the tools, run the spikes (days 0 to 5; Chromium 154; dev and rac-owned files only)
 
 - **Tasks.**
   - Extend the harness in `patches/rac/dev/`: capture a named secondary
@@ -380,7 +384,7 @@ of steps. Plan 06 lists the rebuild time as unknown.
 - **Not in M0.** The full screenshot matrix. It is taken once, on the
   synced build, shared with plan 06's sync checks.
 
-#### M1. Launch-build UI (weeks 1 to 4; lands on 156 after the sync; launch gate)
+#### M1. Launch-build UI (days 1 to 12; lands on 156 after the sync; launch gate)
 
 - **Goal.** The Arc import screens are in plan 06's launch build.
 - **Tasks.** Screens 1 and 2 with plan 04's importer, plus the PWA fixes
@@ -393,7 +397,7 @@ of steps. Plan 06 lists the rebuild time as unknown.
 - **Patch surface.** Rac-owned onboarding and settings files; about 0 to 2
   upstream hunks.
 
-#### M2. Command bar (rac code from week 1 on 154; hooks after the sync on 156; ships in the launch if merged by the start of W5, otherwise a W6 point release via Sparkle, before 12-22)
+#### M2. Command bar (rac code on 154 on days 0 to 6; hooks on 156 on days 4 to 16; ships in the launch if merged by day 13, otherwise the first point release, about day 26, via Sparkle)
 
 - **Tasks.** The panel, rows, ranking, and motion described above. Hooks:
   command ids, accelerators, the menu bar entry, `BUILD.gn`, and the anchor
@@ -411,11 +415,11 @@ of steps. Plan 06 lists the rebuild time as unknown.
   Unit tests for the ranking and the merge.
 - **Patch surface.** About 8 to 12 upstream hunks.
 - **Launch rule (D16).** It is not a launch gate. It ships in the launch
-  build if its hooks are merged by the start of W5. Otherwise it
-  ships in plan 06's one optional W6 point release, only if `update-smoke`
+  build if its hooks are merged by day 13. Otherwise it
+  ships in the first point release, about day 26, only if `update-smoke`
   passes.
 
-#### M3. Peek, little window, Clear (after M0's spikes and the sync; 156; stretch for before 12-22)
+#### M3. Peek, little window, Clear (156; Clear on days 0 to 12, Peek and little window spike on days 0 to 3 then build on days 5 to 24)
 
 - **Tasks.**
   - **Little window.** One hook in the macOS "open URLs" path
@@ -440,7 +444,7 @@ of steps. Plan 06 lists the rebuild time as unknown.
 - **Patch surface.** Re-estimated after the spike. About 12 to 20 upstream
   hunks today (INFERENCE).
 
-#### M4. Sidebar times and forgiving reveal (after plan 06's port; 156)
+#### M4. Sidebar times and forgiving reveal (days 7 to 16, after plan 06's port; 156)
 
 - **Tasks.** Apply the table above. Add the overshoot zone in a rac file. Its
   mouse monitor exists only while the revealed sidebar shows. Plan 02's
@@ -449,9 +453,9 @@ of steps. Plan 06 lists the rebuild time as unknown.
   (trace). Cmd+S show and hide both animate. Reduce Motion gives short
   fades. The rac hunks in Helium's new code are one constant each.
 
-#### M5. Agents section in the sidebar (with plan 05's M2 write tier; 156)
+#### M5. Agents section in the sidebar (design by day 3; build on days 25 to 45, with plan 05's M2 write tier; 156)
 
-- **Tasks.** Design the rows in week 2, so plan 05 can build to them: the
+- **Tasks.** Design the rows by day 3, so plan 05 can build to them: the
   one group per client in the Agents section, with the owner label, Take
   over, and Stop all. No space dot. Build them with plan 05's M2, after its
   rendering spike confirms 05-D3. Also
@@ -460,7 +464,7 @@ of steps. Plan 06 lists the rebuild time as unknown.
   takes focus. The ring and pill stay still, painted once. With both
   switches off, nothing is created and nothing shows.
 
-#### M6. After launch (January onward)
+#### M6. After launch (day 30 on)
 
 The archive store and page; opt-in auto-archive; media controls; the
 separate sign-ins toggle when plan 04 ships partitions; a Spaces settings
@@ -472,18 +476,19 @@ page; split view up to 3 or 4 panes only if users ask.
 |---|---|---|
 | M0 tools and spikes | 6 to 8 | yes |
 | M1 import screens | 3 to 5 | yes, launch gate |
-| M2 command bar | 10 to 14 | yes, in the launch or a W6 point release |
-| M3 little window, Peek, Clear | 16 to 23 (re-estimate after the spike) | stretch |
-| M4 sidebar times | 3 to 5 | stretch |
+| M2 command bar | 10 to 14 | yes, in the launch or the first point release (about day 26) |
+| M3 little window, Peek, Clear | 16 to 23 (re-estimate after the spike) | Clear in the launch or the first point release; Peek and little window in the first point release or later |
+| M4 sidebar times | 3 to 5 | first point release |
 | M5 Agents section UI | 5 to 8, plus 2 to 3 for settings | with plan 05 |
 | M6 | 12 to 18 | no |
 
 - **Critical path.** Plan 06's sync, then the base rebuild, then the
-  command bar hooks, then the launch build, or the W6 point release through Sparkle.
+  command bar hooks, then the launch build, or the first point release through Sparkle.
 - **Capacity.** The base machine is a shared M1 Air with 16 GB of memory and
-  101 GB free (plan 06). Assume one full build at a time. Assume at most two
-  incremental worktree builds at once (INFERENCE). Plans 04, 05, and 06 need
-  the same machine. So this plan runs two UI worktrees at once, not four.
+  101 GB free (plan 06). Builds go through the D63 build queue: two build
+  slots, and a full build takes both. Agents write code and tests without
+  building and verify in batches. Plans 04, 05, and 06 need the same machine.
+  The UI thread's seven streams share the queue.
 
 ### Screenshot and video rules
 
@@ -555,8 +560,8 @@ burst-capture (`patches/rac/dev/window-screenshot-popups.patch`,
   permission prompts, find, extensions. The M0 spike exists to find out.
 - **Arc data may vanish after 12-22** (INFERENCE, closed-ai-browsers
   digest). The import screens are a launch gate for that reason.
-- **One shared Mac.** If plan 06's base rebuild runs long, M2 misses the
-  W6 point release. The fallback is to ship M2 in January and say so on the site.
+- **One shared Mac.** If the build queue backs up, M2 misses the
+  first point release (about day 26). The fallback is the next point release, and the site says so.
 - **Frame metrics.** Chromium's animation histograms may not record in a
   metrics-removed build (ui-and-feel matrix). M0 picks a method that works.
 
