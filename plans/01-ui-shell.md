@@ -14,8 +14,9 @@ Cmd+L opens the command bar too. Cmd+O moves a Peek or little window into a
 space. A Clear button empties a space's open tabs, with Undo.
 
 Plan 06's launch build carries the Helium update and the Arc import
-screens. The command bar follows as an update before 12-22. Peek, the
-little window, and Clear follow if they pass review in time.
+screens. The command bar ships in the launch if it is merged by the start
+of W5, otherwise as a point release in W6 before 12-22. Peek, the little
+window, and Clear follow if they pass review in time.
 
 With AI off, no AI button, row, or label appears anywhere.
 
@@ -28,9 +29,9 @@ parallel work, so stretch items may slip to January.
 
 ## What you need to decide
 
-UI technology is plan 03's decision (03-D7: stay on Views); the command bar
-is native Views (alignment ruling 3). Agent workspaces are 05-D5. Separate
-sign-ins per space are 04-D3. Launch scope is plan 06's.
+UI technology is plan 03's decision (03-D4: stay on Views); the command bar
+is native Views (alignment ruling 3). Agent workspaces are 05-D3. Separate
+sign-ins per space are 04-D6. Launch scope is plan 06's.
 
 1. **01-D1. Does Cmd+T open the command bar?** Yes, plus one setting to get
    the new tab page back / yes, no setting / no. **Recommended: yes, plus
@@ -138,7 +139,7 @@ Full comparisons are in `plans/research/matrices/features.md` and
 
 **Option A: features first, thinning after the sync.** New surfaces go in
 rac-owned files on today's shell. Hooks into hot upstream files land after
-plan 06's sync. Plan 03 (M6) and plan 06 (I2) thin the old hunks afterwards.
+plan 06's sync. Plan 03 (M4) and plan 06 (I2) thin the old hunks afterwards.
 
 - Pros: Arc users get the command bar before 12-22. rac-owned code can be
   written on Chromium 154 now and rebased.
@@ -164,7 +165,7 @@ before any new surface.
 - *Out-of-process shell* (Atlas's OWL design; the Atlas product shut down on
   2026-08-09): it took a funded team (INFERENCE, closed-ai-browsers digest).
 
-**Recommendation: A.** Plan 03 has already ruled out C for now (03-D7).
+**Recommendation: A.** Plan 03 has already ruled out C for now (03-D4).
 Graft from B: each feature PR states its upstream hunk count against plan
 03's metric, and no new hunks go into `look`.
 
@@ -218,8 +219,9 @@ Window (one per profile)
 │  ├─ Pinned tabs and folders (this space; one level)
 │  ├─ Divider with Clear (new)
 │  ├─ Open tabs + New tab row (opens the command bar)
-│  └─ Footer: space dots (agent spaces show as dots, per 05-D5),
-│     media controls (new), menu
+│  ├─ Agents section: one group per client, shown only while it
+│  │  has tabs (05-D3)
+│  └─ Footer: space dots, media controls (new), menu
 ├─ Top bar (top bar layout): address bar, site control center, Chat
 ├─ Page area: one card, or two in split view; agent ring and pill
 └─ Right panel: assistant (AI on only)
@@ -239,7 +241,7 @@ Rules:
   window has Cmd+O and Close. Clear has Undo.
 - **With AI off, no AI button, row, or label appears anywhere,** including
   the command bar (ruling 16). Outside-agent surfaces follow their own
-  switch (05-D2). Settings shows "Outside agents: on" next to the AI switch
+  switch (D12 in decisions.md). Settings shows "Outside agents: on" next to the AI switch
   whenever the door is on (ruling 15).
 - **Incognito.** The command bar shows only that window's tabs and its own
   history, never the regular profile's. A Peek from an incognito page is
@@ -262,11 +264,11 @@ Rules:
 | 8 | Divider with Clear, Undo toast | Views | M3 |
 | 9 | Make rac the default browser (Helium's existing prompt, last onboarding step) | WebUI + system | M3 |
 | 10 | Edge reveal and Cmd+S with new timings and motion | Views | M4 |
-| 11 | Agent space dot, its tab list, owner label, Take over, Stop all (per 05-D5) | Views | M5 |
+| 11 | Agents section: one group per client (shown only while it has tabs), owner label, Take over, Stop all (per 05-D3) | Views | M5 |
 | 12 | Settings > Outside agents, with the status line by the AI switch | WebUI | M5 |
 | 13 | Archive page: search, restore | WebUI | M6 |
 | 14 | Media controls in the sidebar footer | Views | M6 |
-| 15 | Separate sign-ins toggle in the space editor (04-D3) | Views | M6 |
+| 15 | Separate sign-ins toggle in the space editor (04-D6) | Views | M6 |
 
 ### The command bar in detail
 
@@ -301,8 +303,10 @@ Rules:
 - **MayClear rule.** One rac predicate, `rac::cleanup::MayClear(tab)`, with
   a reason per spared tab. Clear never closes pinned tabs or favorites, or a
   tab that is playing media, in PiP, in split view, used by an agent, or
-  holding unsent form text. The list comes from plan 07's draft, which now
-  points here.
+  has a download in progress. It also spares a page that registered
+  `beforeunload`. Chromium keeps no general dirty-form flag, so "unsent form
+  text" is not a rule. The list comes from plan 07's draft, which now points
+  here.
 - **Before launch.** Clear with Undo, backed by Chromium's recently-closed
   restore. That keeps at most 25 entries (FACT,
   `components/sessions/core/tab_restore_service_helper.h:70`). The M0 spike
@@ -365,10 +369,10 @@ of steps. Plan 06 lists the rebuild time as unknown.
   - Extend the harness in `patches/rac/dev/`: capture a named secondary
     window (little window, onboarding, PiP, installed web app); set a space's
     theme and color mode; open a second profile window and an incognito
-    window; stitch burst frames into an MP4 locally.
-  - Prove one frame-timing method, such as Chromium trace events or a
-    compositor timestamp log. Burst PNG capture is accurate only to about
-    one 60 Hz frame (16 ms, INFERENCE). Write the tolerance down.
+    window. Plan 02 M0 builds the frame log and the frames-to-video tool, in
+    the same UI worktree, one after the other.
+  - Use plan 02 M0's frame-timing method. Burst PNG capture is accurate only
+    to about one 60 Hz frame (16 ms, INFERENCE). Write the tolerance down.
   - Record Cmd+S both ways and edge reveal. This confirms or retires the
     snap inference.
   - Check installed web app windows on today's build (ruling 17).
@@ -387,14 +391,14 @@ of steps. Plan 06 lists the rebuild time as unknown.
 - **Tasks.** Screens 1 and 2 with plan 04's importer, plus the PWA fixes
   from M0. The result screen names what didn't come over: declined
   passwords, flattened folders, live folders, Boosts, and other Arc
-  profiles' sign-ins until 04-D3 ships.
+  profiles' sign-ins until 04-D6 ships.
 - **Acceptance.** Plan 04's fixture Arc data gives the same space count,
   pinned tabs, favorites, and themes, with screenshots before and after.
   The AI-off check passes on every screen.
 - **Patch surface.** Rac-owned onboarding and settings files; about 0 to 2
   upstream hunks.
 
-#### M2. Command bar (rac code from week 1 on 154; hooks after the sync on 156; update 0.2.x via Sparkle, target before 12-22)
+#### M2. Command bar (rac code from week 1 on 154; hooks after the sync on 156; ships in the launch if merged by the start of W5, otherwise a W6 point release via Sparkle, before 12-22)
 
 - **Tasks.** The panel, rows, ranking, and motion described above. Hooks:
   command ids, accelerators, the menu bar entry, `BUILD.gn`, and the anchor
@@ -411,8 +415,10 @@ of steps. Plan 06 lists the rebuild time as unknown.
   and split-view windows, plus incognito. Videos of open, close, and Cmd+L.
   Unit tests for the ranking and the merge.
 - **Patch surface.** About 8 to 12 upstream hunks.
-- **If you want it in the launch build,** plan 06's launch gate must add it,
-  and its hooks must land by about a week before 12-15.
+- **Launch rule (D16).** It is not a launch gate. It ships in the launch
+  build if its hooks are merged by the start of W5 (11-30). Otherwise it
+  ships in plan 06's one optional W6 point release, only if `update-smoke`
+  passes.
 
 #### M3. Peek, little window, Clear (after M0's spikes and the sync; 156; stretch for before 12-22)
 
@@ -447,13 +453,14 @@ of steps. Plan 06 lists the rebuild time as unknown.
   (trace). Cmd+S show and hide both animate. Reduce Motion gives short
   fades. The rac hunks in Helium's new code are one constant each.
 
-#### M5. Agent spaces in the sidebar (with plan 05's M2 write tier; 156)
+#### M5. Agents section in the sidebar (with plan 05's M2 write tier; 156)
 
 - **Tasks.** Design the rows in week 2, so plan 05 can build to them: the
-  agent space dot, its tab list, the owner label, Take over, and Stop all.
-  Build them with plan 05's M2, after its rendering spike picks 05-D5. Also
+  one group per client in the Agents section, with the owner label, Take
+  over, and Stop all. No space dot. Build them with plan 05's M2, after its
+  rendering spike confirms 05-D3. Also
   build Settings > Outside agents and the status line next to the AI switch.
-- **Acceptance.** The agent space shows only while it has tabs. It never
+- **Acceptance.** A client's group shows only while it has tabs. It never
   takes focus. The ring and pill stay still, painted once. With both
   switches off, nothing is created and nothing shows.
 
@@ -469,14 +476,14 @@ page; split view up to 3 or 4 panes only if users ask.
 |---|---|---|
 | M0 tools and spikes | 6 to 8 | yes |
 | M1 import screens | 3 to 5 | yes, launch gate |
-| M2 command bar | 10 to 14 | yes, as 0.2.x |
+| M2 command bar | 10 to 14 | yes, in the launch or a W6 point release |
 | M3 little window, Peek, Clear | 16 to 23 (re-estimate after the spike) | stretch |
 | M4 sidebar times | 3 to 5 | stretch |
-| M5 agent spaces UI | 5 to 8, plus 2 to 3 for settings | with plan 05 |
+| M5 Agents section UI | 5 to 8, plus 2 to 3 for settings | with plan 05 |
 | M6 | 12 to 18 | no |
 
 - **Critical path.** Plan 06's sync, then the base rebuild, then the
-  command bar hooks, then 0.2.x through Sparkle.
+  command bar hooks, then the launch build, or the W6 point release through Sparkle.
 - **Capacity.** The base machine is a shared M1 Air with 16 GB of memory and
   101 GB free (plan 06). Assume one full build at a time. Assume at most two
   incremental worktree builds at once (INFERENCE). Plans 04, 05, and 06 need
@@ -530,14 +537,14 @@ burst-capture (`patches/rac/dev/window-screenshot-popups.patch`,
 
 - **02.** Motion tokens and specs: S1, S2, S10 (AI panel), S17, S18, S19.
   This plan's reveal times override S2's grace (see above).
-- **03.** 03-D7 (Views). The single action table (ruling 2). Its "where each
+- **03.** 03-D4 (Views). The single action table (ruling 2). Its "where each
   part lives" row should read "command bar: Views; rows are C++ from the
   action table" (ruling 3). The hunk metric (ruling 11).
-- **04.** The Arc importer and fixtures, the profile mapping (04-D3), and
-  separate sign-ins. Plan 04's table should point to plan 01 for the archive
+- **04.** The Arc importer and fixtures, the profile mapping (04-D2), and
+  separate sign-ins (04-D6). Plan 04's table should point to plan 01 for the archive
   (ruling 4).
-- **05.** 05-D5 (agent space), its rendering spike, and its M2 write tier.
-  Also the outside-agent policy and 05-D2.
+- **05.** 05-D3 (Agents section), its rendering spike, and its M2 write tier.
+  Also the outside-agent policy and the door's own switch (D12 in decisions.md).
 - **06.** The sync, the sidebar-reveal port, the base rebuild, the launch
   gate and calendar, screenshot CI, and gating dev switches.
 - **07.** The shortcut and label fields in the action table, and moving
@@ -552,8 +559,8 @@ burst-capture (`patches/rac/dev/window-screenshot-popups.patch`,
   permission prompts, find, extensions. The M0 spike exists to find out.
 - **Arc data may vanish after 12-22** (INFERENCE, closed-ai-browsers
   digest). The import screens are a launch gate for that reason.
-- **One shared Mac.** If plan 06's base rebuild runs long, M2 slips past
-  12-22. The fallback is to ship M2 in January and say so on the site.
+- **One shared Mac.** If plan 06's base rebuild runs long, M2 misses the
+  W6 point release. The fallback is to ship M2 in January and say so on the site.
 - **Frame metrics.** Chromium's animation histograms may not record in a
   metrics-removed build (ui-and-feel matrix). M0 picks a method that works.
 

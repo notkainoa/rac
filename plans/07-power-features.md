@@ -21,7 +21,7 @@ Only the copy and shortcut pieces can make the launch build before Arc shuts dow
 7. **07-D7. Whose shortcuts?** Chrome's for standard actions and Arc's for rac's own / Arc's everywhere. **Recommended: Chrome's for standard actions, Arc's for rac's own.**
 8. **07-D8. In what order?** By Arc-refugee demand (Boosts, then routing, then bangs) / by the roadmap (bangs first). **Recommended: by demand.**
 
-Decided elsewhere: Clear, the archive, and auto-archive belong to plan 01 (see 01-D6). Debug doors belong to plan 05 (see 05-D9). Routines and recipes also belong to plan 05 (see 05-D10, 05-D11).
+Decided elsewhere: Clear, the archive, and auto-archive belong to plan 01 (see 01-D7). Debug doors belong to plan 05 (see 05-D6). Routines and recipes also belong to plan 05 (see D59 in decisions.md, and 05-D8).
 
 ## Where we are today
 
@@ -31,7 +31,7 @@ Decided elsewhere: Clear, the archive, and auto-archive belong to plan 01 (see 0
 - **Bangs** come from Helium (`helium-chromium/patches/helium/core/add-native-bangs.patch`, `helium/ui/bangs-ui.patch`). The list has 10,730 entries and 13,421 triggers (`plans/research/helium.md:74`). It downloads from Helium services, and only the cache is used when that service is off (`template_url_bang_manager.cc:86-112`). A bang is added only if no search engine already has that keyword (`template_url_service.cc:1737-1753`). A bang's keyword is `!` plus its trigger (`template_url_data_util.cc:536`). So a user's own `!w` site search already beats the downloaded `!w`, and it loads with services off (FACT). Typing `cats !w` still shows "Google search" (`docs/internals/bangs.md`). The bang patches touch about 30 files, many in the omnibox (FACT).
 - **Shortcuts.** Helium has a full custom-shortcut system and page (`helium/core/custom-keyboard-shortcuts.patch`, 2,222 lines). rac adds space commands as `case` labels in Helium's `browser_shortcut_metadata.cc` (`patches/rac/spaces/commands.patch:157-190`). Each new command adds a hunk there.
 - **Groups.** Chromium tab groups exist among open tabs. They start unnamed. rac locks "auto-pin new tab groups" off (`patches/rac/settings/behavior-autopin-tab-groups-off.patch`).
-- **Air Traffic Control.** There is none. Links from other apps enter at `-application:openURLs:` (`app_controller_mac.mm:2062`). Plan 01 adds its little-window router there (`plans/01-ui-shell.md`, M2 task 2).
+- **Air Traffic Control.** There is none. Links from other apps enter at `-application:openURLs:` (`app_controller_mac.mm:2062`). Plan 01 adds its little-window router there (`plans/01-ui-shell.md`, M3).
 - **Boosts.** There are none. `VISION.md` and `docs/internals/glossary.md` define them as "custom CSS and JavaScript".
 - **Themes.** rac has 8 space themes. Chrome Web Store themes survive rac's reset (`patches/rac/spaces/space-owns-appearance.patch`, `ResetBrowserTheme`), and their colors "still win" (`patches/rac/spaces/dia-colors.patch:168`, FACT). rac has no browser mods. Its UI is C++ Views, not CSS, so Zen-style mods don't apply (`plans/research/zen.md:135`).
 - **Extensions.** The Chrome Web Store works through Helium's anonymizing proxy, and full MV2 uBlock is included (`digests/helium.md`). In the sidebar address bar layout, site controls list extensions (`patches/rac/sidebar-address-bar/site-controls.patch`).
@@ -89,8 +89,8 @@ Code goes in new files under `chrome/browser/rac/<feature>/` and `chrome/browser
 
 | Milestone | Starts | Chromium | Target |
 |---|---|---|---|
-| M0 Matcher and table fields | after plan 03 M2 and the sync | 156 | before M1 hooks |
-| M1 Arc habits | logic week 1; hooks after the sync | 156 | launch build if ready by 12-15; else first update |
+| M0 Matcher and table fields | after plan 03 M1 and the sync | 156 | before M1 hooks |
+| M1 Arc habits | logic week 1; hooks after the sync | 156 | launch build if merged by the start of W5; else first update |
 | M2 Boosts basics | spike week 2 on 154; build after the sync | 156 | about 3 to 5 weeks after launch |
 | M3 Air Traffic Control | after plan 01's little-window hook | 156 | early January |
 | M4 Bangs editor | after the sync | 156 | January |
@@ -101,7 +101,7 @@ Code goes in new files under `chrome/browser/rac/<feature>/` and `chrome/browser
 - **Goal.** Two small foundations, with no table of our own.
 - **Tasks.**
   1. Write `rac::SitePattern` in `chrome/browser/rac/site_pattern/`. Plan 07 owns it. It handles host matching (subdomains included) and "URL contains", is case-insensitive, and uses Chromium's registrable-domain helper (not Nook's suffix list, `digests/nook.md`).
-  2. Add "default shortcut" and "menu label" fields to plan 03's action table (03 M2). Helium's shortcut metadata then reads labels from that table through one hook. That replaces the per-command `case` hunks in `patches/rac/spaces/commands.patch`. This rewrites merged work, so re-test every space shortcut.
+  2. Add "default shortcut" and "menu label" fields to plan 03's action table (03 M1). Helium's shortcut metadata then reads labels from that table through one hook. That replaces the per-command `case` hunks in `patches/rac/spaces/commands.patch`. This rewrites merged work, so re-test every space shortcut.
 - **Acceptance.** Space shortcuts still list and rebind in Helium's shortcuts page. `browser_shortcut_metadata.cc` carries one rac hunk.
 - **Verification.** Unit tests for `SitePattern`. A screenshot of the shortcuts page.
 - **Patch surface.** About 2 hunks replace roughly 4 (net negative).
@@ -150,7 +150,7 @@ Code goes in new files under `chrome/browser/rac/<feature>/` and `chrome/browser
 - **Acceptance.** `open` of a matching URL from Terminal lands in the right window and space. A cold profile falls back with the chip. No rules means one empty-list check and nothing else.
 - **Verification.** Unit tests for matching, fallbacks, and the sign-in rule. Screenshots of the settings list and site-controls row. A video of a link from another app landing in a background space.
 - **Patch surface.** 0 to 1 hunks (the link-menu entry).
-- **Depends on** plan 01 M2 task 2, and on rac being the default browser (plan 01's onboarding step).
+- **Depends on** plan 01 M3 (the router), and on rac being the default browser (plan 01's onboarding step).
 
 ### M4. Bangs editor (3 to 5 agent-days)
 
@@ -189,9 +189,9 @@ Code goes in new files under `chrome/browser/rac/<feature>/` and `chrome/browser
 
 ## Dependencies on other plans
 
-- **01 ui-shell.** It places every entry point: the command bar, site controls ("Boost this site", "Always open in…"), and Settings > Spaces. It owns Clear, `MayClear`, the archive, and auto-archive (ruling 4; 01-D6), and media controls (ruling 12). Input for 01's `MayClear`: spare tabs playing media, in picture-in-picture, in split view, in agent use, or with downloads in progress. Drop "unsent form text", because Chromium keeps no general dirty-form flag (`beforeunload` only fires if a page registers it). ATC needs 01's router and the default-browser step.
+- **01 ui-shell.** It places every entry point: the command bar, site controls ("Boost this site", "Always open in…"), and Settings > Spaces. It owns Clear, `MayClear`, the archive, and auto-archive (ruling 4; 01-D7), and media controls (ruling 12). Input for 01's `MayClear`: spare tabs playing media, in picture-in-picture, in split view, in agent use, or with downloads in progress. Drop "unsent form text", because Chromium keeps no general dirty-form flag (`beforeunload` only fires if a page registers it), and spare only pages that registered `beforeunload`. ATC needs 01's router and the default-browser step.
 - **02 visual-design-and-motion.** Motion tokens for Zap and the chip sweep. Plan 02 also owns any custom space-theme editor. The Web Store theme notice (07-D6) needs a design.
-- **03 core-architecture.** It owns the single action table (ruling 2). Plan 07 adds the shortcut and label fields to it. Plan 03 also sets the patch-surface metric (ruling 11). Plan 03 says "07 decides whether M8 is needed". Routines are plan 05's (05-D11), so plan 05 decides that, not plan 07.
+- **03 core-architecture.** It owns the single action table (ruling 2). Plan 07 adds the shortcut and label fields to it. Plan 03 also sets the patch-surface metric (ruling 11). Routines are plan 05's (D59 in decisions.md), so plan 05 decides that, not plan 07.
 - **04 data-storage-import-sync.** Storage formats for Boosts and routes. Arc's raw routing file (M3 task 5). Two import items:
   - (a) Say in the import summary that JavaScript Boosts are not imported.
   - (b) Add a spike to find Arc's local Boost files, and convert CSS-only ones if they parse.
@@ -225,7 +225,7 @@ Code goes in new files under `chrome/browser/rac/<feature>/` and `chrome/browser
 
 > **Thread: power features (rac).** Build plan 07 (`plans/07-power-features.md`) using the maintainer's answers to 07-D1 through 07-D8. Read `docs/internals/bangs.md` and the plan in full.
 >
-> **Order.** M1's logic and the M2 spike may start on Chromium 154 in rac-owned files. Every upstream hook waits for plan 06's sync and base-tree rebuild. M0 waits for plan 03 M2. M3 waits for plan 01's little-window router. M5 needs its own go-ahead after its Helium diff check. Use one worktree per milestone.
+> **Order.** M1's logic and the M2 spike may start on Chromium 154 in rac-owned files. Every upstream hook waits for plan 06's sync and base-tree rebuild. M0 waits for plan 03 M1. M3 waits for plan 01's little-window router. M5 needs its own go-ahead after its Helium diff check. Use one worktree per milestone.
 >
 > **Plan-specific rules.**
 > - No network requests.

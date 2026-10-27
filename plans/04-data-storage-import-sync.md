@@ -99,20 +99,20 @@ This is Arc's real model: one window, with spaces backed by separate cookie jars
 
 **Calendar rules (cross-plan ruling 1).** Weeks count from plan approval. Plan 06 owns the sync and the launch calendar. Work in rac-owned new files may be built on Chromium 154 and rebased later. Work touching files Helium also patches waits for the sync. The fixed anchors are the launch build's hard stop on **2026-12-15** and Arc's shutdown on **2026-12-22**.
 
-**Dependencies.** In weeks 1-2, plan 06 M2 syncs to Helium 0.20.1.1 (Chromium 156) under a `patches/rac` merge freeze (06-D13). After that merge, the base tree must be rebuilt before any import worktree can build on 156 (plan 06 risks: the shared Air is the bottleneck). The Chromium 157 hop is optional; plan 06 decides. Every milestone below targets 156, or 157 if plan 06 hops.
+**Dependencies.** In W1 to W3 (slack to W4), plan 06 M2 syncs to Helium 0.20.1.1 (Chromium 156). Nothing under `patches/` merges until the sync does (plan 06's default list, D11 in decisions.md). After that merge, the base tree must be rebuilt before any import worktree can build on 156 (plan 06 risks: the shared Air is the bottleneck). The Chromium 157 hop is optional; plan 06 decides. Every milestone below targets 156, or 157 if plan 06 hops.
 
-**Test status.** Fixture tests report through the worktree-posted test status (06-D9), not CI. CI does not compile C++ tests before launch.
+**Test status.** Fixture tests report through the worktree-posted test status (06 M4 task 2), not CI. CI does not compile C++ tests before launch.
 
 **Critical path.**
 
 | Weeks after approval | Work | Chromium | Merges? |
 |---|---|---|---|
-| 1-2 (during the sync) | M0a snapshot service; M1a reader, import plan, scrub script, fixtures. All new files | 154, rebased later | No (freeze) |
+| W1 to W3 (during the sync, slack to W4) | M0a snapshot service; M1a reader, import plan, scrub script, fixtures. All new files | 154, rebased later | No (freeze) |
 | After the sync and base rebuild | M0b Keychain fix; M1b applier, hooks, plan 01's screens | 156 | Yes |
 | Next 1-2 weeks | M2 profiles and sign-ins | 156 | Yes |
-| By 2026-12-15 | M1 must be in the launch build; M2 should be | 156/157 | Launch (06 M5) |
+| By the start of W5 (11-30) | M1 must be merged for the launch build (hard stop 12-15); M2 should be | 156/157 | Launch (06 M5) |
 
-**If it slips.** If M2 misses 12-15, launch with sidebar-only import. Ship sign-ins in a point release only if `update-smoke` passes (06 M1) and it lands before 12-22. Otherwise ship it after. Arc's files stay on disk after shutdown, so import still works (INFERENCE). The budget is 16-21 agent-days before launch. If approval lands after mid-November, plan for sidebar-only.
+**If it slips.** If M2 isn't merged by the start of W5, launch with sidebar-only import. Ship sign-ins in a point release only if `update-smoke` passes (06 M1) and it lands before 12-22. Otherwise ship it after. Arc's files stay on disk after shutdown, so import still works (INFERENCE). The budget is 16-21 agent-days before launch. If approval lands after mid-November, plan for sidebar-only.
 
 ### M0. Minimal safety net (S, 3-4 agent-days)
 
@@ -212,7 +212,7 @@ This is Arc's real model: one window, with spaces backed by separate cookie jars
 
 ### After the launch
 
-None of this blocks 2026-12-22. Order and weeks follow plan 06 M6.
+None of this blocks 2026-12-22. Order follows the master plan, with item 2's partition spike and in-memory variant first, right after launch.
 
 **1. Full safety net (S, 2-3 agent-days).**
 - Grow to 14 daily backups (still no open tabs).
@@ -224,14 +224,14 @@ None of this blocks 2026-12-22. Order and weeks follow plan 06 M6.
 
 **2. Separate sign-ins in one window (04-D6; L, 15-25 agent-days; spike first).**
 - **Spike first.** The first deliverable is a one-week spike on a Chromium 156 tree. A space's tabs open with `CreateForFixedStoragePartition` against `StoragePartitionConfig::Create(profile, "rac", <token>, false)`, from one hook in `browser_navigator.cc` (Stedding ADR 0019).
-- **Model.** One jar per space, matching plan 01's toggle (01-D10). Shared jars are left out, because profile mapping covers Arc's case.
+- **Model.** One jar per space, matching plan 01's toggle (screen 15 of plan 01). Shared jars are left out, because profile mapping covers Arc's case.
 - **What the spike must prove:**
   - Restore, rebuilt from the space tag in session extra data (`docs/internals/pinned-tabs.md`).
   - Reopen closed tab and discard.
   - `window.open`, downloads, notifications, DevTools targets, and extension pages.
   - Whether Clear Browsing Data and the site-data settings reach non-default partitions. This is unverified. If they miss them, users would think data is gone when it is not, which breaks the privacy promise. That fix is part of the milestone.
 - **Moving a tab** to a space with another jar reopens its URL there.
-- **Plan 05 M3** builds its agent sign-in modes on this primitive, including in-memory partitions.
+- **In-memory variant first.** Right after launch, schedule the spike plus the in-memory (no-login) variant ahead of the per-space toggle. Plan 05 M2's outside write tier waits for it. Plan 05 M3 builds its persistent agent identities on the same primitive. Plan 05 M2 and this item both touch `browser_navigator.cc` and session restore, so Data and Core take turns there.
 - **Known limit:** `chrome.cookies` without a partition sees only the default jar.
 - **Hunks:** 3-6 in hot files, maybe `web_contents_impl.cc` as Brave does (INFERENCE).
 
@@ -264,11 +264,11 @@ None of this blocks 2026-12-22. Order and weeks follow plan 06 M6.
 
 ## Dependencies on other plans
 
-- **01 ui-shell.** Import screens and the result list (01 M1 task 2). The profile checkboxes and the restore prompt. The separate sign-ins toggle (01-D10), built after launch. The archive store and auto-archive (ruling 4); plan 04 only hands over Arc's threshold and points at Arc's archive file.
+- **01 ui-shell.** Import screens and the result list (01 M1 task 2). The profile checkboxes and the restore prompt. The separate sign-ins toggle (04-D6, plan 01 screen 15), built after launch. The archive store and auto-archive (ruling 4); plan 04 only hands over Arc's threshold and points at Arc's archive file.
 - **02 visual-design-and-motion.** Better theme fidelity, if wanted.
-- **03 core-architecture.** All stores live in the browser process, with no helper (03-D1, 03-D2). Plan 04 owns the history schema and retention (03 M5).
-- **05 agents-and-ai.** Agent runs use the AI store. Plan 05 M3 builds on the partition primitive. Chat encryption is counted once, here.
-- **06 engineering-and-shipping.** The sync and the freeze (06 M2, 06-D13), the base rebuild, the 157 decision, launch gates (06 M5) including the Keychain fix, posted test status (06-D9), and `update-smoke` for any point release.
+- **03 core-architecture.** All stores live in the browser process, with no helper (03-D1, 03-D2). Plan 04 owns the history schema and retention (after-launch item 3).
+- **05 agents-and-ai.** Agent runs use the AI store. Plan 05 M2 (its outside write tier) and M3 build on the partition primitive. Chat encryption is counted once, here.
+- **06 engineering-and-shipping.** The sync and the freeze (06 M2, plan 06's default list, D11 in decisions.md), the base rebuild, the 157 decision, launch gates (06 M5) including the Keychain fix, posted test status (06 M4 task 2), and `update-smoke` for any point release.
 - **07 power-features.** Arc routing rules are handed over in the import record.
 
 ## Risks and unknowns
@@ -298,12 +298,12 @@ None of this blocks 2026-12-22. Order and weeks follow plan 06 M6.
 >
 > **Thread:** architecture and backend, "Arc import". Model: Opus for M0b, M2, and the password spike. Sonnet may write the reader and fixtures, under review.
 >
-> **Goal:** M0 and M1 are in the launch build by 2026-12-15. M2 should be. If M2 slips, launch sidebar-only and follow plan 06 for a point release.
+> **Goal:** M0 and M1 are merged by the start of W5 (11-30) for the launch build (hard stop 12-15). M2 should be. If M2 slips, launch sidebar-only and follow plan 06 for a point release.
 >
-> **Calendar:** weeks 1-2, during plan 06's sync freeze: new files only (M0a, M1a) on Chromium 154, not merged. After the sync merges and the base tree is rebuilt: M0b, M1b, and M2 on 156. Plan 06 owns the calendar.
+> **Calendar:** W1 to W3 (slack to W4), during plan 06's sync freeze: new files only (M0a, M1a) on Chromium 154, not merged. After the sync merges and the base tree is rebuilt: M0b, M1b, and M2 on 156. Plan 06 owns the calendar.
 >
 > **Read first:** `AGENTS.md`, `VISION.md`, this plan, `plans/01-ui-shell.md` M1, `plans/06-engineering-and-shipping.md` M2 and M5, `docs/internals/pinned-tabs.md`, `plans/research/cra.md:375-432,604-637`, `/tmp/rac-overhaul/src/cra/Sources/Cra/Services/Import/` (MIT; credit it), `research/ardia.md:546-553`.
 >
 > **Rules:** code goes in `chrome/browser/rac/storage/` and `chrome/browser/rac/import/`; upstream edits are small hooks, and each PR reports its hunk count. Never edit Helium's importer files. Never read real Arc, Dia, Helium, or rac profiles. Use the maintainer's scrubbed sample and `--rac-import-source-root`, kept out of release builds. Snapshot before every import. No network requests. No plaintext password file without the maintainer's sign-off.
 >
-> **Done means:** fixture tests pass in the worktree-posted status (06-D9). Rerun adds nothing, and Undo restores the sidebar. Screenshots cover the sidebar before and after import in light and dark, both address-bar placements, two profile windows, and incognito unchanged. Videos cover the import and the password hand-off. A net log shows zero requests. `he validate series` passes.
+> **Done means:** fixture tests pass in the worktree-posted status (06 M4 task 2). Rerun adds nothing, and Undo restores the sidebar. Screenshots cover the sidebar before and after import in light and dark, both address-bar placements, two profile windows, and incognito unchanged. Videos cover the import and the password hand-off. A net log shows zero requests. `he validate series` passes.

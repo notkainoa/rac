@@ -13,7 +13,7 @@ gain custom colors, so imported Arc spaces keep theirs in light and dark mode.
 
 What ships first, before the launch build's hard stop on 2026-12-15: press states, calmer hovers, quieter AI
 loops, and custom space colors. These touch only rac's own files. Faster AI panel and tab motion, and Cmd+S and
-edge reveal on springs, need the Helium sync first. They make launch only if that sync lands by 2026-12-01.
+edge reveal on springs, need the Helium sync first. They make launch only if that sync is merged by the start of W5 (11-30).
 
 Cost: about 30 to 45 agent-days over roughly six weeks after approval. Each change ships with video and a frame log.
 
@@ -313,9 +313,11 @@ button. Ideas that need sign-off: a 0.97 press scale on favorites tiles, and Dia
 
 Weeks count from plan approval. Hot files shared with Helium wait for plan 06's sync (its M2) and the base-tree
 rebuild that follows. rac-owned files are built on Chromium 154 and rebased onto 156. The launch hard stop is
-2026-12-15 (plan 06 M5). Anything not merged one week before it waits until after launch.
+2026-12-15 (plan 06 M5). Launch merges close at the start of W5 (11-30, plan 06). Anything not merged by then waits until after launch.
 
 Upstream hunks are counted in plan 03's metric: net-diff hunks in upstream files.
+
+Build slots follow the master plan's rule: launch-gate work gets slots first. M2 and M3 write code and wait for a free slot.
 
 **M0. Baseline, rig, and wash spike** (week 1; Chromium 154; 4 to 5 agent-days)
 
@@ -334,7 +336,8 @@ Upstream hunks are counted in plan 03's metric: net-diff hunks in upstream files
   - The videos answer whether Cmd+S show snaps.
   - The spike returns an approach and an estimate.
   - All new switches are compiled out of release builds through plan 06's GN arg.
-- Patch surface: dev patches, and one hook next to the existing screenshot hook.
+- Patch surface: dev patches, and one hook next to the existing screenshot hook. This milestone builds the frame log and the video tool. Plan 01 M0 adds only the window,
+  profile, and incognito capture verbs, in the same UI worktree, one after the other.
 
 **M1. Token and spring foundation** (weeks 1 to 2; Chromium 154; 6 to 8 agent-days)
 
@@ -358,7 +361,7 @@ Upstream hunks are counted in plan 03's metric: net-diff hunks in upstream files
   - Spring timings match the table within 1 ms.
   - The pager's trace matches its baseline within 1 frame.
   - The lint runs clean on this milestone's own patches.
-- Patch surface: new files, plus about 2 to 3 BUILD hunks. After plan 03's source overlay move (03-D8, 06-D12),
+- Patch surface: new files, plus about 2 to 3 BUILD hunks. After the plain-folder move (06-D12),
   `motion/` moves with `ui/views/rac/**`.
 
 **M2. Visible polish in rac-owned files** (weeks 2 to 4; Chromium 154; 9 to 13 agent-days)
@@ -401,7 +404,7 @@ Upstream hunks are counted in plan 03's metric: net-diff hunks in upstream files
   3. Cmd+S and edge reveal motion (S1, S2) on plan 06's port of sidebar-reveal onto Helium 0.20's overlay, with
      plan 01's dwell and grace times (alignment ruling 6). Includes the A/B video for 02-D1 and the S1 resize
      choice from the frame gate.
-- Cutoff: if the sync hasn't landed by 2026-12-01, M4 ships after launch, and Cmd+S ships as it is (matching
+- Cutoff: if the sync hasn't merged by the start of W5 (11-30), M4 ships after launch, and Cmd+S ships as it is (matching
   plan 01's rule). If M0 shows that show snaps, list it as a known issue in the launch notes.
 - Acceptance: both directions trace to their tokens, pass the gate, and fade under Reduce Motion. A pointer
   reversal mid-slide is smooth.
@@ -415,7 +418,7 @@ plan 01 wants them, and the AI panel moving onto `kSpringDock`.
 **What Arc refugees see by 2026-12-22.**
 
 - For certain: press states, calmer hovers, quieter assistant loops, contrast support, and custom space colors.
-- If the sync lands by 12-01: the quick AI panel, Dia-style tab open and close, and Cmd+S and edge reveal on
+- If the sync is merged by the start of W5: the quick AI panel, Dia-style tab open and close, and Cmd+S and edge reveal on
   springs.
 
 ## Fit with the non-negotiables
@@ -435,7 +438,7 @@ plan 01 wants them, and the AI panel moving onto `kSpringDock`.
 
 - **01 ui-shell:** owns behavior (reveal dwell and grace, forgiving reveal), the layouts, and future surfaces. It
   uses these token names.
-- **03 core-architecture:** owns the hunk metric and the source overlay move (03-D8), which moves `motion/`.
+- **03 core-architecture:** owns the hunk metric. Plan 06 owns the plain-folder move (06-D12), which moves `motion/`.
 - **04 data-storage-import-sync:** copies Arc colors into `color1` and `color2`, and drops the noise texture.
   M3's dark pair makes imported spaces work in dark mode.
 - **05 agents-and-ai:** cards, ring, and loops follow S12 to S15. Any agent marker obeys the rules here.
@@ -476,7 +479,7 @@ plan 01 wants them, and the AI panel moving onto `kSpringDock`.
 > and `plans/research/motion-and-feel.md` lines 437-583. Use plan 06 for the calendar.
 >
 > Goal: M0 to M3 on Chromium 154 in weeks 1 to 4. Then M4 after plan 06's sync and base rebuild, and only if they
-> land by 2026-12-01 for launch. Nothing merges in the week before 2026-12-15.
+> are merged by the start of W5 (11-30) for launch. Nothing launch-bound merges after that.
 >
 > Rules:
 > - Every value comes from `rac_tokens.h` or `rac_tokens.css`.

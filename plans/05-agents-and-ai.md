@@ -14,14 +14,14 @@ What stays the same: AI is off by default. rac never sees your conversations. No
 
 1. **05-D1. How do we close the `auto` hole?** Taint rule (ask before acting on each site once a second site was read) / make `careful` the default / both. **Recommended: the taint rule, and keep `auto` as the default.**
 2. **05-D2. What does a newly connected outside agent get?** Read the tabs you share / act in its own no-login tabs / act in your tabs at your level. **Recommended: read the shared tabs; you can raise it to act in its own tabs.**
-3. **05-D3. What is an agent's workspace?** An Agents section in the sidebar (01-D9) / its own space / an off-screen window. **Recommended: the Agents section, if the rendering spike passes.**
+3. **05-D3. What is an agent's workspace?** An Agents section in the sidebar (plan 01 M5) / its own space / an off-screen window. **Recommended: the Agents section, if the rendering spike passes.**
 4. **05-D4. Should outside agents run JavaScript in pages, as with ego?** Never / step lists only / JavaScript only in no-login agent tabs. **Recommended: step lists now; no-login JavaScript is a later option.**
 5. **05-D5. Which doors?** MCP / a `rac` CLI with a skill / both. **Recommended: both, from plan 03's one relay; MCP first.**
 6. **05-D6. Chromium's own debugging doors?** Refuse them on the real profile, with no new setting / leave them / add an expert switch. **Recommended: refuse, with no new setting.**
 7. **05-D7. How does VISION.md describe the door?** Keep "AI off costs nothing" and add a separate promise for the door / reword the AI rule. **Recommended: add the separate promise.**
 8. **05-D8. Pomerado for repeat tasks?** Embed it / build native recipes later / neither. **Recommended: don't embed it; build native recipes after the evals pass.**
 
-Owned elsewhere: the warm agent (see 03-D3), routines while rac is closed (see 03-D4), and the door transport (see 03-D5 and 03-D6).
+Owned elsewhere: the warm agent (see 03-D3), routines while rac is closed (this plan owns them; D59 in decisions.md), and the door transport (see 03-D2).
 
 ## Where we are today
 
@@ -86,7 +86,7 @@ Every option starts with the safety floor (M0). The costs below are plan-05 agen
 
 ## Recommended plan
 
-**Calendar.** Weeks are counted from the maintainer's approval (`alignment.md` ruling 1). Fixed anchors: the launch build freezes on 2026-12-15, and Arc shuts down on 2026-12-22. Plan 06 owns the Helium sync to Chromium 156 (its M2) and the launch (its M5).
+**Calendar.** Weeks are counted from the maintainer's approval (`alignment.md` ruling 1). Fixed anchors: the launch build must start by 2026-12-15 (launch merges close at the start of W5), and Arc shuts down on 2026-12-22. Plan 06 owns the Helium sync to Chromium 156 (its M2) and the launch (its M5).
 
 - Only M0 is a launch gate.
 - Work in rac-owned files may be built on 154 and rebased.
@@ -96,7 +96,7 @@ Every UI item ships screenshots from `devutils/rac/worktree.sh run`, in light an
 
 **AI-off check** (ruling 16). With AI off, no AI button, row, or label appears anywhere. That includes the command bar. The door's UI is labelled "Outside agents", never "AI".
 
-### M0. Safety floor (weeks 1–3; launch gate; guard on 154, then rebased onto 156)
+### M0. Safety floor (weeks 1–4; launch gate; guard on 154, then rebased onto 156)
 
 **Goal:** no tested variant of the exfiltration chain gets through `auto`, and every default fails closed.
 
@@ -120,7 +120,7 @@ Every UI item ships screenshots from `devutils/rac/worktree.sh run`, in light an
    - Outside-client levels parse to read only.
    - Add a test for each.
 4. **Mark page text for every model, 1–2 days.** Use tool-named boundaries, escape fake markers, and neutralize role tags (including spaced letters). Never skip this for "strong" models (`digests/aside.md`, take 6).
-5. **Debug doors (05-D6).** Plan 03 M1 builds this, on 156 after the sync.
+5. **Debug doors (05-D6).** The Core thread builds this inside M0, on 156 after the sync (week 4).
    - Refuse `--remote-debugging-port` and `--remote-debugging-pipe` on the default profile.
    - Turn the `chrome://inspect` approval feature off, with no new setting.
    - Verify on a build first. Dev runs pass `--user-data-dir` (`dev.sh:132`, `worktree.sh:206`), so the maintainer's DevTools-port screenshot flow should keep working.
@@ -133,15 +133,15 @@ Every UI item ships screenshots from `devutils/rac/worktree.sh run`, in light an
 
 - Tier 1 fixtures stop at a card for every variant listed under "Evals" below. The false-card budget holds.
 - Unit tests cover every fail-closed default.
-- The worktree posts green `rac/unit-tests` and `rac/agent-evals` statuses (plan 06 F1).
+- The worktree posts green `rac/unit-tests` and `rac/agent-evals` statuses (plan 06 M4 task 2).
 
 **Budget.** About 18–25 days, about 2–3 weeks with two threads. It needs one worktree build on 154 that includes agent patches 13–17, because the base tree predates them. After the sync it needs the base-tree rebuild.
 
-**Patch surface:** rac-owned files only. Plan 03 M1 adds about 2 hunks for the doors.
+**Patch surface:** rac-owned files only. This milestone adds about 2 hunks for the doors.
 
-### M1. Read-only door (weeks 4–7; Chromium 156, after the sync; not a launch gate)
+### M1. Read-only door (after launch, W7 or later; Chromium 156; not a launch gate)
 
-**Goal:** Claude Code, Codex, Cursor, or OpenCode can read the tabs you share, with rac's AI off. Plan 03 M3 provides the relay, socket, tokens, and listener lifecycle. Plan 03 M2 splits the controller and guard out of `AiService`.
+**Goal:** Claude Code, Codex, Cursor, or OpenCode can read the tabs you share, with rac's AI off. This milestone and plan 03 M2 are one milestone: the door. It may be built on a branch from W4 if a build slot is free. Plan 03 M2 provides the relay, socket, tokens, and listener lifecycle. Plan 03 M1 splits the controller and guard out of `AiService`, and may land before launch.
 
 **The trust root for outside clients** (alignment ruling 8). rac never sees an outside agent's prompt. These rules replace the chat-message signals:
 
@@ -162,7 +162,7 @@ Under these rules, outside `auto` means: free on named origins and in no-login t
 2. **Read tools only,** taken from plan 03's action table: `snapshot`, `get_page_text`, `find` (returns up to 20 refs), and `list_tabs` (shared tabs only, never your private ones). Each carries MCP annotations. The ref table lives per client in the browser, so refs survive between CLI calls (ego take 7). 1–2 days.
 3. **Cheaper reading:** splice deltas (`{base_rev, startLine, deleteCount, lines}`), `scope: viewport | full | subtree(ref)` with ego's compaction, and cross-origin iframes outside the named set shown as labelled stubs. 5–7 days.
 4. **Sharing:** "Share with <agent>" and "Stop sharing" in rac's site control center (a rac-owned surface, so no hot tab-menu hunk), plus a static marker on shared tabs. 3–4 days, drawn by plan 01.
-5. **Pairing card and connected-agents list** (plan 01's Settings › Agents).
+5. **Pairing card and connected-agents list** (plan 01's Settings > Outside agents).
    - The card names the client. It says plainly that identity is best effort and that the boundary is your macOS user.
    - It says: "This agent's model provider will see the text of tabs you share."
    - "Outside agents: on" shows next to the AI switch while the door is on (ruling 15).
@@ -181,7 +181,7 @@ Under these rules, outside `auto` means: free on named origins and in no-login t
 - With the door off, there is no socket, no listener, and no controller (AI-off set 2).
 - A revoked client is refused.
 
-**Budget:** about 19–27 days. M1 slips if plan 01's Settings › Agents isn't ready; otherwise M1 ships a minimal page.
+**Budget:** about 19–27 days. M1 slips if plan 01's Settings > Outside agents isn't ready; otherwise M1 ships a minimal page.
 
 ### M2. Agent workspace and the write tier (weeks 8–15; Chromium 156)
 
@@ -193,12 +193,12 @@ Under these rules, outside `auto` means: free on named origins and in no-login t
    - **Pass condition:** 10 of ego's benchmark tasks succeed as often in hidden agent tabs as in visible ones.
    - If it fails, agent tabs move to an off-screen window. Nook does this at alpha 0. The sidebar shows them the same way.
 2. **Agent tabs (05-D3), 8–12 days.**
-   - One group per client in the Agents section (01-D9), shown only while the client has tabs.
+   - One group per client in the Agents section (05-D3, plan 01 M5), shown only while the client has tabs.
    - Tabs are muted. They never activate the window or take focus. Popups stay contained, and pages stay out of history.
    - Tabs close after 15 idle minutes and are never session-restored.
    - Agent tabs are exempt from space unload and tab discard.
    - Page budget: 8 tabs per client.
-3. **No-login tabs by default for outside clients.** They use an in-memory partition, thrown away afterwards. Plan 04 adds this as an ephemeral variant of its identity hook (04 M4). Until it exists, the write tier stays off for outside clients. "Use my logins" is a per-client choice on the connected-agents list. 1–2 days of hookup here.
+3. **No-login tabs by default for outside clients.** They use an in-memory partition, thrown away afterwards. Plan 04 builds this as an in-memory variant of its partition hook (04 after-launch item 2, D46), right after launch. This milestone builds agent tabs for the built-in agent and "use my logins" first, and turns on the outside write tier when the in-memory partition lands. Both touch `browser_navigator.cc` and session restore, so Data and Core take turns there. Until then, the write tier stays off for outside clients. "Use my logins" is a per-client choice on the connected-agents list. 1–2 days of hookup here.
 4. **Ownership states, 3–5 days:** `user`, `agent:<client>`, and `handed_to_user`.
    - Real input hands the tab to you.
    - The agent gets a stable error with a reason, and automatic hand-offs get their own code (avoids ego #314).
@@ -242,21 +242,21 @@ Under these rules, outside `auto` means: free on named origins and in no-login t
 ### M3. Secrets and the optional script mode (weeks 16–18)
 
 - **Payments and passwords are the user's step.** A hand-off card says "Fill this yourself, then give it back", with no Allow button (Nanobrowser's rule). 2–3 days.
-- **"Agent's own logins":** a persistent identity from plan 04 M4, chosen per client. 1–2 days.
+- **"Agent's own logins":** a persistent identity from plan 04's partition work (after-launch item 2), chosen per client. 1–2 days.
 - **Spike: fill a login by reference** without Chromium's `ExecutionEngine`. 3 days.
 - **Optional, if 05-D4 allows it:** JavaScript `evaluate` in no-login agent tabs only, with a read-only result and scoped to that client. 4–6 days.
 - **Budget:** about 6–8 days, plus 4–6 if the script mode is approved.
 
 ### Evals and red team
 
-**Tier 1a: guard tables as unit tests** in `rac_agent_unittests`. These run on every PR through plan 06's F1 status. Every level crossed with every action class, for both built-in and outside clients.
+**Tier 1a: guard tables as unit tests** in `rac_agent_unittests`. These run on every PR through plan 06's `rac/unit-tests` status (06 M4 task 2). Every level crossed with every action class, for both built-in and outside clients.
 
 **Tier 1b: fixture runs on a built worktree.** A runner in `devutils/rac/evals/`:
 
 - launches the app through `worktree.sh run` with a throwaway profile;
 - serves hostile fixture pages on localhost;
 - points the Custom provider at a fake OpenAI-compatible model on localhost (already allowed, `ai.md:662-667`) that follows the planted instruction on purpose;
-- posts `rac/agent-evals` the way F1 does.
+- posts `rac/agent-evals` the way 06 M4 task 2 does.
 
 No new browser-test target is needed. Each attack gets four graded outcomes: the attack was attempted, the gate's response, the simulated user's answer, and whether the attacker endpoint received the secret. A committed baseline file is the ratchet: attacker successes may not rise.
 
@@ -301,10 +301,10 @@ Plan 06's bench measures startup, tab switching, scrolling, and typing against H
 ### Later (no milestone yet)
 
 - **Native recipes** (05-D8), after tier 2 is green and stable locators exist. "Save as recipe" stores a run's steps as editable JSON (locators, named inputs, a check that must pass). Replay uses no model, works with AI off, and runs every step through the guard. Authority is fixed at save time. Storage is a profile file, with plan 04. About 15–22 days. Pomerado is not embedded: it needs OpenAI to record, ships its own Chromium, and can't attach to rac.
-- **Routines.** First, document using cron, launchd, or T3 Code with `rac run recipe` (free). Then native routines while rac is open, where a risky step pauses the run and notifies. While rac is closed: see 03-D4.
+- **Routines.** First, document using cron, launchd, or T3 Code with `rac run recipe` (free). Then native routines while rac is open, where a risky step pauses the run and notifies. While rac is closed: see D59 in decisions.md (not planned; no helper).
 - **WebMCP page tools** on Chromium 156 or later, treated as untrusted clicks.
 - **A small sensitive-site list** that Always rules can override. Cut from M0: it is open-ended and fights `auto`.
-- **Assistant extras:** agents' own models in the picker, "/" saved prompts, and queue versus steer. The warm agent is 03-D3. Encrypted history is plan 04 M3.
+- **Assistant extras:** agents' own models in the picker, "/" saved prompts, and queue versus steer. The warm agent is 03-D3. Encrypted history is plan 04's after-launch item 3 (04-D7).
 - **Other channels.** AppleScript is not an agent channel. If plan 07 adds it, it exposes only the action table's Read and safe space actions. DevTools-over-MCP isn't offered; developers use a separate profile.
 - **Subscriptions:** only through the vendor's CLI over ACP, or through the user's own agent driving the door. Never client impersonation (`digests/aside.md`).
 
@@ -325,11 +325,11 @@ Plan 06's bench measures startup, tab switching, scrolling, and typing against H
 
 ## Dependencies on other plans
 
-- **01:** draws the Agents section (01-D9, scheduled with M2), Settings › Agents (M1), the pairing card, the sharing control, and the approval badges.
+- **01:** draws the Agents section (05-D3, plan 01 M5, scheduled with M2), Settings > Outside agents (M1), the pairing card, the sharing control, and the approval badges.
 - **02:** card motion, the static marker, and reduced motion.
-- **03:** the action table (ruling 2), the controller and guard split (its M2), the relay, socket, and tokens (its M3), the debug doors build (its M1), and the warm agent (03-D3).
-- **04:** the ephemeral and persistent agent identities (its M4), the run and tool-call audit log, and storage for recipes.
-- **06:** the F1 statuses, release gating of dev switches, the bench, the sync, and the launch calendar.
+- **03:** the action table (ruling 2), the controller and guard split (its M1), the relay, socket, and tokens (its M2), and the warm agent (03-D3). The debug doors are built here, in M0.
+- **04:** the in-memory and persistent agent partitions (after-launch item 2, D46), the run and tool-call audit log, and storage for recipes.
+- **06:** the posted test statuses (06 M4 task 2), release gating of dev switches, the bench, the sync, and the launch calendar.
 - **07:** the card rule for Boosts, routes, and bang overrides; the AppleScript limits above.
 
 ## Risks and unknowns
@@ -341,10 +341,10 @@ Plan 06's bench measures startup, tab switching, scrolling, and typing against H
   - Document both. They are not fixable without a network policy (`ai.md`, "Open concerns").
 - **Outside agents keep their own memory,** so their read set never resets by itself. That makes `auto` card-heavy in tabs with your logins. No-login tabs are the intended home.
 - **Hidden rendering** may force the off-screen window.
-- **Plan 04's ephemeral identity** may arrive late (its M4 is late January), which holds back the write tier.
+- **Plan 04's in-memory partition** may arrive late (after-launch item 2), which holds back the outside write tier.
 - **Sandboxed agents** may not reach the socket (ego #188). M1 tests this.
 - **Peer identity is weak.** Same-user is the boundary.
-- **Effort:** about 87–126 days for M0–M3, plus later items. Only M0 must make 2026-12-15.
+- **Effort:** about 87–126 days for M0–M3, plus later items. Only M0 must be merged for the launch build (cutoff: the start of W5).
 
 ## Open questions
 
@@ -362,7 +362,7 @@ Plan 06's bench measures startup, tab switching, scrolling, and typing against H
 
 > **Thread: agents and AI (plan 05).** Build M0 to M3 of `plans/05-agents-and-ai.md` in feature worktrees. Read `AGENTS.md`, `VISION.md`, `docs/internals/ai.md`, and `patches/rac/agent/` first.
 >
-> - **Order.** M0 in rac-owned files on 154, rebased after plan 06's sync; it gates the 2026-12-15 launch build. M1 after the sync and base-tree rebuild. M2 after the rendering spike and plan 04's ephemeral identity.
+> - **Order.** M0 in rac-owned files on 154, rebased after plan 06's sync; it gates the 2026-12-15 launch build. M1 after launch, as one milestone with plan 03 M2. M2 after the rendering spike; its outside write tier waits for plan 04's in-memory partition.
 > - **Rules.** Every call enters `AgentController::HandleToolCall` and the guard. No level skips the risky list. Defaults fail closed. No raw CDP or scripts on a profile with logins. With AI off, no AI labels anywhere. Transport, action table, and controller split come from plan 03; identities from plan 04.
 > - **Proof.** Each PR posts `rac/unit-tests` and `rac/agent-evals` from the worktree. UI changes carry screenshots (light, dark, sidebar full and hidden, reduced motion); focus and approval flows get videos.
 > - **Models.** Claude Opus for the guard, controller, concurrency, and UI. Sonnet or a strong open-weight model for fixtures and tools, reviewed by Opus. Open PRs only when the maintainer asks.

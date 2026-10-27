@@ -29,7 +29,7 @@ The launch ships that caught-up build with Arc import and a safer agent.
 
 **I will do these unless you object:**
 - One jump to Helium 0.20.1.1, not two steps.
-- During the sync, `main` takes only changes that add no hunks to upstream files. That means new rac-owned files, docs, the site, CI and plans.
+- During the sync, nothing under `patches/` merges until the sync merges, because every new patch also edits `patches/series`, the one file the sync conflicts on. Docs, the site, CI and plans may merge.
 - Protect `main`. Every PR passes the Linux checks and gets the maintainer's approval. Agents push as a machine user, `rac-bot`, so the approval is a real gate.
 - C++ tests run in the agent's worktree first, and in the release build once they fit.
 - No hop to Chromium 157 before launch.
@@ -125,7 +125,7 @@ Rejected:
 
 **I2. Move them into a plain `rac-src/` folder.** A step like `replace_resources.py` copies them into `build/src`, or dev trees link them, as Zen does (FACT, `devutils/shared.sh:14-20`; `zen`). PR diffs then show real code, not diffs of diffs: today 658 self-edits carry 26k lines of churn (FACT, `rac-baseline`). It changes every agent's workflow. Effort M: 5 to 8 agent-days.
 
-**Recommendation: I2, after launch.** Plan 03 M7 implements it.
+**Recommendation: I2, after launch.** The Ship thread implements it, after a throwaway-worktree spike on copy versus link.
 
 ## Recommended plan
 
@@ -142,7 +142,7 @@ Rejected:
 | W4 | 156 | M3 0.2.0, the first synced release; update loop proven | `update-smoke` 0.1.0 to 0.2.0 | 06 |
 | W2-W5 | 154, then 156 | M4 checks, protection, evidence | Host list and bench run on 0.2.0 | 06 |
 | W5 | 156 | M5 launch candidate 0.2.x with the gates below; launch | Every launch gate checked | 06 + 04 + 05 |
-| W6 | 156 | Float | | |
+| W6 | 156 | Float; one optional point release (D16) | `update-smoke` passes | 06 |
 
 Anchors:
 - Approval by 11-02 puts W5 at 11-30 to 12-06, with W6 as float.
@@ -155,16 +155,16 @@ Anchors:
 
 | Gate | Owner, milestone |
 | --- | --- |
-| Arc sidebar import: spaces, pins, favorites. Sign-ins are not required. | Plan 04 M1 |
-| Keychain "no silent reset" fix (ruling 13) | Plan 04 M0 task 5 |
+| Arc sidebar import: spaces, pins, favorites, including plan 01's import screens. Sign-ins are not required. | Plan 04 M1, plan 01 M1 |
+| Keychain "no silent reset" fix (ruling 13) | Plan 04 M0 task 3 (M0b) |
 | Agent safety floor and the first evals | Plan 05 M0 |
-| Dev switches gated out of release builds | Plan 05 M0 task 7 |
+| Dev switches gated out of release builds | Plan 05 M0 task 6 |
 | Signed synced build passes install and update smoke | Plan 06 M3 |
 | Network host list published | Plan 06 M4 |
 | Speed numbers published, or the site line softened | Plan 06 M4 |
 | DRM test page checked before any Widevine claim | Plan 06 M5 |
 
-Plan 01's launch items, such as the command bar (01-D12), ship if they merge by the start of W5. They are not gates.
+Plan 01's launch items, such as the command bar (D16 in decisions.md), ship if they merge by the start of W5. They are not gates. One optional point release in W6 carries what missed it, only if `update-smoke` passes.
 
 ### M0. Pipeline (W1)
 
@@ -219,7 +219,7 @@ Acceptance: 0.1.0 is public, smoke passes, the runbook exists. Verification: run
 Goal: every rac feature works on 156.
 
 Tasks:
-1. **Day 1:** answer 06-D1. Restore the fetch-only `upstream` remote. Start the freeze (only changes with no upstream hunks merge).
+1. **Day 1:** answer 06-D1. Restore the fetch-only `upstream` remote. Start the freeze (nothing under `patches/` merges until the sync does).
 2. In a `sync/helium-0.20.1.1` worktree on the chosen Mac, merge the tag. Only `patches/series` should conflict (FACT, `helium`).
 3. Adopt the new `prepare_sources` and `configure_build` signatures and Helium's prepared tarballs. Start the cold build at once: it measures the rebuild time every later plan depends on.
 4. **Mechanical fixes** (parallel; Sonnet or open-weight): `ui/BUILD.gn`, the moved `tabs/` files, context drift.
@@ -306,11 +306,11 @@ Effort: about 4 agent-days (UI rule for site pages).
 
 ## Dependencies on other plans
 
-- **01.** The sidebar-reveal port happens in M2, and plan 01 sets its behavior values (ruling 6). Plan 01 work on hot files lands after the base rebuild (W4). Its launch items are optional, merged by W5.
+- **01.** The sidebar-reveal port happens in M2, and plan 01 sets its behavior values (ruling 6). Plan 01 work on hot files lands after the base rebuild (W4). Its launch items are optional, merged by the start of W5.
 - **02.** It owns the motion token names used in the reveal port. The bench measures frame times.
-- **03.** It defines the patch-surface metric, which M0 runs as a check (ruling 11). It implements the overlay if 06-D12 is approved.
-- **04.** M0 task 5 (Keychain) and M1 (Arc sidebar import) are launch gates. Both build in rac-owned files on 154 during W1-W3 and rebase in W4.
-- **05.** M0 is a launch gate. It owns the debug doors (05-D9, ruling 7). Its eval tier 1 runs in CI once test targets compile.
+- **03.** It defines the patch-surface metric, which M0 runs as a check (ruling 11). It does not implement the overlay; this plan owns the move (06-D12).
+- **04.** M0 task 3 (M0b, Keychain) and M1 (Arc sidebar import) are launch gates. Both build in rac-owned files on 154 during W1-W3 and rebase in W4.
+- **05.** M0 is a launch gate. It owns the debug doors (05-D6, ruling 7). Its eval tier 1 runs in CI once test targets compile.
 - **07.** Power patches land after the bench. Features wait for the base rebuild.
 
 ## Risks and unknowns

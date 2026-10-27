@@ -43,9 +43,9 @@ Terms: a **daemon** or **sidecar** is a separate background program. A **utility
 3. **03-D3. Keep a rac-launched agent warm between messages?** Restart each message / one warm agent per profile, 5-minute idle cap. **Recommended: warm, one per profile, 5-minute cap.** Plan 05 refers to this decision.
 4. **03-D4. How do we shrink rac's Chromium edits?** Stay on Views and thin the hooks / native AppKit shell now. **Recommended: Views with thin hooks. Spike a native shell only if the target in 03-D5 is missed after the second sync.**
 5. **03-D5. Which patch-surface number do we hold?** Net-diff hunks plus dry-run failures per sync / raw stacked hunks. **Recommended: net-diff hunks and failures per sync. Accept up to 630 stacked hunks including other plans' additions; aim for 550.**
-6. **03-D6. Add a scoped promise for the door to VISION.md?** Yes / no. **Recommended: yes. "Outside-agent access has its own switch, off by default. When off, it costs nothing."** Whether the door works with AI off is 05-D2.
+6. **03-D6. Add a scoped promise for the door to VISION.md?** Yes / no. **Recommended: yes. "Outside-agent access has its own switch, off by default. When off, it costs nothing."** The same decision (D12 in decisions.md) also settles that the door works with AI off.
 
-Decided elsewhere: the debugging doors are 05-D9. Moving rac's own files into a plain folder is 06-D12. Routines while rac is closed are 05-D11.
+Decided elsewhere: the debugging doors are 05-D6. Moving rac's own files into a plain folder is 06-D12. Routines while rac is closed are plan 05's (D59 in decisions.md).
 
 ## Where we are today
 
@@ -63,7 +63,7 @@ Decided elsewhere: the debugging doors are 05-D9. Moving rac's own files into a 
 
 **JSON parsing is memory-safe.** `base::JSONReader` is backed by Rust `serde_json_lenient` (FACT, `CR:base/json/json_reader.cc:14-20`). rac's MCP, ACP and chat code use it (FACT, grep of `CR:chrome/browser/rac`).
 
-**Debugging doors.** `--remote-debugging-port` on the real profile is refused only in Google-branded builds (FACT, `CR:chrome/browser/devtools/remote_debugging_server.cc:160-180`). Remote debugging from `chrome://inspect` is off by default. The user must turn it on, and each connection needs approval (FACT, same file, as summarized in `plans/research/long-tail.md:630`). Plan 05 decides both (05-D9).
+**Debugging doors.** `--remote-debugging-port` on the real profile is refused only in Google-branded builds (FACT, `CR:chrome/browser/devtools/remote_debugging_server.cc:160-180`). Remote debugging from `chrome://inspect` is off by default. The user must turn it on, and each connection needs approval (FACT, same file, as summarized in `plans/research/long-tail.md:630`). Plan 05 decides both (05-D6). The Core thread builds the refusal inside 05 M0, on 156 after the sync.
 
 **Patch surface.** rac carries 180 patches with 871 stacked hunks in 217 upstream files. 320 hunks are in `ui/views`. 76% sit in files that Helium or ungoogled also patch (FACT, `digests/rac-baseline.md`; per-group recount from `/tmp/rac-overhaul/rac_hunks.tsv`). A dry run to Helium 0.20.1.1 fails 104 hunks at fuzz 2, 46 of them first failures (FACT, `digests/helium.md`).
 
@@ -110,7 +110,7 @@ Every option keeps the browser holding each permission decision, through `AgentC
 Timings come from existing binaries, measured warm on the maintainer's Mac (`digests/local-first-and-sidecars.md`, "Runtime comparison"). Hunks are estimates.
 
 **Recommendation: A.** On this point the matrix and this plan agree. The disagreement is narrow. The matrix treats a warm agent as a reason for a Rust helper. It isn't one: ACP agents are already child processes, so keeping one alive is a lifecycle change (M3). The matrix's other triggers stand:
-- **Routines with rac fully closed.** These would need the browser anyway. Plan 05 decides them (05-D11). This plan adds no helper.
+- **Routines with rac fully closed.** These would need the browser anyway. Plan 05 decides them (D59 in decisions.md). This plan adds no helper.
 - **Crash isolation.** JSON parsing is Rust-backed. The new exposure is a socket feeding C++ handlers, so M2 hardens it.
 
 A future helper is justified only by a named feature that must run without opening rac, such as phone remote control. None is planned.
@@ -165,7 +165,7 @@ Ardia, with no AI and a native shell, sits at 492 (FACT, `digests/ardia.md`). So
 
 **Spike trigger.** Run a one-week S2 spike if, after the second sync on the thinner base, either holds: stacked hunks are above 650, or a sync has more than 30 first-failure hunks. The spike measures files touched, dialogs to rebuild, tab-switch time, and memory (`digests/long-tail.md`, item C6).
 
-**Why it matters.** Chromium ships a major every two weeks (FACT, `digests/helium.md`). Plan 06 budgets 1 to 3 days per sync and lets the cadence vary (06-D6). That puts the yearly cost somewhere between about 15 and 75 agent-days (INFERENCE from plan 06).
+**Why it matters.** Chromium ships a major every two weeks (FACT, `digests/helium.md`). Plan 06 budgets 1 to 3 days per sync and lets the cadence vary (06-D7). That puts the yearly cost somewhere between about 15 and 75 agent-days (INFERENCE from plan 06).
 
 ## Recommended plan
 
@@ -193,6 +193,7 @@ Calendar rules (`/tmp/rac-overhaul/alignment.md`, ruling 1). Weeks count from th
 ### M1. Action table and the rac core split (weeks 2 to 5; 10 to 14 agent-days)
 
 - **Goal.** One list of actions, and agent pieces that no longer depend on the AI switch.
+- **Build slots.** Per the master plan's build-slot rule, launch-gate work gets slots first. This milestone writes code and waits for a free slot.
 - **Tasks.**
   1. **Static table** `rac_actions.{h,cc}`. It is compiled-in data, with no service. Fields: id, label, default shortcut and availability (plan 07's fields), JSON schema, MCP annotations (read-only, destructive, idempotent, open-world), rac's risk class, and surfaces. The sidebar, command bar (Views, plan 01), and shortcuts call handlers directly. That is one function call, and plan 01 measures the one-frame open. AI-only actions are marked "AI on" and never show with AI off.
   2. **`RacCoreService`**, built only when the assistant's browser control or the door needs it. Move `AgentController`, the guard, containment, and the MCP server under it. `AiService` becomes one client. Lifetime rule: the service owns the controller. Each run or warm session owns its `AgentMcpTools`. The MCP server stops before its tool provider is deleted, which is the crash in `docs/internals/ai.md`, "Runs". Cost: 5 to 7 days of the 10 to 14.
@@ -210,6 +211,7 @@ Calendar rules (`/tmp/rac-overhaul/alignment.md`, ruling 1). Weeks count from th
 ### M2. The outside-agent door (after launch; Chromium 156; 9 to 13 agent-days)
 
 - **Gate.** Plan 05's `auto` fix and injection evals are green (05 M0).
+- **One milestone with plan 05 M1.** This milestone and plan 05's M1 (the read-only door) are one piece of work, after launch (W7 or later). It may be built on a branch from W4 if a build slot is free. M1's split may still land before launch.
 - **Tasks.**
   1. **Relay.** `rac.app/Contents/Helpers/rac`, a small GN C++ program that copies bytes between stdio and the socket. It holds no state. Commands are `rac mcp`, `rac skill`, and verbs that map one-to-one to table actions (plan 05 picks them).
   2. **Socket.** One per profile, existing only while `rac.agents.outside_access` is on for that profile. Folder mode 0700, socket mode 0600, on the path M0 chose. Incognito and guest profiles are never reachable.
@@ -273,7 +275,7 @@ Calendar rules (`/tmp/rac-overhaul/alignment.md`, ruling 1). Weeks count from th
 | Action table | Static data in the browser | 03; 07 adds fields; 01 and 05 consume it |
 | Command bar | Views; rows are C++ from the action table | 01 |
 | Assistant panel, settings | WebUI, as clients of the core | 01 |
-| Routines | Browser process, while rac runs | 05 (05-D11) |
+| Routines | Browser process, while rac runs | 05 (D59) |
 | Sync | Browser process, sealed files in a user folder | 04 |
 
 ## Fit with the non-negotiables
@@ -292,7 +294,7 @@ Calendar rules (`/tmp/rac-overhaul/alignment.md`, ruling 1). Weeks count from th
 - **01 ui-shell.** Builds the command bar in Views on the action table. Follows one hook per registry. Draws the Outside agents settings page. Its shell spike uses this plan's trigger.
 - **02 visual-design-and-motion.** Styles the new settings rows and supplies the Views spring helper. Owns token names.
 - **04 data-storage-import-sync.** Owns the history schema, encryption migration, retention, and sync files.
-- **05 agents-and-ai.** Owns door policy, pairing UX, tool list, levels, evals (the gate for M2), the debug doors (05-D9), routines (05-D11), and the agent-space rendering spike. It refers to 03-D3 for the warm agent.
+- **05 agents-and-ai.** Owns door policy, pairing UX, tool list, levels, evals (the gate for M2), the debug doors (05-D6), routines (D59), and the agent workspace rendering spike. It refers to 03-D3 for the warm agent.
 - **06 engineering-and-shipping.** Owns the sync, the launch calendar, the base-tree rebuild, the benchmark, the hunk counter and ratchet using 03-D5's metric, signed builds (gating M2's signed acceptance), and the plain-folder move (06-D12). That move needs a throwaway-worktree spike on copy versus link, because copies change mtimes.
 - **07 power-features.** Adds shortcut and label fields to the table, and keeps only its site-pattern matcher.
 
@@ -326,7 +328,7 @@ Calendar rules (`/tmp/rac-overhaul/alignment.md`, ruling 1). Weeks count from th
 >
 > **Read first.** `AGENTS.md`, `VISION.md`, `docs/internals/ai.md`, `plans/03-core-architecture.md`, the approved plans 05 and 06, and `/tmp/rac-overhaul/alignment.md`.
 >
-> **Order.** M0 spikes, then M1 (rac-owned parts on 154, the hook after the sync), then M3, then M2 once plan 05's evals pass, then M4 after launch. Follow plan 06's weeks and sync freeze (06-D13).
+> **Order.** M0 spikes, then M1 (rac-owned parts on 154, the hook after the sync), then M3, then M2 once plan 05's evals pass, then M4 after launch. Follow plan 06's weeks and sync freeze (plan 06's default list, D11 in decisions.md).
 >
 > **Hard rules.**
 > - Feature worktrees only: `source dev.sh && he build`, then `devutils/rac/worktree.sh run`. Never `he run` or `open` there.
