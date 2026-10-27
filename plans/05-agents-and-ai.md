@@ -8,7 +8,7 @@ The fix has a cost you will notice. On one site, `auto` stays free. Once the age
 
 Next, developers can let their own coding agent drive rac. A separate "Outside agents" switch, off by default, turns this on. While the switch is off, nothing listens. While it is on, outside agents work even with rac's AI off. A new agent starts by reading only the tabs you share with it. Later it can act, but only in its own background tabs, which start with no logins. Risky steps always ask.
 
-What stays the same: AI is off by default. rac never sees your conversations. Nothing phones home. Subscriptions connect only through the vendor's own tools.
+What stays the same: AI is off by default. No one at rac ever sees your conversations. Nothing phones home. A Claude or ChatGPT subscription works only through that company's own app, such as Claude Code.
 
 ## What you need to decide
 
@@ -86,7 +86,7 @@ Every option starts with the safety floor (M0). The costs below are plan-05 agen
 
 ## Recommended plan
 
-**Calendar.** Weeks are counted from the maintainer's approval (`alignment.md` ruling 1). Fixed anchors: the launch build must start by 2026-12-15 (launch merges close at the start of W5), and Arc shuts down on 2026-12-22. Plan 06 owns the Helium sync to Chromium 156 (its M2) and the launch (its M5).
+**Calendar.** Weeks are counted from the maintainer's approval (`plans/rulings.md`, ruling 1). Fixed anchors: the launch build must start by 2026-12-15 (launch merges close at the start of W5), and Arc shuts down on 2026-12-22. Plan 06 owns the Helium sync to Chromium 156 (its M2) and the launch (its M5).
 
 - Only M0 is a launch gate.
 - Work in rac-owned files may be built on 154 and rebased.
@@ -135,7 +135,7 @@ Every UI item ships screenshots from `devutils/rac/worktree.sh run`, in light an
 - Unit tests cover every fail-closed default.
 - The worktree posts green `rac/unit-tests` and `rac/agent-evals` statuses (plan 06 M4 task 2).
 
-**Budget.** About 18–25 days, about 2–3 weeks with two threads. It needs one worktree build on 154 that includes agent patches 13–17, because the base tree predates them. After the sync it needs the base-tree rebuild.
+**Budget.** About 18–25 days, about 2–3 weeks with two threads. It needs one worktree build on 154, after step 0 in the master plan brings the base tree up to date. After the sync it needs the base-tree rebuild.
 
 **Patch surface:** rac-owned files only. This milestone adds about 2 hunks for the doors.
 
@@ -143,7 +143,7 @@ Every UI item ships screenshots from `devutils/rac/worktree.sh run`, in light an
 
 **Goal:** Claude Code, Codex, Cursor, or OpenCode can read the tabs you share, with rac's AI off. This milestone and plan 03 M2 are one milestone: the door. It may be built on a branch from W4 if a build slot is free. Plan 03 M2 provides the relay, socket, tokens, and listener lifecycle. Plan 03 M1 splits the controller and guard out of `AiService`, and may land before launch.
 
-**The trust root for outside clients** (alignment ruling 8). rac never sees an outside agent's prompt. These rules replace the chat-message signals:
+**The trust root for outside clients** (ruling 8). rac never sees an outside agent's prompt. These rules replace the chat-message signals:
 
 | Signal | Built-in agent | Outside client |
 | --- | --- | --- |
@@ -358,11 +358,4 @@ Plan 06's bench measures startup, tab switching, scrolling, and typing against H
 
 ## Draft thread brief
 
-**DRAFT. Do not launch until the maintainer approves plan 05 and answers 05-D1 to 05-D8.**
-
-> **Thread: agents and AI (plan 05).** Build M0 to M3 of `plans/05-agents-and-ai.md` in feature worktrees. Read `AGENTS.md`, `VISION.md`, `docs/internals/ai.md`, and `patches/rac/agent/` first.
->
-> - **Order.** M0 in rac-owned files on 154, rebased after plan 06's sync; it gates the 2026-12-15 launch build. M1 after launch, as one milestone with plan 03 M2. M2 after the rendering spike; its outside write tier waits for plan 04's in-memory partition.
-> - **Rules.** Every call enters `AgentController::HandleToolCall` and the guard. No level skips the risky list. Defaults fail closed. No raw CDP or scripts on a profile with logins. With AI off, no AI labels anywhere. Transport, action table, and controller split come from plan 03; identities from plan 04.
-> - **Proof.** Each PR posts `rac/unit-tests` and `rac/agent-evals` from the worktree. UI changes carry screenshots (light, dark, sidebar full and hidden, reduced motion); focus and approval flows get videos.
-> - **Models.** Claude Opus for the guard, controller, concurrency, and UI. Sonnet or a strong open-weight model for fixtures and tools, reviewed by Opus. Open PRs only when the maintainer asks.
+Thread brief: see `plans/threads/core.md`.

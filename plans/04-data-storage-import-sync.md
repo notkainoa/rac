@@ -6,7 +6,7 @@ Arc closes on 2026-12-22. An Arc user who opens rac today gets an empty sidebar 
 
 Each Arc profile, such as Work or Personal, becomes a rac profile with its own window and its own sign-ins. Sites stay logged in, though some, like Google, may ask you to sign in again.
 
-Saved passwords are harder, because rac has no password manager. If a test works, rac passes them to Apple Passwords or 1Password without ever saving them to disk. If it doesn't, rac shows you how to export them from Arc yourself.
+Saved passwords are harder, because rac has no password manager. If a test works, rac passes them to Apple Passwords or 1Password without writing them to your SSD. The file is plaintext while it is mounted, and any app you run can read it until it unmounts. If it doesn't, rac shows you how to export them from Arc yourself.
 
 Before any import, rac saves a snapshot. You can undo the sidebar part of an import.
 
@@ -97,9 +97,9 @@ This is Arc's real model: one window, with spaces backed by separate cookie jars
 
 ## Recommended plan
 
-**Calendar rules (cross-plan ruling 1).** Weeks count from plan approval. Plan 06 owns the sync and the launch calendar. Work in rac-owned new files may be built on Chromium 154 and rebased later. Work touching files Helium also patches waits for the sync. The fixed anchors are the launch build's hard stop on **2026-12-15** and Arc's shutdown on **2026-12-22**.
+**Calendar rules (`plans/rulings.md`, ruling 1).** Weeks count from plan approval. Plan 06 owns the sync and the launch calendar. Work in rac-owned new files may be built on Chromium 154 and rebased later. Work touching files Helium also patches waits for the sync. The fixed anchors are the launch build's hard stop on **2026-12-15** and Arc's shutdown on **2026-12-22**.
 
-**Dependencies.** In W1 to W3 (slack to W4), plan 06 M2 syncs to Helium 0.20.1.1 (Chromium 156). Nothing under `patches/` merges until the sync does (plan 06's default list, D11 in decisions.md). After that merge, the base tree must be rebuilt before any import worktree can build on 156 (plan 06 risks: the shared Air is the bottleneck). The Chromium 157 hop is optional; plan 06 decides. Every milestone below targets 156, or 157 if plan 06 hops.
+**Dependencies.** In W1 to W3 (slack to W4), plan 06 M2 syncs to Helium 0.20.1.1 (Chromium 156). Nothing under `patches/` merges until the sync does (plan 06's default list, D11 in decisions.md). After that merge, the base tree must be rebuilt before any import worktree can build on 156 (plan 06 risks: the shared Air is the bottleneck). There is no hop to Chromium 157 before launch (plan 06). Every milestone below targets Chromium 156.
 
 **Test status.** Fixture tests report through the worktree-posted test status (06 M4 task 2), not CI. CI does not compile C++ tests before launch.
 
@@ -110,9 +110,9 @@ This is Arc's real model: one window, with spaces backed by separate cookie jars
 | W1 to W3 (during the sync, slack to W4) | M0a snapshot service; M1a reader, import plan, scrub script, fixtures. All new files | 154, rebased later | No (freeze) |
 | After the sync and base rebuild | M0b Keychain fix; M1b applier, hooks, plan 01's screens | 156 | Yes |
 | Next 1-2 weeks | M2 profiles and sign-ins | 156 | Yes |
-| By the start of W5 (11-30) | M1 must be merged for the launch build (hard stop 12-15); M2 should be | 156/157 | Launch (06 M5) |
+| By the start of W5 | M1 must be merged for the launch build (hard stop 12-15); M2 should be | 156 | Launch (06 M5) |
 
-**If it slips.** If M2 isn't merged by the start of W5, launch with sidebar-only import. Ship sign-ins in a point release only if `update-smoke` passes (06 M1) and it lands before 12-22. Otherwise ship it after. Arc's files stay on disk after shutdown, so import still works (INFERENCE). The budget is 16-21 agent-days before launch. If approval lands after mid-November, plan for sidebar-only.
+**If it slips.** If M2 isn't merged by the start of W5, launch with sidebar-only import. Ship sign-ins in a point release only if `update-smoke` passes (06 M1) and it lands before 12-22. Otherwise ship it after. Arc's files stay on disk after shutdown, so import still works (INFERENCE). The budget is 16-21 agent-days before launch. If approval comes after 11-02, plan sidebar-only.
 
 ### M0. Minimal safety net (S, 3-4 agent-days)
 
@@ -186,7 +186,8 @@ This is Arc's real model: one window, with spaces backed by separate cookie jars
    - It asks for Keychain "Arc Safe Storage" only after the user clicks "Unlock Arc data", with an explanation shown first.
    - It copies `Cookies` with `-wal` and `-shm` to a temp folder and opens the copy with `sql::Database`.
    - It decrypts `v10` values: PBKDF2-SHA1 with "saltysalt", 1003 rounds, AES-128-CBC. It checks padding, because a wrong key passes about once in 256 tries. It strips the SHA-256 host prefix at cookie database version 24 and up. Columns are mapped by name.
-   - Port from Cra's MIT `CredentialImport.swift`, with credit.
+   - Port from Cra's MIT `CredentialImport.swift`, with credit (`github.com/VictorKildahl/cra` at commit `94c3034`, `Sources/Cra/Services/Import/`).
+   - Agents test the reader only on fixture `Cookies` databases encrypted with a fixed test password, through a test-only seam. Tests never call the real Keychain. Real-Arc checks are done by the maintainer by hand, on a second macOS user.
 3. **Cookie writer.** It writes through each profile's `CookieManager::SetCanonicalCookie`, and Chromium re-encrypts with "rac Storage Key". INFERENCE: rac is Chromium, so no staging file or restart is needed.
    - Skip expired cookies.
    - Keep `__Host-` and `__Secure-` rules, rejecting rows that break them.
@@ -202,7 +203,7 @@ This is Arc's real model: one window, with spaces backed by separate cookie jars
 
 **Acceptance.**
 - In fixture profiles, cookies are set and sent.
-- Manual checks on Google, GitHub, and one bank-style site. Results are recorded, not required to pass.
+- Manual checks on Google, GitHub, and one bank-style site, run by the maintainer by hand on a second macOS user. Results are recorded, not required to pass.
 - Denying the Keychain keeps the sidebar import and shows a calm retry.
 - After the hand-off, no password text exists on the SSD (checked with `strings` on the temp folders).
 
@@ -268,7 +269,7 @@ None of this blocks 2026-12-22. Order follows the master plan, with item 2's par
 - **02 visual-design-and-motion.** Better theme fidelity, if wanted.
 - **03 core-architecture.** All stores live in the browser process, with no helper (03-D1, 03-D2). Plan 04 owns the history schema and retention (after-launch item 3).
 - **05 agents-and-ai.** Agent runs use the AI store. Plan 05 M2 (its outside write tier) and M3 build on the partition primitive. Chat encryption is counted once, here.
-- **06 engineering-and-shipping.** The sync and the freeze (06 M2, plan 06's default list, D11 in decisions.md), the base rebuild, the 157 decision, launch gates (06 M5) including the Keychain fix, posted test status (06 M4 task 2), and `update-smoke` for any point release.
+- **06 engineering-and-shipping.** The sync and the freeze (06 M2, plan 06's default list, D11 in decisions.md), the base rebuild, no hop to 157 before launch, launch gates (06 M5) including the Keychain fix, posted test status (06 M4 task 2), and `update-smoke` for any point release.
 - **07 power-features.** Arc routing rules are handed over in the import record.
 
 ## Risks and unknowns
@@ -292,18 +293,6 @@ None of this blocks 2026-12-22. Order follows the master plan, with item 2's par
 6. Should the sync key ever live in iCloud Keychain? That needs a team ID; `MAC_TEAM_ID` is empty today (`rac-baseline.md:333`).
 7. Note on critique item 15: sync stays in this plan as a short, gated paragraph, because the brief named it in scope. It is not a pre-launch task.
 
-## Draft thread brief (DRAFT; not to launch until the maintainer approves)
+## Draft thread brief
 
-> **DRAFT. Do not launch until the maintainer approves plan 04.**
->
-> **Thread:** architecture and backend, "Arc import". Model: Opus for M0b, M2, and the password spike. Sonnet may write the reader and fixtures, under review.
->
-> **Goal:** M0 and M1 are merged by the start of W5 (11-30) for the launch build (hard stop 12-15). M2 should be. If M2 slips, launch sidebar-only and follow plan 06 for a point release.
->
-> **Calendar:** W1 to W3 (slack to W4), during plan 06's sync freeze: new files only (M0a, M1a) on Chromium 154, not merged. After the sync merges and the base tree is rebuilt: M0b, M1b, and M2 on 156. Plan 06 owns the calendar.
->
-> **Read first:** `AGENTS.md`, `VISION.md`, this plan, `plans/01-ui-shell.md` M1, `plans/06-engineering-and-shipping.md` M2 and M5, `docs/internals/pinned-tabs.md`, `plans/research/cra.md:375-432,604-637`, `/tmp/rac-overhaul/src/cra/Sources/Cra/Services/Import/` (MIT; credit it), `research/ardia.md:546-553`.
->
-> **Rules:** code goes in `chrome/browser/rac/storage/` and `chrome/browser/rac/import/`; upstream edits are small hooks, and each PR reports its hunk count. Never edit Helium's importer files. Never read real Arc, Dia, Helium, or rac profiles. Use the maintainer's scrubbed sample and `--rac-import-source-root`, kept out of release builds. Snapshot before every import. No network requests. No plaintext password file without the maintainer's sign-off.
->
-> **Done means:** fixture tests pass in the worktree-posted status (06 M4 task 2). Rerun adds nothing, and Undo restores the sidebar. Screenshots cover the sidebar before and after import in light and dark, both address-bar placements, two profile windows, and incognito unchanged. Videos cover the import and the password hand-off. A net log shows zero requests. `he validate series` passes.
+Thread brief: see `plans/threads/data.md`.

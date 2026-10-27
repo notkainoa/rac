@@ -13,7 +13,7 @@ gain custom colors, so imported Arc spaces keep theirs in light and dark mode.
 
 What ships first, before the launch build's hard stop on 2026-12-15: press states, calmer hovers, quieter AI
 loops, and custom space colors. These touch only rac's own files. Faster AI panel and tab motion, and Cmd+S and
-edge reveal on springs, need the Helium sync first. They make launch only if that sync is merged by the start of W5 (11-30).
+edge reveal on springs, need the Helium sync first. They need the Helium sync first, and make the launch only if they merge by the start of W5.
 
 Cost: about 30 to 45 agent-days over roughly six weeks after approval. Each change ships with video and a frame log.
 
@@ -29,7 +29,7 @@ Cost: about 30 to 45 agent-days over roughly six weeks after approval. Each chan
    **Recommended: never.**
 5. **02-D5. Do keyboard shortcuts animate?** Spatial changes only (Cmd+S, space switches) / never.
    **Recommended: spatial changes only.**
-6. **02-D6. Page card corner on macOS 26.** Match the window corner (11 px) / Dia's 10 px.
+6. **02-D6. Page card corner on macOS 26.** Concentric with the window (11 px inside the 17 px window corner) / Dia's 10 px.
    **Recommended: 11 px on macOS 26; keep 10 px on older macOS.**
 7. **02-D7. Under Reduce Motion, does a swipe follow your fingers?** No, as today / yes, then a fade on release.
    **Recommended: yes. Apple's guidelines allow gesture tracking.**
@@ -199,7 +199,7 @@ measurement.
    than 15 updates a second and stop under Reduce Motion.
 7. **Accessibility settings are read at every start and every paint, never cached.**
 8. **No motion or look settings.**
-9. **AI off means no AI buttons, rows, or labels anywhere** (alignment ruling 16). Motion code for AI surfaces
+9. **AI off means no AI buttons, rows, or labels anywhere** (`plans/rulings.md`, ruling 16). Motion code for AI surfaces
    isn't created.
 
 ### Tokens
@@ -313,7 +313,7 @@ button. Ideas that need sign-off: a 0.97 press scale on favorites tiles, and Dia
 
 Weeks count from plan approval. Hot files shared with Helium wait for plan 06's sync (its M2) and the base-tree
 rebuild that follows. rac-owned files are built on Chromium 154 and rebased onto 156. The launch hard stop is
-2026-12-15 (plan 06 M5). Launch merges close at the start of W5 (11-30, plan 06). Anything not merged by then waits until after launch.
+2026-12-15 (plan 06 M5). Launch merges close at the start of W5 (plan 06). Anything not merged by then waits until after launch.
 
 Upstream hunks are counted in plan 03's metric: net-diff hunks in upstream files.
 
@@ -380,7 +380,7 @@ Build slots follow the master plan's rule: launch-gate work gets slots first. M2
   - Idle frames at 0.
   - Before-and-after videos in light and dark, in both address-bar layouts, with Reduce Motion and with Increase
     Contrast.
-  - PWA windows checked (alignment ruling 17).
+  - PWA windows checked (ruling 17).
   - With AI off, no AI rows or buttons appear.
 - Patch surface: rac-owned files, plus the existing color hooks.
 
@@ -402,15 +402,14 @@ Build slots follow the master plan's rule: launch-gate work gets slots first. M2
      `side_panel_animations.cc`. Gated.
   2. Tab open and close S4 and S5: 1 to 2 hunks in `tab_collection_animating_layout_manager`.
   3. Cmd+S and edge reveal motion (S1, S2) on plan 06's port of sidebar-reveal onto Helium 0.20's overlay, with
-     plan 01's dwell and grace times (alignment ruling 6). Includes the A/B video for 02-D1 and the S1 resize
+     plan 01's dwell and grace times (ruling 6). Includes the A/B video for 02-D1 and the S1 resize
      choice from the frame gate.
-- Cutoff: if the sync hasn't merged by the start of W5 (11-30), M4 ships after launch, and Cmd+S ships as it is (matching
+- Cutoff: if the sync hasn't merged by the start of W5, M4 ships after launch, and Cmd+S ships as it is (matching
   plan 01's rule). If M0 shows that show snaps, list it as a known issue in the launch notes.
 - Acceptance: both directions trace to their tokens, pass the gate, and fade under Reduce Motion. A pointer
   reversal mid-slide is smooth.
 - Patch surface: about 4 to 6 hunks, plus the motion hooks into plan 06's ported frameless code. This plan owns
-  only the motion. Plan 01 should drop its Cmd+S and edge-reveal motion estimate (about 6 to 9 of its 13 to 19
-  days).
+  only the motion.
 
 **M5. Future surfaces** (inside each feature's own estimate): the command bar (S18), peek (S19), hover cards if
 plan 01 wants them, and the AI panel moving onto `kSpringDock`.
@@ -470,33 +469,4 @@ plan 01 wants them, and the AI panel moving onto `kSpringDock`.
 
 ## Draft thread brief
 
-**DRAFT. Not to launch until the maintainer approves.**
-
-> **Thread: rac visual design and motion (plan 02).** Model: Claude Opus. One worktree per milestone
-> (`git worktree add -b feat/motion-<m> <path> main`, then `devutils/rac/worktree.sh setup`).
->
-> Read: `AGENTS.md`, `VISION.md`, this plan as edited by the maintainer, `plans/research/digests/motion-and-feel.md`,
-> and `plans/research/motion-and-feel.md` lines 437-583. Use plan 06 for the calendar.
->
-> Goal: M0 to M3 on Chromium 154 in weeks 1 to 4. Then M4 after plan 06's sync and base rebuild, and only if they
-> are merged by the start of W5 (11-30) for launch. Nothing launch-bound merges after that.
->
-> Rules:
-> - Every value comes from `rac_tokens.h` or `rac_tokens.css`.
-> - Upstream edits stay small hooks, and hot files wait for the sync.
-> - Never edit `helium-chromium/` or Helium's patches.
-> - Never use a real profile, and never take the foreground. Use `worktree.sh run` and synthesized input.
-> - Force Reduce Motion and Increase Contrast with flags, never with system settings.
->
-> Done, per changed interaction:
-> - before-and-after videos at real time and 4x;
-> - a `motion_trace.py` report within 1 frame of the token;
-> - a frame log that passes the gate;
-> - screenshots in light and dark, both address-bar layouts, sidebar full, hidden, and revealed, two windows,
->   incognito, and a PWA window;
-> - Reduce Motion and Increase Contrast captures;
-> - idle frames at 0 with AI off and on;
-> - with AI off, no AI buttons.
->
-> Run focused unit tests only. Open PRs only when asked, with videos attached via `gh --attach`. Stop before M4 if
-> the sync hasn't landed, and before acting on any unanswered 02-D decision.
+Thread brief: see `plans/threads/ui.md`.

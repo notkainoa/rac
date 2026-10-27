@@ -2,6 +2,8 @@
 
 > **DRAFT: do not launch until the maintainer approves the plans.**
 
+Follow ["Every thread"](README.md#every-thread) in the README: reading, step 0, workflow stages, verification standard, and hard constraints. This brief adds only what is specific to Power.
+
 ## Goal
 
 After launch, add what Arc refugees reach for daily: clean links, Copy as Markdown, group naming, Boosts, Air Traffic Control (link routing), and bangs, with no second action table and no network calls.
@@ -12,43 +14,24 @@ Plan 07 M0 to M5. Before launch, only 07 M1's pure logic (the strip table, the n
 
 ## Decisions it depends on
 
-- **Before it starts:** D9, D48 (order), D31 (shortcuts; taking Opt+Cmd+N needs the maintainer's OK).
-- **By milestone:** D49 and D50 (M1), D54 (Boosts, before M2; VISION wording), D51 (M3), D52 (M5 go or no-go), D53 (themes vs space colors), D12, D17.
+- **Group A:** D9a/b/c.
+- **Needed before it starts:** D48 (order), D31 (shortcuts; taking Opt+Cmd+N needs the maintainer's OK).
+- **By milestone:** D49 and D50 (M1), D54 (Boosts, before M2; VISION wording), D51 (M3), D52 (M5 go or no-go), D53 (themes vs space colors), D12a/b, D17.
 
-## Read first
+## Plan-specific reading
 
-`AGENTS.md`, `VISION.md`, `plans/07-power-features.md`, `docs/internals/bangs.md`, `plans/00-master-plan.md`, plan 03 M1 (action table), plan 01 M3 (router). Credit Ardia and Stedding with their notices.
+`plans/07-power-features.md`, `docs/internals/bangs.md`, plan 03 M1 (action table), plan 01 M3 (router). Credit Ardia and Stedding with their notices.
 
 ## Machine and worktree
 
-Whichever Mac has a free slot after launch: `git worktree add -b feat/power-<m> <path> main`, then `devutils/rac/worktree.sh setup`; one worktree per milestone. Testing Air Traffic Control means changing the default browser: use a second macOS user, or ask first and restore it afterwards. Never touch real profiles or real agent configs.
+0. Step 0 in the README first: the main checkout is pulled and its base build approved by the maintainer.
+- Whichever Mac has a free slot after launch: `git worktree add -b feat/power-<m> <path> main`, then `devutils/rac/worktree.sh setup` (or `setup <checkout>` to clone a built tree, if the maintainer OKs it, D6). One worktree per milestone.
+- Air Traffic Control tests send links through UI's `open-urls` harness verb. No step changes the default browser; the maintainer checks the real default-browser flow by hand on a second macOS user.
+- Never touch real profiles or real agent configs.
 
-## How to use multi-agent Claude Code workflows inside the thread
+## Power adds to the verification standard
 
-Run each milestone through five stages.
-
-1. **Understand.** Read-only subagents (Haiku or Sonnet) read the plan section, the files it touches, and AGENTS.md, and return a short map.
-2. **Design.** Opus writes a one-page design (interfaces, hunk budget, test plan) before any code.
-3. **Implement.** Hard architecture and security go to Opus. Routine, scoped code and tests go to Sonnet or a strong open-weight model (`kimi-k3`, `glm-5.3`, `deepseek-v4-pro`, `minimax-m3`). UI work goes to Claude Opus (routine UI to Sonnet), never open-weight models.
-4. **Verify.** You build, run, and capture. A Haiku subagent may run tests and summarize.
-5. **Review.** Before every PR, a fresh Opus reviewer that hasn't seen the design tries to break the diff (attacks, edge cases, missed surfaces, hunk count), then run `/code-review`. Fix or answer every finding. Check subagent output before building on it.
-
-## Verification standard
-
-- Build and run it yourself: `source dev.sh && he build`, then `devutils/rac/worktree.sh run --rac-window-screenshot=/abs/path.png`. Wait for real pixels.
-- Answer AGENTS.md "Cover every surface" item by item. Screenshot matrix: sidebar full, hidden, and edge reveal; light and dark; space themes; multiple windows; incognito; split view; an installed web-app (PWA) window; reduced motion; AI off (no AI button, row, or label).
-- Short videos for motion. Focused unit tests only. `he validate series` after touching `patches/series`.
-- Every PR states its net-diff hunk change (D17) and attaches proof with `gh pr create --attach './shot.png#caption'`. Never commit screenshots or videos.
-- No PR unless the maintainer asks, or D9 grants standing permission. The maintainer approves every merge.
-- Power adds: unit tests for `SitePattern`, the strip table (including cases that must not change), and Ardia's naming cases ported one for one; shots in two spaces and incognito where it applies; motion videos with Reduce Motion on and off; a net log showing no requests; zero Boosts means no script and no file read at startup.
-
-## Hard constraints from AGENTS.md
-
-- Never push to, open PRs against, or file issues on `imputnet` or `ungoogled-software`.
-- Never edit `helium-chromium/`, `patches/helium/`, `patches/rebel/`, or `patches/ungoogled-chromium/`.
-- `rac_version.txt` only goes up. The signing key and feed URL never change.
-- Never take the foreground (no `open`, no `he run`, no foreground automation). Never use a real profile.
-- No full build, `he reset`, or deleting `build/` without approval (D6 names the allowed ones). If a worktree build shows tens of thousands of steps, stop.
+Unit tests for `SitePattern`, the strip table (including cases that must not change), and Ardia's naming cases ported one for one; shots in two spaces and incognito where it applies; motion videos with Reduce Motion on and off; a net log showing no requests; zero Boosts means no script and no file read at startup.
 
 ## Coordination
 

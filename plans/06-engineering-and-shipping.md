@@ -22,7 +22,7 @@ The launch ships that caught-up build with Arc import and a safer agent.
 2. **06-D2. How are releases built?** Depot (paid), free GitHub runners, or a local Mac. **Recommended: Depot, with a $300 monthly limit, plus one free trial run alongside.**
 3. **06-D3. Intel Macs at launch?** Yes, or no. **Recommended: no. Apple Silicon only for 0.x.**
 4. **06-D4. A quiet 0.1.0 on Chromium 154 first?** Yes, or wait for the synced build. **Recommended: yes. Keep it short-lived and prove updates with 0.1.0 to 0.2.0.**
-5. **06-D5. Order of work?** Ship, sync, launch, then revamp; or revamp first. **Recommended: ship, sync, launch, then revamp.**
+5. **06-D5. Order of work?** (a) Ship, sync, launch, then revamp; (b) revamp first; (c) a stable track plus the revamp on branches. **Recommended: (c) a stable track ships 0.1, the sync, and the launch while the revamp is built on branches in rac-owned files (D2).**
 6. **06-D6. If the sync isn't merged by the end of W4?** Launch on 154 as a labeled preview, or hold the launch. **Recommended: hold one week. After that, launch on 154 rather than miss 12-15.**
 7. **06-D7. Sync cadence after launch?** Every Chromium major within 14 days, or every other major. Security fixes within 7 days if exploited in the wild, else 14. **Recommended: every major. Review after three cycles.**
 8. **06-D12. Move rac's own source files out of patches into a plain folder?** Yes, after launch; or no. **Recommended: yes, after launch (plan 03 references this).**
@@ -73,11 +73,11 @@ The launch ships that caught-up build with Arc import and a safer agent.
 The real trade is money versus days versus keys leaving GitHub.
 
 **A1. Free GitHub runners, Apple Silicon only.** It costs nothing and touches no Mac. It has never finished. One attempt takes about 30 to 40 hours, and each failure costs a day and a half.
-- Details: merge PR #20, add an `arches` input (default `arm64`), and set `fail-fast: false`. Retry the checkpoint download at the step level, check the artifact digest, and fail clearly.
+- Details: ask the maintainer to merge PR #20, add an `arches` input (default `arm64`), and set `fail-fast: false`. Retry the checkpoint download at the step level, check the artifact digest, and fail clearly.
 - Evidence against: the remaining steps hold the framework link, on 7 GB of RAM. Phase 6 never got that far. Six or seven phases is a guess (INFERENCE).
 - Effort S: about 2 agent-days. Risk: high for the schedule.
 
-**A2. Depot runners (M4, 8 cores, 24 GB).** The same CI on faster rented Macs. Helium's arm64 build takes about 7 hours there.
+**A2. Depot runners (M4, 8 cores, 24 GB).** The same CI on faster rented Macs, used only to compile. Helium's arm64 build takes about 7 hours there. Signing, notarization, stapling, and appcast signing run in a final job on GitHub's own `macos-latest` runner, so the keys never go to Depot.
 - Cost per attempted build: about $35 warm, maybe $70 for the first cold one (INFERENCE from `helium`), plus a plan of about $20 a month.
 - Expected builds: about 6 to 8 per month before launch (0.1.0, the 156 pipeline, launch candidates, retries). After launch, about 4 to 6 (two syncs, point and security releases). That is roughly $150 to $300 a month.
 - Who acts: only the maintainer can create the account, set billing and a spending limit, and install the GitHub app. That takes about an hour, on day one of W1.
@@ -109,7 +109,7 @@ Rejected:
 
 **C2. Revamp first,** or **C3. revamp before the sync:** sync debt grows weekly, revamp patches need rebasing, and the Arc window likely closes first.
 
-**Recommendation: C1.** Under ruling 1, work in rac-owned files may be built on 154 now and rebased. Work that touches hot upstream files waits for the sync.
+**Recommendation: C1.** Under ruling 1 (`plans/rulings.md`), work in rac-owned files may be built on 154 now and rebased. Work that touches hot upstream files waits for the sync.
 
 ### Cadence (E1, E2)
 
@@ -141,7 +141,7 @@ Rejected:
 | W3-W4 | 156 | Base-tree rebuild. Every worktree resyncs. Rac-owned work rebases. | Base built; `worktree.sh sync` works | 06, then each plan |
 | W4 | 156 | M3 0.2.0, the first synced release; update loop proven | `update-smoke` 0.1.0 to 0.2.0 | 06 |
 | W2-W5 | 154, then 156 | M4 checks, protection, evidence | Host list and bench run on 0.2.0 | 06 |
-| W5 | 156 | M5 launch candidate 0.2.x with the gates below; launch | Every launch gate checked | 06 + 04 + 05 |
+| W5 | 156 | M5 launch candidate 0.2.x with gates G1 to G15; launch | Every launch gate checked | 06 + 04 + 05 |
 | W6 | 156 | Float; one optional point release (D16) | `update-smoke` passes | 06 |
 
 Anchors:
@@ -149,20 +149,9 @@ Anchors:
 - Approval by 11-09 puts W5 at 12-07 to 12-13, with no float.
 - Later approval leaves only the 06-D6 slip path.
 
-**Slip rule (06-D6).** If the sync isn't merged by the end of W4, hold one week. If it still isn't merged, build the launch on 154 with the launch gates rebased back. Label it "Preview, Chromium 154", and sync right after launch. The 154 fallback must start by 12-14.
+**Slip rule (06-D6).** If the sync isn't merged by the end of W4, hold one week. If it still isn't merged, build the launch on 154 with the launch gates rebased back. Label it "Preview, Chromium 154", and sync right after launch. The 154 fallback must start by 12-15.
 
-**Launch gates (one list, shared by plans 04, 05 and 06):**
-
-| Gate | Owner, milestone |
-| --- | --- |
-| Arc sidebar import: spaces, pins, favorites, including plan 01's import screens. Sign-ins are not required. | Plan 04 M1, plan 01 M1 |
-| Keychain "no silent reset" fix (ruling 13) | Plan 04 M0 task 3 (M0b) |
-| Agent safety floor and the first evals | Plan 05 M0 |
-| Dev switches gated out of release builds | Plan 05 M0 task 6 |
-| Signed synced build passes install and update smoke | Plan 06 M3 |
-| Network host list published | Plan 06 M4 |
-| Speed numbers published, or the site line softened | Plan 06 M4 |
-| DRM test page checked before any Widevine claim | Plan 06 M5 |
+**Launch gates:** G1 to G15 in `plans/00-master-plan.md`. M5 checks every one.
 
 Plan 01's launch items, such as the command bar (D16 in decisions.md), ship if they merge by the start of W5. They are not gates. One optional point release in W6 carries what missed it, only if `update-smoke` passes.
 
@@ -172,19 +161,20 @@ Goal: a release chain that finishes, plus cheap checks on every PR.
 
 Tasks:
 1. **Maintainer, day 1:** create the Depot account, set a $300 monthly limit, and install the GitHub app.
-2. Merge PR #20.
+2. Ask the maintainer to merge PR #20.
 3. Harden the checkpoint download in `build-phase.yml`:
    - Retry at the step level: re-run `download-artifact`, or fall back to `gh run download`.
    - Compare the digest reported at upload with the downloaded file.
    - Fail clearly after 3 attempts. If the upload itself was short, re-download won't fix it, so also check the archive size and digest in the uploading job.
 4. Add an `arches` input (default `arm64`) and set `fail-fast: false`. Make the release scripts and `github_write_appcasts.sh` handle only the arches built.
-5. Point the build at `depot-macos-latest` through the existing `runner` input, with Depot Cache for sccache. In parallel, start one free `macos-latest` attempt.
-6. Add PR checks on Linux:
+5. Point the build at `depot-macos-latest` through the existing `runner` input, with Depot Cache for sccache. Compile on Depot. Sign, notarize, staple, and sign the appcast in a final job on a GitHub-hosted `macos-latest` runner. Signing needs no big machine, so the secrets never reach Depot. In parallel, start one free `macos-latest` attempt.
+6. Make non-release builds refuse to start on the default `me.kainoa.rac` user-data folder, so a stray launch can never open the maintainer's real profile. Dev runs already pass `--user-data-dir`.
+7. Add PR checks on Linux:
    - the 71 Python tests;
    - `he validate series`;
    - a no-fuzz sparse apply (method in `plans/research/helium.md` lines 582-599);
    - plan 03's patch-surface counter (ruling 11).
-   Make `sanity-check.sh` fail on "with fuzz" too. Delete `pullfrog.yml`.
+   Make `sanity-check.sh` fail on "with fuzz" too. Ask the maintainer about `pullfrog.yml` (a maintainer-installed workflow); don't delete it.
 
 Acceptance: a Depot arm64 chain finishes; a forced bad download is retried or fails clearly; PR checks take under 15 minutes. Verification: run links, phase timings and peak memory. Patch surface: none.
 
@@ -219,7 +209,7 @@ Acceptance: 0.1.0 is public, smoke passes, the runbook exists. Verification: run
 Goal: every rac feature works on 156.
 
 Tasks:
-1. **Day 1:** answer 06-D1. Restore the fetch-only `upstream` remote. Start the freeze (nothing under `patches/` merges until the sync does).
+1. **Day 1:** answer 06-D1. Restore the fetch-only `upstream` remote: `git remote add upstream https://github.com/imputnet/helium-macos && git remote set-url --push upstream no_push`. Start the freeze (nothing under `patches/` merges until the sync does).
 2. In a `sync/helium-0.20.1.1` worktree on the chosen Mac, merge the tag. Only `patches/series` should conflict (FACT, `helium`).
 3. Adopt the new `prepare_sources` and `configure_build` signatures and Helium's prepared tarballs. Start the cold build at once: it measures the rebuild time every later plan depends on.
 4. **Mechanical fixes** (parallel; Sonnet or open-weight): `ui/BUILD.gn`, the moved `tabs/` files, context drift.
@@ -333,24 +323,4 @@ Effort: about 4 agent-days (UI rule for site pages).
 
 ## Draft thread brief
 
-**DRAFT. Not to launch until the maintainer approves this plan.**
-
-Thread: **Engineering and shipping.** One long-running thread.
-
-Goal: run milestones M0 to M5 on the calendar above. The launch build starts by 12-15.
-
-Read first: `AGENTS.md`, `ci-status.md`, `docs/operations/*.md`, `digests/helium.md`.
-
-Hard rules:
-- Nothing goes to `imputnet` or `ungoogled-software`. The detector only reads.
-- Never edit `helium-chromium/` or Helium's patches.
-- No full local build, `he reset` or new tree without the maintainer's OK.
-- Never take the foreground. Use temporary keychains and API keys so no dialog appears. Launch rac only via `worktree.sh run`, or with `--rac-launch-in-background` and a throwaway profile.
-- Never change the update key or the feed URL. Never lower the version. Never publish a draft or prerelease, except a runbook flip.
-- The maintainer posts all launch text.
-
-Work split: CI, smoke, detector and checks to Sonnet or a strong open-weight model; signing and sync design merges to Opus; site pages per the UI rule; a review agent comments on each PR.
-
-Deliverables, each a PR with proof: a green Depot chain (M0); 0.1.0 with smoke logs (M1); the sync with its screenshot matrix and tests (M2); 0.2.0 with an update video (M3); ruleset, host list and bench (M4); the checked gate list (M5).
-
-Done when: rac is public on 156 or later, has updated in place at least once, and `main` is protected.
+Thread brief: see `plans/threads/ship.md`.

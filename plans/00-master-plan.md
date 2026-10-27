@@ -2,7 +2,9 @@
 
 How the seven plans fit together, in what order, on which machines, and what
 must be true before rac launches for Arc users. The open choices are in
-[decisions.md](decisions.md), cited here as D1, D2, and so on.
+[decisions.md](decisions.md), cited here as D1, D2, and so on. "Ruling N"
+means item N in [rulings.md](rulings.md). Terms such as W1, M0, the freeze,
+and the door are defined in the [README](README.md#words-used-here).
 
 ## In plain English
 
@@ -79,7 +81,7 @@ shell.
    01 M3 to M5, 04's storage work, 05 M2 and M3, and 07.
 5. Then the plain-folder move (D58) and patch thinning (03 M4).
 
-**Owners** (alignment rulings): 06 the calendar, sync, and reveal port; 03
+**Owners** ([rulings](rulings.md)): 06 the calendar, sync, and reveal port; 03
 the action table and hunk metric; 01 Clear, archive, media controls, and
 reveal timings; 02 motion and token names; 05 agent policy, debug doors, and
 the agent workspace; 04 the Keychain fix and all storage.
@@ -150,7 +152,7 @@ share, about 57 to 77 days, is required.
 
 Five threads. Four start after approval. Power starts after launch. Each
 thread runs multi-agent workflows, tests with screenshots and video, and opens
-PRs that you approve (D9). Opus leads every thread. Sonnet or a strong
+PRs (D9b); you approve every merge. Opus leads every thread. Sonnet or a strong
 open-weight model does scoped work under Opus review. UI work stays on Claude.
 
 ### Ship: engineering and shipping (plan 06)
@@ -158,10 +160,14 @@ open-weight model does scoped work under Opus review. UI work stays on Claude.
 - **Owns:** 06 M0 to M5, the sync, the base-tree rebuild, cadence syncs, the
   drift detector, the bench, the host list, the launch site pages, and later
   the beta channel, crash reports, and the plain-folder move (D58). It also
-  owns the order of `patches/series` and the launch gate checklist.
+  owns the order of `patches/series` and the launch gate checklist. It asks
+  you to merge PR #20, and asks before deleting `pullfrog.yml`; neither
+  happens without you.
 - **Mac and worktrees:** the sync Mac from D5, in `sync/helium-0.20.1.1`. CI,
   site, and docs work in light worktrees with no build tree (`ci/<name>`,
-  `site/<name>`). Release builds run on Depot, not on a laptop.
+  `site/<name>`). Release builds compile on Depot, not on a laptop. Signing,
+  notarizing, and the appcast run in a final job on a GitHub-hosted runner, so
+  the keys never reach Depot (D4).
 - **Can collide on:** `patches/series`; every hot patch during the sync;
   `patches/rac/sidebar-reveal/` and `patches/rac/settings/` (the port and the
   Layout move); `.github/`; `dev.sh` and `devutils/shared.sh`;
@@ -198,8 +204,7 @@ open-weight model does scoped work under Opus review. UI work stays on Claude.
   recipes later, and thinning (03 M4) last.
 - **Mac and worktrees:** the base Mac, one worktree at a time
   (`feat/agent-<milestone>`, `feat/core-<milestone>`). The eval runner uses
-  that worktree's build. The first 154 build is bigger than usual, because the
-  base tree predates agent patches 13 to 17.
+  that worktree's build.
 - **Can collide on:** `patches/rac/agent/` and `ai/`; `chrome/browser/rac/ai/`
   (Data's AI store); `rac_actions.{h,cc}` (UI, Power); the factory list in
   `chrome_browser_main_extra_parts_profiles.cc`; prefs and strings registries;
@@ -266,6 +271,11 @@ open-weight model does scoped work under Opus review. UI work stays on Claude.
   on that Mac. Each then runs `worktree.sh sync` or is recreated. Its length is
   unknown until Ship times the W1 cold build. Stop any worktree build that
   shows tens of thousands of steps (AGENTS.md).
+- **A cheaper path (D6).** The sync worktree already holds a built 156 tree.
+  After the sync merges, new and rebased worktrees can run `worktree.sh setup
+  <sync worktree>` instead, and the main checkout's rebuild moves to a quiet
+  night or waits for the next sync. Ship checks this in W3 on a throwaway
+  worktree.
 - **Slot priority:** launch gates first (05 M0, 04 M0 and M1, 01 M0's PWA
   check, 01 M1), then 01 M2, then 02 M1 to M3 and 03 M1.
 - **If the Pro qualifies (D5),** it runs the sync and holds the 156 base. New
@@ -277,8 +287,9 @@ open-weight model does scoped work under Opus review. UI work stays on Claude.
 
 ## Launch gates
 
-One list, merged from all plans. Plan 06 M5 checks every item before the
-launch candidate builds.
+The one gate list, merged from all plans. Other plans point here and keep no
+list of their own. Plan 06 M5 checks every item before the launch candidate
+builds.
 
 | # | Gate | From |
 | --- | --- | --- |
@@ -292,7 +303,7 @@ launch candidate builds.
 | G8 | The synced build passes the surface matrix, including an installed web app (PWA) window, with no AI labels when AI is off | 06 M2, 01 M0 and M1 (rulings 16, 17) |
 | G9 | The signed, notarized, synced build passes `install-smoke` and `update-smoke` (0.1.0 to 0.2.0). The bad-release runbook exists | 06 M1, M3 |
 | G10 | The network host list is published from a capture | 06 M4 |
-| G11 | Speed numbers against Helium are published, or the site line is softened | 06 M4 |
+| G11 | Speed numbers against Helium are published, or the site line is softened (D60) | 06 M4 |
 | G12 | A DRM test page is checked before any Widevine claim | 06 M5 |
 | G13 | `main` is protected (D10) | 06 M4 |
 | G14 | A clean runner goes from download to imported Arc spaces in under 5 minutes, on video | 06 M5 |
@@ -303,10 +314,16 @@ polish, plan 07 M1, and Peek, the little window, and Clear.
 
 ## After your review
 
+0. **Update your main checkout first.** Its `main` is 71 commits behind
+   origin/main (verified 2026-10-27), so every worktree would clone a stale
+   base. Fast-forwarding it with `git -C /Users/knewton/Dev/Github/rac pull
+   --ff-only` and running one incremental `source dev.sh && he build` there
+   needs your approval (D6). That checkout has an uncommitted `.gitignore`
+   change and is in the merged state, so deal with both first. No thread
+   starts before this is done.
 1. You edit the plans and answer [decisions.md](decisions.md), group A first.
-2. The broken cross-references listed there get fixed, and the conflict
-   resolutions you accept get written into the plans.
+2. The conflict resolutions you accept get written into the plans.
 3. VISION.md, AGENTS.md, and `docs/roadmap.md` changes land only with your
    sign-off.
-4. Then the four threads launch, each from its plan's draft brief plus this
-   thread map. Not before.
+4. Then the four threads launch, each from its brief in `plans/threads/` plus
+   this thread map. Not before.

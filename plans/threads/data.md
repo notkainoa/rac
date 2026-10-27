@@ -2,6 +2,8 @@
 
 > **DRAFT: do not launch until the maintainer approves the plans.**
 
+Follow ["Every thread"](README.md#every-thread) in the README: reading, step 0, workflow stages, verification standard, and hard constraints. This brief adds only what is specific to Data.
+
 ## Goal
 
 An Arc user sees their spaces, pins, favorites, and themes in rac within a minute, with a safety net under it. M0 and M1 are in the launch build by 12-15; sign-ins (M2) too if ready. After launch: the full safety net, the partition spike, the encrypted AI store.
@@ -12,47 +14,28 @@ Plan 04 M0 (snapshots, restore prompt, Keychain "no silent reset" fix) and M1 (A
 
 ## Decisions it depends on
 
-- **Before it starts:** D1, D2, D9, D41 (scrub script run by the maintainer, W1), D42 (minimal safety net).
-- **By milestone:** D43 and D44 (M2 scope, W4), D45 (password spike; synthetic `Login Data` only), D46 (partitions, after launch), D47 (AI store), D55, D17 (hunk budget).
+- **Group A:** D1, D2, D9a/b, D17 (hunk budget), D41 (scrub script run by the maintainer, W1), D42 (minimal safety net).
+- **By milestone:** D43 and D44 (M2 scope, W4), D45 (password spike; synthetic `Login Data` only), D46 (partitions, after launch), D47 (AI store), D55.
 
-## Read first
+## Plan-specific reading
 
-`AGENTS.md`, `VISION.md`, plans 04, 01 (M1), and 06 (M2, M5), `docs/internals/pinned-tabs.md`, `plans/research/cra.md` (MIT, credit it), `plans/research/ardia.md`.
+Plans 04, 01 (M1), and 06 (M2, M5), `docs/internals/pinned-tabs.md`, `plans/research/cra.md` (MIT, credit it), `plans/research/ardia.md`. For Cra's key paths, clone `github.com/VictorKildahl/cra` at commit `94c3034` into a scratch folder and read only `Sources/Cra/Services/Import/`.
 
 ## Machine and worktree
 
-The base Mac, one worktree: `git worktree add -b feat/import-<m> <path> main`, then `devutils/rac/worktree.sh setup`. The reader and fixtures are pure parsing and need only the unit-test target, a light build. Never read real Arc, Dia, Helium, or rac profiles; use the maintainer's scrubbed sample and `--rac-import-source-root` (compiled out of release builds). Real-Arc credential tests use a throwaway profile or second macOS user with test accounts.
+0. Step 0 in the README first: the main checkout is pulled and its base build approved by the maintainer.
+- The base Mac, one worktree: `git worktree add -b feat/import-<m> <path> main`, then `devutils/rac/worktree.sh setup`. After the sync, `worktree.sh setup <checkout>` may clone the sync worktree's 156 tree if the maintainer OKs it (D6).
+- The reader and fixtures are pure parsing and need only the unit-test target, a light build.
+- Never read real Arc, Dia, Helium, or rac profiles; use the maintainer's scrubbed sample and `--rac-import-source-root` (compiled out of release builds).
+- **Arc credentials.** Test the credential reader only on fixture `Cookies` databases encrypted with a fixed test password, through a test-only seam. The reader never calls the real Keychain in tests, and nothing unlocks the real "Arc Safe Storage" item. Real-Arc checks are the maintainer's, by hand, on a second macOS user.
 
-## How to use multi-agent Claude Code workflows inside the thread
+## Data adds to the verification standard
 
-Run each milestone through five stages.
-
-1. **Understand.** Read-only subagents (Haiku or Sonnet) read the plan section, the files it touches, and AGENTS.md, and return a short map.
-2. **Design.** Opus writes a one-page design (interfaces, hunk budget, test plan) before any code.
-3. **Implement.** Hard architecture and security go to Opus. Routine, scoped code and tests go to Sonnet or a strong open-weight model (`kimi-k3`, `glm-5.3`, `deepseek-v4-pro`, `minimax-m3`). UI work goes to Claude Opus (routine UI to Sonnet), never open-weight models.
-4. **Verify.** You build, run, and capture. A Haiku subagent may run tests and summarize.
-5. **Review.** Before every PR, a fresh Opus reviewer that hasn't seen the design tries to break the diff (attacks, edge cases, missed surfaces, hunk count), then run `/code-review`. Fix or answer every finding. Check subagent output before building on it.
-
-## Verification standard
-
-- Build and run it yourself: `source dev.sh && he build`, then `devutils/rac/worktree.sh run --rac-window-screenshot=/abs/path.png`. Wait for real pixels.
-- Answer AGENTS.md "Cover every surface" item by item. Screenshot matrix: sidebar full, hidden, and edge reveal; light and dark; space themes; multiple windows; incognito; split view; an installed web-app (PWA) window; reduced motion; AI off (no AI button, row, or label).
-- Short videos for motion. Focused unit tests only. `he validate series` after touching `patches/series`.
-- Every PR states its net-diff hunk change (D17) and attaches proof with `gh pr create --attach './shot.png#caption'`. Never commit screenshots or videos.
-- No PR unless the maintainer asks, or D9 grants standing permission. The maintainer approves every merge.
-- Data adds: a rerun adds nothing and Undo restores the sidebar; a net log with zero import requests; corrupt `Preferences` restores in one click; the fake-keychain test writes no second key. Shots: sidebar before and after, restore prompt, two profile windows, incognito unchanged. Videos of the import.
-
-## Hard constraints from AGENTS.md
-
-- Never push to, open PRs against, or file issues on `imputnet` or `ungoogled-software`.
-- Never edit `helium-chromium/`, `patches/helium/`, `patches/rebel/`, or `patches/ungoogled-chromium/`.
-- `rac_version.txt` only goes up. The signing key and feed URL never change.
-- Never take the foreground (no `open`, no `he run`, no foreground automation). Never use a real profile.
-- No full build, `he reset`, or deleting `build/` without approval (D6 names the allowed ones). If a worktree build shows tens of thousands of steps, stop.
+A rerun adds nothing and Undo restores the sidebar; a net log with zero import requests; corrupt `Preferences` restores in one click; the fake-keychain test writes no second key. Shots: sidebar before and after, restore prompt, two profile windows, incognito unchanged. Videos of the import.
 
 ## Coordination
 
-- During Ship's freeze (W1 to W3) write new files only, on Chromium 154, and do not merge. After the sync merges and the base rebuilds: M0b, M1b, and M2 on 156. `keychain_password_mac.mm` is patched by Helium too, so M0b waits for the sync.
+- During Ship's freeze (W1 to W3) write new files only, on Chromium 154, and do not merge. After the sync merges and the base rebuilds (or is cloned): M0b, M1b, and M2 on 156. `keychain_password_mac.mm` is patched by Helium too, so M0b waits for the sync.
 - Agree `import_plan.h` with UI in W1; UI draws the import screens and restore prompt.
 - Write only through `SpacesService` and `SidebarItems`. Coordinate with UI on the `rac spaces` store.
 - `browser_navigator.cc` and session restore are shared with Core's 05 M2: take turns. Data owns the AI store schema; Core reviews it.

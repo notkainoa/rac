@@ -6,7 +6,7 @@ Paths are relative to the repo root unless they start with `CR:`, which means th
 
 For most people nothing changes. rac stays one app, and the browser itself acts as the "server". There is no background program that runs all the time.
 
-Developers get one new switch: "Let other apps' agents use rac." With it on, Claude Code or Codex can drive rac through a small command inside the app. With it off, nothing listens and nothing extra runs.
+Developers get one new switch, "Outside agents." With it on, Claude Code or Codex can drive rac through a small command inside the app. With it off, nothing listens and nothing extra runs.
 
 rac's own assistant answers follow-ups faster. Its agent can stay ready for 5 minutes while the panel is open, instead of restarting for every message.
 
@@ -65,7 +65,7 @@ Decided elsewhere: the debugging doors are 05-D6. Moving rac's own files into a 
 
 **Debugging doors.** `--remote-debugging-port` on the real profile is refused only in Google-branded builds (FACT, `CR:chrome/browser/devtools/remote_debugging_server.cc:160-180`). Remote debugging from `chrome://inspect` is off by default. The user must turn it on, and each connection needs approval (FACT, same file, as summarized in `plans/research/long-tail.md:630`). Plan 05 decides both (05-D6). The Core thread builds the refusal inside 05 M0, on 156 after the sync.
 
-**Patch surface.** rac carries 180 patches with 871 stacked hunks in 217 upstream files. 320 hunks are in `ui/views`. 76% sit in files that Helium or ungoogled also patch (FACT, `digests/rac-baseline.md`; per-group recount from `/tmp/rac-overhaul/rac_hunks.tsv`). A dry run to Helium 0.20.1.1 fails 104 hunks at fuzz 2, 46 of them first failures (FACT, `digests/helium.md`).
+**Patch surface.** rac carries 180 patches with 871 stacked hunks in 217 upstream files. 320 hunks are in `ui/views`. 76% sit in files that Helium or ungoogled also patch (FACT, `digests/rac-baseline.md`; per-group recount from a one-off hunk count over `patches/rac`). A dry run to Helium 0.20.1.1 fails 104 hunks at fuzz 2, 46 of them first failures (FACT, `digests/helium.md`).
 
 **Signing.** Only parts listed in `parts.py` are signed. Helium already patches it for Sparkle (FACT, `CR:chrome/installer/mac/signing/parts.py:261-266`).
 
@@ -144,7 +144,7 @@ A future helper is justified only by a named feature that must run without openi
 1. **Net-diff hunks.** Hunks in the diff between the Helium-patched tree and rac's final tree, in upstream files, reported separately for the files Helium also touches.
 2. **First-failure hunks** in each sync's fuzz-0 dry run. Today that is 46 at two majors behind.
 
-Plan 06 M0 builds the counter and reports the net-diff baseline. Until then, the stacked counts below stand in.
+Plan 06 M0 builds the counter and reports the net-diff baseline. Until Ship's counter reports a net-diff baseline in W1, the stacked counts below stand in, and hold stacked hunks at 630 or fewer, aiming for 550.
 
 | Group | Stacked hunks today | Target | How |
 | --- | --- | --- | --- |
@@ -161,7 +161,7 @@ Plan 06 M0 builds the counter and reports the net-diff baseline. Until then, the
 | Added by plans 01, 02, 04, 05, 07 | 0 | +60 to 110 | Each through single hooks |
 | **Total** | **871** | **580 to 630** | **Accept 630; aim for 550 by routing new features through existing hooks; stretch 450** |
 
-Ardia, with no AI and a native shell, sits at 492 (FACT, `digests/ardia.md`). So under 400 is not credible for rac's shape. Plan 06's dates for "under 400" should use these targets instead.
+Ardia, with no AI and a native shell, sits at 492 (FACT, `digests/ardia.md`). So under 400 is not credible for rac's shape.
 
 **Spike trigger.** Run a one-week S2 spike if, after the second sync on the thinner base, either holds: stacked hunks are above 650, or a sync has more than 30 first-failure hunks. The spike measures files touched, dialogs to rebuild, tab-switch time, and memory (`digests/long-tail.md`, item C6).
 
@@ -169,7 +169,7 @@ Ardia, with no AI and a native shell, sits at 492 (FACT, `digests/ardia.md`). So
 
 ## Recommended plan
 
-Calendar rules (`/tmp/rac-overhaul/alignment.md`, ruling 1). Weeks count from the maintainer's approval. Plan 06 owns the sync (06 M2), the launch build (hard stop 2026-12-15), and the weeks. Work in rac-owned files may start on Chromium 154 and be rebased. Work in hot files shared with Helium waits for the sync to 156 and for each worktree's base-tree rebuild.
+Calendar rules (`plans/rulings.md`, ruling 1). Weeks count from the maintainer's approval. Plan 06 owns the sync (06 M2), the launch build (hard stop 2026-12-15), and the weeks. Work in rac-owned files may start on Chromium 154 and be rebased. Work in hot files shared with Helium waits for the sync to 156 and for each worktree's base-tree rebuild.
 
 **Before 2026-12-22.** Nothing here gates launch or helps Arc refugees directly. M0, and M1's rac-owned parts, may run in parallel if they don't slow plan 06. The door, the warm agent, and M4 come after launch.
 
@@ -185,7 +185,7 @@ Calendar rules (`/tmp/rac-overhaul/alignment.md`, ruling 1). Weeks count from th
 | Codex, Cursor, and OpenCode over `rac mcp` | Lists tools |
 | Socket under Application Support vs a short `$TMPDIR` path | No TCC prompt (macOS's privacy permission dialog) on the chosen path |
 | `mcp add` with a token vs `mcp login` | stdio is enough, or loopback HTTP moves into M2 |
-| Relay with rac closed | Opens the right profile hidden, waits for the socket, and handles the single-instance handoff with no window or focus change |
+| Relay with rac closed | Opens the right profile hidden, waits for the socket, and handles the single-instance handoff with no window or focus change. In non-release builds, the relay never launches rac without an explicit `--user-data-dir` (taken from `RAC_USER_DATA_DIR`), so tests never touch the real profile |
 
 - **Acceptance.** Both tables committed in the M2 PR description. HTTP is in or out of the plan.
 - **Patch surface.** None.
@@ -223,7 +223,7 @@ Calendar rules (`/tmp/rac-overhaul/alignment.md`, ruling 1). Weeks count from th
   4. **Defence in depth.** Accept only peers whose audit token is rac's signed relay. The relay walks its parent chain, Crest-style, to show the agent's name (`digests/long-tail.md`). Unsigned dev builds skip the signature check, but never the token check.
   5. **Input hardening.** No handler runs before the peer and token checks. Frames are capped at 1 MiB and JSON nesting at 64 levels. Each client is rate-limited to 20 calls a second, with at most 4 clients per profile. Parsing happens on the IO thread with the Rust reader, and only typed structs reach the UI thread. A fuzz test covers the framing parser.
   6. **rac-launched ACP agents** use the relay instead of `nc -U`. The token rides an inherited file descriptor, so nothing shows in `ps` (T3's fd-3 pattern, `digests/t3code.md`).
-  7. **When rac is closed**, the relay opens it as M0 proved.
+  7. **When rac is closed**, the relay opens it as M0 proved. In non-release builds, the relay never launches rac without an explicit `--user-data-dir` (taken from `RAC_USER_DATA_DIR`).
   8. **Packaging.** Bundle data and the dependency in `chrome/BUILD.gn` (1 to 2 hunks). Signing in `parts.py`, which Helium also patches (1 to 2). Possibly one in the signing pipeline (0 to 1). No new entitlements.
 - **Acceptance.**
   - With AI off and the door on, `claude mcp add` with the token lists tools.
@@ -320,24 +320,4 @@ Calendar rules (`/tmp/rac-overhaul/alignment.md`, ruling 1). Weeks count from th
 
 ## Draft thread brief
 
-**DRAFT. Do not launch until the maintainer approves this plan and its decisions.**
-
-> **Thread: rac core and the outside-agent door (architecture and backend)**
->
-> **Model.** Claude Opus 5.5 for design, the core split, socket checks, tokens, and signing. Sonnet 5.5 or a strong open-weight model for scoped tasks such as the relay, tests, and the fuzz harness.
->
-> **Read first.** `AGENTS.md`, `VISION.md`, `docs/internals/ai.md`, `plans/03-core-architecture.md`, the approved plans 05 and 06, and `/tmp/rac-overhaul/alignment.md`.
->
-> **Order.** M0 spikes, then M1 (rac-owned parts on 154, the hook after the sync), then M3, then M2 once plan 05's evals pass, then M4 after launch. Follow plan 06's weeks and sync freeze (plan 06's default list, D11 in decisions.md).
->
-> **Hard rules.**
-> - Feature worktrees only: `source dev.sh && he build`, then `devutils/rac/worktree.sh run`. Never `he run` or `open` there.
-> - Never touch real profiles, `helium-chromium/`, or Helium's patch folders. Post nothing upstream.
-> - No resident process, no TCP port unless M0 proves it is needed, no new entitlements, no telemetry.
-> - With AI and the door off, rac creates no service, socket, or child. Prove it with `ps` and `lsof` in a fresh profile.
-> - Every call goes through `AgentController::HandleToolCall`. No policy at the MCP layer. No raw CDP.
-> - Report the net-diff hunk delta in every PR.
->
-> **Done means.** Unit tests run locally. Benchmark numbers where relevant. Screenshots of every visible surface in light and dark. Videos for the door and the warm agent. Updated docs where a decision changed.
->
-> **Stop and ask** before any full build, more than 10 new upstream hunks, a new signed part beyond the relay, or a socket design that M0 failed.
+Thread brief: see `plans/threads/core.md`.

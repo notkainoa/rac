@@ -10,8 +10,8 @@ assistant on the right. Three Arc habits come first. Cmd+T opens a command
 bar that finds tabs, history, and actions. Shift-click opens a link in a
 Peek preview. Links from other apps open in a little window.
 
-Cmd+L opens the command bar too. Cmd+O moves a Peek or little window into a
-space. A Clear button empties a space's open tabs, with Undo.
+If you agree (D28, D31), Cmd+L opens the command bar too, and Cmd+O moves a
+Peek or little window into a space. A Clear button empties a space's open tabs, with Undo.
 
 Plan 06's launch build carries the Helium update and the Arc import
 screens. The command bar ships in the launch if it is merged by the start
@@ -30,7 +30,7 @@ parallel work, so stretch items may slip to January.
 ## What you need to decide
 
 UI technology is plan 03's decision (03-D4: stay on Views); the command bar
-is native Views (alignment ruling 3). Agent workspaces are 05-D3. Separate
+is native Views (`plans/rulings.md`, ruling 3). Agent workspaces are 05-D3. Separate
 sign-ins per space are 04-D6. Launch scope is plan 06's.
 
 1. **01-D1. Does Cmd+T open the command bar?** Yes, plus one setting to get
@@ -109,7 +109,7 @@ patches fail, because Helium rebuilt frameless mode (FACT,
 `plans/research/digests/helium.md`). Plan 06 ports them during its sync.
 
 **Installed web apps.** Nobody has checked whether rac's look and sidebar
-patches break installed web app (PWA) windows (alignment ruling 17).
+patches break installed web app (PWA) windows (ruling 17).
 
 ## What others do
 
@@ -416,7 +416,7 @@ of steps. Plan 06 lists the rebuild time as unknown.
   Unit tests for the ranking and the merge.
 - **Patch surface.** About 8 to 12 upstream hunks.
 - **Launch rule (D16).** It is not a launch gate. It ships in the launch
-  build if its hooks are merged by the start of W5 (11-30). Otherwise it
+  build if its hooks are merged by the start of W5. Otherwise it
   ships in plan 06's one optional W6 point release, only if `update-smoke`
   passes.
 
@@ -439,8 +439,9 @@ of steps. Plan 06 lists the rebuild time as unknown.
     origin.
   - Clear then Undo restores the same tabs in order.
   - Nothing is created before first use: no window, page, or timer.
-- **Verification.** Videos of Peek open, expand, and close; a link opened
-  from Terminal (`open URL`); Clear and Undo. Reduced-motion versions too.
+- **Verification.** Videos of Peek open, expand, and close; a link
+  sent through a new harness verb, `open-urls URL`, that calls the same
+  `application:openURLs:` router inside the worktree process; Clear and Undo. Reduced-motion versions too.
 - **Patch surface.** Re-estimated after the spike. About 12 to 20 upstream
   hunks today (INFERENCE).
 
@@ -579,37 +580,4 @@ burst-capture (`patches/rac/dev/window-screenshot-popups.patch`,
 
 ## Draft thread brief
 
-> **DRAFT. Do not launch until the maintainer approves this plan and its
-> decisions.**
-
-**Thread: rac UI shell (plan 01).** Claude Opus for design and review.
-Sonnet for routine UI subagents.
-
-**Read first.** This plan as edited, `VISION.md`, `AGENTS.md`, the glossary,
-`docs/internals/pinned-tabs.md`, `docs/internals/ai.md`, plan 02's tokens,
-and plan 06's calendar.
-
-**Constraints.**
-
-- Follow AGENTS.md exactly. New code goes under `chrome/browser/ui/views/rac/`
-  or `chrome/browser/ui/rac/`. Capture only with the
-  `--rac-window-screenshot` harness, never in the foreground.
-- No new network calls, no idle loops, Reduce Motion read at every start,
-  and no AI button, row, or label with AI off.
-- State the upstream hunk count in every PR, using plan 03's metric.
-- Land nothing during plan 06's sync freeze. Hooks into hot files wait for
-  the sync and the base rebuild. Ask before any build of tens of thousands
-  of steps. Run at most two UI worktrees at once.
-
-**Order.** M0 (tools and spikes, with a report before any feature work),
-then M1 (import screens, a launch gate), then M2 (command bar). After that,
-M3 and M4 as stretch work before 12-22. M5 runs with plan 05's thread.
-
-**Done means.** Each PR has Tier 0 shots, videos for any motion, focused
-unit tests, the AGENTS.md "Cover every surface" list answered item by item,
-and the "I tested" block. Each milestone ends with a Tier 1 run on the
-synced build and a short report.
-
-**Ask the maintainer before** editing VISION.md, changing a default, adding
-a setting, taking a shortcut that Chromium or Helium already uses, or
-exceeding the planned hunk counts.
+Thread brief: see `plans/threads/ui.md`.

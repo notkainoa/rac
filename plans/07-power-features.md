@@ -8,7 +8,7 @@ Next come Boosts, which let you restyle a site you visit often. You can recolor 
 
 Then comes Air Traffic Control. It sends links from other apps to the right space, so a Slack link opens in your Work space. Last come bangs, shortcuts like `!w cats` that search Wikipedia. You can add and fix your own bangs.
 
-Only the copy and shortcut pieces can make the launch build before Arc shuts down on 2026-12-22. Boosts and link routing follow in the first weeks after. Everything works with AI off, costs nothing until used, and sends nothing anywhere.
+Nothing here is in the launch build. The copy and naming logic may be written beforehand, with unit tests only. Everything else follows after launch. Everything works with AI off, costs nothing until used, and sends nothing anywhere.
 
 ## What you need to decide
 
@@ -56,7 +56,7 @@ Arc's own data says 5.52% of daily users used more than one space (`digests/clos
 
 Build in the order Arc refugees feel the gaps: copy and shortcuts, then no-code Boosts, then routing, then bangs. Use what Helium, Chromium, and uBlock already have, and add thin rac code only where nothing exists.
 
-- **Details.** Clean copy is one hook in `FormatURLForCopy`. Shortcuts are fields in plan 03's action table (ruling 2). Boosts are no-code controls that write CSS, plus Zap and a CSS view. ATC plugs into plan 01's router. The bangs editor reuses Chromium's site-search entries plus one deleted-bangs list.
+- **Details.** Clean copy is one hook in `FormatURLForCopy`. Shortcuts are fields in plan 03's action table (`plans/rulings.md`, ruling 2). Boosts are no-code controls that write CSS, plus Zap and a CSS view. ATC plugs into plan 01's router. The bangs editor reuses Chromium's site-search entries plus one deleted-bangs list.
 - **Pros.** Value lands where users notice it. There are few upstream hunks, and each piece ships alone.
 - **Cons.** Bangs, which you asked for, come last. Boosts need an injection spike first.
 - **Effort.** About 35 to 55 agent-days across M0 to M5 (the milestone sums below).
@@ -90,8 +90,8 @@ Code goes in new files under `chrome/browser/rac/<feature>/` and `chrome/browser
 | Milestone | Starts | Chromium | Target |
 |---|---|---|---|
 | M0 Matcher and table fields | after plan 03 M1 and the sync | 156 | before M1 hooks |
-| M1 Arc habits | logic week 1; hooks after the sync | 156 | launch build if merged by the start of W5; else first update |
-| M2 Boosts basics | spike week 2 on 154; build after the sync | 156 | about 3 to 5 weeks after launch |
+| M1 Arc habits | logic beforehand (unit tests only); hooks after launch | 156 | first update after launch |
+| M2 Boosts basics | spike after launch; build after the sync | 156 | about 3 to 5 weeks after launch |
 | M3 Air Traffic Control | after plan 01's little-window hook | 156 | early January |
 | M4 Bangs editor | after the sync | 156 | January |
 | M5 Bangs address-bar label | go or no-go after M4 | 156 or 157 (plan 06) | February, if approved |
@@ -147,10 +147,10 @@ Code goes in new files under `chrome/browser/rac/<feature>/` and `chrome/browser
   3. **Sign-in safety, minimal rule.** Never route a URL whose host starts with `accounts.`, `login.`, `auth.`, or `sso.`. Never route one whose path contains `oauth`, `authorize`, `callback`, or `saml`. Always show a one-click "Open here instead". Never route into or out of incognito.
   4. Entry points: "Always open <site> in this space" in site controls; a list under Settings > Spaces (plan 01 places it); "Open link in space…" in the link menu; a command bar action.
   5. Convert Arc's routing file, which plan 04 keeps raw in `<profile>/rac imports/` (`plans/04-data-storage-import-sync.md`, M1 item 7).
-- **Acceptance.** `open` of a matching URL from Terminal lands in the right window and space. A cold profile falls back with the chip. No rules means one empty-list check and nothing else.
+- **Acceptance.** A matching URL sent through the harness verb `open-urls URL` (plan 01 M3; it calls the router inside the worktree process) lands in the right window and space. A cold profile falls back with the chip. No rules means one empty-list check and nothing else.
 - **Verification.** Unit tests for matching, fallbacks, and the sign-in rule. Screenshots of the settings list and site-controls row. A video of a link from another app landing in a background space.
 - **Patch surface.** 0 to 1 hunks (the link-menu entry).
-- **Depends on** plan 01 M3 (the router), and on rac being the default browser (plan 01's onboarding step).
+- **Depends on** plan 01 M3 (the router), and on rac being the default browser (plan 01's onboarding step). Agents never change the default browser and never launch a build without `--user-data-dir`. Default-browser checks are done by the maintainer by hand, on a second macOS user; agents use `open-urls`.
 
 ### M4. Bangs editor (3 to 5 agent-days)
 
@@ -221,20 +221,4 @@ Code goes in new files under `chrome/browser/rac/<feature>/` and `chrome/browser
 
 ## Draft thread brief
 
-**DRAFT. Not to launch until the maintainer approves plan 07 and its decisions.**
-
-> **Thread: power features (rac).** Build plan 07 (`plans/07-power-features.md`) using the maintainer's answers to 07-D1 through 07-D8. Read `docs/internals/bangs.md` and the plan in full.
->
-> **Order.** M1's logic and the M2 spike may start on Chromium 154 in rac-owned files. Every upstream hook waits for plan 06's sync and base-tree rebuild. M0 waits for plan 03 M1. M3 waits for plan 01's little-window router. M5 needs its own go-ahead after its Helium diff check. Use one worktree per milestone.
->
-> **Plan-specific rules.**
-> - No network requests.
-> - No AI label with AI off.
-> - No second action table: add fields to plan 03's.
-> - Every per-site entry goes through site controls, placed by plan 01.
-> - Credit Ardia and Stedding with their notices.
-> - Report upstream hunks per PR, using plan 03's metric.
->
-> **Done means.** Unit tests pass. Screenshots from your own build cover light and dark, sidebar full and hidden, two spaces, split view, and incognito where it applies. Motion gets a short video with Reduce Motion on and off.
->
-> **Models.** Opus for the Boosts panel and settings pages. Sonnet for matchers, stores, and tests.
+Thread brief: see `plans/threads/power.md`.
