@@ -1,27 +1,50 @@
 # 04. Data, storage, import, and sync
 
-## In plain English (at most 200 words)
+You only need to read the first two sections. The rest is detail for the build thread.
 
-Arc closes on 2026-12-22. An Arc user who opens rac today gets an empty sidebar and must sign in everywhere again. This plan fixes that before Arc closes. rac reads Arc's files on the Mac and rebuilds each Arc space as a rac space. Names, emoji, pinned tabs, folders, open tabs, and favorites come over. Colors come out close to Arc's, not exact.
+## In plain English
 
-Each Arc profile, such as Work or Personal, becomes a rac profile with its own window and its own sign-ins. Sites stay logged in, though some, like Google, may ask you to sign in again.
+An Arc user who opens rac today gets an empty sidebar and no sign-ins. This plan fixes both before Arc shuts down on 2026-12-22.
 
-Saved passwords are harder, because rac has no password manager. If a test works, rac passes them to Apple Passwords or 1Password without writing them to your SSD. The file is plaintext while it is mounted, and any app you run can read it until it unmounts. If it doesn't, rac shows you how to export them from Arc yourself.
+rac reads Arc's files and rebuilds each Arc space as a rac space. Names, emoji, pinned tabs, folders, open tabs, and favorites come over. Colors come close to Arc's. Each Arc profile becomes a rac profile with its own window. Sites stay signed in, though some, like Google, may ask again.
 
-Before any import, rac saves a snapshot. You can undo the sidebar part of an import.
+rac has no password manager. If a one-day test passes, rac hands Arc's passwords to Apple Passwords or 1Password through a RAM disk, a disk held in memory that never touches the SSD. Until rac removes the file, any app you run can read it. If the test fails, rac shows how to export them from Arc.
 
-After launch, AI chats move to encrypted storage. Later, one window can hold spaces with different sign-ins. Sync stays out unless the maintainer adds it to the vision.
+rac saves a snapshot before each import, so you can undo the sidebar part.
+
+```mermaid
+flowchart LR
+  ARC["Arc's files on this Mac"] --> RD["rac's Arc reader"]
+  RD --> SNAP["Snapshot, for Undo"]
+  SNAP --> PR["One rac profile per Arc profile"]
+  PR --> SP["Spaces and open tabs"]
+  PR --> PIN["Pinned tabs and favorites"]
+  PR --> SI["Sign-ins, after you unlock Arc data"]
+  RD -->|"saved passwords"| RAM["File on a RAM disk, never on the SSD"]
+  RAM --> PW["Apple Passwords or 1Password"]
+```
 
 ## What you need to decide
 
-1. **04-D1. What does the pre-launch import bring?** Sidebar only / sidebar plus sign-ins / plus passwords. **Recommended: sidebar plus sign-ins, Arc only. If sign-ins slip, launch with the sidebar.**
-2. **04-D2. How do Arc profiles map?** Everything into one profile / Arc profile → rac profile / per-space sign-ins in one window. **Recommended: Arc profile → rac profile.**
-3. **04-D3. How do saved passwords move?** RAM-disk hand-off / guide Arc's own export / plaintext temp file / turn on Chromium's password manager. **Recommended: RAM-disk if a one-day spike passes, else guide Arc's export. No plaintext file without sign-off.**
-4. **04-D4. What real Arc data can we test on?** Maintainer runs a scrubbing script on their own Arc / volunteer samples after beta / synthetic only. **Recommended: the scrubbing script now, plus volunteers after beta.**
-5. **04-D5. How big is the safety net before launch?** Pre-import snapshot, one rolling backup, Keychain fix / full 14-day rotation and a Restore UI now. **Recommended: the minimal set now, the rest after launch.**
-6. **04-D6. After launch, how are separate sign-ins in one window built?** Storage partition per space / full profile per space. **Recommended: partition per space, one sign-in jar per space, spike first.**
-7. **04-D7. After launch, how are AI chats and agent runs stored?** Encrypt today's JSON / one encrypted SQLite store with retention. **Recommended: encrypted SQLite. It absorbs plan 05's chat-encryption item.**
-8. **04-D8. Sync?** None / export file / encrypted folder sync / Helium's vault. **Recommended: an export file after launch. Folder sync only if VISION changes, which needs your sign-off.**
+| Id | Question | Options | Recommended |
+| --- | --- | --- | --- |
+| 04-D1 (D43) | What does the pre-launch import bring? | Sidebar only; sidebar plus sign-ins; also passwords | Sidebar plus sign-ins, from Arc only |
+| 04-D2 (D44) | How do Arc profiles map? | All into one profile; one rac profile each; per-space sign-ins in one window | One rac profile for each Arc profile |
+| 04-D3 (D45) | How do saved passwords move? | RAM-disk file; guide Arc's own export; plaintext file on the SSD; Chromium's password manager | The RAM disk if a one-day test passes, else Arc's export |
+| 04-D4 (D41) | What real Arc data can we test on? | You run a scrubbing script on your Arc; volunteer samples after beta; made-up data only | The scrubbing script now, plus volunteers after beta |
+| 04-D5 (D42) | How big is the safety net before launch? | Snapshot, one rolling backup, and the Keychain fix; also 14-day backups and a Restore screen | The small set now, the rest after launch |
+| 04-D6 (D46) | After launch, how do spaces get separate sign-ins? | A storage partition per space; a full profile per space | A partition per space, tried in a spike first |
+| 04-D7 (D47) | After launch, how are AI chats and agent runs stored? | Encrypt today's JSON files; one encrypted SQLite database with retention | One encrypted SQLite database |
+| 04-D8 (D55) | Sync between Macs? | None; an export file; encrypted folder sync; Helium's vault | An export file after launch |
+
+- 04-D1. If sign-ins slip, or approval comes after 11-02, launch with the sidebar only.
+- 04-D2. It is the cheapest correct path before 12-22. Two Arc profiles mean two windows.
+- 04-D3. A plaintext file on the SSD needs your sign-off.
+- 04-D4. The script swaps every title and URL for a placeholder. You run it, and agents never read your real Arc data.
+- 04-D5. The Keychain fix stops rac from silently replacing the key that protects its encrypted data.
+- 04-D6. A partition is a separate cookie and storage jar inside one profile.
+- 04-D7. It also covers plan 05's chat-encryption item.
+- 04-D8. Folder sync would need a VISION.md change.
 
 ## Where we are today
 

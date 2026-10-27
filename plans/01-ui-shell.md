@@ -1,61 +1,56 @@
 # 01. UI shell and information architecture
 
+You only need to read the first two sections. The rest is detail for the build thread.
+
 ## In plain English
 
-This plan decides what a rac window holds, where each feature lives, and
-what Arc users get before Arc shuts down on 2026-12-22.
+rac gets four Arc habits before Arc shuts down on 2026-12-22.
 
-The window keeps its shape: sidebar on the left, the page in a card, and the
-assistant on the right. Three Arc habits come first. Cmd+T opens a command
-bar that finds tabs, history, and actions. Shift-click opens a link in a
-Peek preview. Links from other apps open in a little window.
+- Cmd+T opens the command bar, a search box that finds open tabs, history, and actions.
+- Shift-click a link to open Peek, a preview that floats over the page until you close or expand it.
+- A link from another app, such as Slack, opens in a little window. Cmd+O moves it into a space.
+- Clear empties a space's open tabs, and Undo brings them back.
 
-If you agree (D28, D31), Cmd+L opens the command bar too, and Cmd+O moves a
-Peek or little window into a space. A Clear button empties a space's open tabs, with Undo.
+The window keeps its sidebar, page card, and assistant panel. With AI off, no AI button, row, or label appears anywhere.
 
-Plan 06's launch build carries the Helium update and the Arc import
-screens. The command bar ships in the launch if it is merged by the start
-of W5, otherwise as a point release in W6 before 12-22. Peek, the little
-window, and Clear follow if they pass review in time.
+The command bar ships at launch if it merges by the start of week 5. Otherwise an update brings it before 12-22. Peek, the little window, and Clear follow if they pass review in time, or slip to January.
 
-With AI off, no AI button, row, or label appears anywhere.
-
-Four changes need your sign-off: Peek, an optional auto-archive later, the
-command bar as the default for Cmd+T, and moving these items ahead of the
-roadmap.
-
-Effort before 12-22 is about 38 to 55 agent-days. One shared Mac limits
-parallel work, so stretch items may slip to January.
+```mermaid
+flowchart LR
+  subgraph SB["Sidebar, shown or hidden with Cmd+S"]
+    SP["A space's pinned and open tabs, with Clear"]
+    AG["Agents section, shown only while an agent has tabs"]
+  end
+  K1["Cmd+T, or New tab in the sidebar"] --> CB["Command bar"]
+  K2["Shift-click a link"] --> PK["Peek"]
+  K3["A link from another app"] --> LW["Little window"]
+  K4["An agent opens a tab"] --> AG
+  PK -->|"Expand or Cmd+O"| SP
+  LW -->|"Cmd+O"| SP
+```
 
 ## What you need to decide
 
-UI technology is plan 03's decision (03-D4: stay on Views); the command bar
-is native Views (`plans/rulings.md`, ruling 3). Agent workspaces are 05-D3. Separate
-sign-ins per space are 04-D6. Launch scope is plan 06's.
+Four answers bend VISION.md or the roadmap and need your sign-off. They are 01-D1, 01-D4, 01-D7, and building this ahead of the roadmap (D15).
 
-1. **01-D1. Does Cmd+T open the command bar?** Yes, plus one setting to get
-   the new tab page back / yes, no setting / no. **Recommended: yes, plus
-   one setting.**
-2. **01-D2. What do Cmd+L and a click on the address bar do?** Both open the
-   command bar (Arc) / Cmd+L opens it, a click edits in place / both edit in
-   place. **Recommended: Cmd+L opens it; a click edits in place.**
-3. **01-D3. When do command bar queries reach the search engine?** Same as
-   the address bar / only after local results run out and typing pauses /
-   never. **Recommended: only after local results run out and typing pauses.**
-4. **01-D4. Build Peek, and does it enter history?** Yes, history only once
-   expanded / yes, always in history / no. **Recommended: yes, history only
-   once expanded.**
-5. **01-D5. Do links from other apps open in a little window?** Yes by
-   default / opt-in / not built. **Recommended: yes by default, in the
-   last-used space, keeping nothing when closed.**
-6. **01-D6. Which keys do the new actions take?** Arc's keys, with Cmd+O
-   only inside Peek and the little window / new keys that clash with
-   nothing. **Recommended: Arc's keys, scoped that way.**
-7. **01-D7. How does clean-up work?** Manual Clear only / Clear now, opt-in
-   auto-archive later (off by default, keeps an Arc user's own setting) /
-   auto-archive on. **Recommended: Clear now, opt-in auto-archive later.**
-8. **01-D8. Does Ask move from the AI new tab page into the command bar?**
-   Yes, retire the AI new tab page / keep both. **Recommended: yes.**
+| Id | Question | Options | Recommended |
+| --- | --- | --- | --- |
+| 01-D1 (D13) | Does Cmd+T open the command bar? | Yes, with a setting for the new tab page; yes, no setting; no | Yes, with one setting to get the new tab page back |
+| 01-D2 (D28) | What do Cmd+L and a click on the address bar do? | Both open the command bar; Cmd+L opens it, a click edits; both edit in place | Cmd+L opens it, and a click edits in place |
+| 01-D3 (D29) | When do command bar queries reach the search engine? | Same as the address bar; after local results run out and typing pauses; never | Only after local results run out and typing pauses |
+| 01-D4 (D14) | Build Peek, and does it enter history? | Yes, in history once expanded; yes, always in history; no | Yes, and it enters history only once expanded |
+| 01-D5 (D38) | Do links from other apps open in a little window? | Yes by default; opt-in; not built | Yes by default, in the last-used space, keeping nothing when closed |
+| 01-D6 (D31) | Which keys do the new actions take? | Arc's keys, with Cmd+O only in Peek and the little window; new keys that clash with nothing | Arc's keys, with Cmd+O only in Peek and the little window |
+| 01-D7 (D39) | How does clean-up work? | Manual Clear only; Clear now and opt-in auto-archive later; auto-archive on | Clear now, and an opt-in auto-archive later, off by default |
+| 01-D8 (D30) | Move Ask from the AI new tab page into the command bar? | Yes, and retire the AI new tab page; keep both | Yes |
+
+- 01-D2. A click that edits in place keeps paste-and-go and inline autocomplete.
+- 01-D3. Most command bar typing is meant to find a tab, so sending each word to the search engine would be a new leak.
+- 01-D4. A preview is not a visit. VISION.md lists Peek as "not planned".
+- 01-D6. Cmd+O stays Open File everywhere else. Taking Opt+Cmd+N moves Helium's split-view shortcut.
+- 01-D7. Auto-archive would keep an imported Arc user's own setting.
+
+Other plans decide the UI toolkit (03-D4), agent workspaces (05-D3), separate sign-ins per space (04-D6), and the launch scope (plan 06).
 
 ## Where we are today
 

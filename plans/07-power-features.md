@@ -1,27 +1,34 @@
 # 07. Customization, automation, and power features
 
+You only need to read the first two sections. The rest is detail for the build thread.
+
 ## In plain English
 
-This plan adds a few Arc habits. Copying a link drops its tracking junk. Arc's shortcuts work for rac's own actions. New tab groups get a sensible name.
+This plan adds a few Arc habits, all after the launch build. Copying a link with Shift+Cmd+C drops its tracking codes. Arc's shortcuts work for rac's own actions. New tab groups get a sensible name.
 
-Next come Boosts, which let you restyle a site you visit often. You can recolor it, change its font, make it dark, or click an annoying element to hide it. A code view lets you write your own CSS. Boosts never run code.
+Next come Boosts, which restyle a site you visit often. You can recolor it, change its font, make it dark, or click an annoying element to hide it. A code view lets you write your own CSS. Boosts never run code.
 
-Then comes Air Traffic Control. It sends links from other apps to the right space, so a Slack link opens in your Work space. Last come bangs, shortcuts like `!w cats` that search Wikipedia. You can add and fix your own bangs.
+Then comes Air Traffic Control, which sends links from other apps to the right space, so a Slack link opens in your Work space. Last come bangs, shortcuts like `!w cats` that search Wikipedia. You can add and edit your own.
 
-Nothing here is in the launch build. The copy and naming logic may be written beforehand, with unit tests only. Everything else follows after launch. Everything works with AI off, costs nothing until used, and sends nothing anywhere.
+The link-cleaning and naming code may be written earlier, with unit tests only. Everything works with AI off, costs nothing until used, and sends nothing anywhere.
 
 ## What you need to decide
 
-1. **07-D1. What can a Boost do?** No-code looks plus a CSS editor / also JavaScript. **Recommended: looks only. JavaScript is deferred, and `VISION.md`'s "CSS and JavaScript" line changes to match.**
-2. **07-D2. Which links does Air Traffic Control route?** Links from other apps / every link. **Recommended: links from other apps only.**
-3. **07-D3. Where does clean-link copy apply?** Shift+Cmd+C and the tab menu / also the page's "Copy link address". **Recommended: Shift+Cmd+C and the tab menu only. No setting.**
-4. **07-D4. How are tab groups named?** A simple rule / the rule plus a "Name with AI" button when AI is on. **Recommended: the rule plus the button.**
-5. **07-D5. How much bangs work?** An editor page only / editor plus an address-bar rework. **Recommended: the editor now. The address-bar rework gets its own go or no-go after the sync.**
-6. **07-D6. Chrome Web Store themes and space colors?** The store theme overrides, with a notice / space colors always win. **Recommended: the store theme overrides, with a notice in the space editor.**
-7. **07-D7. Whose shortcuts?** Chrome's for standard actions and Arc's for rac's own / Arc's everywhere. **Recommended: Chrome's for standard actions, Arc's for rac's own.**
-8. **07-D8. In what order?** By Arc-refugee demand (Boosts, then routing, then bangs) / by the roadmap (bangs first). **Recommended: by demand.**
+| Id | Question | Options | Recommended |
+| --- | --- | --- | --- |
+| 07-D1 (D54) | What can a Boost do? | Looks plus a CSS editor; also JavaScript | Looks only, with JavaScript deferred |
+| 07-D2 (D51) | Which links does Air Traffic Control route? | Links from other apps; every link | Links from other apps only |
+| 07-D3 (D49) | Where does clean-link copy apply? | Shift+Cmd+C and the tab menu; also the page's "Copy link address" | Shift+Cmd+C and the tab menu only, with no setting |
+| 07-D4 (D50) | How are new tab groups named? | A simple rule; the rule plus a "Name with AI" button | The rule, plus the button when AI is on |
+| 07-D5 (D52) | How much work goes into bangs? | An editor page; the editor plus an address-bar rework | The editor now. Decide the rework after the sync |
+| 07-D6 (D53) | Chrome Web Store themes or space colors? | The store theme wins, with a notice; space colors always win | The store theme wins, with a notice in the space editor |
+| 07-D7 (D31) | Whose keyboard shortcuts? | Chrome's for standard actions and Arc's for rac's own; Arc's everywhere | Chrome's for standard actions, Arc's for rac's own |
+| 07-D8 (D48) | In what order do these ship? | By Arc-user demand, so Boosts, routing, then bangs; by the roadmap, bangs first | By demand |
 
-Decided elsewhere: Clear, the archive, and auto-archive belong to plan 01 (see 01-D7). Debug doors belong to plan 05 (see 05-D6). Routines and recipes also belong to plan 05 (see D59 in decisions.md, and 05-D8).
+- 07-D1. VISION.md's "CSS and JavaScript" line changes to match.
+- 07-D7. This is the same decision as 01-D6.
+
+Plan 01 owns Clear and auto-archive (01-D7). Plan 05 owns the debugging ports (05-D6), routines (D59), and recipes (05-D8).
 
 ## Where we are today
 

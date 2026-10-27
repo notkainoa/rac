@@ -1,40 +1,56 @@
 # 06. Engineering platform and shipping
 
+You only need to read the first two sections. The rest is detail for the build thread.
+
 Citation keys: `ci-status` = `plans/context/ci-status.md`. `eng-matrix` = `plans/research/matrices/engineering-and-shipping.md`. Digests are `plans/research/digests/<slug>.md`, cited by slug. The council is `plans/context/inboxzero/{opus,sonnet,kimi-k3}.md`. `run 40222453249` is the last CI validation run (read with `gh run view` and its log artifact on 2026-10-27). FACT = checked in a primary source or the repo. CLAIM = a self-report. INFERENCE = my reasoning.
 
 This plan owns the shared calendar. Weeks are counted from the maintainer's approval: W1 is the first week after it. The only fixed dates are two anchors. The launch build must start by **2026-12-15**. Arc shuts down on **2026-12-22**.
 
 ## In plain English
 
-Nobody can install rac yet. This plan gets a signed copy out, catches rac up with Helium, and launches it for Arc users.
+Nobody can install rac yet. This plan ships a signed copy, catches rac up with Helium, and launches it for Arc users.
 
-GitHub's free build machines have never finished a rac build. They are slow, and they have little memory. So we rent faster ones from a company called Depot. A build there should cost about $35 to $70 and take most of a day. One free attempt runs alongside, at no cost.
+GitHub's free build machines are too slow and too small to finish a rac build. So rac rents faster Macs from Depot. A build there should cost about $35 to $70 and take most of a day. One free GitHub attempt runs alongside.
 
-First comes a quiet test release on today's code, labeled "Preview". Then rac catches up with Helium. That moves rac from Chromium 154, which is two versions old, to Chromium 156. It takes two to three weeks. The second release then proves that updates reach installed copies.
+First comes a quiet "Preview" release on today's code. Then rac catches up with Helium, from Chromium 154 to 156, over two to three weeks. The second release proves updates reach installed copies. The launch ships that build with Arc import and a safer agent.
 
-The launch ships that caught-up build with Arc import and a safer agent.
+The Arc date holds only if you approve the plans by about 11-02, which leaves one spare week. You also set up Depot in about an hour and pick the Mac for the heavy build.
 
-**Is the Arc date safe?** Only if the plans are approved by about 11-02. That leaves one spare week. Approval by 11-09 leaves none. Two things must happen first. The maintainer sets up Depot, which takes about an hour. They also pick which Mac does the heavy build.
+```mermaid
+flowchart LR
+  D["Depot Mac compiles rac, holding no keys"] --> G["GitHub's own Mac signs the app, has Apple notarize it, and staples the ticket"]
+  G --> A["GitHub release with the DMG and a signed appcast, the update feed"]
+  A --> S["Sparkle in each installed rac reads the appcast and updates"]
+```
 
 ## What you need to decide
 
-1. **06-D1. Which Mac runs the sync and the rebuilds?** The shared Air, or the MacBook Pro. **Recommended: the Pro, if it has at least 32 GB of RAM and 150 GB free. Otherwise the Air.**
-2. **06-D2. How are releases built?** Depot (paid), free GitHub runners, or a local Mac. **Recommended: Depot, with a $300 monthly limit, plus one free trial run alongside.**
-3. **06-D3. Intel Macs at launch?** Yes, or no. **Recommended: no. Apple Silicon only for 0.x.**
-4. **06-D4. A quiet 0.1.0 on Chromium 154 first?** Yes, or wait for the synced build. **Recommended: yes. Keep it short-lived and prove updates with 0.1.0 to 0.2.0.**
-5. **06-D5. Order of work?** (a) Ship, sync, launch, then revamp; (b) revamp first; (c) a stable track plus the revamp on branches. **Recommended: (c) a stable track ships 0.1, the sync, and the launch while the revamp is built on branches in rac-owned files (D2).**
-6. **06-D6. If the sync isn't merged by the end of W4?** Launch on 154 as a labeled preview, or hold the launch. **Recommended: hold one week. After that, launch on 154 rather than miss 12-15.**
-7. **06-D7. Sync cadence after launch?** Every Chromium major within 14 days, or every other major. Security fixes within 7 days if exploited in the wild, else 14. **Recommended: every major. Review after three cycles.**
-8. **06-D12. Move rac's own source files out of patches into a plain folder?** Yes, after launch; or no. **Recommended: yes, after launch (plan 03 references this).**
+| Id | Question | Options | Recommended |
+| --- | --- | --- | --- |
+| 06-D1 (D5) | Which Mac runs the Helium sync and rebuilds? | The shared Air; the MacBook Pro | The Pro if it has 32 GB RAM and 150 GB free |
+| 06-D2 (D4) | How are releases built? | Depot, paid; free GitHub runners; a local Mac | Depot with a $300 monthly cap, plus one free attempt |
+| 06-D3 (D7) | Support Intel Macs at launch? | Yes, about $99 a build; no | No, Apple Silicon only for 0.x |
+| 06-D4 (D3) | Publish a quiet 0.1.0 on Chromium 154 first? | Yes, labeled "Preview"; wait for the synced build | Yes, then prove updates by going from 0.1.0 to 0.2.0 |
+| 06-D5 (D2) | In what order does the work happen? | Ship, sync, launch, then revamp; revamp first; a stable track plus revamp branches | A stable track ships while the revamp builds on branches |
+| 06-D6 (D8) | What if the sync isn't merged by the end of week 4? | Launch on 154 as a preview; hold the launch; hold a week, then 154 | Hold one week, then launch on 154 |
+| 06-D7 (D18) | How often does rac sync after launch? | Every Chromium major within 14 days; every other major | Every major, reviewed after three cycles |
+| 06-D12 (D58) | Move rac's own source files out of patches into a folder? | Yes, after launch; no | Yes, after launch |
 
-**I will do these unless you object:**
-- One jump to Helium 0.20.1.1, not two steps.
-- During the sync, nothing under `patches/` merges until the sync merges, because every new patch also edits `patches/series`, the one file the sync conflicts on. Docs, the site, CI and plans may merge.
-- Protect `main`. Every PR passes the Linux checks and gets the maintainer's approval. Agents push as a machine user, `rac-bot`, so the approval is a real gate.
-- C++ tests run in the agent's worktree first, and in the release build once they fit.
-- No hop to Chromium 157 before launch.
+- 06-D1. The Pro needs at least 32 GB of RAM and 150 GB free, otherwise the Air. Please send its specs, or let an agent read them.
+- 06-D2. Depot only compiles, so the signing keys never leave GitHub. A local build would move them.
+- 06-D5. The stable track ships 0.1, the sync, and the launch. The revamp stays in rac-owned files.
+- 06-D6. The 154 fallback must start by 12-15.
+- 06-D7. Security fixes ship within 7 days if attackers already use the bug, otherwise within 14.
+
+I'll do these unless you object (D10, D11, D60):
+
+- Jump straight to Helium 0.20.1.1, not in two steps.
+- Merge nothing under `patches/` until the sync merges, because every new patch also edits `patches/series`, the file the sync conflicts on. Docs, the site, CI, and plans may merge.
+- Protect `main`. Every PR needs the Linux checks and your approval. Agents push as a machine user, `rac-bot`, so your approval is a real gate.
+- Run C++ tests in the agent's worktree first, and in the release build once they fit.
+- Stay off Chromium 157 until after launch.
 - Publish speed numbers against Helium if they're ready. If not, soften "never slower" on the site.
-- A beta channel and crash reports come later (see "Later").
+- Add a beta channel and crash reports after launch.
 
 ## Where we are today
 

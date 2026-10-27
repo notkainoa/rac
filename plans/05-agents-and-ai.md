@@ -1,27 +1,55 @@
 # 05. Agents and AI
 
+You only need to read the first two sections. The rest is detail for the build thread.
+
 ## In plain English
 
-rac's AI already works: a side panel, Ask in the new tab and in Find, link summaries, and an agent that clicks and types. Its default level has a hole. A hostile page can make the agent read your mail and type it back into that page. We close the hole first, and write tests that attack it.
+rac's AI already has a side panel, Ask in the new tab page and in Find, link summaries, and an agent that clicks and types. The agent's default level, `auto`, has a hole. A hostile page can make the agent copy your mail into that page. This plan closes the hole first, with tests that attack it.
 
-The fix has a cost you will notice. On one site, `auto` stays free. Once the agent has read a second site, it asks once before it acts on each site.
+You will notice the fix. On one site, `auto` acts without asking. Once the agent has read a second site, it asks once before acting on each site.
 
-Next, developers can let their own coding agent drive rac. A separate "Outside agents" switch, off by default, turns this on. While the switch is off, nothing listens. While it is on, outside agents work even with rac's AI off. A new agent starts by reading only the tabs you share with it. Later it can act, but only in its own background tabs, which start with no logins. Risky steps always ask.
+Developers can also let their coding agent drive rac. A separate "Outside agents" switch, off by default, turns this on, even with AI off. A new outside agent can only read tabs you share. Later it can act in its own background tabs, which have no logins. Risky steps always ask.
 
-What stays the same: AI is off by default. No one at rac ever sees your conversations. Nothing phones home. A Claude or ChatGPT subscription works only through that company's own app, such as Claude Code.
+AI stays off by default, and nothing phones home.
+
+```mermaid
+flowchart TD
+  A["The agent wants to take a step that changes something"] --> N{"Is the site set to Never?"}
+  N -->|"yes"| X["Refused"]
+  N -->|"no"| R{"Is the step on the risky list, such as Enter, a password, or buy?"}
+  R -->|"yes"| CARD["Confirm card"]
+  R -->|"no"| L{"Which level?"}
+  L -->|"ask"| CARD
+  L -->|"careful"| P["A plan card once, then a safety check on each step"]
+  L -->|"auto"| T{"Taint rule. Has it read two or more sites, and could this step carry what it read?"}
+  T -->|"yes"| CARD
+  T -->|"no"| GO["The step runs"]
+  P --> GO
+  CARD -->|"Allow once, or allow this site for the conversation"| GO
+  CARD -->|"Don't allow"| X
+```
 
 ## What you need to decide
 
-1. **05-D1. How do we close the `auto` hole?** Taint rule (ask before acting on each site once a second site was read) / make `careful` the default / both. **Recommended: the taint rule, and keep `auto` as the default.**
-2. **05-D2. What does a newly connected outside agent get?** Read the tabs you share / act in its own no-login tabs / act in your tabs at your level. **Recommended: read the shared tabs; you can raise it to act in its own tabs.**
-3. **05-D3. What is an agent's workspace?** An Agents section in the sidebar (plan 01 M5) / its own space / an off-screen window. **Recommended: the Agents section, if the rendering spike passes.**
-4. **05-D4. Should outside agents run JavaScript in pages, as with ego?** Never / step lists only / JavaScript only in no-login agent tabs. **Recommended: step lists now; no-login JavaScript is a later option.**
-5. **05-D5. Which doors?** MCP / a `rac` CLI with a skill / both. **Recommended: both, from plan 03's one relay; MCP first.**
-6. **05-D6. Chromium's own debugging doors?** Refuse them on the real profile, with no new setting / leave them / add an expert switch. **Recommended: refuse, with no new setting.**
-7. **05-D7. How does VISION.md describe the door?** Keep "AI off costs nothing" and add a separate promise for the door / reword the AI rule. **Recommended: add the separate promise.**
-8. **05-D8. Pomerado for repeat tasks?** Embed it / build native recipes later / neither. **Recommended: don't embed it; build native recipes after the evals pass.**
+| Id | Question | Options | Recommended |
+| --- | --- | --- | --- |
+| 05-D1 (D19) | How do we close the `auto` hole? | The taint rule; make `careful` the default; both | The taint rule, and keep `auto` the default |
+| 05-D2 (D26) | What does a newly connected outside agent get? | Read tabs you share; act in its own no-login tabs; act in your tabs at your level | Read shared tabs. You can let it act in its own tabs |
+| 05-D3 (D23) | Where does an agent do its work? | An Agents section in the sidebar; its own space; an off-screen window | The Agents section, if the rendering spike passes |
+| 05-D4 (D56) | May outside agents run JavaScript in pages, as ego does? | Never; step lists only; JavaScript only in no-login agent tabs | Step lists now, and no-login JavaScript maybe later |
+| 05-D5 (D25) | Which ways in for outside agents? | MCP; a `rac` command with a skill; both | Both, through one relay, MCP first |
+| 05-D6 (D20) | What about Chromium's own debugging ports? | Refuse them on the real profile; leave them; add an expert switch | Refuse them, with no new setting |
+| 05-D7 (D12b) | How does VISION.md describe outside agents? | Keep "AI off costs nothing" and add a separate promise; reword the AI rule | Add the separate promise |
+| 05-D8 (D57) | Use Pomerado for repeat tasks? | Embed it; build native recipes later; neither | Don't embed it. Build native recipes after the evals pass |
 
-Owned elsewhere: the warm agent (see 03-D3), routines while rac is closed (this plan owns them; D59 in decisions.md), and the door transport (see 03-D2).
+- 05-D1. Once the agent has read two sites, the taint rule asks before any step that could carry what it read.
+- 05-D3. If the spike fails, the off-screen window is the fallback.
+- 05-D4. ego is another agent browser, and its scripts can read every cookie. A step list is a short list of tool calls that rac checks one at a time.
+- 05-D5. MCP is the standard way coding agents call tools. A skill is a short file that teaches an agent the `rac` command.
+- 05-D6. Dev runs use their own profile folder, so your DevTools screenshot flow keeps working.
+- 05-D8. Pomerado replays a recorded task, but it needs OpenAI and its own Chromium. The evals are rac's attack tests.
+
+Other plans decide the warm agent (03-D3) and how outside agents connect (03-D2). This plan owns routines while rac is closed (D59).
 
 ## Where we are today
 

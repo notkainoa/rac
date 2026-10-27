@@ -1,41 +1,33 @@
 # 02. Visual design system and motion
 
+You only need to read the first two sections. The rest is detail for the build thread.
+
 ## In plain English
 
-Today every part of rac picks its own sizes, corners, speeds, and curves. The space swipe already feels like
-Arc. Other parts feel slow or rough. Buttons don't react when you press them, and the AI panel starts slowly.
-Cmd+S may jump instead of slide when the sidebar comes back.
+Today each part of rac picks its own sizes, corners, and speeds. The space swipe already feels like Arc, but other parts feel slow or rough. Buttons don't react when pressed, the AI panel opens slowly, and Cmd+S can jump instead of slide.
 
-This plan gives rac one list of design values and one small motion system. Things that move use springs, which
-start fast and settle smoothly. Things you do hundreds of times a day get little or no motion. Nothing loops
-while you're idle. Under Reduce Motion, slides become short fades. Increase Contrast strengthens edges. Spaces
-gain custom colors, so imported Arc spaces keep theirs in light and dark mode.
+This plan gives rac one list of design values and one set of motion rules. Moving things use springs, which start fast and settle without a hard stop. Actions you repeat all day get little or no motion. Nothing animates while you're idle. Under Reduce Motion, slides become short fades. Spaces gain custom colors, so imported Arc spaces keep theirs in light and dark mode.
 
-What ships first, before the launch build's hard stop on 2026-12-15: press states, calmer hovers, quieter AI
-loops, and custom space colors. These touch only rac's own files. Faster AI panel and tab motion, and Cmd+S and
-edge reveal on springs, need the Helium sync first. They need the Helium sync first, and make the launch only if they merge by the start of W5.
-
-Cost: about 30 to 45 agent-days over roughly six weeks after approval. Each change ships with video and a frame log.
+Press states, calmer hovers, quieter AI animations, and custom colors come first. A faster AI panel, tab motion, and springs for Cmd+S wait for the Helium catch-up, and reach the launch only if they merge by week 5.
 
 ## What you need to decide
 
-1. **02-D1. How springy is Cmd+S?** Dia's spring (about 3.4 px of bounce on a 200 px sidebar) / calmer (1.2 px)
-   / none. **Recommended: calmer. This is a compromise: Apple's rule favors none. Confirm with a side-by-side
-   video.**
-2. **02-D2. Glass or solid?** Solid, as today / blur behind the window by default. **Recommended: solid.**
-3. **02-D3. Space themes.** Eight presets / presets plus custom colors / a full gradient editor.
-   **Recommended: presets plus custom colors.**
-4. **02-D4. Do buttons shrink when pressed?** Never, like Dia / favorites tiles only / every icon button.
-   **Recommended: never.**
-5. **02-D5. Do keyboard shortcuts animate?** Spatial changes only (Cmd+S, space switches) / never.
-   **Recommended: spatial changes only.**
-6. **02-D6. Page card corner on macOS 26.** Concentric with the window (11 px inside the 17 px window corner) / Dia's 10 px.
-   **Recommended: 11 px on macOS 26; keep 10 px on older macOS.**
-7. **02-D7. Under Reduce Motion, does a swipe follow your fingers?** No, as today / yes, then a fade on release.
-   **Recommended: yes. Apple's guidelines allow gesture tracking.**
+| Id | Question | Options | Recommended |
+| --- | --- | --- | --- |
+| 02-D1 (D40) | How springy is Cmd+S? | Dia's spring, about 3.4 px of bounce; calmer, 1.2 px; none | Calmer, confirmed with a side-by-side video |
+| 02-D2 (D32) | Glass or solid window background? | Solid, as today; blur behind the window by default | Solid |
+| 02-D3 (D33) | How much can space themes change? | Eight presets; presets plus custom colors; a full gradient editor | Presets plus custom colors |
+| 02-D4 (D34) | Do buttons shrink when pressed? | Never, like Dia; favorites tiles only; every icon button | Never |
+| 02-D5 (D35) | Do keyboard shortcuts animate? | Only spatial changes, like Cmd+S and space switches; never | Only spatial changes |
+| 02-D6 (D36) | What corner does the page card get on macOS 26? | Concentric with the window; Dia's 10 px | 11 px on macOS 26, and 10 px on older macOS |
+| 02-D7 (D37) | Under Reduce Motion, does a swipe follow your fingers? | No, as today; yes, then a fade on release | Yes |
 
-The plan decides the rest: how springs are built, the 8 ms frame gate for page resizes, and dropping Arc's
-noise texture on import. Edge-reveal dwell and grace times belong to plan 01.
+- 02-D1. Apple's guidance favors no bounce at all, so calmer is a compromise.
+- 02-D3. Custom colors also fix dark mode for imported Arc spaces.
+- 02-D6. Concentric means 11 px, the window's 17 px corner minus the 6 px gap around the card.
+- 02-D7. Apple's guidelines allow motion that tracks a gesture under Reduce Motion.
+
+The plan settles the rest, such as how springs are built and dropping Arc's noise texture on import. Plan 01 owns the timing of edge reveal, where the hidden sidebar slides out at the window edge.
 
 ## Where we are today
 

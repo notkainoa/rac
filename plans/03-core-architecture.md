@@ -1,51 +1,51 @@
 # 03. Core architecture and a local "rac core" service
 
+You only need to read the first two sections. The rest is detail for the build thread.
+
 Paths are relative to the repo root unless they start with `CR:`, which means the read-only Chromium tree at `/Users/knewton/Dev/Github/rac/build/src`. Digests live in `plans/research/digests/`, matrices in `plans/research/matrices/`. Tags: FACT (primary source), CLAIM (self-report), INFERENCE (reasoning).
 
 ## In plain English
 
-For most people nothing changes. rac stays one app, and the browser itself acts as the "server". There is no background program that runs all the time.
+For most people nothing changes. rac stays one app, and no background program runs all the time. The browser itself acts as the server.
 
-Developers get one new switch, "Outside agents." With it on, Claude Code or Codex can drive rac through a small command inside the app. With it off, nothing listens and nothing extra runs.
+Developers get one new switch, "Outside agents". With it on, a coding agent such as Claude Code or Codex can drive rac through a small relay program inside rac.app. With it off, nothing listens and nothing extra runs.
 
-rac's own assistant answers follow-ups faster. Its agent can stay ready for 5 minutes while the panel is open, instead of restarting for every message.
+rac's own agent answers follow-ups faster. It stays ready for 5 minutes while the panel is open, instead of restarting for every message.
 
-Everything rac can do goes into one list of actions. The sidebar, the command bar, shortcuts, rac's agent, and outside agents all use it. So the safety rules live in one place.
+Everything rac can do goes into one action table. The sidebar, the command bar, shortcuts, rac's agent, and outside agents all use it, so the safety checks live in one place.
 
-We also cut how much of Chromium rac edits. That makes each Helium update cheaper.
+rac also edits less of Chromium, which makes each Helium update cheaper.
 
-Nothing here is needed for the Arc shutdown on 2026-12-22. It is the ground the next stage is built on.
+Nothing here is needed for the Arc shutdown on 2026-12-22.
 
-### Is there a server?
-
-**Yes: the browser is the server.** It opens a private local socket only while you allow outside agents. No network port is involved.
-
+```mermaid
+flowchart LR
+  subgraph CORE["rac core, inside the browser"]
+    T["Action table, everything rac can do"] --> G["Guard, which checks every agent step"]
+    G --> C["Agent controller"]
+  end
+  OA["Outside agent, such as Claude Code"] -->|"stdio"| R["Relay, a small program inside rac.app"]
+  R -->|"private socket for one profile, only while Outside agents is on"| G
+  C --> TABS["Your tabs"]
 ```
-Claude Code ─stdio─> rac (tiny relay inside rac.app) ─private socket─> rac browser
-                                                                        ├ rac core: action list + guard
-                                                                        └ your tabs and logins
-```
-
-Compared with a T3 Code-style server, you give up four things:
-- Agent runs end when rac quits, crashes, or updates.
-- No phone or second Mac can connect.
-- Sessions don't survive a restart.
-- Nothing runs with rac fully closed.
-
-In return, nothing listens or uses memory while the switch is off. Safety checks also stay in one process.
 
 ## What you need to decide
 
-Terms: a **daemon** or **sidecar** is a separate background program. A **utility process** is a helper process that Chromium starts and stops itself. **CDP** is Chrome's debugging protocol.
+| Id | Question | Options | Recommended |
+| --- | --- | --- | --- |
+| 03-D1 (D21) | Does rac run a separate local server or helper program? | No, the browser is the server; a Rust helper; a Node sidecar | No. No Swift helper, so local models stay Ollama and LM Studio |
+| 03-D2 (D24) | How do outside agents connect? | A socket per profile, a signed relay, and per-client tokens; local HTTP with OAuth | Socket, relay, and tokens, adding HTTP only if a client needs it |
+| 03-D3 (D27) | Keep rac's own agent warm between messages? | Restart every message; one warm agent per profile, 5-minute idle limit | Warm, one per profile, with a 5-minute idle limit |
+| 03-D4 (D22) | How does rac shrink its Chromium edits? | Stay on Views and thin the hooks; a native AppKit shell now | Views, with a native shell tried only if 03-D5's target slips |
+| 03-D5 (D17) | Which patch-size number do we hold to? | Net-diff hunks plus failures per sync; raw stacked hunks | Net-diff hunks plus failures per sync |
+| 03-D6 (D12a, D12b) | Add a promise about outside agents to VISION.md? | Yes; no | Yes. It has its own switch, off by default, costing nothing |
 
-1. **03-D1. Does rac run a separate local server or helper program?** No, the browser is the server / Rust helper / Node sidecar. **Recommended: no. rac also adds no Swift helper, so local models stay Ollama and LM Studio.**
-2. **03-D2. How do outside agents connect?** Per-profile socket, signed relay, per-client tokens / loopback HTTP with OAuth. **Recommended: socket, relay, and tokens. Add HTTP only if the door spike shows a client needs it.**
-3. **03-D3. Keep a rac-launched agent warm between messages?** Restart each message / one warm agent per profile, 5-minute idle cap. **Recommended: warm, one per profile, 5-minute cap.** Plan 05 refers to this decision.
-4. **03-D4. How do we shrink rac's Chromium edits?** Stay on Views and thin the hooks / native AppKit shell now. **Recommended: Views with thin hooks. Spike a native shell only if the target in 03-D5 is missed after the second sync.**
-5. **03-D5. Which patch-surface number do we hold?** Net-diff hunks plus dry-run failures per sync / raw stacked hunks. **Recommended: net-diff hunks and failures per sync. Accept up to 630 stacked hunks including other plans' additions; aim for 550.**
-6. **03-D6. Add a scoped promise for the door to VISION.md?** Yes / no. **Recommended: yes. "Outside-agent access has its own switch, off by default. When off, it costs nothing."** The same decision (D12 in decisions.md) also settles that the door works with AI off.
+- 03-D1. Without a separate server, agent runs end when rac quits, and no phone or second Mac can connect.
+- 03-D4. Views is Chromium's built-in UI toolkit. The shell try happens only if the target is missed after the second sync.
+- 03-D5. A hunk is one edited block of an upstream file, and net-diff counts each final edit once. Until that count exists, hold 630 stacked hunks at most, aiming for 550.
+- 03-D6. The same decision settles that outside agents work with rac's AI off.
 
-Decided elsewhere: the debugging doors are 05-D6. Moving rac's own files into a plain folder is 06-D12. Routines while rac is closed are plan 05's (D59 in decisions.md).
+Other plans decide Chromium's debugging ports (05-D6), moving rac's own files into a plain folder (06-D12), and routines while rac is closed (D59).
 
 ## Where we are today
 
