@@ -26,9 +26,11 @@ Each brief says "Follow 'Every thread' in the README" and adds only what is spec
 
 ## Step 0: start from an up-to-date main
 
-The maintainer has done this already: the main checkout at `/Users/knewton/Dev/Github/rac` was pulled to d3f0d66 and synced, and one incremental `source dev.sh && he build` is running there. Threads never do this themselves.
+The main checkout at `/Users/knewton/Dev/Github/rac` was pulled to d3f0d66 and synced (547 patches applied). Its build tree is **not usable for cheap builds**. Xcode is now 27.1, so `he build` there wanted a full rebuild (84,903 steps). It was stopped after about five minutes, which dirtied most of its `out/Default`. Threads never touch the main checkout.
 
-Nobody waits for that build. Streams start at once in **light worktrees**: `git worktree add -b <branch> <path> origin/main`, with no `setup` and no build tree. They run the understand and design stages, reading Chromium sources from the main checkout's `build/src`, read only. New code is drafted in a git-ignored scratch folder in the worktree and becomes a patch through quilt once the tree exists. A stream runs `devutils/rac/worktree.sh setup` only when its first batch is ready to build, and only after step 0's build has finished, since setup refuses to clone during a build. If `git merge-base --is-ancestor origin/main main` fails in the main checkout at that point, stop and tell the maintainer.
+Until the maintainer decides otherwise, the plan is: no full rebuild of the 154 tree. The full-build budget goes to the Chromium 156 sync tree, which Ship's `sync` stream sets up and builds cold. Worktrees that need to build clone that 156 tree once it compiles (about day 4), with `devutils/rac/worktree.sh setup <sync worktree>`. Don't run `worktree.sh setup` against the main checkout, and don't build a worktree cloned from it. Either one turns into a full rebuild.
+
+So every stream starts in a **light worktree**: `git worktree add -b <branch> <path> origin/main`, with no `setup` and no build tree. It runs the understand and design stages, reading Chromium sources from the main checkout's `build/src`, read only. It drafts new code and unit tests in a git-ignored scratch folder in the worktree. The code becomes a patch through quilt once the stream has a tree cloned from the 156 base. Write against Chromium 156 APIs where they differ; the sync worktree has those sources once its checkout exists.
 
 ## Streams
 
