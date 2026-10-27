@@ -91,6 +91,12 @@ the update signing key, feed URL, and rising version number never change.
   CLI and MCP as "so obviously good features" but wished he could kill Aside's
   built-in agent because he has his own. rac today can't be driven by an outside
   agent at all, and turning AI off also removes its MCP server.
+- ego(lite) by Citro Labs (lite.ego.app, github.com/citrolabs/ego-lite) is a
+  Chromium browser that doubles as the browser your own coding agents drive
+  through a skill and shell commands, with in-page JavaScript tools, batched
+  steps, stable element refs, and isolated agent Spaces that never steal focus.
+  The maintainer said it does "a lot of the agent in a browser stuff really
+  really well". Treat it as a primary reference for rac's agent design.
 - An Inbox Zero comparison and a three-model council (in
   `plans/context/inboxzero/`) concluded: ship one signed release and prove the
   update loop; do the first Helium sync now; make the agent default safe and add
@@ -133,3 +139,22 @@ Key files: `VISION.md`, `AGENTS.md`, `docs/roadmap.md`, `docs/internals/*.md`
 The main checkout with a built Chromium tree (read-only for you):
 `/Users/knewton/Dev/Github/rac/build/src` (Chromium 154 with Helium and rac
 patches applied).
+
+## Added 2026-10-27
+
+- Cra (crabrowser.app, github.com/VictorKildahl/cra, MIT, created 2026-10-24) is a
+  new, independent, privacy-first Arc replacement for macOS 14+. Swift plus
+  Objective-C++ around what looks like an embedded Chromium (Chrome extensions
+  and DevTools work). Spaces with their own pinned tabs and Today list, a shared
+  favorites grid, folders, a command bar over tabs, archive, history and actions,
+  auto-archive, Little Windows, split view up to 4 panes, auto PiP, Arc/Dia/Chrome
+  and other imports, a built-in blocker, no AI, no account, no server, data as
+  plain JSON in Application Support. It is the closest positioning match to rac
+  minus AI, and its "native shell around Chromium" approach matters for the
+  architecture plan (patch surface).
+- Pomerado (YC F26, github.com/Pomerado/pomerado, MIT) turns any website into a
+  deterministic, self-healing API/MCP integration for agents, minted from a
+  natural-language task (it uses OpenAI models to build integrations; Node 24).
+  The maintainer asked whether rac should use it. Treat it as an outside-agent
+  tool and an idea source (deterministic replayable "recipes" instead of an LLM
+  loop for repeat tasks), not as something to embed by default.

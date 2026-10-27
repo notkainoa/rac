@@ -22,3 +22,22 @@
   build that passes on timeout.
 - Fallback idea (needs maintainer approval): build and sign 0.1.0 locally on the
   maintainer's Mac and publish to the same Sparkle feed.
+
+## Validation run 40222453249 (tar fix, 2026-10-25 to 2026-10-26)
+
+- The pax fix works: no "older than log" reruns; remaining steps shrink each phase.
+  x86_64 remaining: 92,352 -> 71,370 -> 60,512 -> 51,425 -> 46,220.
+  arm64 remaining: 56,232 -> 43,362 -> 31,802 -> 18,477 -> 3,391 (would have
+  finished in phase 6).
+- New limit: raw CPU. After phase 1 the sccache hit rate is about 0%, because the
+  repo's GitHub Actions cache is capped at 10 GB (in use: 10 GB, about 148k
+  entries) and thrashes. Free macos-latest runners compile about one Blink file
+  every 6.5 s. x86_64 is much slower because it also builds a host (arm64) copy
+  of Blink and content for the V8 context snapshot (clang_arm64_v8_x64).
+- Phase 6 died on a flaky artifact download: the 5.36 GB checkpoint "downloaded"
+  without sums.txt, the checksum step failed, and fail-fast cancelled arm64 one
+  phase from the end. Needs a retry or verification around the download.
+- Options for the engineering plan: ship Apple Silicon only first (like Ardia);
+  retry the checkpoint download; larger or third-party runners (Helium uses
+  sponsored Depot M4 runners and Depot Cache); a self-hosted runner on the
+  maintainer's Mac (public repo risk); build, sign, and notarize locally.
