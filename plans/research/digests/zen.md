@@ -253,7 +253,7 @@ Cost: XS <1 d; S 1–3 d; M 1–2 w; L 3–6 w. "Thread" = UI or architecture.
 **Not transferable:** macOS cross-compile (Firefox-only — INFERENCE), 45-min
 engine builds vs rac's ~130k-step Chromium build (the CI gap is the engine
 — INFERENCE from FACT numbers), cookie-isolated spaces (Firefox containers;
-Chromium has no per-tab cookie jar in a normal window — INFERENCE),
+Chromium can do this too, via a fixed StoragePartition per space as Stedding and Brave Containers do; see the long-tail digest, which corrects an earlier claim here),
 HTML/CSS chrome UI (CSS `linear()` springs and front-end-only rebuilds vs
 rac's Views `gfx::Tween`; a WebUI surface could get similar tools at
 memory/startup cost — open choice for heavy panels like Library).
