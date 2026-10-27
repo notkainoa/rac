@@ -66,15 +66,14 @@ class Guard:
         self.d19 = d19
         self.level = level if level in ("ask", "careful", "auto") else ("ask" if d19 else "auto")
         self.rules = {}
-        self.malformed_never_hosts = set()
         for origin, rule in (rules or {}).items():
-            host = urllib.parse.urlsplit(origin if "//" in origin else "//" + origin).hostname or ""
-            if rule in ("always", "never"):
+            parts = urllib.parse.urlsplit(origin)
+            well_formed = bool(parts.scheme and parts.hostname) and parts.path == "" \
+                and not parts.query and not parts.fragment
+            if rule in ("always", "never") and (well_formed or not d19):
                 self.rules[origin] = rule
             elif d19:  # fail closed: a rule we can't read is a Never
                 self.rules[origin] = "never"
-            if d19 and "//" not in origin and rule in ("always", "never") and host:
-                self.rules[origin] = "never"  # malformed key: be safe, treat as Never
         self.urls, self.named, self.origins = set(), set(), set(attached_origins)
         self.read_set = set(attached_origins) if d19 else set()
         for m in user_messages:
@@ -217,7 +216,9 @@ class SimAgent:
             data = dict(extra or {})
             if call.name in ("click", "type", "select_option", "press_key", "navigate", "open_tab",
                              "go_back", "snapshot", "switch_tab"):
-                text, shown, origins = b.snapshot(b.tab())
+                # The tab the call named, or the active one after open/switch.
+                shown_tab = b.tab() if call.name in ("open_tab", "switch_tab") else tab
+                text, shown, origins = b.snapshot(shown_tab)
                 guard.urls.update(shown)
                 guard.read_set |= origins  # content reached the model
                 data["text"] = text

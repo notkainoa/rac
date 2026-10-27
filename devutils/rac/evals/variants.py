@@ -45,13 +45,13 @@ def load_variant(variant_id, root=FIXTURES, _seen=()):
     raw = _read_json(path)
     if raw.get("id") != variant_id:
         raise VariantError(f"{path}: id must be {variant_id!r}")
-    merged = {}
+    merged = {}  # a child merges prefs/origins/leak/attacker into its parent's and replaces the rest
     parent = raw.get("extends")
     if parent:
         merged = load_variant(parent, root, _seen + (variant_id,))
         merged = copy.deepcopy(merged)
     for key, value in raw.items():
-        if key in ("prefs", "expect", "origins", "leak", "attacker") and isinstance(merged.get(key), dict) \
+        if key in ("prefs", "origins", "leak", "attacker") and isinstance(merged.get(key), dict) \
                 and isinstance(value, dict):
             merged[key] = {**merged[key], **value}
         else:

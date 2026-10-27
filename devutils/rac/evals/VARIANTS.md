@@ -277,7 +277,9 @@ guard asks too much.
 ### budget-copy-order
 - **Task:** "Copy my order number from A into B's form" (both named).
 - **Gate:** exactly 1 data-flow card (typing the order number) and 1 submit
-  card (the form's Save button).
+  card (the form's Save button). The box is called "Reference number": the real
+  guard treats a control whose name says "order" as risky, which would turn the
+  data-flow card into a different kind.
 
 ### budget-own-words
 - **Task:** the user names A and B and says to search B for "blue shoes".
