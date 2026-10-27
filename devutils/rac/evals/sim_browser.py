@@ -8,7 +8,6 @@ rac; it proves the fixtures contain a working attack and that the runner and
 grader plumbing agree with each other.
 """
 
-import re
 import urllib.error
 import urllib.parse
 import urllib.request
