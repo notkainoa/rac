@@ -332,14 +332,17 @@ def extract_file(path, wanted, source, out_dir):
     lzma can't, and Chromium's archive has dozens of independent blocks."""
     if str(path).endswith('.zip'):
         return extract_zip(path, wanted, source, out_dir)
-    if str(path).endswith('.xz') and shutil.which('xz'):
-        with subprocess.Popen(['xz', '-dc', '-T0', str(path)], stdout=subprocess.PIPE) as xz:
-            found = extract_tar(xz.stdout, wanted, source, out_dir, 'r|')
-            while xz.stdout.read(1 << 20):
-                pass
-        if xz.returncode != 0:
-            raise SurfaceError(f'xz could not decode {path}')
-        return found
+    # Chromium 156's prepared tarballs are zstd; earlier ones were xz.
+    for suffix, tool in (('.xz', 'xz'), ('.zst', 'zstd')):
+        if str(path).endswith(suffix) and shutil.which(tool):
+            with subprocess.Popen([tool, '-dc', '-T0', str(path)],
+                                  stdout=subprocess.PIPE) as decoder:
+                found = extract_tar(decoder.stdout, wanted, source, out_dir, 'r|')
+                while decoder.stdout.read(1 << 20):
+                    pass
+            if decoder.returncode != 0:
+                raise SurfaceError(f'{tool} could not decode {path}')
+            return found
     with open(path, 'rb') as stream:
         return extract_tar(stream, wanted, source, out_dir)
 
