@@ -2,328 +2,308 @@
 
 ## In plain English (at most 200 words)
 
-Arc closes on 2026-12-22. An Arc user who opens rac today gets an empty sidebar and has to sign in everywhere again. This plan fixes that first. rac will read Arc's files on the Mac and rebuild each Arc space as a rac space. Each space keeps its name, emoji, colors, pinned tabs, folders, and open tabs. Favorites come over too. Next, rac brings your sign-ins (cookies), so sites stay logged in. Dia comes next, then Chrome, Safari, Zen, and Firefox.
+Arc closes on 2026-12-22. An Arc user who opens rac today gets an empty sidebar and must sign in everywhere again. This plan fixes that before Arc closes. rac reads Arc's files on the Mac and rebuilds each Arc space as a rac space. Names, emoji, pinned tabs, folders, open tabs, and favorites come over. Colors come out close to Arc's, not exact.
 
-Saved passwords need a choice. Helium turns off the browser's password manager, so rac has nowhere to keep them. The plan hands them to Apple Passwords or 1Password instead.
+Each Arc profile, such as Work or Personal, becomes a rac profile with its own window and its own sign-ins. Sites stay logged in, though some, like Google, may ask you to sign in again.
 
-Behind the scenes, rac gets safer with your data. It keeps daily backups of your spaces, and any import can be undone. AI chats are stored encrypted instead of as plain text.
+Saved passwords are harder, because rac has no password manager. If a test works, rac passes them to Apple Passwords or 1Password without ever saving them to disk. If it doesn't, rac shows you how to export them from Arc yourself.
 
-Later, a space can get its own sign-ins, like Arc profiles. Work and personal Google accounts can then sit side by side in one window. Sync comes after the release. It writes locked files to your own iCloud Drive, so no rac server is involved.
+Before any import, rac saves a snapshot. You can undo the sidebar part of an import.
+
+After launch, AI chats move to encrypted storage. Later, one window can hold spaces with different sign-ins. Sync stays out unless the maintainer adds it to the vision.
 
 ## What you need to decide
 
-1. **04-D1. What does the first Arc import bring?** Sidebar only / sidebar plus sign-ins / everything including passwords. **Recommended: the sidebar first (by about 2026-11-17), then sign-ins (by about 2026-12-01). Both ship before Arc closes.**
-2. **04-D2. Where do imported passwords go?** Hand them to Apple Passwords or 1Password / turn Chromium's password manager back on / skip them. **Recommended: hand them off through a short-lived file that rac deletes.**
-3. **04-D3. How do Arc profiles map?** One shared sign-in jar / separate sign-ins per space / each becomes a rac profile (as Ardia does). **Recommended: separate sign-ins per space once built. Until then, bring only the main Arc profile's sign-ins.**
-4. **04-D4. Build separate sign-ins per space?** Storage partition per space, opt-in / full profile per space / not now. **Recommended: opt-in partition, with one "identity" that several spaces can share.**
-5. **04-D5. How are AI chats and agent run logs stored?** Plain JSON as today / encrypted JSON / encrypted SQLite with retention. **Recommended: encrypted SQLite. Chats stay until deleted. Runs are kept 30 days.**
-6. **04-D6. How much backup?** `.bak` only / daily snapshots plus one before every import or migration / the same plus a Restore item in Settings. **Recommended: the last option, keeping 14 daily snapshots.**
-7. **04-D7. Moving to another Mac before sync exists?** An Export/Import file / nothing. **Recommended: an export file in the first release after Arc import.**
-8. **04-D8. Which sync?** None / an end-to-end encrypted folder (iCloud Drive by default, any folder for self-hosting) / wait for Helium's vault / a rac server. **Recommended: no sync in the first release. Build folder sync in phase 6. Use Helium's vault for Chromium data if it ships.**
-9. **04-D9. Where does sidebar data live long term?** Keep it in Chromium's `Preferences` / move it to a rac-owned versioned file. **Recommended: keep it for now. Move it when sync work starts.**
+1. **04-D1. What does the pre-launch import bring?** Sidebar only / sidebar plus sign-ins / plus passwords. **Recommended: sidebar plus sign-ins, Arc only. If sign-ins slip, launch with the sidebar.**
+2. **04-D2. How do Arc profiles map?** Everything into one profile / Arc profile → rac profile / per-space sign-ins in one window. **Recommended: Arc profile → rac profile.**
+3. **04-D3. How do saved passwords move?** RAM-disk hand-off / guide Arc's own export / plaintext temp file / turn on Chromium's password manager. **Recommended: RAM-disk if a one-day spike passes, else guide Arc's export. No plaintext file without sign-off.**
+4. **04-D4. What real Arc data can we test on?** Maintainer runs a scrubbing script on their own Arc / volunteer samples after beta / synthetic only. **Recommended: the scrubbing script now, plus volunteers after beta.**
+5. **04-D5. How big is the safety net before launch?** Pre-import snapshot, one rolling backup, Keychain fix / full 14-day rotation and a Restore UI now. **Recommended: the minimal set now, the rest after launch.**
+6. **04-D6. After launch, how are separate sign-ins in one window built?** Storage partition per space / full profile per space. **Recommended: partition per space, one sign-in jar per space, spike first.**
+7. **04-D7. After launch, how are AI chats and agent runs stored?** Encrypt today's JSON / one encrypted SQLite store with retention. **Recommended: encrypted SQLite. It absorbs plan 05's chat-encryption item.**
+8. **04-D8. Sync?** None / export file / encrypted folder sync / Helium's vault. **Recommended: an export file after launch. Folder sync only if VISION changes, which needs your sign-off.**
 
 ## Where we are today
 
-All FACT unless tagged. Paths are in the rac worktree or in the built tree at `/Users/knewton/Dev/Github/rac/build/src` (marked `CR:`).
-
-**Where each kind of data lives now.**
+FACT unless tagged. `CR:` is the built tree at `/Users/knewton/Dev/Github/rac/build/src` (Chromium 154).
 
 | Data | Where | Format | Source |
 |---|---|---|---|
-| Spaces: id, name, emoji, theme, last active | Profile pref `rac.spaces` | JSON inside `Preferences`, plaintext. Unknown fields are kept for newer builds | `CR:chrome/browser/rac/spaces/space.h:22-80`; `plans/research/rac-baseline.md:323` |
-| Themes | Inside each space (`SpaceTheme`: two color stops plus mode; 8 presets; custom colors allowed) | Same | `CR:chrome/browser/rac/spaces/space.h:22-43` |
-| Hidden spaces' tabs | `<profile>/rac spaces`, plus `rac spaces.bak` | JSON, `kVersion = 1`, atomic, 1 s coalesce, background sequence | `CR:chrome/browser/rac/spaces/spaces_store.h:64-74`; `spaces_store.cc:58,257,271` |
-| Favorites, pinned tabs, folders (one level), pinned URLs, names | Profile pref `rac.sidebar.lists` (`pinned.<space id>`) | JSON in `Preferences` | `CR:chrome/browser/ui/rac/sidebar/sidebar_items.cc:32`; `docs/internals/pinned-tabs.md` |
-| Which space a window shows; tab-to-space and tab-to-item tags | Chromium session files (extra data) | Session format | `docs/internals/pinned-tabs.md` ("A space tag lives in two places") |
-| Agent per-site rules; permission level | Prefs `rac.ai.agent_site_rules`, `rac.ai.agent_permission_level` | JSON in `Preferences` | `patches/rac/agent/14-site-rules.patch:598-603`; `13-permission-levels.patch:573-579` |
-| Site controls (permissions, cookies) | Chromium content settings | Chromium's | `plans/research/matrices/features.md` (Per-site tools) |
-| Settings | `rac.*` profile prefs; `rac.browser_updates` in Local State | JSON | `plans/research/rac-baseline.md:325-326` |
-| One-time migrations | Two booleans: `rac.sidebar.migrated_pinned_tabs`, `rac.browser.center_address_bar_contents_migrated` | Prefs | grep of `patches/rac` |
-| AI provider keys | Pref `rac.ai.encrypted_keys` | `os_crypt_async` ciphertext; Keychain item "rac Storage Key" | `CR:chrome/browser/rac/ai/ai_prefs.h:24-26`; `rac-baseline.md:328` |
-| AI conversations | `<profile>/rac_ai_history.json` | **Plaintext JSON**, 16 MB read cap, saving on by default | `rac-baseline.md:329` |
-| Agent run logs | Not stored as a separate log | n/a | `rac-baseline.md:319-334` (no row); `matrices/architecture-and-storage.md:173` |
-| Cookies, history, extensions, bookmarks | Chromium's own SQLite and JSON | Chromium's | `rac-baseline.md:321` |
+| Spaces: id, name, emoji, theme, last active | Pref `rac.spaces` | JSON in `Preferences`; unknown fields kept | `CR:chrome/browser/rac/spaces/space.h:22-80` |
+| Themes | Inside each space: two color stops plus mode | Same | `space.h:22-43` |
+| Hidden spaces' tabs | `<profile>/rac spaces`, plus `.bak` | JSON `kVersion = 1`, atomic, 1 s coalesce | `CR:chrome/browser/rac/spaces/spaces_store.h:64-74` |
+| Favorites, pinned tabs, folders (one level) | Pref `rac.sidebar.lists` | JSON in `Preferences`. `SidebarItem` holds only id, url, title, name, and **keeps no unknown fields** | `CR:chrome/browser/ui/rac/sidebar/sidebar_items.h:38-50` |
+| Tab-to-space and tab-to-item tags | Chromium session extra data | Session format | `docs/internals/pinned-tabs.md` |
+| Agent site rules, permission level | `rac.ai.agent_site_rules`, `rac.ai.agent_permission_level` | Prefs | `patches/rac/agent/14-site-rules.patch:598-603`; `13-permission-levels.patch:573-579` |
+| Settings | `rac.*` prefs; `rac.browser_updates` in Local State | JSON | `plans/research/rac-baseline.md:325-326` |
+| AI keys | `rac.ai.encrypted_keys` | `os_crypt_async`, Keychain "rac Storage Key" | `CR:chrome/browser/rac/ai/ai_prefs.h:24-26` |
+| AI chats | `<profile>/rac_ai_history.json` | **Plaintext JSON** | `rac-baseline.md:329` |
+| Agent run logs | Not stored | n/a | `rac-baseline.md:319-334` |
 
 **Facts that shape this plan.**
 
-- rac has no SQLite database of its own (FACT, `rac-baseline.md:321`).
-- If `Preferences` is corrupt, Chromium renames it to `Preferences.bad` and starts with defaults (FACT, `CR:components/prefs/json_pref_store.cc:55-58,141`). Spaces, pins, and favorites live there, and no `.bak` covers them. INFERENCE: one bad write today loses a user's whole sidebar.
-- Import is Helium's. Helium finds Arc and Dia profiles (`CR:chrome/browser/importer/chrome_importer_list.cc:86-95`). It imports bookmarks, history, and extensions (`CR:chrome/common/importer/chrome_importer_utils.cc:192-226`). Its `ArcSidebarImporter` turns Top Apps into bookmark-bar entries, and each space's pinned tabs into bookmarks in a folder named by the space's internal id (`CR:chrome/utility/importer/arc_sidebar_importer.cc:268-330`). It runs in the utility process and can only return bookmarks through the importer bridge (FACT, same file, `bridge_->AddBookmarks`).
-- Helium strips passwords and autofill from every source (`CR:chrome/browser/importer/importer_list.cc:257-260`). Cookies are "Not supported yet" in Chromium's importer (`CR:components/user_data_importer/common/importer_data_types.h:27`).
-- Helium forces the password manager off by policy (`helium-chromium/patches/helium/hop/disable-password-manager.patch`).
-- rac's onboarding has an import screen that calls Helium's `listImportableProfiles` and `importProfile` (`patches/rac/onboarding/03-tour-window.patch:24-28`).
-- Helium already keeps a denied Keychain from wiping data (`patches/helium/macos/prevent-reset-on-keychain-unavailability.patch`). Ardia found a second path: the item is briefly missing at login, and Chromium writes a new key (`plans/research/digests/ardia.md:223-230`). Whether Helium's patch covers that case is unverified.
-- Chromium can isolate cookies per space. It has `SiteInstance::CreateForFixedStoragePartition` (`CR:content/public/browser/site_instance.h:255`; `plans/research/digests/long-tail.md:23`).
-- Chromium has versioned SQLite migrations built in (`CR:sql/meta_table.h:75,122`).
+- **Preferences is a single point of failure.** If `Preferences` is corrupt, Chromium renames it `Preferences.bad` and starts with defaults (`CR:components/prefs/json_pref_store.cc:55-58,141`). Spaces and pins live there, with no `.bak`.
+- **Helium's Arc importer can only make bookmarks.** It runs in the utility process and returns data only through the importer bridge (`CR:chrome/utility/importer/arc_sidebar_importer.cc:268-330`). It reads the space list from `containers[1]` by fixed index. It names folders by the space's internal id.
+- **Helium imports little else.** It imports bookmarks, history, and extensions from Chromium browsers (`CR:chrome/common/importer/chrome_importer_utils.cc:192-226`). It strips passwords from every source (`CR:chrome/browser/importer/importer_list.cc:257-260`). Cookies are "Not supported yet" (`CR:components/user_data_importer/common/importer_data_types.h:27`).
+- **There is no password manager to fill.** Helium forces the password manager off by policy (`helium-chromium/patches/helium/hop/disable-password-manager.patch`).
+- **The Keychain reset path exists in rac's tree.** It is find-then-add: on `errSecItemNotFound` it adds a fresh key, which can overwrite an item that has just appeared (`research/ardia.md:546-553`, citing `CR:components/os_crypt/common/keychain_password_mac.mm:64-65,92-95`). Helium's macOS patch also edits that file for denied access (`patches/helium/macos/prevent-reset-on-keychain-unavailability.patch`).
+- **Onboarding already has an import step.** It calls Helium's `listImportableProfiles` and `importProfile` (`patches/rac/onboarding/03-tour-window.patch:24-28`).
+- **Chromium has the building blocks.** It can isolate cookies per space (`CR:content/public/browser/site_instance.h:255`; `digests/long-tail.md:23`). It has versioned SQLite (`CR:sql/meta_table.h:75,122`).
 
 ## What others do
 
-Full comparison: `plans/research/matrices/architecture-and-storage.md` (Matrix B) and `plans/research/matrices/features.md` (Import, Sync and backup).
+Full tables: `matrices/architecture-and-storage.md` (Matrix B) and `matrices/features.md` (Import, Sync and backup).
 
-- **Cra** stores everything as plain JSON files, debounced at 0.4 s, with one `.bak` each. It also runs a repair pass at every launch. Its Arc import is the most exact in the field: sidebar, favicons, archive, windows, link routing, and Arc's Chromium profile. It re-encrypts passwords and cookies with its own key and stages them in a 0600 file. It writes them at next launch, before Chromium opens its databases. Spaces with the same title merge, so a rerun is safe (`digests/cra.md`; `research/cra.md:375-432,604-637`).
-- **Ardia** imports Arc spaces, pins, folders, live folders, splits, and themes. It turns each space into a profile, which loses shared logins (issue #50). It syncs through sealed files in iCloud Drive, with no server and no account. Its two-Mac test was never run (`digests/ardia.md:67-86,231-236`).
-- **Helium** has the bookmark-only Arc importer above. Its experimental "private vault" sync is off by default. It needs a provider extension to store encrypted blobs, and it carries Chromium data types, including `PREFERENCES` (`digests/helium.md:111-112`; `/tmp/rac-overhaul/src/helium/patches/helium/core/sync/datatype-policy.patch:19-30`).
-- **Zen** keeps 3-hour backup buckets, the newest 20, but tries only two fallbacks. Its storage moves were followed by data-loss reports (`digests/zen.md`, Avoid 8).
-- **Nook** keeps daily dated backups for 7 days, a `formatVersion`, 30-day tombstones, and fractional ordering (`matrices/architecture-and-storage.md:29-33`).
-- **T3 Code** shows the trap: an event log reached 17-40 GB. It also snapshots its database before an update and rolls back if the trial fails (`digests/t3code.md:86-98`).
-- **Stedding and Brave** isolate cookies per space or container with a storage partition. Stedding needs one upstream hunk. Brave keeps the partition through session restore with a URL prefix (`digests/long-tail.md:20-25`).
-- **Crest** keeps one SQLite file of JSON records and offers optional CloudKit sync. Passwords never enter that sync. Its portable archive leaves out passwords, cookies, and site storage (`digests/long-tail.md:47`).
+- **Cra**: plain JSON files with one `.bak` and a launch-time repair. It reads Arc's sidebar, favicons, archive, windows, and routing rules exactly. It re-encrypts passwords and cookies into a 0600 staging file and writes them before Chromium opens its databases (`research/cra.md:375-432,604-637`). It has no Arc fixtures; the code is the only record of the format.
+- **Ardia**: imports Arc spaces, pins, folders, live folders, and themes. It turns each Arc space into a profile, which loses shared logins (issue #50). Its own review says to map Arc profile → profile and Arc space → space (`research/ardia.md:55,554-558`). It syncs sealed files through iCloud Drive and never tested two Macs (`digests/ardia.md:79-86`).
+- **Zen**: 3-hour backups, the newest 20, but only two fallbacks. Data-loss reports followed its storage moves (`digests/zen.md`, Avoid 8). **Nook**: daily backups kept 7 days (`matrices/architecture-and-storage.md:33`).
+- **T3 Code**: an event log grew to 17-40 GB. It snapshots its database before updates (`digests/t3code.md:86-98`).
+- **Stedding and Brave**: one storage partition per space or container. Brave carries the partition through restore with a URL prefix (`digests/long-tail.md:20-25`).
 
 ## Options
 
-Each option is a whole strategy for this area. Sign-ins per space and sync have their own sub-choices (04-D4, 04-D8). Those are covered inside Option B.
+These options are about what ships before 2026-12-22 and how Arc profiles map. The storage work after launch has its own section and decisions (04-D5 to 04-D8).
 
-### Option A: Ship-first. Arc sidebar import on today's stores, nothing else
+### Option A: Sidebar only, into the current profile
 
-rac gains an Arc importer that writes into the existing spaces and sidebar services. Nothing else changes before Arc closes. Backups, encryption, sign-ins, and sync wait.
+rac rebuilds Arc's spaces, pins, folders, and favorites in the profile the user is in. Every Arc profile's spaces land in that one profile. Nobody's sign-ins come over.
 
-- **Details.** A rac-owned reader in `chrome/browser/rac/import/` parses `StorableSidebar.json`. An applier calls `SpacesService` and `SidebarItems`. Helium's importer still brings history and extensions.
-- **Pros.** Smallest change. About 3-5 upstream hunks. Lands well before 2026-12-22.
-- **Cons.** Users still sign in everywhere again. An import goes into a sidebar that has no backup and no undo. Chat history stays plaintext.
-- **Effort.** M, about 7-9 agent-days.
-- **Risk.** Low for code. Medium for trust: a bad first import with no way back.
-- **Locks in.** Nothing.
+- **Details.** A rac-owned reader and applier. Helium's importer brings history and extensions as a separate step.
+- **Pros.** Smallest change, about 3-4 upstream hunks. Easiest to fit before the launch.
+- **Cons.** Everyone signs in again everywhere. Work and personal spaces end up sharing one cookie jar.
+- **Effort.** M, 7-9 agent-days. **Risk.** Low. **Locks in.** Nothing.
 
-### Option B: Local-first foundation (recommended)
+### Option B: Sidebar plus sign-ins, Arc profile → rac profile (recommended)
 
-rac first adds a safety net: daily backups, versioned data, and undo for imports. Then it builds Arc import in two cuts, sidebar first and sign-ins second. After the release, AI data moves to an encrypted store and spaces can get their own sign-ins. Sync is designed now but built later, as sealed files in a folder the user owns.
+Each Arc profile becomes a rac profile with its own window. Its spaces, favorites, and cookies go into that profile. Most Arc users have one profile, so they get one window, as before. Users with Work and Personal profiles get two windows.
 
-- **Details.** Milestones M0-M6 below. Settings and the sidebar stay in prefs for now (04-D9). Data that grows without limit goes to SQLite with retention: AI chats, agent runs, and later the archive. Small, bounded data stays in prefs or JSON. Every importer writes through service APIs, so storage can change later without touching importers.
-- **Sign-ins per space (04-D4).** (B1) A storage partition per space, opt-in, as Stedding and Brave do. (B2) A full Chromium profile per space in one window, as Arc and Crest do; L+ effort, and it fights rac's one-sidebar-per-profile model. (B3) Not now; profiles stay one per window. Pick B1.
-- **Sync (04-D8).** (S1) None. (S2) Sealed-folder sync, as Ardia does: iCloud Drive by default; Syncthing, Dropbox, or a NAS for self-hosting. (S3) Helium's vault, once Helium ships it. (S4) A rac server: rejected, because it breaks "no rac servers". Pick S1 now, then S2 for rac's sidebar data. Take S3 for Chromium data (bookmarks, history) if Helium ships it.
-- **Pros.** Arc users get spaces and sign-ins before the shutdown. Every import can be undone. Chat history stops being plaintext. Per-space sign-ins fix Arc's profile model properly, which Ardia gets wrong.
-- **Cons.** More work before Arc closes than Option A. The partition hook sits in `browser_navigator.cc`, a file three other patches already edit (`digests/long-tail.md:25`).
-- **Effort.** Before 2026-12-22: M0-M2, about 17-22 agent-days in two parallel worktrees. After: M3-M5, about 20-30 agent-days. Sync (M6): L, about 20-35 agent-days.
-- **Risk.** Medium. Keychain prompts, macOS data-access prompts, and Arc format variants need care.
-- **Locks in.** A record shape (stable id, timestamps, source id) that later sync must honor. That is cheap and reversible.
+- **Details.** This is Option A, plus creating profiles from the import sheet, plus a cookie reader and writer. It matches rac's own model, where profiles keep logins separate (VISION). Arc's Top Apps were per profile, so favorites map exactly (`research/cra.md:614`). No partition, no navigator hook, and no edits to session restore.
+- **Pros.** Every Arc profile's sign-ins arrive before Arc closes. Undo is clean for extra profiles: deleting the created profile removes them. It is the cheapest correct mapping.
+- **Cons.** Spaces from different Arc profiles live in different windows. In Arc they shared one window. Switching between them is a window switch until plan 01 adds a profile hop. Imported cookies may not satisfy sites that bind sessions to a device.
+- **Effort.** M, 13-17 agent-days in total. **Risk.** Medium: Keychain and macOS prompts, cookie edge cases. **Locks in.** Imported Work spaces live in their own profile. Merging them into one window later needs per-space sign-ins (04-D6) plus a "move space to profile" tool.
 
-### Option C: Sync-first rebuild. One rac store now
+### Option C: Sidebar plus sign-ins, all in one window, a jar per Arc profile
 
-All rac data moves out of `Preferences` into one rac-owned SQLite file of records, like Crest's. Import writes into it, and iCloud folder sync follows soon after.
+This is Arc's real model: one window, with spaces backed by separate cookie jars.
 
-- **Details.** New `RacStore` service. Spaces, pins, favorites, themes, rules, archive, and AI data become rows. Every record gets an id, a hybrid logical clock, and a tombstone. The settings WebUI reads through a new handler instead of prefs.
-- **Pros.** The cleanest base for sync. One backup target. One migration system.
-- **Cons.** It rewrites the spaces and pinned stores that 44 patches depend on (26 spaces, 18 pinned; `rac-baseline.md`), before Arc closes. Settings lose free pref binding. It is the classic moment for data loss (Zen's history).
-- **Effort.** L-XL, about 30-45 agent-days before import even starts.
-- **Risk.** High. It misses the Arc window.
-- **Locks in.** A storage engine and a sync shape before anyone has asked for sync.
-
-### Option D: Lean on Helium
-
-rac extends Helium's own importer to map Arc data, and stores rac data as syncable prefs. It then waits for Helium's vault sync.
-
-- **Details.** Subclass `ArcSidebarImporter` (Helium made `ImportBookmarks` virtual; `digests/helium.md`, take 6). New bridge methods would carry spaces from the utility process. rac prefs would be registered as syncable, with entries in `chrome_syncable_prefs_database.cc`.
-- **Pros.** Reuses Helium's process model and its UI. Sync costs rac little if Helium ships it.
-- **Cons.** Spaces cannot cross the importer bridge without editing Helium- and Brave-created files, which AGENTS.md says to avoid. Chromium syncs a dictionary pref as one value, so two Macs editing the sidebar would overwrite each other (INFERENCE). There is no shipping date for Helium's sync (`digests/helium.md`, Open questions). Its storage provider must be an extension (`provider/api.patch`).
-- **Effort.** M for import, though with high rebase cost. Sync timing is unknown.
-- **Risk.** High dependency risk.
-- **Locks in.** Helium's timeline, and edits to Helium's importer files.
+- **Details.** It needs storage partitions per space, restore hooks, and clear-data reach before launch (see After launch, part 2). Those edit hot files shared with Helium, so they wait for the sync.
+- **Pros.** The truest copy of Arc.
+- **Cons.** L effort, with hunks in `browser_navigator.cc` and session restore. It cannot fit between the sync and 2026-12-15.
+- **Effort.** L, 15-25 agent-days. **Risk.** High for the date. **Locks in.** The partition design, untested.
 
 ### Recommendation
 
-**Option B.** It is the only option that brings both spaces and sign-ins before Arc closes, with a way back if an import goes wrong. Take from A the rule that import ships first, on today's stores. Take from C the record shape (stable ids, source ids, timestamps), adding it as fields, not as a rewrite. Take from D the detection code, the history and extension import, the macOS permission prompt, and the vault for Chromium data later. Do not route rac data through it.
+**Option B.** It is the only option that brings every sign-in before Arc closes without touching hot files. Option C stays the after-launch goal for users who want one window. From A, keep the rule that sidebar import ships even if sign-ins slip.
 
 ## Recommended plan
 
-Dates assume work starts 2026-10-28. Arc import is only useful inside a signed release, so M1 and M2 depend on plan 06 shipping one.
+**Calendar rules (cross-plan ruling 1).** Weeks count from plan approval. Plan 06 owns the sync and the launch calendar. Work in rac-owned new files may be built on Chromium 154 and rebased later. Work touching files Helium also patches waits for the sync. The fixed anchors are the launch build's hard stop on **2026-12-15** and Arc's shutdown on **2026-12-22**.
 
-### M0. Safety net (target 2026-11-04; S-M, 4-5 agent-days)
+**Dependencies.** In weeks 1-2, plan 06 M2 syncs to Helium 0.20.1.1 (Chromium 156) under a `patches/rac` merge freeze (06-D13). After that merge, the base tree must be rebuilt before any import worktree can build on 156 (plan 06 risks: the shared Air is the bottleneck). The Chromium 157 hop is optional; plan 06 decides. Every milestone below targets 156, or 157 if plan 06 hops.
 
-**Goal.** No rac data can be lost silently, and every later change can be undone.
+**Test status.** Fixture tests report through the worktree-posted test status (06-D9), not CI. CI does not compile C++ tests before launch.
 
-**Tasks.**
-1. Add `rac::DataBackups`, a rac-owned profile service. Once a day, on the first change, it writes one snapshot to `<profile>/rac backups/YYYY-MM-DD.json`. The snapshot holds `rac.spaces`, `rac.sidebar.lists`, the agent rules, and the `rac spaces` file. It keeps the newest 14. It also writes a named snapshot before any import or migration. Writes run on a background sequence with `ImportantFileWriter`. Files are mode 0600.
-2. Recovery order at load: the live data, then `.bak`, then the newest dated snapshot, then older ones. This fixes Zen's two-fallback limit. If `Preferences.bad` exists and `rac.spaces` is empty, offer "Restore your spaces from <date>". Never restore silently.
-3. Replace the two migration booleans with one integer pref, `rac.data_version`. A small runner applies numbered, idempotent steps, after a snapshot. Keep the old booleans readable for one release.
-4. Versioning rules for every rac file, written in `docs/internals/storage.md`. Each file carries a `version` and a `min_reader_version`. Builds keep unknown fields, as `Space` and `StoredSpace` already do. A build refuses to write a file whose `min_reader_version` is newer than itself. SQLite stores use `sql::MetaTable` with compatible-version numbers.
-5. Check the Keychain "no silent reset" case. Read Ardia's patch notes (`research/ardia.md:546-553`) against Helium's patch. Add a test only if the gap is real.
-6. Add a dev-only switch, `--rac-import-source-root=<dir>`, so tests read copies, never real Arc data. Leave it out of release builds (`rac-baseline.md`, take 12).
+**Critical path.**
 
-**Acceptance.** Corrupting `Preferences` in a test profile restores spaces and pins after one confirmation. Snapshots stay at 14 or fewer. A cold start reads nothing extra when the live data is fine.
+| Weeks after approval | Work | Chromium | Merges? |
+|---|---|---|---|
+| 1-2 (during the sync) | M0a snapshot service; M1a reader, import plan, scrub script, fixtures. All new files | 154, rebased later | No (freeze) |
+| After the sync and base rebuild | M0b Keychain fix; M1b applier, hooks, plan 01's screens | 156 | Yes |
+| Next 1-2 weeks | M2 profiles and sign-ins | 156 | Yes |
+| By 2026-12-15 | M1 must be in the launch build; M2 should be | 156/157 | Launch (06 M5) |
 
-**Verification.** Unit tests for snapshot rotation, recovery order, and the migration runner. A screenshot of the restore prompt in light and dark mode. A trace showing no extra disk read at startup.
+**If it slips.** If M2 misses 12-15, launch with sidebar-only import. Ship sign-ins in a point release only if `update-smoke` passes (06 M1) and it lands before 12-22. Otherwise ship it after. Arc's files stay on disk after shutdown, so import still works (INFERENCE). The budget is 16-21 agent-days before launch. If approval lands after mid-November, plan for sidebar-only.
 
-**Patch surface.** New files in `chrome/browser/rac/storage/`. Hooks: one keyed-service factory registration and one `BUILD.gn` dependency. About 2-3 upstream hunks (INFERENCE).
+### M0. Minimal safety net (S, 3-4 agent-days)
 
-### M1. Arc import, sidebar (target 2026-11-17; M, 7-9 agent-days)
-
-**Goal.** An Arc user sees their spaces in rac within a minute, looking like Arc.
+**Goal.** An import can't destroy a user's sidebar or their encrypted data.
 
 **Tasks.**
-1. **Reader** (`chrome/browser/rac/import/arc_reader.{h,cc}`). It is pure parsing, with no browser state, so fixtures can test it. It reads `StorableSidebar.json` using Cra's exact keys (`research/cra.md:604-627`): the flat `[id, object, …]` lists; `containerIDs` (`pinned`, `unpinned`); `topApps` containers; space `title` and `profile`; `customInfo.iconType.emoji_v2` or `.emoji`; `windowTheme` gradients; and dates counted in seconds since 2001. It also reads favicons from `SidebarItemsFaviconCache/<md5(id)>`. Parsing uses `base::JSONReader` on a background thread.
-2. **Import plan** (`import_plan.h`). A source-neutral tree, like Cra's `ImportPlan`: spaces, favorites, pinned trees, open tabs, theme, emoji, and source ids. Every later importer (Dia, Zen, Safari) produces the same plan.
-3. **Mapping.**
-   - Arc space → rac space, with name, emoji, and theme. The first two gradient base colors become `color1` and `color2`. The light and dark variants become the mode.
-   - Pinned container → the space's pinned list.
-   - Arc allows nested folders; rac folders are one level deep (`docs/internals/pinned-tabs.md`). Deeper levels flatten into their top folder as "Parent › Child" names.
-   - Split views and tab groups flatten to tabs (as Cra does).
-   - Unpinned tabs → that space's open tabs, stored unloaded in the `rac spaces` file. A checkbox shows the count.
-   - Top Apps from the main Arc profile → rac favorites.
-   - Top Apps from other Arc profiles → a "Favorites" folder pinned in each space that uses that profile. Then a work favorite never opens with the personal sign-in.
-   - Favicons → Chromium's favicon database, so unloaded pins show icons with no network request.
-4. **Applier** (`import_applier.cc`). It writes only through `SpacesService` and `SidebarItems`. It runs after an M0 snapshot. Each created item records its Arc source id, so a rerun skips what already exists. That is exact where Cra's title match is not.
-5. **Helium's part.** Run Helium's importer for history and extensions, with bookmarks turned off for Arc. Otherwise pins arrive twice, as bookmarks too.
-6. **Undo.** "Undo Arc import" in Settings, for 7 days. It restores the pre-import snapshot and removes the created items. A space the user has changed since asks first.
-7. **Not imported, and said so in the summary:** archive (rac has none yet), link routing rules (kept raw in `<profile>/rac imports/` for plan 07's Air Traffic Control), Boosts, Easels, Notes, and live folders.
-8. **UI.** One import sheet, reached from onboarding's import step and from Settings. Plan 01 owns the look. Before the macOS data-access prompt, rac explains it. On macOS 27, reuse Helium's Files & Folders prompt (`research/helium.md:101`).
+1. **M0a, new files.** A rac-owned `DataBackups` service in `chrome/browser/rac/storage/`.
+   - Before any import or migration, it writes a named snapshot of `rac.spaces`, `rac.sidebar.lists`, the agent rules, and the `rac spaces` file.
+   - It keeps one rolling daily backup with no open-tab data: only spaces, themes, pins, favorites, and rules.
+   - The pre-import snapshot is deleted when the 7-day Undo window ends. Open-tab URLs are not kept longer than that (minor 14).
+   - Files are 0600, written by `ImportantFileWriter` on a background sequence.
+2. **M0a.** If `Preferences.bad` exists and `rac.spaces` is empty, offer "Restore your spaces from <date>." Never restore silently.
+3. **M0b, Chromium 156, Opus, 1-2 days.** Fix the Keychain silent reset. On `errSecItemNotFound`, retry before adding. Never overwrite an item that appears in the meantime. Rewrite Ardia's idea; don't copy its 554-line patch (`research/ardia.md:546-553`). Add a unit test with a fake keychain that returns not-found, then found. This is a plan 06 launch gate (cross-plan ruling 13). It waits for the sync because Helium's macOS patch edits the same file.
 
-**Acceptance.** Fixtures from at least three Arc layouts import with correct names, emoji, colors, folders, and order: one space, several spaces across two profiles, and nested folders with splits. A second run adds nothing. Undo restores the exact prior state. The import makes zero network requests.
+**Acceptance.** Corrupting `Preferences` in a test profile restores spaces and pins after one click. The Keychain test proves no second key is written. Startup reads no backup when the live data is fine.
 
-**Verification.** Reader unit tests with fixtures. A browser test for the applier and for undo. Screenshots before and after (empty sidebar, then imported spaces) in light and dark, with the address bar in the toolbar and in the sidebar. A short video of the import sheet, progress, and summary. A net-log run proving no network requests.
+**Verification.** Unit tests through posted status. A screenshot of the restore prompt in light and dark.
 
-**Patch surface.** New files only, plus hooks: `BUILD.gn`, rac's onboarding handler (rac-owned), and one call to deselect bookmarks for Arc. About 2-4 upstream hunks (INFERENCE). No edits to Helium's importer files.
+**Patch surface.** One keyed-service registration and one `BUILD.gn` line, plus 1-2 hunks in `keychain_password_mac.mm` (INFERENCE).
 
-### M2. Arc sign-ins, password hand-off, Dia (target 2026-12-01; M, 6-8 agent-days)
+### M1. Arc sidebar import (M, 7-9 agent-days)
 
-**Goal.** Sites stay signed in after the move. Passwords reach a real password manager. Dia users get the same flow.
+**Goal.** An Arc user sees their spaces in rac within a minute.
 
 **Tasks.**
-1. **Credential reader** (`credential_reader_mac.mm`). It asks the Keychain for "Arc Safe Storage" (account "Arc") only after the user clicks "Unlock Arc data". It copies `Cookies` and `Login Data` with their `-wal` and `-shm` files to a temp folder, opens the copy with `sql::Database`, and decrypts the `v10` values. The scheme is PBKDF2-SHA1 ("saltysalt", 1003 rounds) with AES-128-CBC. It checks padding, because a wrong key passes about once in 256 tries. It strips the SHA-256 host prefix from cookie databases at version 24 and up. Source: Cra's `CredentialImport.swift`, MIT, ported with credit.
-2. **Cookie writer.** It writes through `CookieManager::SetCanonicalCookie` on the profile's storage partition while rac runs. Chromium re-encrypts with "rac Storage Key". INFERENCE: because rac is Chromium, it needs no Cra-style staging file and no restart.
-3. **Scope until M4.** Only the main Arc profile's cookies come over, because two profiles' cookies would collide in one jar. The summary says: "Sign-ins for 'Work' arrive when separate sign-ins ship." The import record keeps the space-to-Arc-profile mapping so M4 can finish the job.
-4. **Password hand-off (04-D2).** "Move passwords to…" offers Apple Passwords and 1Password. rac writes a CSV into a 0700 temp folder and opens the target app's import. It deletes the file when import is confirmed, after 10 minutes, or at quit. rac keeps no passwords.
-5. **Dia.** Dia's Chromium profiles use "Dia Safe Storage". Read `StorableProfileContainers.json` for open tabs and `User Data/*/Bookmarks` for Dia's imported Arc folders (Cra's `DiaImporter`). Dia's pinned tabs live in an SQLCipher `tabs.db` that nobody has read (`digests/ardia.md:78`). Try Dia's AppleScript dictionary for pinned tabs, as Ardia does. Each Dia profile maps like an Arc profile.
+1. **M1a reader** (`chrome/browser/rac/import/arc_reader.{h,cc}`).
+   - Pure parsing, no browser state, on a background thread with `base::JSONReader`.
+   - Find the data container as the entry in `sidebar.containers[]` that holds `spaces`. Don't rely on a fixed index, as Helium does.
+   - Read with Cra's keys (`research/cra.md:609-627`): the flat `[id, object, …]` lists; `containerIDs` (pinned, unpinned); `topAppsContainerIDs`; space `title`, `profile`, `emoji_v2` or `emoji`; `windowTheme` gradients; `data.splitView` and `data.tabGroup`; dates in seconds since 2001; favicons from `SidebarItemsFaviconCache/<md5(id)>`.
+   - Also read `StorableLinkRouting.json`, `defaults` `autoArchiveTimeThreshold`, and `extensions.pinned_extensions`.
+2. **M1a import plan** (`import_plan.h`). A source-neutral tree, like Cra's `ImportPlan`: profiles, then spaces, favorites, pinned trees, open tabs, themes, emoji, and Arc source ids.
+3. **M1a test data (04-D4).** `devutils/rac/arc_scrub.py` copies `StorableSidebar.json` and replaces every title and URL with placeholders, keeping the shape. The maintainer runs it on their own Arc; agents never read real Arc data. Add synthetic edge cases: nested folders, splits, emoji code points, light and dark themes. After the beta, invite two or three volunteer samples through an issue template. A dev switch, `--rac-import-source-root=<dir>`, points the reader at copies. It stays out of release builds.
+4. **M1b mapping** (Chromium 156).
+   - Arc space → rac space, with name and emoji. The theme takes the first two gradient base colors and the light or dark variant. Overlay colors, intensity, noise, and vibrancy are dropped, so colors are close, not exact (plan 02 may refine).
+   - Pinned container → the space's pinned list. Nested folders flatten into their top folder as "Parent › Child", and plan 01's result screen says so. Splits and groups flatten to tabs.
+   - Unpinned tabs → open tabs, unloaded. For the space a window shows after import, create unloaded tabs in that window, the same way pinned items open unloaded (`docs/internals/pinned-tabs.md`). For other spaces, write them to the `rac spaces` store.
+   - Top Apps → that profile's favorites. Favicons → Chromium's favicon database, so nothing is fetched.
+   - Pinned extension ids → Chromium's `extensions.pinned_extensions`.
+5. **M1b idempotence.** `SidebarItem` keeps no unknown fields (see "Where we are today"), so the Arc-id-to-rac-id map lives in an import record, `<profile>/rac imports/arc.json` (0600). A rerun skips mapped items. Same-title spaces merge, as in Cra.
+6. **M1b applier.** It writes only through `SpacesService` and `SidebarItems`, after the M0 snapshot.
+7. **Helium's step, run separately and labeled.** History and extensions, with bookmarks off for Arc. Otherwise pins arrive twice.
+8. **Undo, scoped.** "Undo Arc import" works for 7 days and restores the sidebar part only. It leaves history, extensions, favicons, and cookies in place. The result screen says so. It also clears session tab tags that point at removed spaces.
+9. **Hand-offs, not imported now.**
+   - Routing rules are kept in the import record for plan 07's Air Traffic Control.
+   - The auto-archive threshold is kept for plan 01's later auto-archive (cross-plan ruling 4).
+   - Arc's archive (`StorableArchiveItems.json`) waits for plan 01's archive store. It is re-read from Arc's folder then, not copied now.
+   - Live folders, Boosts, Easels, and Notes aren't imported, because rac has no equivalent.
+   - Plan 01's result screen lists all of these.
+10. **Screens are plan 01's** (01 M1 task 2). On macOS 27, Helium's Files & Folders prompt (Helium 0.19.4.1) is available only after the sync (`research/helium.md:101`). Whether macOS 27's gate covers Arc's folder is unverified.
 
-**Acceptance.** After importing a fixture profile, a test site's session cookie works in rac. Denying the Keychain prompt leaves the sidebar import intact and shows a calm retry. No plaintext secret remains on disk after the hand-off.
+**Acceptance.**
+- The scrubbed sample and every synthetic fixture import with the right space count, names, emoji, folders, order, and favorites.
+- A rerun adds nothing. Undo restores the prior sidebar exactly.
+- A net log shows zero requests during import.
+- With AI off, no AI rows or labels appear in the import flow (cross-plan ruling 16).
 
-**Verification.** Unit tests: decrypting fixtures, the version-24 prefix, wrong-key rejection. A browser test that a cookie is set and sent. Screenshots of the unlock explanation, the Keychain prompt state, and the summary. A video of the password hand-off.
+**Verification.**
+- Reader unit tests and an applier browser test, through posted status.
+- Screenshots of the sidebar before and after import, in light and dark, with the address bar in the toolbar and in the sidebar. Incognito unchanged.
+- A video of plan 01's import flow.
 
-**Patch surface.** New files. Possibly one upstream hunk to reach the cookie manager from rac's service (INFERENCE).
+**Patch surface.** New files, plus `BUILD.gn`, rac's onboarding handler, and one call that turns off Arc bookmarks. About 2-4 upstream hunks (INFERENCE). No edits to Helium's importer.
 
-### M3. Encrypted AI store (target 2026-12-15, parallel to M1-M2; S-M, 4-6 agent-days)
+### M2. Arc profiles and sign-ins (M, 6-8 agent-days)
 
-**Goal.** Chats and agent history are encrypted at rest, bounded, and cost nothing with AI off.
-
-**Tasks.**
-1. `<profile>/rac_ai.db` through Chromium's `sql::Database`, in WAL mode, versioned with `sql::MetaTable`. Tables: `conversations` (id, title, updated); `messages` (conversation, role, encrypted text); `runs` (id, conversation, started, ended, outcome, agent, level); and `tool_calls` (run, tool, origin, decision, encrypted arguments and result, error). One row per run and per tool call, never per token (`digests/local-first-and-sidecars.md`, take 5).
-2. Text columns are encrypted with `os_crypt_async`, the same path as the API keys (`rac-baseline.md`, take 9).
-3. Retention: conversations stay until the user deletes them, or turns off "Save history". Runs and tool calls are kept 30 days. The run table doubles as the agent's audit log for plan 05.
-4. Migrate `rac_ai_history.json` once, then delete it.
-5. The store is created only when AI is on, following the existing rule (`docs/internals/ai.md`, "AI off costs nothing").
-
-**Acceptance.** No plaintext chat text in the profile folder. A fresh profile with AI off has no `rac_ai.db`. The database stays bounded on a 30-day synthetic run load.
-
-**Verification.** Unit tests for migration, retention, and encryption round-trips. A `strings` check on the database file. An AI-off check in a fresh profile.
-
-**Patch surface.** rac-owned files only. 0-1 upstream hunks.
-
-### M4. Separate sign-ins per space (target late January 2027; M-L, 10-15 agent-days)
-
-**Goal.** A space can use its own accounts, as Arc profiles did. Arc users with several profiles get every sign-in.
-
-**Tasks.**
-1. **Model.** A profile-level list of identities, `rac.identities` (id, name, partition token). Each space gains an optional `identity_id`. Several spaces can share one identity, matching Arc profiles that served several spaces. Stedding binds one jar per space and calls sharing "a later ADR" (`/tmp/rac-overhaul/src/stedding/docs/decisions/0019-space-sessions-are-storage-partitions.md`).
-2. **Partition.** Tabs in such a space open with `CreateForFixedStoragePartition` against `StoragePartitionConfig::Create(profile, "rac", <token>, false)`. Make this one hook in `browser_navigator.cc`, which already picks the `SiteInstance`. Turning isolation off keeps the jar for later (Stedding).
-3. **Restore.** rac already saves each tab's space in session extra data (`docs/internals/pinned-tabs.md`). So restore can rebuild the partition from the space, instead of Brave's URL prefix. This needs hooks in session restore and Reopen Closed Tab, plus rac's own hidden-space restore. Test discard too.
-4. **Moving a tab** to a space with another identity reopens its URL in the target jar. The page state is lost, and the user is told quietly.
-5. **Favorites** stay on the default jar. The M1 rule already keeps other identities' favorites inside their spaces.
-6. **Finish Arc and Dia.** Re-run sign-in import for each extra Arc or Dia profile into its identity.
-7. **Agent.** A "clean room" identity with no sign-ins, for plan 05 (`digests/long-tail.md`, agent idea B5).
-8. **Known limit.** `chrome.cookies` without a partition sees only the default jar. Cookie extensions miss isolated spaces (Stedding ADR 0019).
-
-**Acceptance.** Two spaces are signed into two Google accounts at once, and both survive a restart, Reopen Closed Tab, and unloading. With no isolated spaces, navigation cost is unchanged.
-
-**Verification.** Browser tests for restart and restore. Screenshots of two spaces showing different accounts, the space edit toggle, and incognito unchanged. A video of switching spaces. Before and after timing of the navigation path.
-
-**Patch surface.** About 3-5 upstream hunks: navigator, session restore, tab restore, and possibly `web_contents_impl.cc` if a leak shows up (INFERENCE). This is the riskiest rebase item in the plan.
-
-### M5. Export file and more importers (target February 2027; M, 6-10 agent-days)
+**Goal.** Each Arc profile arrives as a rac profile, still signed in.
 
 **Tasks.**
-1. **"Export rac setup…"** writes a `.rac` file (JSON, `format: "rac-export"`, `version: 1`). It holds spaces, themes, identities (names only), pins, favorites, folders, agent site rules, and a list of rac settings. It never holds cookies, passwords, history, keys, or chats. "Import rac setup…" merges by stable id and never closes an open tab (`digests/long-tail.md`, take 3). The same record shape becomes the sync payload in M6.
-2. **Zen.** Spaces, Essentials, pinned tabs, and folders from `zen-sessions.jsonlz4`, with older profiles in `places.sqlite` (Cra's `ZenImporter.swift`). Containers map to identities. Firefox cookies are plain SQLite.
-3. **Safari.** Use Safari's "Export Browsing Data" zip (Bookmarks, History, Passwords.csv), as Cra does. This avoids asking for Full Disk Access. Passwords go to the M2 hand-off.
-4. **Chrome and other Chromium browsers.** Helium already does bookmarks, history, and extensions. Add cookies through the M2 reader ("Chrome Safe Storage" and similar).
-5. **Firefox.** Helium's importer, plus cookies.
+1. **Profiles (04-D2).** The Arc `profile` field maps spaces to Arc profiles. The default profile goes into the current rac profile. Each other profile becomes a new rac profile, created with Chromium's profile manager from rac code and named after the Arc profile. The applier then runs per profile. Plan 01 shows one checkbox per profile. Surfaces: multiple profile windows (AGENTS.md).
+2. **Credential reader** (`credential_reader_mac.mm`).
+   - It asks for Keychain "Arc Safe Storage" only after the user clicks "Unlock Arc data", with an explanation shown first.
+   - It copies `Cookies` with `-wal` and `-shm` to a temp folder and opens the copy with `sql::Database`.
+   - It decrypts `v10` values: PBKDF2-SHA1 with "saltysalt", 1003 rounds, AES-128-CBC. It checks padding, because a wrong key passes about once in 256 tries. It strips the SHA-256 host prefix at cookie database version 24 and up. Columns are mapped by name.
+   - Port from Cra's MIT `CredentialImport.swift`, with credit.
+3. **Cookie writer.** It writes through each profile's `CookieManager::SetCanonicalCookie`, and Chromium re-encrypts with "rac Storage Key". INFERENCE: rac is Chromium, so no staging file or restart is needed.
+   - Skip expired cookies.
+   - Keep `__Host-` and `__Secure-` rules, rejecting rows that break them.
+   - Rebuild a partitioned (CHIPS) cookie's partition key from `top_frame_site_key`.
+   - Pass options that allow HttpOnly and the same-site context.
+4. **Tell the truth in the result.** "Some sites, like Google, may ask you to sign in again." Sites that bind sessions to a device can reject copied cookies (INFERENCE).
+5. **Passwords (04-D3).**
+   - First, a one-day spike. Decrypt Arc's `Login Data` into a CSV on a RAM volume (`hdiutil attach -nomount ram://…`, then format and mount). The CSV never touches the SSD. Show the file in Finder for Apple Passwords or 1Password to import, and unmount when the sheet closes. A crash or reboot also wipes it.
+   - The spike checks two things: that the target apps accept a file from that volume, and how Spotlight and Time Machine treat it.
+   - If the spike fails, show steps for Arc's own password export instead. rac never writes a plaintext file without the maintainer's explicit sign-off.
+   - Rejected: turning Chromium's password manager back on. Helium forces it off by policy. Undoing that means a rac patch against Helium's policy, plus password settings and autofill surfaces to own (L), against rac's no-password-manager stance (`matrices/features.md`).
+   - While mounted, the volume is readable by any process running as the user, including outside agents (plan 05).
 
-**Verification.** Fixture tests per source. Screenshots of each source in the import sheet.
+**Acceptance.**
+- In fixture profiles, cookies are set and sent.
+- Manual checks on Google, GitHub, and one bank-style site. Results are recorded, not required to pass.
+- Denying the Keychain keeps the sidebar import and shows a calm retry.
+- After the hand-off, no password text exists on the SSD (checked with `strings` on the temp folders).
 
-**Patch surface.** New files only.
+**Verification.** Unit tests: decryption fixtures, the version-24 prefix, wrong-key rejection, cookie prefix rules. Screenshots of the unlock explanation and a two-profile result. A video of the password hand-off.
 
-### M6. Sync (phase 6, only after maintainer approval; L, 20-35 agent-days)
+**Patch surface.** New files. Possibly one hunk to reach profile creation or the cookie manager (INFERENCE).
 
-**Goal.** The sidebar and rac settings follow the user between their Macs, with no rac server.
+### After the launch
 
-**Tasks.**
-1. **Move the data first (04-D9).** Spaces, pins, favorites, and identities move from prefs into a rac-owned document of records. Each record has an id, a hybrid logical clock, a device, a tombstone, and a fractional position. M0 snapshots run before the move.
-2. **Seal files, Ardia's way.** A 24-word phrase holds 256 bits. HKDF yields an AES-256-GCM file key and an HMAC name key. Additional authenticated data binds each file to its path. Files are padded to 1 KiB and never compressed. They are immutable, saved under random names, and moved in with `NSFileCoordinator`. Merges are per-record last-writer-wins. Snapshots compact old files, and tombstones expire after 45 days (`research/ardia.md:370-389`).
-3. **Where the files go.** `~/Library/Mobile Documents/com~apple~CloudDocs/rac Sync/` by default, or any folder. Syncthing, Dropbox, or a NAS makes this the self-hosted option.
-4. **The key.** Keychain item "rac Sync Key", this device only. The phrase pairs a second Mac.
-5. **Scope v1.** Sidebar, themes, identities (names only), agent site rules, and chosen settings. Not synced: cookies, passwords, history, open tabs, chats. Chromium data can ride Helium's vault later, if Helium ships it.
-6. **Lazy.** Nothing runs until sync is turned on. Then it checks on change and every few minutes, not Ardia's 15 s.
+None of this blocks 2026-12-22. Order and weeks follow plan 06 M6.
 
-**Acceptance.** A real two-Mac test over iCloud Drive (Ardia never ran one): concurrent edits, offline edits, deletes, and recovery from a lost phrase.
+**1. Full safety net (S, 2-3 agent-days).**
+- Grow to 14 daily backups (still no open tabs).
+- Recovery order: live data, `.bak`, then the newest backups in turn (fixes Zen's two-fallback limit).
+- A Restore item in Settings (plan 01).
+- One `rac.data_version` integer replaces the two migration booleans, with numbered, idempotent steps after a snapshot.
+- Versioning rules go in a new `docs/internals/storage.md`. Each file carries `version` and `min_reader_version`. Builds keep unknown fields, `SidebarItem` included. SQLite uses `sql::MetaTable`.
+- The rule: data that grows without limit goes to SQLite with retention. Small, bounded data stays in prefs.
 
-**Patch surface.** rac-owned files, in the browser process (03-D1).
+**2. Separate sign-ins in one window (04-D6; L, 15-25 agent-days; spike first).**
+- **Spike first.** The first deliverable is a one-week spike on a Chromium 156 tree. A space's tabs open with `CreateForFixedStoragePartition` against `StoragePartitionConfig::Create(profile, "rac", <token>, false)`, from one hook in `browser_navigator.cc` (Stedding ADR 0019).
+- **Model.** One jar per space, matching plan 01's toggle (01-D10). Shared jars are left out, because profile mapping covers Arc's case.
+- **What the spike must prove:**
+  - Restore, rebuilt from the space tag in session extra data (`docs/internals/pinned-tabs.md`).
+  - Reopen closed tab and discard.
+  - `window.open`, downloads, notifications, DevTools targets, and extension pages.
+  - Whether Clear Browsing Data and the site-data settings reach non-default partitions. This is unverified. If they miss them, users would think data is gone when it is not, which breaks the privacy promise. That fix is part of the milestone.
+- **Moving a tab** to a space with another jar reopens its URL there.
+- **Plan 05 M3** builds its agent sign-in modes on this primitive, including in-memory partitions.
+- **Known limit:** `chrome.cookies` without a partition sees only the default jar.
+- **Hunks:** 3-6 in hot files, maybe `web_contents_impl.cc` as Brave does (INFERENCE).
 
-### Where each kind of data will live
+**3. Encrypted AI store (04-D7; S-M, 4-6 agent-days; absorbs plan 05's 2-day item).**
+- `<profile>/rac_ai.db` via `sql::Database`, WAL mode, versioned with `sql::MetaTable`.
+- Tables: conversations, messages, runs, and tool calls. One row per turn and per tool call, never per token.
+- Text is encrypted with `os_crypt_async`.
+- Chats are kept until deleted. Runs and tool calls are kept 30 days. Plan 05 sets what the audit view shows.
+- Migrate `rac_ai_history.json` once, then delete it. The store is created only with AI on.
 
-| Data | Lives in | Encrypted | Backed up | Synced (M6) |
-|---|---|---|---|---|
-| Spaces, themes, identities | `rac.spaces`, `rac.identities` prefs; a rac document from M6 | No (FileVault) | Daily | Yes |
-| Pins, favorites, folders | `rac.sidebar.lists`; a rac document from M6 | No | Daily | Yes |
-| Hidden spaces' tabs | `<profile>/rac spaces` | No | Daily | No |
-| Agent per-site rules, level | `rac.ai.*` prefs | No | Daily | Yes |
-| Link routing, Boosts (plans 07) | Prefs if small; rac document if large | No | Daily | Yes |
-| Archive (if approved, plan 07) | SQLite with retention | Text, yes | No | No |
-| AI chats, agent runs | `<profile>/rac_ai.db` | Text, yes | No | No |
-| API keys | `rac.ai.encrypted_keys` | Yes | No | No |
-| Cookies per identity | Chromium storage partitions | Chromium's | No | No |
-| Import records | `<profile>/rac imports/` (0600) | No secrets inside | n/a | No |
-| Settings | `rac.*` prefs, Local State | No | Selected | Selected |
+**4. Export file and more importers (M, 6-10 agent-days).**
+- "Export rac setup…" writes a versioned `.rac` JSON file: spaces, themes, pins, favorites, rules, and chosen settings. It never holds cookies, passwords, history, keys, or chats. Importing merges by id.
+- Then Zen (spaces from `zen-sessions.jsonlz4`), Safari (its export zip, so no Full Disk Access), and cookies for Chrome and Firefox.
+- Dia comes here, not before launch. Dia isn't closing, its pinned tabs sit in an unread SQLCipher `tabs.db`, and its Terms forbid reverse engineering (`digests/ardia.md:78,276-279`). Use AppleScript only.
+
+**5. Sync (04-D8; L, 20-35 agent-days; only if VISION changes).**
+- VISION lists sync as "Not planned for now". If the maintainer changes that, use Ardia's design: sealed, immutable files in an iCloud Drive folder or any folder (which covers self-hosting), a 24-word phrase, and per-record last-writer-wins (`research/ardia.md:370-389`).
+- Before sync, the sidebar moves out of `Preferences` into a rac-owned record file, with backups first.
+- Run a real two-Mac test before shipping; Ardia never did.
+- Helium's vault (`digests/helium.md`) could carry Chromium data if it ships. rac runs no server.
 
 ## Fit with the non-negotiables
 
-- **Private.** Every import reads local files and makes no network request; favicons come from Arc's cache. Export files never contain secrets. Sync is end to end, to the user's own folder, and rac runs no server. **Bent:** the password hand-off writes plaintext passwords to a 0700 temp file for a few minutes. The alternative is a rac password manager, which Helium deliberately turns off. Flagged for 04-D2.
-- **Never slower than Helium.** Backups write once a day on a background sequence. Startup reads a backup only when live data fails. A partition costs nothing until a space is isolated: the navigator hook checks one field. Each isolated identity adds its own network context and cache (INFERENCE: a few MB each). Measure this in M4.
-- **AI off costs nothing.** `rac_ai.db` exists only with AI on. Backups and import never touch AI data.
-- **Cheap to update.** Nearly everything is in new rac-owned files. Upstream hunks: M0-M2 about 5-8, M4 about 3-5. **Bent:** M4 adds a hunk to `browser_navigator.cc`, a hot file, and to session restore. These are the costliest lines in this plan. No Helium importer files are edited.
-- **Calm UI.** One import sheet, plain progress, a summary of what came and what didn't, and Undo. The Keychain and macOS prompts are explained before they appear.
-- **GPL.** Ports from Cra (MIT) and Ardia's own files (Apache-2.0) keep their notices (`digests/ardia.md:215-217`). Stedding (BSD-3) and Brave (MPL-2.0) inform the design only. Reading Arc's file format is fine. Do not copy Arc's text or assets (`digests/cra.md`, Avoid 5).
+- **Private.** Import reads local files only and makes zero network requests. Rolling backups hold no open-tab URLs, and the pre-import snapshot expires with Undo. Export never holds secrets. **Bent, pending 04-D3:** passwords exist briefly as a readable file, on a RAM volume rather than the SSD, and only with the maintainer's sign-off for any fallback that writes to disk. After launch, separate sign-ins must make Clear Browsing Data reach every partition before shipping.
+- **Never slower than Helium.** Backups write at most once a day, on a background sequence. Startup reads nothing extra. Profile mapping adds no hooks to hot paths.
+- **AI off costs nothing.** Import and backups never touch AI data. `rac_ai.db` exists only with AI on. No AI labels appear in import screens.
+- **Cheap to update.** Before launch, about 4-8 upstream hunks, mostly hooks. No Helium importer files are edited. **Bent:** the Keychain fix edits a file Helium also patches. It is small, and it is the reason M0b waits for the sync. After launch, separate sign-ins add hot-file hunks.
+- **Calm UI.** One flow, owned by plan 01, with honest result text and scoped Undo.
+- **GPL.** Ports from Cra (MIT) and Ardia's own files (Apache-2.0) keep their notices. Stedding and Brave inform the design only. Arc's text and assets are not copied.
 
 ## Dependencies on other plans
 
-- **01 ui-shell.** The import sheet in onboarding and Settings, the restore prompt, Undo import, the "Separate sign-ins" toggle in space editing, and whether rac allows nested folders (M1 flattens them).
-- **02 visual-design-and-motion.** How Arc's gradients and noise map onto rac themes. Calm motion for import progress, honoring Reduce Motion.
-- **03 core-architecture.** This plan follows 03-D1 and 03-D2: every store lives in the browser process as a profile service, with no resident helper. 03's placement table puts history in browser-process SQLite and sync in the browser as sealed files in a user folder; plan 04 owns their schema, retention, migration, backups, and sync files (`plans/03-core-architecture.md`, M5 and the placement table). Importers stay in the browser too, because cookies must be written through Chromium. If 03-D2 ever approves a helper, `rac_ai.db` and the sync engine sit behind one interface so they can move. If 03-D8 moves rac sources into an overlay folder, the new `storage/` and `import/` directories move with it.
-- **05 agents-and-ai.** The `runs` and `tool_calls` schema is the agent audit log. Plan 05 sets retention and what an outside agent may read. The clean-room identity (M4) serves agents without sign-ins.
-- **06 engineering-and-shipping.** M1 and M2 matter only inside a signed release before 2026-12-22. CI must run the reader fixture tests. A release smoke test should carry real data from the previous build (Ardia's pattern), covering migrations.
-- **07 power-features.** Archive storage, Air Traffic Control using the imported link rules, Boosts storage, and Little Arc.
+- **01 ui-shell.** Import screens and the result list (01 M1 task 2). The profile checkboxes and the restore prompt. The separate sign-ins toggle (01-D10), built after launch. The archive store and auto-archive (ruling 4); plan 04 only hands over Arc's threshold and points at Arc's archive file.
+- **02 visual-design-and-motion.** Better theme fidelity, if wanted.
+- **03 core-architecture.** All stores live in the browser process, with no helper (03-D1, 03-D2). Plan 04 owns the history schema and retention (03 M5).
+- **05 agents-and-ai.** Agent runs use the AI store. Plan 05 M3 builds on the partition primitive. Chat encryption is counted once, here.
+- **06 engineering-and-shipping.** The sync and the freeze (06 M2, 06-D13), the base rebuild, the 157 decision, launch gates (06 M5) including the Keychain fix, posted test status (06-D9), and `update-smoke` for any point release.
+- **07 power-features.** Arc routing rules are handed over in the import record.
 
 ## Risks and unknowns
 
-- **Testing on real Arc data.** AGENTS.md forbids pointing builds at real rac or Helium profiles. Reading the maintainer's real Arc folder is not covered by that rule, but it is close. The plan uses fixtures and copies, through the dev switch. Running against a live Arc install needs maintainer sign-off.
-- **Arc format variants.** Only Cra's and Helium's readings are known. Old Arc versions, empty profiles, and odd shapes such as emoji code points need fixtures. Arc may stop launching after 2026-12-22, but its files stay on disk (INFERENCE), so import stays possible later.
-- **macOS prompts.** The App Data protection prompt and the Keychain prompt may confuse users or be denied. Whether macOS 27's gate covers Arc's folder is unverified (`digests/helium.md`, Open questions).
-- **Cookie schema drift.** Cookie database versions differ across Chromium releases (the v24 host prefix). Map columns by name, as Cra does.
-- **Partition leaks** through restore, discard, downloads, service workers, extensions, or `window.open`. Brave patches `web_contents_impl.cc` for this; Stedding does not, yet.
-- **Keychain silent reset.** If the "rac Storage Key" item is replaced, cookies and API keys become unreadable. M0 checks this path.
-- **Helium sync** has no date, and it may never carry rac's data.
-- **Two-Mac sync** is untested anywhere in the field.
-- **Effort.** M0-M2 is about 17-22 agent-days in 56 days, alongside a first release and a Helium sync. It is tight but realistic only if M1 starts by early November.
+- **Real Arc data.** Without the scrubbed sample (04-D4), tests only prove the reader matches Cra's notes.
+- **The calendar.** Pre-launch work fits only if approval comes early enough. Nothing merges during the sync, and the base rebuild on the shared Air takes an unknown time.
+- **Prompts.** The Keychain and macOS data-access prompts may confuse users or be denied.
+- **Cookies.** Device-bound sessions, schema drift, and prefix rules may make some sign-ins fail.
+- **Passwords.** RAM-volume behavior with Spotlight, Time Machine, and the target apps is unknown until the spike.
+- **Two windows.** Users with two Arc profiles may dislike getting two windows.
+- **Partitions (after launch).** Leaks, and whether Clear data reaches them.
+- **Arc after shutdown.** Arc's file formats may change in its last release.
 
 ## Open questions
 
-1. Should imported cookies include known tracker domains, or only sites in the user's sidebar and history? Cra imports everything.
-2. Does Arc's `profile` field name readable profile titles for the summary, or only ids?
-3. Should Dia's pinned tabs come through AppleScript (Dia must be running), or wait for someone to read `tabs.db`?
-4. Is a 7-day Undo window right, or should Undo stay until the next import?
-5. Should agent site rules sync (M6), given they are security decisions made on one Mac?
-6. Should the sync key also live in iCloud Keychain, so a second Mac needs no phrase? That needs a team ID and access groups; `MAC_TEAM_ID` is empty today (`rac-baseline.md:333`).
-7. Should chats ever sync, end to end, as an opt-in?
-8. Does Helium's Keychain patch already cover Ardia's login-time case?
-9. Should an Arc profile with its own spaces become a rac identity (this plan) or a rac profile window? This plan assumes identity, against Ardia's choice.
+1. Should imported cookies skip known tracker domains? Cra imports everything.
+2. Does Arc's `profile` field give readable profile names, or only ids?
+3. Is a 7-day Undo window right?
+4. Should plan 01 add a quick profile hop in the space switcher, for users with two imported profiles?
+5. Should a later tool merge an imported profile into one window as spaces with separate sign-ins?
+6. Should the sync key ever live in iCloud Keychain? That needs a team ID; `MAC_TEAM_ID` is empty today (`rac-baseline.md:333`).
+7. Note on critique item 15: sync stays in this plan as a short, gated paragraph, because the brief named it in scope. It is not a pre-launch task.
 
 ## Draft thread brief (DRAFT; not to launch until the maintainer approves)
 
 > **DRAFT. Do not launch until the maintainer approves plan 04.**
 >
-> **Thread:** architecture and backend, "Data and import". Model: Opus for M0, M2, and M4. Sonnet may do the M1 reader and fixtures under review.
+> **Thread:** architecture and backend, "Arc import". Model: Opus for M0b, M2, and the password spike. Sonnet may write the reader and fixtures, under review.
 >
-> **Goal:** Ship M0 (safety net), M1 (Arc sidebar import), and M2 (Arc sign-ins, password hand-off, Dia) in signed releases before 2026-12-22. Then M3 (encrypted AI store) and M4 (separate sign-ins per space). M5 and M6 wait for a new go-ahead.
+> **Goal:** M0 and M1 are in the launch build by 2026-12-15. M2 should be. If M2 slips, launch sidebar-only and follow plan 06 for a point release.
 >
-> **Read first:** `AGENTS.md`, `VISION.md`, `plans/04-data-storage-import-sync.md`, `docs/internals/pinned-tabs.md`, `docs/internals/ai.md` ("AI off costs nothing"), `plans/research/cra.md:375-432,604-637`, `/tmp/rac-overhaul/src/cra/Sources/Cra/Services/Import/` (MIT; port with credit), `CR:chrome/utility/importer/arc_sidebar_importer.cc`, and the Stedding ADR 0019 path above.
+> **Calendar:** weeks 1-2, during plan 06's sync freeze: new files only (M0a, M1a) on Chromium 154, not merged. After the sync merges and the base tree is rebuilt: M0b, M1b, and M2 on 156. Plan 06 owns the calendar.
 >
-> **Rules:** one worktree per milestone. Put code in `chrome/browser/rac/storage/` and `chrome/browser/rac/import/`. Upstream edits stay small hooks; report the hunk count in each PR. Never edit Helium's importer or patch files. Never read real Arc, Dia, Helium, or rac profiles; use fixtures and `--rac-import-source-root`, kept out of release builds. Snapshot before every import or migration. The importer makes no network requests.
+> **Read first:** `AGENTS.md`, `VISION.md`, this plan, `plans/01-ui-shell.md` M1, `plans/06-engineering-and-shipping.md` M2 and M5, `docs/internals/pinned-tabs.md`, `plans/research/cra.md:375-432,604-637`, `/tmp/rac-overhaul/src/cra/Sources/Cra/Services/Import/` (MIT; credit it), `research/ardia.md:546-553`.
 >
-> **Done means:** fixture tests pass in CI. The import is idempotent and undoable. Screenshots cover the sidebar before and after import in light and dark, both address-bar placements, and incognito unchanged. Videos show the import sheet and the password hand-off. A net log shows zero requests during import. `he validate series` passes. Each PR states which "Cover every surface" items applied.
+> **Rules:** code goes in `chrome/browser/rac/storage/` and `chrome/browser/rac/import/`; upstream edits are small hooks, and each PR reports its hunk count. Never edit Helium's importer files. Never read real Arc, Dia, Helium, or rac profiles. Use the maintainer's scrubbed sample and `--rac-import-source-root`, kept out of release builds. Snapshot before every import. No network requests. No plaintext password file without the maintainer's sign-off.
+>
+> **Done means:** fixture tests pass in the worktree-posted status (06-D9). Rerun adds nothing, and Undo restores the sidebar. Screenshots cover the sidebar before and after import in light and dark, both address-bar placements, two profile windows, and incognito unchanged. Videos cover the import and the password hand-off. A net log shows zero requests. `he validate series` passes.
