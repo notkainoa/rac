@@ -9,6 +9,15 @@ together.
 The 15 conflicts between plans (C1 to C15) are resolved, and the fixes are
 written into the plans.
 
+## Your answers (2026-10-27)
+
+Group A is accepted as recommended, except two:
+
+- D4 is open. You asked whether a free route exists. The free options are listed under D4 below.
+- D5 has no answer yet. The Air runs the sync until you give the Pro's RAM and free disk.
+
+You also set a rule for every thread: when a feature in a worktree is done, the agent posts before and after screenshots in the chat, plus a video when the change has an animation or an interaction. See [threads/README.md](threads/README.md).
+
 ## Group A at a glance
 
 These are the 16 week-1 decisions. D9 has three parts.
@@ -60,6 +69,15 @@ signing keys on a laptop. You create the Depot account on day 1, which takes
 about an hour. Depot only compiles. Signing and notarizing run on a
 GitHub-hosted runner.
 [06 build route](06-engineering-and-shipping.md#build-route-a1-to-a3)
+
+Free routes, asked about on 2026-10-27:
+
+1. Free GitHub runners, Apple Silicon only. It costs nothing but time: a build is a chain of 6-hour jobs that takes about 1.5 days. It has never finished. In the last run the Apple Silicon chain had about 3,400 steps left when the Intel chain failed and cancelled it. Turning off that cancel and retrying the flaky download may be enough.
+2. Ask Depot for free open-source runners. Helium's Depot runners are sponsored. Only you can ask.
+3. A self-hosted runner on one of your Macs. The keys stay in GitHub, but the job runs on your Mac and uses it for hours. On the 16 GB Air it competes with every worktree build.
+4. Build and sign on your Mac by hand. It is free, but the signing keys sit on a laptop.
+
+If free matters more than speed: run route 1 now, ask Depot (route 2) at the same time, and pay for Depot only if both fail.
 
 **D5 (06-D1). What are the MacBook Pro's RAM and free disk?** Tell us both,
 or let an agent read them with

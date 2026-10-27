@@ -40,6 +40,7 @@ After the sync merges, worktrees may clone the sync worktree's built 156 tree wi
 
 - Build and run it yourself: `source dev.sh && he build`, then `devutils/rac/worktree.sh run --rac-window-screenshot=/abs/path.png`. Wait for real pixels.
 - Answer AGENTS.md "Cover every surface" item by item. Screenshot matrix: sidebar full, hidden, and edge reveal; light and dark; space themes; multiple windows; incognito; split view; an installed web-app (PWA) window; reduced motion; AI off (no AI button, row, or label).
+- When a feature or fix in a worktree is done, post the proof in the thread's chat, not only in the PR. Show before and after screenshots of every changed surface, embedded as markdown images with absolute paths. If the change has an animation or an interaction (a click, a drag, a shortcut, a flow), also record a short video of it and embed or link it in the chat. The maintainer asked for this on 2026-10-27.
 - Short videos for motion. Focused unit tests only. `he validate series` after touching `patches/series`.
 - Every PR states its net-diff hunk change (D17) and attaches proof with `gh pr create --attach './shot.png#caption'`. Never commit screenshots or videos.
 - PRs are opened only as D9b allows (otherwise only when asked). The maintainer approves every merge.
