@@ -14,7 +14,7 @@ Days count from approval, assumed on Wed 2026-10-28 (day 0). The target launch i
 
 Decisions outside group A are listed in each brief with the day they are needed.
 
-**How launching works.** The maintainer approves the plans, answers group A, and has started step 0 below. Then each thread is a T3 Code thread, started from its brief plus the master plan. A thread's lead opens one worktree per stream and gives each stream a lead agent. All five threads start on day 0. The maintainer approves every merge.
+**How launching works.** The maintainer approves the plans, answers group A, and has started step 0 below. Then each thread is a T3 Code thread, started from its brief plus the master plan. A thread's lead opens one worktree per stream and runs each stream with Claude Code subagents (the Agent tool), working in that stream's worktree. Leads never create new threads: no `delegate_task`, `t3_thread_launch`, or `create_threads`. Free OpenCode models are called from the shell (`opencode run -m ...`), not as threads. The planning thread is the main thread over all five leads. The maintainer asked for this on 2026-10-27. All five threads start on day 0. The maintainer approves every merge.
 
 # Every thread
 
