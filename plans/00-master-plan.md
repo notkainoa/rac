@@ -56,11 +56,15 @@ changes is the overlap:
 3. **A build queue on each Mac (D63).** Agents write code, tests, and
    reviews without building. Builds run one or two at a time. Agents verify
    in batches: one build, then every test and screenshot it allows.
-4. **Three release builds, fire-and-forget (D4, D64).** A thread starts one
-   and keeps working. Only publishing waits.
+4. **Two release builds, fire-and-forget (D4, D64).** Both come from the
+   synced 156 tree. Build 1 is 0.1.0, quiet and unannounced, fired when the
+   sync merges, about day 7. Build 2 is the launch build, 0.2.0, fired on day
+   13. A thread starts one and keeps working. Only publishing waits.
 
-**Truly sequential:** 0.1.0 is published before an update can be proven. The
-sync compiles before hooks go into Helium-shared files, and merges before
+**Truly sequential:** 0.1.0 is published before an update can be proven, and
+the proof runs on the launch build on day 15. If build 1 slips, the proof
+moves to the first point release, and launch is not blocked on it unless the
+maintainer says so. The sync compiles before hooks go into Helium-shared files, and merges before
 the launch build. Gates G1 to G7 merge before the launch build starts. The
 launch build finishes before the last update test, the video (G14), and the
 post. Everything else overlaps.
@@ -90,13 +94,13 @@ gantt
 
     section Ship
     Queue and CI fixes, d0-1            :s1, 2026-10-28, 1d
-    Build 1, 0.1.0 on 154, d1-3         :s2, 2026-10-29, 2d
+    Release checks and runbook, d1-7    :s2, 2026-10-29, 6d
     Sync to 156, d0-7                   :s3, 2026-10-28, 7d
     Checks, protection, drift, d0-10    :s4, 2026-10-28, 10d
-    Build 2, 0.2.0 update proof, d7-10  :s5, 2026-11-04, 3d
+    Build 1, 0.1.0 on 156, d7-9         :s5, 2026-11-04, 2d
     Site and launch copy, d2-13         :s6, 2026-10-30, 11d
     Merge window, d7-13                 :s7, 2026-11-04, 6d
-    Build 3, launch, d13-15             :s8, 2026-11-10, 2d
+    Build 2, launch 0.2.0, d13-15       :s8, 2026-11-10, 2d
     Room for one retry, d15-19          :s9, 2026-11-12, 4d
 
     section Core
@@ -127,12 +131,13 @@ gantt
     Hooks on the table, d16-24          :p2, 2026-11-13, 8d
 ```
 
-**Your steps.** Day 0: approve the builds below, do step 0, merge PR #20,
-ask Depot for sponsorship, run the Arc scrub script (D41), and send the
-Pro's specs (D5). Day 3: publish 0.1.0. By day 5: create `rac-bot`, protect
-`main` (D10), and decide on paid Depot if D4's trigger fires. Days 7 to 13:
-review merges. About day 12: the by-hand Arc sign-in check. Day 15: publish
-the launch build quietly. Day 19: post.
+**Your steps.** Day 0: merge PR #20, run the Arc scrub script (D41), and
+send the Pro's specs (D5) once it is online. Step 0 and the build approvals
+(D6) are done. By day 5: create `rac-bot` and protect `main` (D10). About day
+9: publish 0.1.0 quietly. Days 7 to 13: review merges. About day 12: the
+by-hand Arc sign-in check. Day 15: publish the launch build quietly. Day 19:
+post. Later, not on day 0: ask Depot about sponsorship. Paid Depot needs your
+word, and only if a free build fails twice.
 
 **After launch,** Ship starts the next sync at once (D18). Other timings are
 in the table at the end.
@@ -194,8 +199,10 @@ flowchart TD
   removing the old worktree.
 - **The main checkout** stays on 154 until after launch. After the sync,
   every `setup` names the 156 base.
-- **The Pro (D61),** if approved, hosts the sync and a 156 base, one build
-  at a time. The Air then builds its own 156 base once, on day 4.
+- **The Pro (D61)** is approved but offline (last seen on Tailscale 2 days
+  ago). The Air does everything until it is back. Once it is online and D5
+  qualifies, it can host a 156 base, one build at a time. The Air then builds
+  its own 156 base once, on day 4.
 - **kainoas-linux-mba** runs patch-only checks. Signing stays on GitHub.
 
 ## Launch gates
@@ -213,7 +220,7 @@ G9, G10, and G14 run again on the launch build. Details are in each plan.
 | G6 | Dev switches compiled out of release builds | 05 M0, 02 M0, 04 M1 | Day 12 |
 | G7 | Public copy matches behavior | 05 M0, 06 M5 | Day 12 |
 | G8 | The synced build passes the surface matrix, PWA windows included | 06 M2, 01 M0 | Day 7 |
-| G9 | Signed, notarized synced build passes install and update tests from 0.1.0; bad-release runbook | 06 M1, M3 | Days 10, 15 |
+| G9 | Signed, notarized synced build passes install tests (0.1.0) and the update test from 0.1.0 (launch build); bad-release runbook | 06 M1, M5 | Days 9, 15 |
 | G10 | Network host list published from a capture | 06 M4 | Days 10, 15 |
 | G11 | Speed numbers published, or the site line softened (D60) | 06 M4 | Day 10 |
 | G12 | DRM test page checked | 06 M5 | Day 10 |
@@ -229,28 +236,30 @@ plan 07 M1, Peek, and the little window.
 AGENTS.md forbids full builds and `he reset` without your approval. Before
 launch, this plan asks for these and no others (D6):
 
-1. **Step 0, day 0:** one incremental `he build` in the main checkout.
+1. **Step 0, day 0 (done):** one incremental `he build` in the main
+   checkout, pulled to d3f0d66 and synced. The build is running.
 2. **The sync's cold build, day 0:** one full 156 build in the sync
    worktree. Helium's patches build first, overnight, while agents fix
    rac's. rac's patches then build on top, incrementally.
 3. **Cloning the 156 base, from day 4:** `worktree.sh setup <sync
    worktree>` on the same Mac. No new full build.
-4. **Only if the Pro hosts the sync (D61):** one cold 156 build on the Air,
-   in a `base-156` worktree, day 4, overnight.
-5. **CI release builds:** 0.1.0 (day 1), 0.2.0 (day 7), launch (day 13)
-   (D64). Paid Depot only on D4's trigger.
+4. **Only if the sync moves to the Pro (D61):** one cold 156 build on the
+   Air, in a `base-156` worktree, day 4, overnight. Not needed while the Pro
+   is offline.
+5. **CI release builds (D64):** 0.1.0 about day 7, from the synced tree, and
+   the launch build 0.2.0 on day 13. Paid Depot only if a free build fails
+   twice, and only on your word.
 
 Not asked for: `he reset` in the main checkout. Its one 156 rebuild after
 launch is optional and asked for separately.
 
 ## After your review
 
-0. Fix your main checkout: it is 71 commits behind `origin/main`, has an
-   uncommitted `.gitignore` change, and is in the merged state. Then run
-   `git -C /Users/knewton/Dev/Github/rac pull --ff-only` and start
-   `source dev.sh && he build` there. Threads start in light worktrees
-   while it runs.
-1. Answer group A of [decisions.md](decisions.md), including D61 to D64.
+0. Done: the main checkout was pulled to d3f0d66 and synced, and
+   `source dev.sh && he build` is running there. Threads start in light
+   worktrees while it runs.
+1. Group A of [decisions.md](decisions.md) is answered except D5 (the Pro's
+   specs; the Pro is offline).
 2. VISION.md, AGENTS.md, and `docs/roadmap.md` change only with your OK.
 3. All five threads launch from their briefs plus this page.
 
@@ -291,11 +300,11 @@ merged by day 13, else the first point release, about day 26.
 | 05 M2 workspace, write tier | 25-45 | Point release | Core with UI |
 | 05 M3 | 45-55 | Later | Core |
 | 06 M0 pipeline, queue | 0-1 | None | ship ci |
-| 06 M1 quiet 0.1.0 | 1-3 | 0.1.0 | ship ci |
-| 06 M2 sync | 0-7, slack to 10 | 0.2.0 | ship sync |
-| 06 M3 update proof | 7-10 | 0.2.0 | ship ci |
+| 06 M1 0.1.0 (checks 1-7, build fired about 7, published about 9) | 1-10 | 0.1.0 | ship ci |
+| 06 M2 sync | 0-7, slack to 10 | 0.1.0 | ship sync |
+| 06 M3 evidence on 0.1.0 | 9-10 | None | ship ci, checks |
 | 06 M4 checks, evidence | 0-10 | L | ship checks |
-| 06 M5 launch | Site 2-13, build 13, post 19 | L | ship site, ci |
+| 06 M5 launch, with the update proof | Site 2-13, build 13, proof 15, post 19 | L, 0.2.0 | ship site, ci |
 | 06 later | Next sync 19-33, beta 20-30, crash reports 25-40, folder move about 40 | Later | Ship |
 | 07 M0 matcher, fields | 1-6, fields 16-20 | P1 | power logic |
 | 07 M1 Arc habits | Logic 1-6, hooks 16-24 | P1 | power logic |

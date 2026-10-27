@@ -6,7 +6,7 @@ Days count from approval, assumed on Wed 2026-10-28 (day 0). The target launch i
 
 | Thread | Owns | Streams | Starts | Machine |
 | --- | --- | --- | --- | --- |
-| [Ship](ship.md) | Plan 06 M0 to M5, the sync, the build queue, the merge order, launch gates G9 to G14, later the beta channel and plain-folder move | `ci`, `sync`, `checks`, `site` | Day 0 | The sync on the Mac from D61. Free GitHub runners compile releases. Light worktrees for CI and site |
+| [Ship](ship.md) | Plan 06 M0 to M5, the sync, the build queue, the merge order, launch gates G9 to G14, later the beta channel and plain-folder move | `ci`, `sync`, `checks`, `site` | Day 0 | The sync on the Air (the Pro, D61, is approved but offline). Free GitHub runners compile releases. Light worktrees for CI and site |
 | [UI](ui.md) | Plan 01 M0 to M4 and M6 (M5 with Core), plan 02 M0 to M5, the harness | `tools`, `import`, `bar`, `peek`, `clear`, `design`, `motion` (day 7) | Day 0 | The Air, through the queue |
 | [Core](core.md) | Plan 05 M0 (launch gate), plan 03 M0 and M1; after launch the door, warm agent, 05 M2 and M3, thinning | `guard`, `evals`, `doors` (day 4), `table` | Day 0 | The Air, through the queue; `doors` on the 156 base |
 | [Data](data.md) | Plan 04 M0, M1, and M2 if ready; after launch partitions and the AI store | `net`, `reader`, `apply` (day 3), `signins` | Day 0 | The Air, through the queue; light unit-test builds |
@@ -14,7 +14,7 @@ Days count from approval, assumed on Wed 2026-10-28 (day 0). The target launch i
 
 Decisions outside group A are listed in each brief with the day they are needed.
 
-**How launching works.** The maintainer approves the plans, answers group A, and starts step 0 below. Then each thread is a T3 Code thread, started from its brief plus the master plan. A thread's lead opens one worktree per stream and gives each stream a lead agent. All five threads start on day 0. The maintainer approves every merge.
+**How launching works.** The maintainer approves the plans, answers group A, and has started step 0 below. Then each thread is a T3 Code thread, started from its brief plus the master plan. A thread's lead opens one worktree per stream and gives each stream a lead agent. All five threads start on day 0. The maintainer approves every merge.
 
 # Every thread
 
@@ -26,7 +26,7 @@ Each brief says "Follow 'Every thread' in the README" and adds only what is spec
 
 ## Step 0: start from an up-to-date main
 
-The main checkout at `/Users/knewton/Dev/Github/rac` has a local `main` 71 commits behind `origin/main`, and its `build/src` was built from that. On day 0 the maintainer fast-forwards it (`git -C /Users/knewton/Dev/Github/rac pull --ff-only`, after dealing with its uncommitted `.gitignore` change) and starts one incremental `source dev.sh && he build` there. Threads never do this themselves.
+The maintainer has done this already: the main checkout at `/Users/knewton/Dev/Github/rac` was pulled to d3f0d66 and synced, and one incremental `source dev.sh && he build` is running there. Threads never do this themselves.
 
 Nobody waits for that build. Streams start at once in **light worktrees**: `git worktree add -b <branch> <path> origin/main`, with no `setup` and no build tree. They run the understand and design stages, reading Chromium sources from the main checkout's `build/src`, read only. New code is drafted in a git-ignored scratch folder in the worktree and becomes a patch through quilt once the tree exists. A stream runs `devutils/rac/worktree.sh setup` only when its first batch is ready to build, and only after step 0's build has finished, since setup refuses to clone during a build. If `git merge-base --is-ancestor origin/main main` fails in the main checkout at that point, stop and tell the maintainer.
 
@@ -81,4 +81,4 @@ Every local build goes through `devutils/rac/build-queue.sh`, never a bare `he b
 - **By hand.** Real-Arc and default-browser checks are done by the maintainer, by hand, on a second macOS user.
 - Never take the foreground (no foreground automation, no system dialogs).
 - No full build, `he reset`, or deleting `build/` without approval. D6 names the five allowed builds. If a worktree build shows tens of thousands of steps, stop.
-- **Other machines.** Agents SSH to the MacBook Pro only if the maintainer approves D61, and only for that work. Runs there use `--rac-launch-in-background`.
+- **Other machines.** Agents SSH to the MacBook Pro only for D61's work, and only once it is back online (it is offline now, so the Air does everything). Runs there use `--rac-launch-in-background`.

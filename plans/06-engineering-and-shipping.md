@@ -10,9 +10,9 @@ This plan owns the shared calendar. Days are counted from the maintainer's appro
 
 Nobody can install rac yet. This plan ships a signed copy, catches rac up with Helium, and launches it for Arc users.
 
-Release builds run on GitHub's free Macs, for Apple Silicon only. One takes about 1.5 days, and none has finished yet. You also ask Depot for free open-source runners. rac pays for Depot only if the free builds keep failing and Depot says no. That is fine because nothing waits on a release build: a thread starts one and keeps working.
+Release builds run on GitHub's free Macs, for Apple Silicon only. One takes about 1.5 days, and none has finished yet. The maintainer will ask Depot about free open-source runners later, not on day 0. rac pays for Depot only if a free build fails twice, and only on the maintainer's word. That is fine because nothing waits on a release build: a thread starts one and keeps working.
 
-There are three release builds before launch. A quiet "Preview" 0.1.0 on today's code starts on day 1. Meanwhile rac catches up with Helium, from Chromium 154 to 156, in about a week. A quiet 0.2.0 from the synced code starts on day 7 and proves that updates reach installed copies. The launch build starts on day 13 with Arc import and a safer agent, and launch is day 19.
+There are two release builds before launch, both from the synced Chromium 156 tree. First rac catches up with Helium, from Chromium 154 to 156, in about a week. Build 1 is 0.1.0, quiet and unannounced. It starts when the sync merges, about day 7. Build 2 is the launch build, 0.2.0, with Arc import and a safer agent. It starts on day 13 and proves that updates reach installed copies from 0.1.0, before anyone is told. Launch is day 19.
 
 Local builds are rare too. Every agent build goes through a queue, one or two at a time per Mac. The plan names exactly which full builds you approve.
 
@@ -27,18 +27,19 @@ flowchart LR
 
 | Id | Question | Options | Recommended |
 | --- | --- | --- | --- |
-| 06-D1 (D5, D61) | Which Mac runs the Helium sync? Does the Pro become a second build Mac? | The shared Air; the MacBook Pro | The Pro if it has 32 GB RAM and 150 GB free |
-| 06-D2 (D4) | How are releases built? | Free GitHub runners; Depot, sponsored or paid; a local Mac | Answered: free first, ask Depot in parallel, pay only if both fail |
+| 06-D1 (D5, D61) | Which Mac runs the Helium sync? Does the Pro become a second build Mac? | The shared Air; the MacBook Pro | D61 approved, but the Pro is offline, so the Air for now. D5 is unknown |
+| 06-D2 (D4) | How are releases built? | Free GitHub runners; Depot, sponsored or paid; a local Mac | Answered: free first, ask Depot later, pay only if a free build fails twice and the maintainer says so |
 | 06-D3 (D7) | Support Intel Macs at launch? | Yes, about $99 a build; no | No, Apple Silicon only for 0.x |
-| 06-D4 (D3, D64) | Publish a quiet 0.1.0 on Chromium 154 first? How many release builds before launch? | Two; three; more | Three: 0.1.0, 0.2.0 to prove updates, and the launch |
+| 06-D4 (D3, D64) | Publish a quiet 0.1.0 on Chromium 154 first? How many release builds before launch? | Two; three; more | Answered: no 154 build. Two builds from 156: 0.1.0 about day 7, and the launch build 0.2.0 on day 13 |
 | 06-D5 (D2) | In what order does the work happen? | Ship, sync, launch, then revamp; revamp first; a stable track plus revamp branches | A stable track ships while the revamp runs in parallel streams |
 | 06-D6 (D8) | What if the sync isn't merged by day 10? | Launch on 154 as a preview; hold the launch | Hold. Decide on 154 only if it isn't merged by day 30 |
 | 06-D7 (D18) | How often does rac sync after launch? | Every Chromium major within 14 days; every other major | Every major, reviewed after three cycles |
 | 06-D12 (D58) | Move rac's own source files out of patches into a folder? | Yes, after launch; no | Yes, after launch |
 
-- 06-D1. The Pro needs at least 32 GB of RAM and 150 GB free, otherwise the Air does everything. Please send its specs, or let an agent read them.
+- 06-D1. The Pro is offline (last seen on Tailscale 2 days ago), so the Air does everything until it is back. It needs at least 32 GB of RAM and 150 GB free to take the sync's base work. Please send its specs, or let an agent read them.
 - 06-D2. Free runners and Depot only compile. Signing runs on GitHub's own runner, so the keys never leave GitHub. A local build would move them.
 - 06-D5. The stable track ships 0.1.0, the sync, and the launch. The revamp runs in parallel streams and stacks on the 156 base once the sync compiles (D62).
+- 06-D4. If build 1 slips, the update proof moves to the first point release, and launch is not blocked on it unless the maintainer says so.
 - 06-D6. Arc's shutdown is a month after the target, so holding is cheap. The 154 fallback must still start by 12-15.
 - 06-D7. Security fixes ship within 7 days if attackers already use the bug, otherwise within 14.
 
@@ -96,8 +97,8 @@ The real trade is money versus days versus keys leaving GitHub. Because nothing 
 
 **A2. Depot runners (M4, 8 cores, 24 GB).** The same CI on faster rented Macs, used only to compile. Helium's arm64 build takes about 7 hours there. Signing, notarization, stapling, and appcast signing run in a final job on GitHub's own `macos-latest` runner, so the keys never go to Depot.
 - Cost per attempted build: about $35 warm, maybe $70 for the first cold one (INFERENCE from `helium`), plus a plan of about $20 a month.
-- Expected builds under this plan: three before launch, then about one point release a week. That is about $150 a month if paid.
-- Sponsored route: Helium's Depot runners are sponsored. Only the maintainer can ask, on day 0. If Depot says yes, use it for every build after that.
+- Expected builds under this plan: two before launch, then about one point release a week. That is about $150 a month if paid.
+- Sponsored route: Helium's Depot runners are sponsored. Only the maintainer can ask, and will do so later, not on day 0. If Depot says yes, use it for every build after that.
 - Who acts: only the maintainer can create the account, set billing and a spending limit, and install the GitHub app. That takes about an hour.
 - Pros: 2 phases, a working cache, room for test targets, and a realistic 14-day cadence. Cons: spend and a vendor, unless sponsored.
 - Effort S: about 1 agent-day after signup. Risk: low.
@@ -113,7 +114,7 @@ Rejected:
 - A self-hosted runner. The repo is public, so a stranger's PR could run code on the Mac (`eng-matrix`).
 - Larger GitHub runners. They need an organization, which puts the permanent feed path at risk, and they are slower per dollar than Depot (see "Where we are today").
 
-**Answered (D4, 2026-10-27): A1 first, with a sponsored A2 asked for in parallel. Paid A2 only if both fail.** "Both fail" means build 1 fails twice in a row, or can't finish its framework link inside a phase, and Depot hasn't offered sponsorship by day 5. Then the maintainer decides on paid Depot with a $300 monthly cap. A3 stays the emergency path only.
+**Answered (D4, 2026-10-27): A1 first. A sponsored A2 is asked for later. Paid A2 is the fallback only if a free build fails twice.** A failure means two builds in a row fail, or one can't finish its framework link inside a phase. Paying needs the maintainer's word at that time, with a $300 monthly cap. A3 stays the emergency path only.
 
 ### Intel (B1, B2)
 
@@ -153,14 +154,14 @@ Days count from approval on Wed 10-28 (day 0). "Chromium" is the version the wor
 
 | Days | Chromium | Work | Gate | Owner |
 | --- | --- | --- | --- | --- |
-| 0 | 154 | Build queue, CI fixes, Depot sponsorship ask, step 0 | Queue script works; PR #20 merged | 06 `ci`, maintainer |
+| 0 | 154 | Build queue, CI fixes. Step 0 is done | Queue script works; PR #20 merged | 06 `ci`, maintainer |
 | 0-7 | 154 to 156 | M2 sync. The cold build starts on day 0 | 156 base tagged about day 4; sync merged by day 7, slack to 10 | 06 `sync` |
-| 1-3 | 154 | M1 build 1, quiet 0.1.0. Fired on day 1, nobody waits | Smoke on the CI artifact before publishing | 06 `ci` |
+| 1-7 | 154, then 156 | M1 release readiness: preflight, `install-smoke`, `update-smoke`, runbook. No release build yet | Jobs reviewed and dry-run where they need no build | 06 `ci` |
 | 0-10 | 154, then 156 | M4 checks, protection, evidence | `main` protected by day 5 | 06 `checks` |
 | 4-13 | 156 | Streams stack on the 156 base and write their hooks | Each stream's PR ready | Every thread |
-| 7-10 | 156 | M3 build 2, 0.2.0. Fired at the sync merge | `update-smoke` 0.1.0 to 0.2.0; host list and bench on it | 06 `ci`, `checks` |
+| 7-10 | 156 | M1 build 1, quiet 0.1.0. Fired at the sync merge, nobody waits. M3 evidence on it | Smoke on the CI artifact before publishing, about day 9; host list and bench on it | 06 `ci`, `checks` |
 | 7-13 | 156 | Merge window, in Ship's merge order | Launch gates merged by the start of day 13 | 06, maintainer |
-| 13-15 | 156 | M5 build 3, the launch build 0.3.0 | `install-smoke`, `update-smoke`, G14 video | 06 `ci` |
+| 13-15 | 156 | M5 build 2, the launch build 0.2.0 | `install-smoke`, `update-smoke` from 0.1.0, G14 video | 06 `ci` |
 | 15-19 | 156 | Quiet publish, then launch. Room for one retry | Every launch gate checked | 06, maintainer |
 
 Anchors:
@@ -168,6 +169,8 @@ Anchors:
 - The 12-15 hard stop is met as long as approval comes by about 12-02.
 
 **Slip rule (06-D6).** If the sync isn't merged by day 10, hold the launch and keep the other streams going on the 156 base. Only if it isn't merged by day 30 does the maintainer decide whether to launch on 154 as "Preview, Chromium 154", with the launch gates rebased back. That fallback must start by 12-15.
+
+**Build 1 slip rule (06-D4).** If build 1 isn't published by day 13, the launch build still fires. The update proof then moves to the first point release, about day 26, and launch is not blocked on it unless the maintainer says so.
 
 **Launch gates:** G1 to G15 in `plans/00-master-plan.md`. M5 checks every one.
 
@@ -190,13 +193,13 @@ Goal: a release chain that can finish on free runners, cheap checks on every PR,
 
 Tasks:
 1. **Day 0, first:** the build queue above.
-2. **Maintainer, day 0:** merge PR #20, and ask Depot for open-source runners.
+2. **Maintainer, day 0:** merge PR #20. Asking Depot for open-source runners comes later.
 3. Harden the checkpoint download in `build-phase.yml`:
    - Retry at the step level: re-run `download-artifact`, or fall back to `gh run download`.
    - Compare the digest reported at upload with the downloaded file.
    - Fail clearly after 3 attempts. If the upload itself was short, re-download won't fix it, so also check the archive size and digest in the uploading job.
 4. Add an `arches` input (default `arm64`) and set `fail-fast: false`. Make the release scripts and `github_write_appcasts.sh` handle only the arches built.
-5. Keep the compile on free `macos-latest` runners, through the existing `runner` input. If D4's trigger fires, point it at `depot-macos-latest` with Depot Cache. Either way, sign, notarize, staple, and sign the appcast in a final job on a GitHub-hosted `macos-latest` runner, so the secrets never leave GitHub.
+5. Keep the compile on free `macos-latest` runners, through the existing `runner` input. If D4's trigger fires and the maintainer says yes, point it at `depot-macos-latest` with Depot Cache. Either way, sign, notarize, staple, and sign the appcast in a final job on a GitHub-hosted `macos-latest` runner, so the secrets never leave GitHub.
 6. Make non-release builds refuse to start on the default `me.kainoa.rac` user-data folder, so a stray launch can never open the maintainer's real profile. Dev runs already pass `--user-data-dir`.
 7. Add PR checks on Linux (days 0-2):
    - the 71 Python tests;
@@ -205,34 +208,34 @@ Tasks:
    - plan 03's patch-surface counter (ruling 11).
    Make `sanity-check.sh` fail on "with fuzz" too. Ask the maintainer about `pullfrog.yml` (a maintainer-installed workflow); don't delete it.
 
-Acceptance: build 1 is running by day 1; a forced bad download is retried or fails clearly; PR checks take under 15 minutes; two agents asking for a build at once get one slot each, and a third waits. Verification: run links and queue logs. Patch surface: none.
+Acceptance: the chain is ready to fire the day the sync merges; a forced bad download is retried or fails clearly; PR checks take under 15 minutes; two agents asking for a build at once get one slot each, and a third waits. Verification: run links and queue logs. Patch surface: none.
 
 Effort: about 2 agent-days (Sonnet), plus an hour of maintainer time.
 
-### M1. Quiet 0.1.0 on 154 (days 1-3, build 1)
+### M1. 0.1.0, the first signed release (days 1-10, build 1)
 
-Goal: the first signed, notarized release works on a clean Mac. Nobody is told about it.
+Goal: the first signed, notarized release, built from the synced 156 tree, works on a clean Mac. Nobody is told about it. There is no 154 build (D3).
 
 Tasks:
-1. Preflight, before firing build 1:
+1. Preflight, days 1-7, before firing build 1:
    - Check the empty `MAC_TEAM_ID` under real signing.
    - Check that the entitlements profile covers every claimed entitlement. An app that claims more than its profile grants won't launch (`eng-matrix`).
    - Notarize and staple the DMG.
-2. Fire build 1 on day 1 and keep working. Nobody waits on it.
-3. Add an `install-smoke` job that runs on the **CI artifact, before the release step publishes anything**. On a free macOS runner (a clean Mac):
+2. Fire build 1 from `main` as soon as the sync merges, about day 7, and keep working. Nobody waits on it. The release path is untested until it finishes. If it fails, fix and fire once more; the launch build on day 13 is the next attempt.
+3. Write `update-smoke` (used in M5) and add an `install-smoke` job that runs on the **CI artifact, before the release step publishes anything**. On a free macOS runner (a clean Mac):
    - attach the DMG with `-nobrowse`;
    - run `spctl -a -vv`, `codesign --verify --deep --strict` and `stapler validate`;
    - launch with a throwaway profile and `--rac-window-screenshot`, and check the PNG has real pixels;
    - confirm the updater reaches the real feed without an error.
-4. Publish 0.1.0 on the maintainer's word, about day 3. The note says: "Preview. Not for daily use. Chromium 154." Keep `RELEASE_READY = false`. If the build fails, fix and fire once more. Two failures in a row trigger D4.
-5. **Bad-release runbook** in `docs/operations/releases.md`:
+4. Publish 0.1.0 on the maintainer's word, about day 9. It is quiet and unannounced. The note says: "Preview. Not for daily use." Keep `RELEASE_READY = false`. Two failures in a row trigger D4.
+5. **Bad-release runbook**, written during days 1-7, in `docs/operations/releases.md`:
    - Un-publish fast by flipping the bad release to a prerelease. `latest` then falls back to the previous release, so nobody new is offered the bad one (INFERENCE from `latest` skipping prereleases).
    - Fix forward with a higher version within 48 hours. Versions never go down.
    - If a build can't launch, its users must download again by hand. Post a note on the release and the site.
    - Only the maintainer decides. An agent flips a release only on their word.
    - Test that a lower version is never offered.
 
-Acceptance: 0.1.0 is public, smoke passes, the runbook exists. Verification: runner logs and About rac screenshots; nothing runs on the shared Mac. Effort: 2 to 3 agent-days (Opus for signing). Risk: 0.1.0 is linkable, since "quiet" is not access control; flip it to a prerelease once the launch build ships.
+Acceptance: 0.1.0 is public by about day 9, smoke passes, the runbook exists. Verification: runner logs and About rac screenshots; nothing runs on the shared Mac. Effort: 2 to 3 agent-days (Opus for signing). Risk: 0.1.0 is linkable, since "quiet" is not access control; flip it to a prerelease once the launch build ships.
 
 ### M2. Sync to Helium 0.20.1.1 / Chromium 156 (days 0-7, slack to day 10)
 
@@ -240,7 +243,7 @@ Goal: every rac feature works on 156, and a compiling 156 base exists by about d
 
 Tasks:
 1. **Day 0:** restore the fetch-only `upstream` remote: `git remote add upstream https://github.com/imputnet/helium-macos && git remote set-url --push upstream no_push`. Announce the short freeze: nothing under `patches/` merges until the sync does.
-2. In a `sync/helium-0.20.1.1` worktree on the Mac from D61, branched from `origin/main`, merge the tag. Only `patches/series` should conflict (FACT, `helium`). The sync needs no 154 tree, so it doesn't wait for step 0.
+2. In a `sync/helium-0.20.1.1` worktree on the Air (the Pro only once it is online, D61), branched from `origin/main`, merge the tag. Only `patches/series` should conflict (FACT, `helium`). The sync needs no 154 tree, so it doesn't wait for step 0.
 3. Adopt the new `prepare_sources` and `configure_build` signatures and Helium's prepared tarballs.
 4. **Start the cold build on day 0, with Helium's patches only** (`quilt push` up to Helium's last patch). It runs overnight, alone in the queue on that Mac, while agents fix rac's patches as text. It also measures the build time every later sync depends on.
 5. **Mechanical fixes** (parallel, one agent per patch group; Sonnet or open-weight): `ui/BUILD.gn`, the moved `tabs/` files, context drift. These are text fixes against the 156 sources and need no build.
@@ -256,26 +259,19 @@ Acceptance: a clean fuzz-0 `quilt push -a` and passing targets. Screenshots of s
 
 Effort: L, about 8 to 12 agent-days, now spread over many agents. The serial part is the cold build plus the compile rounds. Calendar: about 7 days. The compile cost is still unmeasured.
 
-**No base rebuild before launch.** The main checkout stays on 154. On the sync's Mac, worktrees clone the sync worktree. If the Pro hosts the sync (D61), the Air builds one `base-156` worktree from the 156 base on day 4, overnight. After the sync merges, the base worktree fast-forwards to `main` and rebuilds incrementally. The main checkout's own 156 rebuild waits until after launch, if it's needed at all.
+**No base rebuild before launch.** The main checkout stays on 154. On the sync's Mac, worktrees clone the sync worktree. The sync runs on the Air for now. If it moves to the Pro (D61, once the Pro is online), the Air builds one `base-156` worktree from the 156 base on day 4, overnight. After the sync merges, the base worktree fast-forwards to `main` and rebuilds incrementally. The main checkout's own 156 rebuild waits until after launch, if it's needed at all.
 
-### M3. 0.2.0, the update proof (days 7-10, build 2)
+### M3. Evidence on 0.1.0 and the drift detector (days 9-10)
 
-Goal: prove the 156 pipeline and the update loop in one step, a week before the launch build.
+Goal: use the first 156 build for evidence, so none of it waits for the launch build.
 
 Tasks:
-1. Fire build 2 from `main` as soon as the sync merges. Treat the new build path as unproven until it finishes. Nobody waits on it. If it fails, fix the pipeline; the launch build is the next attempt.
-2. `update-smoke` on a free runner:
-   - install 0.1.0;
-   - make a space and a pinned tab;
-   - let Sparkle update to 0.2.0 from the real feed, then relaunch;
-   - confirm 0.2.0, data carried over, no Keychain prompt, and no offer of a lower version.
-3. Publish 0.2.0 quietly.
-4. Run the network capture, the DRM test page, and the bench on 0.2.0 (M4), so they don't wait for the launch build.
-5. Add the drift detector: a daily, read-only Linux job that sparse-applies each new helium-macos tag at fuzz 0 and updates one rac issue with failing patches and exact commands (Cra and Zen patterns).
+1. Run the network capture, the DRM test page, and the bench on 0.1.0 (M4).
+2. Add the drift detector: a daily, read-only Linux job that sparse-applies each new helium-macos tag at fuzz 0 and updates one rac issue with failing patches and exact commands (Cra and Zen patterns).
 
-Acceptance: `update-smoke` passes, and the detector has opened its first issue.
+Acceptance: one host list and one bench table exist, and the detector has opened its first issue.
 
-Effort: about 3 to 4 agent-days.
+Effort: about 2 agent-days.
 
 ### M4. Checks, protection and evidence (days 0-10)
 
@@ -286,7 +282,7 @@ Tasks:
    - Don't require linear history: Helium syncs are merge commits (FACT, `docs/operations/upstream-sync.md`).
    - Agents push as the machine user `rac-bot`. Commits stay authored by Kainoa Newton, so the approval is a real gate.
 2. **`devutils/rac/test.sh`** builds and runs the affected test targets in the worktree, through the queue, and posts a `rac/unit-tests` status. It is a reminder, not a gate: the same machine posts it. The real gates are the Linux checks and the approval. Add the PR flow to `AGENTS.md` in one short section.
-3. **Network capture.** A free runner installs the release DMG and runs a fresh profile for 10 minutes with `--log-net-log`, before and after Helium-services consent. It compares the hosts contacted with a published list (Stedding's pattern, `long-tail`). Run it on 0.2.0, then again on the launch build.
+3. **Network capture.** A free runner installs the release DMG and runs a fresh profile for 10 minutes with `--log-net-log`, before and after Helium-services consent. It compares the hosts contacted with a published list (Stedding's pattern, `long-tail`). Run it on 0.1.0, then again on the launch build.
 4. **Speed bench** in `devutils/rac/bench/`. It drives rac and the Helium release on the same Chromium major over DevTools, with throwaway profiles. It measures cold launch, new tab, tab switch, sidebar reveal, memory at 1, 10 and 20 tabs, and idle CPU and wakeups. Rounds are interleaved, reporting medians with min and max (Ardia's method).
    - Advisory on free runners, after measuring the noise floor from 10 repeats. The release gate is one run on an idle real Mac, at night when the queue is empty.
 
@@ -294,13 +290,13 @@ Acceptance: an unapproved PR can't merge. One host list and one bench table are 
 
 Effort: about 6 to 8 agent-days, in the `checks` stream.
 
-### M5. Arc-refugee launch (days 2-19, build 3)
+### M5. Arc-refugee launch (days 2-19, build 2)
 
 Tasks:
 1. Days 2-13, in the `site` stream: fix public claims ("thin layer", "It asks before it acts", "four weeks", `rac-baseline`). Add a "Moving from Arc" page and comparison pages. Draft Show HN, r/ArcBrowser and Product Hunt posts. The maintainer posts them.
-2. The site says "Apple silicon, macOS 13+". Load a DRM test page in 0.2.0 first. Then state the real Netflix-class DRM status.
-3. Day 13: check every launch gate that doesn't need the launch build, then fire build 3, the launch build 0.3.0.
-4. Day 15: `install-smoke`, `update-smoke` from 0.1.0 and from 0.2.0, the host capture again, and the G14 video. Publish quietly on the maintainer's word. If it fails, fix and fire once more; days 15 to 19 leave room for one retry.
+2. The site says "Apple silicon, macOS 13+". Load a DRM test page in 0.1.0 first. Then state the real Netflix-class DRM status.
+3. Day 13: check every launch gate that doesn't need the launch build, then fire build 2, the launch build 0.2.0.
+4. Day 15: `install-smoke`, `update-smoke` from 0.1.0 (the update proof: install 0.1.0, make a space and a pinned tab, let Sparkle update to 0.2.0 from the real feed, then relaunch; confirm 0.2.0, data carried over, no Keychain prompt, and no offer of a lower version), the host capture again, and the G14 video. Publish quietly on the maintainer's word. If build 1 slipped, the update proof moves to the first point release (see the build 1 slip rule). If it fails, fix and fire once more; days 15 to 19 leave room for one retry.
 5. Day 19: flip `RELEASE_READY` and add the Vercel deploy hook (`docs/operations/releases.md`). The maintainer posts.
 6. Measure success only by GitHub download counts, with no analytics. Add issue templates for crashes and import. A triage agent labels issues and never closes them.
 
@@ -326,7 +322,7 @@ Effort: about 4 agent-days (UI rule for site pages).
 - **AI off costs nothing.** Unchanged. The test targets include `MasterSwitchGatesEntryPoints`. Plan 05 owns the wider checks, and ruling 16's "no AI labels with AI off" becomes part of M2's screenshot checks.
 - **Cheap to update.** This plan carries it: the detector, the 14-day cadence, the no-fuzz gate, plan 03's counter, and the overlay.
 - **Calm UI and GPL-3.0.** Unaffected.
-- **Bent, with reasons.** 0.1.0 ships Chromium 154 as a labeled, short-lived preview, so updates are proven before anyone relies on them. The 06-D6 slip path could launch on 154; that is the maintainer's call. Paying a vendor happens only if the free and sponsored routes both fail.
+- **Bent, with reasons.** 0.1.0 is a quiet, unannounced build on Chromium 156, so updates are proven before anyone relies on them. The 06-D6 slip path could launch on 154; that is the maintainer's call. Paying a vendor happens only if a free build fails twice and the maintainer says so.
 
 ## Dependencies on other plans
 
@@ -339,19 +335,19 @@ Effort: about 4 agent-days (UI rule for site pages).
 
 ## Risks and unknowns
 
-- **Free runners have never finished a build.** The 1.5 days is a guess. The framework link on 7 GB of RAM is untested. Each failure costs about 1.5 days, which the launch's four spare days can absorb once. If D4's trigger fires, builds move to Depot, where one takes about 7 hours.
-- **Depot unknowns.** Sponsorship, rate, cold-build time and terms are unconfirmed.
+- **Free runners have never finished a build.** The 1.5 days is a guess. The framework link on 7 GB of RAM is untested. Each failure costs about 1.5 days. Build 1 has slack until day 13, and the launch's four spare days can absorb one retry. If D4's trigger fires and the maintainer says yes, builds move to Depot, where one takes about 7 hours.
+- **Depot unknowns.** The maintainer will ask later. Sponsorship, rate, cold-build time and terms are unconfirmed.
 - **The sync's compile cost** is unmeasured, since the dry run checks text only (FACT, `helium`). Chromium 157 lands 11-03, mid-sync. Ignore it until launch.
 - **The heavy Mac.** M2's cold build takes the whole Mac for a night. On a 16 GB Air, two builds plus many agent sessions plus harness runs can swap. The queue caps builds; leads cap agent sessions. If a cold build takes more than about 12 hours, the sync slips by a day.
 - **Disk.** The Air has 101 GB free. The sync tree and many cloned worktrees grow as they build. The queue refuses below 20 GB, and old 154 worktrees are removed with the maintainer's OK once their branch is on 156.
 - **The merge window.** Most PRs merge in days 7 to 13, and the maintainer approves each one. Ship's merge order and small PRs per stream keep it moving.
-- **First-signing surprises** (team ID, entitlements, Sparkle's consent prompt): M1 smoke catches them.
+- **First-signing surprises** (team ID, entitlements, Sparkle's consent prompt): M1 smoke catches them, but only from day 9, since the first build is on 156.
 - **Launching on 156 in mid-November** means Chromium is one major old at launch, without 157's security fixes (INFERENCE). The first cadence sync, started right after launch, is the fix.
 
 ## Open questions
 
-1. What are the MacBook Pro's RAM and free disk? This answers 06-D1 and D61.
-2. Will Depot offer open-source terms? What does a cold rac build cost there?
+1. What are the MacBook Pro's RAM and free disk? It is offline for now. This answers 06-D1 and how much the Pro does under D61.
+2. Will Depot offer open-source terms when the maintainer asks? What does a cold rac build cost there?
 3. Can a free runner link the main framework inside one 6-hour phase on 7 GB of RAM?
 4. Does an official build tree compile the five test targets cheaply?
 5. Does a signed first launch ask for update consent? Does Keychain prompt across an update?

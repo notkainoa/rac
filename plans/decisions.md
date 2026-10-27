@@ -14,30 +14,38 @@ written into the plans.
 
 Group A is accepted as recommended, with these changes:
 
-- **D4 is answered: free first.** Free GitHub runners for Apple Silicon only, with fail-fast off, the checkpoint download retried, and PR #20 merged. You ask Depot for open-source sponsorship at the same time. Paid Depot only if both fail.
-- **D5 has no answer yet.** It now also decides D61, the second build Mac. The Air does everything until you give the Pro's RAM and free disk.
+- **D4 is answered: free first.** Free GitHub runners for Apple Silicon only, with fail-fast off, the checkpoint download retried, and PR #20 merged. You will ask Depot about open-source sponsorship later, not on day 0. Paid Depot is the fallback only if a free build fails twice, and paying needs your word at that time.
+- **D5 has no answer yet.** It also decides how much the Pro does under D61. The Air does everything until the Pro is online and you give its RAM and free disk.
 - **New direction: much shorter and more parallel.** You expect the work to take a couple of weeks. Full builds are rare and run in the background, and nobody waits on them. More work runs in parallel. So D1, D6, D8, D9a, D11, and D16 are rewritten, every date-tied decision now names a day, and D61 to D64 are new. The rewritten and new ones need your answer again.
+
+Later answers, also 2026-10-27:
+
+- **D3 is answered: no.** There is no quiet 0.1.0 on Chromium 154.
+- **D64 is answered: two release builds,** both from the synced Chromium 156 tree, both fire-and-forget on free GitHub runners. Build 1 is 0.1.0, quiet and unannounced, fired once the sync merges, about day 7. Build 2 is the launch build, 0.2.0, fired on day 13. It proves the in-place update from 0.1.0 before it is announced. If build 1 slips, the update proof moves to the first point release, and launch is not blocked on it unless you say so.
+- **D6 is approved.** Step 0 is done: the main checkout was pulled to d3f0d66 and synced, and its incremental build is running.
+- **D61 is approved,** but the Pro is offline (last seen on Tailscale 2 days ago). The Air does everything until it comes online. D5 is still unknown.
+- **Accepted as recommended:** D1, D8, D9a, D11, D16, D62, and D63.
 
 You also set a rule for every thread: when a feature in a worktree is done, the agent posts before and after screenshots in the chat, plus a video when the change has an animation or an interaction. See [threads/README.md](threads/README.md).
 
 ## Group A at a glance
 
-These are the 20 day-0 decisions. D9 has three parts. Rows marked **Again**
-changed on 2026-10-27 and need your answer again.
+These are the 20 day-0 decisions. D9 has three parts. Rows marked **Answered**
+were settled on 2026-10-27. Only D5 is still unknown.
 
 | D | Question | Recommended | Flag |
 | --- | --- | --- | --- |
-| D1 | By when do you approve the plans? | Wed 10-28, for a launch on Mon 11-16 (day 19) | Again |
+| D1 | By when do you approve the plans? | Wed 10-28, for a launch on Mon 11-16 (day 19) | Answered |
 | D2 | In what order does the work happen? | A stable track ships while the revamp runs in parallel streams | |
-| D4 | How are release builds compiled, and for how much? | Answered: free GitHub runners first, Depot sponsorship asked in parallel, paid Depot only if both fail | Money |
-| D5 | What are the MacBook Pro's RAM and free disk? | The Pro syncs if it has 32 GB and 150 GB free | |
-| D6 | Which full builds do you approve now? | The five named in the master plan, and no others | AGENTS, Again |
-| D9a | Which threads launch? | All five on day 0. Power writes pure logic only until Core's table lands | Again |
+| D4 | How are release builds compiled, and for how much? | Answered: free GitHub runners first, Depot sponsorship asked later, paid Depot only if a free build fails twice and you say so | Money, Answered |
+| D5 | What are the MacBook Pro's RAM and free disk? | Still unknown. The Pro is offline, so the Air does everything for now | Open |
+| D6 | Which full builds do you approve now? | Approved: the five named in the master plan, and no others. Step 0 is done | AGENTS, Answered |
+| D9a | Which threads launch? | All five on day 0. Power writes pure logic only until Core's table lands | Answered |
 | D9b | May threads open PRs without asking each time? | Yes. You still approve every merge | AGENTS |
 | D9c | May threads drive rac through the test tools? | Yes, on throwaway profiles only | AGENTS |
-| D11 | Accept plan 06's default list? | Accept all, with the freeze replaced by D62 | Again |
+| D11 | Accept plan 06's default list? | Accept all, with the freeze replaced by D62 | Answered |
 | D14 | Build Peek, and does it enter history? | Yes, and history only once a Peek is expanded | VISION |
-| D16 | Is the command bar a launch gate? | No. It ships if merged by day 13, else in the first point release, about day 26 | Again |
+| D16 | Is the command bar a launch gate? | No. It ships if merged by day 13, else in the first point release, about day 26 | Answered |
 | D17 | Which patch-size number do the plans hold to? | Net-diff hunks plus first failures per sync | |
 | D19 | How do we close the agent's `auto` hole? | The taint rule, with `auto` kept as the default | |
 | D20 | What happens to Chromium's debug doors? | Refuse them on the real profile, with no new setting | |
@@ -45,17 +53,17 @@ changed on 2026-10-27 and need your answer again.
 | D22 | How do we shrink rac's Chromium edits? | Stay on Views and thin the hooks | |
 | D41 | What real Arc data can we test on? | You scrub your own Arc now, volunteers after beta | Real data |
 | D42 | How big is the safety net before launch? | A snapshot, one rolling backup, and the Keychain fix | |
-| D61 | Does the MacBook Pro become a second build Mac? | Yes if D5 qualifies: it hosts the sync and a 156 base | New, AGENTS |
-| D62 | What replaces the three-week freeze? | A one-week freeze, with streams stacked on the 156 base from day 4 | New |
-| D63 | How do many agents share one Mac's builds? | A build queue with two slots, and verification in batches | New, AGENTS |
-| D64 | How many release builds before launch? | Three: 0.1.0, 0.2.0 to prove updates, and the launch | New |
+| D61 | Does the MacBook Pro become a second build Mac? | Approved, but the Pro is offline. The Air does everything until it is back | AGENTS, Answered |
+| D62 | What replaces the three-week freeze? | A one-week freeze, with streams stacked on the 156 base from day 4 | Answered |
+| D63 | How do many agents share one Mac's builds? | A build queue with two slots, and verification in batches | AGENTS, Answered |
+| D64 | How many release builds before launch? | Answered: two from the 156 tree, 0.1.0 about day 7 and the launch build 0.2.0 on day 13 | Answered |
 
 Reply with the D-numbers you disagree with; everything else is accepted.
 
 ## A. Needed on day 0
 
 **D1 (M-1). By when do you approve the plans?** Wed 10-28, or later.
-**Recommended: Wed 10-28.** Launch is then Mon 11-16 (day 19), with room for
+**Answered on 2026-10-27: as recommended, Wed 10-28.** Launch is then Mon 11-16 (day 19), with room for
 one retry of the launch build. Each day later moves launch one day. The 12-15
 hard stop still holds for approval by about 12-02.
 [06 critical path](06-engineering-and-shipping.md#critical-path)
@@ -73,14 +81,14 @@ sequencing section calls this C1 plus ruling 1.
 GitHub runners, Depot runners (sponsored or paid), or a local Mac.
 **Answered on 2026-10-27: free first.** Free GitHub runners build Apple
 Silicon only, with fail-fast off, the flaky checkpoint download retried, and
-PR #20's pax fix merged. You ask Depot for open-source sponsorship on day 0.
+PR #20's pax fix merged. You will ask Depot about open-source sponsorship
+later, not on day 0.
 Each free build takes about 1.5 days, which is fine because nothing waits on
 it. Signing and notarizing still run on GitHub's own runner, so the keys
 never leave GitHub.
-**Trigger for paid Depot:** build 1 fails twice in a row, or can't finish its
-framework link inside a 6-hour phase, and Depot hasn't offered sponsorship by
-day 5. Then you decide on paid Depot with a $300 monthly cap, about $35 to
-$70 a build.
+**Trigger for paid Depot:** a free build fails twice in a row, or can't finish
+its framework link inside a 6-hour phase. Paying needs your word at that
+time. The cap is $300 a month, about $35 to $70 a build.
 [06 build route](06-engineering-and-shipping.md#build-route-a1-to-a3)
 
 The routes considered on 2026-10-27:
@@ -90,27 +98,31 @@ The routes considered on 2026-10-27:
 3. A self-hosted runner on one of your Macs. The keys stay in GitHub, but the job runs on your Mac and uses it for hours. On the 16 GB Air it competes with every worktree build.
 4. Build and sign on your Mac by hand. It is free, but the signing keys sit on a laptop.
 
-You chose routes 1 and 2 together, with paid Depot as the fallback.
+You chose route 1, with route 2 asked later and paid Depot as the fallback.
 
 **D5 (06-D1). What are the MacBook Pro's RAM and free disk?** Tell us both,
 or let an agent read them with
 `ssh knewton@kainoas-macbook-pro 'sysctl -n hw.memsize; df -h ~'`.
-**Rule: with at least 32 GB of RAM and 150 GB free, the Pro runs the sync and
-holds a 156 base (D61). Otherwise the Air does.** The Air has 16 GB and 101 GB
+**Still unknown, and the Pro is offline (last seen on Tailscale 2 days ago).
+The Air runs the sync and the 156 base for now.** Rule once it is back: with at
+least 32 GB of RAM and 150 GB free, the Pro takes over the sync's base work
+(D61). Otherwise the Air keeps it. The Air has 16 GB and 101 GB
 free. The Pro is your main machine, so long builds will slow it.
 [06](06-engineering-and-shipping.md#what-you-need-to-decide)
 
 **D6 (M-2). Which full builds do you approve now?** The named list below, or
 ask each time.
-**Recommended: these, and no others, before launch.** AGENTS.md requires your
-approval for full builds and `he reset`.
-1. Day 0: one incremental `he build` in your main checkout, after you pull it.
+**Approved on 2026-10-27: these, and no others, before launch.** AGENTS.md
+requires your approval for full builds and `he reset`.
+1. Day 0, done: one incremental `he build` in your main checkout. It was pulled
+   to d3f0d66 and synced, and the build is running.
 2. Day 0: one cold 156 build in the sync worktree. Helium's patches build
    first, overnight, then rac's build on top, incrementally.
 3. From day 4: worktrees on the same Mac clone the sync worktree's built
    tree with `worktree.sh setup <sync worktree>`. No new full build.
-4. Only if D61 puts the sync on the Pro: one cold 156 build on the Air, in a
-   `base-156` worktree, on day 4, overnight. This is the one base rebuild.
+4. Only if the sync moves to the Pro (D61): one cold 156 build on the Air, in a
+   `base-156` worktree, on day 4, overnight. This is the one base rebuild. It
+   doesn't apply while the Pro is offline.
 5. The CI release builds in D64.
 
 Not approved: `he reset` in the main checkout before launch. It stays on 154
@@ -211,8 +223,10 @@ and a Restore UI now.
 **D61 (M-7). Does the MacBook Pro become a second build Mac?** (a) Yes: it
 hosts the sync and a 156 base from day 0, with its own build queue. (b) No:
 the Air does everything. (c) Only after launch.
-**Recommended: (a) if D5 shows at least 32 GB and 150 GB free, otherwise
-(b).** It roughly doubles build capacity in the busiest week. It keeps the
+**Answered on 2026-10-27: (a) approved, but the Pro is offline** (last seen on
+Tailscale 2 days ago). The Air does everything until it comes online, and D5
+is still unknown. The recommendation was (a) if D5 shows at least 32 GB and
+150 GB free, otherwise (b). It roughly doubles build capacity in the busiest week. It keeps the
 sync's overnight cold build off the Air, so the Air's two slots stay with
 the feature streams. The costs:
 - About half an agent-day to set it up: a clone of rac, Xcode, and the
@@ -261,24 +275,28 @@ every check that build allows. Ship writes it on day 0. It changes AGENTS.md's
 [06 build queue](06-engineering-and-shipping.md#build-queue-d63)
 
 **D64 (M-10). How many release builds before launch?** (a) Two: 0.1.0 and the
-launch build, which proves the update after a quiet publish. (b) Three: add
-0.2.0 from the synced `main` on day 7. (c) More, as needed.
-**Recommended: (b).** Build 2 proves the new 156 pipeline and the update from
-0.1.0 six days before the launch build. It costs nothing on free runners, and
-nothing waits on it. If it fails, the launch build is the retry, with fixes.
-With (a), the first 156 build is the launch build, and a pipeline failure
-costs 1.5 days at launch. After launch, at most one point release a week,
-plus security fixes.
-[06 M3](06-engineering-and-shipping.md#m3-020-the-update-proof-days-7-10-build-2)
+launch build. (b) Three: add a 0.2.0 update proof from the synced `main` on
+day 7. (c) More, as needed.
+**Answered on 2026-10-27: (a), two builds,** both from the synced Chromium 156
+tree and both fire-and-forget on free GitHub runners.
+- Build 1 is 0.1.0, quiet and unannounced. It is fired once the sync merges,
+  about day 7, and published about day 9.
+- Build 2 is the launch build, 0.2.0, fired on day 13. On day 15 it proves the
+  in-place update from 0.1.0, before it is announced.
+- If build 1 slips, the update proof moves to the first point release, and
+  launch is not blocked on it unless you say so.
+
+After launch, at most one point release a week, plus security fixes.
+[06 M1](06-engineering-and-shipping.md#m1-010-the-first-signed-release-days-1-10-build-1)
 
 ## B. Needed later, by thread
 
 ### Ship (plan 06)
 
 **D3 (06-D4). Publish a quiet 0.1.0 on Chromium 154 first?** Yes, labeled
-"Preview", or wait for the synced build. Needed on day 0, before build 1.
-**Recommended: yes.** It proves signing now, and 0.1.0 to 0.2.0 proves
-updates (D64).
+"Preview", or wait for the synced build.
+**Answered on 2026-10-27: no.** 0.1.0 is built from the synced 156 tree
+instead (D64), and 0.1.0 to the launch build proves updates.
 
 **D7 (06-D3). Support Intel Macs at launch?** (Money) Yes, at about $99 a
 build on Depot, or no. Needed on day 0, before the `arches` input.
@@ -287,7 +305,7 @@ build on Depot, or no. Needed on day 0, before the `arches` input.
 
 **D8 (06-D6). What if the sync isn't merged by day 10?** Launch on 154 as a
 labeled preview, or hold the launch.
-**Recommended: hold.** Arc's shutdown is a month after the target, so holding
+**Answered on 2026-10-27: hold, as recommended.** Arc's shutdown is a month after the target, so holding
 is cheap, and the other streams keep working on the 156 base. Decide on a 154
 launch only if the sync isn't merged by day 30 (11-27). That fallback must
 start by 12-15.
@@ -577,7 +595,7 @@ the agent it launched".
 
 | Item | Cost | Decision |
 | --- | --- | --- |
-| Depot runners | $0 if sponsored. Paid only on D4's trigger: about $20 a month for the plan, about $35 per warm arm64 build and maybe $70 cold. About $150 a month at three builds before launch and one a week after, capped at $300 | D4, D64 |
+| Depot runners | $0 if sponsored (you ask later). Paid only on D4's trigger and with your word: about $20 a month for the plan, about $35 per warm arm64 build and maybe $70 cold. About $150 a month at two builds before launch and one a week after, capped at $300 | D4, D64 |
 | Intel builds | About $99 per two-architecture build on Depot | D7 |
 | Free GitHub runners | $0, about 30 to 40 hours a build, and it has never finished. The chosen first route | D4 |
 | Tier 2 agent evals before each release | Your API keys. 30 to 50 pages, 4 models, 2 modes, 3 runs. Likely tens to a few hundred dollars a release (estimate) | 05 M0, M2 |
@@ -609,7 +627,8 @@ the agent it launched".
   at night when the queue is empty. It uses throwaway profiles.
 - **Your MacBook Pro (D61).** Builds and runs there sit next to your daily
   data. Agents use throwaway profiles only, never `open` rac.app, and never
-  take the foreground. They SSH there only because D61 asks for it.
+  take the foreground. They SSH there only because D61 asks for it, and only
+  once it is back online.
 
 ## Open questions
 
@@ -635,7 +654,7 @@ None of these blocks the start.
 - Should the built-in assistant get a read-only level? [05](05-agents-and-ai.md#open-questions)
 - Should a shared tab return to you when the agent's session ends? [05](05-agents-and-ai.md#open-questions)
 - Does a data-flow grant last for the session or until revoked? [05](05-agents-and-ai.md#open-questions)
-- Does Depot offer open-source terms, and what does a cold rac build cost? [06](06-engineering-and-shipping.md#open-questions)
+- Will Depot offer open-source terms when you ask, and what does a cold rac build cost? [06](06-engineering-and-shipping.md#open-questions)
 - Does an official build tree compile the five test targets cheaply? [06](06-engineering-and-shipping.md#open-questions)
 - Does a signed first launch ask for update consent, and does Keychain prompt across an update? [06](06-engineering-and-shipping.md#open-questions)
 - Is 5% the right speed tolerance against Helium, or 0% for typing and tab switching? [06](06-engineering-and-shipping.md#open-questions)

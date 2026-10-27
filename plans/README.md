@@ -9,9 +9,10 @@ shutdown on 2026-12-22 is now a safety margin, not the schedule.
 1. **Ship first, with everything else in parallel.** A signed release, the
    catch-up to Helium, and proof that updates work come first. Every other
    thread starts the same day, in 20 parallel streams.
-2. **Builds are rare and nobody waits on them.** Three release builds before
-   launch, on free GitHub runners, about 1.5 days each. Depot is asked to
-   sponsor, and paid only if both fail. Local builds go through a queue on
+2. **Builds are rare and nobody waits on them.** Two release builds before
+   launch, both from the synced Chromium 156 tree, on free GitHub runners,
+   about 1.5 days each. You ask Depot to sponsor later, and paid Depot needs
+   your word, only if a free build fails twice. Local builds go through a queue on
    each Mac, and you approve five named builds.
 3. **No separate server.** The browser is its own server. After launch,
    outside agents get a private door with its own switch, off by default.
