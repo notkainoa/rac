@@ -17,6 +17,7 @@ import difflib
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -221,6 +222,9 @@ class SyncTest(WorktreeTestCase):
         self.worktree('sync')
         self.assertEqual((self.tree / 'three').read_text(), 'saved three\n')
 
+    # Homebrew's quilt 0.69 pushes a new patch whose file doesn't exist yet as
+    # empty; Ubuntu's 0.67 refuses. worktree.sh only runs on macOS.
+    @unittest.skipUnless(sys.platform == 'darwin', 'needs quilt 0.69 (Homebrew)')
     def test_sync_with_new_empty_patch(self):
         self.quilt('new', 'c.patch')
         self.quilt('add', 'two')
@@ -410,6 +414,8 @@ class SyncTest(WorktreeTestCase):
         self.assertEqual(copies, recorded)
 
 
+@unittest.skipUnless(sys.platform == 'darwin',
+                     'setup clones the tree with APFS clonefile(2) from libSystem')
 class SetupTest(WorktreeTestCase):
     """setup in a worktree, cloning the fixture checkout's tree."""
 
