@@ -353,6 +353,7 @@ class Session:
         argv = run.launch_args(profile, self.port) + [
             f"--log-net-log={netlog}", "--net-log-capture-mode=Everything"]
         self.proc = subprocess.Popen(argv, cwd=ROOT, start_new_session=True,
+                                     env=run.launch_env(profile),
                                      stdout=self.log, stderr=subprocess.STDOUT)
         endpoint = run.wait_for(lambda: run.http_json(f"http://127.0.0.1:{self.port}/json/version"),
                                 "the DevTools endpoint", 120, self.proc)

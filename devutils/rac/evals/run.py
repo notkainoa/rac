@@ -188,6 +188,15 @@ def free_port():
     return port
 
 
+def launch_env(profile):
+    """The launch environment. Crash dumps go into the throwaway profile, so a
+    dev run never writes the real me.kainoa.rac/Crashpad (PR #25 does the
+    same in worktree.sh; this holds even without it)."""
+    env = dict(os.environ)
+    env["BREAKPAD_DUMP_LOCATION"] = os.path.join(profile, "Crashpad")
+    return env
+
+
 def launch_args(profile, port):
     return [os.path.join(ROOT, "devutils/rac/worktree.sh"), "run",
             f"--user-data-dir={profile}", f"--remote-debugging-port={port}",
@@ -237,6 +246,7 @@ def run_browser(variant, args):
             json.dump(prefs, f)
         port = free_port()
         proc = subprocess.Popen(launch_args(profile, port), cwd=ROOT, start_new_session=True,
+                                env=launch_env(profile),
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         endpoint = wait_for(lambda: http_json(f"http://127.0.0.1:{port}/json/version"),
                             "the DevTools endpoint", 120, proc)

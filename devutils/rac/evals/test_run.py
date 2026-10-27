@@ -133,5 +133,11 @@ class CliTest(unittest.TestCase):
             self.main("--dry-run", "d19", "--variants", "nope")
 
 
+class LaunchEnvTest(unittest.TestCase):
+    def test_crash_dumps_stay_in_the_throwaway_profile(self):
+        env = run.launch_env("/tmp/rac-evals-x")
+        self.assertEqual(env["BREAKPAD_DUMP_LOCATION"], "/tmp/rac-evals-x/Crashpad")
+
+
 if __name__ == "__main__":
     unittest.main()
