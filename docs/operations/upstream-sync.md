@@ -80,6 +80,12 @@ conflicts, take Helium's change and keep rac's file names (`rac_<version>`,
 `sign_and_package_app.sh` for when `MACOS_CERTIFICATE_NAME` isn't set: rac
 has no Apple developer account yet, so CI builds depend on it.
 
+rac signs in a separate `sign` job at the end of `building.yml`, not in the
+build phases. If Helium changes `build-phase.yml`, `.github/actions/do-build`
+or `github_prepare_artifacts.sh`, keep the signing and notarization secrets
+out of them: build phases may run on machines outside GitHub
+([Releases](releases.md)).
+
 Every other helium-macos file stays Helium's. rac-only files (`AGENTS.md`,
 `CLAUDE.md`, `VISION.md`, `CONTRIBUTING.md`, `.github/SECURITY.md`,
 `docs/README.md`, `docs/roadmap.md`, `docs/internals/`, `docs/operations/`,

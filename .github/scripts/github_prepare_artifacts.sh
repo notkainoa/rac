@@ -7,75 +7,32 @@ _root_dir="$(dirname "$(greadlink -f "$0")")"
 _main_repo="$_root_dir/helium-chromium"
 _src_dir="$_root_dir/build/src"
 
-# If build finished successfully
+# If the build finished, pack the unsigned app for the `sign` job, which runs on
+# a GitHub-hosted runner. Build runners never see the signing keys.
 if [ -f "$_root_dir/build_finished_$_target_cpu.log" ]; then
-  # For packaging
-  _rac_version=$(python3 "$_root_dir/devutils/rac/rac_version.py" --print)
+  cd "$_src_dir/out/Default"
 
-  _file_name="rac_${_rac_version}_${_target_cpu}-macos.dmg"
-  _hash_name="${_file_name}.hashes.md"
+  xattr -cs rac.app
 
-  cd "$_src_dir"
+  # sign_chrome.py and pkg-dmg come from the packaging folder; deltas need
+  # Sparkle's BinaryDelta, which is only built with the updater.
+  _app_files=(rac.app "rac Packaging")
+  for _optional in BinaryDelta Sparkle.framework; do
+    if [ -e "$_optional" ]; then
+      _app_files+=("$_optional")
+    fi
+  done
 
-  xattr -cs out/Default/rac.app
-
-  # Without a certificate, sign_and_package_app.sh signs ad hoc.
-  if [ -n "${MACOS_CERTIFICATE:-}" ]; then
-    echo $MACOS_CERTIFICATE | base64 --decode > "$TMPDIR/certificate.p12"
-
-    security create-keychain -p "$MACOS_CI_KEYCHAIN_PWD" build.keychain
-    security default-keychain -s build.keychain
-    security unlock-keychain -p "$MACOS_CI_KEYCHAIN_PWD" build.keychain
-    security import "$TMPDIR/certificate.p12" -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
-    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CI_KEYCHAIN_PWD" build.keychain
-  fi
-
-  if ! [ -z "${PROD_MACOS_SPECIAL_ENTITLEMENTS_PROFILE_B64:-}" ]; then
-    export PROD_MACOS_SPECIAL_ENTITLEMENTS_PROFILE_PATH=$(mktemp)
-    echo "$PROD_MACOS_SPECIAL_ENTITLEMENTS_PROFILE_B64" \
-      | base64 --decode > "$PROD_MACOS_SPECIAL_ENTITLEMENTS_PROFILE_PATH"
-  fi
-
-  export OUT_DMG_PATH="$_root_dir/$_file_name"
-  "$_root_dir/sign_and_package_app.sh"
-
-  if ! [ -z "${PROD_MACOS_SPECIAL_ENTITLEMENTS_PROFILE_B64:-}" ]; then
-    rm -f "$PROD_MACOS_SPECIAL_ENTITLEMENTS_PROFILE_PATH"
-  fi
+  mkdir -p "$_root_dir/upload_app"
+  # tar keeps the framework symlinks and permissions that a zip artifact loses.
+  ( set -o pipefail
+    tar --format pax --no-mac-metadata -c -f - "${_app_files[@]}" \
+      | zstd -vv -10 -T0 -o "$_root_dir/upload_app/rac_unsigned.tar.zst" )
+  zstd -t "$_root_dir/upload_app/rac_unsigned.tar.zst"
+  (cd "$_root_dir/upload_app" && sha256sum rac_unsigned.tar.zst | tee app_sums.txt)
 
   cd "$_root_dir"
-  echo -e "md5: \nsha1: \nsha256: " | tee ./hash_types.txt
-  { md5sum "$_file_name" ; sha1sum "$_file_name" ; sha256sum "$_file_name" ; } | tee ./sums.txt
-
-  _hash_md=$(paste ./hash_types.txt ./sums.txt | awk '{print $1 " " $2}')
-
-  echo "file_name=$_file_name" >> $GITHUB_OUTPUT
-
-  printf 'Hashes for the disk image `%s`: \n' "$_file_name" | tee -a ./${_hash_name}
-  printf '\n```\n%s\n```\n' "$_hash_md" | tee -a ./${_hash_name}
-
-  # Use separate folder for build product, so that it can be used as individual asset in case the release action fails
-  mkdir -p release_asset
-  mv "$_file_name" release_asset/
-
-  if [ "$_target_cpu" = "x86_64" ]; then
-    DELTA_ARG="--x86"
-  else
-    DELTA_ARG="--arm"
-  fi
-
-  PATH="$_src_dir/out/Default:$PATH" python3 "$_root_dir/devutils/generate_sparkle_deltas.py" \
-    "$DELTA_ARG" "./release_asset/$_file_name" \
-    --out ./release_asset
-
-  {
-    echo 'deltas<<EOF'
-    find ./release_asset/ -name '*.delta'
-    echo EOF
-  } >> "$GITHUB_OUTPUT"
-
-  ls -kahl release_asset/
-  du -hs release_asset/
+  ls -kahl upload_app/
 fi
 
 gsync --file-system "$_src_dir"
