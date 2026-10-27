@@ -44,6 +44,9 @@ takes several hours.
    he build
    he run
    ```
+   On a Mac that several agents share, build through the queue instead:
+   `devutils/rac/build-queue.sh --allow-main he build` (see
+   [the build queue](docs/operations/worktrees.md#the-build-queue)).
 
 ## Making a change
 

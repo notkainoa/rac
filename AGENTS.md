@@ -170,8 +170,9 @@ done, go through this list and say which items applied:
 You test it. The maintainer does not take first look. A reply that says
 "ready to test" without screenshots of the running build is unfinished.
 
-- Build and run it yourself: `he build && he run` in the main checkout,
-  `devutils/rac/worktree.sh run` in a worktree. Never `open` rac.app
+- Build it yourself with `devutils/rac/build-queue.sh he build`, then run
+  it: `devutils/rac/worktree.sh run` in a worktree, `he run` in the main
+  checkout (which also needs `--allow-main` to build). Never `open` rac.app
   (Launch Services can start the installed copy against a real profile).
 - Exercise the changed behavior in that process. Cover the surfaces in
   [Cover every surface](#cover-every-surface) that apply.
@@ -213,7 +214,8 @@ Worktree: `<absolute path>` (branch `<branch>`)
 ```
 
 - Give the exact commands with the real path, ready to paste. If the
-  maintainer needs to rebuild, include `source dev.sh && he build` first.
+  maintainer needs to rebuild, include `devutils/rac/build-queue.sh he build`
+  first.
 - Write the steps for someone who hasn't read the code. Name the menus,
   shortcuts, and settings you used.
 - Cover the surfaces from [Cover every surface](#cover-every-surface) that
