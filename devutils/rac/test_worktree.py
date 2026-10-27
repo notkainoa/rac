@@ -17,6 +17,7 @@ import difflib
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -410,6 +411,8 @@ class SyncTest(WorktreeTestCase):
         self.assertEqual(copies, recorded)
 
 
+@unittest.skipUnless(sys.platform == 'darwin',
+                     'setup clones the tree with APFS clonefile(2) from libSystem')
 class SetupTest(WorktreeTestCase):
     """setup in a worktree, cloning the fixture checkout's tree."""
 
