@@ -28,6 +28,16 @@ Later answers, also 2026-10-27:
 
 You also set a rule for every thread: when a feature in a worktree is done, the agent posts before and after screenshots in the chat, plus a video when the change has an animation or an interaction. See [threads/README.md](threads/README.md).
 
+## Answers from day 0 (2026-10-27, evening)
+
+- D13: yes. Cmd+T opens the command bar, with one setting for the normal new tab page. The VISION.md change is approved.
+- D28 to D31: as recommended. Opt+Cmd+N goes to the little window, and Helium's new-split-tab action loses that default.
+- Command bar details: suggestions only when two or fewer local rows match and typing pauses for 300 ms; "+" and File > New Tab keep the normal new tab; Enter opens in place and Cmd+Enter in a new tab; pinned tabs and favorites in one section; accent matching later.
+- Clear: the divider shows even without pinned tabs; the label is always visible; video-call and tab-group tabs are spared; no Clear in incognito at launch; the one-hunk hook makes one Clear one Undo.
+- A minimal action table may merge before the day-13 cutoff (ready day 10, merged day 11).
+- PR #20 is merged (d8b2a87).
+- The signins stream stays on Opus 5.5 with a narrower brief. No automatic model switching.
+
 ## Group A at a glance
 
 These are the 20 day-0 decisions. D9 has three parts. Rows marked **Answered**
