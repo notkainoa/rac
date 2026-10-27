@@ -17,13 +17,23 @@ own `macos-latest`, then:
    when the job ends, even if it fails;
 3. signs, notarizes and staples the app, packages the disk image, then
    signs, notarizes and staples the disk image too;
-4. mounts the disk image and checks it as a downloading Mac would
-   (`codesign --verify --deep --strict`, `spctl`, `stapler validate`, and
-   no entitlement that needs a provisioning profile it doesn't have);
+4. mounts the disk image and checks it (`codesign --verify --deep
+   --strict`, `spctl` saying `Notarized Developer ID` for the app and the
+   disk image, `stapler validate`, the signing team, and no entitlement that
+   needs a provisioning profile it doesn't have). The mount has no
+   quarantine flag, so this doesn't replay a first launch from a browser;
 5. makes the update deltas.
 
 The release job also runs on GitHub's runner, because it holds the update
 signing key. So moving the compile to another provider never moves a key.
+Before it writes the update feeds, it runs the same disk image check on every
+downloaded image (notarized builds only), so an artifact swapped after the
+`sign` job isn't signed into a feed.
+
+The one thing a build phase learns about the entitlements profile is whether
+it exists: the `settings` job in `building.yml` turns that into a plain
+`true` or `false` for `RAC_BRANDED_ENTITLEMENTS`. The profile itself only
+reaches the `sign` job.
 
 ## One-time setup
 

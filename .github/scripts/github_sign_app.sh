@@ -23,12 +23,19 @@ _rac_version=$(python3 "$_root_dir/devutils/rac/rac_version.py" --print)
 _file_name="rac_${_rac_version}_${_target_cpu}-macos.dmg"
 _hash_name="${_file_name}.hashes.md"
 
+# Tracing stays off from here until the signing script starts, so it never
+# echoes a credential. GitHub masks secrets in logs, but a decoded or derived
+# value wouldn't be masked. Even the `[ -n ... ]` checks are traced with the
+# secret's value expanded.
+{ set +x; } 2>/dev/null
+
 _notarized=0
 if [ -n "${MACOS_CERTIFICATE:-}" ]; then
   _notarized=1
-  # Turn tracing off so it never echoes a credential; GitHub masks secrets in
-  # logs, but a decoded or derived value wouldn't be masked.
-  set +x
+  # A secret pasted with a trailing newline would break the checks below.
+  PROD_MACOS_NOTARIZATION_TEAM_ID=$(printf '%s' "${PROD_MACOS_NOTARIZATION_TEAM_ID:-}" | tr -d '[:space:]')
+  MACOS_CERTIFICATE_NAME=$(printf '%s' "${MACOS_CERTIFICATE_NAME:-}" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  export PROD_MACOS_NOTARIZATION_TEAM_ID MACOS_CERTIFICATE_NAME
   _missing=()
   for _var in MACOS_CERTIFICATE_PWD MACOS_CERTIFICATE_NAME MACOS_CI_KEYCHAIN_PWD \
       PROD_MACOS_NOTARIZATION_APPLE_ID PROD_MACOS_NOTARIZATION_TEAM_ID PROD_MACOS_NOTARIZATION_PWD; do
@@ -75,17 +82,17 @@ if [ -n "${MACOS_CERTIFICATE:-}" ]; then
     exit 1
   fi
   echo "Signing identity found in the temporary keychain."
-  set -x
 else
   echo "::warning::PROD_MACOS_CERTIFICATE is not set; the app is signed ad hoc and not notarized."
 fi
 
 if [ -n "${PROD_MACOS_SPECIAL_ENTITLEMENTS_PROFILE_B64:-}" ]; then
-  export PROD_MACOS_SPECIAL_ENTITLEMENTS_PROFILE_PATH
-  PROD_MACOS_SPECIAL_ENTITLEMENTS_PROFILE_PATH=$(mktemp)
+  # A fixed name, so the workflow's cleanup step can remove it if this fails.
+  export PROD_MACOS_SPECIAL_ENTITLEMENTS_PROFILE_PATH="${RUNNER_TEMP:-$TMPDIR}/entitlements.provisionprofile"
   printf '%s' "$PROD_MACOS_SPECIAL_ENTITLEMENTS_PROFILE_B64" \
     | base64 --decode > "$PROD_MACOS_SPECIAL_ENTITLEMENTS_PROFILE_PATH"
 fi
+set -x
 
 # Signs and notarizes the app, staples it, packages the disk image, and signs,
 # notarizes and staples that too.

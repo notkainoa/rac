@@ -1,8 +1,9 @@
 #!/bin/bash
-# Checks a packaged rac disk image the way a downloading Mac will: mounts it
-# read-only and verifies the app's signature, its entitlements and, for a
-# Developer ID build, Gatekeeper's verdict and the stapled tickets on both the
-# app and the disk image.
+# Checks a packaged rac disk image: mounts it read-only and verifies the app's
+# signature, its entitlements and, for a Developer ID build, Gatekeeper's
+# verdict (it must say Notarized Developer ID) and the stapled tickets on both
+# the app and the disk image. The image has no quarantine flag here, so this
+# doesn't show what a first launch from a browser download will do.
 #
 # Usage: github_verify_dmg.sh <path/to/rac.dmg>
 #
@@ -20,6 +21,7 @@ _team="${RAC_EXPECT_TEAM_ID:-}"
 
 _mnt=$(mktemp -d "${TMPDIR:-/tmp}/rac-dmg.XXXXXX")
 _detach() {
+  rm -f "$_mnt.entitlements.plist"
   hdiutil detach "$_mnt" -quiet || hdiutil detach "$_mnt" -force -quiet || true
   rmdir "$_mnt" 2>/dev/null || true
 }
@@ -93,14 +95,36 @@ if [ -n "$_team" ] && [ "$_app_team" != "$_team" ]; then
   exit 1
 fi
 
-echo "== spctl (app)"
-spctl -a -vv "$_app"
+# Gatekeeper's verdict means nothing if assessments are switched off.
+if ! spctl --status 2>&1 | grep -q 'assessments enabled'; then
+  echo "::error::Gatekeeper assessments are disabled on this machine, so spctl would accept anything: $(spctl --status 2>&1)"
+  exit 1
+fi
+
+# spctl prints its verdict on stderr. A notarized build must come from
+# Notarized Developer ID; plain "Developer ID" means the ticket is missing.
+_spctl_notarized() {
+  local label="$1" out
+  shift
+  echo "== spctl ($label)"
+  if ! out=$(spctl "$@" 2>&1); then
+    echo "$out"
+    echo "::error::spctl rejected the $label"
+    exit 1
+  fi
+  echo "$out"
+  if ! grep -qF 'source=Notarized Developer ID' <<< "$out"; then
+    echo "::error::spctl did not report source=Notarized Developer ID for the $label"
+    exit 1
+  fi
+}
+
+_spctl_notarized app -a -vv "$_app"
 echo "== stapler validate (app)"
 xcrun stapler validate "$_app"
 echo "== codesign --verify (disk image)"
 codesign --verify --strict --verbose=2 "$_dmg"
-echo "== spctl -t install (disk image)"
-spctl -a -vv -t install "$_dmg"
+_spctl_notarized "disk image" -a -vv -t open --context context:primary-signature "$_dmg"
 echo "== stapler validate (disk image)"
 xcrun stapler validate "$_dmg"
 
