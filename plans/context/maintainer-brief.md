@@ -158,3 +158,12 @@ patches applied).
   The maintainer asked whether rac should use it. Treat it as an outside-agent
   tool and an idea source (deterministic replayable "recipes" instead of an LLM
   loop for repeat tasks), not as something to embed by default.
+
+## Added 2026-10-27 (later)
+
+- An Arc-refugee wishlist on X (ZaynHao, 2026-10-27, in Chinese): Chromium-based, PWA
+  support, a sidebar, split view, pins or folders, multiple profiles or spaces, and
+  "as few AI buttons as possible, chat or summaries". rac fits this on paper. Two
+  lessons: with AI off, no AI button, row, or label may appear anywhere; and
+  installed web-app (PWA) windows have never been tested with rac's look and
+  sidebar patches.
