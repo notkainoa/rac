@@ -194,14 +194,14 @@ cmd_setup() {
   cmd_sync
   empty_trash
 
-  log "ready. build with: source dev.sh && he build"
+  log "ready. build with: devutils/rac/build-queue.sh he build"
   log "then run with: devutils/rac/worktree.sh run"
 }
 
 cmd_run() {
   [ "$root" != "$base" ] || die "in the main checkout, use he run"
   local app="$out/rac.app/Contents/MacOS/rac"
-  [ -x "$app" ] || die "no build at $out; run: source dev.sh && he build"
+  [ -x "$app" ] || die "no build at $out; run: devutils/rac/build-queue.sh he build"
   exec "$app" \
     --user-data-dir="$root/build/profile" \
     --enable-ui-devtools \

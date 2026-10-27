@@ -41,7 +41,8 @@ applies rac's names to the dev tree (see
 
 ## Working in a worktree
 
-- Build with `source dev.sh && he build`, the same as in the main checkout.
+- Build with `devutils/rac/build-queue.sh he build`. See
+  [the build queue](#the-build-queue).
 - Run with `devutils/rac/worktree.sh run`, not `he run`. `he run` uses
   one shared dev profile. If two builds launch with the same profile, the
   second one only opens a window in the browser that's already running.
@@ -54,7 +55,8 @@ applies rac's names to the dev tree (see
   [overview.md](../internals/overview.md#making-a-rac-change). Commit after
   `he unmerge`, then run `he merge` to keep working.
 - After the branch's patches change outside quilt, such as after a rebase or
-  a `git pull`, run `devutils/rac/worktree.sh sync`, then `he build`.
+  a `git pull`, run `devutils/rac/worktree.sh sync`, then build through
+  the queue.
   Sync stops, and names the file, if popping a patch would throw away an
   edit that isn't saved in any version of it, applied or committed. It
   prints the `quilt diff` that shows the edit. Before you `quilt refresh`
@@ -66,6 +68,48 @@ If a build in a worktree shows tens of thousands of steps, something
 invalidated the clone. Stop it and find out why before letting it run for
 hours.
 
+## The build queue
+
+Several agents share each Mac, and a 16 GB Mac swaps hard with more than two
+Chromium builds at once. So every local build goes through
+`devutils/rac/build-queue.sh` instead of a bare `he build`:
+
+```sh
+devutils/rac/build-queue.sh he build     # waits for a slot, builds, frees it
+devutils/rac/build-queue.sh status       # who holds a slot, who waits
+devutils/rac/build-queue.sh log          # recent starts, ends, and refusals
+```
+
+- **Slots.** Each Mac has two build slots and two run slots, as directories
+  under `~/.rac-build-queue/`. Screenshot-harness and eval runs take a run
+  slot with `--run`. `build-queue.sh devutils/rac/worktree.sh run` picks a
+  run slot without it; `worktree.sh run` on its own doesn't queue. A slot is
+  freed when its build ends, fails, or is interrupted. If the queue process
+  dies, its slot stays held until its build has stopped too, and then the
+  next queue user frees it.
+- **Order.** First come, first served. Sync and launch-gate work may pass
+  `--priority` to go ahead of other waiters.
+- **Full builds.** A full build the maintainer approved takes both build
+  slots: `build-queue.sh --full "D6 item 2: sync cold build" he build`.
+- **Guards.** The queue refuses to start a build with less than 20 GB free,
+  and waits while memory pressure is critical. It stops a build that shows
+  more than 20,000 steps, since that means something invalidated the tree.
+  siso's total starts near the whole graph and shrinks as it finds steps up
+  to date, so the queue judges it only after it settles (three minutes, or
+  a minute without changing), or once 20,000 steps have actually run. It
+  refuses to build in the main checkout without `--allow-main`, and refuses
+  a second build in a worktree that's already building.
+- **Batches.** Don't build after every edit. Collect a batch of changes,
+  build once, then run every test and screenshot the batch needs. Never
+  hold a slot while you think or fix; let the build end and queue again.
+- **Outside builds.** A siso build that didn't come through the queue
+  doesn't hold a slot, but the queue leaves one build slot empty for each
+  one, and `status` lists them.
+- **The manual lock.** `mkdir ~/.rac-build-queue/manual` holds both build
+  slots until you `rmdir` it, and waiters print how long it has been held.
+  It predates the queue and only works one way: whoever holds it can't see
+  builds in the queue. Use it only when the queue itself is broken.
+
 ## Updating the base
 
 After merging features into `main`, update the main checkout so new
@@ -76,7 +120,7 @@ he unmerge
 git pull
 he merge
 devutils/rac/worktree.sh sync
-he build
+devutils/rac/build-queue.sh --allow-main he build
 ```
 
 `sync` pops only the patches that changed, plus every patch applied after
@@ -86,7 +130,7 @@ Chromium.
 
 Existing worktrees don't follow the base on their own. To bring one up to
 date, run `he unmerge`, rebase its branch onto `main`, run `he merge`, then
-`sync` and `he build`.
+`sync` and build through the queue.
 
 ## Removing a worktree
 

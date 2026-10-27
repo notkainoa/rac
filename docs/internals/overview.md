@@ -54,9 +54,11 @@ Install the requirements in [building.md](../building.md) first.
 3. Start a new patch: `quilt new rac/<area>/<name>.patch`.
 4. Register each file before you modify it: `quilt add <path>`. For new
    files, run `quilt add` before creating them.
-5. Edit, then test with `he build && he run` (`devutils/rac/worktree.sh run`
-   in a worktree). You run it. For UI changes, capture screenshots of the
-   running window and put them in the reply. On macOS 26, launch with
+5. Edit, then build with `devutils/rac/build-queue.sh he build` (see
+   [the build queue](../operations/worktrees.md#the-build-queue)) and test
+   with `devutils/rac/worktree.sh run` (`he run` in the main checkout). You
+   run it. For UI changes, capture screenshots of the running window and
+   put them in the reply. On macOS 26, launch with
    `--rac-window-screenshot=/absolute/path.png` so rac writes the PNG;
    `screencapture -l` of another app is blank.
 6. Save the patch: `quilt refresh`. Format it with `he format`.
