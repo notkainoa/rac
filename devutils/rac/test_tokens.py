@@ -243,6 +243,23 @@ class CommandTest(unittest.TestCase):
         patch.write_text(new_file(tokens.HEADER.as_posix(), HEADER) +
                          new_file(tokens.CSS.as_posix(), css.replace('100ms', '99ms')))
         self.assertEqual(self.run_tokens('--check', '--patches', root).returncode, 1)
+
+    def test_check_from_patches_with_b_paths(self):
+        patches = self.folder / 'patches' / 'rac' / 'look'
+        patches.mkdir(parents=True)
+        css = tokens.render_css(tokens.parse_header(HEADER))
+
+        def new_file(path, text):
+            lines = text.splitlines()
+            return ('--- /dev/null\n'
+                    f'+++ b/{path}\n'
+                    f'@@ -0,0 +1,{len(lines)} @@\n' + ''.join(f'+{l}\n' for l in lines))
+
+        patch = patches / 'tokens.patch'
+        patch.write_text(new_file(tokens.HEADER.as_posix(), HEADER) +
+                         new_file(tokens.CSS.as_posix(), css))
+        root = str(self.folder / 'patches')
+        self.assertEqual(self.run_tokens('--check', '--patches', root).returncode, 0)
         self.assertEqual(self.run_tokens('--patches', root).returncode, 1)
 
 

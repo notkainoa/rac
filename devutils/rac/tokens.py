@@ -395,11 +395,13 @@ def render_css(items):
 
 def new_file_from_patches(patches, path):
     """The contents of `path` as created by a patch under `patches`, or None."""
-    target = f'+++ src/{path.as_posix()}'
+    # quilt writes `b/` paths with rac's settings and `src/` without them.
+    targets = tuple(f'+++ {prefix}/{path.as_posix()}' for prefix in ('b', 'src'))
     for patch in sorted(Path(patches).rglob('*.patch')):
         lines = patch.read_text(encoding='utf-8', errors='replace').splitlines()
         for i, line in enumerate(lines):
-            if not line.startswith(target) or not lines[i - 1].startswith('--- /dev/null'):
+            if (line.split('\t')[0] not in targets or i == 0 or
+                    not lines[i - 1].startswith('--- /dev/null')):
                 continue
             body = []
             for line_after in lines[i + 2:]:
