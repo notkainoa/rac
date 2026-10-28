@@ -194,15 +194,18 @@ cmd_setup() {
   cmd_sync
   empty_trash
 
-  log "ready. build with: source dev.sh && he build"
+  log "ready. build with: devutils/rac/build-queue.sh he build"
   log "then run with: devutils/rac/worktree.sh run"
 }
 
 cmd_run() {
   [ "$root" != "$base" ] || die "in the main checkout, use he run"
   local app="$out/rac.app/Contents/MacOS/rac"
-  [ -x "$app" ] || die "no build at $out; run: source dev.sh && he build"
-  exec "$app" \
+  [ -x "$app" ] || die "no build at $out; run: devutils/rac/build-queue.sh he build"
+  # Chromium keeps its crash database next to the default data folder and
+  # ignores --user-data-dir, so without this every run writes to the real
+  # me.kainoa.rac/Crashpad.
+  BREAKPAD_DUMP_LOCATION="$root/build/profile/Crashpad" exec "$app" \
     --user-data-dir="$root/build/profile" \
     --enable-ui-devtools \
     --use-mock-keychain \

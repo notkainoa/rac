@@ -1,0 +1,136 @@
+name: Checks
+
+# Cheap checks on Linux for every pull request and every push to main. None of
+# them builds Chromium or needs a macOS runner; the whole workflow should finish
+# in well under 15 minutes.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  python-tests:
+    name: Python tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+        persist-credentials: false
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.14'
+    - name: Install quilt and the macOS tool names the tests use
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends quilt
+        # worktree.sh wants Homebrew's greadlink; GNU readlink is the same tool.
+        mkdir -p "$RUNNER_TEMP/bin"
+        ln -s "$(command -v readlink)" "$RUNNER_TEMP/bin/greadlink"
+        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+    - name: Fetch GRIT, which the name-pass tests read
+      # Only tools/grit is needed, not a Chromium tree. If Google's mirror is
+      # down the GRIT tests skip instead of blocking the pull request.
+      run: |
+        version=$(cat helium-chromium/chromium_version.txt)
+        if curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -o "$RUNNER_TEMP/grit.tar.gz" \
+            "https://chromium.googlesource.com/chromium/src/+archive/$version/tools/grit.tar.gz"; then
+          mkdir -p build/src/tools/grit
+          tar -xzf "$RUNNER_TEMP/grit.tar.gz" -C build/src/tools/grit
+        else
+          echo "::warning::Could not fetch tools/grit; the GRIT tests will be skipped"
+        fi
+    - name: Run the tests
+      run: |
+        set -o pipefail
+        python3 -m unittest discover -s devutils/rac -p 'test_*.py' -v 2>&1 | tee "$RUNNER_TEMP/tests.log"
+    - name: Summarize the tests
+      if: always()
+      run: |
+        {
+          echo '## Python tests'
+          echo
+          grep -E '^(Ran |OK|FAILED)' "$RUNNER_TEMP/tests.log" | sed 's/^/- /'
+          echo
+          echo '<details><summary>Skipped tests</summary>'
+          echo
+          grep -E ' skipped ' "$RUNNER_TEMP/tests.log" | sed 's/^/- /' || true
+          echo
+          echo '</details>'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+  series:
+    name: Patch series
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+        persist-credentials: false
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.14'
+    - name: Check rac's patches against the series (he validate series)
+      # devutils/check_patch_files.sh minus its macOS-only greadlink.
+      run: python3 helium-chromium/devutils/check_patch_files.py -p patches
+    - name: Check the merged series (no duplicates, rac last)
+      run: python3 -I devutils/rac/patch_surface.py files -o /dev/null
+
+  patch-apply:
+    name: Patches apply without fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+        persist-credentials: false
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.14'
+    - name: List the files the patches modify
+      id: files
+      run: |
+        mkdir -p build
+        python3 -I devutils/rac/patch_surface.py files -o build/pristine-files.txt
+        echo "version=$(cat helium-chromium/chromium_version.txt)" >> "$GITHUB_OUTPUT"
+    # The pristine files are about 50 MB and change only with Chromium, Helium's
+    # downloads, or the list above, so most runs skip the 2 GB download.
+    - name: Restore the pristine files
+      id: pristine
+      uses: actions/cache/restore@v5
+      with:
+        path: build/pristine
+        key: pristine-v1-${{ steps.files.outputs.version }}-${{ hashFiles('build/pristine-files.txt', 'helium-chromium/downloads.ini', 'helium-chromium/deps.ini', 'downloads.ini') }}
+    - name: Extract the pristine files from Chromium's source archive
+      if: steps.pristine.outputs.cache-hit != 'true'
+      env:
+        CHROMIUM_VERSION: ${{ steps.files.outputs.version }}
+      run: |
+        python3 -I devutils/rac/patch_surface.py extract \
+          --list build/pristine-files.txt --out build/pristine \
+          --version "$CHROMIUM_VERSION"
+    - name: Save the pristine files
+      if: steps.pristine.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: build/pristine
+        key: ${{ steps.pristine.outputs.cache-primary-key }}
+    - name: Apply Helium's, then helium-macos's, then rac's patches
+      # rac's patches apply with --fuzz=0. A failed hunk, or a hunk that needs
+      # fuzz anywhere in the stack, fails the job. The report, with the patch
+      # surface, goes to the job summary.
+      run: python3 -I devutils/rac/patch_surface.py apply --pristine build/pristine

@@ -46,6 +46,7 @@ if grep -q 'offset .* lines' setup.log; then
     grep -A20 -B20 'offset .* lines' setup.log >&2
     exit 1
 fi
+if grep -q 'with fuzz' setup.log; then grep -B20 'with fuzz' setup.log >&2; exit 1; fi
 
 he configure
 

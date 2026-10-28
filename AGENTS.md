@@ -108,14 +108,17 @@ the maintainer when they ask how to work on features in parallel.
   `git worktree add -b feat/<name> <path> main`, then
   `devutils/rac/worktree.sh setup` from the new worktree. Setup takes
   about 30 seconds.
-- **Building and running.** Build with `source dev.sh && he build` and run
+- **Building and running.** Build with
+  `devutils/rac/build-queue.sh he build`, never a bare `he build`: several
+  agents share each Mac, and the queue runs at most two builds at once (see
+  [the build queue](docs/operations/worktrees.md#the-build-queue)). Run
   with `devutils/rac/worktree.sh run`. Never use `he run` in a worktree.
   It shares one profile with every other build, so the second browser only
   opens a window in the first.
 - **Committing.** Run `he unmerge`, commit the patch with its
   `patches/series` change, then run `he merge` to keep working.
 - **After a rebase or pull.** Run `devutils/rac/worktree.sh sync`, then
-  `he build`.
+  build through the queue.
 - **String files.** Dev trees show rac's names, which changes the `.grd`,
   `.grdp`, and `.xtb` files in `build/src`. Run
   `devutils/rac/dev_names.py unsub` before a patch edits one, and
@@ -167,8 +170,9 @@ done, go through this list and say which items applied:
 You test it. The maintainer does not take first look. A reply that says
 "ready to test" without screenshots of the running build is unfinished.
 
-- Build and run it yourself: `he build && he run` in the main checkout,
-  `devutils/rac/worktree.sh run` in a worktree. Never `open` rac.app
+- Build it yourself with `devutils/rac/build-queue.sh he build`, then run
+  it: `devutils/rac/worktree.sh run` in a worktree, `he run` in the main
+  checkout (which also needs `--allow-main` to build). Never `open` rac.app
   (Launch Services can start the installed copy against a real profile).
 - Exercise the changed behavior in that process. Cover the surfaces in
   [Cover every surface](#cover-every-surface) that apply.
@@ -210,7 +214,8 @@ Worktree: `<absolute path>` (branch `<branch>`)
 ```
 
 - Give the exact commands with the real path, ready to paste. If the
-  maintainer needs to rebuild, include `source dev.sh && he build` first.
+  maintainer needs to rebuild, include `devutils/rac/build-queue.sh he build`
+  first.
 - Write the steps for someone who hasn't read the code. Name the menus,
   shortcuts, and settings you used.
 - Cover the surfaces from [Cover every surface](#cover-every-surface) that
