@@ -36,6 +36,26 @@ So every stream starts in a **light worktree**: `git worktree add -b <branch> <p
 
 A stream is one worktree, one branch, and one lead agent with helpers. Streams are split so they don't edit the same files. When two streams must touch one file, the brief names the owner, and the other asks or waits. Leads stagger their streams so the Air runs about 10 agent sessions at once, to start, and they watch memory pressure.
 
+## Which model does what
+
+The maintainer asked on 2026-10-27 to spend less Claude usage by pushing work that doesn't need a smart model to free models, while still using Claude subagents heavily. Pick the cheapest tier that can do the job well, and check anything a free model produces before you build on it.
+
+| Tier | Models | Use it for |
+| --- | --- | --- |
+| Free | OpenCode: `opencode/deepseek-v4.1-flash-free`, `opencode/glm-5.3-flash-free`, `opencode/mimo-v2.6-flash-free` | Searching and reading code, summarizing files and logs, mapping where something lives in Chromium, first-pass reviews and second opinions, drafting tests from a written spec, boilerplate, doc wording, checking fixtures |
+| Free, vision | `opencode/nemotron-3.5-super-vl-free` | First look at screenshots: blank frames, overlap, clipped text, wrong theme. A Claude model makes the final call |
+| Free, when available | Cursor `grok-4.7-medium` (the only Grok on the free plan; often out of usage) | The same jobs as the free tier. If it errors, move on without retrying |
+| Cheap Claude | Haiku 5.5 | Mechanical edits, renames, running tests and builds and summarizing them, reformatting |
+| Claude | Sonnet 5.5 | Routine code with a clear spec, wiring, unit tests, most PR fixes |
+| Claude, strongest | Opus 5.5 | Security code (the guard, sign-in import, the Keychain), architecture, UI and motion design, final adversarial reviews, anything a free model got wrong |
+
+How to call them:
+- OpenCode: `timeout 1200 opencode run -m <model> --dir <stream worktree> "<brief>"`. Cursor: `timeout 1200 cursor-agent -p --trust --model grok-4.7-medium --workspace <stream worktree> --output-format text "<brief>"`. Both run from the shell inside your own turn, never as threads.
+- Give them a complete brief: the goal, the exact files, what done looks like, and "read only" unless they must write one named file.
+- Free models are often slow when busy. Use a timeout. If one times out or gives a weak answer, use Haiku or Sonnet instead and don't retry it in a loop.
+- Free and Cursor models never write security-sensitive code, never see real user data or secrets, never commit, push, or open PRs, and never run builds through the queue. A Claude model reviews their output before it lands in a patch.
+- Never use OpenCode `auto` routing or Factory. Factory has no subscription right now.
+
 ## The build queue (D63)
 
 Every local build goes through `devutils/rac/build-queue.sh`, never a bare `he build`. Ship writes it on day 0. Until it lands, build one at a time with a manual lock: `mkdir ~/.rac-build-queue/manual` before the build and `rmdir` after. If `mkdir` fails, someone else is building, so wait.
