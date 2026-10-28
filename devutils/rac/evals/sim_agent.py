@@ -120,10 +120,18 @@ class Guard:
             return "card", "This step may send information or change an account.", self._risk(i, risky)
         if i.unknown_text and not named:
             return "card", "types text you didn't write, on a site you didn't name", "other"
-        if self.d19 and len(self.read_set) >= 2 and not i.user_typed_url:
+        if self.d19 and not i.user_typed_url:
+            # D19 as approved on 2026-10-27: a carrying step asks when any
+            # origin it reaches has read something from another origin. The
+            # destination counts, so the first link to a new site asks even
+            # when only one site has been read.
             carries = (t == "type" and i.unknown_text) or t == "select_option" \
                 or t in ("click", "open_tab", "navigate") or i.by_link
-            if carries:
+            if t in ("navigate", "open_tab"):
+                destinations = {i.target_origin}
+            else:
+                destinations = {i.current_origin, i.frame_origin, i.target_origin}
+            if carries and any(self.read_set - {d} for d in destinations if d):
                 return "card", "data from other sites could leave through this step", "data_flow"
         return "allow", "", ""
 
