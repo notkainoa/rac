@@ -1,0 +1,4026 @@
+Rolling backups of the profile's sidebar data, with the restore plan and the
+profile-keyed factory. The restore UI and the registration hooks come later.
+--- a/chrome/browser/prefs/BUILD.gn
++++ b/chrome/browser/prefs/BUILD.gn
+@@ -107,6 +107,7 @@
+     "//chrome/browser/rac/import:arc_source",
+     "//chrome/browser/rac/pip",
+     "//chrome/browser/rac/spaces",
++    "//chrome/browser/rac/storage",
+     "//chrome/browser/rac/updates",
+     "//chrome/browser/search",
+     "//chrome/browser/search/background",
+--- /dev/null
++++ b/chrome/browser/rac/storage/BUILD.gn
+@@ -0,0 +1,59 @@
++# Copyright 2026 The rac Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import("//testing/test.gni")
++
++# Backups of the profile's sidebar data. Depends only on base and prefs, so
++# it can be tested without a browser.
++source_set("storage") {
++  sources = [
++    "data_backups.cc",
++    "data_backups.h",
++    "restore_plan.cc",
++    "restore_plan.h",
++  ]
++  public_deps = [
++    "//base",
++    "//components/keyed_service/core",
++
++    # PrefChangeRegistrar is a member.
++    "//components/prefs",
++  ]
++}
++
++source_set("browser") {
++  sources = [
++    "data_backups_factory.cc",
++    "data_backups_factory.h",
++  ]
++  public_deps = [
++    ":storage",
++    "//chrome/browser/profiles:profile",
++  ]
++
++  # Only for the pref-name static_asserts. Nothing from them runs.
++  deps = [
++    "//chrome/browser/rac/ai:core",
++    "//chrome/browser/rac/spaces",
++  ]
++}
++
++# Build with `autoninja -C out/Default
++# chrome/browser/rac/storage:rac_storage_unittests`. It's separate from
++# Chromium's unit_tests, which takes hours to build.
++test("rac_storage_unittests") {
++  sources = [
++    "data_backups_unittest.cc",
++    "restore_plan_unittest.cc",
++  ]
++  deps = [
++    ":storage",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//components/prefs",
++    "//components/prefs:test_support",
++    "//testing/gtest",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/rac/storage/data_backups.cc
+@@ -0,0 +1,1266 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/storage/data_backups.h"
++
++#include <algorithm>
++#include <utility>
++#include <vector>
++
++#include "base/containers/adapters.h"
++#include "base/files/file.h"
++#include "base/files/file_enumerator.h"
++#include "base/files/file_util.h"
++#include "base/files/important_file_writer.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/json/values_util.h"
++#include "base/logging.h"
++#include "base/memory/ptr_util.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "base/time/clock.h"
++#include "base/time/default_clock.h"
++#include "build/build_config.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
++
++namespace rac {
++
++namespace backups_internal {
++
++// What the startup check for a reset `Preferences` found.
++struct ResetCheck {
++  // Backup files existed, so this `Preferences` was reset.
++  bool reset = false;
++  // Every daily backup became a pre-reset copy. If not, the check runs again
++  // at the next launch and no daily is written until then.
++  bool rotated = true;
++  std::optional<DataBackups::RestoreOffer> offer;
++};
++
++// What a background write or prune did.
++struct FileWork {
++  FileWork() = default;
++  FileWork(FileWork&&) = default;
++  FileWork& operator=(FileWork&&) = default;
++  ~FileWork() = default;
++
++  std::optional<base::Time> daily_written;
++  std::optional<std::string> snapshot_written;
++  // When the next pre-reset copy or snapshot expires.
++  std::optional<base::Time> next_expiry;
++  // Snapshots still on disk, so pins on deleted ones can be dropped.
++  std::vector<std::string> snapshot_ids;
++};
++
++}  // namespace backups_internal
++
++namespace {
++
++using backups_internal::FileWork;
++using backups_internal::ResetCheck;
++using Kind = DataBackups::Kind;
++
++// File keys. Files carry their own version so a newer rac's backups are
++// never misread by an older one.
++constexpr char kVersionKey[] = "version";
++constexpr char kMinReaderVersionKey[] = "min_reader_version";
++constexpr char kKindKey[] = "kind";
++constexpr char kReasonKey[] = "reason";
++constexpr char kCreatedKey[] = "created";
++constexpr char kPrefsKey[] = "prefs";
++constexpr char kSpacesStoreKey[] = "spaces_store";
++
++constexpr char kKindDaily[] = "daily";
++constexpr char kKindPreReset[] = "prereset";
++constexpr char kKindSnapshot[] = "snapshot";
++
++// File names: "<prefix><time>.json", and snapshots add "-<reason>".
++constexpr char kDailyPrefix[] = "daily-";
++constexpr char kPreResetPrefix[] = "prereset-";
++constexpr char kSnapshotPrefix[] = "snapshot-";
++constexpr char kJsonExtension[] = ".json";
++// "20261027T130501123Z": UTC, to the millisecond.
++constexpr size_t kTimeLength = 19;
++constexpr size_t kMaxReasonLength = 32;
++
++// SpacesStore's file and its previous copy.
++constexpr char kSpacesStoreFile[] = "rac spaces";
++constexpr char kSpacesStoreBackupSuffix[] = ".bak";
++
++// RestoreOffer keys.
++constexpr char kOfferBackupKey[] = "backup";
++constexpr char kOfferCreatedKey[] = "created";
++constexpr char kOfferDetectedKey[] = "detected";
++constexpr char kOfferSpacesKey[] = "spaces";
++constexpr char kOfferPinnedTabsKey[] = "pinned_tabs";
++constexpr char kOfferFavoritesKey[] = "favorites";
++constexpr char kOfferSpaceListKey[] = "space_list";
++constexpr char kSummaryNameKey[] = "name";
++constexpr char kSummaryEmojiKey[] = "emoji";
++constexpr char kSummaryColor1Key[] = "color1";
++constexpr char kSummaryColor2Key[] = "color2";
++constexpr char kSummaryModeKey[] = "mode";
++
++// The shapes of rac.spaces and rac.sidebar.lists, as SpacesService and
++// SidebarItems write them.
++constexpr char kSpacesListKey[] = "spaces";
++constexpr char kSpaceIdKey[] = "id";
++constexpr char kSpaceNameKey[] = "name";
++constexpr char kSpaceIconKey[] = "icon";
++// A space's `theme`: {"color1": "#RRGGBB", "color2": "#RRGGBB",
++// "mode": "light" | "dark" | "auto"}.
++constexpr char kSpaceThemeKey[] = "theme";
++constexpr char kThemeColor1Key[] = "color1";
++constexpr char kThemeColor2Key[] = "color2";
++constexpr char kThemeModeKey[] = "mode";
++constexpr char kModeLight[] = "light";
++constexpr char kModeDark[] = "dark";
++constexpr char kModeAuto[] = "auto";
++constexpr char kFavoritesList[] = "favorites";
++constexpr char kPinnedListPrefix[] = "pinned.";
++constexpr char kEntriesKey[] = "entries";
++constexpr char kFolderItemsKey[] = "items";
++
++// Far bigger than any backup this build writes. Larger files are skipped.
++constexpr size_t kMaxFileSize = 64 * 1024 * 1024;
++
++// How long a failed write or delete waits before it's tried again.
++constexpr base::TimeDelta kRetryDelay = base::Hours(1);
++// The shortest wait between two runs of the scheduled work.
++constexpr base::TimeDelta kMinRunInterval = base::Minutes(1);
++
++std::string FormatTime(base::Time time) {
++  base::Time::Exploded exploded;
++  time.UTCExplode(&exploded);
++  return base::StringPrintf("%04d%02d%02dT%02d%02d%02d%03dZ", exploded.year,
++                            exploded.month, exploded.day_of_month,
++                            exploded.hour, exploded.minute, exploded.second,
++                            exploded.millisecond);
++}
++
++std::optional<base::Time> ParseTime(std::string_view text) {
++  if (text.size() != kTimeLength || text[8] != 'T' || text[18] != 'Z') {
++    return std::nullopt;
++  }
++  auto field = [&](size_t start, size_t length) -> std::optional<int> {
++    std::string_view digits = text.substr(start, length);
++    int value = 0;
++    if (!std::ranges::all_of(digits, base::IsAsciiDigit<char>) ||
++        !base::StringToInt(digits, &value)) {
++      return std::nullopt;
++    }
++    return value;
++  };
++  std::optional<int> year = field(0, 4), month = field(4, 2),
++                     day = field(6, 2), hour = field(9, 2),
++                     minute = field(11, 2), second = field(13, 2),
++                     millisecond = field(15, 3);
++  if (!year || !month || !day || !hour || !minute || !second ||
++      !millisecond) {
++    return std::nullopt;
++  }
++  base::Time::Exploded exploded = {};
++  exploded.year = *year;
++  exploded.month = *month;
++  exploded.day_of_month = *day;
++  exploded.hour = *hour;
++  exploded.minute = *minute;
++  exploded.second = *second;
++  exploded.millisecond = *millisecond;
++  base::Time time;
++  if (!base::Time::FromUTCExploded(exploded, &time)) {
++    return std::nullopt;
++  }
++  return time;
++}
++
++bool IsValidReason(std::string_view reason) {
++  return !reason.empty() && reason.size() <= kMaxReasonLength &&
++         std::ranges::all_of(reason, [](char c) {
++           return base::IsAsciiLower(c) || base::IsAsciiDigit(c) || c == '-';
++         });
++}
++
++std::string DailyId(base::Time created) {
++  return base::StrCat({kDailyPrefix, FormatTime(created)});
++}
++
++std::string PreResetId(base::Time created) {
++  return base::StrCat({kPreResetPrefix, FormatTime(created)});
++}
++
++std::string SnapshotId(base::Time created, std::string_view reason) {
++  return base::StrCat({kSnapshotPrefix, FormatTime(created), "-", reason});
++}
++
++struct ParsedId {
++  Kind kind;
++  base::Time created;
++};
++
++// Ids become file names, so this strict parser is also what keeps a caller's
++// id from naming any other file.
++std::optional<ParsedId> ParseBackupId(std::string_view id) {
++  for (const auto& [prefix, kind] :
++       {std::pair(kDailyPrefix, Kind::kDaily),
++        std::pair(kPreResetPrefix, Kind::kPreReset)}) {
++    if (base::StartsWith(id, prefix)) {
++      std::optional<base::Time> created =
++          ParseTime(id.substr(std::string_view(prefix).size()));
++      return created ? std::optional<ParsedId>({kind, *created})
++                     : std::nullopt;
++    }
++  }
++  if (!base::StartsWith(id, kSnapshotPrefix)) {
++    return std::nullopt;
++  }
++  id.remove_prefix(std::string_view(kSnapshotPrefix).size());
++  if (id.size() < kTimeLength + 2 || id[kTimeLength] != '-' ||
++      !IsValidReason(id.substr(kTimeLength + 1))) {
++    return std::nullopt;
++  }
++  std::optional<base::Time> created = ParseTime(id.substr(0, kTimeLength));
++  return created ? std::optional<ParsedId>({Kind::kSnapshot, *created})
++                 : std::nullopt;
++}
++
++bool IsSnapshotId(std::string_view id) {
++  std::optional<ParsedId> parsed = ParseBackupId(id);
++  return parsed && parsed->kind == Kind::kSnapshot;
++}
++
++base::FilePath FileForId(const base::FilePath& dir, std::string_view id) {
++  return dir.AppendASCII(base::StrCat({id, kJsonExtension}));
++}
++
++base::DictValue MakeFile(std::string_view kind,
++                         std::string_view reason,
++                         base::Time created) {
++  base::DictValue file;
++  file.Set(kVersionKey, DataBackups::kVersion);
++  file.Set(kMinReaderVersionKey, DataBackups::kMinReaderVersion);
++  file.Set(kKindKey, kind);
++  if (!reason.empty()) {
++    file.Set(kReasonKey, reason);
++  }
++  file.Set(kCreatedKey, base::TimeToValue(created));
++  return file;
++}
++
++bool HasData(const DataBackups::Contents& contents) {
++  return !DataBackups::IsEmpty(
++      contents.prefs.Find(DataBackups::kSpacesPref),
++      contents.prefs.Find(DataBackups::kSidebarListsPref));
++}
++
++// The functions below run on the background sequence.
++
++std::optional<base::DictValue> ReadJsonDict(const base::FilePath& path) {
++  std::string content;
++  if (!base::ReadFileToStringWithMaxSize(path, &content, kMaxFileSize) ||
++      content.empty()) {
++    return std::nullopt;
++  }
++  std::optional<base::Value> parsed =
++      base::JSONReader::Read(content, base::JSON_PARSE_RFC);
++  if (!parsed || !parsed->is_dict()) {
++    return std::nullopt;
++  }
++  return std::move(parsed->GetDict());
++}
++
++// The folder is the user's only, and so is every file in it. Backups hold
++// the same data as `Preferences`, but nobody else needs to read them.
++bool WriteBackupFile(const base::FilePath& dir,
++                     std::string_view id,
++                     const base::DictValue& file) {
++  if (!base::CreateDirectory(dir)) {
++    LOG(ERROR) << "rac: couldn't create the backups folder";
++    return false;
++  }
++  std::string json;
++  if (!base::JSONWriter::Write(file, &json)) {
++    LOG(ERROR) << "rac: couldn't serialize a backup";
++    return false;
++  }
++#if BUILDFLAG(IS_POSIX)
++  if (!base::SetPosixFilePermissions(dir, base::FILE_PERMISSION_USER_MASK)) {
++    LOG(ERROR) << "rac: couldn't restrict the backups folder";
++    return false;
++  }
++#endif
++  // The temporary file it renames into place comes from mkstemp, so it's
++  // 0600 from the start. Nothing else needs to change its mode.
++  if (!base::ImportantFileWriter::WriteFileAtomically(FileForId(dir, id), json,
++                                                      "RacDataBackups")) {
++    LOG(ERROR) << "rac: couldn't write a backup";
++    return false;
++  }
++  return true;
++}
++
++// Reads `rac spaces` the way SpacesStore does: the file, else its previous
++// copy, else nothing. A snapshot then holds what the store would load.
++std::optional<base::DictValue> ReadSpacesStore(
++    const base::FilePath& profile_dir) {
++  for (const char* suffix : {"", kSpacesStoreBackupSuffix}) {
++    std::optional<base::DictValue> dict = ReadJsonDict(
++        profile_dir.AppendASCII(base::StrCat({kSpacesStoreFile, suffix})));
++    if (dict) {
++      return dict;
++    }
++  }
++  return std::nullopt;
++}
++
++struct BackupFile {
++  base::FilePath path;
++  std::string id;
++  Kind kind;
++  base::Time created;
++  base::Time modified;
++};
++
++// Oldest first. Names and the directory's stat data only; no file is opened.
++std::vector<BackupFile> ListBackups(const base::FilePath& dir) {
++  std::vector<BackupFile> backups;
++  base::FileEnumerator files(dir, /*recursive=*/false,
++                             base::FileEnumerator::FILES,
++                             FILE_PATH_LITERAL("*.json"));
++  for (base::FilePath path = files.Next(); !path.empty();
++       path = files.Next()) {
++    std::string id = path.BaseName().RemoveFinalExtension().MaybeAsASCII();
++    if (std::optional<ParsedId> parsed = ParseBackupId(id)) {
++      backups.push_back({path, std::move(id), parsed->kind, parsed->created,
++                         files.GetInfo().GetLastModifiedTime()});
++    }
++  }
++  std::ranges::sort(backups, {}, &BackupFile::created);
++  return backups;
++}
++
++// When a backup stops being kept. Daily backups are kept by count instead.
++//
++// A snapshot's lifetime starts at the older of the time in its name and its
++// file's time, so neither a renamed file nor a skewed name keeps open-tab
++// URLs longer. A pre-reset copy's starts when it became one (rotation sets
++// its file time), so the copy an offer points at always outlives the offer.
++//
++// If the start is more than kClockSkewAllowance in the future, the clock
++// moved back since it was written. The lifetime then restarts now, recorded
++// in the file's time: the file still goes within one lifetime, and Undo
++// isn't wiped by a clock correction.
++std::optional<base::Time> ExpiryOf(const BackupFile& file, base::Time now) {
++  base::TimeDelta lifetime = DataBackups::kSnapshotLifetime;
++  base::Time start = std::min(file.created, file.modified);
++  switch (file.kind) {
++    case Kind::kDaily:
++      return std::nullopt;
++    case Kind::kPreReset:
++      lifetime = DataBackups::kPreResetLifetime;
++      start = file.modified;
++      break;
++    case Kind::kSnapshot:
++      break;
++  }
++  if (start > now + DataBackups::kClockSkewAllowance) {
++    if (!base::TouchFile(file.path, now, now)) {
++      LOG(ERROR) << "rac: couldn't restart a backup's lifetime";
++    }
++    start = now;
++  }
++  return start + lifetime;
++}
++
++bool IsExpired(const BackupFile& file, base::Time now) {
++  std::optional<base::Time> expiry = ExpiryOf(file, now);
++  return expiry && *expiry <= now;
++}
++
++std::optional<DataBackups::Contents> DecodeBackup(const base::DictValue& file,
++                                                  const ParsedId& parsed,
++                                                  std::string_view id) {
++  if (file.FindInt(kMinReaderVersionKey).value_or(DataBackups::kVersion) >
++      DataBackups::kVersion) {
++    return std::nullopt;
++  }
++  std::optional<base::Time> created = base::ValueToTime(file.Find(kCreatedKey));
++  if (!created) {
++    return std::nullopt;
++  }
++  DataBackups::Contents contents;
++  contents.id = std::string(id);
++  contents.kind = parsed.kind;
++  contents.created = *created;
++  if (const std::string* reason = file.FindString(kReasonKey)) {
++    contents.reason = *reason;
++  }
++  // Only the prefs this build restores. A newer build may back up more.
++  if (const base::DictValue* prefs = file.FindDict(kPrefsKey)) {
++    for (const char* name : DataBackups::kBackedUpPrefs) {
++      if (const base::Value* value = prefs->Find(name)) {
++        contents.prefs.Set(name, value->Clone());
++      }
++    }
++  }
++  // Only snapshots may hold open tabs. Anything else that claims to is
++  // ignored, so a daily or pre-reset copy never brings tabs back.
++  if (parsed.kind == Kind::kSnapshot) {
++    if (const base::DictValue* store = file.FindDict(kSpacesStoreKey)) {
++      contents.spaces_store = store->Clone();
++    }
++  }
++  contents.counts =
++      DataBackups::Count(contents.prefs.Find(DataBackups::kSpacesPref),
++                         contents.prefs.Find(DataBackups::kSidebarListsPref));
++  return contents;
++}
++
++std::optional<DataBackups::Contents> ReadBackupFile(const base::FilePath& dir,
++                                                    const std::string& id,
++                                                    base::Time now) {
++  std::optional<ParsedId> parsed = ParseBackupId(id);
++  if (!parsed) {
++    return std::nullopt;
++  }
++  const base::FilePath path = FileForId(dir, id);
++  base::File::Info info;
++  if (!base::GetFileInfo(path, &info)) {
++    return std::nullopt;
++  }
++  // Pruning may not have run yet. An expired backup is gone either way.
++  if (IsExpired({path, id, parsed->kind, parsed->created, info.last_modified},
++                now)) {
++    return std::nullopt;
++  }
++  std::optional<base::DictValue> file = ReadJsonDict(path);
++  if (!file) {
++    return std::nullopt;
++  }
++  return DecodeBackup(*file, *parsed, id);
++}
++
++// The newest pre-reset copy or snapshot with data in it, other than
++// `skip_id`. Daily backups aren't considered: after a reset, every daily is
++// either a pre-reset copy already or holds what was made since.
++std::optional<DataBackups::Contents> NewestWithData(const base::FilePath& dir,
++                                                    base::Time now,
++                                                    std::string_view skip_id) {
++  std::vector<BackupFile> backups = ListBackups(dir);
++  for (const BackupFile& backup : base::Reversed(backups)) {
++    if (backup.kind == Kind::kDaily || backup.id == skip_id) {
++      continue;
++    }
++    std::optional<DataBackups::Contents> contents =
++        ReadBackupFile(dir, backup.id, now);
++    if (contents && HasData(*contents)) {
++      return contents;
++    }
++  }
++  return std::nullopt;
++}
++
++// Deletes expired backups, daily backups beyond kDailyGenerations, and the
++// oldest unpinned snapshots beyond kMaxSnapshots.
++void Prune(const base::FilePath& dir,
++           base::Time now,
++           const base::flat_set<std::string>& pinned,
++           FileWork& work) {
++  std::vector<BackupFile> backups = ListBackups(dir);
++  std::vector<const BackupFile*> dailies;
++  std::vector<const BackupFile*> snapshots;
++  auto note_expiry = [&](base::Time expiry) {
++    work.next_expiry =
++        work.next_expiry ? std::min(*work.next_expiry, expiry) : expiry;
++  };
++  auto remove = [&](const BackupFile& backup) {
++    if (base::DeleteFile(backup.path)) {
++      return true;
++    }
++    LOG(ERROR) << "rac: couldn't delete an old backup";
++    note_expiry(now + kRetryDelay);
++    return false;
++  };
++  for (const BackupFile& backup : backups) {
++    std::optional<base::Time> expiry = ExpiryOf(backup, now);
++    if (expiry && *expiry <= now) {
++      if (remove(backup)) {
++        continue;
++      }
++    } else if (expiry) {
++      note_expiry(*expiry);
++    }
++    if (backup.kind == Kind::kDaily) {
++      dailies.push_back(&backup);
++    } else if (backup.kind == Kind::kSnapshot) {
++      snapshots.push_back(&backup);
++    }
++  }
++  // Both lists are oldest first.
++  for (size_t i = 0; i + DataBackups::kDailyGenerations < dailies.size(); ++i) {
++    remove(*dailies[i]);
++  }
++  size_t snapshot_count = snapshots.size();
++  for (const BackupFile* snapshot : snapshots) {
++    if (snapshot_count <= DataBackups::kMaxSnapshots) {
++      break;
++    }
++    if (!pinned.contains(snapshot->id) && remove(*snapshot)) {
++      --snapshot_count;
++    }
++  }
++  for (const BackupFile* snapshot : snapshots) {
++    if (base::PathExists(snapshot->path)) {
++      work.snapshot_ids.push_back(snapshot->id);
++    }
++  }
++}
++
++FileWork WriteSnapshot(const base::FilePath& profile_dir,
++                       const base::FilePath& dir,
++                       std::string id,
++                       base::DictValue file,
++                       base::Time now,
++                       base::flat_set<std::string> pinned) {
++  if (std::optional<base::DictValue> store = ReadSpacesStore(profile_dir)) {
++    file.Set(kSpacesStoreKey, std::move(*store));
++  }
++  FileWork work;
++  if (WriteBackupFile(dir, id, file)) {
++    work.snapshot_written = std::move(id);
++  }
++  // `pinned` includes the new snapshot, so the cap never takes it.
++  Prune(dir, now, pinned, work);
++  return work;
++}
++
++FileWork DoScheduledWork(
++    const base::FilePath& dir,
++    std::optional<std::pair<std::string, base::DictValue>> daily,
++    base::Time now,
++    base::flat_set<std::string> pinned) {
++  FileWork work;
++  if (daily && WriteBackupFile(dir, daily->first, daily->second)) {
++    work.daily_written = now;
++  }
++  Prune(dir, now, pinned, work);
++  return work;
++}
++
++FileWork DeleteSnapshotFile(const base::FilePath& dir,
++                            const std::string& id,
++                            base::Time now,
++                            base::flat_set<std::string> pinned) {
++  base::DeleteFile(FileForId(dir, id));
++  FileWork work;
++  Prune(dir, now, pinned, work);
++  return work;
++}
++
++// Runs once per `Preferences`, when kInitializedPref is unset. Backup files
++// then mean `Preferences` was reset: every daily backup becomes a pre-reset
++// copy, so nothing written from now on can replace it. If the live sidebar
++// is empty, the newest backup with data in it is offered.
++ResetCheck CheckForReset(const base::FilePath& dir,
++                         bool live_empty,
++                         base::Time now) {
++  ResetCheck result;
++  std::vector<BackupFile> backups = ListBackups(dir);
++  if (backups.empty()) {
++    return result;
++  }
++  result.reset = true;
++  for (const BackupFile& backup : backups) {
++    if (backup.kind != Kind::kDaily) {
++      continue;
++    }
++    const base::FilePath target = FileForId(dir, PreResetId(backup.created));
++    if (base::PathExists(target)) {
++      // Kept at an earlier reset already.
++      base::DeleteFile(backup.path);
++      continue;
++    }
++    // The file's time marks when it became a pre-reset copy, which starts
++    // its kPreResetLifetime.
++    if (!base::Move(backup.path, target) ||
++        !base::TouchFile(target, now, now)) {
++      LOG(ERROR) << "rac: couldn't keep a backup from before a reset";
++      result.rotated = false;
++    }
++  }
++  if (!live_empty) {
++    return result;
++  }
++  std::optional<DataBackups::Contents> best =
++      NewestWithData(dir, now, /*skip_id=*/std::string_view());
++  if (!best) {
++    return result;
++  }
++  if (best->kind == Kind::kSnapshot) {
++    // A snapshot expires in at most kSnapshotLifetime, which can be before
++    // the offer lapses. The offer gets a pre-reset copy of its prefs. Its open
++    // tabs aren't copied, so they still go on time.
++    const std::string id = PreResetId(best->created);
++    base::DictValue copy = MakeFile(kKindPreReset, best->reason, best->created);
++    copy.Set(kPrefsKey, best->prefs.Clone());
++    if (!base::PathExists(FileForId(dir, id)) &&
++        WriteBackupFile(dir, id, copy)) {
++      best->id = id;
++    }
++  }
++  // Only the offer's small summaries are made here, not a copy of the prefs.
++  std::vector<DataBackups::SpaceSummary> spaces =
++      DataBackups::SummarizeSpaces(best->prefs.Find(DataBackups::kSpacesPref));
++  result.offer = DataBackups::RestoreOffer{.backup_id = best->id,
++                                           .created = best->created,
++                                           .counts = best->counts,
++                                           .spaces = std::move(spaces),
++                                           .detected = now};
++  return result;
++}
++
++std::optional<DataBackups::Contents> ReadOfferedBackupFile(
++    const base::FilePath& dir,
++    const std::string& id,
++    base::Time now) {
++  std::optional<DataBackups::Contents> offered = ReadBackupFile(dir, id, now);
++  if (offered && HasData(*offered)) {
++    return offered;
++  }
++  LOG(ERROR) << "rac: the offered backup is gone; using the next newest";
++  return NewestWithData(dir, now, id);
++}
++
++// Calls `visit` with each list in rac.sidebar.lists, its key, and its
++// entries.
++template <typename Visitor>
++void ForEachSidebarList(const base::Value* sidebar_lists, Visitor visit) {
++  if (!sidebar_lists || !sidebar_lists->is_dict()) {
++    return;
++  }
++  for (const auto [key, value] : sidebar_lists->GetDict()) {
++    const base::DictValue* list = value.GetIfDict();
++    const base::ListValue* entries =
++        list ? list->FindList(kEntriesKey) : nullptr;
++    if (entries) {
++      visit(key, *entries);
++    }
++  }
++}
++
++const base::ListValue* FindSpacesList(const base::Value* spaces) {
++  return spaces && spaces->is_dict()
++             ? spaces->GetDict().FindList(kSpacesListKey)
++             : nullptr;
++}
++
++bool IsSpace(const base::Value& entry) {
++  return entry.is_dict() && entry.GetDict().FindString(kSpaceIdKey);
++}
++
++// "#RRGGBB" only, the form SpaceTheme stores. Anything else becomes empty, so
++// the UI falls back to its own color instead of parsing a stranger's string.
++std::string ValidColor(const std::string* color) {
++  if (!color || color->size() != 7 || (*color)[0] != '#' ||
++      !std::ranges::all_of(std::string_view(*color).substr(1),
++                           base::IsHexDigit<char>)) {
++    return std::string();
++  }
++  return *color;
++}
++
++DataBackups::SpaceSummary::Mode ParseMode(const std::string* mode) {
++  using Mode = DataBackups::SpaceSummary::Mode;
++  if (mode && *mode == kModeLight) {
++    return Mode::kLight;
++  }
++  if (mode && *mode == kModeDark) {
++    return Mode::kDark;
++  }
++  return Mode::kAuto;
++}
++
++const char* ModeName(DataBackups::SpaceSummary::Mode mode) {
++  using Mode = DataBackups::SpaceSummary::Mode;
++  return mode == Mode::kLight  ? kModeLight
++         : mode == Mode::kDark ? kModeDark
++                               : kModeAuto;
++}
++
++// Bounds a string the offer shows. Names are cut on a character boundary;
++// an emoji that is too long is dropped, because half an emoji is worse than
++// none.
++std::string BoundName(const std::string* name) {
++  return name ? std::string(base::TruncateUTF8ToByteSize(
++                    *name, DataBackups::kMaxSummaryNameBytes))
++              : std::string();
++}
++
++std::string BoundEmoji(const std::string* emoji) {
++  return emoji && emoji->size() <= DataBackups::kMaxSummaryEmojiBytes &&
++                 base::IsStringUTF8(*emoji)
++             ? *emoji
++             : std::string();
++}
++
++}  // namespace
++
++DataBackups::Contents::Contents() = default;
++DataBackups::Contents::Contents(Contents&&) = default;
++DataBackups::Contents& DataBackups::Contents::operator=(Contents&&) = default;
++DataBackups::Contents::~Contents() = default;
++
++base::DictValue DataBackups::RestoreOffer::ToDict() const {
++  base::ListValue space_list;
++  for (size_t i = 0; i < std::min(spaces.size(), kMaxOfferSpaces); ++i) {
++    const SpaceSummary& space = spaces[i];
++    space_list.Append(base::DictValue()
++                          .Set(kSummaryNameKey, space.name)
++                          .Set(kSummaryEmojiKey, space.emoji)
++                          .Set(kSummaryColor1Key, space.color1)
++                          .Set(kSummaryColor2Key, space.color2)
++                          .Set(kSummaryModeKey, ModeName(space.mode)));
++  }
++  return base::DictValue()
++      .Set(kOfferBackupKey, backup_id)
++      .Set(kOfferCreatedKey, base::TimeToValue(created))
++      .Set(kOfferDetectedKey, base::TimeToValue(detected))
++      .Set(kOfferSpacesKey, static_cast<int>(counts.spaces))
++      .Set(kOfferPinnedTabsKey, static_cast<int>(counts.pinned_tabs))
++      .Set(kOfferFavoritesKey, static_cast<int>(counts.favorites))
++      .Set(kOfferSpaceListKey, std::move(space_list));
++}
++
++// static
++std::optional<DataBackups::RestoreOffer> DataBackups::RestoreOffer::FromDict(
++    const base::DictValue& dict) {
++  const std::string* backup_id = dict.FindString(kOfferBackupKey);
++  std::optional<base::Time> created =
++      base::ValueToTime(dict.Find(kOfferCreatedKey));
++  std::optional<base::Time> detected =
++      base::ValueToTime(dict.Find(kOfferDetectedKey));
++  if (!backup_id || !ParseBackupId(*backup_id) || !created || !detected) {
++    return std::nullopt;
++  }
++  auto count = [&](std::string_view key) {
++    return static_cast<size_t>(std::max(dict.FindInt(key).value_or(0), 0));
++  };
++  RestoreOffer offer{.backup_id = *backup_id,
++                     .created = *created,
++                     .counts = {.spaces = count(kOfferSpacesKey),
++                                .pinned_tabs = count(kOfferPinnedTabsKey),
++                                .favorites = count(kOfferFavoritesKey)},
++                     .detected = *detected};
++  // Prefs can be edited or come from another build, so the list is checked
++  // again. A missing or malformed list just means no summaries.
++  if (const base::ListValue* space_list = dict.FindList(kOfferSpaceListKey)) {
++    for (const base::Value& entry : *space_list) {
++      const base::DictValue* summary = entry.GetIfDict();
++      if (!summary) {
++        continue;
++      }
++      if (offer.spaces.size() >= kMaxOfferSpaces) {
++        break;
++      }
++      offer.spaces.push_back(
++          {.name = BoundName(summary->FindString(kSummaryNameKey)),
++           .emoji = BoundEmoji(summary->FindString(kSummaryEmojiKey)),
++           .color1 = ValidColor(summary->FindString(kSummaryColor1Key)),
++           .color2 = ValidColor(summary->FindString(kSummaryColor2Key)),
++           .mode = ParseMode(summary->FindString(kSummaryModeKey))});
++    }
++  }
++  return offer;
++}
++
++DataBackups::Operation::Operation(base::WeakPtr<DataBackups> owner)
++    : owner_(std::move(owner)) {}
++
++DataBackups::Operation::~Operation() {
++  if (owner_) {
++    owner_->EndOperation(data_changed_);
++  }
++}
++
++template <typename Result>
++void DataBackups::PostFileTask(base::OnceCallback<Result()> task,
++                               base::OnceCallback<void(Result)> reply) {
++  ++file_tasks_posted_;
++  task_runner_->PostTaskAndReplyWithResult(FROM_HERE, std::move(task),
++                                           std::move(reply));
++}
++
++DataBackups::DataBackups(PrefService* prefs,
++                         base::FilePath profile_dir,
++                         const base::Clock* clock)
++    : prefs_(prefs),
++      profile_dir_(std::move(profile_dir)),
++      dir_(profile_dir_.AppendASCII(kDirName)),
++      clock_(clock ? clock : base::DefaultClock::GetInstance()),
++      task_runner_(base::ThreadPool::CreateSequencedTaskRunner(
++          {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
++           base::TaskShutdownBehavior::BLOCK_SHUTDOWN})),
++      timer_(clock_, /*tick_clock=*/nullptr) {
++  CHECK(prefs_);
++  sidebar_watch_.Init(prefs_);
++  // Everything here reads prefs already in memory. A file is touched only
++  // when this `Preferences` was never checked against the backups folder: a
++  // new profile's first launch, or the first launch after a reset.
++  const base::DictValue& stored_offer = prefs_->GetDict(kRestoreOfferPref);
++  if (!stored_offer.empty()) {
++    std::optional<RestoreOffer> offer = RestoreOffer::FromDict(stored_offer);
++    if (offer && offer->detected > Now() + kClockSkewAllowance) {
++      // The clock moved back. The offer's lifetime restarts now.
++      offer->detected = Now();
++      prefs_->SetDict(kRestoreOfferPref, offer->ToDict());
++    }
++    if (offer && Now() < offer->detected + kRestoreOfferLifetime) {
++      restore_offer_ = std::move(offer);
++    } else {
++      // An offer nobody answered lapses as if dismissed. The pre-reset copy it
++      // pointed at stays for its own lifetime.
++      prefs_->ClearPref(kRestoreOfferPref);
++    }
++  }
++  if (!prefs_->GetBoolean(kInitializedPref)) {
++    PostFileTask(base::BindOnce(&CheckForReset, dir_, IsLiveEmpty(), Now()),
++                 base::BindOnce(&DataBackups::DidCheckForReset,
++                                weak_factory_.GetWeakPtr()));
++  }
++  startup_run_time_ = Now() + kStartupDelay;
++  ScheduleWork(kStartupDelay);
++}
++
++DataBackups::~DataBackups() = default;
++
++// static
++void DataBackups::RegisterProfilePrefs(PrefRegistrySimple* registry) {
++  registry->RegisterBooleanPref(kInitializedPref, false);
++  registry->RegisterTimePref(kLastDailyPref, base::Time());
++  registry->RegisterDictionaryPref(kRestoreOfferPref);
++  registry->RegisterListPref(kPinnedSnapshotsPref);
++}
++
++// static
++DataBackups::Counts DataBackups::Count(const base::Value* spaces,
++                                       const base::Value* sidebar_lists) {
++  Counts counts;
++  if (const base::ListValue* list = FindSpacesList(spaces)) {
++    counts.spaces = static_cast<size_t>(std::ranges::count_if(*list, &IsSpace));
++  }
++  ForEachSidebarList(sidebar_lists, [&](std::string_view key,
++                                        const base::ListValue& entries) {
++    size_t items = 0;
++    for (const base::Value& entry : entries) {
++      const base::DictValue* dict = entry.GetIfDict();
++      if (!dict) {
++        continue;
++      }
++      // A folder holds items; anything else is an item.
++      if (const base::ListValue* folder = dict->FindList(kFolderItemsKey)) {
++        items += static_cast<size_t>(std::ranges::count_if(
++            *folder, [](const base::Value& item) { return item.is_dict(); }));
++      } else {
++        ++items;
++      }
++    }
++    if (key == kFavoritesList) {
++      counts.favorites += items;
++    } else if (base::StartsWith(key, kPinnedListPrefix)) {
++      counts.pinned_tabs += items;
++    }
++  });
++  return counts;
++}
++
++// static
++std::vector<DataBackups::SpaceSummary> DataBackups::SummarizeSpaces(
++    const base::Value* spaces) {
++  std::vector<SpaceSummary> summaries;
++  const base::ListValue* list = FindSpacesList(spaces);
++  if (!list) {
++    return summaries;
++  }
++  summaries.reserve(std::min(list->size(), kMaxOfferSpaces));
++  for (const base::Value& entry : *list) {
++    if (summaries.size() >= kMaxOfferSpaces) {
++      break;
++    }
++    if (!IsSpace(entry)) {
++      continue;
++    }
++    const base::DictValue& space = entry.GetDict();
++    SpaceSummary summary;
++    summary.name = BoundName(space.FindString(kSpaceNameKey));
++    summary.emoji = BoundEmoji(space.FindString(kSpaceIconKey));
++    if (const base::DictValue* theme = space.FindDict(kSpaceThemeKey)) {
++      summary.color1 = ValidColor(theme->FindString(kThemeColor1Key));
++      summary.color2 = ValidColor(theme->FindString(kThemeColor2Key));
++      summary.mode = ParseMode(theme->FindString(kThemeModeKey));
++    }
++    summaries.push_back(std::move(summary));
++  }
++  return summaries;
++}
++
++// static
++bool DataBackups::IsEmpty(const base::Value* spaces,
++                          const base::Value* sidebar_lists) {
++  // An empty folder is something the user made too.
++  bool has_entries = false;
++  ForEachSidebarList(sidebar_lists,
++                     [&](std::string_view, const base::ListValue& entries) {
++                       has_entries |= !entries.empty();
++                     });
++  if (has_entries) {
++    return false;
++  }
++  const base::ListValue* list = FindSpacesList(spaces);
++  if (!list) {
++    return true;
++  }
++  const base::DictValue* only_space = nullptr;
++  for (const base::Value& entry : *list) {
++    if (!IsSpace(entry)) {
++      continue;
++    }
++    if (only_space) {
++      return false;
++    }
++    only_space = &entry.GetDict();
++  }
++  if (!only_space) {
++    return true;
++  }
++  const std::string* name = only_space->FindString(kSpaceNameKey);
++  const std::string* icon = only_space->FindString(kSpaceIconKey);
++  return (!name || name->empty()) && (!icon || icon->empty());
++}
++
++void DataBackups::CreateSnapshot(std::string_view reason,
++                                 SnapshotCallback done) {
++  if (!IsValidReason(reason)) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(done), std::nullopt));
++    return;
++  }
++  const base::Time now = Now();
++  const base::Time created =
++      std::max(now, last_snapshot_time_ + base::Milliseconds(1));
++  last_snapshot_time_ = created;
++
++  base::DictValue file = MakeFile(kKindSnapshot, reason, created);
++  file.Set(kPrefsKey, CapturePrefs());
++
++  // For this session only. If the browser quits first, the prune at the next
++  // launch's kStartupDelay deletes it.
++  const base::Time expiry = created + kSnapshotLifetime;
++  next_expiry_ = next_expiry_ ? std::min(*next_expiry_, expiry) : expiry;
++
++  std::string id = SnapshotId(created, reason);
++  base::flat_set<std::string> pinned = PinnedSnapshots();
++  pinned.insert(id);
++  PostFileTask(base::BindOnce(&WriteSnapshot, profile_dir_, dir_,
++                              std::move(id), std::move(file), now,
++                              std::move(pinned)),
++               base::BindOnce(&DataBackups::DidCreateSnapshot,
++                              weak_factory_.GetWeakPtr(), std::move(done)));
++}
++
++void DataBackups::ReadBackup(std::string_view id, ReadCallback done) {
++  if (!ParseBackupId(id)) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(done), std::nullopt));
++    return;
++  }
++  PostFileTask(base::BindOnce(&ReadBackupFile, dir_, std::string(id), Now()),
++               std::move(done));
++}
++
++void DataBackups::ReadOfferedBackup(ReadCallback done) {
++  if (!restore_offer_) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(done), std::nullopt));
++    return;
++  }
++  PostFileTask(base::BindOnce(&ReadOfferedBackupFile, dir_,
++                              restore_offer_->backup_id, Now()),
++               std::move(done));
++}
++
++void DataBackups::DeleteSnapshot(std::string_view id) {
++  if (!IsSnapshotId(id)) {
++    return;
++  }
++  UnpinSnapshot(id);
++  PostFileTask(base::BindOnce(&DeleteSnapshotFile, dir_, std::string(id),
++                              Now(), PinnedSnapshots()),
++               base::BindOnce(&DataBackups::DidPrune,
++                              weak_factory_.GetWeakPtr()));
++}
++
++void DataBackups::PinSnapshot(std::string_view id) {
++  if (!IsSnapshotId(id) || PinnedSnapshots().contains(id)) {
++    return;
++  }
++  base::ListValue pinned = prefs_->GetList(kPinnedSnapshotsPref).Clone();
++  pinned.Append(id);
++  prefs_->SetList(kPinnedSnapshotsPref, std::move(pinned));
++}
++
++void DataBackups::UnpinSnapshot(std::string_view id) {
++  base::ListValue pinned = prefs_->GetList(kPinnedSnapshotsPref).Clone();
++  if (pinned.EraseValue(base::Value(id)) > 0) {
++    prefs_->SetList(kPinnedSnapshotsPref, std::move(pinned));
++  }
++}
++
++std::unique_ptr<DataBackups::Operation> DataBackups::TryBeginOperation() {
++  if (operation_running_) {
++    return nullptr;
++  }
++  operation_running_ = true;
++  if (restore_offer_) {
++    NotifyOfferObservers();
++  }
++  return base::WrapUnique(new Operation(weak_factory_.GetWeakPtr()));
++}
++
++void DataBackups::ResolveRestoreOffer() {
++  if (!restore_offer_) {
++    return;
++  }
++  SetRestoreOffer(std::nullopt);
++  ScheduleWork(kMinRunInterval);
++}
++
++void DataBackups::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void DataBackups::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++void DataBackups::RunScheduledWorkForTesting() {
++  timer_.Stop();
++  RunScheduledWork();
++}
++
++void DataBackups::FlushForTesting(base::OnceClosure done) {
++  task_runner_->PostTaskAndReply(FROM_HERE, base::DoNothing(),
++                                 std::move(done));
++}
++
++base::Time DataBackups::Now() const {
++  return clock_->Now();
++}
++
++base::DictValue DataBackups::CapturePrefs() const {
++  base::DictValue captured;
++  for (const char* name : kBackedUpPrefs) {
++    // Only values the user changed. A default isn't worth keeping, and
++    // reading it this way never creates state for the pref's owner.
++    if (const base::Value* value = prefs_->GetUserPrefValue(name)) {
++      captured.Set(name, value->Clone());
++    }
++  }
++  return captured;
++}
++
++bool DataBackups::IsLiveEmpty() const {
++  return IsEmpty(prefs_->GetUserPrefValue(kSpacesPref),
++                 prefs_->GetUserPrefValue(kSidebarListsPref));
++}
++
++base::flat_set<std::string> DataBackups::PinnedSnapshots() const {
++  base::flat_set<std::string> pinned;
++  for (const base::Value& id : prefs_->GetList(kPinnedSnapshotsPref)) {
++    if (id.is_string()) {
++      pinned.insert(id.GetString());
++    }
++  }
++  return pinned;
++}
++
++void DataBackups::DidCheckForReset(ResetCheck result) {
++  if (result.rotated) {
++    prefs_->SetBoolean(kInitializedPref, true);
++  }
++  // The user may have started over while the files were read. Then there's
++  // nothing to offer: a restore would replace what they just made.
++  if (result.offer && !restore_offer_ && IsLiveEmpty()) {
++    SetRestoreOffer(std::move(result.offer));
++  }
++  ScheduleWork(kMinRunInterval);
++}
++
++void DataBackups::SetRestoreOffer(std::optional<RestoreOffer> offer) {
++  restore_offer_ = std::move(offer);
++  if (restore_offer_) {
++    prefs_->SetDict(kRestoreOfferPref, restore_offer_->ToDict());
++  } else {
++    prefs_->ClearPref(kRestoreOfferPref);
++  }
++  NotifyOfferObservers();
++}
++
++void DataBackups::NotifyOfferObservers() {
++  for (Observer& observer : observers_) {
++    observer.OnRestoreOfferChanged();
++  }
++}
++
++base::Time DataBackups::OfferLapseTime() const {
++  return restore_offer_->detected + kRestoreOfferLifetime;
++}
++
++base::Time DataBackups::DailyDueTime() const {
++  // Not before this `Preferences` was checked for a reset, so a daily never
++  // replaces what the check would keep. Not while the sidebar is empty.
++  if (!prefs_->GetBoolean(kInitializedPref) || !sidebar_watch_.IsEmpty()) {
++    return base::Time::Max();
++  }
++  const base::Time now = Now();
++  const base::Time last = prefs_->GetTime(kLastDailyPref);
++  // A last backup in the future means the clock moved back; don't wait for
++  // it to catch up.
++  base::Time due = last.is_null() || last > now ? now : last + kDailyInterval;
++  if (!daily_soon_.is_null()) {
++    due = std::min(due, daily_soon_);
++  }
++  return std::max(due, daily_retry_);
++}
++
++void DataBackups::ScheduleWork(base::TimeDelta min_delay) {
++  const base::Time now = Now();
++  base::Time due = base::Time::Max();
++  if (!startup_run_time_.is_null()) {
++    // Nothing runs before the first run, which handles everything due.
++    due = startup_run_time_;
++  } else {
++    due = std::min(due, DailyDueTime());
++    if (next_expiry_) {
++      due = std::min(due, *next_expiry_);
++    }
++    if (restore_offer_) {
++      due = std::min(due, OfferLapseTime());
++    }
++  }
++  if (due.is_max()) {
++    // Nothing is due, so nothing wakes the service.
++    timer_.Stop();
++    return;
++  }
++  timer_.Start(FROM_HERE, std::max(due, now + min_delay),
++               base::BindOnce(&DataBackups::RunScheduledWork,
++                              base::Unretained(this)));
++}
++
++void DataBackups::RunScheduledWork() {
++  const base::Time now = Now();
++  startup_run_time_ = base::Time();
++  if (restore_offer_ && now >= OfferLapseTime()) {
++    // Nobody answered. It lapses as if dismissed; the pre-reset copy stays.
++    SetRestoreOffer(std::nullopt);
++  }
++  std::optional<std::pair<std::string, base::DictValue>> daily;
++  bool daily_attempted = false;
++  // An import, Undo, or restore schedules a daily for when it ends.
++  if (!operation_running_ && DailyDueTime() <= now) {
++    if (IsLiveEmpty()) {
++      // Never back up an empty sidebar, and don't wake up to check again.
++      WaitForSidebarData();
++    } else {
++      daily_attempted = true;
++      base::DictValue file = MakeFile(kKindDaily, std::string_view(), now);
++      file.Set(kPrefsKey, CapturePrefs());
++      daily.emplace(DailyId(now), std::move(file));
++    }
++  }
++  // Always prunes, so a snapshot expires on time even if a crash lost the
++  // in-memory expiry.
++  PostFileTask(base::BindOnce(&DoScheduledWork, dir_, std::move(daily), now,
++                              PinnedSnapshots()),
++               base::BindOnce(&DataBackups::DidRunScheduledWork,
++                              weak_factory_.GetWeakPtr(), daily_attempted));
++}
++
++void DataBackups::DidRunScheduledWork(bool daily_attempted, FileWork result) {
++  if (result.daily_written) {
++    prefs_->SetTime(kLastDailyPref, *result.daily_written);
++    daily_soon_ = base::Time();
++    daily_retry_ = base::Time();
++  } else if (daily_attempted) {
++    daily_retry_ = Now() + kRetryDelay;
++  }
++  DidPrune(std::move(result));
++}
++
++void DataBackups::DidCreateSnapshot(SnapshotCallback done, FileWork result) {
++  std::optional<std::string> id = result.snapshot_written;
++  DidPrune(std::move(result));
++  std::move(done).Run(std::move(id));
++}
++
++void DataBackups::DidPrune(FileWork result) {
++  next_expiry_ = result.next_expiry;
++  // Drop pins on snapshots that are gone. Replies arrive in the order their
++  // tasks ran, so a snapshot pinned after it was written is never dropped by
++  // an older prune.
++  const base::ListValue& pinned = prefs_->GetList(kPinnedSnapshotsPref);
++  if (!pinned.empty()) {
++    const base::flat_set<std::string> existing(result.snapshot_ids);
++    base::ListValue kept;
++    for (const base::Value& id : pinned) {
++      if (id.is_string() && existing.contains(id.GetString())) {
++        kept.Append(id.Clone());
++      }
++    }
++    if (kept.size() != pinned.size()) {
++      prefs_->SetList(kPinnedSnapshotsPref, std::move(kept));
++    }
++  }
++  ScheduleWork(kMinRunInterval);
++}
++
++void DataBackups::WaitForSidebarData() {
++  if (!sidebar_watch_.IsEmpty()) {
++    return;
++  }
++  const base::RepeatingClosure changed = base::BindRepeating(
++      &DataBackups::OnSidebarPrefChanged, base::Unretained(this));
++  sidebar_watch_.Add(kSpacesPref, changed);
++  sidebar_watch_.Add(kSidebarListsPref, changed);
++}
++
++void DataBackups::OnSidebarPrefChanged() {
++  if (IsLiveEmpty()) {
++    return;
++  }
++  sidebar_watch_.RemoveAll();
++  ScheduleWork(kMinRunInterval);
++}
++
++void DataBackups::EndOperation(bool data_changed) {
++  operation_running_ = false;
++  if (data_changed) {
++    daily_soon_ = Now() + kDailyAfterChangeDelay;
++    sidebar_watch_.RemoveAll();
++  }
++  if (restore_offer_) {
++    NotifyOfferObservers();
++  }
++  ScheduleWork(kMinRunInterval);
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/storage/data_backups.h
+@@ -0,0 +1,391 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_STORAGE_DATA_BACKUPS_H_
++#define CHROME_BROWSER_RAC_STORAGE_DATA_BACKUPS_H_
++
++#include <array>
++#include <cstddef>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/flat_set.h"
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/observer_list.h"
++#include "base/observer_list_types.h"
++#include "base/time/time.h"
++#include "base/timer/wall_clock_timer.h"
++#include "base/values.h"
++#include "components/keyed_service/core/keyed_service.h"
++#include "components/prefs/pref_change_registrar.h"
++
++class PrefRegistrySimple;
++class PrefService;
++
++namespace base {
++class Clock;
++class SequencedTaskRunner;
++}  // namespace base
++
++namespace rac {
++
++namespace backups_internal {
++struct ResetCheck;
++struct FileWork;
++}  // namespace backups_internal
++
++// Copies of the profile's sidebar data, in `<profile>/rac backups/`, so an
++// import, a migration, or a lost or corrupt `Preferences` can't lose it.
++//
++// - A snapshot is taken on request, before an import or a migration. It
++//   holds the backed-up prefs and the hidden spaces' tabs from `rac spaces`.
++//   It's deleted kSnapshotLifetime after it was taken, which is also how long
++//   "Undo import" lasts, so open-tab URLs are never kept longer than that.
++// - Daily backups hold the backed-up prefs only: spaces, themes, pinned tabs,
++//   favorites, and agent site rules. No open tabs. The newest
++//   kDailyGenerations are kept.
++// - Pre-reset copies. When `Preferences` turns out to have been reset (see
++//   kInitializedPref), every daily backup is renamed to a pre-reset copy and
++//   kept kPreResetLifetime, so nothing written after the reset can replace
++//   it. Prefs only, like the dailies.
++//
++// Nothing is ever restored silently. After a reset, the service offers the
++// newest backup with data in it (see RestoreOffer) and the UI asks. The
++// restore itself goes through SpacesService and SidebarItems, in
++// DataRestorer, because they keep the live copy of this data.
++//
++// While the live data is fine, startup does no file work here: everything the
++// service needs to decide is already in prefs. All methods must be called on
++// the UI thread. Files are read and written on a background sequence.
++class DataBackups : public KeyedService {
++ public:
++  // The newest format this build writes, and the oldest build that can read
++  // it. Builds only ever raise them. A file whose `min_reader_version` is
++  // above kVersion is ignored.
++  static constexpr int kVersion = 1;
++  static constexpr int kMinReaderVersion = 1;
++
++  // Snapshots hold open-tab URLs, so they never live longer than this. It's
++  // also the Undo window; `apply` reads this constant.
++  static constexpr base::TimeDelta kSnapshotLifetime = base::Days(7);
++  // Pre-reset copies hold prefs only, so they can stay long enough for the
++  // user to notice what a reset lost.
++  static constexpr base::TimeDelta kPreResetLifetime = base::Days(30);
++  static constexpr base::TimeDelta kDailyInterval = base::Days(1);
++  // Daily backups kept, newest first. About this many days of history.
++  static constexpr size_t kDailyGenerations = 3;
++  // How long an unanswered restore offer stays. The backup it points at is a
++  // pre-reset copy, which outlives it.
++  static constexpr base::TimeDelta kRestoreOfferLifetime = base::Days(7);
++  // Scheduled work first runs this long after the service is created, so it
++  // never competes with startup. That run always prunes expired files.
++  static constexpr base::TimeDelta kStartupDelay = base::Minutes(2);
++  // After an import or a restore, the daily backup is refreshed this soon.
++  static constexpr base::TimeDelta kDailyAfterChangeDelay = base::Minutes(1);
++  // Unpinned snapshots beyond this are deleted early, oldest first.
++  static constexpr size_t kMaxSnapshots = 8;
++  // A backup dated more than this in the future means the clock moved back.
++  // Its lifetime then starts now, so it still ends, and Undo isn't wiped.
++  static constexpr base::TimeDelta kClockSkewAllowance = base::Days(1);
++
++  static constexpr char kDirName[] = "rac backups";
++
++  // The prefs a backup holds. Each is owned elsewhere; DataBackups only reads
++  // their stored values, so backing up the agent rules creates no AI state.
++  // The factory static_asserts the names it can see.
++  static constexpr char kSpacesPref[] = "rac.spaces";
++  // Must match kListsPref in chrome/browser/ui/rac/sidebar/sidebar_items.cc.
++  static constexpr char kSidebarListsPref[] = "rac.sidebar.lists";
++  static constexpr char kAgentSiteRulesPref[] = "rac.ai.agent_site_rules";
++  static constexpr char kAgentPermissionLevelPref[] =
++      "rac.ai.agent_permission_level";
++  // Agent pref values a merge restore compares, so it only ever tightens.
++  static constexpr char kAgentPermissionAsk[] = "ask";
++  static constexpr char kAgentPermissionCareful[] = "careful";
++  static constexpr char kAgentSiteNever[] = "never";
++  static constexpr std::array<const char*, 4> kBackedUpPrefs = {
++      kSpacesPref, kSidebarListsPref, kAgentSiteRulesPref,
++      kAgentPermissionLevelPref};
++
++  // This service's own prefs. All of them live in `Preferences`, so a reset
++  // clears them together with the data they describe.
++  //
++  // True once this `Preferences` has been checked against the backups
++  // folder. Unset while backup files exist means `Preferences` was reset,
++  // whatever the cause: corrupt, deleted, or unreadable. A new profile has no
++  // backup files, so it's never mistaken for one.
++  static constexpr char kInitializedPref[] = "rac.backups.initialized";
++  // When the newest daily backup was written.
++  static constexpr char kLastDailyPref[] = "rac.backups.last_daily";
++  // The pending restore offer, as RestoreOffer::ToDict(). Unset when none.
++  static constexpr char kRestoreOfferPref[] = "rac.backups.restore_offer";
++  // Snapshot ids the kMaxSnapshots cap must not delete, such as the one a
++  // pending "Undo import" needs. They still expire.
++  static constexpr char kPinnedSnapshotsPref[] = "rac.backups.pinned_snapshots";
++
++  enum class Kind { kDaily, kPreReset, kSnapshot };
++
++  // How much a backup holds, for the restore prompt's text.
++  struct Counts {
++    size_t spaces = 0;
++    size_t pinned_tabs = 0;
++    size_t favorites = 0;
++
++    bool operator==(const Counts&) const = default;
++  };
++
++  // A decoded backup file.
++  struct Contents {
++    Contents();
++    Contents(Contents&&);
++    Contents& operator=(Contents&&);
++    ~Contents();
++
++    std::string id;
++    Kind kind = Kind::kDaily;
++    base::Time created;
++    // Why the snapshot was taken, such as "import-arc". A pre-reset copy of a
++    // snapshot keeps it. Empty for daily backups.
++    std::string reason;
++    // Pref name -> the value it had. A pref missing here had its default
++    // value, so an exact restore clears it.
++    base::DictValue prefs;
++    // `rac spaces` as it was on disk. Snapshots only, and only if the file
++    // existed. Without it, a restore leaves stored tabs alone.
++    std::optional<base::DictValue> spaces_store;
++    Counts counts;
++  };
++
++  // What the restore prompt shows for one space in the offered backup. Taken
++  // from the stored form in `rac.spaces`, so it holds no ids, tabs, or other
++  // fields.
++  struct SpaceSummary {
++    enum class Mode { kAuto, kLight, kDark };
++
++    // Cut to kMaxSummaryNameBytes on a character boundary. Empty for a space
++    // the user never named; the UI shows its usual fallback.
++    std::string name;
++    // The space's emoji, or empty if it shows a dot. Dropped, not cut, if it's
++    // over kMaxSummaryEmojiBytes.
++    std::string emoji;
++    // "#RRGGBB" as stored, or empty if the backup had none or a malformed one.
++    std::string color1;
++    std::string color2;
++    Mode mode = Mode::kAuto;
++
++    bool operator==(const SpaceSummary&) const = default;
++  };
++
++  // The offer lists at most this many spaces, in their stored order.
++  // `Counts::spaces` still counts all of them.
++  static constexpr size_t kMaxOfferSpaces = 12;
++  static constexpr size_t kMaxSummaryNameBytes = 64;
++  static constexpr size_t kMaxSummaryEmojiBytes = 32;
++
++  // "Restore your spaces from <created>." Made once, when a reset is found
++  // and the live sidebar is empty. It points at a pre-reset copy, which
++  // outlives the offer. The UI shows it while ShouldShowRestoreOffer().
++  struct RestoreOffer {
++    std::string backup_id;
++    base::Time created;
++    Counts counts;
++    // The first kMaxOfferSpaces spaces of the backup. Built on the background
++    // sequence with the offer, and kept with it in prefs, so showing the
++    // prompt reads no file. An offer stored by an older build has none.
++    std::vector<SpaceSummary> spaces;
++    // When the reset was found. The offer lapses kRestoreOfferLifetime later.
++    base::Time detected;
++
++    base::DictValue ToDict() const;
++    static std::optional<RestoreOffer> FromDict(const base::DictValue& dict);
++  };
++
++  // Import, Undo, and restore each hold one of these for their whole run, so
++  // they never overlap. Destroying it ends the operation.
++  class Operation {
++   public:
++    Operation(const Operation&) = delete;
++    Operation& operator=(const Operation&) = delete;
++    ~Operation();
++
++    // The sidebar data was changed, by an import or a restore. The daily
++    // backup is refreshed kDailyAfterChangeDelay after the operation ends.
++    void MarkDataChanged() { data_changed_ = true; }
++
++   private:
++    friend class DataBackups;
++    explicit Operation(base::WeakPtr<DataBackups> owner);
++
++    base::WeakPtr<DataBackups> owner_;
++    bool data_changed_ = false;
++  };
++
++  class Observer : public base::CheckedObserver {
++   public:
++    // The offer appeared, was answered, or lapsed, or ShouldShowRestoreOffer()
++    // changed because an operation started or ended.
++    virtual void OnRestoreOfferChanged() = 0;
++  };
++
++  // Runs with the new snapshot's id, or nullopt if it couldn't be written.
++  // An import must not start without one. Not run if the service is
++  // destroyed first, which happens only when the profile goes away.
++  using SnapshotCallback =
++      base::OnceCallback<void(std::optional<std::string> id)>;
++  using ReadCallback = base::OnceCallback<void(std::optional<Contents>)>;
++
++  // `profile_dir` holds `Preferences` and `rac spaces`. `clock` is for tests;
++  // null means the real clock.
++  DataBackups(PrefService* prefs,
++              base::FilePath profile_dir,
++              const base::Clock* clock = nullptr);
++  DataBackups(const DataBackups&) = delete;
++  DataBackups& operator=(const DataBackups&) = delete;
++  ~DataBackups() override;
++
++  static void RegisterProfilePrefs(PrefRegistrySimple* registry);
++
++  // True if `spaces` and `sidebar_lists` (stored values of kSpacesPref and
++  // kSidebarListsPref, null if unset) hold nothing a user made: at most one
++  // space with no name and no icon, and no favorites or pinned tabs. That's
++  // what a new profile, or one whose `Preferences` was reset, looks like.
++  static bool IsEmpty(const base::Value* spaces,
++                      const base::Value* sidebar_lists);
++  static Counts Count(const base::Value* spaces,
++                      const base::Value* sidebar_lists);
++  // Summaries of the first kMaxOfferSpaces spaces in `spaces` (a stored value
++  // of kSpacesPref, null if unset), skipping entries that aren't spaces.
++  // Touches only what it returns, so it's cheap enough for the background
++  // sequence and safe on any thread.
++  static std::vector<SpaceSummary> SummarizeSpaces(const base::Value* spaces);
++
++  // Snapshots the backed-up prefs now, as they are at this call, then copies
++  // `rac spaces` and writes the file on the background sequence. A caller
++  // that changes prefs right after, such as a migration, doesn't need to
++  // wait. A caller that changes `rac spaces` must flush that store first and
++  // wait for `done`. `reason` is 1-32 of [a-z0-9-].
++  void CreateSnapshot(std::string_view reason, SnapshotCallback done);
++
++  // Reads any backup by id. Runs with nullopt if it's missing, expired,
++  // unreadable, or too new for this build.
++  void ReadBackup(std::string_view id, ReadCallback done);
++
++  // Reads the backup the pending offer points at. If that one can't be read,
++  // falls back to the newest other pre-reset copy or snapshot with data in
++  // it. Runs with nullopt if there's no offer or nothing usable.
++  void ReadOfferedBackup(ReadCallback done);
++
++  // Deletes a snapshot early, for example once its import can no longer be
++  // undone, and unpins it. Does nothing for other kinds or unknown ids.
++  void DeleteSnapshot(std::string_view id);
++
++  // Keeps the kMaxSnapshots cap from deleting a snapshot that a pending Undo
++  // needs. It still expires after kSnapshotLifetime.
++  void PinSnapshot(std::string_view id);
++  void UnpinSnapshot(std::string_view id);
++
++  // Starts an import, Undo, or restore. Returns null while another one is
++  // running. The restore offer is hidden while one runs.
++  std::unique_ptr<Operation> TryBeginOperation();
++  bool operation_running() const { return operation_running_; }
++
++  // The pending offer, or nullopt.
++  const std::optional<RestoreOffer>& restore_offer() const {
++    return restore_offer_;
++  }
++  // Whether the UI should show the offer now: one is pending and no import,
++  // Undo, or restore is running.
++  bool ShouldShowRestoreOffer() const {
++    return restore_offer_.has_value() && !operation_running_;
++  }
++  // Call only when the user dismissed the offer, or after DataRestorer
++  // restored it successfully. Never after a failed restore: the offer stays.
++  void ResolveRestoreOffer();
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
++
++  // Runs the scheduled work now instead of waiting for its timer.
++  void RunScheduledWorkForTesting();
++  // Runs `done` after every file task posted so far has finished and its
++  // reply has run.
++  void FlushForTesting(base::OnceClosure done);
++  // How many tasks were posted to the background sequence.
++  size_t file_tasks_posted_for_testing() const { return file_tasks_posted_; }
++  // Whether a timer will wake the service.
++  bool HasScheduledWorkForTesting() const { return timer_.IsRunning(); }
++
++ private:
++  base::Time Now() const;
++  base::DictValue CapturePrefs() const;
++  bool IsLiveEmpty() const;
++  base::flat_set<std::string> PinnedSnapshots() const;
++
++  // Posts `task` to the background sequence and `reply` back to this one,
++  // dropped if the service is gone.
++  template <typename Result>
++  void PostFileTask(base::OnceCallback<Result()> task,
++                    base::OnceCallback<void(Result)> reply);
++
++  void DidCheckForReset(backups_internal::ResetCheck result);
++  void SetRestoreOffer(std::optional<RestoreOffer> offer);
++  void NotifyOfferObservers();
++  base::Time OfferLapseTime() const;
++
++  // Schedules RunScheduledWork() for when something is next due, and never
++  // sooner than `min_delay` from now. Stops the timer when nothing is due.
++  void ScheduleWork(base::TimeDelta min_delay);
++  base::Time DailyDueTime() const;
++  void RunScheduledWork();
++  void DidRunScheduledWork(bool daily_attempted,
++                           backups_internal::FileWork result);
++  void DidCreateSnapshot(SnapshotCallback done,
++                         backups_internal::FileWork result);
++  // Takes the next expiry from a prune, drops pins on deleted snapshots, and
++  // reschedules.
++  void DidPrune(backups_internal::FileWork result);
++
++  // While the live sidebar is empty, no daily backup is due and nothing
++  // wakes the service for one. A change to the sidebar prefs ends the wait.
++  void WaitForSidebarData();
++  void OnSidebarPrefChanged();
++
++  void EndOperation(bool data_changed);
++
++  const raw_ptr<PrefService> prefs_;
++  const base::FilePath profile_dir_;
++  const base::FilePath dir_;
++  const raw_ptr<const base::Clock> clock_;
++  const scoped_refptr<base::SequencedTaskRunner> task_runner_;
++
++  std::optional<RestoreOffer> restore_offer_;
++  bool operation_running_ = false;
++  // Keeps snapshot ids unique when two are taken in the same millisecond.
++  base::Time last_snapshot_time_;
++  // The first scheduled run, which always prunes. Null once it has run.
++  base::Time startup_run_time_;
++  // When the next pre-reset copy or snapshot expires, from the last prune.
++  std::optional<base::Time> next_expiry_;
++  // A daily backup due sooner than usual, after an import or a restore.
++  base::Time daily_soon_;
++  // A daily backup that failed waits until then.
++  base::Time daily_retry_;
++  PrefChangeRegistrar sidebar_watch_;
++  size_t file_tasks_posted_ = 0;
++  // A wall-clock timer, so a Mac that sleeps overnight still backs up daily.
++  base::WallClockTimer timer_;
++  base::ObserverList<Observer> observers_;
++  base::WeakPtrFactory<DataBackups> weak_factory_{this};
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_STORAGE_DATA_BACKUPS_H_
+--- /dev/null
++++ b/chrome/browser/rac/storage/data_backups_factory.cc
+@@ -0,0 +1,68 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/storage/data_backups_factory.h"
++
++#include <string_view>
++
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
++#include "chrome/browser/rac/spaces/spaces_prefs.h"
++#include "chrome/browser/rac/storage/data_backups.h"
++
++namespace rac {
++
++namespace {
++
++// DataBackups names the prefs it copies itself, so it needs no code from
++// their owners. Catch a rename here. rac.sidebar.lists is private to
++// SidebarItems, so its name is checked by hand.
++static_assert(std::string_view(DataBackups::kSpacesPref) == kSpaces);
++static_assert(std::string_view(DataBackups::kAgentSiteRulesPref) ==
++              ai::kAgentSiteRules);
++static_assert(std::string_view(DataBackups::kAgentPermissionLevelPref) ==
++              ai::kAgentPermissionLevel);
++static_assert(std::string_view(DataBackups::kAgentPermissionAsk) ==
++              ai::kAgentPermissionAsk);
++static_assert(std::string_view(DataBackups::kAgentPermissionCareful) ==
++              ai::kAgentPermissionCareful);
++static_assert(std::string_view(DataBackups::kAgentSiteNever) ==
++              ai::kAgentSiteNever);
++
++}  // namespace
++
++// static
++DataBackups* DataBackupsFactory::GetForProfile(Profile* profile) {
++  return static_cast<DataBackups*>(
++      GetInstance()->GetServiceForBrowserContext(profile, /*create=*/true));
++}
++
++// static
++DataBackupsFactory* DataBackupsFactory::GetInstance() {
++  static base::NoDestructor<DataBackupsFactory> instance;
++  return instance.get();
++}
++
++DataBackupsFactory::DataBackupsFactory()
++    : ProfileKeyedServiceFactory("RacDataBackups",
++                                 ProfileSelections::BuildForRegularProfile()) {}
++
++DataBackupsFactory::~DataBackupsFactory() = default;
++
++std::unique_ptr<KeyedService>
++DataBackupsFactory::BuildServiceInstanceForBrowserContext(
++    content::BrowserContext* context) const {
++  Profile* profile = Profile::FromBrowserContext(context);
++  return std::make_unique<DataBackups>(profile->GetPrefs(), profile->GetPath());
++}
++
++bool DataBackupsFactory::ServiceIsCreatedWithBrowserContext() const {
++  return true;
++}
++
++bool DataBackupsFactory::ServiceIsNULLWhileTesting() const {
++  return true;
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/storage/data_backups_factory.h
+@@ -0,0 +1,46 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_STORAGE_DATA_BACKUPS_FACTORY_H_
++#define CHROME_BROWSER_RAC_STORAGE_DATA_BACKUPS_FACTORY_H_
++
++#include <memory>
++
++#include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile_keyed_service_factory.h"
++
++class Profile;
++
++namespace rac {
++
++class DataBackups;
++
++class DataBackupsFactory : public ProfileKeyedServiceFactory {
++ public:
++  // Null for incognito and guest profiles, which keep no sidebar data.
++  static DataBackups* GetForProfile(Profile* profile);
++  static DataBackupsFactory* GetInstance();
++
++  DataBackupsFactory(const DataBackupsFactory&) = delete;
++  DataBackupsFactory& operator=(const DataBackupsFactory&) = delete;
++
++ private:
++  friend base::NoDestructor<DataBackupsFactory>;
++
++  DataBackupsFactory();
++  ~DataBackupsFactory() override;
++
++  // ProfileKeyedServiceFactory:
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override;
++  // Created with the profile, so a reset `Preferences` is noticed before the
++  // first window asks.
++  bool ServiceIsCreatedWithBrowserContext() const override;
++  // Tests get no service, and so no files, unless they ask for one.
++  bool ServiceIsNULLWhileTesting() const override;
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_STORAGE_DATA_BACKUPS_FACTORY_H_
+--- /dev/null
++++ b/chrome/browser/rac/storage/data_backups_unittest.cc
+@@ -0,0 +1,1380 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/storage/data_backups.h"
++
++#include <algorithm>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/files/file_enumerator.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/json/values_util.h"
++#include "base/run_loop.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
++#include "base/test/simple_test_clock.h"
++#include "base/test/task_environment.h"
++#include "base/test/test_future.h"
++#include "base/test/values_test_util.h"
++#include "base/threading/thread_restrictions.h"
++#include "base/time/clock.h"
++#include "base/time/time.h"
++#include "base/values.h"
++#include "build/build_config.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/testing_pref_service.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++constexpr char kSpacesStoreFile[] = "rac spaces";
++constexpr char kImportReason[] = "import-arc";
++
++// What SetUserData() writes: two named spaces, one favorite, and two pinned
++// tabs (one of them in a folder).
++const DataBackups::Counts kUserDataCounts = {
++    .spaces = 2, .pinned_tabs = 2, .favorites = 1};
++
++// A realistic wall-clock time, for tests that set file times. The mock clock
++// starts near 1970, where going back a few weeks would be before the epoch.
++base::Time RealisticTime() {
++  return base::Time::UnixEpoch() + base::Days(20000);
++}
++
++// {"version":1,"spaces":[{"id":"<uuid>","name":"Work"}, ...]}. An empty name
++// leaves the name out, like a space the user never named.
++base::DictValue MakeSpaces(const std::vector<std::string>& names) {
++  base::ListValue spaces;
++  int index = 0;
++  for (const std::string& name : names) {
++    base::DictValue space;
++    space.Set("id", base::StringPrintf(
++                        "0f7a5c9e-6f8b-4b5e-9c1d-2a3b4c5d6e%02d", ++index));
++    if (!name.empty()) {
++      space.Set("name", name);
++    }
++    spaces.Append(std::move(space));
++  }
++  return base::DictValue().Set("version", 1).Set("spaces", std::move(spaces));
++}
++
++// One favorite, and pinned tabs: one item and a folder holding one more.
++base::DictValue MakeLists() {
++  return base::test::ParseJsonDict(
++      R"({"favorites":{"entries":[)"
++      R"({"id":"f1","url":"https://a.test/","title":"A"}]},)"
++      R"("pinned.0f7a5c9e-6f8b-4b5e-9c1d-2a3b4c5d6e01":{"entries":[)"
++      R"({"id":"p1","url":"https://b.test/","title":"B"},)"
++      R"({"id":"folder1","title":"F","collapsed":false,"items":[)"
++      R"({"id":"p2","url":"https://c.test/","title":"C"}]}]}})");
++}
++
++// A list per kind of sidebar list, with nothing in them.
++base::DictValue MakeEmptyLists() {
++  return base::test::ParseJsonDict(
++      R"({"favorites":{"entries":[]},)"
++      R"("pinned.0f7a5c9e-6f8b-4b5e-9c1d-2a3b4c5d6e01":{"entries":[]}})");
++}
++
++bool IsEmptyFor(const base::DictValue& spaces, const base::DictValue& lists) {
++  const base::Value spaces_value(spaces.Clone());
++  const base::Value lists_value(lists.Clone());
++  return DataBackups::IsEmpty(&spaces_value, &lists_value);
++}
++
++// The time part of a backup id: UTC, to the millisecond.
++std::string IdTime(base::Time time) {
++  base::Time::Exploded exploded;
++  time.UTCExplode(&exploded);
++  return base::StringPrintf("%04d%02d%02dT%02d%02d%02d%03dZ", exploded.year,
++                            exploded.month, exploded.day_of_month,
++                            exploded.hour, exploded.minute, exploded.second,
++                            exploded.millisecond);
++}
++
++// Runs after every file task posted to `backups` so far, and its reply.
++void Flush(DataBackups& backups) {
++  base::RunLoop run_loop;
++  backups.FlushForTesting(run_loop.QuitClosure());
++  run_loop.Run();
++}
++
++class TestObserver : public DataBackups::Observer {
++ public:
++  void OnRestoreOfferChanged() override { ++changes_; }
++
++  int changes() const { return changes_; }
++
++ private:
++  int changes_ = 0;
++};
++
++class DataBackupsTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    ASSERT_TRUE(dir_.CreateUniqueTempDir());
++    // What production registers: the prefs owned elsewhere, then this
++    // service's own.
++    prefs_.registry()->RegisterDictionaryPref(DataBackups::kSpacesPref);
++    prefs_.registry()->RegisterDictionaryPref(DataBackups::kSidebarListsPref);
++    prefs_.registry()->RegisterDictionaryPref(
++        DataBackups::kAgentSiteRulesPref);
++    prefs_.registry()->RegisterStringPref(
++        DataBackups::kAgentPermissionLevelPref, "auto");
++    DataBackups::RegisterProfilePrefs(prefs_.registry());
++  }
++  void TearDown() override { task_environment_.RunUntilIdle(); }
++
++  const base::Clock* clock() const { return task_environment_.GetMockClock(); }
++
++  std::unique_ptr<DataBackups> Make() {
++    return std::make_unique<DataBackups>(&prefs_, dir_.GetPath(), clock());
++  }
++
++  // Moves the mock clock, runs the timers that come due, and waits for the
++  // file work they start.
++  void FastForward(base::TimeDelta delta) {
++    task_environment_.FastForwardBy(delta);
++    task_environment_.RunUntilIdle();
++  }
++
++  void SetSpaces(const base::DictValue& spaces) {
++    prefs_.SetUserPref(DataBackups::kSpacesPref, spaces.Clone());
++  }
++  void SetLists(const base::DictValue& lists) {
++    prefs_.SetUserPref(DataBackups::kSidebarListsPref, lists.Clone());
++  }
++  void SetUserData() {
++    SetSpaces(MakeSpaces({"Work", "Play"}));
++    SetLists(MakeLists());
++  }
++
++  // What a corrupt, deleted, or unreadable `Preferences` leaves: every pref
++  // at its default, this service's own included. No `Preferences.bad` is
++  // needed to notice.
++  void ResetPreferences() {
++    for (const char* name :
++         {DataBackups::kSpacesPref, DataBackups::kSidebarListsPref,
++          DataBackups::kAgentSiteRulesPref,
++          DataBackups::kAgentPermissionLevelPref,
++          DataBackups::kInitializedPref, DataBackups::kLastDailyPref,
++          DataBackups::kRestoreOfferPref,
++          DataBackups::kPinnedSnapshotsPref}) {
++      prefs_.ClearPref(name);
++    }
++  }
++
++  std::optional<std::string> TakeSnapshot(DataBackups& backups,
++                                          std::string_view reason) {
++    base::test::TestFuture<std::optional<std::string>> future;
++    backups.CreateSnapshot(reason, future.GetCallback());
++    return future.Take();
++  }
++
++  std::optional<DataBackups::Contents> ReadContents(DataBackups& backups,
++                                                    std::string_view id) {
++    base::test::TestFuture<std::optional<DataBackups::Contents>> future;
++    backups.ReadBackup(id, future.GetCallback());
++    return future.Take();
++  }
++
++  std::optional<DataBackups::Contents> ReadOffered(DataBackups& backups) {
++    base::test::TestFuture<std::optional<DataBackups::Contents>> future;
++    backups.ReadOfferedBackup(future.GetCallback());
++    return future.Take();
++  }
++
++  base::FilePath BackupsDir() const {
++    return dir_.GetPath().AppendASCII(DataBackups::kDirName);
++  }
++  base::FilePath BackupFile(std::string_view id) const {
++    return BackupsDir().AppendASCII(base::StrCat({id, ".json"}));
++  }
++
++  bool FileExists(const base::FilePath& path) {
++    base::ScopedAllowBlockingForTesting allow_blocking;
++    return base::PathExists(path);
++  }
++
++  // The ids of the backups whose ids start with `prefix`, oldest first. Ids
++  // sort by time within a kind.
++  std::vector<std::string> Ids(std::string_view prefix) {
++    base::ScopedAllowBlockingForTesting allow_blocking;
++    std::vector<std::string> ids;
++    base::FileEnumerator files(BackupsDir(), /*recursive=*/false,
++                               base::FileEnumerator::FILES);
++    for (base::FilePath path = files.Next(); !path.empty();
++         path = files.Next()) {
++      std::string id = path.BaseName().RemoveFinalExtension().MaybeAsASCII();
++      if (base::StartsWith(id, prefix)) {
++        ids.push_back(std::move(id));
++      }
++    }
++    std::ranges::sort(ids);
++    return ids;
++  }
++
++  std::optional<DataBackups::Contents> ReadNewestDaily(DataBackups& backups) {
++    std::vector<std::string> dailies = Ids("daily-");
++    if (dailies.empty()) {
++      return std::nullopt;
++    }
++    return ReadContents(backups, dailies.back());
++  }
++
++  void WriteTextFile(const base::FilePath& path, std::string_view text) {
++    base::ScopedAllowBlockingForTesting allow_blocking;
++    ASSERT_TRUE(base::WriteFile(path, text));
++  }
++
++  void WriteSpacesFile(std::string_view name, std::string_view json) {
++    WriteTextFile(dir_.GetPath().AppendASCII(name), json);
++  }
++
++  void SetFileTime(const base::FilePath& path, base::Time time) {
++    base::ScopedAllowBlockingForTesting allow_blocking;
++    ASSERT_TRUE(base::TouchFile(path, time, time));
++  }
++
++  std::optional<base::DictValue> ReadRawFile(const base::FilePath& path) {
++    base::ScopedAllowBlockingForTesting allow_blocking;
++    std::string content;
++    if (!base::ReadFileToString(path, &content)) {
++      return std::nullopt;
++    }
++    return base::JSONReader::ReadDict(content, base::JSON_PARSE_RFC);
++  }
++
++  // A daily backup written by hand, with no prefs in it. Returns its id.
++  std::string WriteDailyFile(int min_reader_version, base::Time created) {
++    const base::DictValue file =
++        base::DictValue()
++            .Set("version", DataBackups::kVersion)
++            .Set("min_reader_version", min_reader_version)
++            .Set("kind", "daily")
++            .Set("created", base::TimeToValue(created))
++            .Set("prefs", base::DictValue());
++    std::optional<std::string> json = base::WriteJson(file);
++    EXPECT_TRUE(json);
++    const std::string id = base::StrCat({"daily-", IdTime(created)});
++    base::ScopedAllowBlockingForTesting allow_blocking;
++    EXPECT_TRUE(base::CreateDirectory(BackupsDir()));
++    EXPECT_TRUE(base::WriteFile(BackupFile(id), json.value_or("")));
++    return id;
++  }
++
++  // Runs a service with user data until a daily backup exists, then quits
++  // it, as the browser would. Returns the backup's creation time. The prefs
++  // are left as they were.
++  base::Time WriteDaily() {
++    SetUserData();
++    std::unique_ptr<DataBackups> backups = Make();
++    FastForward(DataBackups::kStartupDelay);
++    std::optional<DataBackups::Contents> daily = ReadNewestDaily(*backups);
++    EXPECT_TRUE(daily);
++    return daily ? daily->created : base::Time();
++  }
++
++  // A daily backup with user data, then a reset `Preferences`, then a new
++  // service that has found it. Returns the daily's creation time.
++  base::Time WriteDailyThenReset(std::unique_ptr<DataBackups>& backups) {
++    const base::Time created = WriteDaily();
++    ResetPreferences();
++    backups = Make();
++    task_environment_.RunUntilIdle();
++    return created;
++  }
++
++  base::test::TaskEnvironment task_environment_{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME};
++  base::ScopedTempDir dir_;
++  TestingPrefServiceSimple prefs_;
++};
++
++// A profile with nothing the user made counts as empty, even with the lists
++// and one default space in it.
++TEST_F(DataBackupsTest, IsEmptyForNewProfile) {
++  EXPECT_TRUE(DataBackups::IsEmpty(nullptr, nullptr));
++  EXPECT_TRUE(IsEmptyFor(MakeSpaces({""}), MakeEmptyLists()));
++  EXPECT_TRUE(IsEmptyFor(MakeSpaces({""}), base::DictValue()));
++}
++
++// Anything a user made makes the profile non-empty: a name, more than one
++// space, an icon, a favorite, a pinned tab, or just a folder.
++TEST_F(DataBackupsTest, IsNotEmptyWithUserData) {
++  const base::DictValue unnamed = MakeSpaces({""});
++  const base::DictValue no_lists = MakeEmptyLists();
++
++  {
++    SCOPED_TRACE("named space");
++    EXPECT_FALSE(IsEmptyFor(MakeSpaces({"Work"}), no_lists));
++  }
++  {
++    SCOPED_TRACE("two spaces");
++    EXPECT_FALSE(IsEmptyFor(MakeSpaces({"", ""}), no_lists));
++  }
++  {
++    SCOPED_TRACE("space with an icon");
++    base::DictValue with_icon = MakeSpaces({""});
++    with_icon.FindList("spaces")->front().GetDict().Set("icon", "star");
++    EXPECT_FALSE(IsEmptyFor(with_icon, no_lists));
++  }
++  {
++    SCOPED_TRACE("favorite");
++    EXPECT_FALSE(IsEmptyFor(
++        unnamed, base::test::ParseJsonDict(
++                     R"({"favorites":{"entries":[)"
++                     R"({"id":"f1","url":"https://a.test/","title":"A"}]}})")));
++  }
++  {
++    SCOPED_TRACE("pinned tab");
++    EXPECT_FALSE(IsEmptyFor(
++        unnamed,
++        base::test::ParseJsonDict(
++            R"({"pinned.0f7a5c9e-6f8b-4b5e-9c1d-2a3b4c5d6e01":{"entries":[)"
++            R"({"id":"p1","url":"https://b.test/","title":"B"}]}})")));
++  }
++  {
++    SCOPED_TRACE("empty folder");
++    EXPECT_FALSE(IsEmptyFor(
++        unnamed,
++        base::test::ParseJsonDict(
++            R"({"pinned.0f7a5c9e-6f8b-4b5e-9c1d-2a3b4c5d6e01":{"entries":[)"
++            R"({"id":"folder1","title":"F","collapsed":false,)"
++            R"("items":[]}]}})")));
++  }
++}
++
++// Items in a folder are counted, the folder itself isn't, and favorites and
++// pinned tabs are counted apart.
++TEST_F(DataBackupsTest, CountsItemsInFolders) {
++  const base::Value spaces(MakeSpaces({"Work", "Play"}));
++  const base::Value lists(MakeLists());
++  const DataBackups::Counts counts = DataBackups::Count(&spaces, &lists);
++  EXPECT_EQ(counts.favorites, 1u);
++  EXPECT_EQ(counts.pinned_tabs, 2u);
++  EXPECT_EQ(counts.spaces, 2u);
++  EXPECT_EQ(counts, kUserDataCounts);
++  EXPECT_EQ(DataBackups::Count(nullptr, nullptr), DataBackups::Counts());
++}
++
++// A snapshot holds all four backed-up prefs and the `rac spaces` file, and
++// reads back the same.
++TEST_F(DataBackupsTest, SnapshotHoldsPrefsAndSpacesStore) {
++  const base::DictValue spaces = MakeSpaces({"Work", "Play"});
++  const base::DictValue lists = MakeLists();
++  const base::DictValue rules =
++      base::test::ParseJsonDict(R"({"a.test":"never"})");
++  SetSpaces(spaces);
++  SetLists(lists);
++  prefs_.SetUserPref(DataBackups::kAgentSiteRulesPref, rules.Clone());
++  prefs_.SetString(DataBackups::kAgentPermissionLevelPref, "ask");
++  WriteSpacesFile(kSpacesStoreFile, R"({"version":1,"spaces":{}})");
++
++  std::unique_ptr<DataBackups> backups = Make();
++  std::optional<std::string> id = TakeSnapshot(*backups, kImportReason);
++  ASSERT_TRUE(id);
++  EXPECT_TRUE(base::StartsWith(*id, "snapshot-"));
++  EXPECT_TRUE(base::EndsWith(*id, "-import-arc"));
++
++  std::optional<DataBackups::Contents> contents = ReadContents(*backups, *id);
++  ASSERT_TRUE(contents);
++  EXPECT_EQ(contents->id, *id);
++  EXPECT_EQ(contents->kind, DataBackups::Kind::kSnapshot);
++  EXPECT_EQ(contents->reason, kImportReason);
++  EXPECT_EQ(contents->prefs.size(), 4u);
++  ASSERT_TRUE(contents->prefs.FindDict(DataBackups::kSpacesPref));
++  EXPECT_EQ(*contents->prefs.FindDict(DataBackups::kSpacesPref), spaces);
++  ASSERT_TRUE(contents->prefs.FindDict(DataBackups::kSidebarListsPref));
++  EXPECT_EQ(*contents->prefs.FindDict(DataBackups::kSidebarListsPref), lists);
++  ASSERT_TRUE(contents->prefs.FindDict(DataBackups::kAgentSiteRulesPref));
++  EXPECT_EQ(*contents->prefs.FindDict(DataBackups::kAgentSiteRulesPref),
++            rules);
++  ASSERT_TRUE(
++      contents->prefs.FindString(DataBackups::kAgentPermissionLevelPref));
++  EXPECT_EQ(
++      *contents->prefs.FindString(DataBackups::kAgentPermissionLevelPref),
++      "ask");
++  ASSERT_TRUE(contents->spaces_store);
++  EXPECT_EQ(*contents->spaces_store,
++            base::test::ParseJsonDict(R"({"version":1,"spaces":{}})"));
++  EXPECT_EQ(contents->counts, kUserDataCounts);
++}
++
++// When `rac spaces` is unreadable, a snapshot holds its previous copy, the
++// way SpacesStore would load it.
++TEST_F(DataBackupsTest, SnapshotFallsBackToSpacesStoreBak) {
++  WriteSpacesFile(kSpacesStoreFile, "this is not json");
++  WriteSpacesFile("rac spaces.bak",
++                  R"({"version":1,"spaces":{"from":"bak"}})");
++
++  std::unique_ptr<DataBackups> backups = Make();
++  std::optional<std::string> id = TakeSnapshot(*backups, kImportReason);
++  ASSERT_TRUE(id);
++  std::optional<DataBackups::Contents> contents = ReadContents(*backups, *id);
++  ASSERT_TRUE(contents);
++  ASSERT_TRUE(contents->spaces_store);
++  EXPECT_EQ(*contents->spaces_store,
++            base::test::ParseJsonDict(
++                R"({"version":1,"spaces":{"from":"bak"}})"));
++}
++
++// A profile that never saved a `rac spaces` file still gets a snapshot, with
++// no spaces store in it.
++TEST_F(DataBackupsTest, SnapshotWithoutSpacesStore) {
++  std::unique_ptr<DataBackups> backups = Make();
++  std::optional<std::string> id = TakeSnapshot(*backups, kImportReason);
++  ASSERT_TRUE(id);
++  std::optional<DataBackups::Contents> contents = ReadContents(*backups, *id);
++  ASSERT_TRUE(contents);
++  EXPECT_FALSE(contents->spaces_store);
++}
++
++// Prefs the user never changed aren't captured, and backing them up never
++// creates state for the pref's owner.
++TEST_F(DataBackupsTest, DefaultPrefsAreNotCaptured) {
++  SetSpaces(MakeSpaces({"Work"}));
++
++  std::unique_ptr<DataBackups> backups = Make();
++  std::optional<std::string> id = TakeSnapshot(*backups, kImportReason);
++  ASSERT_TRUE(id);
++  std::optional<DataBackups::Contents> contents = ReadContents(*backups, *id);
++  ASSERT_TRUE(contents);
++  EXPECT_EQ(contents->prefs.size(), 1u);
++  EXPECT_TRUE(contents->prefs.contains(DataBackups::kSpacesPref));
++  EXPECT_FALSE(contents->prefs.contains(DataBackups::kAgentSiteRulesPref));
++  EXPECT_FALSE(
++      contents->prefs.contains(DataBackups::kAgentPermissionLevelPref));
++
++  EXPECT_FALSE(prefs_.GetUserPrefValue(DataBackups::kAgentSiteRulesPref));
++  EXPECT_FALSE(
++      prefs_.GetUserPrefValue(DataBackups::kAgentPermissionLevelPref));
++  EXPECT_EQ(prefs_.GetString(DataBackups::kAgentPermissionLevelPref), "auto");
++}
++
++// A snapshot holds the prefs as they were when it was requested, even if
++// they change before the file is written.
++TEST_F(DataBackupsTest, SnapshotCapturesPrefsAtCallTime) {
++  const base::DictValue spaces_a = MakeSpaces({"A"});
++  SetSpaces(spaces_a);
++
++  std::unique_ptr<DataBackups> backups = Make();
++  base::test::TestFuture<std::optional<std::string>> future;
++  backups->CreateSnapshot(kImportReason, future.GetCallback());
++  SetSpaces(MakeSpaces({"B"}));
++  std::optional<std::string> id = future.Take();
++  ASSERT_TRUE(id);
++
++  std::optional<DataBackups::Contents> contents = ReadContents(*backups, *id);
++  ASSERT_TRUE(contents);
++  ASSERT_TRUE(contents->prefs.FindDict(DataBackups::kSpacesPref));
++  EXPECT_EQ(*contents->prefs.FindDict(DataBackups::kSpacesPref), spaces_a);
++}
++
++// Only 1-32 characters of a-z, 0-9, and "-" make a reason, and a bad one
++// writes nothing.
++TEST_F(DataBackupsTest, RejectsBadReason) {
++  std::unique_ptr<DataBackups> backups = Make();
++  const std::vector<std::string> reasons = {
++      "", "Import", "a/b", "../x", std::string(33, 'a')};
++  for (const std::string& reason : reasons) {
++    SCOPED_TRACE(reason);
++    EXPECT_FALSE(TakeSnapshot(*backups, reason));
++  }
++  Flush(*backups);
++  EXPECT_TRUE(Ids("").empty());
++}
++
++// An id that isn't a well-formed daily, pre-reset, or snapshot id reads
++// nothing, so it can't name another file.
++TEST_F(DataBackupsTest, ReadBackupRejectsBadIds) {
++  std::unique_ptr<DataBackups> backups = Make();
++  for (std::string_view id :
++       {"../Preferences", "snapshot-x", "daily", "daily-x", "daily.json",
++        "prereset-../x", "daily-20261027T130501123Z/../../Preferences",
++        "snapshot-20261027T130501123Z-../x", ""}) {
++    SCOPED_TRACE(id);
++    EXPECT_FALSE(ReadContents(*backups, id));
++  }
++}
++
++#if BUILDFLAG(IS_POSIX)
++// Only the user can open the backups folder or read a backup, daily or
++// snapshot. The files are never chmod'ed after the write; they're private
++// from the start.
++TEST_F(DataBackupsTest, FilesArePrivate) {
++  SetUserData();
++  std::unique_ptr<DataBackups> backups = Make();
++  std::optional<std::string> id = TakeSnapshot(*backups, kImportReason);
++  ASSERT_TRUE(id);
++  FastForward(DataBackups::kStartupDelay);
++  ASSERT_EQ(Ids("daily-").size(), 1u);
++
++  base::ScopedAllowBlockingForTesting allow_blocking;
++  int dir_mode = 0;
++  ASSERT_TRUE(base::GetPosixFilePermissions(BackupsDir(), &dir_mode));
++  EXPECT_EQ(dir_mode & base::FILE_PERMISSION_MASK,
++            static_cast<int>(base::FILE_PERMISSION_USER_MASK));
++  for (const std::string& file : {*id, Ids("daily-").front()}) {
++    SCOPED_TRACE(file);
++    int file_mode = 0;
++    ASSERT_TRUE(base::GetPosixFilePermissions(BackupFile(file), &file_mode));
++    EXPECT_EQ(file_mode & base::FILE_PERMISSION_MASK,
++              static_cast<int>(base::FILE_PERMISSION_READ_BY_USER |
++                               base::FILE_PERMISSION_WRITE_BY_USER));
++  }
++}
++#endif  // BUILDFLAG(IS_POSIX)
++
++// A backup file says which format it is and which builds can read it.
++TEST_F(DataBackupsTest, FileHasVersionFields) {
++  std::unique_ptr<DataBackups> backups = Make();
++  std::optional<std::string> id = TakeSnapshot(*backups, kImportReason);
++  ASSERT_TRUE(id);
++
++  std::optional<base::DictValue> file = ReadRawFile(BackupFile(*id));
++  ASSERT_TRUE(file);
++  EXPECT_EQ(file->FindInt("version"), DataBackups::kVersion);
++  EXPECT_EQ(file->FindInt("min_reader_version"),
++            DataBackups::kMinReaderVersion);
++  ASSERT_TRUE(file->FindString("kind"));
++  EXPECT_EQ(*file->FindString("kind"), "snapshot");
++}
++
++// A file written by a build that raised min_reader_version is ignored, and
++// the same file at the current version is read.
++TEST_F(DataBackupsTest, IgnoresFileTooNewToRead) {
++  const base::Time created = clock()->Now();
++  std::unique_ptr<DataBackups> backups = Make();
++  // Let the new profile's reset check finish first, so it can't take the
++  // hand-written daily for one from before a reset.
++  task_environment_.RunUntilIdle();
++
++  const std::string id =
++      WriteDailyFile(DataBackups::kMinReaderVersion, created);
++  std::optional<DataBackups::Contents> readable = ReadContents(*backups, id);
++  ASSERT_TRUE(readable);
++  EXPECT_EQ(readable->created, created);
++  EXPECT_EQ(readable->kind, DataBackups::Kind::kDaily);
++
++  WriteDailyFile(DataBackups::kVersion + 1, created);
++  EXPECT_FALSE(ReadContents(*backups, id));
++}
++
++// A snapshot is deleted kSnapshotLifetime after it was taken, and reads as
++// gone as soon as it's expired, before it's pruned.
++TEST_F(DataBackupsTest, SnapshotExpiresAfterLifetime) {
++  const base::Time start = clock()->Now();
++  std::unique_ptr<DataBackups> backups = Make();
++  std::optional<std::string> id = TakeSnapshot(*backups, kImportReason);
++  ASSERT_TRUE(id);
++  EXPECT_TRUE(FileExists(BackupFile(*id)));
++
++  {
++    // A service whose clock is past the expiry reads nothing, though nothing
++    // has pruned the file yet.
++    base::SimpleTestClock late_clock;
++    late_clock.SetNow(start + DataBackups::kSnapshotLifetime + base::Hours(1));
++    DataBackups late_backups(&prefs_, dir_.GetPath(), &late_clock);
++    EXPECT_FALSE(ReadContents(late_backups, *id));
++    Flush(late_backups);
++    EXPECT_TRUE(FileExists(BackupFile(*id)));
++  }
++  EXPECT_TRUE(ReadContents(*backups, *id));
++
++  FastForward(DataBackups::kSnapshotLifetime + base::Hours(1));
++  EXPECT_FALSE(FileExists(BackupFile(*id)));
++  EXPECT_FALSE(ReadContents(*backups, *id));
++}
++
++// The expiry isn't kept anywhere that a crash could lose: the first run
++// after every launch prunes, so a snapshot left by a session that never got
++// to delete it goes kStartupDelay after the next launch.
++TEST_F(DataBackupsTest, PrunesExpiredSnapshotsAtStartupDelay) {
++  std::optional<std::string> id;
++  {
++    std::unique_ptr<DataBackups> backups = Make();
++    id = TakeSnapshot(*backups, kImportReason);
++    ASSERT_TRUE(id);
++  }
++  task_environment_.AdvanceClock(DataBackups::kSnapshotLifetime +
++                                 base::Hours(1));
++
++  std::unique_ptr<DataBackups> backups = Make();
++  task_environment_.RunUntilIdle();
++  EXPECT_TRUE(FileExists(BackupFile(*id)));
++  FastForward(DataBackups::kStartupDelay);
++  EXPECT_FALSE(FileExists(BackupFile(*id)));
++}
++
++// A snapshot's lifetime is capped by its file's time too, so a file whose
++// name claims to be newer than it is still goes on time.
++TEST_F(DataBackupsTest, SnapshotLifetimeCappedByFileTime) {
++  base::SimpleTestClock test_clock;
++  test_clock.SetNow(RealisticTime());
++  DataBackups backups(&prefs_, dir_.GetPath(), &test_clock);
++  std::optional<std::string> id = TakeSnapshot(backups, kImportReason);
++  ASSERT_TRUE(id);
++  ASSERT_TRUE(ReadContents(backups, *id));
++
++  SetFileTime(BackupFile(*id), test_clock.Now() - base::Days(8));
++  EXPECT_FALSE(ReadContents(backups, *id));
++}
++
++// When the clock moves back, a snapshot dated in the future isn't wiped,
++// so Undo still works, and isn't kept forever either: its lifetime restarts
++// at the moment the move was noticed.
++TEST_F(DataBackupsTest, ClockMovedBackRestartsSnapshotLifetime) {
++  base::SimpleTestClock test_clock;
++  test_clock.SetNow(RealisticTime());
++  std::optional<std::string> id;
++  {
++    DataBackups backups(&prefs_, dir_.GetPath(), &test_clock);
++    id = TakeSnapshot(backups, kImportReason);
++    ASSERT_TRUE(id);
++  }
++
++  test_clock.Advance(-base::Days(30));
++  {
++    DataBackups backups(&prefs_, dir_.GetPath(), &test_clock);
++    EXPECT_TRUE(ReadContents(backups, *id));
++  }
++  test_clock.Advance(DataBackups::kSnapshotLifetime - base::Hours(1));
++  {
++    DataBackups backups(&prefs_, dir_.GetPath(), &test_clock);
++    EXPECT_TRUE(ReadContents(backups, *id));
++  }
++  test_clock.Advance(base::Hours(2));
++  {
++    DataBackups backups(&prefs_, dir_.GetPath(), &test_clock);
++    EXPECT_FALSE(ReadContents(backups, *id));
++  }
++}
++
++// Beyond kMaxSnapshots the oldest are deleted early, and read as gone.
++TEST_F(DataBackupsTest, KeepsAtMostMaxSnapshots) {
++  std::unique_ptr<DataBackups> backups = Make();
++  std::vector<std::string> ids;
++  for (size_t i = 0; i < DataBackups::kMaxSnapshots + 2; ++i) {
++    std::optional<std::string> id = TakeSnapshot(*backups, kImportReason);
++    ASSERT_TRUE(id);
++    ids.push_back(*id);
++    task_environment_.FastForwardBy(base::Seconds(1));
++  }
++
++  EXPECT_EQ(Ids("snapshot-").size(), DataBackups::kMaxSnapshots);
++  for (size_t i = 0; i < ids.size(); ++i) {
++    SCOPED_TRACE(ids[i]);
++    EXPECT_EQ(ReadContents(*backups, ids[i]).has_value(), i >= 2);
++  }
++}
++
++// The cap never deletes a pinned snapshot, the one a pending Undo needs. It
++// takes the oldest unpinned ones instead.
++TEST_F(DataBackupsTest, CapNeverPrunesPinnedSnapshot) {
++  std::unique_ptr<DataBackups> backups = Make();
++  std::optional<std::string> pinned = TakeSnapshot(*backups, kImportReason);
++  ASSERT_TRUE(pinned);
++  backups->PinSnapshot(*pinned);
++  std::vector<std::string> ids;
++  for (size_t i = 0; i < DataBackups::kMaxSnapshots + 1; ++i) {
++    task_environment_.FastForwardBy(base::Seconds(1));
++    std::optional<std::string> id = TakeSnapshot(*backups, "restore");
++    ASSERT_TRUE(id);
++    ids.push_back(*id);
++  }
++
++  EXPECT_EQ(Ids("snapshot-").size(), DataBackups::kMaxSnapshots);
++  EXPECT_TRUE(ReadContents(*backups, *pinned));
++  EXPECT_FALSE(ReadContents(*backups, ids[0]));
++  EXPECT_FALSE(ReadContents(*backups, ids[1]));
++  EXPECT_TRUE(ReadContents(*backups, ids.back()));
++}
++
++// A pin goes when its snapshot is deleted or expires.
++TEST_F(DataBackupsTest, PinsGoWithTheirSnapshots) {
++  std::unique_ptr<DataBackups> backups = Make();
++  std::optional<std::string> deleted = TakeSnapshot(*backups, kImportReason);
++  std::optional<std::string> expiring = TakeSnapshot(*backups, kImportReason);
++  ASSERT_TRUE(deleted && expiring);
++  backups->PinSnapshot(*deleted);
++  backups->PinSnapshot(*expiring);
++  EXPECT_EQ(prefs_.GetList(DataBackups::kPinnedSnapshotsPref).size(), 2u);
++
++  backups->DeleteSnapshot(*deleted);
++  Flush(*backups);
++  EXPECT_EQ(prefs_.GetList(DataBackups::kPinnedSnapshotsPref).size(), 1u);
++
++  FastForward(DataBackups::kSnapshotLifetime + base::Hours(1));
++  EXPECT_FALSE(FileExists(BackupFile(*expiring)));
++  EXPECT_TRUE(prefs_.GetList(DataBackups::kPinnedSnapshotsPref).empty());
++}
++
++// DeleteSnapshot removes a snapshot's file and leaves daily backups alone.
++TEST_F(DataBackupsTest, DeleteSnapshotRemovesFile) {
++  std::unique_ptr<DataBackups> backups = Make();
++  std::optional<std::string> id = TakeSnapshot(*backups, kImportReason);
++  ASSERT_TRUE(id);
++  ASSERT_TRUE(FileExists(BackupFile(*id)));
++
++  backups->DeleteSnapshot(*id);
++  Flush(*backups);
++  EXPECT_FALSE(FileExists(BackupFile(*id)));
++  EXPECT_FALSE(ReadContents(*backups, *id));
++
++  const std::string daily =
++      WriteDailyFile(DataBackups::kMinReaderVersion, clock()->Now());
++  backups->DeleteSnapshot(daily);
++  Flush(*backups);
++  EXPECT_TRUE(FileExists(BackupFile(daily)));
++  EXPECT_TRUE(ReadContents(*backups, daily));
++}
++
++// The daily backup waits kStartupDelay, so it never competes with startup.
++TEST_F(DataBackupsTest, DailyBackupWaitsForStartupDelay) {
++  SetUserData();
++  std::unique_ptr<DataBackups> backups = Make();
++  task_environment_.RunUntilIdle();
++  EXPECT_TRUE(Ids("daily-").empty());
++  EXPECT_TRUE(prefs_.GetTime(DataBackups::kLastDailyPref).is_null());
++
++  FastForward(DataBackups::kStartupDelay);
++  EXPECT_EQ(Ids("daily-").size(), 1u);
++  EXPECT_FALSE(prefs_.GetTime(DataBackups::kLastDailyPref).is_null());
++}
++
++// The daily backup holds the prefs only. Hidden spaces' open tabs stay in
++// `rac spaces` and are never copied into it.
++TEST_F(DataBackupsTest, DailyBackupHoldsNoOpenTabs) {
++  WriteSpacesFile(kSpacesStoreFile, R"({"version":1,"spaces":{}})");
++  SetUserData();
++  std::unique_ptr<DataBackups> backups = Make();
++  FastForward(DataBackups::kStartupDelay);
++
++  std::optional<DataBackups::Contents> daily = ReadNewestDaily(*backups);
++  ASSERT_TRUE(daily);
++  EXPECT_FALSE(daily->spaces_store);
++  EXPECT_EQ(daily->counts, kUserDataCounts);
++
++  std::optional<base::DictValue> file = ReadRawFile(BackupFile(daily->id));
++  ASSERT_TRUE(file);
++  EXPECT_FALSE(file->Find("spaces_store"));
++}
++
++// A new daily backup is written only once a day has passed since the last.
++TEST_F(DataBackupsTest, DailyBackupAtMostOncePerDay) {
++  SetUserData();
++  std::unique_ptr<DataBackups> backups = Make();
++  FastForward(DataBackups::kStartupDelay);
++  std::optional<DataBackups::Contents> first = ReadNewestDaily(*backups);
++  ASSERT_TRUE(first);
++
++  FastForward(base::Hours(12));
++  EXPECT_EQ(Ids("daily-").size(), 1u);
++
++  FastForward(base::Hours(13));
++  std::optional<DataBackups::Contents> next = ReadNewestDaily(*backups);
++  ASSERT_TRUE(next);
++  EXPECT_GE(next->created - first->created, DataBackups::kDailyInterval);
++  EXPECT_EQ(Ids("daily-").size(), 2u);
++}
++
++// Only the newest kDailyGenerations daily backups are kept.
++TEST_F(DataBackupsTest, KeepsDailyGenerations) {
++  SetUserData();
++  std::unique_ptr<DataBackups> backups = Make();
++  FastForward(DataBackups::kStartupDelay);
++  FastForward(DataBackups::kDailyInterval *
++              (DataBackups::kDailyGenerations + 2));
++  EXPECT_EQ(Ids("daily-").size(), DataBackups::kDailyGenerations);
++}
++
++// After an import changes the data, the daily backup is refreshed
++// kDailyAfterChangeDelay after the import ends, not a day later.
++TEST_F(DataBackupsTest, DailyRefreshedSoonAfterImport) {
++  SetUserData();
++  std::unique_ptr<DataBackups> backups = Make();
++  FastForward(DataBackups::kStartupDelay);
++  ASSERT_EQ(Ids("daily-").size(), 1u);
++
++  std::unique_ptr<DataBackups::Operation> import =
++      backups->TryBeginOperation();
++  ASSERT_TRUE(import);
++  SetSpaces(MakeSpaces({"Work", "Play", "Imported"}));
++  import->MarkDataChanged();
++  import.reset();
++
++  FastForward(DataBackups::kDailyAfterChangeDelay);
++  std::optional<DataBackups::Contents> daily = ReadNewestDaily(*backups);
++  ASSERT_TRUE(daily);
++  EXPECT_EQ(daily->counts.spaces, 3u);
++  EXPECT_EQ(Ids("daily-").size(), 2u);
++}
++
++// An empty sidebar is never backed up, and the service doesn't wake to check
++// again: it waits for the sidebar prefs to change.
++TEST_F(DataBackupsTest, EmptyProfileDoesNotWake) {
++  std::unique_ptr<DataBackups> backups = Make();
++  FastForward(DataBackups::kStartupDelay);
++  EXPECT_TRUE(Ids("daily-").empty());
++  EXPECT_FALSE(backups->HasScheduledWorkForTesting());
++  const size_t tasks = backups->file_tasks_posted_for_testing();
++
++  FastForward(base::Days(3));
++  EXPECT_EQ(backups->file_tasks_posted_for_testing(), tasks);
++
++  SetUserData();
++  EXPECT_TRUE(backups->HasScheduledWorkForTesting());
++  FastForward(base::Minutes(1));
++  EXPECT_EQ(Ids("daily-").size(), 1u);
++}
++
++// While the live data is fine, startup does no file work at all, even with
++// a stale `Preferences.bad` lying around. The first file work is the prune
++// at kStartupDelay.
++TEST_F(DataBackupsTest, StartupDoesNoFileWorkWhenDataIsFine) {
++  ASSERT_FALSE(WriteDaily().is_null());
++  WriteTextFile(dir_.GetPath().AppendASCII("Preferences.bad"), "{ not json");
++
++  std::unique_ptr<DataBackups> backups = Make();
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(backups->file_tasks_posted_for_testing(), 0u);
++  EXPECT_FALSE(backups->restore_offer());
++
++  FastForward(DataBackups::kStartupDelay - base::Seconds(1));
++  EXPECT_EQ(backups->file_tasks_posted_for_testing(), 0u);
++}
++
++// A new profile checks the backups folder once, finds nothing, and never
++// checks again.
++TEST_F(DataBackupsTest, NewProfileChecksForResetOnce) {
++  {
++    std::unique_ptr<DataBackups> backups = Make();
++    EXPECT_EQ(backups->file_tasks_posted_for_testing(), 1u);
++    task_environment_.RunUntilIdle();
++    EXPECT_FALSE(backups->restore_offer());
++  }
++  EXPECT_TRUE(prefs_.GetBoolean(DataBackups::kInitializedPref));
++
++  std::unique_ptr<DataBackups> restarted = Make();
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(restarted->file_tasks_posted_for_testing(), 0u);
++  EXPECT_FALSE(restarted->restore_offer());
++}
++
++// A reset is found from prefs that lost their state while backup files
++// exist, with no `Preferences.bad`. The daily backup becomes a pre-reset
++// copy and is offered, once, and the offer is remembered in prefs.
++TEST_F(DataBackupsTest, OffersRestoreAfterResetWithoutBadPrefs) {
++  const base::Time created = WriteDaily();
++  ASSERT_FALSE(created.is_null());
++  ResetPreferences();
++  ASSERT_FALSE(FileExists(dir_.GetPath().AppendASCII("Preferences.bad")));
++
++  std::unique_ptr<DataBackups> backups = Make();
++  TestObserver observer;
++  backups->AddObserver(&observer);
++  EXPECT_FALSE(backups->restore_offer());
++  task_environment_.RunUntilIdle();
++
++  ASSERT_TRUE(backups->restore_offer());
++  const DataBackups::RestoreOffer& offer = *backups->restore_offer();
++  EXPECT_TRUE(base::StartsWith(offer.backup_id, "prereset-"));
++  EXPECT_EQ(offer.created, created);
++  EXPECT_EQ(offer.counts, kUserDataCounts);
++  EXPECT_FALSE(offer.detected.is_null());
++  EXPECT_TRUE(backups->ShouldShowRestoreOffer());
++  EXPECT_EQ(observer.changes(), 1);
++  EXPECT_TRUE(Ids("daily-").empty());
++  EXPECT_EQ(Ids("prereset-"), std::vector<std::string>{offer.backup_id});
++  EXPECT_TRUE(prefs_.GetBoolean(DataBackups::kInitializedPref));
++
++  std::optional<DataBackups::RestoreOffer> stored =
++      DataBackups::RestoreOffer::FromDict(
++          prefs_.GetDict(DataBackups::kRestoreOfferPref));
++  ASSERT_TRUE(stored);
++  EXPECT_EQ(stored->backup_id, offer.backup_id);
++  EXPECT_EQ(stored->created, offer.created);
++  backups->RemoveObserver(&observer);
++}
++
++// The pre-reset copy is never replaced: not after the user dismisses the
++// offer, makes a space, and several days of daily backups of the near-empty
++// sidebar go by.
++TEST_F(DataBackupsTest, ResetNeverOverwritesPreResetBackup) {
++  std::unique_ptr<DataBackups> backups;
++  const base::Time created = WriteDailyThenReset(backups);
++  ASSERT_TRUE(backups->restore_offer());
++  const std::string kept = backups->restore_offer()->backup_id;
++
++  backups->ResolveRestoreOffer();
++  SetSpaces(MakeSpaces({"Fresh"}));
++  FastForward(DataBackups::kDailyInterval *
++              (DataBackups::kDailyGenerations + 2));
++
++  ASSERT_EQ(Ids("daily-").size(), DataBackups::kDailyGenerations);
++  for (const std::string& id : Ids("daily-")) {
++    std::optional<DataBackups::Contents> daily = ReadContents(*backups, id);
++    ASSERT_TRUE(daily);
++    EXPECT_EQ(daily->counts, DataBackups::Counts{.spaces = 1});
++  }
++  std::optional<DataBackups::Contents> before = ReadContents(*backups, kept);
++  ASSERT_TRUE(before);
++  EXPECT_EQ(before->kind, DataBackups::Kind::kPreReset);
++  EXPECT_EQ(before->created, created);
++  EXPECT_EQ(before->counts, kUserDataCounts);
++}
++
++// Daily backups go on while an offer is pending, and never touch the backup
++// it offers.
++TEST_F(DataBackupsTest, DailyDuringOfferKeepsOfferedBackup) {
++  std::unique_ptr<DataBackups> backups;
++  WriteDailyThenReset(backups);
++  ASSERT_TRUE(backups->restore_offer());
++
++  SetSpaces(MakeSpaces({"Fresh"}));
++  FastForward(base::Days(2));
++  EXPECT_FALSE(Ids("daily-").empty());
++
++  ASSERT_TRUE(backups->restore_offer());
++  std::optional<DataBackups::Contents> offered = ReadOffered(*backups);
++  ASSERT_TRUE(offered);
++  EXPECT_EQ(offered->id, backups->restore_offer()->backup_id);
++  EXPECT_EQ(offered->counts, kUserDataCounts);
++}
++
++// A pre-reset copy is kept kPreResetLifetime from the reset, then deleted.
++TEST_F(DataBackupsTest, PreResetCopyExpires) {
++  std::unique_ptr<DataBackups> backups;
++  WriteDailyThenReset(backups);
++  ASSERT_TRUE(backups->restore_offer());
++  const std::string kept = backups->restore_offer()->backup_id;
++
++  FastForward(DataBackups::kPreResetLifetime - base::Hours(1));
++  EXPECT_TRUE(FileExists(BackupFile(kept)));
++  FastForward(base::Hours(2));
++  EXPECT_FALSE(FileExists(BackupFile(kept)));
++}
++
++// With no backup files, an empty sidebar is a new profile, not a reset, so
++// nothing is offered.
++TEST_F(DataBackupsTest, NoOfferForNewProfile) {
++  std::unique_ptr<DataBackups> backups = Make();
++  TestObserver observer;
++  backups->AddObserver(&observer);
++  task_environment_.RunUntilIdle();
++  EXPECT_FALSE(backups->restore_offer());
++  EXPECT_EQ(observer.changes(), 0);
++  EXPECT_FALSE(prefs_.GetUserPrefValue(DataBackups::kRestoreOfferPref));
++  backups->RemoveObserver(&observer);
++}
++
++// When a snapshot is newer than the daily backup, it's what's offered, as a
++// pre-reset copy of its prefs. That copy outlives the snapshot, so the
++// offer still works after the snapshot expires, and the snapshot's open
++// tabs aren't kept any longer.
++TEST_F(DataBackupsTest, OfferedSnapshotOutlivesSnapshotExpiry) {
++  WriteSpacesFile(kSpacesStoreFile, R"({"version":1,"spaces":{}})");
++  ASSERT_FALSE(WriteDaily().is_null());
++  std::optional<std::string> snapshot_id;
++  base::Time snapshot_created;
++  {
++    std::unique_ptr<DataBackups> backups = Make();
++    FastForward(base::Hours(1));
++    snapshot_created = clock()->Now();
++    snapshot_id = TakeSnapshot(*backups, kImportReason);
++    ASSERT_TRUE(snapshot_id);
++  }
++  task_environment_.AdvanceClock(base::Days(3));
++  ResetPreferences();
++
++  std::unique_ptr<DataBackups> backups = Make();
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(backups->restore_offer());
++  const DataBackups::RestoreOffer offer = *backups->restore_offer();
++  EXPECT_TRUE(base::StartsWith(offer.backup_id, "prereset-"));
++  EXPECT_EQ(offer.created, snapshot_created);
++  EXPECT_EQ(offer.counts, kUserDataCounts);
++
++  FastForward(base::Days(5));
++  EXPECT_FALSE(FileExists(BackupFile(*snapshot_id)));
++  ASSERT_TRUE(backups->restore_offer());
++  std::optional<DataBackups::Contents> offered = ReadOffered(*backups);
++  ASSERT_TRUE(offered);
++  EXPECT_EQ(offered->id, offer.backup_id);
++  EXPECT_EQ(offered->counts, kUserDataCounts);
++  EXPECT_FALSE(offered->spaces_store);
++}
++
++// If the offered backup can't be read, the next newest one with data is
++// used instead, and the offer stays until it's resolved.
++TEST_F(DataBackupsTest, ReadOfferedBackupFallsBack) {
++  const base::Time older = WriteDaily();
++  task_environment_.AdvanceClock(base::Days(2));
++  ASSERT_FALSE(WriteDaily().is_null());
++  ResetPreferences();
++
++  std::unique_ptr<DataBackups> backups = Make();
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(backups->restore_offer());
++  ASSERT_EQ(Ids("prereset-").size(), 2u);
++  const std::string offered_id = backups->restore_offer()->backup_id;
++  EXPECT_EQ(offered_id, Ids("prereset-").back());
++  WriteTextFile(BackupFile(offered_id), "not json");
++
++  std::optional<DataBackups::Contents> fallback = ReadOffered(*backups);
++  ASSERT_TRUE(fallback);
++  EXPECT_EQ(fallback->id, Ids("prereset-").front());
++  EXPECT_EQ(fallback->created, older);
++  EXPECT_EQ(fallback->counts, kUserDataCounts);
++  EXPECT_TRUE(backups->restore_offer());
++}
++
++// The offer is in prefs, so a restarted service has it at once, with no file
++// work first.
++TEST_F(DataBackupsTest, OfferPersistsAcrossRestart) {
++  std::optional<DataBackups::RestoreOffer> first;
++  {
++    std::unique_ptr<DataBackups> backups;
++    WriteDailyThenReset(backups);
++    ASSERT_TRUE(backups->restore_offer());
++    first = backups->restore_offer();
++  }
++
++  std::unique_ptr<DataBackups> restarted = Make();
++  ASSERT_TRUE(restarted->restore_offer());
++  EXPECT_EQ(restarted->file_tasks_posted_for_testing(), 0u);
++  EXPECT_EQ(restarted->restore_offer()->backup_id, first->backup_id);
++  EXPECT_EQ(restarted->restore_offer()->created, first->created);
++  EXPECT_EQ(restarted->restore_offer()->detected, first->detected);
++  EXPECT_EQ(restarted->restore_offer()->counts, first->counts);
++}
++
++// Once dismissed, an offer isn't repeated, even after a restart with the
++// sidebar still empty. The reset is handled once per `Preferences`.
++TEST_F(DataBackupsTest, DismissedOfferIsNotRepeated) {
++  {
++    std::unique_ptr<DataBackups> backups;
++    WriteDailyThenReset(backups);
++    TestObserver observer;
++    backups->AddObserver(&observer);
++    ASSERT_TRUE(backups->restore_offer());
++
++    backups->ResolveRestoreOffer();
++    EXPECT_FALSE(backups->restore_offer());
++    EXPECT_FALSE(prefs_.GetUserPrefValue(DataBackups::kRestoreOfferPref));
++    EXPECT_EQ(observer.changes(), 1);
++    backups->RemoveObserver(&observer);
++  }
++
++  std::unique_ptr<DataBackups> restarted = Make();
++  task_environment_.RunUntilIdle();
++  EXPECT_FALSE(restarted->restore_offer());
++  EXPECT_EQ(restarted->file_tasks_posted_for_testing(), 0u);
++}
++
++// An offer nobody answers lapses after kRestoreOfferLifetime, even in a
++// browser that stays open, and is treated as dismissed. The pre-reset copy
++// stays.
++TEST_F(DataBackupsTest, OfferLapses) {
++  std::string kept;
++  {
++    std::unique_ptr<DataBackups> backups;
++    WriteDailyThenReset(backups);
++    ASSERT_TRUE(backups->restore_offer());
++    kept = backups->restore_offer()->backup_id;
++    FastForward(DataBackups::kRestoreOfferLifetime + base::Hours(1));
++    EXPECT_FALSE(backups->restore_offer());
++  }
++
++  std::unique_ptr<DataBackups> restarted = Make();
++  task_environment_.RunUntilIdle();
++  EXPECT_FALSE(restarted->restore_offer());
++  EXPECT_FALSE(prefs_.GetUserPrefValue(DataBackups::kRestoreOfferPref));
++  EXPECT_TRUE(FileExists(BackupFile(kept)));
++}
++
++// An offer whose detection time is in the future (the clock moved back)
++// restarts its lifetime now instead of staying forever.
++TEST_F(DataBackupsTest, OfferFromTheFutureRestartsItsLifetime) {
++  DataBackups::RestoreOffer offer;
++  offer.backup_id = base::StrCat({"prereset-", IdTime(clock()->Now())});
++  offer.created = clock()->Now();
++  offer.counts = kUserDataCounts;
++  offer.detected = clock()->Now() + base::Days(30);
++  prefs_.SetBoolean(DataBackups::kInitializedPref, true);
++  prefs_.SetDict(DataBackups::kRestoreOfferPref, offer.ToDict());
++
++  std::unique_ptr<DataBackups> backups = Make();
++  ASSERT_TRUE(backups->restore_offer());
++  EXPECT_EQ(backups->restore_offer()->detected, clock()->Now());
++}
++
++// Import, Undo, and restore can't overlap: only one operation at a time.
++TEST_F(DataBackupsTest, OperationsAreExclusive) {
++  std::unique_ptr<DataBackups> backups = Make();
++  std::unique_ptr<DataBackups::Operation> first = backups->TryBeginOperation();
++  ASSERT_TRUE(first);
++  EXPECT_TRUE(backups->operation_running());
++  EXPECT_FALSE(backups->TryBeginOperation());
++
++  first.reset();
++  EXPECT_FALSE(backups->operation_running());
++  EXPECT_TRUE(backups->TryBeginOperation());
++}
++
++// The offer is hidden while an import runs, and shown again after, without
++// being resolved.
++TEST_F(DataBackupsTest, OfferHiddenWhileOperationRuns) {
++  std::unique_ptr<DataBackups> backups;
++  WriteDailyThenReset(backups);
++  ASSERT_TRUE(backups->ShouldShowRestoreOffer());
++  TestObserver observer;
++  backups->AddObserver(&observer);
++
++  std::unique_ptr<DataBackups::Operation> import =
++      backups->TryBeginOperation();
++  ASSERT_TRUE(import);
++  EXPECT_FALSE(backups->ShouldShowRestoreOffer());
++  EXPECT_TRUE(backups->restore_offer());
++  EXPECT_EQ(observer.changes(), 1);
++
++  import.reset();
++  EXPECT_TRUE(backups->ShouldShowRestoreOffer());
++  EXPECT_EQ(observer.changes(), 2);
++  backups->RemoveObserver(&observer);
++}
++
++// An offer survives ToDict and FromDict, and a dict with a bad backup id or
++// no times isn't an offer.
++TEST_F(DataBackupsTest, RestoreOfferRoundTrips) {
++  DataBackups::RestoreOffer offer;
++  offer.backup_id = "prereset-20261027T130501123Z";
++  offer.created = base::Time::UnixEpoch() + base::Days(3);
++  offer.counts = {.spaces = 3, .pinned_tabs = 2, .favorites = 1};
++  offer.detected = base::Time::UnixEpoch() + base::Days(4);
++
++  std::optional<DataBackups::RestoreOffer> decoded =
++      DataBackups::RestoreOffer::FromDict(offer.ToDict());
++  ASSERT_TRUE(decoded);
++  EXPECT_EQ(decoded->backup_id, offer.backup_id);
++  EXPECT_EQ(decoded->created, offer.created);
++  EXPECT_EQ(decoded->counts, offer.counts);
++  EXPECT_EQ(decoded->detected, offer.detected);
++
++  offer.backup_id = "snapshot-20261027T130501123Z-import-arc";
++  EXPECT_TRUE(DataBackups::RestoreOffer::FromDict(offer.ToDict()));
++
++  for (const char* bad_id : {"../x", "snapshot-x", "daily", "daily.json", ""}) {
++    SCOPED_TRACE(bad_id);
++    offer.backup_id = bad_id;
++    EXPECT_FALSE(DataBackups::RestoreOffer::FromDict(offer.ToDict()));
++  }
++
++  offer.backup_id = "prereset-20261027T130501123Z";
++  for (const char* key : {"created", "detected"}) {
++    SCOPED_TRACE(key);
++    base::DictValue dict = offer.ToDict();
++    ASSERT_TRUE(dict.Remove(key));
++    EXPECT_FALSE(DataBackups::RestoreOffer::FromDict(dict));
++  }
++}
++
++// A space as `rac.spaces` stores it, with the optional icon and theme.
++base::DictValue MakeThemedSpace(int index,
++                                std::string_view name,
++                                std::string_view icon,
++                                std::string_view color1,
++                                std::string_view color2,
++                                std::string_view mode) {
++  base::DictValue space;
++  space.Set("id", base::StringPrintf("0f7a5c9e-6f8b-4b5e-9c1d-2a3b4c5d6e%02d",
++                                     index));
++  space.Set("name", name);
++  if (!icon.empty()) {
++    space.Set("icon", icon);
++  }
++  space.Set("theme", base::DictValue()
++                         .Set("color1", color1)
++                         .Set("color2", color2)
++                         .Set("mode", mode)
++                         .Set("future_field", 7));
++  return space;
++}
++
++base::DictValue SpacesStore(std::vector<base::DictValue> spaces) {
++  base::ListValue list;
++  for (base::DictValue& space : spaces) {
++    list.Append(std::move(space));
++  }
++  return base::DictValue().Set("version", 1).Set("spaces", std::move(list));
++}
++
++// The offer lists each space's name, emoji, colors, and mode, in stored
++// order, skips what isn't a space, and keeps only what the prompt can trust.
++TEST_F(DataBackupsTest, SummarizeSpacesReadsNameEmojiColorsAndMode) {
++  using Mode = DataBackups::SpaceSummary::Mode;
++  std::vector<base::DictValue> spaces;
++  spaces.push_back(
++      MakeThemedSpace(1, "Work", "\U0001F680", "#FFE9F4", "#F1D1EC", "dark"));
++  // No icon, no theme at all: the defaults.
++  spaces.push_back(MakeSpaces({"Plain"})
++                       .FindList("spaces")
++                       ->front()
++                       .GetDict()
++                       .Clone());
++  // Bad colors and mode are dropped, not copied. An over-long emoji goes; an
++  // over-long name is cut on a character boundary.
++  spaces.push_back(MakeThemedSpace(3, std::string(40, 'a') + "é" +
++                                          std::string(40, 'b'),
++                                   std::string(40, 'x'), "red", "#12345",
++                                   "sepia"));
++  base::DictValue store = SpacesStore(std::move(spaces));
++  // An entry with no id isn't a space.
++  store.FindList("spaces")->Append(base::DictValue().Set("name", "Ghost"));
++  store.FindList("spaces")->Append("not a dict");
++  const base::Value value(std::move(store));
++
++  const std::vector<DataBackups::SpaceSummary> summaries =
++      DataBackups::SummarizeSpaces(&value);
++  ASSERT_EQ(summaries.size(), 3u);
++  EXPECT_EQ(summaries[0],
++            (DataBackups::SpaceSummary{.name = "Work",
++                                       .emoji = "\U0001F680",
++                                       .color1 = "#FFE9F4",
++                                       .color2 = "#F1D1EC",
++                                       .mode = Mode::kDark}));
++  EXPECT_EQ(summaries[1], (DataBackups::SpaceSummary{.name = "Plain"}));
++  EXPECT_LE(summaries[2].name.size(), DataBackups::kMaxSummaryNameBytes);
++  EXPECT_TRUE(base::IsStringUTF8(summaries[2].name));
++  EXPECT_TRUE(base::StartsWith(summaries[2].name, std::string(40, 'a')));
++  EXPECT_TRUE(summaries[2].emoji.empty());
++  EXPECT_TRUE(summaries[2].color1.empty());
++  EXPECT_TRUE(summaries[2].color2.empty());
++  EXPECT_EQ(summaries[2].mode, Mode::kAuto);
++
++  EXPECT_TRUE(DataBackups::SummarizeSpaces(nullptr).empty());
++  const base::Value not_a_store(5);
++  EXPECT_TRUE(DataBackups::SummarizeSpaces(&not_a_store).empty());
++}
++
++// Only kMaxOfferSpaces are listed, but the counts still say how many there
++// are. Entries that aren't spaces don't use up the limit.
++TEST_F(DataBackupsTest, SummarizeSpacesIsBounded) {
++  std::vector<std::string> names;
++  for (size_t i = 0; i < DataBackups::kMaxOfferSpaces + 5; ++i) {
++    names.push_back(base::StringPrintf("Space %02zu", i));
++  }
++  base::DictValue store = MakeSpaces(names);
++  store.FindList("spaces")->Insert(store.FindList("spaces")->begin(),
++                                   base::Value(base::DictValue()));
++  const base::Value value(std::move(store));
++
++  const std::vector<DataBackups::SpaceSummary> summaries =
++      DataBackups::SummarizeSpaces(&value);
++  ASSERT_EQ(summaries.size(), DataBackups::kMaxOfferSpaces);
++  EXPECT_EQ(summaries.front().name, "Space 00");
++  EXPECT_EQ(summaries.back().name, "Space 11");
++  EXPECT_EQ(DataBackups::Count(&value, nullptr).spaces, names.size());
++}
++
++// The offer built after a reset carries the summaries and the full counts,
++// and both survive being stored in prefs and read back at the next launch.
++TEST_F(DataBackupsTest, OfferAfterResetListsSpaces) {
++  using Mode = DataBackups::SpaceSummary::Mode;
++  std::vector<base::DictValue> spaces;
++  spaces.push_back(
++      MakeThemedSpace(1, "Work", "\U0001F680", "#FFE9F4", "#F1D1EC", "light"));
++  spaces.push_back(
++      MakeThemedSpace(2, "Play", "", "#226149", "#26456B", "dark"));
++  SetSpaces(SpacesStore(std::move(spaces)));
++  SetLists(MakeLists());
++  {
++    std::unique_ptr<DataBackups> backups = Make();
++    FastForward(DataBackups::kStartupDelay);
++    ASSERT_FALSE(Ids("daily-").empty());
++  }
++  ResetPreferences();
++
++  std::unique_ptr<DataBackups> backups = Make();
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(backups->restore_offer());
++  const DataBackups::RestoreOffer& offer = *backups->restore_offer();
++  EXPECT_EQ(offer.counts, (DataBackups::Counts{
++                              .spaces = 2, .pinned_tabs = 2, .favorites = 1}));
++  const std::vector<DataBackups::SpaceSummary> want = {
++      {.name = "Work",
++       .emoji = "\U0001F680",
++       .color1 = "#FFE9F4",
++       .color2 = "#F1D1EC",
++       .mode = Mode::kLight},
++      {.name = "Play",
++       .color1 = "#226149",
++       .color2 = "#26456B",
++       .mode = Mode::kDark}};
++  EXPECT_EQ(offer.spaces, want);
++
++  // The stored offer has them too, so the prompt reads no file.
++  std::optional<DataBackups::RestoreOffer> stored =
++      DataBackups::RestoreOffer::FromDict(
++          prefs_.GetDict(DataBackups::kRestoreOfferPref));
++  ASSERT_TRUE(stored);
++  EXPECT_EQ(stored->spaces, want);
++  backups.reset();
++  std::unique_ptr<DataBackups> restarted = Make();
++  ASSERT_TRUE(restarted->restore_offer());
++  EXPECT_EQ(restarted->restore_offer()->spaces, want);
++}
++
++// A stored offer from an older build has no list, and one with a damaged or
++// oversized list is cut back, never trusted.
++TEST_F(DataBackupsTest, RestoreOfferSpaceListIsChecked) {
++  DataBackups::RestoreOffer offer;
++  offer.backup_id = "prereset-20261027T130501123Z";
++  offer.created = base::Time::UnixEpoch() + base::Days(3);
++  offer.detected = base::Time::UnixEpoch() + base::Days(4);
++
++  base::DictValue old_build = offer.ToDict();
++  ASSERT_TRUE(old_build.Remove("space_list"));
++  std::optional<DataBackups::RestoreOffer> decoded =
++      DataBackups::RestoreOffer::FromDict(old_build);
++  ASSERT_TRUE(decoded);
++  EXPECT_TRUE(decoded->spaces.empty());
++
++  base::ListValue list;
++  for (size_t i = 0; i < DataBackups::kMaxOfferSpaces + 8; ++i) {
++    list.Append(base::DictValue()
++                    .Set("name", "S")
++                    .Set("color1", "not a color")
++                    .Set("mode", "neon"));
++    list.Append("junk");
++  }
++  base::DictValue damaged = offer.ToDict();
++  damaged.Set("space_list", std::move(list));
++  decoded = DataBackups::RestoreOffer::FromDict(damaged);
++  ASSERT_TRUE(decoded);
++  ASSERT_EQ(decoded->spaces.size(), DataBackups::kMaxOfferSpaces);
++  EXPECT_TRUE(decoded->spaces[0].color1.empty());
++  EXPECT_EQ(decoded->spaces[0].mode, DataBackups::SpaceSummary::Mode::kAuto);
++
++  // ToDict also stops at the limit.
++  offer.spaces.assign(DataBackups::kMaxOfferSpaces + 3,
++                      DataBackups::SpaceSummary{.name = "S"});
++  EXPECT_EQ(offer.ToDict().FindList("space_list")->size(),
++            DataBackups::kMaxOfferSpaces);
++}
++
++}  // namespace
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/storage/restore_plan.cc
+@@ -0,0 +1,273 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/storage/restore_plan.h"
++
++#include <string_view>
++
++#include "base/strings/strcat.h"
++
++namespace rac {
++
++namespace {
++
++// The shapes SpacesService, SidebarItems, SpacesStore, and the agent guard
++// write. See data_backups.cc for the first two.
++constexpr char kSpacesListKey[] = "spaces";
++constexpr char kSpaceIdKey[] = "id";
++constexpr char kSpaceNameKey[] = "name";
++constexpr char kSpaceIconKey[] = "icon";
++constexpr char kPinnedListPrefix[] = "pinned.";
++constexpr char kEntriesKey[] = "entries";
++constexpr char kEntryIdKey[] = "id";
++// `rac spaces`: {"version": N, "spaces": {<space id>: StoredSpace}}.
++constexpr char kStoreSpacesKey[] = "spaces";
++
++const base::ListValue* SpacesIn(const base::DictValue& prefs) {
++  const base::DictValue* spaces = prefs.FindDict(DataBackups::kSpacesPref);
++  return spaces ? spaces->FindList(kSpacesListKey) : nullptr;
++}
++
++const std::string* SpaceId(const base::Value& space) {
++  return space.is_dict() ? space.GetDict().FindString(kSpaceIdKey) : nullptr;
++}
++
++const base::ListValue* EntriesOf(const base::DictValue* lists,
++                                 std::string_view key) {
++  const base::DictValue* list = lists ? lists->FindDict(key) : nullptr;
++  return list ? list->FindList(kEntriesKey) : nullptr;
++}
++
++bool IsBlankSpace(const base::DictValue& space,
++                  const base::DictValue* live_lists) {
++  const std::string* name = space.FindString(kSpaceNameKey);
++  const std::string* icon = space.FindString(kSpaceIconKey);
++  const std::string* id = space.FindString(kSpaceIdKey);
++  const base::ListValue* pinned =
++      id ? EntriesOf(live_lists, base::StrCat({kPinnedListPrefix, *id}))
++         : nullptr;
++  return (!name || name->empty()) && (!icon || icon->empty()) &&
++         (!pinned || pinned->empty());
++}
++
++// Backup lists first; then, per list, live entries the backup doesn't have.
++// `drop_list` is the placeholder's (empty) pinned list.
++std::optional<base::Value> MergeLists(const base::DictValue* backup,
++                                      const base::DictValue* live,
++                                      std::string_view drop_list) {
++  if (!backup && !live) {
++    return std::nullopt;
++  }
++  base::DictValue merged = backup ? backup->Clone() : base::DictValue();
++  if (live) {
++    for (const auto [key, live_list] : *live) {
++      const base::DictValue* live_dict = live_list.GetIfDict();
++      const base::ListValue* live_entries =
++          live_dict ? live_dict->FindList(kEntriesKey) : nullptr;
++      if (key == drop_list || !live_entries || live_entries->empty()) {
++        continue;
++      }
++      base::DictValue* target = merged.FindDict(key);
++      if (!target) {
++        merged.Set(key, live_dict->Clone());
++        continue;
++      }
++      base::ListValue* entries = target->FindList(kEntriesKey);
++      if (!entries) {
++        // Keep the backup's other fields for this list.
++        target->Set(kEntriesKey, live_entries->Clone());
++        continue;
++      }
++      base::flat_set<std::string> ids;
++      for (const base::Value& entry : *entries) {
++        if (const std::string* id =
++                entry.is_dict() ? entry.GetDict().FindString(kEntryIdKey)
++                                : nullptr) {
++          ids.insert(*id);
++        }
++      }
++      for (const base::Value& entry : *live_entries) {
++        const std::string* id =
++            entry.is_dict() ? entry.GetDict().FindString(kEntryIdKey) : nullptr;
++        if (!id || !ids.contains(*id)) {
++          entries->Append(entry.Clone());
++        }
++      }
++    }
++  }
++  return base::Value(std::move(merged));
++}
++
++// Higher is stricter. A missing or unknown value counts as the default,
++// "auto".
++int Strictness(const base::Value* level) {
++  if (level && level->is_string()) {
++    if (level->GetString() == DataBackups::kAgentPermissionAsk) {
++      return 2;
++    }
++    if (level->GetString() == DataBackups::kAgentPermissionCareful) {
++      return 1;
++    }
++  }
++  return 0;
++}
++
++std::optional<base::Value> MergePermissionLevel(const base::Value* backup,
++                                                const base::Value* live) {
++  if (!backup && !live) {
++    return std::nullopt;
++  }
++  const base::Value* stricter =
++      !live || (backup && Strictness(backup) > Strictness(live)) ? backup
++                                                                  : live;
++  return stricter->Clone();
++}
++
++// The backup's rules, plus live rules for other sites. A "never" from either
++// side wins, so a merge never allows the agent somewhere it was blocked.
++std::optional<base::Value> MergeSiteRules(const base::Value* backup,
++                                          const base::Value* live) {
++  const base::DictValue* backup_rules = backup ? backup->GetIfDict() : nullptr;
++  const base::DictValue* live_rules = live ? live->GetIfDict() : nullptr;
++  if (!backup_rules && !live_rules) {
++    return std::nullopt;
++  }
++  base::DictValue merged = backup_rules ? backup_rules->Clone()
++                                        : base::DictValue();
++  if (live_rules) {
++    for (const auto [origin, rule] : *live_rules) {
++      const bool live_never = rule.is_string() && rule.GetString() ==
++                                   DataBackups::kAgentSiteNever;
++      if (live_never || !merged.contains(origin)) {
++        merged.Set(origin, rule.Clone());
++      }
++    }
++  }
++  return base::Value(std::move(merged));
++}
++
++std::optional<base::Value> CloneOrNull(const base::Value* value) {
++  return value ? std::optional<base::Value>(value->Clone()) : std::nullopt;
++}
++
++}  // namespace
++
++LiveSidebar::LiveSidebar() = default;
++LiveSidebar::LiveSidebar(LiveSidebar&&) = default;
++LiveSidebar& LiveSidebar::operator=(LiveSidebar&&) = default;
++LiveSidebar::~LiveSidebar() = default;
++
++RestorePlan::RestorePlan() = default;
++RestorePlan::RestorePlan(RestorePlan&&) = default;
++RestorePlan& RestorePlan::operator=(RestorePlan&&) = default;
++RestorePlan::~RestorePlan() = default;
++
++RestorePlan MakeRestorePlan(const DataBackups::Contents& backup,
++                            const LiveSidebar& live,
++                            RestoreMode mode) {
++  RestorePlan plan;
++  const base::DictValue* backup_lists =
++      backup.prefs.FindDict(DataBackups::kSidebarListsPref);
++  const base::DictValue* live_lists =
++      live.prefs.FindDict(DataBackups::kSidebarListsPref);
++
++  // 1. The backup's spaces, in order.
++  base::flat_set<std::string> backup_ids;
++  if (const base::ListValue* spaces = SpacesIn(backup.prefs)) {
++    for (const base::Value& space : *spaces) {
++      if (const std::string* id = SpaceId(space)) {
++        backup_ids.insert(*id);
++        plan.spaces.push_back(space.GetDict().Clone());
++      }
++    }
++  }
++
++  // 2. Live spaces the backup doesn't have.
++  if (const base::ListValue* spaces = SpacesIn(live.prefs)) {
++    for (const base::Value& space : *spaces) {
++      const std::string* id = SpaceId(space);
++      if (!id || backup_ids.contains(*id)) {
++        continue;
++      }
++      if (mode == RestoreMode::kExact) {
++        plan.delete_spaces.push_back(*id);
++      } else if (!plan.move_tabs_from && !plan.spaces.empty() &&
++                 IsBlankSpace(space.GetDict(), live_lists)) {
++        // The space a reset leaves. Whatever is open in it moves, so a merge
++        // closes nothing.
++        plan.move_tabs_from = *id;
++        plan.move_tabs_to = *plan.spaces.front().FindString(kSpaceIdKey);
++        plan.delete_spaces.push_back(*id);
++      }
++      // Any other live space is kept, after the backup's.
++    }
++  }
++
++  // 3. Favorites and pinned tabs.
++  if (mode == RestoreMode::kExact) {
++    plan.sidebar_lists = CloneOrNull(
++        backup.prefs.Find(DataBackups::kSidebarListsPref));
++  } else {
++    plan.sidebar_lists = MergeLists(
++        backup_lists, live_lists,
++        plan.move_tabs_from
++            ? base::StrCat({kPinnedListPrefix, *plan.move_tabs_from})
++            : std::string());
++  }
++
++  // 4. Stored tabs. Only a backup that has `rac spaces` says anything about
++  // them. A daily or pre-reset copy doesn't, and a reset of `Preferences`
++  // doesn't touch `rac spaces`, so the live stored tabs are what's left. A
++  // store without its spaces dict is treated as saying nothing, so a
++  // malformed one never wipes live tabs. Spaces in `delete_spaces` lose
++  // their stored tabs through DeleteSpace, not here.
++  const base::DictValue* stored =
++      backup.spaces_store ? backup.spaces_store->FindDict(kStoreSpacesKey)
++                          : nullptr;
++  if (stored) {
++    for (const base::DictValue& space : plan.spaces) {
++      const std::string& id = *space.FindString(kSpaceIdKey);
++      const base::DictValue* tabs = stored->FindDict(id);
++      if (live.spaces_with_window_tabs.contains(id)) {
++        // Its tabs are open in a window. They stay as they are.
++        continue;
++      }
++      if (tabs) {
++        if (mode == RestoreMode::kMerge &&
++            live.spaces_with_stored_tabs.contains(id)) {
++          continue;
++        }
++        plan.restore_stored_tabs.emplace_back(id, tabs->Clone());
++      } else if (mode == RestoreMode::kExact &&
++                 live.spaces_with_stored_tabs.contains(id)) {
++        plan.remove_stored_tabs.push_back(id);
++      }
++    }
++  }
++
++  // 5. Agent permissions.
++  const base::Value* backup_rules =
++      backup.prefs.Find(DataBackups::kAgentSiteRulesPref);
++  const base::Value* backup_level =
++      backup.prefs.Find(DataBackups::kAgentPermissionLevelPref);
++  if (mode == RestoreMode::kExact) {
++    plan.agent_site_rules = CloneOrNull(backup_rules);
++    plan.agent_permission_level = CloneOrNull(backup_level);
++  } else {
++    plan.agent_site_rules = MergeSiteRules(
++        backup_rules, live.prefs.Find(DataBackups::kAgentSiteRulesPref));
++    plan.agent_permission_level = MergePermissionLevel(
++        backup_level, live.prefs.Find(DataBackups::kAgentPermissionLevelPref));
++  }
++  return plan;
++}
++
++bool NeedsSafetySnapshot(RestoreMode mode, const LiveSidebar& live) {
++  return mode == RestoreMode::kExact ||
++         !DataBackups::IsEmpty(
++             live.prefs.Find(DataBackups::kSpacesPref),
++             live.prefs.Find(DataBackups::kSidebarListsPref));
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/storage/restore_plan.h
+@@ -0,0 +1,90 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_STORAGE_RESTORE_PLAN_H_
++#define CHROME_BROWSER_RAC_STORAGE_RESTORE_PLAN_H_
++
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/containers/flat_set.h"
++#include "base/values.h"
++#include "chrome/browser/rac/storage/data_backups.h"
++
++namespace rac {
++
++enum class RestoreMode {
++  // For Undo. The sidebar becomes exactly the backup: its spaces in its
++  // order, its favorites and pinned tabs, its agent rules, and, if the backup
++  // has `rac spaces`, its hidden spaces' tabs. Spaces the backup doesn't have
++  // are deleted, which closes their tabs (they stay in History).
++  kExact,
++  // For the restore prompt. The backup's spaces, favorites, and pinned tabs
++  // come back first, and everything live is kept after them. Nothing is
++  // closed or removed, and agent permissions only ever get stricter.
++  kMerge,
++};
++
++// What's live when a restore starts. DataRestorer fills it in from prefs,
++// SpacesWindowManager, and its store, all on the UI thread.
++struct LiveSidebar {
++  LiveSidebar();
++  LiveSidebar(LiveSidebar&&);
++  LiveSidebar& operator=(LiveSidebar&&);
++  ~LiveSidebar();
++
++  // Stored values of DataBackups::kBackedUpPrefs. A pref missing here is at
++  // its default.
++  base::DictValue prefs;
++  // Spaces with tabs open in a window.
++  base::flat_set<std::string> spaces_with_window_tabs;
++  // Spaces with tabs in `rac spaces`.
++  base::flat_set<std::string> spaces_with_stored_tabs;
++};
++
++// Everything a restore changes, worked out before anything is changed.
++// DataRestorer applies it in one UI task, in the order of the fields.
++struct RestorePlan {
++  RestorePlan();
++  RestorePlan(RestorePlan&&);
++  RestorePlan& operator=(RestorePlan&&);
++  ~RestorePlan();
++
++  // Upserted in this order with SpacesService::RestoreSpace(space, index).
++  std::vector<base::DictValue> spaces;
++  // kMerge only: the empty space a reset left. Its window tabs move into
++  // `move_tabs_to`, the first restored space, and then it's deleted, so the
++  // result is exactly the backup plus what was made since. Not set when it
++  // can't be told apart from a space the user made.
++  std::optional<std::string> move_tabs_from;
++  std::string move_tabs_to;
++  // Deleted with SpacesWindowManager::DeleteSpace, after the move.
++  std::vector<std::string> delete_spaces;
++  // New stored values; nullopt clears the pref. rac.spaces isn't here:
++  // SpacesService writes it as it restores `spaces`.
++  std::optional<base::Value> sidebar_lists;
++  std::optional<base::Value> agent_site_rules;
++  std::optional<base::Value> agent_permission_level;
++  // Space id -> its StoredSpace dict from the backup's `rac spaces`, for
++  // SpacesWindowManager::RestoreStoredTabs.
++  std::vector<std::pair<std::string, base::DictValue>> restore_stored_tabs;
++  // kExact only, and only when the backup has `rac spaces`: spaces whose
++  // stored tabs are dropped because they had none at backup time.
++  std::vector<std::string> remove_stored_tabs;
++};
++
++RestorePlan MakeRestorePlan(const DataBackups::Contents& backup,
++                            const LiveSidebar& live,
++                            RestoreMode mode);
++
++// Whether DataRestorer snapshots the live data before applying, so the
++// restore can be undone. Not for kMerge into an empty sidebar: a merge loses
++// nothing, and a full disk mustn't stop the user getting their data back.
++bool NeedsSafetySnapshot(RestoreMode mode, const LiveSidebar& live);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_STORAGE_RESTORE_PLAN_H_
+--- /dev/null
++++ b/chrome/browser/rac/storage/restore_plan_unittest.cc
+@@ -0,0 +1,414 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/storage/restore_plan.h"
++
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/test/values_test_util.h"
++#include "base/values.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++using Ids = std::vector<std::string>;
++
++// {"version":1,"spaces":[{"id":"s1","name":"Work"}, ...]}. An empty name
++// leaves the name out, like a space the user never named.
++base::DictValue MakeSpacesPref(
++    const std::vector<std::pair<std::string, std::string>>& id_and_name) {
++  base::ListValue spaces;
++  for (const auto& [id, name] : id_and_name) {
++    base::DictValue space;
++    space.Set("id", id);
++    if (!name.empty()) {
++      space.Set("name", name);
++    }
++    spaces.Append(std::move(space));
++  }
++  return base::DictValue().Set("version", 1).Set("spaces", std::move(spaces));
++}
++
++// Backup prefs that hold only a spaces pref.
++base::DictValue MakePrefs(
++    const std::vector<std::pair<std::string, std::string>>& id_and_name) {
++  return base::DictValue().Set(DataBackups::kSpacesPref,
++                               MakeSpacesPref(id_and_name));
++}
++
++// {"entries":[{"id":"<id>", ...}, ...]}: one sidebar list.
++base::DictValue MakeEntries(const std::vector<std::string>& ids,
++                            const std::string& title = "T") {
++  base::ListValue entries;
++  for (const std::string& id : ids) {
++    entries.Append(base::DictValue()
++                       .Set("id", id)
++                       .Set("url", "https://a.test/")
++                       .Set("title", title));
++  }
++  return base::DictValue().Set("entries", std::move(entries));
++}
++
++// {"version":1,"spaces":{"<id>":{"tabs":[...]}}}, like `rac spaces`.
++base::DictValue MakeStore(const std::vector<std::string>& ids_with_tabs) {
++  base::DictValue spaces;
++  for (const std::string& id : ids_with_tabs) {
++    spaces.Set(id, base::test::ParseJsonDict(
++                       R"({"tabs":[{"url":"https://t.test/"}]})"));
++  }
++  return base::DictValue().Set("version", 1).Set("spaces", std::move(spaces));
++}
++
++DataBackups::Contents MakeBackup(base::DictValue prefs) {
++  DataBackups::Contents backup;
++  backup.prefs = std::move(prefs);
++  return backup;
++}
++
++LiveSidebar MakeLive(base::DictValue prefs) {
++  LiveSidebar live;
++  live.prefs = std::move(prefs);
++  return live;
++}
++
++Ids IdsOf(const std::vector<base::DictValue>& spaces) {
++  Ids ids;
++  for (const base::DictValue& space : spaces) {
++    const std::string* id = space.FindString("id");
++    ids.push_back(id ? *id : std::string());
++  }
++  return ids;
++}
++
++Ids StoredIdsOf(
++    const std::vector<std::pair<std::string, base::DictValue>>& stored) {
++  Ids ids;
++  for (const auto& [id, tabs] : stored) {
++    ids.push_back(id);
++  }
++  return ids;
++}
++
++// The entry ids in list `key` of a sidebar lists value; empty if it has none.
++Ids EntryIds(const std::optional<base::Value>& lists, const std::string& key) {
++  Ids ids;
++  const base::DictValue* list =
++      lists && lists->is_dict() ? lists->GetDict().FindDict(key) : nullptr;
++  const base::ListValue* entries = list ? list->FindList("entries") : nullptr;
++  if (entries) {
++    for (const base::Value& entry : *entries) {
++      ids.push_back(*entry.GetDict().FindString("id"));
++    }
++  }
++  return ids;
++}
++
++// The permission level a merge picks, or nullopt if it clears the pref.
++std::optional<std::string> MergedLevel(
++    const std::optional<std::string>& backup_level,
++    const std::optional<std::string>& live_level) {
++  DataBackups::Contents backup;
++  LiveSidebar live;
++  if (backup_level) {
++    backup.prefs.Set(DataBackups::kAgentPermissionLevelPref, *backup_level);
++  }
++  if (live_level) {
++    live.prefs.Set(DataBackups::kAgentPermissionLevelPref, *live_level);
++  }
++  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  if (!plan.agent_permission_level) {
++    return std::nullopt;
++  }
++  return plan.agent_permission_level->GetString();
++}
++
++RestorePlan MergeRules(base::DictValue backup_rules,
++                       base::DictValue live_rules) {
++  DataBackups::Contents backup;
++  backup.prefs.Set(DataBackups::kAgentSiteRulesPref, std::move(backup_rules));
++  LiveSidebar live;
++  live.prefs.Set(DataBackups::kAgentSiteRulesPref, std::move(live_rules));
++  return MakeRestorePlan(backup, live, RestoreMode::kMerge);
++}
++
++// A backup with no `rac spaces` says nothing about stored tabs, so a merge
++// leaves them, and so does an exact restore.
++TEST(RestorePlanTest, MergeWithoutSpacesStoreLeavesStoredTabsAlone) {
++  DataBackups::Contents backup =
++      MakeBackup(MakePrefs({{"s1", "Work"}, {"s2", "Play"}}));
++  ASSERT_FALSE(backup.spaces_store.has_value());
++  LiveSidebar live;
++  live.spaces_with_stored_tabs.insert("s1");
++  live.spaces_with_stored_tabs.insert("s2");
++
++  RestorePlan merge = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  EXPECT_TRUE(merge.restore_stored_tabs.empty());
++  EXPECT_TRUE(merge.remove_stored_tabs.empty());
++
++  RestorePlan exact = MakeRestorePlan(backup, live, RestoreMode::kExact);
++  EXPECT_TRUE(exact.restore_stored_tabs.empty());
++  EXPECT_TRUE(exact.remove_stored_tabs.empty());
++
++  // A store with no spaces dict says nothing either.
++  backup.spaces_store = base::DictValue().Set("version", 1);
++  exact = MakeRestorePlan(backup, live, RestoreMode::kExact);
++  EXPECT_TRUE(exact.remove_stored_tabs.empty());
++}
++
++// A merge brings back stored tabs the backup has, but never overwrites the
++// live ones and never drops a space's stored tabs.
++TEST(RestorePlanTest, MergeNeverRemovesStoredTabs) {
++  DataBackups::Contents backup =
++      MakeBackup(MakePrefs({{"s1", "Work"}, {"s2", "Play"}}));
++  backup.spaces_store = MakeStore({"s1"});
++
++  LiveSidebar live;
++  live.spaces_with_stored_tabs.insert("s2");
++  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  EXPECT_TRUE(plan.remove_stored_tabs.empty());
++  EXPECT_EQ(StoredIdsOf(plan.restore_stored_tabs), Ids({"s1"}));
++
++  // The live stored tabs of s1 aren't clobbered by the backup's.
++  live.spaces_with_stored_tabs.insert("s1");
++  plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  EXPECT_TRUE(plan.remove_stored_tabs.empty());
++  EXPECT_TRUE(plan.restore_stored_tabs.empty());
++}
++
++// An exact restore of a backup with `rac spaces` makes stored tabs match it:
++// restored where the backup has them, removed where it doesn't. A space open
++// in a window is left as it is.
++TEST(RestorePlanTest, ExactRemovesStoredTabsOnlyWithSpacesStore) {
++  DataBackups::Contents backup =
++      MakeBackup(MakePrefs({{"s1", "Work"}, {"s2", "Play"}}));
++  backup.spaces_store = MakeStore({"s1"});
++
++  LiveSidebar live;
++  live.spaces_with_stored_tabs.insert("s2");
++  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kExact);
++  EXPECT_EQ(plan.remove_stored_tabs, Ids({"s2"}));
++  ASSERT_EQ(plan.restore_stored_tabs.size(), 1u);
++  EXPECT_EQ(plan.restore_stored_tabs[0].first, "s1");
++  EXPECT_EQ(plan.restore_stored_tabs[0].second,
++            *backup.spaces_store->FindDict("spaces")->FindDict("s1"));
++
++  // Both spaces have their tabs open in a window now.
++  live.spaces_with_window_tabs.insert("s1");
++  live.spaces_with_window_tabs.insert("s2");
++  plan = MakeRestorePlan(backup, live, RestoreMode::kExact);
++  EXPECT_TRUE(plan.restore_stored_tabs.empty());
++  EXPECT_TRUE(plan.remove_stored_tabs.empty());
++}
++
++// An exact restore deletes spaces made since the backup and doesn't move
++// their tabs anywhere. The spaces come out in the backup's order.
++TEST(RestorePlanTest, ExactDeletesSpacesNotInBackup) {
++  DataBackups::Contents backup =
++      MakeBackup(MakePrefs({{"s1", "Work"}, {"s2", "Play"}}));
++  LiveSidebar live = MakeLive(base::DictValue().Set(
++      DataBackups::kSpacesPref, MakeSpacesPref({{"s1", "Work"},
++                                                {"s9", "Since"}})));
++
++  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kExact);
++  EXPECT_EQ(plan.delete_spaces, Ids({"s9"}));
++  EXPECT_FALSE(plan.move_tabs_from.has_value());
++  EXPECT_TRUE(plan.move_tabs_to.empty());
++  EXPECT_EQ(IdsOf(plan.spaces), Ids({"s1", "s2"}));
++}
++
++// The blank space a reset leaves hands its open tabs to the first restored
++// space and is then deleted, so nothing is closed.
++TEST(RestorePlanTest, MergeMovesPlaceholderTabsIntoFirstRestoredSpace) {
++  DataBackups::Contents backup =
++      MakeBackup(MakePrefs({{"s1", "Work"}, {"s2", "Play"}}));
++  LiveSidebar live = MakeLive(base::DictValue().Set(
++      DataBackups::kSpacesPref, MakeSpacesPref({{"reset", ""}})));
++
++  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  ASSERT_TRUE(plan.move_tabs_from.has_value());
++  EXPECT_EQ(*plan.move_tabs_from, "reset");
++  EXPECT_EQ(plan.move_tabs_to, "s1");
++  EXPECT_EQ(plan.delete_spaces, Ids({"reset"}));
++  EXPECT_EQ(IdsOf(plan.spaces), Ids({"s1", "s2"}));
++}
++
++// A merge keeps spaces made since the reset. Only the blank one is the
++// placeholder, and only when there is a restored space to move its tabs to.
++TEST(RestorePlanTest, MergeKeepsSpacesMadeSinceReset) {
++  DataBackups::Contents backup =
++      MakeBackup(MakePrefs({{"s1", "Work"}, {"s2", "Play"}}));
++  LiveSidebar live = MakeLive(
++      base::DictValue()
++          .Set(DataBackups::kSpacesPref,
++               MakeSpacesPref({{"reset", ""}, {"s9", "New"}}))
++          .Set(DataBackups::kSidebarListsPref,
++               base::DictValue().Set("pinned.s9", MakeEntries({"p9"}))));
++
++  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  EXPECT_EQ(plan.delete_spaces, Ids({"reset"}));
++  EXPECT_EQ(*plan.move_tabs_from, "reset");
++
++  // An unnamed space with a pinned tab isn't blank, even listed first.
++  live = MakeLive(
++      base::DictValue()
++          .Set(DataBackups::kSpacesPref,
++               MakeSpacesPref({{"s9", ""}, {"reset", ""}}))
++          .Set(DataBackups::kSidebarListsPref,
++               base::DictValue().Set("pinned.s9", MakeEntries({"p9"}))));
++  plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  EXPECT_EQ(plan.delete_spaces, Ids({"reset"}));
++  EXPECT_EQ(*plan.move_tabs_from, "reset");
++
++  // With no spaces in the backup, there's nowhere to move tabs, so the blank
++  // space is kept.
++  DataBackups::Contents no_spaces = MakeBackup(base::DictValue());
++  live = MakeLive(base::DictValue().Set(
++      DataBackups::kSpacesPref, MakeSpacesPref({{"reset", ""}})));
++  plan = MakeRestorePlan(no_spaces, live, RestoreMode::kMerge);
++  EXPECT_FALSE(plan.move_tabs_from.has_value());
++  EXPECT_TRUE(plan.delete_spaces.empty());
++}
++
++// A merge puts the backup's favorites first and adds the live ones it doesn't
++// have. Live pinned lists stay, and the placeholder's own list is dropped.
++TEST(RestorePlanTest, MergeAppendsLiveSidebarEntries) {
++  DataBackups::Contents backup =
++      MakeBackup(MakePrefs({{"s1", "Work"}}));
++  backup.prefs.Set(
++      DataBackups::kSidebarListsPref,
++      base::DictValue().Set("favorites", MakeEntries({"f1"}, "Backup")));
++  LiveSidebar live = MakeLive(
++      base::DictValue()
++          .Set(DataBackups::kSpacesPref,
++               MakeSpacesPref({{"reset", ""}, {"s9", "New"}}))
++          .Set(DataBackups::kSidebarListsPref,
++               base::DictValue()
++                   .Set("favorites", MakeEntries({"f1", "f2"}, "Live"))
++                   .Set("pinned.s9", MakeEntries({"p9"}))
++                   .Set("pinned.reset", MakeEntries({}))));
++
++  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  ASSERT_TRUE(plan.sidebar_lists.has_value());
++  EXPECT_EQ(*plan.move_tabs_from, "reset");
++  EXPECT_EQ(EntryIds(plan.sidebar_lists, "favorites"), Ids({"f1", "f2"}));
++  EXPECT_EQ(EntryIds(plan.sidebar_lists, "pinned.s9"), Ids({"p9"}));
++  EXPECT_EQ(plan.sidebar_lists->GetDict().Find("pinned.reset"), nullptr);
++  // The backup's copy of a shared entry wins.
++  const base::DictValue& first = (*plan.sidebar_lists->GetDict()
++                                       .FindDict("favorites")
++                                       ->FindList("entries"))[0]
++                                     .GetDict();
++  EXPECT_EQ(*first.FindString("title"), "Backup");
++}
++
++// An exact restore makes the lists the backup's, and clears them when the
++// backup had none.
++TEST(RestorePlanTest, ExactSidebarListsAreTheBackups) {
++  base::DictValue backup_lists =
++      base::DictValue().Set("favorites", MakeEntries({"f1"}));
++  DataBackups::Contents backup = MakeBackup(
++      MakePrefs({{"s1", "Work"}}));
++  backup.prefs.Set(DataBackups::kSidebarListsPref, backup_lists.Clone());
++  LiveSidebar live = MakeLive(base::DictValue().Set(
++      DataBackups::kSidebarListsPref,
++      base::DictValue()
++          .Set("favorites", MakeEntries({"f1", "f2"}))
++          .Set("pinned.s9", MakeEntries({"p9"}))));
++
++  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kExact);
++  ASSERT_TRUE(plan.sidebar_lists.has_value());
++  EXPECT_EQ(*plan.sidebar_lists, base::Value(std::move(backup_lists)));
++
++  DataBackups::Contents no_lists = MakeBackup(MakePrefs({{"s1", "Work"}}));
++  plan = MakeRestorePlan(no_lists, live, RestoreMode::kExact);
++  EXPECT_FALSE(plan.sidebar_lists.has_value());
++}
++
++// A merge never loosens the agent's permissions: the stricter level wins, and
++// a "never" for a site wins over an "always".
++TEST(RestorePlanTest, MergeKeepsStricterAgentPermissions) {
++  using Level = std::optional<std::string>;
++  EXPECT_EQ(MergedLevel(DataBackups::kAgentPermissionAsk, std::nullopt),
++            Level("ask"));
++  EXPECT_EQ(MergedLevel("auto", DataBackups::kAgentPermissionAsk),
++            Level("ask"));
++  EXPECT_EQ(MergedLevel(DataBackups::kAgentPermissionAsk, "auto"),
++            Level("ask"));
++  EXPECT_EQ(MergedLevel(std::nullopt, DataBackups::kAgentPermissionCareful),
++            Level("careful"));
++  EXPECT_EQ(MergedLevel(DataBackups::kAgentPermissionAsk,
++                        DataBackups::kAgentPermissionCareful),
++            Level("ask"));
++  EXPECT_FALSE(MergedLevel(std::nullopt, std::nullopt).has_value());
++
++  RestorePlan plan =
++      MergeRules(base::test::ParseJsonDict(R"({"a":"always","b":"always"})"),
++                 base::test::ParseJsonDict(R"({"a":"never","c":"always"})"));
++  ASSERT_TRUE(plan.agent_site_rules.has_value());
++  EXPECT_EQ(*plan.agent_site_rules,
++            base::Value(base::test::ParseJsonDict(
++                R"({"a":"never","b":"always","c":"always"})")));
++
++  plan = MergeRules(base::test::ParseJsonDict(R"({"d":"never"})"),
++                    base::test::ParseJsonDict(R"({"d":"always"})"));
++  ASSERT_TRUE(plan.agent_site_rules.has_value());
++  EXPECT_EQ(*plan.agent_site_rules,
++            base::Value(base::test::ParseJsonDict(R"({"d":"never"})")));
++}
++
++// An exact restore sets the agent's rules and level to the backup's, even if
++// that is looser than what's live, and clears them if the backup has none.
++TEST(RestorePlanTest, ExactAgentPrefsAreTheBackups) {
++  DataBackups::Contents backup = MakeBackup(
++      base::DictValue()
++          .Set(DataBackups::kAgentSiteRulesPref,
++               base::test::ParseJsonDict(R"({"a":"always"})"))
++          .Set(DataBackups::kAgentPermissionLevelPref, "auto"));
++  LiveSidebar live = MakeLive(
++      base::DictValue()
++          .Set(DataBackups::kAgentSiteRulesPref,
++               base::test::ParseJsonDict(R"({"a":"never","c":"never"})"))
++          .Set(DataBackups::kAgentPermissionLevelPref,
++               DataBackups::kAgentPermissionAsk));
++
++  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kExact);
++  ASSERT_TRUE(plan.agent_site_rules.has_value());
++  EXPECT_EQ(*plan.agent_site_rules,
++            base::Value(base::test::ParseJsonDict(R"({"a":"always"})")));
++  ASSERT_TRUE(plan.agent_permission_level.has_value());
++  EXPECT_EQ(*plan.agent_permission_level, base::Value("auto"));
++
++  DataBackups::Contents empty_backup;
++  plan = MakeRestorePlan(empty_backup, live, RestoreMode::kExact);
++  EXPECT_FALSE(plan.agent_site_rules.has_value());
++  EXPECT_FALSE(plan.agent_permission_level.has_value());
++}
++
++// Merging into a sidebar with nothing a user made loses nothing, so it skips
++// the safety snapshot. Anything else, and every exact restore, takes one.
++TEST(RestorePlanTest, MergeIntoEmptySidebarSkipsSafetySnapshot) {
++  LiveSidebar blank = MakeLive(base::DictValue().Set(
++      DataBackups::kSpacesPref, MakeSpacesPref({{"reset", ""}})));
++  EXPECT_FALSE(NeedsSafetySnapshot(RestoreMode::kMerge, blank));
++
++  LiveSidebar named = MakeLive(base::DictValue().Set(
++      DataBackups::kSpacesPref, MakeSpacesPref({{"s1", "Work"}})));
++  EXPECT_TRUE(NeedsSafetySnapshot(RestoreMode::kMerge, named));
++
++  LiveSidebar with_favorite = MakeLive(
++      base::DictValue()
++          .Set(DataBackups::kSpacesPref, MakeSpacesPref({{"reset", ""}}))
++          .Set(DataBackups::kSidebarListsPref,
++               base::DictValue().Set("favorites", MakeEntries({"f1"}))));
++  EXPECT_TRUE(NeedsSafetySnapshot(RestoreMode::kMerge, with_favorite));
++
++  EXPECT_TRUE(NeedsSafetySnapshot(RestoreMode::kExact, LiveSidebar()));
++}
++
++}  // namespace
++}  // namespace rac
