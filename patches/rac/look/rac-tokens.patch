@@ -1,0 +1,739 @@
+--- a/chrome/browser/ui/views/rac/BUILD.gn
++++ b/chrome/browser/ui/views/rac/BUILD.gn
+@@ -14,6 +14,8 @@ source_set("look") {
+     "window_screenshot.mm",
+   ]
+ 
++  public_deps = [ ":tokens" ]
++
+   deps = [
+     "//base",
+     "//cc/paint",
+@@ -37,6 +39,22 @@ source_set("look") {
+   ]
+ }
+ 
++# rac's design values. chrome/browser/ui gets them through ":look"; other
++# targets depend on ":tokens". The WebUI copy is
++# ui/webui/resources/css/rac_tokens.css, which devutils/rac/tokens.py writes
++# from rac_tokens.h.
++source_set("tokens") {
++  sources = [
++    "motion/rac_spring.cc",
++    "motion/rac_spring.h",
++    "rac_tokens.h",
++  ]
++  public_deps = [
++    "//base",
++    "//ui/gfx/animation",
++  ]
++}
++
+ # The space emoji picker's table, built from the tree's CLDR and ICU data so
+ # it follows Chromium's Unicode updates.
+ action("emoji_data_inc") {
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/motion/rac_spring.cc
+@@ -0,0 +1,277 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/motion/rac_spring.h"
++
++#include <algorithm>
++#include <cmath>
++#include <numbers>
++#include <optional>
++
++#include "base/check_op.h"
++
++namespace rac {
++
++namespace {
++
++// Ratios this close to 1 use the critically damped form. The other forms
++// divide by sqrt(|1 - ratio^2|), which loses precision near 1.
++constexpr double kCriticalTolerance = 1e-9;
++// Searches stop once the window is this small, in seconds.
++constexpr double kSearchPrecision = 1e-10;
++
++double ToSeconds(base::TimeDelta time) {
++  return std::max(0.0, time.InSecondsF());
++}
++
++// The first whole microsecond at or after `seconds`.
++base::TimeDelta CeilToMicroseconds(double seconds) {
++  return base::Microseconds(
++      std::ceil(seconds * base::Time::kMicrosecondsPerSecond));
++}
++
++enum class Damping { kUnder, kCritical, kOver };
++
++Damping DampingOf(const Spring& spring) {
++  const double ratio = spring.damping_ratio();
++  if (std::abs(ratio - 1) < kCriticalTolerance) {
++    return Damping::kCritical;
++  }
++  return ratio < 1 ? Damping::kUnder : Damping::kOver;
++}
++
++// The two decay rates of an overdamped spring, and how much of each the
++// motion holds.
++struct OverdampedTerms {
++  double rate1, rate2;
++  double amount1, amount2;
++};
++
++OverdampedTerms Overdamped(const SpringMotion& m) {
++  const double w = m.spring.AngularFrequency();
++  const double ratio = m.spring.damping_ratio();
++  const double root = std::sqrt(ratio * ratio - 1);
++  OverdampedTerms terms;
++  terms.rate1 = -w * (ratio - root);
++  terms.rate2 = -w * (ratio + root);
++  terms.amount1 =
++      (m.velocity - terms.rate2 * m.offset) / (terms.rate1 - terms.rate2);
++  terms.amount2 = m.offset - terms.amount1;
++  return terms;
++}
++
++double OffsetAtSeconds(const SpringMotion& m, double t) {
++  const double w = m.spring.AngularFrequency();
++  const double ratio = m.spring.damping_ratio();
++  switch (DampingOf(m.spring)) {
++    case Damping::kCritical: {
++      // Written exactly as the space pager always has, so the pager moves
++      // onto this spring without a bit of change.
++      const double rate = m.velocity + w * m.offset;
++      return (m.offset + rate * t) * std::exp(-w * t);
++    }
++    case Damping::kUnder: {
++      const double wd = w * std::sqrt(1 - ratio * ratio);
++      const double b = (m.velocity + ratio * w * m.offset) / wd;
++      return std::exp(-ratio * w * t) *
++             (m.offset * std::cos(wd * t) + b * std::sin(wd * t));
++    }
++    case Damping::kOver: {
++      const OverdampedTerms o = Overdamped(m);
++      return o.amount1 * std::exp(o.rate1 * t) +
++             o.amount2 * std::exp(o.rate2 * t);
++    }
++  }
++}
++
++double VelocityAtSeconds(const SpringMotion& m, double t) {
++  const double w = m.spring.AngularFrequency();
++  const double ratio = m.spring.damping_ratio();
++  switch (DampingOf(m.spring)) {
++    case Damping::kCritical: {
++      const double rate = m.velocity + w * m.offset;
++      return (rate - w * (m.offset + rate * t)) * std::exp(-w * t);
++    }
++    case Damping::kUnder: {
++      const double wd = w * std::sqrt(1 - ratio * ratio);
++      const double b = (m.velocity + ratio * w * m.offset) / wd;
++      const double sine_part = ratio * w * b + m.offset * wd;
++      return std::exp(-ratio * w * t) *
++             (m.velocity * std::cos(wd * t) - sine_part * std::sin(wd * t));
++    }
++    case Damping::kOver: {
++      const OverdampedTerms o = Overdamped(m);
++      return o.amount1 * o.rate1 * std::exp(o.rate1 * t) +
++             o.amount2 * o.rate2 * std::exp(o.rate2 * t);
++    }
++  }
++}
++
++// The first time after `t` at which the velocity is zero, if any.
++std::optional<double> NextTurn(const SpringMotion& m, double t) {
++  const double w = m.spring.AngularFrequency();
++  const double ratio = m.spring.damping_ratio();
++  switch (DampingOf(m.spring)) {
++    case Damping::kCritical: {
++      // v(t) = (v0 - w * rate * t) * exp(-w t) turns at most once.
++      const double rate = m.velocity + w * m.offset;
++      if (rate == 0) {
++        return std::nullopt;
++      }
++      const double turn = m.velocity / (w * rate);
++      return turn > t ? std::optional(turn) : std::nullopt;
++    }
++    case Damping::kOver: {
++      const OverdampedTerms o = Overdamped(m);
++      const double ratio_of_terms =
++          -(o.amount2 * o.rate2) / (o.amount1 * o.rate1);
++      if (!std::isfinite(ratio_of_terms) || ratio_of_terms <= 0) {
++        return std::nullopt;
++      }
++      const double turn = std::log(ratio_of_terms) / (o.rate1 - o.rate2);
++      return turn > t ? std::optional(turn) : std::nullopt;
++    }
++    case Damping::kUnder: {
++      // v(t) is zero where v0 cos(wd t) = s sin(wd t), every pi / wd.
++      const double wd = w * std::sqrt(1 - ratio * ratio);
++      const double b = (m.velocity + ratio * w * m.offset) / wd;
++      const double sine_part = ratio * w * b + m.offset * wd;
++      double phase = std::atan2(m.velocity, sine_part);
++      if (phase <= 0) {
++        phase += std::numbers::pi;
++      }
++      const double half_period = std::numbers::pi / wd;
++      double turn = phase / wd;
++      if (turn <= t) {
++        turn += std::ceil((t - turn) / half_period + kSearchPrecision) *
++                half_period;
++      }
++      return turn;
++    }
++  }
++}
++
++// The smallest time in (lo, hi] for which `done` holds, given it holds at
++// `hi` and, once it holds, keeps holding up to `hi`.
++template <typename Done>
++double Search(double lo, double hi, Done done) {
++  DCHECK(done(hi));
++  while (hi - lo > kSearchPrecision) {
++    const double mid = (lo + hi) / 2;
++    if (done(mid)) {
++      hi = mid;
++    } else {
++      lo = mid;
++    }
++  }
++  return hi;
++}
++
++}  // namespace
++
++double Spring::AngularFrequency() const {
++  return 2 * std::numbers::pi / response_;
++}
++
++double Spring::ValueAt(base::TimeDelta time, double initial_velocity) const {
++  return 1 + SpringMotion{*this, -1, initial_velocity}.OffsetAt(time);
++}
++
++double Spring::VelocityAt(base::TimeDelta time, double initial_velocity) const {
++  return SpringMotion{*this, -1, initial_velocity}.VelocityAt(time);
++}
++
++base::TimeDelta Spring::SettleTime(double epsilon,
++                                   double initial_velocity) const {
++  return SpringMotion{*this, -1, initial_velocity}.SettleTime(epsilon);
++}
++
++base::TimeDelta Spring::TimeToReach(double fraction) const {
++  DCHECK_GT(fraction, 0);
++  DCHECK_LT(fraction, 1);
++  const SpringMotion motion{*this, -1, 0};
++  auto reached = [&](double t) {
++    return 1 + OffsetAtSeconds(motion, t) >= fraction;
++  };
++  // From rest the value only climbs until its first turn.
++  double hi = NextTurn(motion, 0).value_or(response_);
++  while (!reached(hi)) {
++    hi *= 2;
++  }
++  return CeilToMicroseconds(Search(0, hi, reached));
++}
++
++double Spring::Overshoot() const {
++  if (damping_ratio_ >= 1) {
++    return 0;
++  }
++  return std::exp(-damping_ratio_ * std::numbers::pi /
++                  std::sqrt(1 - damping_ratio_ * damping_ratio_));
++}
++
++double SpringMotion::OffsetAt(base::TimeDelta time) const {
++  return OffsetAtSeconds(*this, ToSeconds(time));
++}
++
++double SpringMotion::VelocityAt(base::TimeDelta time) const {
++  return VelocityAtSeconds(*this, ToSeconds(time));
++}
++
++base::TimeDelta SpringMotion::SettleTime(double distance) const {
++  DCHECK_GT(distance, 0);
++  auto settled = [&](double t) {
++    return std::abs(OffsetAtSeconds(*this, t)) <= distance;
++  };
++  // Between two turns the distance from rest falls to zero and climbs to the
++  // next turn, which is nearer rest than the one before. So the motion
++  // settles after the last turn that is still too far out.
++  std::optional<double> last_far;
++  if (!settled(0)) {
++    last_far = 0;
++  }
++  std::optional<double> next = NextTurn(*this, 0);
++  while (next && !settled(*next)) {
++    last_far = *next;
++    next = NextTurn(*this, *next);
++  }
++  if (!last_far) {
++    return base::TimeDelta();
++  }
++  double hi;
++  if (next) {
++    hi = *next;
++  } else {
++    // No more turns: the distance only shrinks from here.
++    hi = *last_far + spring.response();
++    while (!settled(hi)) {
++      hi += spring.response();
++    }
++  }
++  return CeilToMicroseconds(Search(*last_far, hi, settled));
++}
++
++base::TimeDelta SpringMotion::RestTime(const RestRule& rule) const {
++  // Layers take float transforms, so rest is judged in float, as the space
++  // pager always has.
++  base::TimeDelta time = rule.step;
++  while (time < rule.longest &&
++         (std::abs(static_cast<float>(OffsetAt(time))) > rule.max_offset ||
++          std::abs(static_cast<float>(VelocityAt(time))) > rule.max_speed)) {
++    time += rule.step;
++  }
++  return time;
++}
++
++SpringMotion SpringMotion::Retarget(base::TimeDelta elapsed,
++                                    double rest_shift) const {
++  return Retarget(elapsed, rest_shift, spring);
++}
++
++SpringMotion SpringMotion::Retarget(base::TimeDelta elapsed,
++                                    double rest_shift,
++                                    const Spring& next) const {
++  return {next, OffsetAt(elapsed) - rest_shift, VelocityAt(elapsed)};
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/motion/rac_spring.h
+@@ -0,0 +1,94 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_MOTION_RAC_SPRING_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_MOTION_RAC_SPRING_H_
++
++#include "base/time/time.h"
++
++namespace rac {
++
++// When a spring counts as at rest: closer than `max_offset` and slower than
++// `max_speed`, checked every `step` and given up on at `longest`. Offsets are
++// in the caller's units (DIPs for layers) and speeds in units per second.
++struct RestRule {
++  float max_offset;
++  float max_speed;
++  base::TimeDelta step;
++  base::TimeDelta longest;
++};
++
++// A damped spring, written as Apple writes them: `response` is the period in
++// seconds the spring would swing at with no damping, and `damping_ratio` is 1
++// for no bounce, under 1 for some, and over 1 for a slower, heavier settle.
++// The motion is x'' + 2 * ratio * w * x' + w * w * x = 0, with
++// w = 2 * pi / response, where x is the distance from rest.
++//
++// The values live in rac_tokens.h (kSpringPage, kSpringDock, ...). The unit
++// functions below describe a move from 0 to 1, which is what tests, CSS
++// curves, and tables use. SpringMotion is the same spring started from an
++// actual place and speed.
++class Spring {
++ public:
++  constexpr Spring(double response, double damping_ratio)
++      : response_(response), damping_ratio_(damping_ratio) {}
++
++  constexpr double response() const { return response_; }
++  constexpr double damping_ratio() const { return damping_ratio_; }
++  // w, in radians per second.
++  double AngularFrequency() const;
++
++  // A move from 0 to 1 that starts at `initial_velocity`, in moves per
++  // second toward 1. Under a ratio of 1 the value passes 1 before settling.
++  double ValueAt(base::TimeDelta time, double initial_velocity = 0) const;
++  double VelocityAt(base::TimeDelta time, double initial_velocity = 0) const;
++  // From then on the value stays within `epsilon` of 1. SettleTime(0.01) is
++  // the table's "within 1% at".
++  base::TimeDelta SettleTime(double epsilon, double initial_velocity = 0) const;
++  // When a move from rest first reaches `fraction`, such as 0.9.
++  base::TimeDelta TimeToReach(double fraction) const;
++  // How far past 1 a move from rest goes, as a fraction of the move. 0 for a
++  // ratio of 1 or more.
++  double Overshoot() const;
++
++  constexpr bool operator==(const Spring&) const = default;
++
++ private:
++  double response_;
++  double damping_ratio_;
++};
++
++// One run of a spring: it starts `offset` from rest moving at `velocity`,
++// both in the caller's units, and heads for rest at 0.
++//
++// To retarget without losing speed, take the place and speed now and start a
++// new motion from them (Retarget). A swipe hands its release speed over the
++// same way.
++struct SpringMotion {
++  Spring spring;
++  double offset = 0;
++  double velocity = 0;
++
++  double OffsetAt(base::TimeDelta time) const;
++  double VelocityAt(base::TimeDelta time) const;
++  // From then on the offset stays within `distance` of rest.
++  base::TimeDelta SettleTime(double distance) const;
++  // The first `rule.step` at which the motion is at rest under `rule`, or
++  // `rule.longest`. With tokens::kSpringRest this is exactly what the space
++  // pager's spring has always used.
++  base::TimeDelta RestTime(const RestRule& rule) const;
++
++  // The motion that continues from this one at `elapsed` toward a resting
++  // place `rest_shift` further along, with the same place and speed. Pass
++  // `next` to change springs, such as kSpringReveal to kSpringExit when the
++  // pointer turns back.
++  SpringMotion Retarget(base::TimeDelta elapsed, double rest_shift) const;
++  SpringMotion Retarget(base::TimeDelta elapsed,
++                        double rest_shift,
++                        const Spring& next) const;
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_MOTION_RAC_SPRING_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/rac_tokens.h
+@@ -0,0 +1,177 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_RAC_TOKENS_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_RAC_TOKENS_H_
++
++#include "base/time/time.h"
++#include "chrome/browser/ui/views/rac/motion/rac_spring.h"
++#include "ui/gfx/animation/tween.h"
++
++// rac's design values: motion, corners, spacing, and type. Colors stay in
++// the color mixer (rac_color_id.h).
++//
++// This file is the source of truth for WebUI too. devutils/rac/tokens.py
++// reads the tokens below and writes ui/webui/resources/css/rac_tokens.css,
++// which pages load as chrome://resources/css/rac_tokens.css. Write each
++// token as one `inline constexpr` statement whose value is a number, a
++// base::Milliseconds() or base::Hertz() duration, a braced list of those, or
++// another token. A `// rac-css:` comment adds a CSS-only property. Run
++// `tokens.py` after a change; `tokens.py --check` fails on drift.
++//
++// Frequency sets the budget: hundreds of times a day, 0 to 100 ms of color
++// or opacity; tens a day, 120 to 250 ms with springs for movement; rare
++// surfaces up to 400 ms. Springs move things, fixed curves fade and recolor.
++// Read rac::motion::ReducedMotion() each time an animation starts.
++
++namespace rac {
++
++// A fixed curve. CSS and rac's curve elements use the bezier as recorded.
++// Code that takes only a gfx::Tween::Type uses `tween`, the nearest one.
++struct Curve {
++  double x1, y1, x2, y2;
++  gfx::Tween::Type tween;
++};
++
++// A duration and its curve.
++struct Timing {
++  base::TimeDelta duration;
++  Curve curve;
++};
++
++namespace tokens {
++
++// Curves.
++
++// Material 3 standard, as Helium's reveal uses.
++inline constexpr Curve kEaseStandard{0.2, 0, 0, 1,
++                                     gfx::Tween::FAST_OUT_SLOW_IN_3};
++// Within 4% of Dia's row slide.
++inline constexpr Curve kEaseList{0.2, 0, 0.2, 1,
++                                 gfx::Tween::FAST_OUT_SLOW_IN_2};
++// CSS's ease-out; Dia's close fade. EASE_OUT is 6.9% off.
++inline constexpr Curve kEaseFadeOut{0, 0, 0.58, 1, gfx::Tween::EASE_OUT};
++// Dia's command bar. No tween is close (16.7%), so native code runs it in a
++// rac::CurveElement.
++inline constexpr Curve kEaseExpo{0.16, 1, 0.3, 1,
++                                 gfx::Tween::ACCEL_5_70_DECEL_90};
++// Cubic ease-in-out; Arc's edge peek out. For opacity only. EASE_IN_OUT is
++// the nearest tween (7.4% off).
++inline constexpr Curve kEaseInOut{0.65, 0, 0.35, 1, gfx::Tween::EASE_IN_OUT};
++
++// Durations and timings.
++
++// Keyboard tab switches, selection, the command bar as the new tab page.
++inline constexpr base::TimeDelta kInstant = base::Milliseconds(0);
++// Tab and list rows, in and out, as Chromium's glow hover.
++inline constexpr Timing kHoverRow{base::Milliseconds(50), kEaseFadeOut};
++// Icon buttons, tiles, chips.
++inline constexpr Timing kHoverControl{base::Milliseconds(120), kEaseStandard};
++// The pressed fill shows at once (kInstant); letting go fades it back.
++inline constexpr Timing kPressRelease = kHoverControl;
++// Fades: a closing row, a row's close button, popover close.
++inline constexpr Timing kFade{base::Milliseconds(100), kEaseFadeOut};
++// Rows sliding to open or close a gap.
++inline constexpr Timing kList{base::Milliseconds(140), kEaseList};
++// Opacity exits.
++inline constexpr Timing kExit{base::Milliseconds(150), kEaseInOut};
++// Confirm and plan cards: opacity plus a kSpacing4 rise, no scale.
++inline constexpr Timing kCard{base::Milliseconds(200), kEaseStandard};
++// Rare popovers (edit space, site controls): scale 0.96 to 1 from the
++// trigger's side, with a kFade fade.
++inline constexpr Timing kPopover{base::Milliseconds(120), kEaseStandard};
++inline constexpr Timing kPanelOpen{base::Milliseconds(250), kEaseStandard};
++inline constexpr Timing kPanelClose{base::Milliseconds(200), kEaseStandard};
++// The command bar growing out of the address field. Closing is kFade.
++inline constexpr Timing kCommandBarGrow{base::Milliseconds(130), kEaseExpo};
++// What a slide becomes under Reduce Motion.
++inline constexpr Timing kReducedFade{base::Milliseconds(150), kEaseFadeOut};
++// Waiting loops step at most this often, and only while work shows.
++inline constexpr base::TimeDelta kLoopStep = base::Hertz(15);
++// A spinner turns no faster than this.
++inline constexpr base::TimeDelta kSpinnerTurn = base::Milliseconds(1880);
++// The first tooltip waits; any shown within the warm window after one
++// closes appears at once, without animation.
++inline constexpr base::TimeDelta kTooltipDelay = base::Milliseconds(500);
++inline constexpr base::TimeDelta kTooltipWarmWindow = base::Milliseconds(1500);
++
++// Springs, as (response in seconds, damping ratio).
++
++// The space pager, the space wash, and the space dots.
++inline constexpr Spring kSpringPage{0.25, 1.0};
++// Cmd+S both ways; later the AI panel. 02-D1 picks the bounce.
++inline constexpr Spring kSpringDock{0.2, 0.85};
++// Rows moving between sections: pin, unpin, favorite, folder moves.
++inline constexpr Spring kSpringMove{0.22, 1.0};
++// The hidden sidebar sliding in at the window edge.
++inline constexpr Spring kSpringReveal{0.185, 0.77};
++// Movement exits, including edge reveal out. Fast and without bounce, so a
++// reversal keeps its speed.
++inline constexpr Spring kSpringExit{0.16, 1.0};
++// Peek growing out of a link.
++inline constexpr Spring kSpringGrow{0.22, 0.9};
++// When a spring is at rest: under 0.25 DIP and 15 DIP/s, checked at 240 Hz
++// as Arc samples its springs.
++inline constexpr RestRule kSpringRest{0.25f, 15.0f, base::Hertz(240),
++                                      base::Milliseconds(1500)};
++
++// Corner radii. Corners are circular; Views has no squircle.
++
++inline constexpr int kRadius4 = 4;
++inline constexpr int kRadius6 = 6;
++inline constexpr int kRadius8 = 8;
++inline constexpr int kRadius10 = 10;
++inline constexpr int kRadius12 = 12;
++// Popovers, menus, bubbles, cards.
++inline constexpr int kRadiusPanel = kRadius12;
++// Buttons, tiles, fields.
++inline constexpr int kRadiusControl = kRadius8;
++// Rows inside menus and lists.
++inline constexpr int kRadiusMenuRow = kRadius6;
++// The page card before macOS 26. On macOS 26 the card is concentric with
++// the window: the window's corner minus kInsetPageCard (17 - 6 = 11). See
++// rac::PageCardRadius().
++inline constexpr int kRadiusPageCard = kRadius10;
++// A pill's radius is half its height.
++constexpr int PillRadius(int height) {
++  return height / 2;
++}
++// rac-css: --rac-radius-pill: 9999px;
++
++// Spacing.
++
++inline constexpr int kSpacing2 = 2;
++inline constexpr int kSpacing4 = 4;
++inline constexpr int kSpacing6 = 6;
++inline constexpr int kSpacing8 = 8;
++inline constexpr int kSpacing10 = 10;
++inline constexpr int kSpacing12 = 12;
++inline constexpr int kSpacing16 = 16;
++inline constexpr int kSpacing20 = 20;
++inline constexpr int kSpacing24 = 24;
++// The gap between the page card and the window edge, as in Dia.
++inline constexpr int kInsetPageCard = kSpacing6;
++// The gap between the page card and the sidebar's contents.
++inline constexpr int kGapBesideSidebar = kSpacing10;
++// The gap between a sidebar row's icon and its title.
++inline constexpr int kGapRowIconTitle = 7;
++
++// Type: the system font, in points.
++
++inline constexpr int kFontSizeCaption = 11;
++// Secondary text and the URL.
++inline constexpr int kFontSizeSecondary = 12;
++// Tab and list rows, as Dia.
++inline constexpr int kFontSizeRow = 13;
++inline constexpr int kFontSizeAssistant = 15;
++inline constexpr int kFontSizeTitle = 17;
++// Weights match gfx::Font::Weight's values, so a static_cast converts them.
++inline constexpr int kFontWeightRegular = 400;
++inline constexpr int kFontWeightMedium = 500;
++inline constexpr int kFontWeightSemibold = 600;
++
++}  // namespace tokens
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_RAC_TOKENS_H_
+--- a/ui/webui/resources/css/BUILD.gn
++++ b/ui/webui/resources/css/BUILD.gn
+@@ -26,6 +26,7 @@ preprocess_if_expr("preprocess") {
+   in_files = [
+     "action_link.css",
+     "chrome_shared.css",
++    "rac_tokens.css",
+     "spinner.css",
+     "text_defaults_md.css",
+     "text_defaults.css",
+--- /dev/null
++++ b/ui/webui/resources/css/rac_tokens.css
+@@ -0,0 +1,135 @@
++/* Copyright 2026 The rac Authors
++ * You can use, redistribute, and/or modify this source code under
++ * the terms of the GPL-3.0 license that can be found in the LICENSE file. */
++
++/* Generated by devutils/rac/tokens.py from
++ * chrome/browser/ui/views/rac/rac_tokens.h. Don't edit it here: change the
++ * header and run tokens.py. */
++
++:root {
++  /* Material 3 standard, as Helium's reveal uses. */
++  --rac-ease-standard: cubic-bezier(0.2, 0, 0, 1);
++  /* Within 4% of Dia's row slide. */
++  --rac-ease-list: cubic-bezier(0.2, 0, 0.2, 1);
++  /* CSS's ease-out; Dia's close fade. EASE_OUT is 6.9% off. */
++  --rac-ease-fade-out: cubic-bezier(0, 0, 0.58, 1);
++  /* Dia's command bar. No tween is close (16.7%), so native code runs it in
++   * a rac::CurveElement. */
++  --rac-ease-expo: cubic-bezier(0.16, 1, 0.3, 1);
++  /* Cubic ease-in-out; Arc's edge peek out. For opacity only. EASE_IN_OUT is
++   * the nearest tween (7.4% off). */
++  --rac-ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
++  /* Keyboard tab switches, selection, the command bar as the new tab page. */
++  --rac-duration-instant: 0ms;
++  /* Tab and list rows, in and out, as Chromium's glow hover. */
++  --rac-duration-hover-row: 50ms;
++  --rac-motion-hover-row: var(--rac-duration-hover-row) var(--rac-ease-fade-out);
++  /* Icon buttons, tiles, chips. */
++  --rac-duration-hover-control: 120ms;
++  --rac-motion-hover-control: var(--rac-duration-hover-control) var(--rac-ease-standard);
++  /* The pressed fill shows at once (kInstant); letting go fades it back. */
++  --rac-duration-press-release: 120ms;
++  --rac-motion-press-release: var(--rac-motion-hover-control);
++  /* Fades: a closing row, a row's close button, popover close. */
++  --rac-duration-fade: 100ms;
++  --rac-motion-fade: var(--rac-duration-fade) var(--rac-ease-fade-out);
++  /* Rows sliding to open or close a gap. */
++  --rac-duration-list: 140ms;
++  --rac-motion-list: var(--rac-duration-list) var(--rac-ease-list);
++  /* Opacity exits. */
++  --rac-duration-exit: 150ms;
++  --rac-motion-exit: var(--rac-duration-exit) var(--rac-ease-in-out);
++  /* Confirm and plan cards: opacity plus a kSpacing4 rise, no scale. */
++  --rac-duration-card: 200ms;
++  --rac-motion-card: var(--rac-duration-card) var(--rac-ease-standard);
++  /* Rare popovers (edit space, site controls): scale 0.96 to 1 from the
++   * trigger's side, with a kFade fade. */
++  --rac-duration-popover: 120ms;
++  --rac-motion-popover: var(--rac-duration-popover) var(--rac-ease-standard);
++  --rac-duration-panel-open: 250ms;
++  --rac-motion-panel-open: var(--rac-duration-panel-open) var(--rac-ease-standard);
++  --rac-duration-panel-close: 200ms;
++  --rac-motion-panel-close: var(--rac-duration-panel-close) var(--rac-ease-standard);
++  /* The command bar growing out of the address field. Closing is kFade. */
++  --rac-duration-command-bar-grow: 130ms;
++  --rac-motion-command-bar-grow: var(--rac-duration-command-bar-grow) var(--rac-ease-expo);
++  /* What a slide becomes under Reduce Motion. */
++  --rac-duration-reduced-fade: 150ms;
++  --rac-motion-reduced-fade: var(--rac-duration-reduced-fade) var(--rac-ease-fade-out);
++  /* Waiting loops step at most this often, and only while work shows. */
++  --rac-duration-loop-step: 66.666ms;
++  /* A spinner turns no faster than this. */
++  --rac-duration-spinner-turn: 1880ms;
++  /* The first tooltip waits; any shown within the warm window after one
++   * closes appears at once, without animation. */
++  --rac-duration-tooltip-delay: 500ms;
++  --rac-duration-tooltip-warm-window: 1500ms;
++  /* The space pager, the space wash, and the space dots. */
++  --rac-spring-page-duration: 368ms;
++  --rac-spring-page-easing: linear(0, 0.0073 1.36%, 0.0319 2.99%, 0.0798 5.03%, 0.1659 7.88%, 0.4236 15.62%, 0.5363 19.43%, 0.6296 23.1%, 0.7077 26.77%, 0.7756 30.71%, 0.8342 35.05%, 0.8833 39.95%, 0.9234 45.65%, 0.9547 52.58%, 0.9779 61.82%, 0.9928 75.82%, 1);
++  --rac-spring-page: var(--rac-spring-page-duration) var(--rac-spring-page-easing);
++  /* Cmd+S both ways; later the AI panel. 02-D1 picks the bounce. */
++  --rac-spring-dock-duration: 279ms;
++  --rac-spring-dock-easing: linear(0, 0.0074 1.43%, 0.0306 3.05%, 0.0754 5.02%, 0.1497 7.53%, 0.3052 12.01%, 0.486 17.2%, 0.6024 20.97%, 0.693 24.37%, 0.7688 27.78%, 0.8334 31.36%, 0.8882 35.3%, 0.9317 39.61%, 0.9657 44.62%, 0.9895 50.72%, 1.0032 58.96%, 1.0055 74.91%, 1);
++  --rac-spring-dock: var(--rac-spring-dock-duration) var(--rac-spring-dock-easing);
++  /* Rows moving between sections: pin, unpin, favorite, folder moves. */
++  --rac-spring-move-duration: 324ms;
++  --rac-spring-move-easing: linear(0, 0.0076 1.39%, 0.0338 3.09%, 0.0816 5.09%, 0.1657 7.87%, 0.4227 15.59%, 0.5369 19.44%, 0.6311 23.15%, 0.7096 26.85%, 0.7783 30.86%, 0.8359 35.19%, 0.885 40.12%, 0.9246 45.83%, 0.9555 52.78%, 0.9783 62.04%, 0.993 76.23%, 1);
++  --rac-spring-move: var(--rac-spring-move-duration) var(--rac-spring-move-easing);
++  /* The hidden sidebar sliding in at the window edge. */
++  --rac-spring-reveal-duration: 242ms;
++  --rac-spring-reveal-easing: linear(0, 0.0066 1.45%, 0.0284 3.1%, 0.0723 5.17%, 0.1421 7.64%, 0.2668 11.36%, 0.4986 17.98%, 0.6222 21.9%, 0.718 25.41%, 0.7982 28.93%, 0.8631 32.44%, 0.9164 36.16%, 0.9595 40.29%, 0.991 44.83%, 1.0124 50.41%, 1.0221 57.64%, 1.0165 71.28%, 1.0017 96.69%, 1);
++  --rac-spring-reveal: var(--rac-spring-reveal-duration) var(--rac-spring-reveal-easing);
++  /* Movement exits, including edge reveal out. Fast and without bounce, so a
++   * reversal keeps its speed. */
++  --rac-spring-exit-duration: 236ms;
++  --rac-spring-exit-easing: linear(0, 0.0064 1.27%, 0.0275 2.75%, 0.0703 4.66%, 0.1446 7.2%, 0.4263 15.68%, 0.5391 19.49%, 0.6306 23.09%, 0.7073 26.69%, 0.7736 30.51%, 0.8314 34.75%, 0.8812 39.62%, 0.9209 45.13%, 0.9527 51.91%, 0.9763 60.81%, 0.9918 74.15%, 1);
++  --rac-spring-exit: var(--rac-spring-exit-duration) var(--rac-spring-exit-easing);
++  /* Peek growing out of a link. */
++  --rac-spring-grow-duration: 294ms;
++  --rac-spring-grow-easing: linear(0, 0.0076 1.53%, 0.0313 3.23%, 0.0752 5.27%, 0.1511 7.99%, 0.4633 17.69%, 0.5756 21.6%, 0.6682 25.34%, 0.7456 29.08%, 0.8111 32.99%, 0.8666 37.24%, 0.9123 42.01%, 0.9481 47.45%, 0.9754 54.25%, 0.993 63.27%, 1.0011 78.57%, 1);
++  --rac-spring-grow: var(--rac-spring-grow-duration) var(--rac-spring-grow-easing);
++  --rac-radius-4: 4px;
++  --rac-radius-6: 6px;
++  --rac-radius-8: 8px;
++  --rac-radius-10: 10px;
++  --rac-radius-12: 12px;
++  /* Popovers, menus, bubbles, cards. */
++  --rac-radius-panel: var(--rac-radius-12);
++  /* Buttons, tiles, fields. */
++  --rac-radius-control: var(--rac-radius-8);
++  /* Rows inside menus and lists. */
++  --rac-radius-menu-row: var(--rac-radius-6);
++  /* The page card before macOS 26. On macOS 26 the card is concentric with
++   * the window: the window's corner minus kInsetPageCard (17 - 6 = 11). See
++   * rac::PageCardRadius(). */
++  --rac-radius-page-card: var(--rac-radius-10);
++  --rac-radius-pill: 9999px;
++  --rac-spacing-2: 2px;
++  --rac-spacing-4: 4px;
++  --rac-spacing-6: 6px;
++  --rac-spacing-8: 8px;
++  --rac-spacing-10: 10px;
++  --rac-spacing-12: 12px;
++  --rac-spacing-16: 16px;
++  --rac-spacing-20: 20px;
++  --rac-spacing-24: 24px;
++  /* The gap between the page card and the window edge, as in Dia. */
++  --rac-inset-page-card: var(--rac-spacing-6);
++  /* The gap between the page card and the sidebar's contents. */
++  --rac-gap-beside-sidebar: var(--rac-spacing-10);
++  /* The gap between a sidebar row's icon and its title. */
++  --rac-gap-row-icon-title: 7px;
++  --rac-font-size-caption: 11px;
++  /* Secondary text and the URL. */
++  --rac-font-size-secondary: 12px;
++  /* Tab and list rows, as Dia. */
++  --rac-font-size-row: 13px;
++  --rac-font-size-assistant: 15px;
++  --rac-font-size-title: 17px;
++  /* Weights match gfx::Font::Weight's values, so a static_cast converts
++   * them. */
++  --rac-font-weight-regular: 400;
++  --rac-font-weight-medium: 500;
++  --rac-font-weight-semibold: 600;
++}
