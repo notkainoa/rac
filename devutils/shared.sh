@@ -96,6 +96,9 @@ write_gn_args() {
       echo 'cc_wrapper="env CCACHE_COMPILERCHECK=content CCACHE_SLOPPINESS=time_macros ccache"' >> "$args"
     else
       echo 'warn: sccache or ccache is not available' >&2
+      # Without a compiler cache GN turns on precompiled headers, which fail
+      # on Chromium 156 ("missing 'export module' declaration").
+      echo 'enable_precompiled_headers=false' >> "$args"
     fi
 
     if [ "$mode" = release ] && [ -n "${MACOS_CERTIFICATE_NAME:-}" ] && [ -n "${PROD_MACOS_SPECIAL_ENTITLEMENTS_PROFILE_PATH:-}" ]; then
