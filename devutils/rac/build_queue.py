@@ -25,7 +25,13 @@ usage: devutils/rac/build-queue.sh [options] <command> [args...]
                       (default 20000)
   --allow-main        allow building in the main checkout
   --pass-fds N[,N...] hands open file descriptors to the command, e.g.
-                      --pass-fds 3,4 for --remote-debugging-pipe
+                      --pass-fds 3,4 for --remote-debugging-pipe. The fds
+                      must reach build-queue.sh itself as inheritable
+                      descriptors (subprocess.Popen(..., pass_fds=(r, w)),
+                      or bash `3<&$r 4>&$w`), since non-inheritable fds
+                      don't survive into the queue. The queue drops its
+                      own copies once the command starts, so the caller
+                      still sees EOF when the command closes its end.
 
 There are two build slots and two run slots. A slot is a directory under
 ~/.rac-build-queue holding holder.json and a lock file that its queue process
@@ -745,6 +751,11 @@ class Queue:
                 stdout=subprocess.PIPE if piped else None,
                 stderr=subprocess.STDOUT if piped else None,
                 pass_fds=self.args.pass_fds)
+            # The child has its own copies now; drop the queue's so a
+            # caller waiting on the other end sees EOF when the child
+            # closes them or exits, not only when this queue ends.
+            for fd in self.args.pass_fds:
+                os.close(fd)
             self.info['pgid'] = self.child.pid
             self.update_holders()
             if piped:
@@ -974,9 +985,10 @@ def parse_pass_fds(text):
             raise ValueError(f'{fd} is a standard stream; pass fds 3 and above')
         try:
             os.fstat(fd)
-        except OSError:
+        except (OSError, OverflowError):
             raise ValueError(f'{fd} is not open in this process')
-        fds.append(fd)
+        if fd not in fds:
+            fds.append(fd)
     return tuple(fds)
 
 

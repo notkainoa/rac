@@ -92,7 +92,12 @@ devutils/rac/build-queue.sh log          # recent starts, ends, and refusals
 - **Full builds.** A full build the maintainer approved takes both build
   slots: `build-queue.sh --full "D6 item 2: sync cold build" he build`.
 - **File descriptors.** `--pass-fds 3,4` hands open file descriptors to
-  the command, for `--remote-debugging-pipe`.
+  the command, for `--remote-debugging-pipe`. Pass the descriptors to
+  `build-queue.sh` itself as inheritable fds (Python
+  `subprocess.Popen(..., pass_fds=(r, w))`, or bash `3<&$r 4>&$w`), since
+  non-inheritable fds don't survive into the queue. The queue drops its
+  own copies once the command starts, so pipe EOF still means the command
+  closed its end.
 - **Guards.** The queue refuses to start a build with less than 20 GB free,
   and waits while memory pressure is critical. It stops a build that shows
   more than 20,000 steps, since that means something invalidated the tree.
