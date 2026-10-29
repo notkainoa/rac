@@ -1,0 +1,332 @@
+--- a/chrome/browser/ui/views/rac/spaces/space_pager.cc
++++ b/chrome/browser/ui/views/rac/spaces/space_pager.cc
+@@ -6,34 +6,28 @@
+ 
+ #include <algorithm>
+ #include <cmath>
+-#include <numbers>
+ #include <utility>
+ #include <vector>
+ 
+ #include "base/functional/bind.h"
+ #include "base/memory/ptr_util.h"
+ #include "base/task/sequenced_task_runner.h"
+-#include "cc/animation/keyframe_model.h"
+ #include "cc/paint/display_item_list.h"
+-#include "cc/trees/target_property.h"
+ #include "chrome/browser/rac/spaces/spaces_service.h"
++#include "chrome/browser/ui/views/rac/motion/rac_motion.h"
++#include "chrome/browser/ui/views/rac/rac_tokens.h"
+ #include "ui/compositor/compositor.h"
+ #include "ui/compositor/layer.h"
+-#include "ui/compositor/layer_animation_delegate.h"
+ #include "ui/compositor/layer_animation_element.h"
+ #include "ui/compositor/layer_animation_sequence.h"
+ #include "ui/compositor/layer_animator.h"
+ #include "ui/compositor/layer_delegate.h"
+-#include "ui/compositor/layer_threaded_animation_delegate.h"
+ #include "ui/compositor/layer_tree_owner.h"
+ #include "ui/compositor/paint_context.h"
+ #include "ui/compositor/paint_recorder.h"
+-#include "ui/gfx/animation/animation.h"
+-#include "ui/gfx/animation/keyframe/animation_curve.h"
+ #include "ui/gfx/canvas.h"
+ #include "ui/gfx/geometry/size_conversions.h"
+ #include "ui/gfx/geometry/transform.h"
+-#include "ui/gfx/geometry/transform_operations.h"
+ #include "ui/views/controls/scroll_view.h"
+ #include "ui/views/view.h"
+ 
+@@ -41,8 +35,6 @@ namespace rac {
+ 
+ namespace {
+ 
+-// Arc's page spring: critically damped with a 0.25 s response.
+-constexpr double kSpringOmega = 2 * std::numbers::pi / 0.25;
+ // Arc moves its pages half as far as the scroll delta, which keeps a page
+ // under control for a whole trackpad's travel.
+ constexpr float kDragScale = 0.5f;
+@@ -102,126 +94,15 @@ class RecordedPainter : public ui::Layer
+   cc::PaintRecord record_;
+ };
+ 
+-// The spring as a compositor curve, so it runs on the compositor thread.
+-// `rest` is where the layer ends up.
+-class SpringCurve : public gfx::TransformAnimationCurve {
+- public:
+-  SpringCurve(const SpacePager::Spring& spring, float rest)
+-      : spring_(spring), rest_(rest), duration_(spring.Duration()) {}
+-  SpringCurve(const SpringCurve&) = default;
+-  SpringCurve& operator=(const SpringCurve&) = delete;
+-  ~SpringCurve() override = default;
+-
+-  // gfx::TransformAnimationCurve:
+-  base::TimeDelta Duration() const override { return duration_; }
+-  std::unique_ptr<gfx::AnimationCurve> Clone() const override {
+-    return std::make_unique<SpringCurve>(*this);
+-  }
+-  gfx::TransformOperations GetValue(base::TimeDelta t) const override {
+-    gfx::TransformOperations operations;
+-    operations.AppendTranslate(
+-        rest_ + (t >= duration_ ? 0 : spring_.OffsetAt(t)), 0, 0);
+-    return operations;
+-  }
+-  gfx::TransformOperations GetTransformedValue(
+-      base::TimeDelta t,
+-      gfx::TimingFunction::LimitDirection limit_direction) const override {
+-    return GetValue(t);
+-  }
+-  bool PreservesAxisAlignment() const override { return true; }
+-  bool MaximumScale(float* max_scale) const override {
+-    *max_scale = 1.0f;
+-    return true;
+-  }
+-
+- private:
+-  const SpacePager::Spring spring_;
+-  const float rest_;
+-  const base::TimeDelta duration_;
+-};
+-
+ // Moves a layer from the spring's offset to `rest`. ui::LayerAnimator's own
+ // transitions only take fixed curves, which can't start at the swipe's
+ // speed.
+-class SpringElement : public ui::LayerAnimationElement {
+- public:
+-  SpringElement(const SpacePager::Spring& spring, float rest)
+-      : ui::LayerAnimationElement(TRANSFORM, spring.Duration()),
+-        spring_(spring),
+-        rest_(rest) {}
+-  SpringElement(const SpringElement&) = delete;
+-  SpringElement& operator=(const SpringElement&) = delete;
+-  ~SpringElement() override = default;
+-
+-  // How far from rest the compositor has the layer now.
+-  float GetOffset() const {
+-    const base::TimeTicks start = effective_start_time();
+-    return start.is_null() ? spring_.offset
+-                           : spring_.OffsetAt(base::TimeTicks::Now() - start);
+-  }
+-
+-  // ui::LayerAnimationElement:
+-  bool IsThreaded(ui::LayerAnimationDelegate* delegate) const override {
+-    return true;
+-  }
+-
+- protected:
+-  std::string DebugName() const override { return "SpacePagerSpring"; }
+-  void OnStart(ui::LayerAnimationDelegate* delegate) override {
+-    delegate->SetTransformFromAnimation(
+-        Translation(rest_ + spring_.offset),
+-        ui::PropertyChangeReason::FROM_ANIMATION);
+-  }
+-  bool OnProgress(double t, ui::LayerAnimationDelegate* delegate) override {
+-    if (t < 1.0) {
+-      return false;
+-    }
+-    if (Started()) {
+-      delegate->GetThreadedAnimationDelegate()->RemoveThreadedAnimation(
+-          keyframe_model_id());
+-    }
+-    delegate->SetTransformFromAnimation(
+-        Translation(rest_), ui::PropertyChangeReason::FROM_ANIMATION);
+-    return true;
+-  }
+-  void OnGetTarget(TargetValue* target) const override {
+-    target->transform = Translation(rest_);
+-  }
+-  void OnAbort(ui::LayerAnimationDelegate* delegate) override {
+-    if (!delegate || !Started()) {
+-      return;
+-    }
+-    delegate->GetThreadedAnimationDelegate()->RemoveThreadedAnimation(
+-        keyframe_model_id());
+-    delegate->SetTransformFromAnimation(
+-        Translation(rest_ + GetOffset()),
+-        ui::PropertyChangeReason::FROM_ANIMATION);
+-  }
+-  void RequestEffectiveStart(ui::LayerAnimationDelegate* delegate) override {
+-    // The compositor sets the real start time when it first ticks the curve.
+-    set_effective_start_time(base::TimeTicks());
+-    UpdateKeyframeModelId();
+-    std::unique_ptr<cc::KeyframeModel> keyframe_model =
+-        cc::KeyframeModel::Create(
+-            std::make_unique<SpringCurve>(spring_, rest_), keyframe_model_id(),
+-            animation_group_id(),
+-            cc::KeyframeModel::TargetPropertyId(
+-                cc::TargetProperty::TRANSFORM));
+-    keyframe_model->set_needs_synchronized_start_time(true);
+-    delegate->GetThreadedAnimationDelegate()->AddThreadedAnimation(
+-        std::move(keyframe_model));
+-  }
+-
+- private:
+-  const SpacePager::Spring spring_;
+-  const float rest_;
+-};
+-
+ std::unique_ptr<ui::LayerAnimationSequence> CreateSpring(
+-    const SpacePager::Spring& spring,
++    const SpringMotion& spring,
+     float rest) {
+   return std::make_unique<ui::LayerAnimationSequence>(
+-      std::make_unique<SpringElement>(spring, rest));
++      std::make_unique<SpringTransformElement>(
++          spring, gfx::Vector2dF(rest, 0), SpringTransformElement::Axis::kX));
+ }
+ 
+ }  // namespace
+@@ -304,32 +185,6 @@ class SpacePager::Page {
+   std::unique_ptr<ui::LayerTreeOwner> tree_;
+ };
+ 
+-float SpacePager::Spring::OffsetAt(base::TimeDelta time) const {
+-  const double t = std::max(0.0, time.InSecondsF());
+-  const double rate = velocity + kSpringOmega * offset;
+-  return (offset + rate * t) * std::exp(-kSpringOmega * t);
+-}
+-
+-float SpacePager::Spring::VelocityAt(base::TimeDelta time) const {
+-  const double t = std::max(0.0, time.InSecondsF());
+-  const double rate = velocity + kSpringOmega * offset;
+-  return (rate - kSpringOmega * (offset + rate * t)) *
+-         std::exp(-kSpringOmega * t);
+-}
+-
+-base::TimeDelta SpacePager::Spring::Duration() const {
+-  // Arc samples its spring at 240 Hz; the same steps find where it rests.
+-  constexpr base::TimeDelta kStep = base::Hertz(240);
+-  constexpr base::TimeDelta kLongest = base::Milliseconds(1500);
+-  base::TimeDelta time = kStep;
+-  while (time < kLongest &&
+-         (std::abs(OffsetAt(time)) > 0.25f ||
+-          std::abs(VelocityAt(time)) > 15.0f)) {
+-    time += kStep;
+-  }
+-  return time;
+-}
+-
+ // static
+ std::unique_ptr<SpacePager> SpacePager::Create(BrowserWindowInterface* browser,
+                                                PageGetter get_page) {
+@@ -358,7 +213,7 @@ SpacePager::~SpacePager() {
+ 
+ bool SpacePager::BeginDrag() {
+   views::View* page = GetPage();
+-  if (!page || gfx::Animation::PrefersReducedMotion() ||
++  if (!page || motion::ReducedMotion() ||
+       !manager_->GetActiveSpaceId(browser_)) {
+     return false;
+   }
+@@ -405,7 +260,7 @@ void SpacePager::EndDrag() {
+     direction = -1;
+   }
+   if (direction) {
+-    release_ = Spring{offset, velocity};
++    release_ = SpringMotion{tokens::kSpringPage, offset, velocity};
+     manager_->ShowAdjacentSpace(browser_, direction);
+     if (!release_) {
+       return;
+@@ -425,7 +280,8 @@ void SpacePager::OnWindowSpaceWillChange
+     return;
+   }
+   dragging_ = false;
+-  leaving_offset_ = release_ ? release_->offset : Stop();
++  leaving_offset_ =
++      release_ ? static_cast<float>(release_->offset) : Stop();
+   HidePages();
+   leaving_ = Page::Record(*page);
+ }
+@@ -437,7 +293,8 @@ void SpacePager::OnActiveSpaceChanged(Br
+     return;
+   }
+   std::unique_ptr<Page> leaving = std::move(leaving_);
+-  const std::optional<Spring> release = std::exchange(release_, std::nullopt);
++  const std::optional<SpringMotion> release =
++      std::exchange(release_, std::nullopt);
+   views::View* page = GetPage();
+   if (!page) {
+     return;
+@@ -450,7 +307,7 @@ void SpacePager::OnActiveSpaceChanged(Br
+     SetOffset(0);
+     return;
+   }
+-  if (gfx::Animation::PrefersReducedMotion()) {
++  if (motion::ReducedMotion()) {
+     SetOffset(0);
+     CrossFade(std::move(leaving));
+     return;
+@@ -463,7 +320,7 @@ void SpacePager::OnActiveSpaceChanged(Br
+   // and leaves the other way.
+   ShowPage(old_page, -direction * spacing);
+   Settle(leaving_offset_ + direction * spacing,
+-         release ? release->velocity : 0.0f);
++         release ? static_cast<float>(release->velocity) : 0.0f);
+ }
+ 
+ void SpacePager::OnWindowSpaceChanged(BrowserWindowInterface* browser) {
+@@ -542,7 +399,8 @@ std::optional<SpaceId> SpacePager::GetAd
+ 
+ float SpacePager::GetOffset() const {
+   if (settling_) {
+-    return static_cast<SpringElement*>(settling_->FirstElement())->GetOffset();
++    return static_cast<SpringTransformElement*>(settling_->FirstElement())
++        ->GetOffset();
+   }
+   views::View* page = GetPage();
+   return page ? page->layer()->transform().To2dTranslation().x() : 0;
+@@ -638,11 +496,12 @@ void SpacePager::Settle(float offset, fl
+     return;
+   }
+   // Toward rest, a spring this fast would overshoot by a visible amount.
+-  const float limit = 2 * kSpringOmega * std::abs(offset);
++  const float limit =
++      2 * tokens::kSpringPage.AngularFrequency() * std::abs(offset);
+   if (velocity * offset < 0) {
+     velocity = std::clamp(velocity, -limit, limit);
+   }
+-  const Spring spring{offset, velocity};
++  const SpringMotion spring{tokens::kSpringPage, offset, velocity};
+   ui::LayerAnimator* animator = page->layer()->GetAnimator();
+   if (settling_) {
+     stopping_ = true;
+--- a/chrome/browser/ui/views/rac/spaces/space_pager.h
++++ b/chrome/browser/ui/views/rac/spaces/space_pager.h
+@@ -18,6 +18,7 @@
+ #include "base/time/time.h"
+ #include "chrome/browser/rac/spaces/space.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
++#include "chrome/browser/ui/views/rac/motion/rac_spring.h"
+ #include "ui/compositor/layer.h"
+ #include "ui/compositor/layer_animation_observer.h"
+ 
+@@ -84,20 +85,6 @@ class SpacePager : public SpacesWindowMa
+   void OnLayerAnimationScheduled(
+       ui::LayerAnimationSequence* sequence) override {}
+ 
+-  // A critically damped spring, as Arc settles its pages: no bounce, and it
+-  // starts at the speed it's given.
+-  struct Spring {
+-    // Distance from the resting place, and speed, in DIPs and DIPs per
+-    // second.
+-    float offset = 0;
+-    float velocity = 0;
+-
+-    float OffsetAt(base::TimeDelta time) const;
+-    float VelocityAt(base::TimeDelta time) const;
+-    // When it's close enough to rest to stop.
+-    base::TimeDelta Duration() const;
+-  };
+-
+  private:
+   class Page;
+ 
+@@ -161,7 +148,7 @@ class SpacePager : public SpacesWindowMa
+   base::circular_deque<Sample> samples_;
+   // Set while a swipe switches spaces, so the switch starts where the
+   // swipe let go.
+-  std::optional<Spring> release_;
++  std::optional<SpringMotion> release_;
+ 
+   raw_ptr<ui::LayerAnimationSequence> settling_ = nullptr;
+   // True while stopping the spring on purpose, which keeps the pages.

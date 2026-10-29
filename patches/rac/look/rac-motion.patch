@@ -1,0 +1,1711 @@
+--- a/chrome/browser/ui/views/rac/BUILD.gn
++++ b/chrome/browser/ui/views/rac/BUILD.gn
+@@ -2,6 +2,8 @@
+ # You can use, redistribute, and/or modify this source code under
+ # the terms of the GPL-3.0 license that can be found in the LICENSE file.
+ 
++import("//testing/test.gni")
++
+ assert(!is_android)
+ 
+ source_set("look") {
+@@ -14,7 +16,10 @@ source_set("look") {
+     "window_screenshot.mm",
+   ]
+ 
+-  public_deps = [ ":tokens" ]
++  public_deps = [
++    ":motion",
++    ":tokens",
++  ]
+ 
+   deps = [
+     "//base",
+@@ -55,6 +60,51 @@ source_set("tokens") {
+   ]
+ }
+ 
++# Runs the motion tokens: springs and curves on compositor layers, and
++# springs on the UI thread.
++source_set("motion") {
++  sources = [
++    "motion/rac_motion.cc",
++    "motion/rac_motion.h",
++  ]
++  public_deps = [
++    ":tokens",
++    "//base",
++    "//ui/compositor",
++    "//ui/gfx/animation",
++    "//ui/gfx/geometry",
++  ]
++  deps = [
++    "//cc",
++    "//cc/animation",
++    "//ui/gfx",
++    "//ui/gfx/animation/keyframe",
++  ]
++}
++
++# Build with `autoninja -C out/Default
++# chrome/browser/ui/views/rac:rac_motion_unittests`. It's separate from
++# Chromium's unit_tests, which takes hours to build.
++test("rac_motion_unittests") {
++  sources = [
++    "motion/rac_motion_unittest.cc",
++    "motion/rac_spring_unittest.cc",
++  ]
++  deps = [
++    ":motion",
++    ":tokens",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//cc/animation",
++    "//testing/gtest",
++    "//ui/compositor",
++    "//ui/gfx",
++    "//ui/gfx/animation/keyframe",
++    "//ui/gfx/geometry",
++  ]
++}
++
+ # The space emoji picker's table, built from the tree's CLDR and ICU data so
+ # it follows Chromium's Unicode updates.
+ action("emoji_data_inc") {
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/motion/rac_motion.cc
+@@ -0,0 +1,699 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/motion/rac_motion.h"
++
++#include <algorithm>
++#include <cmath>
++#include <utility>
++
++#include "base/check.h"
++#include "base/check_op.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback.h"
++#include "base/memory/ptr_util.h"
++#include "base/notreached.h"
++#include "cc/animation/keyframe_model.h"
++#include "cc/trees/target_property.h"
++#include "ui/compositor/layer_animation_delegate.h"
++#include "ui/compositor/layer_threaded_animation_delegate.h"
++#include "ui/gfx/animation/animation_delegate.h"
++#include "ui/gfx/animation/keyframe/animation_curve.h"
++#include "ui/gfx/animation/linear_animation.h"
++#include "ui/gfx/animation/tween.h"
++#include "ui/gfx/geometry/cubic_bezier.h"
++#include "ui/gfx/geometry/transform_operations.h"
++
++namespace rac {
++
++namespace {
++
++// A move from 0 to 1 rests as a slide this many DIPs long would under
++// tokens::kSpringRest: within 0.25 DIP of 300 and slower than 15 DIP/s.
++constexpr double kUnitMoveDips = 300;
++
++RestRule UnitRest() {
++  RestRule rule = tokens::kSpringRest;
++  rule.max_offset /= kUnitMoveDips;
++  rule.max_speed /= kUnitMoveDips;
++  return rule;
++}
++
++// A curve the compositor runs by asking `value` for each frame. The callback
++// holds only copies of plain values, so the compositor thread can run it.
++template <typename Base, typename T>
++class FunctionCurve : public Base {
++ public:
++  using Function = base::RepeatingCallback<T(base::TimeDelta)>;
++
++  FunctionCurve(base::TimeDelta duration,
++                Function value,
++                std::optional<float> maximum_scale = std::nullopt)
++      : duration_(duration),
++        value_(std::move(value)),
++        maximum_scale_(maximum_scale) {}
++  FunctionCurve(const FunctionCurve&) = default;
++  FunctionCurve& operator=(const FunctionCurve&) = delete;
++  ~FunctionCurve() override = default;
++
++  // gfx::AnimationCurve:
++  base::TimeDelta Duration() const override { return duration_; }
++  std::unique_ptr<gfx::AnimationCurve> Clone() const override {
++    return std::make_unique<FunctionCurve>(*this);
++  }
++  bool MaximumScale(float* max_scale) const override {
++    if (!maximum_scale_) {
++      return false;
++    }
++    *max_scale = *maximum_scale_;
++    return true;
++  }
++  T GetValue(base::TimeDelta t) const override { return value_.Run(t); }
++  T GetTransformedValue(
++      base::TimeDelta t,
++      gfx::TimingFunction::LimitDirection limit_direction) const override {
++    return GetValue(t);
++  }
++
++ private:
++  const base::TimeDelta duration_;
++  const Function value_;
++  const std::optional<float> maximum_scale_;
++};
++
++using TransformCurve =
++    FunctionCurve<gfx::TransformAnimationCurve, gfx::TransformOperations>;
++using OpacityCurve = FunctionCurve<gfx::FloatAnimationCurve, float>;
++
++gfx::TransformOperations ToOperations(const gfx::Transform& transform) {
++  gfx::TransformOperations operations;
++  operations.AppendMatrix(transform);
++  return operations;
++}
++
++// Translates by `rest` plus `offset` along `axis`. Additions stay in float,
++// as the space pager's always were.
++gfx::Transform Along(SpringTransformElement::Axis axis,
++                     const gfx::Vector2dF& rest,
++                     float offset) {
++  return axis == SpringTransformElement::Axis::kX
++             ? gfx::Transform::MakeTranslation(rest.x() + offset, rest.y())
++             : gfx::Transform::MakeTranslation(rest.x(), rest.y() + offset);
++}
++
++// Translate and scale `progress` of the way from `from` to `to`. Unlike
++// gfx::Tween, it follows a spring past 1.
++gfx::Transform Blend(const gfx::Transform& from,
++                     const gfx::Transform& to,
++                     double progress) {
++  const gfx::Vector2dF translate =
++      from.To2dTranslation() +
++      gfx::ScaleVector2d(to.To2dTranslation() - from.To2dTranslation(),
++                         progress);
++  const gfx::Vector2dF scale =
++      from.To2dScale() +
++      gfx::ScaleVector2d(to.To2dScale() - from.To2dScale(), progress);
++  gfx::Transform transform =
++      gfx::Transform::MakeTranslation(translate.x(), translate.y());
++  transform.Scale(scale.x(), scale.y());
++  return transform;
++}
++
++gfx::TransformOperations SpringTranslationAt(
++    const SpringMotion& motion,
++    base::TimeDelta duration,
++    const gfx::Vector2dF& rest,
++    SpringTransformElement::Axis axis,
++    base::TimeDelta t) {
++  const float offset =
++      t >= duration ? 0 : static_cast<float>(motion.OffsetAt(t));
++  gfx::TransformOperations operations;
++  if (axis == SpringTransformElement::Axis::kX) {
++    operations.AppendTranslate(rest.x() + offset, rest.y(), 0);
++  } else {
++    operations.AppendTranslate(rest.x(), rest.y() + offset, 0);
++  }
++  return operations;
++}
++
++// How far past rest `motion` goes. A fast start carries even a critically
++// damped spring past rest, so it's sampled rather than read off the spring.
++double PeakOvershoot(const SpringMotion& motion, base::TimeDelta duration) {
++  double peak = 0;
++  for (base::TimeDelta t; t < duration; t += base::Hertz(240)) {
++    peak = std::max(peak, motion.OffsetAt(t));
++  }
++  return peak;
++}
++
++gfx::TransformOperations SpringBlendAt(const SpringMotion& motion,
++                                       base::TimeDelta duration,
++                                       const gfx::Transform& from,
++                                       const gfx::Transform& to,
++                                       base::TimeDelta t) {
++  const double progress = t >= duration ? 1 : 1 + motion.OffsetAt(t);
++  return ToOperations(Blend(from, to, progress));
++}
++
++float SpringOpacityAt(const SpringMotion& motion,
++                      base::TimeDelta duration,
++                      float from,
++                      float to,
++                      base::TimeDelta t) {
++  const double progress = t >= duration ? 1 : 1 + motion.OffsetAt(t);
++  return std::clamp(
++      static_cast<float>(from + (to - from) * progress), 0.0f, 1.0f);
++}
++
++// How far along `curve` is at `linear`, a fraction of its time.
++double CurveAt(const Curve& curve, double linear) {
++  if (linear >= 1) {
++    return 1;
++  }
++  return gfx::CubicBezier(curve.x1, curve.y1, curve.x2, curve.y2)
++      .Solve(std::max(0.0, linear));
++}
++
++double CurveFraction(const Curve& curve,
++                     base::TimeDelta duration,
++                     base::TimeDelta t) {
++  return duration.is_positive() ? CurveAt(curve, t / duration) : 1;
++}
++
++float CurveOpacityAt(const Curve& curve,
++                     base::TimeDelta duration,
++                     float from,
++                     float to,
++                     base::TimeDelta t) {
++  return gfx::Tween::FloatValueBetween(CurveFraction(curve, duration, t), from,
++                                       to);
++}
++
++gfx::TransformOperations CurveTransformAt(const Curve& curve,
++                                          base::TimeDelta duration,
++                                          const gfx::Transform& from,
++                                          const gfx::Transform& to,
++                                          base::TimeDelta t) {
++  return ToOperations(gfx::Tween::TransformValueBetween(
++      CurveFraction(curve, duration, t), from, to));
++}
++
++}  // namespace
++
++namespace motion {
++
++bool ReducedMotion() {
++  // gfx::Animation refreshes this when the system setting changes, and
++  // --force-prefers-reduced-motion overrides it.
++  return gfx::Animation::PrefersReducedMotion();
++}
++
++}  // namespace motion
++
++// SpringAnimation.
++
++SpringAnimation::SpringAnimation(gfx::AnimationDelegate* delegate,
++                                 const Spring& spring,
++                                 float distance)
++    // Views' CompositorAnimationRunner steps it at the display's rate; this
++    // interval is only the fallback timer's.
++    : gfx::Animation(base::Hertz(gfx::LinearAnimation::kDefaultFrameRate)),
++      spring_(spring),
++      distance_(distance) {
++  set_delegate(delegate);
++}
++
++SpringAnimation::~SpringAnimation() = default;
++
++void SpringAnimation::Show() {
++  SetTarget(1);
++}
++
++void SpringAnimation::Hide() {
++  SetTarget(0);
++}
++
++void SpringAnimation::SetTarget(double target) {
++  Begin(target, spring_, std::nullopt);
++}
++
++void SpringAnimation::SetTarget(double target, const Spring& spring) {
++  Begin(target, spring, std::nullopt);
++}
++
++void SpringAnimation::SetTargetWithVelocity(double target, double velocity) {
++  Begin(target, spring_, velocity);
++}
++
++void SpringAnimation::Reset(double value) {
++  target_ = value;
++  value_ = value;
++  motion_ = {spring_};
++  Stop();
++}
++
++double SpringAnimation::GetCurrentVelocity() const {
++  if (!is_animating()) {
++    return 0;
++  }
++  return MotionAt(base::TimeTicks::Now()).velocity / distance_;
++}
++
++double SpringAnimation::GetCurrentValue() const {
++  return value_;
++}
++
++void SpringAnimation::Step(base::TimeTicks now) {
++  const base::TimeDelta elapsed = now - motion_start_;
++  const bool done = elapsed >= rest_time_;
++  value_ = done ? target_ : target_ + motion_.OffsetAt(elapsed) / distance_;
++  if (delegate()) {
++    delegate()->AnimationProgressed(this);
++  }
++  // The delegate may have set a new target, which starts a new motion.
++  if (done && now - motion_start_ >= rest_time_) {
++    Stop();
++  }
++}
++
++void SpringAnimation::Begin(double target,
++                            const Spring& spring,
++                            std::optional<double> velocity) {
++  if (motion::ReducedMotion() || distance_ <= 0) {
++    // A jump, which ends at once, as gfx::SlideAnimation's does.
++    const bool was_animating = is_animating();
++    spring_ = spring;
++    target_ = target;
++    value_ = target;
++    if (delegate()) {
++      delegate()->AnimationProgressed(this);
++    }
++    if (was_animating) {
++      Stop();
++    } else if (delegate()) {
++      delegate()->AnimationEnded(this);
++    }
++    return;
++  }
++  const base::TimeTicks now = base::TimeTicks::Now();
++  const SpringMotion current = MotionAt(now);
++  // Where the value is now, in DIPs from the new target, at its speed now.
++  motion_ = current.Retarget(base::TimeDelta(), (target - target_) * distance_,
++                             spring);
++  if (velocity) {
++    motion_.velocity = *velocity * distance_;
++  }
++  spring_ = spring;
++  target_ = target;
++  motion_start_ = now;
++  rest_time_ = motion_.RestTime(tokens::kSpringRest);
++  if (!is_animating()) {
++    Start();
++  }
++}
++
++SpringMotion SpringAnimation::MotionAt(base::TimeTicks now) const {
++  if (!is_animating()) {
++    return {spring_, (value_ - target_) * distance_, 0};
++  }
++  const base::TimeDelta elapsed = now - motion_start_;
++  return {spring_, motion_.OffsetAt(elapsed), motion_.VelocityAt(elapsed)};
++}
++
++// CompositorElement.
++
++CompositorElement::CompositorElement(AnimatableProperty property,
++                                     base::TimeDelta duration)
++    : ui::LayerAnimationElement(property, duration), property_(property) {}
++
++CompositorElement::~CompositorElement() = default;
++
++bool CompositorElement::IsThreaded(ui::LayerAnimationDelegate* delegate) const {
++  return duration().is_positive();
++}
++
++base::TimeDelta CompositorElement::Elapsed() const {
++  const base::TimeTicks start = effective_start_time();
++  return start.is_null() ? base::TimeDelta() : base::TimeTicks::Now() - start;
++}
++
++bool CompositorElement::OnProgress(double t,
++                                   ui::LayerAnimationDelegate* delegate) {
++  if (t < 1.0) {
++    return false;
++  }
++  RemoveFromCompositor(delegate);
++  SetEnd(delegate);
++  return true;
++}
++
++void CompositorElement::OnAbort(ui::LayerAnimationDelegate* delegate) {
++  if (!delegate || !Started() || !IsThreaded(delegate)) {
++    return;
++  }
++  RemoveFromCompositor(delegate);
++  SetAt(Elapsed(), delegate);
++}
++
++void CompositorElement::RequestEffectiveStart(
++    ui::LayerAnimationDelegate* delegate) {
++  if (!IsThreaded(delegate)) {
++    set_effective_start_time(requested_start_time());
++    return;
++  }
++  // The compositor sets the real start time when it first ticks the curve.
++  set_effective_start_time(base::TimeTicks());
++  // A new id, so a model isn't removed and added under one id in a frame.
++  UpdateKeyframeModelId();
++  const cc::TargetProperty::Type property =
++      property_ == TRANSFORM ? cc::TargetProperty::TRANSFORM
++                             : cc::TargetProperty::OPACITY;
++  std::unique_ptr<cc::KeyframeModel> keyframe_model = cc::KeyframeModel::Create(
++      CreateCurve(), keyframe_model_id(), animation_group_id(),
++      cc::KeyframeModel::TargetPropertyId(property));
++  keyframe_model->set_needs_synchronized_start_time(true);
++  delegate->GetThreadedAnimationDelegate()->AddThreadedAnimation(
++      std::move(keyframe_model));
++}
++
++void CompositorElement::RemoveFromCompositor(
++    ui::LayerAnimationDelegate* delegate) {
++  if (Started() && IsThreaded(delegate)) {
++    delegate->GetThreadedAnimationDelegate()->RemoveThreadedAnimation(
++        keyframe_model_id());
++  }
++}
++
++// SpringTransformElement.
++
++SpringTransformElement::SpringTransformElement(const SpringMotion& motion,
++                                               const gfx::Vector2dF& rest,
++                                               Axis axis)
++    : CompositorElement(TRANSFORM, motion.RestTime(tokens::kSpringRest)),
++      motion_(motion),
++      blend_(false),
++      rest_(rest),
++      axis_(axis) {}
++
++SpringTransformElement::SpringTransformElement(const SpringMotion& motion,
++                                               const gfx::Transform& from,
++                                               const gfx::Transform& to)
++    : CompositorElement(TRANSFORM, motion.RestTime(UnitRest())),
++      motion_(motion),
++      blend_(true),
++      axis_(Axis::kX),
++      from_(from),
++      to_(to) {
++  DCHECK(from.IsScaleOrTranslation());
++  DCHECK(to.IsScaleOrTranslation());
++}
++
++SpringTransformElement::~SpringTransformElement() = default;
++
++// static
++std::unique_ptr<SpringTransformElement> SpringTransformElement::CreateBlend(
++    const Spring& spring,
++    const gfx::Transform& from,
++    const gfx::Transform& to,
++    double initial_velocity) {
++  return base::WrapUnique(new SpringTransformElement(
++      SpringMotion{spring, -1, initial_velocity}, from, to));
++}
++
++float SpringTransformElement::GetOffset() const {
++  const base::TimeTicks start = effective_start_time();
++  return start.is_null() ? static_cast<float>(motion_.offset)
++                         : static_cast<float>(motion_.OffsetAt(
++                               base::TimeTicks::Now() - start));
++}
++
++float SpringTransformElement::GetVelocity() const {
++  return static_cast<float>(motion_.VelocityAt(Elapsed()));
++}
++
++gfx::Transform SpringTransformElement::TransformAt(
++    base::TimeDelta elapsed) const {
++  if (blend_) {
++    return Blend(from_, to_,
++                 elapsed >= duration() ? 1 : 1 + motion_.OffsetAt(elapsed));
++  }
++  return Along(axis_, rest_,
++               elapsed >= duration()
++                   ? 0
++                   : static_cast<float>(motion_.OffsetAt(elapsed)));
++}
++
++std::unique_ptr<gfx::AnimationCurve> SpringTransformElement::CreateCurve()
++    const {
++  if (blend_) {
++    const float maximum_scale = std::max(
++        {from_.To2dScale().x(), from_.To2dScale().y(), to_.To2dScale().x(),
++         to_.To2dScale().y()});
++    return std::make_unique<TransformCurve>(
++        duration(),
++        base::BindRepeating(&SpringBlendAt, motion_, duration(), from_, to_),
++        maximum_scale * (1 + PeakOvershoot(motion_, duration())));
++  }
++  return std::make_unique<TransformCurve>(
++      duration(),
++      base::BindRepeating(&SpringTranslationAt, motion_, duration(), rest_,
++                          axis_),
++      1.0f);
++}
++
++void SpringTransformElement::SetAt(base::TimeDelta elapsed,
++                                   ui::LayerAnimationDelegate* delegate) {
++  // Where an abort leaves the layer, past the end included, as the space
++  // pager always has.
++  const gfx::Transform transform =
++      blend_ ? Blend(from_, to_, 1 + motion_.OffsetAt(elapsed))
++             : Along(axis_, rest_,
++                     static_cast<float>(motion_.OffsetAt(elapsed)));
++  delegate->SetTransformFromAnimation(transform,
++                                      ui::PropertyChangeReason::FROM_ANIMATION);
++}
++
++void SpringTransformElement::SetEnd(ui::LayerAnimationDelegate* delegate) {
++  delegate->SetTransformFromAnimation(blend_ ? to_ : Along(axis_, rest_, 0),
++                                      ui::PropertyChangeReason::FROM_ANIMATION);
++}
++
++std::string SpringTransformElement::DebugName() const {
++  return "RacSpringTransform";
++}
++
++void SpringTransformElement::OnStart(ui::LayerAnimationDelegate* delegate) {
++  delegate->SetTransformFromAnimation(
++      blend_ ? from_ : Along(axis_, rest_, static_cast<float>(motion_.offset)),
++      ui::PropertyChangeReason::FROM_ANIMATION);
++}
++
++void SpringTransformElement::OnGetTarget(TargetValue* target) const {
++  target->transform = blend_ ? to_ : Along(axis_, rest_, 0);
++}
++
++// SpringOpacityElement.
++
++SpringOpacityElement::SpringOpacityElement(const Spring& spring,
++                                           float from,
++                                           float to,
++                                           double initial_velocity)
++    : CompositorElement(OPACITY,
++                        from == to ? base::TimeDelta()
++                                   : SpringMotion{spring, -1, initial_velocity}
++                                         .RestTime(UnitRest())),
++      motion_{spring, -1, initial_velocity},
++      from_(from),
++      to_(to) {}
++
++SpringOpacityElement::~SpringOpacityElement() = default;
++
++float SpringOpacityElement::OpacityAt(base::TimeDelta elapsed) const {
++  return SpringOpacityAt(motion_, duration(), from_, to_, elapsed);
++}
++
++std::unique_ptr<gfx::AnimationCurve> SpringOpacityElement::CreateCurve()
++    const {
++  return std::make_unique<OpacityCurve>(
++      duration(),
++      base::BindRepeating(&SpringOpacityAt, motion_, duration(), from_, to_));
++}
++
++void SpringOpacityElement::SetAt(base::TimeDelta elapsed,
++                                 ui::LayerAnimationDelegate* delegate) {
++  delegate->SetOpacityFromAnimation(OpacityAt(elapsed),
++                                    ui::PropertyChangeReason::FROM_ANIMATION);
++}
++
++void SpringOpacityElement::SetEnd(ui::LayerAnimationDelegate* delegate) {
++  delegate->SetOpacityFromAnimation(to_,
++                                    ui::PropertyChangeReason::FROM_ANIMATION);
++}
++
++std::string SpringOpacityElement::DebugName() const {
++  return "RacSpringOpacity";
++}
++
++void SpringOpacityElement::OnStart(ui::LayerAnimationDelegate* delegate) {
++  delegate->SetOpacityFromAnimation(from_,
++                                    ui::PropertyChangeReason::FROM_ANIMATION);
++}
++
++void SpringOpacityElement::OnGetTarget(TargetValue* target) const {
++  target->opacity = to_;
++}
++
++// CurveElement.
++
++// static
++std::unique_ptr<CurveElement> CurveElement::CreateOpacity(
++    float to,
++    const Timing& timing) {
++  TargetValue target;
++  target.opacity = to;
++  return base::WrapUnique(new CurveElement(OPACITY, target, timing));
++}
++
++// static
++std::unique_ptr<CurveElement> CurveElement::CreateTransform(
++    const gfx::Transform& to,
++    const Timing& timing) {
++  TargetValue target;
++  target.transform = to;
++  return base::WrapUnique(new CurveElement(TRANSFORM, target, timing));
++}
++
++// static
++std::unique_ptr<CurveElement> CurveElement::CreateClipRect(
++    const gfx::Rect& to,
++    const Timing& timing) {
++  TargetValue target;
++  target.clip_rect = to;
++  return base::WrapUnique(new CurveElement(CLIP, target, timing));
++}
++
++// static
++std::unique_ptr<CurveElement> CurveElement::CreateRoundedCorners(
++    const gfx::RoundedCornersF& to,
++    const Timing& timing) {
++  TargetValue target;
++  target.rounded_corners = to;
++  return base::WrapUnique(new CurveElement(ROUNDED_CORNERS, target, timing));
++}
++
++CurveElement::CurveElement(AnimatableProperty property,
++                           const TargetValue& to,
++                           const Timing& timing)
++    : CompositorElement(property, timing.duration),
++      to_(to),
++      curve_(timing.curve) {}
++
++CurveElement::~CurveElement() = default;
++
++bool CurveElement::IsThreaded(ui::LayerAnimationDelegate* delegate) const {
++  return (property() == OPACITY || property() == TRANSFORM) &&
++         CompositorElement::IsThreaded(delegate);
++}
++
++std::unique_ptr<gfx::AnimationCurve> CurveElement::CreateCurve() const {
++  if (property() == OPACITY) {
++    return std::make_unique<OpacityCurve>(
++        duration(), base::BindRepeating(&CurveOpacityAt, curve_, duration(),
++                                        from_.opacity, to_.opacity));
++  }
++  DCHECK_EQ(property(), TRANSFORM);
++  return std::make_unique<TransformCurve>(
++      duration(), base::BindRepeating(&CurveTransformAt, curve_, duration(),
++                                      from_.transform, to_.transform));
++}
++
++void CurveElement::SetAt(base::TimeDelta elapsed,
++                         ui::LayerAnimationDelegate* delegate) {
++  SetFraction(CurveFraction(curve_, duration(), elapsed), delegate);
++}
++
++void CurveElement::SetEnd(ui::LayerAnimationDelegate* delegate) {
++  SetFraction(1, delegate);
++}
++
++std::string CurveElement::DebugName() const {
++  return "RacCurve";
++}
++
++void CurveElement::OnStart(ui::LayerAnimationDelegate* delegate) {
++  from_ = TargetValue(delegate);
++}
++
++bool CurveElement::OnProgress(double t, ui::LayerAnimationDelegate* delegate) {
++  if (IsThreaded(delegate)) {
++    return CompositorElement::OnProgress(t, delegate);
++  }
++  // `t` is linear: the element's own tween is never set.
++  SetFraction(CurveAt(curve_, t), delegate);
++  return true;
++}
++
++void CurveElement::OnGetTarget(TargetValue* target) const {
++  switch (property()) {
++    case OPACITY:
++      target->opacity = to_.opacity;
++      return;
++    case TRANSFORM:
++      target->transform = to_.transform;
++      return;
++    case CLIP:
++      target->clip_rect = to_.clip_rect;
++      return;
++    case ROUNDED_CORNERS:
++      target->rounded_corners = to_.rounded_corners;
++      return;
++    default:
++      NOTREACHED();
++  }
++}
++
++void CurveElement::SetFraction(double fraction,
++                               ui::LayerAnimationDelegate* delegate) {
++  constexpr auto kReason = ui::PropertyChangeReason::FROM_ANIMATION;
++  switch (property()) {
++    case OPACITY:
++      delegate->SetOpacityFromAnimation(
++          gfx::Tween::FloatValueBetween(fraction, from_.opacity, to_.opacity),
++          kReason);
++      return;
++    case TRANSFORM:
++      delegate->SetTransformFromAnimation(
++          gfx::Tween::TransformValueBetween(fraction, from_.transform,
++                                            to_.transform),
++          kReason);
++      return;
++    case CLIP:
++      delegate->SetClipRectFromAnimation(
++          gfx::Tween::RectValueBetween(fraction, from_.clip_rect,
++                                       to_.clip_rect),
++          kReason);
++      return;
++    case ROUNDED_CORNERS:
++      delegate->SetRoundedCornersFromAnimation(
++          gfx::RoundedCornersF(
++              gfx::Tween::FloatValueBetween(fraction,
++                                            from_.rounded_corners.upper_left(),
++                                            to_.rounded_corners.upper_left()),
++              gfx::Tween::FloatValueBetween(fraction,
++                                            from_.rounded_corners.upper_right(),
++                                            to_.rounded_corners.upper_right()),
++              gfx::Tween::FloatValueBetween(fraction,
++                                            from_.rounded_corners.lower_right(),
++                                            to_.rounded_corners.lower_right()),
++              gfx::Tween::FloatValueBetween(fraction,
++                                            from_.rounded_corners.lower_left(),
++                                            to_.rounded_corners.lower_left())),
++          kReason);
++      return;
++    default:
++      NOTREACHED();
++  }
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/motion/rac_motion.h
+@@ -0,0 +1,301 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_MOTION_RAC_MOTION_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_MOTION_RAC_MOTION_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++
++#include "base/time/time.h"
++#include "chrome/browser/ui/views/rac/motion/rac_spring.h"
++#include "chrome/browser/ui/views/rac/rac_tokens.h"
++#include "ui/compositor/layer_animation_element.h"
++#include "ui/gfx/animation/animation.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/rounded_corners_f.h"
++#include "ui/gfx/geometry/transform.h"
++#include "ui/gfx/geometry/vector2d_f.h"
++
++namespace gfx {
++class AnimationCurve;
++class AnimationDelegate;
++}  // namespace gfx
++
++// rac's three ways to run motion tokens natively:
++// - compositor layers: SpringTransformElement, SpringOpacityElement, and
++//   CurveElement, started on a layer's ui::LayerAnimator. Use these for
++//   anything that moves, so it stays smooth while the UI thread is busy.
++// - the UI thread: SpringAnimation, for what has to lay out each frame.
++// - WebUI: the CSS tokens in rac_tokens.css.
++//
++// Nothing here runs or allocates until an animation starts, and nothing
++// keeps the compositor ticking once an animation rests.
++
++namespace rac {
++
++namespace motion {
++
++// Whether the system asks for reduced motion. Read it each time an
++// animation starts, never once in a constructor: the user can change it
++// while rac runs. Under it, slides become tokens::kReducedFade fades and
++// springs jump; gesture tracking may still follow the fingers.
++bool ReducedMotion();
++
++}  // namespace motion
++
++// A UI-thread animation on a spring, shaped like gfx::SlideAnimation: Show()
++// heads for 1 and Hide() for 0. A new target while moving keeps the current
++// place and speed, so reversing Cmd+S mid-slide doesn't jolt. Under a ratio
++// below 1 the value passes its target briefly.
++//
++// Prefer a compositor element; use this only for what must lay out every
++// frame.
++class SpringAnimation : public gfx::Animation {
++ public:
++  // `distance` is how many DIPs a change of 1 in the value moves something.
++  // Rest is judged in those DIPs, by tokens::kSpringRest.
++  SpringAnimation(gfx::AnimationDelegate* delegate,
++                  const Spring& spring,
++                  float distance);
++  SpringAnimation(const SpringAnimation&) = delete;
++  SpringAnimation& operator=(const SpringAnimation&) = delete;
++  ~SpringAnimation() override;
++
++  void Show();
++  void Hide();
++  // Heads for `target` from the value and speed it has now. Under reduced
++  // motion it jumps there instead.
++  void SetTarget(double target);
++  // The same on another spring, such as tokens::kSpringExit for an exit.
++  void SetTarget(double target, const Spring& spring);
++  // Heads for `target` starting at `velocity`, in values per second, as a
++  // swipe hands over its speed.
++  void SetTargetWithVelocity(double target, double velocity);
++  // Jumps to `value` and stops.
++  void Reset(double value);
++
++  bool IsShowing() const { return target_ == 1; }
++  double target() const { return target_; }
++  // In values per second.
++  double GetCurrentVelocity() const;
++
++  // gfx::Animation:
++  double GetCurrentValue() const override;
++
++ protected:
++  // gfx::Animation:
++  void Step(base::TimeTicks now) override;
++
++ private:
++  void Begin(double target,
++             const Spring& spring,
++             std::optional<double> velocity);
++  // The motion's offset and speed at `now`, in DIPs from `target_`.
++  SpringMotion MotionAt(base::TimeTicks now) const;
++
++  Spring spring_;
++  const float distance_;
++  double target_ = 0;
++  double value_ = 0;
++  // In DIPs from `target_`, started at `motion_start_`.
++  SpringMotion motion_{spring_};
++  base::TimeTicks motion_start_;
++  base::TimeDelta rest_time_;
++};
++
++// What rac's compositor elements share: the curve runs on the compositor
++// thread, which picks the start time on its first frame, and the UI thread
++// only hears about the end. Chromium's own threaded elements aren't public.
++class CompositorElement : public ui::LayerAnimationElement {
++ public:
++  CompositorElement(const CompositorElement&) = delete;
++  CompositorElement& operator=(const CompositorElement&) = delete;
++  ~CompositorElement() override;
++
++  // ui::LayerAnimationElement:
++  bool IsThreaded(ui::LayerAnimationDelegate* delegate) const override;
++
++ protected:
++  // Only a TRANSFORM or OPACITY element runs on the compositor.
++  CompositorElement(AnimatableProperty property, base::TimeDelta duration);
++
++  AnimatableProperty property() const { return property_; }
++
++  // How long the compositor has been running the curve; zero until its first
++  // frame.
++  base::TimeDelta Elapsed() const;
++
++  // The curve for the compositor, from what OnStart() read off the layer.
++  virtual std::unique_ptr<gfx::AnimationCurve> CreateCurve() const = 0;
++  // Sets the layer where the curve has it after `elapsed`, when an abort
++  // leaves it there.
++  virtual void SetAt(base::TimeDelta elapsed,
++                     ui::LayerAnimationDelegate* delegate) = 0;
++  // Sets the layer to where the curve ends.
++  virtual void SetEnd(ui::LayerAnimationDelegate* delegate) = 0;
++
++  // ui::LayerAnimationElement:
++  bool OnProgress(double t, ui::LayerAnimationDelegate* delegate) override;
++  void OnAbort(ui::LayerAnimationDelegate* delegate) override;
++  void RequestEffectiveStart(ui::LayerAnimationDelegate* delegate) override;
++
++ private:
++  void RemoveFromCompositor(ui::LayerAnimationDelegate* delegate);
++
++  const AnimatableProperty property_;
++};
++
++// Slides a layer on the compositor thread until it rests at `rest`: the
++// space pager's element, made general. It starts `motion.offset` DIPs from
++// rest along `axis`, moving at `motion.velocity`, and ends once
++// tokens::kSpringRest holds. Every frame changes only the layer's transform.
++//
++// To retarget, read GetOffset() and GetVelocity(), then start a new element
++// from them; the layer's animator replaces the old one.
++class SpringTransformElement : public CompositorElement {
++ public:
++  enum class Axis { kX, kY };
++
++  SpringTransformElement(const SpringMotion& motion,
++                         const gfx::Vector2dF& rest,
++                         Axis axis);
++  SpringTransformElement(const SpringTransformElement&) = delete;
++  SpringTransformElement& operator=(const SpringTransformElement&) = delete;
++  ~SpringTransformElement() override;
++
++  // Moves and scales a layer from `from` to `to` on the spring's progress,
++  // for Peek growing out of a link. Both are 2D translate-and-scale
++  // transforms; the layer's contents keep their final size.
++  // `initial_velocity` is in moves per second toward `to`.
++  static std::unique_ptr<SpringTransformElement> CreateBlend(
++      const Spring& spring,
++      const gfx::Transform& from,
++      const gfx::Transform& to,
++      double initial_velocity = 0);
++
++  // Where the compositor has the layer now, as DIPs from rest along the
++  // axis, and how fast it's moving. For a blend they're in moves: the offset
++  // runs from -1 to 0.
++  float GetOffset() const;
++  float GetVelocity() const;
++
++  // The layer's transform `elapsed` into the run.
++  gfx::Transform TransformAt(base::TimeDelta elapsed) const;
++
++ protected:
++  // CompositorElement:
++  std::unique_ptr<gfx::AnimationCurve> CreateCurve() const override;
++  void SetAt(base::TimeDelta elapsed,
++             ui::LayerAnimationDelegate* delegate) override;
++  void SetEnd(ui::LayerAnimationDelegate* delegate) override;
++
++  // ui::LayerAnimationElement:
++  std::string DebugName() const override;
++  void OnStart(ui::LayerAnimationDelegate* delegate) override;
++  void OnGetTarget(TargetValue* target) const override;
++
++ private:
++  SpringTransformElement(const SpringMotion& motion,
++                         const gfx::Transform& from,
++                         const gfx::Transform& to);
++
++  const SpringMotion motion_;
++  const bool blend_;
++  const gfx::Vector2dF rest_;
++  const Axis axis_;
++  const gfx::Transform from_;
++  const gfx::Transform to_;
++};
++
++// Fades a layer from `from` to `to` on a spring's progress, on the
++// compositor thread. The opacity stays within 0 and 1 even if the spring
++// passes its target.
++class SpringOpacityElement : public CompositorElement {
++ public:
++  SpringOpacityElement(const Spring& spring,
++                       float from,
++                       float to,
++                       double initial_velocity = 0);
++  SpringOpacityElement(const SpringOpacityElement&) = delete;
++  SpringOpacityElement& operator=(const SpringOpacityElement&) = delete;
++  ~SpringOpacityElement() override;
++
++  float OpacityAt(base::TimeDelta elapsed) const;
++
++ protected:
++  // CompositorElement:
++  std::unique_ptr<gfx::AnimationCurve> CreateCurve() const override;
++  void SetAt(base::TimeDelta elapsed,
++             ui::LayerAnimationDelegate* delegate) override;
++  void SetEnd(ui::LayerAnimationDelegate* delegate) override;
++
++  // ui::LayerAnimationElement:
++  std::string DebugName() const override;
++  void OnStart(ui::LayerAnimationDelegate* delegate) override;
++  void OnGetTarget(TargetValue* target) const override;
++
++ private:
++  // A unit move from 0 to 1.
++  const SpringMotion motion_;
++  const float from_;
++  const float to_;
++};
++
++// Runs a property over a rac::Timing with its bezier as recorded, which
++// gfx::Tween can't always hold (kEaseExpo). It starts from the layer's
++// value when it starts. Opacity and transforms run on the compositor thread;
++// a clip rect and rounded corners run on the UI thread, as Chromium's own
++// elements for them do.
++class CurveElement : public CompositorElement {
++ public:
++  static std::unique_ptr<CurveElement> CreateOpacity(float to,
++                                                     const Timing& timing);
++  static std::unique_ptr<CurveElement> CreateTransform(
++      const gfx::Transform& to,
++      const Timing& timing);
++  // The command bar growing out of the address field.
++  static std::unique_ptr<CurveElement> CreateClipRect(const gfx::Rect& to,
++                                                      const Timing& timing);
++  static std::unique_ptr<CurveElement> CreateRoundedCorners(
++      const gfx::RoundedCornersF& to,
++      const Timing& timing);
++
++  CurveElement(const CurveElement&) = delete;
++  CurveElement& operator=(const CurveElement&) = delete;
++  ~CurveElement() override;
++
++  // ui::LayerAnimationElement:
++  bool IsThreaded(ui::LayerAnimationDelegate* delegate) const override;
++
++ protected:
++  // CompositorElement:
++  std::unique_ptr<gfx::AnimationCurve> CreateCurve() const override;
++  void SetAt(base::TimeDelta elapsed,
++             ui::LayerAnimationDelegate* delegate) override;
++  void SetEnd(ui::LayerAnimationDelegate* delegate) override;
++
++  // ui::LayerAnimationElement:
++  std::string DebugName() const override;
++  void OnStart(ui::LayerAnimationDelegate* delegate) override;
++  bool OnProgress(double t, ui::LayerAnimationDelegate* delegate) override;
++  void OnGetTarget(TargetValue* target) const override;
++
++ private:
++  CurveElement(AnimatableProperty property,
++               const TargetValue& to,
++               const Timing& timing);
++
++  // Sets the property at `fraction` of the way from the start to the end.
++  void SetFraction(double fraction, ui::LayerAnimationDelegate* delegate);
++
++  const TargetValue to_;
++  TargetValue from_;
++  const Curve curve_;
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_MOTION_RAC_MOTION_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/motion/rac_motion_unittest.cc
+@@ -0,0 +1,385 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/motion/rac_motion.h"
++
++#include <memory>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/test/task_environment.h"
++#include "base/time/time.h"
++#include "cc/animation/keyframe_model.h"
++#include "chrome/browser/ui/views/rac/rac_tokens.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/compositor/layer_animation_delegate.h"
++#include "ui/compositor/layer_threaded_animation_delegate.h"
++#include "ui/gfx/animation/animation_delegate.h"
++#include "ui/gfx/animation/keyframe/animation_curve.h"
++#include "ui/gfx/geometry/linear_gradient.h"
++
++namespace rac {
++namespace {
++
++// Records what an element does to a layer, without a compositor.
++class FakeLayer : public ui::LayerAnimationDelegate,
++                  public ui::LayerThreadedAnimationDelegate {
++ public:
++  // ui::LayerAnimationDelegate:
++  void SetBoundsFromAnimation(const gfx::Rect& bounds,
++                              ui::PropertyChangeReason reason) override {
++    bounds_ = bounds;
++  }
++  void SetTransformFromAnimation(const gfx::Transform& transform,
++                                 ui::PropertyChangeReason reason) override {
++    transform_ = transform;
++  }
++  void SetOpacityFromAnimation(float opacity,
++                               ui::PropertyChangeReason reason) override {
++    opacity_ = opacity;
++  }
++  void SetVisibilityFromAnimation(bool visibility,
++                                  ui::PropertyChangeReason reason) override {}
++  void SetBrightnessFromAnimation(float brightness,
++                                  ui::PropertyChangeReason reason) override {}
++  void SetGrayscaleFromAnimation(float grayscale,
++                                 ui::PropertyChangeReason reason) override {}
++  void SetColorFromAnimation(SkColor4f color,
++                             ui::PropertyChangeReason reason) override {}
++  void SetClipRectFromAnimation(const gfx::Rect& clip_rect,
++                                ui::PropertyChangeReason reason) override {
++    clip_rect_ = clip_rect;
++  }
++  void SetRoundedCornersFromAnimation(
++      const gfx::RoundedCornersF& rounded_corners,
++      ui::PropertyChangeReason reason) override {
++    rounded_corners_ = rounded_corners;
++  }
++  void SetGradientMaskFromAnimation(const gfx::LinearGradient& gradient_mask,
++                                    ui::PropertyChangeReason reason) override {}
++  void ScheduleDrawForAnimation() override {}
++  const gfx::Rect& GetBoundsForAnimation() const override { return bounds_; }
++  gfx::Transform GetTransformForAnimation() const override {
++    return transform_;
++  }
++  float GetOpacityForAnimation() const override { return opacity_; }
++  bool GetVisibilityForAnimation() const override { return true; }
++  float GetBrightnessForAnimation() const override { return 0; }
++  float GetGrayscaleForAnimation() const override { return 0; }
++  SkColor4f GetColorForAnimation() const override { return SkColors::kBlack; }
++  gfx::Rect GetClipRectForAnimation() const override { return clip_rect_; }
++  gfx::RoundedCornersF GetRoundedCornersForAnimation() const override {
++    return rounded_corners_;
++  }
++  const gfx::LinearGradient& GetGradientMaskForAnimation() const override {
++    return gradient_mask_;
++  }
++  float GetDeviceScaleFactor() const override { return 1; }
++  ui::Layer* GetLayer() override { return nullptr; }
++  cc::Layer* GetCcLayer() const override { return nullptr; }
++  ui::LayerAnimatorCollection* GetLayerAnimatorCollection() override {
++    return nullptr;
++  }
++  ui::LayerThreadedAnimationDelegate* GetThreadedAnimationDelegate() override {
++    return this;
++  }
++  float GetRefreshRate() const override { return 60; }
++
++  // ui::LayerThreadedAnimationDelegate:
++  void AddThreadedAnimation(
++      std::unique_ptr<cc::KeyframeModel> keyframe_model) override {
++    models_.push_back(std::move(keyframe_model));
++  }
++  void RemoveThreadedAnimation(int keyframe_model_id) override {
++    ++removed_;
++  }
++
++  gfx::Rect bounds_;
++  gfx::Transform transform_;
++  float opacity_ = 1;
++  gfx::Rect clip_rect_;
++  gfx::RoundedCornersF rounded_corners_;
++  gfx::LinearGradient gradient_mask_;
++  std::vector<std::unique_ptr<cc::KeyframeModel>> models_;
++  int removed_ = 0;
++};
++
++const gfx::TransformAnimationCurve* TransformCurveOf(const FakeLayer& layer) {
++  return gfx::TransformAnimationCurve::ToTransformAnimationCurve(
++      layer.models_.back()->curve());
++}
++
++const gfx::FloatAnimationCurve* FloatCurveOf(const FakeLayer& layer) {
++  return gfx::FloatAnimationCurve::ToFloatAnimationCurve(
++      layer.models_.back()->curve());
++}
++
++class RacMotionTest : public testing::Test {
++ protected:
++  // Starts `element` on `layer` as a ui::LayerAnimator would, with the
++  // compositor's first frame at `start_`.
++  void Start(ui::LayerAnimationElement& element, FakeLayer& layer) {
++    element.set_requested_start_time(start_);
++    element.Start(&layer, 1);
++    if (element.IsThreaded(&layer)) {
++      element.set_effective_start_time(start_);
++    }
++  }
++
++  base::test::SingleThreadTaskEnvironment task_environment_{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME};
++  const base::TimeTicks start_ = base::TimeTicks::Now();
++};
++
++TEST_F(RacMotionTest, SpringSlideRunsOnTheCompositorAndRests) {
++  FakeLayer layer;
++  const SpringMotion motion{tokens::kSpringPage, 200, -900};
++  SpringTransformElement element(motion, gfx::Vector2dF(40, 0),
++                                 SpringTransformElement::Axis::kX);
++  EXPECT_EQ(element.duration(), motion.RestTime(tokens::kSpringRest));
++
++  Start(element, layer);
++  EXPECT_EQ(layer.transform_, gfx::Transform::MakeTranslation(240, 0));
++  ASSERT_EQ(layer.models_.size(), 1u);
++  EXPECT_TRUE(layer.models_[0]->needs_synchronized_start_time());
++
++  // The compositor's curve is the spring, then rest.
++  const gfx::TransformAnimationCurve* curve = TransformCurveOf(layer);
++  EXPECT_EQ(curve->Duration(), element.duration());
++  for (base::TimeDelta t; t < element.duration(); t += base::Hertz(240)) {
++    const gfx::Transform expected = gfx::Transform::MakeTranslation(
++        40 + static_cast<float>(motion.OffsetAt(t)), 0);
++    EXPECT_EQ(curve->GetValue(t).Apply(), expected);
++    EXPECT_EQ(element.TransformAt(t), expected);
++  }
++  EXPECT_EQ(curve->GetValue(element.duration()).Apply(),
++            gfx::Transform::MakeTranslation(40, 0));
++  float scale = 0;
++  EXPECT_TRUE(curve->MaximumScale(&scale));
++  EXPECT_EQ(scale, 1);
++
++  // The UI thread hears only about the end.
++  EXPECT_FALSE(element.Progress(start_ + base::Milliseconds(50), &layer));
++  EXPECT_EQ(layer.transform_, gfx::Transform::MakeTranslation(240, 0));
++  EXPECT_TRUE(element.Progress(start_ + element.duration(), &layer));
++  EXPECT_EQ(layer.transform_, gfx::Transform::MakeTranslation(40, 0));
++  EXPECT_EQ(layer.removed_, 1);
++}
++
++TEST_F(RacMotionTest, SpringSlideAbortsWhereItIs) {
++  FakeLayer layer;
++  const SpringMotion motion{tokens::kSpringPage, -300, 0};
++  SpringTransformElement element(motion, gfx::Vector2dF(0, 12),
++                                 SpringTransformElement::Axis::kY);
++  Start(element, layer);
++  EXPECT_EQ(layer.transform_, gfx::Transform::MakeTranslation(0, -288));
++
++  task_environment_.FastForwardBy(base::Milliseconds(60));
++  const float offset = static_cast<float>(
++      motion.OffsetAt(base::Milliseconds(60)));
++  EXPECT_EQ(element.GetOffset(), offset);
++  EXPECT_FLOAT_EQ(element.GetVelocity(),
++                  motion.VelocityAt(base::Milliseconds(60)));
++  element.Abort(&layer);
++  EXPECT_EQ(layer.transform_, gfx::Transform::MakeTranslation(0, 12 + offset));
++  EXPECT_EQ(layer.removed_, 1);
++}
++
++TEST_F(RacMotionTest, SpringBlendFollowsTheBounce) {
++  FakeLayer layer;
++  gfx::Transform from = gfx::Transform::MakeTranslation(100, 50);
++  from.Scale(0.5, 0.5);
++  const gfx::Transform to;
++  std::unique_ptr<SpringTransformElement> element =
++      SpringTransformElement::CreateBlend(tokens::kSpringGrow, from, to);
++  Start(*element, layer);
++  EXPECT_EQ(layer.transform_, from);
++
++  // kSpringGrow bounces, so the layer passes `to` before resting there.
++  const base::TimeDelta peak = base::Milliseconds(245);
++  const gfx::Transform at_peak = element->TransformAt(peak);
++  EXPECT_GT(at_peak.To2dScale().x(), 1);
++  EXPECT_LT(at_peak.To2dTranslation().x(), 0);
++  EXPECT_EQ(TransformCurveOf(layer)->GetValue(peak).Apply(), at_peak);
++
++  float scale = 0;
++  EXPECT_TRUE(TransformCurveOf(layer)->MaximumScale(&scale));
++  EXPECT_GE(scale, at_peak.To2dScale().x());
++
++  EXPECT_TRUE(element->Progress(start_ + element->duration(), &layer));
++  EXPECT_EQ(layer.transform_, to);
++}
++
++TEST_F(RacMotionTest, SpringOpacityStaysInRange) {
++  FakeLayer layer;
++  SpringOpacityElement element(tokens::kSpringReveal, 0.2f, 1);
++  Start(element, layer);
++  EXPECT_EQ(layer.opacity_, 0.2f);
++  const gfx::FloatAnimationCurve* curve = FloatCurveOf(layer);
++  for (base::TimeDelta t; t <= element.duration(); t += base::Hertz(240)) {
++    const float opacity = curve->GetValue(t);
++    EXPECT_GE(opacity, 0);
++    EXPECT_LE(opacity, 1);
++    EXPECT_EQ(opacity, element.OpacityAt(t));
++  }
++  EXPECT_EQ(curve->GetValue(element.duration()), 1);
++  EXPECT_TRUE(element.Progress(start_ + element.duration(), &layer));
++  EXPECT_EQ(layer.opacity_, 1);
++}
++
++TEST_F(RacMotionTest, SpringOpacityWithNothingToDoEndsAtOnce) {
++  FakeLayer layer;
++  SpringOpacityElement element(tokens::kSpringReveal, 1, 1);
++  EXPECT_TRUE(element.duration().is_zero());
++  Start(element, layer);
++  EXPECT_FALSE(element.IsThreaded(&layer));
++  EXPECT_TRUE(layer.models_.empty());
++  EXPECT_TRUE(element.Progress(start_, &layer));
++  EXPECT_EQ(layer.opacity_, 1);
++}
++
++TEST_F(RacMotionTest, CurveOpacityRunsTheRecordedBezier) {
++  FakeLayer layer;
++  layer.opacity_ = 0;
++  std::unique_ptr<CurveElement> element =
++      CurveElement::CreateOpacity(1, tokens::kCommandBarGrow);
++  Start(*element, layer);
++  ASSERT_EQ(layer.models_.size(), 1u);
++  const gfx::FloatAnimationCurve* curve = FloatCurveOf(layer);
++  EXPECT_EQ(curve->Duration(), base::Milliseconds(130));
++  // kEaseExpo is most of the way there by a third of the time.
++  EXPECT_GT(curve->GetValue(base::Milliseconds(43)), 0.85f);
++  EXPECT_EQ(curve->GetValue(base::Milliseconds(130)), 1);
++  EXPECT_TRUE(element->Progress(start_ + base::Milliseconds(130), &layer));
++  EXPECT_EQ(layer.opacity_, 1);
++  EXPECT_EQ(layer.removed_, 1);
++}
++
++TEST_F(RacMotionTest, CurveClipRectRunsOnTheUiThread) {
++  FakeLayer layer;
++  layer.clip_rect_ = gfx::Rect(100, 10, 200, 30);
++  std::unique_ptr<CurveElement> element = CurveElement::CreateClipRect(
++      gfx::Rect(0, 0, 400, 300), tokens::kCommandBarGrow);
++  Start(*element, layer);
++  EXPECT_FALSE(element->IsThreaded(&layer));
++  EXPECT_TRUE(layer.models_.empty());
++
++  EXPECT_TRUE(element->Progress(start_ + base::Milliseconds(65), &layer));
++  // Past the halfway point of the rect on an expo curve.
++  EXPECT_GT(layer.clip_rect_.width(), 300);
++  EXPECT_LT(layer.clip_rect_.width(), 400);
++  EXPECT_TRUE(element->Progress(start_ + base::Milliseconds(130), &layer));
++  EXPECT_EQ(layer.clip_rect_, gfx::Rect(0, 0, 400, 300));
++
++  ui::LayerAnimationElement::TargetValue target;
++  element->GetTargetValue(&target);
++  EXPECT_EQ(target.clip_rect, gfx::Rect(0, 0, 400, 300));
++}
++
++TEST_F(RacMotionTest, CurveRoundedCorners) {
++  FakeLayer layer;
++  layer.rounded_corners_ = gfx::RoundedCornersF(8);
++  std::unique_ptr<CurveElement> element = CurveElement::CreateRoundedCorners(
++      gfx::RoundedCornersF(12), tokens::kPopover);
++  Start(*element, layer);
++  EXPECT_TRUE(element->Progress(start_ + base::Milliseconds(60), &layer));
++  EXPECT_GT(layer.rounded_corners_.upper_left(), 8);
++  EXPECT_LT(layer.rounded_corners_.upper_left(), 12);
++  EXPECT_TRUE(element->Progress(start_ + base::Milliseconds(120), &layer));
++  EXPECT_EQ(layer.rounded_corners_, gfx::RoundedCornersF(12));
++}
++
++// Counts what a SpringAnimation tells its owner.
++class Recorder : public gfx::AnimationDelegate {
++ public:
++  void AnimationProgressed(const gfx::Animation* animation) override {
++    values_.push_back(animation->GetCurrentValue());
++  }
++  void AnimationEnded(const gfx::Animation* animation) override { ++ended_; }
++
++  std::vector<double> values_;
++  int ended_ = 0;
++};
++
++TEST_F(RacMotionTest, SpringAnimationReachesItsTarget) {
++  gfx::Animation::SetPrefersReducedMotionForTesting(false);
++  Recorder recorder;
++  SpringAnimation animation(&recorder, tokens::kSpringDock, 280);
++  animation.Show();
++  EXPECT_TRUE(animation.is_animating());
++  EXPECT_TRUE(animation.IsShowing());
++  task_environment_.FastForwardBy(base::Seconds(1));
++  EXPECT_FALSE(animation.is_animating());
++  EXPECT_EQ(animation.GetCurrentValue(), 1);
++  EXPECT_EQ(recorder.ended_, 1);
++  ASSERT_GT(recorder.values_.size(), 5u);
++  // kSpringDock bounces a little past its target.
++  double highest = 0;
++  for (double value : recorder.values_) {
++    highest = std::max(highest, value);
++  }
++  EXPECT_GT(highest, 1);
++  EXPECT_LT(highest, 1.01);
++}
++
++TEST_F(RacMotionTest, SpringAnimationReversesWithoutAJolt) {
++  gfx::Animation::SetPrefersReducedMotionForTesting(false);
++  Recorder recorder;
++  SpringAnimation animation(&recorder, tokens::kSpringDock, 280);
++  animation.Show();
++  task_environment_.FastForwardBy(base::Milliseconds(50));
++  const double value = animation.GetCurrentValue();
++  const double velocity = animation.GetCurrentVelocity();
++  EXPECT_GT(velocity, 0);
++  animation.Hide();
++  // Same place and speed right after the turn.
++  EXPECT_DOUBLE_EQ(animation.GetCurrentVelocity(), velocity);
++  task_environment_.FastForwardBy(base::Seconds(1));
++  EXPECT_EQ(animation.GetCurrentValue(), 0);
++  EXPECT_GT(value, 0);
++}
++
++TEST_F(RacMotionTest, SpringAnimationJumpsUnderReducedMotion) {
++  gfx::Animation::SetPrefersReducedMotionForTesting(true);
++  EXPECT_TRUE(motion::ReducedMotion());
++  Recorder recorder;
++  SpringAnimation animation(&recorder, tokens::kSpringDock, 280);
++  animation.Show();
++  EXPECT_FALSE(animation.is_animating());
++  EXPECT_EQ(animation.GetCurrentValue(), 1);
++  ASSERT_EQ(recorder.values_.size(), 1u);
++  EXPECT_EQ(recorder.ended_, 1);
++  gfx::Animation::SetPrefersReducedMotionForTesting(false);
++}
++
++// Turns back from inside the last frame, as an owner may.
++class TurnBack : public Recorder {
++ public:
++  void AnimationProgressed(const gfx::Animation* animation) override {
++    Recorder::AnimationProgressed(animation);
++    if (!turned_ && animation->GetCurrentValue() == 1) {
++      turned_ = true;
++      animation_->Hide();
++    }
++  }
++
++  raw_ptr<SpringAnimation> animation_ = nullptr;
++  bool turned_ = false;
++};
++
++TEST_F(RacMotionTest, SpringAnimationCanTurnBackOnItsLastFrame) {
++  gfx::Animation::SetPrefersReducedMotionForTesting(false);
++  TurnBack owner;
++  SpringAnimation animation(&owner, tokens::kSpringDock, 280);
++  owner.animation_ = &animation;
++  animation.Show();
++  task_environment_.FastForwardBy(base::Seconds(2));
++  EXPECT_TRUE(owner.turned_);
++  EXPECT_FALSE(animation.is_animating());
++  EXPECT_EQ(animation.GetCurrentValue(), 0);
++  EXPECT_EQ(owner.ended_, 1);
++}
++
++}  // namespace
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/motion/rac_spring_unittest.cc
+@@ -0,0 +1,239 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/motion/rac_spring.h"
++
++#include <algorithm>
++#include <cmath>
++#include <numbers>
++
++#include "base/time/time.h"
++#include "chrome/browser/ui/views/rac/rac_tokens.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++// Expected values come from spring_ref.py, a standard-library reference that
++// checks its closed forms against a numerical solution. Times are in
++// microseconds and are the first whole microsecond at or after the exact
++// time.
++struct TableRow {
++  const char* name;
++  Spring spring;
++  int64_t ninety_percent_us;
++  int64_t within_one_percent_us;
++  double overshoot;
++  // The design table, in milliseconds. Timings must stay within 1 ms of it.
++  int table_ninety_percent_ms;
++  int table_within_one_percent_ms;
++};
++
++constexpr TableRow kTable[] = {
++    {"kSpringPage", tokens::kSpringPage, 154768, 264132, 0, 155, 264},
++    {"kSpringDock", tokens::kSpringDock, 101361, 142045, 0.006288, 101, 142},
++    {"kSpringMove", tokens::kSpringMove, 136196, 232436, 0, 136, 233},
++    {"kSpringReveal", tokens::kSpringReveal, 84449, 192801, 0.022566, 84, 192},
++    {"kSpringExit", tokens::kSpringExit, 99051, 169045, 0, 99, 169},
++    {"kSpringGrow", tokens::kSpringGrow, 119241, 179529, 0.001524, 0, 0},
++};
++
++int64_t Us(base::TimeDelta time) {
++  return time.InMicroseconds();
++}
++
++TEST(RacSpringTest, MatchesTheReferenceTable) {
++  for (const TableRow& row : kTable) {
++    SCOPED_TRACE(row.name);
++    EXPECT_NEAR(Us(row.spring.TimeToReach(0.9)), row.ninety_percent_us, 1);
++    EXPECT_NEAR(Us(row.spring.SettleTime(0.01)), row.within_one_percent_us, 1);
++    EXPECT_NEAR(row.spring.Overshoot(), row.overshoot, 1e-6);
++  }
++}
++
++TEST(RacSpringTest, MatchesTheDesignTableWithinOneMillisecond) {
++  for (const TableRow& row : kTable) {
++    if (!row.table_ninety_percent_ms) {
++      continue;
++    }
++    SCOPED_TRACE(row.name);
++    EXPECT_NEAR(row.spring.TimeToReach(0.9).InMillisecondsF(),
++                row.table_ninety_percent_ms, 1.0);
++    EXPECT_NEAR(row.spring.SettleTime(0.01).InMillisecondsF(),
++                row.table_within_one_percent_ms, 1.0);
++  }
++}
++
++TEST(RacSpringTest, DiasDockSpringForTheSideBySide) {
++  const Spring dia(0.215, 0.79);
++  EXPECT_NEAR(Us(dia.TimeToReach(0.9)), 100693, 1);
++  EXPECT_NEAR(Us(dia.SettleTime(0.01)), 220431, 1);
++  EXPECT_NEAR(dia.Overshoot(), 0.017457, 1e-6);
++}
++
++struct Sample {
++  int ms;
++  double offset;
++  double velocity;
++};
++
++// A motion that starts 120 DIP short of rest and moving away at 900 DIP/s.
++void ExpectSamples(const Spring& spring, const Sample (&samples)[5]) {
++  const SpringMotion motion{spring, -120, 900};
++  for (const Sample& sample : samples) {
++    SCOPED_TRACE(sample.ms);
++    EXPECT_NEAR(motion.OffsetAt(base::Milliseconds(sample.ms)), sample.offset,
++                1e-6);
++    EXPECT_NEAR(motion.VelocityAt(base::Milliseconds(sample.ms)),
++                sample.velocity, 1e-6);
++  }
++}
++
++TEST(RacSpringTest, CriticallyDamped) {
++  ExpectSamples(Spring(0.25, 1.0), {{0, -120, 900},
++                                    {16, -102.913193502, 1171.150250648},
++                                    {50, -64.263823774, 1012.912481804},
++                                    {100, -26.859884015, 503.666784829},
++                                    {200, -3.564070068, 75.691352367}});
++}
++
++TEST(RacSpringTest, Underdamped) {
++  ExpectSamples(Spring(0.2, 0.85), {{0, -120, 900},
++                                    {16, -99.318053819, 1540.382558947},
++                                    {50, -48.340023526, 1265.216608675},
++                                    {100, -8.907390142, 388.260544443},
++                                    {200, 0.678743333, -8.831008257}});
++}
++
++TEST(RacSpringTest, Overdamped) {
++  ExpectSamples(Spring(0.3, 1.6), {{0, -120, 900},
++                                   {16, -106.512018437, 789.872510923},
++                                   {50, -82.871206172, 610.117012608},
++                                   {100, -57.370362884, 421.794474906},
++                                   {200, -27.505312771, 202.200890897}});
++}
++
++TEST(RacSpringTest, VelocityIsTheRateOfChange) {
++  constexpr base::TimeDelta kStep = base::Microseconds(1);
++  for (const Spring& spring :
++       {Spring(0.25, 1.0), Spring(0.2, 0.85), Spring(0.3, 1.6),
++        Spring(0.2, 0.3)}) {
++    const SpringMotion motion{spring, 80, -2500};
++    for (int ms = 1; ms < 400; ms += 13) {
++      const base::TimeDelta t = base::Milliseconds(ms);
++      const double slope =
++          (motion.OffsetAt(t + kStep) - motion.OffsetAt(t - kStep)) /
++          (2 * kStep.InSecondsF());
++      EXPECT_NEAR(motion.VelocityAt(t), slope, 1e-3);
++    }
++  }
++}
++
++TEST(RacSpringTest, NearCriticalRatiosAreContinuous) {
++  const SpringMotion critical{Spring(0.25, 1.0), -120, 900};
++  for (double ratio : {1 - 1e-7, 1 + 1e-7}) {
++    const SpringMotion near{Spring(0.25, ratio), -120, 900};
++    for (int ms = 0; ms < 300; ms += 3) {
++      EXPECT_NEAR(near.OffsetAt(base::Milliseconds(ms)),
++                  critical.OffsetAt(base::Milliseconds(ms)), 1e-4);
++    }
++  }
++}
++
++TEST(RacSpringTest, UnitMoveStartsAtZeroAndRests) {
++  for (const TableRow& row : kTable) {
++    SCOPED_TRACE(row.name);
++    EXPECT_EQ(row.spring.ValueAt(base::TimeDelta()), 0);
++    EXPECT_EQ(row.spring.VelocityAt(base::TimeDelta()), 0);
++    EXPECT_NEAR(row.spring.ValueAt(base::Seconds(2)), 1, 1e-9);
++    EXPECT_NEAR(row.spring.VelocityAt(base::Milliseconds(0), 3.5), 3.5, 1e-12);
++  }
++}
++
++TEST(RacSpringTest, SettlesWithAStartingSpeed) {
++  // Each overshoots rest or first moves away from it.
++  EXPECT_NEAR(Us(SpringMotion{tokens::kSpringPage, 100, -8000}.SettleTime(1)),
++              290877, 1);
++  EXPECT_NEAR(Us(SpringMotion{Spring(0.3, 1.6), 100, -8000}.SettleTime(1)),
++              497864, 1);
++  EXPECT_NEAR(Us(SpringMotion{tokens::kSpringReveal, 100, 2000}.SettleTime(1)),
++              207797, 1);
++  const SpringMotion still{tokens::kSpringReveal, 0, 0};
++  EXPECT_EQ(still.SettleTime(1), base::TimeDelta());
++}
++
++TEST(RacSpringTest, RetargetKeepsPlaceAndSpeed) {
++  // The pointer leaves mid-reveal: the sidebar heads back out on the exit
++  // spring from where it is, as fast as it was going.
++  const SpringMotion in{tokens::kSpringReveal, -280, 0};
++  const base::TimeDelta elapsed = base::Milliseconds(40);
++  const SpringMotion out = in.Retarget(elapsed, -280, tokens::kSpringExit);
++  EXPECT_EQ(out.spring, tokens::kSpringExit);
++  EXPECT_DOUBLE_EQ(out.OffsetAt(base::TimeDelta()) - 280,
++                   in.OffsetAt(elapsed));
++  EXPECT_DOUBLE_EQ(out.VelocityAt(base::TimeDelta()), in.VelocityAt(elapsed));
++}
++
++// The space pager's spring before it moved onto rac::Spring, verbatim.
++constexpr double kPagerOmega = 2 * std::numbers::pi / 0.25;
++
++struct PagerSpring {
++  float offset = 0;
++  float velocity = 0;
++
++  float OffsetAt(base::TimeDelta time) const {
++    const double t = std::max(0.0, time.InSecondsF());
++    const double rate = velocity + kPagerOmega * offset;
++    return (offset + rate * t) * std::exp(-kPagerOmega * t);
++  }
++  float VelocityAt(base::TimeDelta time) const {
++    const double t = std::max(0.0, time.InSecondsF());
++    const double rate = velocity + kPagerOmega * offset;
++    return (rate - kPagerOmega * (offset + rate * t)) *
++           std::exp(-kPagerOmega * t);
++  }
++  base::TimeDelta Duration() const {
++    constexpr base::TimeDelta kStep = base::Hertz(240);
++    constexpr base::TimeDelta kLongest = base::Milliseconds(1500);
++    base::TimeDelta time = kStep;
++    while (time < kLongest && (std::abs(OffsetAt(time)) > 0.25f ||
++                               std::abs(VelocityAt(time)) > 15.0f)) {
++      time += kStep;
++    }
++    return time;
++  }
++};
++
++TEST(RacSpringTest, PagerMovesWithoutChange) {
++  for (float offset = -600; offset <= 600; offset += 7.25f) {
++    for (float velocity = -6000; velocity <= 6000; velocity += 123.5f) {
++      const PagerSpring old{offset, velocity};
++      const SpringMotion now{tokens::kSpringPage, offset, velocity};
++      ASSERT_EQ(old.Duration(), now.RestTime(tokens::kSpringRest))
++          << offset << ", " << velocity;
++      for (base::TimeDelta t; t < base::Milliseconds(400);
++           t += base::Hertz(240)) {
++        ASSERT_EQ(old.OffsetAt(t), static_cast<float>(now.OffsetAt(t)));
++        ASSERT_EQ(old.VelocityAt(t), static_cast<float>(now.VelocityAt(t)));
++      }
++    }
++  }
++}
++
++TEST(RacSpringTest, PagerRestTimes) {
++  struct {
++    float offset, velocity;
++    int64_t rest_us;
++  } const kCases[] = {{300, 0, 379106},    {-300, 0, 379106},
++                      {150, -2000, 316616}, {12, 0, 233296},
++                      {0.2f, 0, 4166},      {300, 4000, 395770}};
++  for (const auto& c : kCases) {
++    EXPECT_EQ(Us(SpringMotion{tokens::kSpringPage, c.offset, c.velocity}
++                     .RestTime(tokens::kSpringRest)),
++              c.rest_us);
++  }
++}
++
++}  // namespace
++}  // namespace rac

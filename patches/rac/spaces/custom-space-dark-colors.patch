@@ -1,0 +1,735 @@
+--- a/chrome/browser/rac/spaces/BUILD.gn
++++ b/chrome/browser/rac/spaces/BUILD.gn
+@@ -10,6 +10,8 @@ source_set("spaces") {
+   sources = [
+     "space.cc",
+     "space.h",
++    "space_colors.cc",
++    "space_colors.h",
+     "spaces_prefs.cc",
+     "spaces_prefs.h",
+     "spaces_service.cc",
+@@ -59,6 +61,7 @@ source_set("browser") {
+ # Chromium's unit_tests, which takes hours to build.
+ test("rac_spaces_unittests") {
+   sources = [
++    "space_colors_unittest.cc",
+     "spaces_service_unittest.cc",
+     "spaces_store_unittest.cc",
+   ]
+--- a/chrome/browser/rac/spaces/space.cc
++++ b/chrome/browser/rac/spaces/space.cc
+@@ -4,13 +4,19 @@
+ 
+ #include "chrome/browser/rac/spaces/space.h"
+ 
++#include <algorithm>
+ #include <array>
++#include <optional>
++#include <string>
+ #include <tuple>
+ #include <utility>
+ 
+ #include "base/json/values_util.h"
++#include "base/no_destructor.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
++#include "base/synchronization/lock.h"
++#include "chrome/browser/rac/spaces/space_colors.h"
+ 
+ namespace rac {
+ 
+@@ -23,9 +29,10 @@ constexpr char kIconKey[] = "icon";
+ constexpr char kThemeKey[] = "theme";
+ 
+ bool IsSrgbHex(const std::string& color) {
+-  uint32_t value = 0;
++  // Six hex digits and nothing else: HexStringToUInt would also take a sign
++  // or an "0x".
+   return color.size() == 7 && color[0] == '#' &&
+-         base::HexStringToUInt(std::string_view(color).substr(1), &value);
++         std::all_of(color.begin() + 1, color.end(), base::IsHexDigit<char>);
+ }
+ 
+ struct PresetColors {
+@@ -64,6 +71,36 @@ constexpr std::array<std::tuple<std::str
+                        {"#D7B35D", "#7AA982", 4},
+                        {"#226149", "#26456B", 4}}};
+ 
++// A custom color's stops for one mode. Deriving them takes about 0.1 ms, and
++// every view that paints the wash asks on every paint, so recent answers are
++// kept: enough for several windows on different custom spaces in both modes.
++SpaceStops CustomStops(const std::string& color1,
++                       const std::string& color2,
++                       bool dark) {
++  struct Entry {
++    std::string color1, color2;
++    bool dark;
++    SpaceStops stops;
++  };
++  static base::NoDestructor<base::Lock> lock;
++  static base::NoDestructor<std::array<std::optional<Entry>, 8>> cache;
++  static size_t next = 0;
++  base::AutoLock hold(*lock);
++  for (const std::optional<Entry>& entry : *cache) {
++    if (entry && entry->dark == dark && entry->color1 == color1 &&
++        entry->color2 == color2) {
++      return entry->stops;
++    }
++  }
++  std::optional<Entry>& entry = (*cache)[next];
++  next = (next + 1) % cache->size();
++  entry = Entry{color1, color2, dark,
++                dark ? WithTitleContrastFloor(
++                           DeriveDarkStops(color1, color2), true)
++                     : WithTitleContrastFloor({color1, color2}, false)};
++  return entry->stops;
++}
++
+ }  // namespace
+ 
+ SpaceTheme SpaceTheme::Preset(size_t index) {
+@@ -82,16 +119,15 @@ std::string_view SpaceTheme::PresetSwatc
+   return kPresets[index % kPresets.size()].swatch;
+ }
+ 
+-std::pair<std::string_view, std::string_view> SpaceTheme::GetStops(
+-    bool dark) const {
+-  if (dark) {
+-    for (const auto& preset : kPresets) {
+-      if (color1 == preset.light1 && color2 == preset.light2) {
+-        return {preset.dark1, preset.dark2};
+-      }
++std::pair<std::string, std::string> SpaceTheme::GetStops(bool dark) const {
++  for (const auto& preset : kPresets) {
++    if (color1 == preset.light1 && color2 == preset.light2) {
++      // Dia tuned these, so they're painted as they are.
++      return dark ? SpaceStops(preset.dark1, preset.dark2)
++                  : SpaceStops(color1, color2);
+     }
+   }
+-  return {color1, color2};
++  return CustomStops(color1, color2, dark);
+ }
+ 
+ base::DictValue SpaceTheme::ToDict() const {
+@@ -111,8 +147,9 @@ std::optional<SpaceTheme> SpaceTheme::Fr
+     return std::nullopt;
+   }
+   SpaceTheme theme;
+-  theme.color1 = *color1;
+-  theme.color2 = *color2;
++  // Upper case, so every comparison with a preset can be exact.
++  theme.color1 = base::ToUpperASCII(*color1);
++  theme.color2 = base::ToUpperASCII(*color2);
+   for (const auto& [legacy1, legacy2, preset] : kLegacyPresets) {
+     if (theme.color1 == legacy1 && theme.color2 == legacy2) {
+       theme.color1 = kPresets[preset].light1;
+--- a/chrome/browser/rac/spaces/space.h
++++ b/chrome/browser/rac/spaces/space.h
+@@ -33,9 +33,11 @@ struct SpaceTheme {
+ 
+   base::DictValue ToDict() const;
+ 
+-  // The stops to paint. Only the light pair is stored, so a preset's dark
+-  // pair is looked up from it; other colors are used as they are.
+-  std::pair<std::string_view, std::string_view> GetStops(bool dark) const;
++  // The "#RRGGBB" stops to paint. Only the light pair is stored. A preset
++  // paints Dia's own pair for the mode. Any other color is used as it is in
++  // light and gets a derived pair in dark, and either is kept readable under
++  // tab titles (see space_colors.h).
++  std::pair<std::string, std::string> GetStops(bool dark) const;
+ 
+   std::string color1 = "#FFFFD7";
+   std::string color2 = "#FFD9FB";
+--- /dev/null
++++ b/chrome/browser/rac/spaces/space_colors.cc
+@@ -0,0 +1,317 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/spaces/space_colors.h"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <limits>
++#include <numbers>
++
++#include "base/check.h"
++#include "base/strings/stringprintf.h"
++
++// Each step below is rounded to a double on its own, so the 8-bit results
++// don't depend on whether the compiler fuses a multiply and an add.
++#pragma STDC FP_CONTRACT OFF
++
++namespace rac {
++
++namespace {
++
++// Dia only hand-tuned dark pairs for its seven presets. A color the user
++// picks gets a dark pair from a rule fitted to those pairs, in OKLCH
++// (Bjorn Ottosson's OKLab) so that it keeps its hue as it darkens:
++//   dark1 = (clamp(0.58 + 0.45 * (L1 - 0.62), 0.30, 0.70), 1.12 * C1, h1)
++//   dark2 = (0.38, clamp(max(C2, 0.6 * C1), 0.05, 0.10), halfway h2 to h1)
++// A gray pair keeps dark2 gray. Presets never come through here: they keep
++// Dia's own pairs.
++
++using Rgb = std::array<double, 3>;
++
++// What PaintSpaceTint lays the stops over, and at what opacity.
++constexpr Rgb kLightBase = {1, 1, 1};
++constexpr Rgb kDarkBase = {0x1C / 255.0, 0x1A / 255.0, 0x1F / 255.0};
++constexpr double kLightAlpha = 0x4D / 255.0;
++constexpr double kDarkAlpha = 0x2E / 255.0;
++
++// kColorRacTabTitleUnselected: black at 0xAD in light, white at 0xC7 in dark.
++constexpr Rgb kTitleLight = {0, 0, 0};
++constexpr Rgb kTitleDark = {1, 1, 1};
++constexpr double kTitleLightAlpha = 0xAD / 255.0;
++constexpr double kTitleDarkAlpha = 0xC7 / 255.0;
++
++// WCAG AA for normal text.
++constexpr double kContrastFloor = 4.5;
++
++// Below this chroma a color is gray and its hue means nothing.
++constexpr double kGrayChroma = 0.02;
++
++// Two stops closer than this in OKLab look like one color under the wash,
++// so the theme counts as flat.
++constexpr double kFlatDistance = 0.02;
++
++constexpr double kRadiansPerDegree = std::numbers::pi / 180.0;
++constexpr double kDegreesPerRadian = 180.0 / std::numbers::pi;
++
++struct Oklab {
++  double L, a, b;
++};
++
++struct Oklch {
++  double L, C, h;
++};
++
++// The remainder with the sign of `y`, like a modulo on angles.
++double Modulo(double x, double y) {
++  double mod = std::fmod(x, y);
++  if (mod == 0) {
++    return std::copysign(0.0, y);
++  }
++  if ((y < 0) != (mod < 0)) {
++    mod += y;
++  }
++  return mod;
++}
++
++int HexNibble(char c) {
++  if (c >= '0' && c <= '9') {
++    return c - '0';
++  }
++  if (c >= 'a' && c <= 'f') {
++    return c - 'a' + 10;
++  }
++  if (c >= 'A' && c <= 'F') {
++    return c - 'A' + 10;
++  }
++  return -1;
++}
++
++// SpaceTheme::FromDict has already checked saved colors, so anything else is
++// a bug in the caller. Black keeps the paint code from crashing on it.
++Rgb HexToRgb(std::string_view hex) {
++  Rgb rgb = {0, 0, 0};
++  bool valid = hex.size() == 7 && hex[0] == '#';
++  for (size_t i = 0; valid && i < 3; ++i) {
++    const int high = HexNibble(hex[1 + 2 * i]);
++    const int low = HexNibble(hex[2 + 2 * i]);
++    if (high < 0 || low < 0) {
++      valid = false;
++      break;
++    }
++    rgb[i] = (high * 16 + low) / 255.0;
++  }
++  DCHECK(valid) << hex;
++  return valid ? rgb : Rgb{0, 0, 0};
++}
++
++std::string RgbToHex(const Rgb& rgb) {
++  int bytes[3];
++  for (size_t i = 0; i < 3; ++i) {
++    // The default rounding mode rounds halves to even.
++    bytes[i] = static_cast<int>(
++        std::nearbyint(std::min(1.0, std::max(0.0, rgb[i])) * 255));
++  }
++  return base::StringPrintf("#%02X%02X%02X", bytes[0], bytes[1], bytes[2]);
++}
++
++double ToLinear(double c) {
++  return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
++}
++
++double ToSrgb(double c) {
++  return c <= 0.0031308 ? 12.92 * c
++                        : 1.055 * std::pow(c, 1 / 2.4) - 0.055;
++}
++
++double Cbrt(double x) {
++  return std::copysign(std::pow(std::abs(x), 1.0 / 3), x);
++}
++
++Oklab RgbToOklab(const Rgb& rgb) {
++  const double r = ToLinear(rgb[0]);
++  const double g = ToLinear(rgb[1]);
++  const double b = ToLinear(rgb[2]);
++  const double l = Cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
++  const double m = Cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
++  const double s = Cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
++  return {0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
++          1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
++          0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s};
++}
++
++Rgb OklabToLinear(const Oklab& lab) {
++  const double l = std::pow(lab.L + 0.3963377774 * lab.a + 0.2158037573 * lab.b,
++                            3.0);
++  const double m = std::pow(lab.L - 0.1055613458 * lab.a - 0.0638541728 * lab.b,
++                            3.0);
++  const double s = std::pow(lab.L - 0.0894841775 * lab.a - 1.2914855480 * lab.b,
++                            3.0);
++  return {4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
++          -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
++          -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s};
++}
++
++Oklch RgbToOklch(const Rgb& rgb) {
++  const Oklab lab = RgbToOklab(rgb);
++  return {lab.L, std::hypot(lab.a, lab.b),
++          Modulo(std::atan2(lab.b, lab.a) * kDegreesPerRadian, 360)};
++}
++
++Rgb OklchToLinear(double L, double C, double h) {
++  const double radians = h * kRadiansPerDegree;
++  return OklabToLinear({L, C * std::cos(radians), C * std::sin(radians)});
++}
++
++bool FitsSrgb(const Rgb& linear) {
++  for (double x : linear) {
++    if (!(x >= -1e-6 && x <= 1 + 1e-6)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// Keeps L and h and lowers chroma until sRGB can show the color. Clipping the
++// channels instead would shift the hue.
++Rgb OklchToRgb(double L, double C, double h) {
++  if (!FitsSrgb(OklchToLinear(L, C, h))) {
++    double lo = 0.0;
++    double hi = C;
++    for (int i = 0; i < 40; ++i) {
++      const double mid = (lo + hi) / 2;
++      if (FitsSrgb(OklchToLinear(L, mid, h))) {
++        lo = mid;
++      } else {
++        hi = mid;
++      }
++    }
++    C = lo;
++  }
++  const Rgb linear = OklchToLinear(L, C, h);
++  Rgb rgb;
++  for (size_t i = 0; i < 3; ++i) {
++    rgb[i] = ToSrgb(std::min(1.0, std::max(0.0, linear[i])));
++  }
++  return rgb;
++}
++
++double Luminance(const Rgb& rgb) {
++  return 0.2126 * ToLinear(rgb[0]) + 0.7152 * ToLinear(rgb[1]) +
++         0.0722 * ToLinear(rgb[2]);
++}
++
++double Contrast(const Rgb& a, const Rgb& b) {
++  const double la = Luminance(a);
++  const double lb = Luminance(b);
++  return (std::max(la, lb) + 0.05) / (std::min(la, lb) + 0.05);
++}
++
++// `top` at `alpha` over an opaque `bottom`, in sRGB as Skia blends.
++Rgb Over(const Rgb& top, double alpha, const Rgb& bottom) {
++  return {top[0] * alpha + bottom[0] * (1 - alpha),
++          top[1] * alpha + bottom[1] * (1 - alpha),
++          top[2] * alpha + bottom[2] * (1 - alpha)};
++}
++
++// From hue `a` toward hue `b` by `t`, the short way round.
++double MixHue(double a, double b, double t) {
++  const double d = Modulo(b - a + 180, 360) - 180;
++  return Modulo(a + d * t, 360);
++}
++
++// The stop as painted: over the window's base, at the wash's opacity.
++Rgb Wash(std::string_view stop, bool dark) {
++  return Over(HexToRgb(stop), dark ? kDarkAlpha : kLightAlpha,
++              dark ? kDarkBase : kLightBase);
++}
++
++}  // namespace
++
++SpaceStops DeriveDarkStops(std::string_view color1, std::string_view color2) {
++  const Oklch first = RgbToOklch(HexToRgb(color1));
++  const Oklch second = RgbToOklch(HexToRgb(color2));
++  const double L1 = first.L;
++  const double C1 = first.C;
++  const double C2 = second.C;
++  double h1 = first.h;
++  double h2 = second.h;
++  // A gray has no hue to keep; borrow the other stop's, else stay gray.
++  if (C1 < kGrayChroma && C2 >= kGrayChroma) {
++    h1 = h2;
++  }
++  if (C2 < kGrayChroma) {
++    h2 = h1;
++  }
++  const Oklch dark1 = {
++      std::min(0.70, std::max(0.30, 0.58 + 0.45 * (L1 - 0.62))), 1.12 * C1, h1};
++  const double chroma2 =
++      std::max(C1, C2) < kGrayChroma
++          ? 0.0
++          : std::min(0.10, std::max(0.05, std::max(C2, 0.6 * C1)));
++  const Oklch dark2 = {0.38, chroma2, MixHue(h2, h1, 0.5)};
++
++  const Rgb rgb1 = OklchToRgb(dark1.L, dark1.C, dark1.h);
++  const Rgb rgb2 = OklchToRgb(dark2.L, dark2.C, dark2.h);
++  const Oklab lab1 = RgbToOklab(HexToRgb(color1));
++  const Oklab lab2 = RgbToOklab(HexToRgb(color2));
++  if (std::hypot(lab1.L - lab2.L, lab1.a - lab2.a, lab1.b - lab2.b) <
++      kFlatDistance) {
++    // A flat theme stays flat: the OKLab midpoint of the two stops, at the
++    // color's own hue. Picked by eye over the first stop alone and over a
++    // fixed lightness; it reads as the gradient's average.
++    const Oklab a = RgbToOklab(rgb1);
++    const Oklab b = RgbToOklab(rgb2);
++    const double L = (a.L + b.L) / 2;
++    const double A = (a.a + b.a) / 2;
++    const double B = (a.b + b.b) / 2;
++    std::string flat = RgbToHex(OklchToRgb(L, std::hypot(A, B), h1));
++    return {flat, flat};
++  }
++  return {RgbToHex(rgb1), RgbToHex(rgb2)};
++}
++
++double TitleContrast(std::string_view color1,
++                     std::string_view color2,
++                     bool dark) {
++  const Rgb& title = dark ? kTitleDark : kTitleLight;
++  const double alpha = dark ? kTitleDarkAlpha : kTitleLightAlpha;
++  const Rgb a = HexToRgb(color1);
++  const Rgb b = HexToRgb(color2);
++  // Both ends and three points between, since contrast isn't linear along
++  // the gradient. Each is a stop of its own so that it is rounded to 8 bits,
++  // as the gradient's pixels are.
++  double worst = std::numeric_limits<double>::infinity();
++  for (double t : {0.0, 0.25, 0.5, 0.75, 1.0}) {
++    const Rgb mixed = {a[0] * (1 - t) + b[0] * t, a[1] * (1 - t) + b[1] * t,
++                       a[2] * (1 - t) + b[2] * t};
++    const Rgb ground = Wash(RgbToHex(mixed), dark);
++    worst = std::min(worst, Contrast(Over(title, alpha, ground), ground));
++  }
++  return worst;
++}
++
++SpaceStops WithTitleContrastFloor(SpaceStops stops, bool dark) {
++  // A step is 0.01 of lightness, so 100 steps cover the whole range.
++  for (int i = 0; i < 100; ++i) {
++    if (TitleContrast(stops.first, stops.second, dark) >= kContrastFloor) {
++      break;
++    }
++    const SpaceStops before = stops;
++    for (std::string* stop : {&stops.first, &stops.second}) {
++      const Oklch lch = RgbToOklch(HexToRgb(*stop));
++      const double L = dark ? lch.L - 0.01 : lch.L + 0.01;
++      *stop = RgbToHex(OklchToRgb(std::max(0.0, std::min(1.0, L)), lch.C,
++                                  lch.h));
++    }
++    // At black or white there's nowhere further to go.
++    if (stops == before) {
++      break;
++    }
++  }
++  return stops;
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/spaces/space_colors.h
+@@ -0,0 +1,31 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_SPACES_SPACE_COLORS_H_
++#define CHROME_BROWSER_RAC_SPACES_SPACE_COLORS_H_
++
++#include <string>
++#include <string_view>
++#include <utility>
++
++namespace rac {
++
++// "#RRGGBB" stops for a color that isn't a preset.
++using SpaceStops = std::pair<std::string, std::string>;
++
++// The dark pair for a light pair, in OKLCH. A flat pair stays flat.
++SpaceStops DeriveDarkStops(std::string_view color1, std::string_view color2);
++
++// Moves both stops' lightness away from the tab title until an unselected
++// title reads at 4.5:1 on the wash.
++SpaceStops WithTitleContrastFloor(SpaceStops stops, bool dark);
++
++// The lowest unselected-title contrast across the wash, for tests.
++double TitleContrast(std::string_view color1,
++                     std::string_view color2,
++                     bool dark);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_SPACES_SPACE_COLORS_H_
+--- /dev/null
++++ b/chrome/browser/rac/spaces/space_colors_unittest.cc
+@@ -0,0 +1,169 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/spaces/space_colors.h"
++
++#include <cmath>
++#include <string>
++#include <string_view>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++struct Case {
++  const char* name;
++  const char* color1;
++  const char* color2;
++  // DeriveDarkStops(color1, color2), from the Python prototype. The title
++  // floor leaves each of these, and the light pair, as they are.
++  const char* dark1;
++  const char* dark2;
++};
++
++// Generated by gen_expected.py from the prototype's derive.py; its
++// first eight rows are the prototype's CUSTOM colors.
++constexpr Case kCases[] = {
++    {"Violet", "#5E4AE3", "#9B8CFF", "#6245F5", "#3E3875"},
++    {"Coral", "#FF6B6B", "#FF6B6B", "#A93538", "#A93538"},
++    {"Midnight", "#1B2A49", "#3E5C99", "#3D4F76", "#254077"},
++    {"Mint", "#A8E6CF", "#DCEDC1", "#68AD95", "#2B4B2F"},
++    {"Sunset", "#FF9A3C", "#FF4F81", "#D27400", "#6E2A1C"},
++    {"Graphite", "#3A3A3C", "#3A3A3C", "#4D4D4E", "#4D4D4E"},
++    {"Paper", "#F4F1EA", "#F4F1EA", "#706E6B", "#706E6B"},
++    {"Lime", "#C6FF00", "#00E5FF", "#87AF00", "#004F39"},
++    {"Flat violet", "#5E4AE3", "#5E4AE3", "#4D42B4", "#4D42B4"},
++    {"Flat coral lowercase", "#ff6b6b", "#FF6B6B", "#A93538", "#A93538"},
++    {"Gray pair", "#808080", "#C0C0C0", "#777777", "#424242"},
++    {"Gray then color", "#808080", "#5E4AE3", "#777777", "#3B3975"},
++    {"Color then gray", "#5E4AE3", "#808080", "#6245F5", "#3B3975"},
++    {"Across red", "#FF5A8A", "#FF8A3C", "#EA286F", "#6E2922"},
++    {"Black", "#000000", "#000000", "#383838", "#383838"},
++    {"White", "#FFFFFF", "#FFFFFF", "#6F6F6F", "#6F6F6F"},
++};
++
++SpaceStops Stops(const char* first, const char* second) {
++  return {first, second};
++}
++
++struct Lab {
++  double L, a, b;
++};
++
++// sRGB "#RRGGBB" to OKLab, to measure how far two colors look apart.
++Lab ToLab(std::string_view hex) {
++  auto channel = [&](size_t i) {
++    const double c =
++        std::stoi(std::string(hex.substr(1 + 2 * i, 2)), nullptr, 16) / 255.0;
++    return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
++  };
++  const double r = channel(0), g = channel(1), b = channel(2);
++  const double l = std::cbrt(0.4122214708 * r + 0.5363325363 * g +
++                             0.0514459929 * b);
++  const double m = std::cbrt(0.2119034982 * r + 0.6806995451 * g +
++                             0.1073969566 * b);
++  const double s = std::cbrt(0.0883024619 * r + 0.2817188376 * g +
++                             0.6299787005 * b);
++  return {0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
++          1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
++          0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s};
++}
++
++double Distance(std::string_view a, std::string_view b) {
++  const Lab x = ToLab(a);
++  const Lab y = ToLab(b);
++  return std::hypot(x.L - y.L, x.a - y.a, x.b - y.b);
++}
++
++TEST(SpaceColorsTest, DerivesTheDarkPairFromTheLightPair) {
++  for (const Case& c : kCases) {
++    SCOPED_TRACE(c.name);
++    EXPECT_EQ(DeriveDarkStops(c.color1, c.color2), Stops(c.dark1, c.dark2));
++  }
++}
++
++TEST(SpaceColorsTest, AFlatPairStaysFlat) {
++  for (const char* color :
++       {"#FF6B6B", "#5E4AE3", "#F4F1EA", "#3A3A3C", "#FF0080", "#00FF00"}) {
++    SCOPED_TRACE(color);
++    const SpaceStops dark = DeriveDarkStops(color, color);
++    EXPECT_EQ(dark.first, dark.second);
++  }
++  // Letter case doesn't make a pair a gradient.
++  const SpaceStops lower = DeriveDarkStops("#ff6b6b", "#FF6B6B");
++  EXPECT_EQ(lower.first, lower.second);
++  EXPECT_EQ(lower, DeriveDarkStops("#FF6B6B", "#FF6B6B"));
++  // Nor does a difference too small to see under the wash.
++  const SpaceStops near = DeriveDarkStops("#FF6B6B", "#FF6C6B");
++  EXPECT_EQ(near.first, near.second);
++  // But a real gradient doesn't collapse.
++  const SpaceStops gradient = DeriveDarkStops("#5E4AE3", "#9B8CFF");
++  EXPECT_NE(gradient.first, gradient.second);
++}
++
++TEST(SpaceColorsTest, TitlesReadAtTheFloorInBothModes) {
++  for (const Case& c : kCases) {
++    SCOPED_TRACE(c.name);
++    const SpaceStops light =
++        WithTitleContrastFloor(Stops(c.color1, c.color2), false);
++    EXPECT_GE(TitleContrast(light.first, light.second, false), 4.5);
++    const SpaceStops dark = WithTitleContrastFloor(
++        DeriveDarkStops(c.color1, c.color2), true);
++    EXPECT_GE(TitleContrast(dark.first, dark.second, true), 4.5);
++  }
++}
++
++// No color can fall under 4.5:1. The wash is only 30% (light) or 18% (dark)
++// of the stop, so the worst colors are black in light (5.43:1) and white in
++// dark (6.70:1). The floor is there for a change to those numbers, and
++// until then it must leave every stop as it is.
++TEST(SpaceColorsTest, TheFloorLeavesEveryColorAsItIs) {
++  for (const Case& c : kCases) {
++    SCOPED_TRACE(c.name);
++    EXPECT_EQ(WithTitleContrastFloor(Stops(c.color1, c.color2), false),
++              Stops(c.color1, c.color2));
++    EXPECT_EQ(WithTitleContrastFloor(Stops(c.dark1, c.dark2), true),
++              Stops(c.dark1, c.dark2));
++  }
++  EXPECT_GE(TitleContrast("#000000", "#000000", false), 4.5);
++  EXPECT_GE(TitleContrast("#FFFFFF", "#FFFFFF", true), 4.5);
++}
++
++struct Preset {
++  const char* name;
++  const char* light1;
++  const char* light2;
++  const char* dia_dark1;
++  const char* dia_dark2;
++};
++
++// Dia's pairs, as in space.cc. Presets paint these, not derived pairs. The
++// rule is fitted to them, so they show how close it comes.
++constexpr Preset kDiaPresets[] = {
++    {"Red", "#C1575C", "#FCD098", "#CC4A55", "#632E20"},
++    {"Orange", "#D87249", "#FFD1B1", "#C95125", "#65251A"},
++    {"Yellow", "#E3AC38", "#F9E6C0", "#C98400", "#60371E"},
++    {"Green", "#3EB489", "#C8E8AD", "#008B5D", "#00544D"},
++    {"Blue", "#3A88C4", "#CFEFE9", "#007FBD", "#004263"},
++    {"Pink", "#D37B8B", "#D4D5F0", "#BD556B", "#4E5081"},
++    {"Purple", "#5F5B9E", "#E2BEBF", "#625DA5", "#562F43"},
++};
++
++// Neutral is left out. Its stops only name the theme (the window paints it
++// as flat gray), and Dia's dark pair for it is a blue and a pink that no
++// rule would find from its light pair.
++TEST(SpaceColorsTest, DerivedDarkPairsAreNearDiasOwn) {
++  for (const Preset& preset : kDiaPresets) {
++    SCOPED_TRACE(preset.name);
++    const SpaceStops derived =
++        DeriveDarkStops(preset.light1, preset.light2);
++    EXPECT_LT(Distance(derived.first, preset.dia_dark1), 0.06);
++    // Pink's second stop is the outlier, 0.093 away: Dia turns it blue.
++    EXPECT_LT(Distance(derived.second, preset.dia_dark2), 0.10);
++  }
++}
++
++}  // namespace
++}  // namespace rac
+--- a/chrome/browser/rac/spaces/spaces_service_unittest.cc
++++ b/chrome/browser/rac/spaces/spaces_service_unittest.cc
+@@ -154,17 +154,56 @@ TEST_F(SpacesServiceTest, AppearancePres
+ 
+ TEST(SpaceThemeTest, PresetsPaintTheirDarkStopsInDarkMode) {
+   const SpaceTheme orange = SpaceTheme::Preset(2);
+-  EXPECT_EQ(
+-      orange.GetStops(false),
+-      std::make_pair(std::string_view("#D87249"), std::string_view("#FFD1B1")));
++  EXPECT_EQ(orange.GetStops(false),
++            std::make_pair(std::string("#D87249"), std::string("#FFD1B1")));
+   EXPECT_EQ(orange.GetStops(true),
+-            std::make_pair(std::string_view("#C95125"),
+-                           std::string_view("#65251A")));
++            std::make_pair(std::string("#C95125"), std::string("#65251A")));
+ 
++  // Other colors are used as they are in light and get a derived pair in
++  // dark.
+   SpaceTheme custom;
+   custom.color1 = "#123456";
+   custom.color2 = "#654321";
+-  EXPECT_EQ(custom.GetStops(true).first, "#123456");
++  EXPECT_EQ(custom.GetStops(false),
++            std::make_pair(std::string("#123456"), std::string("#654321")));
++  EXPECT_EQ(custom.GetStops(true),
++            std::make_pair(std::string("#2F567F"), std::string("#59344F")));
++  // A flat color stays flat.
++  custom.color2 = custom.color1;
++  EXPECT_EQ(custom.GetStops(true).first, custom.GetStops(true).second);
++
++  // A preset saved in lowercase is still the preset.
++  base::DictValue dict;
++  dict.Set("color1", "#d87249");
++  dict.Set("color2", "#ffd1b1");
++  std::optional<SpaceTheme> lower = SpaceTheme::FromDict(dict);
++  ASSERT_TRUE(lower);
++  EXPECT_EQ(lower->color1, "#D87249");
++  EXPECT_EQ(lower->GetStops(true), orange.GetStops(true));
++
++  // Custom spaces painting one after another each keep their own pair.
++  SpaceTheme violet;
++  violet.color1 = "#5E4AE3";
++  violet.color2 = "#9B8CFF";
++  const auto flat_dark = custom.GetStops(true);
++  const auto violet_dark = violet.GetStops(true);
++  EXPECT_NE(flat_dark, violet_dark);
++  for (int i = 0; i < 3; ++i) {
++    EXPECT_EQ(custom.GetStops(true), flat_dark);
++    EXPECT_EQ(violet.GetStops(true), violet_dark);
++    EXPECT_EQ(violet.GetStops(false),
++              std::make_pair(std::string("#5E4AE3"), std::string("#9B8CFF")));
++  }
++}
++
++TEST(SpaceThemeTest, ColorsMustBeSixHexDigits) {
++  for (const char* color :
++       {"#+12345", "#0x1234", "#12345", "#1234567", "123456#", "#12345G"}) {
++    base::DictValue dict;
++    dict.Set("color1", color);
++    dict.Set("color2", "#123456");
++    EXPECT_FALSE(SpaceTheme::FromDict(dict)) << color;
++  }
+ }
+ 
+ TEST(SpaceThemeTest, OldArcPresetsBecomeDiaPresets) {
