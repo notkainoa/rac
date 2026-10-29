@@ -88,8 +88,47 @@ Installed copies check the feed at launch and then hourly, download the update i
 the background, and install it when rac quits. The feed's address
 (`notkainoa/rac`) is built into rac, in `rac/updates/update-feed.patch`.
 
-Don't mark a release as a prerelease or a draft. GitHub's `latest` link
-skips them, so nobody would get the update.
+Don't mark a good release as a prerelease or a draft. GitHub's `latest`
+link skips them, so nobody would get the update. (Marking a bad one is the
+point of the next section.)
+
+## If a release is bad
+
+Whether a release is bad is the maintainer's call. An agent flips a release
+only on their word.
+
+1. Un-publish it fast. On GitHub, edit the bad release and mark it a
+   **pre-release**. `releases/latest` then points back at the previous
+   release, so no new install or update is offered the bad one. Copies that
+   already updated keep it.
+2. Never delete a published tag: installed copies may have updated to it,
+   and versions in `rac_version.txt` only go up. Fix forward instead —
+   raise the version and put out a higher release, within 48 hours when the
+   bad one breaks the browser.
+3. When the bad build can't launch at all, its users have to download rac
+   again by hand. Post a note on the release and on the site, both through
+   the maintainer.
+4. Afterwards, read the live feed (and `appcast-x86_64.xml` if you built
+   Intel) and confirm it names the release before the bad one:
+   ```sh
+   curl -fsSL https://github.com/notkainoa/rac/releases/latest/download/appcast-arm64.xml
+   ```
+   Copies already on the bad version ignore that feed, because Sparkle only
+   offers a higher version. They wait for the fix. Then rebuild the website
+   (see [The website](#the-website)), so its download page, which reads
+   `releases/latest`, stops showing the bad release.
+
+Before a release goes out, or when one looks wrong, run the **Release smoke
+tests** workflow (`.github/workflows/smoke.yml`) from **Actions > Release
+smoke tests > Run workflow**. Give it a build run's ID to test its
+disk-image artifact, or a release tag to test a published one. Add an
+earlier release tag to run the update check too, and tick **Require
+Gatekeeper approval** for signed and notarized builds. Each job uploads its
+summary and the window screenshot it captured as an artifact. The update
+check swaps the old app bundle for the new one, which proves profile
+carry-over and version ordering — it doesn't drive Sparkle's download and
+install, which stays the by-hand check under [Testing an update
+locally](#testing-an-update-locally).
 
 ## Testing an update locally
 

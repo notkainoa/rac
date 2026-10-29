@@ -1,0 +1,157 @@
+name: Release smoke tests
+
+# Manual smoke tests for a finished disk image. Point it at a build run's
+# artifacts (run-id) or at a published release (release-tag). Install smoke
+# mounts the DMG, copies rac.app out like a user would, checks the signature
+# and the update feed, launches it once on a throwaway profile, and proves a
+# real window is drawn. With old-release-tag, update smoke also installs the
+# old build first and checks that the update keeps the profile and lands a
+# higher version. Nothing here needs a secret: downloading artifacts and
+# releases uses the workflow's own token.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run-id:
+        required: false
+        type: string
+        description: "Build run whose DMG artifact to test (alternative to release-tag)"
+      release-tag:
+        required: false
+        type: string
+        description: "Published release tag to test, such as 0.1.1 (alternative to run-id)"
+      old-release-tag:
+        required: false
+        type: string
+        description: "Earlier release tag for the update smoke test (optional)"
+      expect-notarized:
+        required: false
+        type: boolean
+        description: "Require Gatekeeper approval and a stapled notarization ticket"
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  install-smoke:
+    name: Install smoke
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      RUN_ID: ${{ inputs.run-id }}
+      RELEASE_TAG: ${{ inputs.release-tag }}
+      EXPECT_NOTARIZED: ${{ inputs.expect-notarized }}
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check inputs
+        run: |
+          if [ -n "$RUN_ID" ] && [ -n "$RELEASE_TAG" ]; then
+            echo "::error::Give either run-id or release-tag, not both."
+            exit 1
+          fi
+          if [ -z "$RUN_ID" ] && [ -z "$RELEASE_TAG" ]; then
+            echo "::error::Nothing to test: give run-id or release-tag."
+            exit 1
+          fi
+      - name: Download the disk image from the build run
+        if: ${{ inputs.run-id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "$RUN_ID" -R '${{ github.repository }}' -p 'rac_*_arm64-macos.dmg' -D smoke-in
+      - name: Download the disk image from the release
+        if: ${{ inputs.release-tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$RELEASE_TAG" -R '${{ github.repository }}' -p 'rac_*_arm64-macos.dmg' -D smoke-in --clobber
+      - name: Run the install smoke test
+        run: |
+          mkdir -p smoke-out
+          dmg=$(find smoke-in -name 'rac_*_arm64-macos.dmg' -print -quit)
+          if [ -z "$dmg" ]; then
+            echo "::error::No rac_*_arm64-macos.dmg in the downloaded files:"
+            find smoke-in
+            exit 1
+          fi
+          flags=()
+          [ "$EXPECT_NOTARIZED" = "true" ] && flags+=(--expect-notarized)
+          # A published release must have a live feed; a build run is allowed
+          # to 404 until its release exists.
+          [ -n "$RELEASE_TAG" ] && flags+=(--expect-feed)
+          .github/scripts/github_install_smoke.sh "$dmg" smoke-out ${flags[@]+"${flags[@]}"}
+      - name: Upload the results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-smoke
+          path: smoke-out/
+          if-no-files-found: warn
+      - name: Add the summary
+        if: ${{ always() }}
+        run: cat smoke-out/install-smoke.md >> "$GITHUB_STEP_SUMMARY" || true
+
+  update-smoke:
+    name: Update smoke
+    runs-on: macos-latest
+    timeout-minutes: 30
+    # Needs something new to update to and an old release to update from.
+    if: ${{ inputs.old-release-tag != '' && (inputs.run-id != '' || inputs.release-tag != '') }}
+    env:
+      RUN_ID: ${{ inputs.run-id }}
+      RELEASE_TAG: ${{ inputs.release-tag }}
+      OLD_RELEASE_TAG: ${{ inputs.old-release-tag }}
+      EXPECT_NOTARIZED: ${{ inputs.expect-notarized }}
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check inputs
+        run: |
+          if [ -n "$RUN_ID" ] && [ -n "$RELEASE_TAG" ]; then
+            echo "::error::Give either run-id or release-tag, not both."
+            exit 1
+          fi
+      - name: Download the old release's disk image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$OLD_RELEASE_TAG" -R '${{ github.repository }}' -p 'rac_*_arm64-macos.dmg' -D smoke-old --clobber
+      - name: Download the new disk image from the build run
+        if: ${{ inputs.run-id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "$RUN_ID" -R '${{ github.repository }}' -p 'rac_*_arm64-macos.dmg' -D smoke-new
+      - name: Download the new disk image from the release
+        if: ${{ inputs.release-tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$RELEASE_TAG" -R '${{ github.repository }}' -p 'rac_*_arm64-macos.dmg' -D smoke-new --clobber
+      - name: Run the update smoke test
+        run: |
+          mkdir -p smoke-out
+          old_dmg=$(find smoke-old -name 'rac_*_arm64-macos.dmg' -print -quit)
+          new_dmg=$(find smoke-new -name 'rac_*_arm64-macos.dmg' -print -quit)
+          if [ -z "$old_dmg" ] || [ -z "$new_dmg" ]; then
+            echo "::error::Need rac_*_arm64-macos.dmg from both the old release and the new source:"
+            find smoke-old smoke-new
+            exit 1
+          fi
+          .github/scripts/github_update_smoke.sh "$old_dmg" "$new_dmg" smoke-out
+      - name: Upload the results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: update-smoke
+          path: smoke-out/
+          if-no-files-found: warn
+      - name: Add the summary
+        if: ${{ always() }}
+        run: cat smoke-out/update-smoke.md >> "$GITHUB_STEP_SUMMARY" || true
