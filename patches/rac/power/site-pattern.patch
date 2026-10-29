@@ -1,0 +1,843 @@
+Index: src/chrome/browser/rac/power/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/power/BUILD.gn
++++ src/chrome/browser/rac/power/BUILD.gn
+@@ -23,8 +23,9 @@ source_set("power") {
+ }
+ 
+ # Build with `autoninja -C out/Default
+-# chrome/browser/rac/power:rac_power_unittests`. It's separate from Chromium's
+-# unit_tests, which takes hours to build.
++# chrome/browser/rac/power:rac_power_unittests`. It also runs the SitePattern
++# tests, so one binary covers both. It's separate from Chromium's unit_tests,
++# which takes hours to build.
+ test("rac_power_unittests") {
+   sources = [ "markdown_link_unittest.cc" ]
+   deps = [
+@@ -34,6 +35,7 @@ test("rac_power_unittests") {
+     "//base",
+     "//base/test:run_all_unittests",
+     "//base/test:test_support",
++    "//chrome/browser/rac/site_pattern:unit_tests",
+     "//testing/gtest",
+     "//url",
+   ]
+Index: src/chrome/browser/rac/site_pattern/BUILD.gn
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/site_pattern/BUILD.gn
+@@ -0,0 +1,31 @@
++# Copyright 2026 The rac Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++# A rule for a set of sites ("domain is" or "URL contains"), shared by the
++# features that act per site. Depends only on base, net, and url.
++source_set("site_pattern") {
++  sources = [
++    "site_pattern.cc",
++    "site_pattern.h",
++  ]
++  public_deps = [
++    "//base",
++    "//url",
++  ]
++  deps = [ "//net" ]
++}
++
++# Linked into //chrome/browser/rac/power:rac_power_unittests, so one binary
++# runs both sets of tests.
++source_set("unit_tests") {
++  testonly = true
++  sources = [ "site_pattern_unittest.cc" ]
++  deps = [
++    ":site_pattern",
++    "//base",
++    "//base:i18n",
++    "//testing/gtest",
++    "//url",
++  ]
++}
+Index: src/chrome/browser/rac/site_pattern/site_pattern.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/site_pattern/site_pattern.cc
+@@ -0,0 +1,206 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/site_pattern/site_pattern.h"
++
++#include <algorithm>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/strings/strcat.h"
++#include "base/strings/string_util.h"
++#include "net/base/registry_controlled_domains/registry_controlled_domain.h"
++
++namespace rac {
++
++namespace {
++
++constexpr std::string_view kTypeKey = "type";
++constexpr std::string_view kValueKey = "value";
++constexpr std::string_view kDomainTypeName = "domain";
++constexpr std::string_view kContainsTypeName = "contains";
++
++std::string_view TrimDots(std::string_view host) {
++  while (!host.empty() && host.front() == '.') {
++    host.remove_prefix(1);
++  }
++  while (!host.empty() && host.back() == '.') {
++    host.remove_suffix(1);
++  }
++  return host;
++}
++
++// True when `typed` opens with a URL scheme that isn't followed by `//`,
++// such as `https:/a.test` or `mailto:a@b.test`, which would otherwise store
++// `https` or `mailto` as the host. A colon after what looks like a scheme
++// is a port instead when only digits follow, so `a.test:8080` stays a
++// host:port.
++bool StartsWithBrokenScheme(std::string_view typed) {
++  const size_t colon = typed.find(':');
++  if (colon == std::string_view::npos || colon == 0 ||
++      !base::IsAsciiAlpha(typed.front())) {
++    return false;
++  }
++  if (!std::ranges::all_of(typed.substr(0, colon), [](char c) {
++        return base::IsAsciiAlphaNumeric(c) || c == '+' || c == '.' || c == '-';
++      })) {
++    return false;
++  }
++  const std::string_view after = typed.substr(colon + 1);
++  if (after.starts_with("//")) {
++    return false;
++  }
++  const size_t port_end = after.find_first_not_of("0123456789");
++  const bool port_follows =
++      !after.empty() && port_end != 0 &&
++      (port_end == std::string_view::npos || after[port_end] == '/' ||
++       after[port_end] == '?' || after[port_end] == '#');
++  return !port_follows;
++}
++
++// The host a "domain is" pattern stores for `typed`, or nullopt.
++std::optional<std::string> DomainFromTyped(std::string_view typed) {
++  std::string_view trimmed = base::TrimWhitespaceASCII(typed, base::TRIM_ALL);
++  if (trimmed.empty() || trimmed.front() == '/' ||
++      StartsWithBrokenScheme(trimmed)) {
++    return std::nullopt;
++  }
++  // A scheme comes before any path, so `a.test/?r=https://b.test` has none.
++  const size_t scheme_end = trimmed.find("://");
++  const bool has_scheme = scheme_end != std::string_view::npos &&
++                          trimmed.substr(0, scheme_end).find_first_of("/?#") ==
++                              std::string_view::npos;
++  // Arc and Zen users type `*.slack.com` for "slack.com and its
++  // subdomains", which is what "domain is" means anyway. One `*.` comes off
++  // the host with or without a scheme; a second stays in the address and is
++  // refused below.
++  std::string without_wildcard;
++  if (has_scheme) {
++    const std::string_view after_scheme = trimmed.substr(scheme_end + 3);
++    if (after_scheme.starts_with("*.")) {
++      without_wildcard = base::StrCat(
++          {trimmed.substr(0, scheme_end + 3), after_scheme.substr(2)});
++      trimmed = without_wildcard;
++    }
++  } else {
++    if (trimmed.starts_with("*.")) {
++      trimmed.remove_prefix(2);
++    }
++    // A host with no scheme in front takes its leading dots off here, so
++    // the result doesn't depend on how GURL treats them.
++    while (!trimmed.empty() && trimmed.front() == '.') {
++      trimmed.remove_prefix(1);
++    }
++  }
++  const GURL url(has_scheme ? std::string(trimmed)
++                            : base::StrCat({"https://", trimmed}));
++  if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS() || url.has_username() ||
++      url.has_password()) {
++    return std::nullopt;
++  }
++  const std::string_view host = TrimDots(url.host());
++  // A `%` is an escaped character such as a second `*`, which no real host
++  // has, so the pattern could never match.
++  if (host.empty() || host.find('%') != std::string_view::npos) {
++    return std::nullopt;
++  }
++  // `https//shop.example`, with its colon missing, parses as the host
++  // `https`. No one means to route a site by that name.
++  if (host == "http" || host == "https") {
++    return std::nullopt;
++  }
++  // Only a host that survives canonicalization unchanged goes any further.
++  // This also keeps HostIsRegistryIdentifier(), which requires a canonical
++  // host, away from input it would crash on.
++  const GURL host_url(base::StrCat({"https://", host, "/"}));
++  if (!host_url.is_valid() || host_url.host() != host) {
++    return std::nullopt;
++  }
++  if (!host_url.HostIsIPAddress() &&
++      net::registry_controlled_domains::HostIsRegistryIdentifier(
++          host, net::registry_controlled_domains::EXCLUDE_PRIVATE_REGISTRIES)) {
++    return std::nullopt;
++  }
++  return std::string(host);
++}
++
++}  // namespace
++
++SitePattern::SitePattern(Type type, std::string value)
++    : type_(type), value_(std::move(value)) {}
++
++// static
++std::optional<SitePattern> SitePattern::Create(Type type,
++                                               std::string_view typed) {
++  switch (type) {
++    case Type::kDomainIs: {
++      std::optional<std::string> host = DomainFromTyped(typed);
++      if (!host) {
++        return std::nullopt;
++      }
++      return SitePattern(type, std::move(*host));
++    }
++    case Type::kUrlContains: {
++      const std::string_view trimmed =
++          base::TrimWhitespaceASCII(typed, base::TRIM_ALL);
++      if (trimmed.empty()) {
++        return std::nullopt;
++      }
++      return SitePattern(type, base::ToLowerASCII(trimmed));
++    }
++  }
++  return std::nullopt;
++}
++
++// static
++std::optional<SitePattern> SitePattern::ForSiteOf(const GURL& url) {
++  if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS()) {
++    return std::nullopt;
++  }
++  const std::string domain =
++      net::registry_controlled_domains::GetDomainAndRegistry(
++          url, net::registry_controlled_domains::INCLUDE_PRIVATE_REGISTRIES);
++  // An IP address, a single label, and a bare suffix have no registrable
++  // domain, so those use their host (and Create() then refuses a suffix).
++  return Create(Type::kDomainIs, domain.empty() ? url.host() : domain);
++}
++
++// static
++std::optional<SitePattern> SitePattern::FromValue(const base::DictValue& dict) {
++  const std::string* type = dict.FindString(kTypeKey);
++  const std::string* value = dict.FindString(kValueKey);
++  if (!type || !value) {
++    return std::nullopt;
++  }
++  if (*type == kDomainTypeName) {
++    return Create(Type::kDomainIs, *value);
++  }
++  if (*type == kContainsTypeName) {
++    return Create(Type::kUrlContains, *value);
++  }
++  return std::nullopt;
++}
++
++base::DictValue SitePattern::ToValue() const {
++  return base::DictValue()
++      .Set(kTypeKey,
++           type_ == Type::kDomainIs ? kDomainTypeName : kContainsTypeName)
++      .Set(kValueKey, value_);
++}
++
++bool SitePattern::Matches(const GURL& url) const {
++  if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS()) {
++    return false;
++  }
++  switch (type_) {
++    case Type::kDomainIs:
++      return url.DomainIs(value_);
++    case Type::kUrlContains:
++      return base::ToLowerASCII(url.spec()).find(value_) != std::string::npos;
++  }
++  return false;
++}
++
++}  // namespace rac
+Index: src/chrome/browser/rac/site_pattern/site_pattern.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/site_pattern/site_pattern.h
+@@ -0,0 +1,81 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_SITE_PATTERN_SITE_PATTERN_H_
++#define CHROME_BROWSER_RAC_SITE_PATTERN_SITE_PATTERN_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++
++#include "base/values.h"
++#include "url/gurl.h"
++
++namespace rac {
++
++// A rule that picks out a set of web pages. Only valid http and https URLs
++// ever match; every other scheme gives false.
++//
++// kDomainIs matches the stored host and any subdomain of it, on a label
++// boundary (`github.com` matches `gist.github.com`, not `notgithub.com`).
++//
++// kUrlContains matches when the stored text is a substring of the page's
++// canonical address, ignoring ASCII case. The needle is compared byte for
++// byte after ASCII lower-casing, so a non-ASCII needle only matches the
++// percent-encoded form that appears in the canonical address, never the
++// characters as typed. A typed space can't match either: in the canonical
++// address a space is `%20` or `+`.
++class SitePattern {
++ public:
++  enum class Type { kDomainIs, kUrlContains };
++
++  // Builds a pattern from what a person typed.
++  //
++  // kDomainIs takes a host or a whole address (`Shop.Example`,
++  // `https://shop.example/x?y`, `.shop.example`, `shop.example.`,
++  // `*.shop.example`, `https://*.shop.example`) and stores
++  // the canonical lower-case host without leading or trailing dots. It
++  // returns nullopt for empty input, a path alone, an address that is not
++  // http or https, and a bare ICANN public suffix (`com`, `co.uk`). A private
++  // suffix such as `github.io` or `blogspot.com` is accepted on purpose and
++  // matches every site under it. IP addresses and single labels such as
++  // `localhost` are allowed.
++  //
++  // kUrlContains trims whitespace, stores the ASCII-lower-cased text, and
++  // returns nullopt for empty input.
++  static std::optional<SitePattern> Create(Type type, std::string_view typed);
++
++  // Gives the "domain is" pattern for the site `url` belongs to: its
++  // registrable domain (`app.slack.com` gives `slack.com`; `me.github.io`
++  // stays itself), or its host for an IP address, a single label, or a bare
++  // private suffix (`https://github.io/` gives a `github.io` pattern).
++  // Returns nullopt when `url` is not a valid http or https address, or when
++  // its host is a bare ICANN public suffix (`https://co.uk/`).
++  static std::optional<SitePattern> ForSiteOf(const GURL& url);
++
++  // Reads a pattern written by ToValue(). The checks in Create() run again,
++  // so a hand-edited preference can't smuggle in a rule Create() would
++  // refuse. Returns nullopt for anything malformed.
++  static std::optional<SitePattern> FromValue(const base::DictValue& dict);
++
++  // Writes {"type": "domain" | "contains", "value": <text>}.
++  base::DictValue ToValue() const;
++
++  bool Matches(const GURL& url) const;
++
++  Type type() const { return type_; }
++  const std::string& value() const { return value_; }
++
++  friend bool operator==(const SitePattern&, const SitePattern&) = default;
++
++ private:
++  SitePattern(Type type, std::string value);
++
++  Type type_;
++  std::string value_;
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_SITE_PATTERN_SITE_PATTERN_H_
+Index: src/chrome/browser/rac/site_pattern/site_pattern_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/site_pattern/site_pattern_unittest.cc
+@@ -0,0 +1,481 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/site_pattern/site_pattern.h"
++
++#include <optional>
++#include <string>
++
++#include "base/i18n/icu_util.h"
++#include "base/values.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace rac {
++namespace {
++
++using Type = SitePattern::Type;
++
++// IDN hosts need ICU's data. base::TestSuite loads it in the real binary;
++// this also covers a plain gtest main.
++void InitializeIcu() {
++  base::i18n::AllowMultipleInitializeCallsForTesting();
++  ASSERT_TRUE(base::i18n::InitializeICU());
++}
++
++std::optional<std::string> DomainValue(std::string_view typed) {
++  std::optional<SitePattern> pattern =
++      SitePattern::Create(Type::kDomainIs, typed);
++  if (!pattern) {
++    return std::nullopt;
++  }
++  return pattern->value();
++}
++
++TEST(SitePatternTest, DomainIsStoresTheCanonicalHost) {
++  EXPECT_EQ("shop.example", DomainValue("shop.example"));
++  EXPECT_EQ("shop.example", DomainValue("Shop.Example"));
++  EXPECT_EQ("shop.example", DomainValue("  shop.example  "));
++  EXPECT_EQ("shop.example", DomainValue(".shop.example"));
++  EXPECT_EQ("shop.example", DomainValue("shop.example."));
++  EXPECT_EQ("shop.example", DomainValue("shop.example/path"));
++  EXPECT_EQ("shop.example", DomainValue("https://shop.example/x?y"));
++  EXPECT_EQ("shop.example", DomainValue("HTTP://Shop.Example:8080/x#y"));
++  EXPECT_EQ("slack.com", DomainValue("*.slack.com"));
++  EXPECT_EQ("slack.com", DomainValue("https://*.slack.com"));
++}
++
++TEST(SitePatternTest, DomainIsRefusesWhatIsNotASite) {
++  EXPECT_FALSE(DomainValue(""));
++  EXPECT_FALSE(DomainValue("   "));
++  EXPECT_FALSE(DomainValue("/path"));
++  EXPECT_FALSE(DomainValue("/shop.example"));
++  EXPECT_FALSE(DomainValue("chrome://settings"));
++  EXPECT_FALSE(DomainValue("ftp://shop.example/"));
++  EXPECT_FALSE(DomainValue("file:///tmp/a"));
++  EXPECT_FALSE(DomainValue("https://"));
++  EXPECT_FALSE(DomainValue("."));
++  // Only one `*.` is stripped; a wildcard left in the host could never
++  // match.
++  EXPECT_FALSE(DomainValue("https://*.*.slack.com"));
++  EXPECT_FALSE(DomainValue("*.*.slack.com"));
++  EXPECT_FALSE(DomainValue("sl*ck.com"));
++}
++
++TEST(SitePatternTest, DomainIsReadsASchemeOnlyBeforeThePath) {
++  EXPECT_EQ("a.test", DomainValue("a.test/?r=https://b.test"));
++  EXPECT_EQ("a.test", DomainValue("a.test?r=https://b.test"));
++}
++
++// A scheme and a colon without `//` after it isn't a host: today it would
++// store `https` or `http`.
++TEST(SitePatternTest, DomainIsRefusesASchemeWithoutSlashes) {
++  EXPECT_FALSE(DomainValue("https:/shop.example"));
++  EXPECT_FALSE(DomainValue("http:shop.example"));
++  EXPECT_FALSE(DomainValue("HTTPS:/shop.example"));
++  EXPECT_FALSE(DomainValue("https:"));
++  EXPECT_FALSE(DomainValue("mailto:a@shop.example"));
++  // The colon missing instead of a slash.
++  EXPECT_FALSE(DomainValue("https//shop.example"));
++  EXPECT_FALSE(DomainValue("http//shop.example"));
++}
++
++// What follows the colon is a port, not a scheme.
++TEST(SitePatternTest, DomainIsKeepsAHostAndPort) {
++  EXPECT_EQ("localhost", DomainValue("localhost:8080"));
++  EXPECT_EQ("shop.example", DomainValue("shop.example:8080/path"));
++}
++
++TEST(SitePatternTest, DomainIsRefusesABarePublicSuffix) {
++  EXPECT_FALSE(DomainValue("com"));
++  EXPECT_FALSE(DomainValue("COM"));
++  EXPECT_FALSE(DomainValue(".com."));
++  EXPECT_FALSE(DomainValue("co.uk"));
++  EXPECT_FALSE(DomainValue("*.com"));
++  EXPECT_FALSE(DomainValue("https://co.uk/page"));
++}
++
++TEST(SitePatternTest, DomainIsAllowsPrivateSuffixesIpsAndSingleLabels) {
++  EXPECT_EQ("github.io", DomainValue("github.io"));
++  EXPECT_EQ("localhost", DomainValue("localhost"));
++  EXPECT_EQ("192.168.0.1", DomainValue("192.168.0.1"));
++  EXPECT_EQ("192.168.0.1", DomainValue("http://192.168.0.1:3000/x"));
++}
++
++TEST(SitePatternTest, DomainIsMatchesTheHostAndItsSubdomains) {
++  const std::optional<SitePattern> pattern =
++      SitePattern::Create(Type::kDomainIs, "github.com");
++  ASSERT_TRUE(pattern);
++  EXPECT_EQ(Type::kDomainIs, pattern->type());
++  EXPECT_TRUE(pattern->Matches(GURL("https://github.com/")));
++  EXPECT_TRUE(pattern->Matches(GURL("http://github.com/a?b#c")));
++  EXPECT_TRUE(pattern->Matches(GURL("https://www.github.com/")));
++  EXPECT_TRUE(pattern->Matches(GURL("https://a.b.github.com/")));
++  EXPECT_TRUE(pattern->Matches(GURL("https://github.com:8443/")));
++  // Case in the address doesn't matter: GURL lower-cases the host.
++  EXPECT_TRUE(pattern->Matches(GURL("https://GitHub.COM/")));
++  // A trailing dot on the host is the same host.
++  EXPECT_TRUE(pattern->Matches(GURL("https://github.com./")));
++
++  // The label boundary.
++  EXPECT_FALSE(pattern->Matches(GURL("https://notgithub.com/")));
++  EXPECT_FALSE(pattern->Matches(GURL("https://github.com.evil.test/")));
++  EXPECT_FALSE(pattern->Matches(GURL("https://evil.test/github.com")));
++  EXPECT_FALSE(pattern->Matches(GURL("https://evil.test/?u=github.com")));
++  EXPECT_FALSE(pattern->Matches(GURL("https://com/")));
++}
++
++TEST(SitePatternTest, DomainIsMatchesAnIpAddress) {
++  const std::optional<SitePattern> pattern =
++      SitePattern::Create(Type::kDomainIs, "192.168.0.1");
++  ASSERT_TRUE(pattern);
++  EXPECT_TRUE(pattern->Matches(GURL("http://192.168.0.1:8080/x")));
++  EXPECT_FALSE(pattern->Matches(GURL("http://192.168.0.10/")));
++}
++
++TEST(SitePatternTest, OnlyHttpAndHttpsEverMatch) {
++  const std::optional<SitePattern> domain =
++      SitePattern::Create(Type::kDomainIs, "github.com");
++  const std::optional<SitePattern> contains =
++      SitePattern::Create(Type::kUrlContains, "github");
++  ASSERT_TRUE(domain);
++  ASSERT_TRUE(contains);
++  for (const char* spec :
++       {"ftp://github.com/", "ws://github.com/", "chrome://github.com/",
++        "file:///github.com/x", "about:blank", "data:text/plain,github",
++        "mailto:a@github.com", "javascript:github", "blob:https://github.com/a",
++        "not a url", ""}) {
++    SCOPED_TRACE(spec);
++    EXPECT_FALSE(domain->Matches(GURL(spec)));
++    EXPECT_FALSE(contains->Matches(GURL(spec)));
++  }
++  EXPECT_TRUE(contains->Matches(GURL("https://github.com/")));
++}
++
++TEST(SitePatternTest, UrlContainsTrimsAndLowerCasesTheNeedle) {
++  const std::optional<SitePattern> pattern =
++      SitePattern::Create(Type::kUrlContains, "  GitHub.com/Pull  ");
++  ASSERT_TRUE(pattern);
++  EXPECT_EQ(Type::kUrlContains, pattern->type());
++  EXPECT_EQ("github.com/pull", pattern->value());
++  EXPECT_FALSE(SitePattern::Create(Type::kUrlContains, ""));
++  EXPECT_FALSE(SitePattern::Create(Type::kUrlContains, " \t\n"));
++}
++
++TEST(SitePatternTest, UrlContainsIsACaseInsensitiveSubstringTest) {
++  const std::optional<SitePattern> pattern =
++      SitePattern::Create(Type::kUrlContains, "/Pull/");
++  ASSERT_TRUE(pattern);
++  EXPECT_TRUE(pattern->Matches(GURL("https://github.com/o/r/pull/1")));
++  EXPECT_TRUE(pattern->Matches(GURL("https://github.com/o/r/PULL/1")));
++  EXPECT_FALSE(pattern->Matches(GURL("https://github.com/o/r/pulls")));
++
++  const std::optional<SitePattern> query =
++      SitePattern::Create(Type::kUrlContains, "?TAB=repos");
++  ASSERT_TRUE(query);
++  EXPECT_TRUE(query->Matches(GURL("https://github.com/o?tab=repos")));
++  EXPECT_TRUE(query->Matches(GURL("https://github.com/o?Tab=Repos")));
++}
++
++TEST(SitePatternTest, UrlContainsSeesTheCanonicalAddress) {
++  InitializeIcu();
++  // The scheme and host are always part of the canonical address.
++  const std::optional<SitePattern> scheme =
++      SitePattern::Create(Type::kUrlContains, "https://github");
++  ASSERT_TRUE(scheme);
++  EXPECT_TRUE(scheme->Matches(GURL("HTTPS://GITHUB.com/")));
++  EXPECT_FALSE(scheme->Matches(GURL("http://github.com/")));
++
++  // A space in the address is stored percent-encoded, so that is the form a
++  // needle has to use. A non-ASCII needle never matches as typed.
++  const std::optional<SitePattern> encoded =
++      SitePattern::Create(Type::kUrlContains, "a%20b");
++  ASSERT_TRUE(encoded);
++  EXPECT_TRUE(encoded->Matches(GURL("https://x.test/a b")));
++  const std::optional<SitePattern> typed =
++      SitePattern::Create(Type::kUrlContains, "a b");
++  ASSERT_TRUE(typed);
++  EXPECT_FALSE(typed->Matches(GURL("https://x.test/a b")));
++  const std::optional<SitePattern> non_ascii =
++      SitePattern::Create(Type::kUrlContains, "caf\xC3\xA9");
++  ASSERT_TRUE(non_ascii);
++  EXPECT_FALSE(non_ascii->Matches(GURL("https://x.test/caf\xC3\xA9")));
++}
++
++TEST(SitePatternTest, ForSiteOfGivesTheRegistrableDomain) {
++  auto site_of = [](const char* spec) -> std::optional<std::string> {
++    std::optional<SitePattern> pattern = SitePattern::ForSiteOf(GURL(spec));
++    if (!pattern) {
++      return std::nullopt;
++    }
++    EXPECT_EQ(Type::kDomainIs, pattern->type());
++    return pattern->value();
++  };
++  EXPECT_EQ("slack.com", site_of("https://app.slack.com/client/x"));
++  EXPECT_EQ("slack.com", site_of("http://slack.com/"));
++  EXPECT_EQ("b.co.uk", site_of("https://a.b.co.uk/x"));
++  EXPECT_EQ("github.com", site_of("https://github.com./"));
++  // A private suffix: each subdomain is its own site.
++  EXPECT_EQ("me.github.io", site_of("https://me.github.io/page"));
++  EXPECT_EQ("me.github.io", site_of("https://www.me.github.io/"));
++  // No registrable domain: the host itself.
++  EXPECT_EQ("192.168.0.1", site_of("https://192.168.0.1:8080/x"));
++  EXPECT_EQ("localhost", site_of("http://localhost:3000/"));
++  EXPECT_EQ("github.io", site_of("https://github.io/"));
++  // Not a site.
++  EXPECT_FALSE(site_of("file:///tmp/a.html"));
++  EXPECT_FALSE(site_of("chrome://settings/"));
++  EXPECT_FALSE(site_of("about:blank"));
++  EXPECT_FALSE(site_of("ftp://github.com/"));
++  EXPECT_FALSE(site_of("not a url"));
++  EXPECT_FALSE(site_of("https://co.uk/"));
++  EXPECT_FALSE(site_of("https://com/"));
++}
++
++// A bare private suffix has no registrable domain, so the host itself is
++// the site and the pattern matches every site under it.
++TEST(SitePatternTest, ForSiteOfAcceptsABarePrivateSuffix) {
++  const std::optional<SitePattern> pattern =
++      SitePattern::ForSiteOf(GURL("https://github.io/"));
++  ASSERT_TRUE(pattern);
++  EXPECT_EQ("github.io", pattern->value());
++  EXPECT_TRUE(pattern->Matches(GURL("https://me.github.io/")));
++}
++
++TEST(SitePatternTest, ForSiteOfMatchesThePageItCameFrom) {
++  const GURL page("https://app.slack.com/client/T1/C2");
++  const std::optional<SitePattern> pattern = SitePattern::ForSiteOf(page);
++  ASSERT_TRUE(pattern);
++  EXPECT_TRUE(pattern->Matches(page));
++  EXPECT_TRUE(pattern->Matches(GURL("https://slack.com/")));
++  EXPECT_TRUE(pattern->Matches(GURL("https://files.slack.com/")));
++  EXPECT_FALSE(pattern->Matches(GURL("https://notslack.com/")));
++}
++
++TEST(SitePatternTest, ValueRoundTrips) {
++  for (const SitePattern& original :
++       {*SitePattern::Create(Type::kDomainIs, "Docs.Example.com"),
++        *SitePattern::Create(Type::kUrlContains, "/Pull/")}) {
++    const base::DictValue dict = original.ToValue();
++    ASSERT_TRUE(dict.FindString("type"));
++    ASSERT_TRUE(dict.FindString("value"));
++    EXPECT_EQ(original.value(), *dict.FindString("value"));
++    const std::optional<SitePattern> restored = SitePattern::FromValue(dict);
++    ASSERT_TRUE(restored);
++    EXPECT_EQ(original, *restored);
++  }
++  EXPECT_EQ("domain", *SitePattern::Create(Type::kDomainIs, "a.test")
++                           ->ToValue()
++                           .FindString("type"));
++  EXPECT_EQ("contains", *SitePattern::Create(Type::kUrlContains, "a")
++                             ->ToValue()
++                             .FindString("type"));
++}
++
++TEST(SitePatternTest, PatternsOfDifferentTypeOrValueDiffer) {
++  EXPECT_EQ(*SitePattern::Create(Type::kDomainIs, "a.test"),
++            *SitePattern::Create(Type::kDomainIs, "A.test."));
++  EXPECT_NE(*SitePattern::Create(Type::kDomainIs, "a.test"),
++            *SitePattern::Create(Type::kDomainIs, "b.test"));
++  EXPECT_NE(*SitePattern::Create(Type::kDomainIs, "a.test"),
++            *SitePattern::Create(Type::kUrlContains, "a.test"));
++}
++
++TEST(SitePatternTest, FromValueRefusesATamperedDictionary) {
++  auto make = [](std::string_view type, std::string_view value) {
++    return base::DictValue().Set("type", type).Set("value", value);
++  };
++  // The control: well-formed.
++  EXPECT_TRUE(SitePattern::FromValue(make("domain", "a.test")));
++  EXPECT_TRUE(SitePattern::FromValue(make("contains", "needle")));
++
++  EXPECT_FALSE(SitePattern::FromValue(base::DictValue()));
++  EXPECT_FALSE(SitePattern::FromValue(make("regex", "a.test")));
++  EXPECT_FALSE(SitePattern::FromValue(make("", "a.test")));
++  EXPECT_FALSE(SitePattern::FromValue(make("Domain", "a.test")));
++  // The checks in Create() run again on the stored text.
++  EXPECT_FALSE(SitePattern::FromValue(make("domain", "com")));
++  EXPECT_FALSE(SitePattern::FromValue(make("domain", "co.uk")));
++  EXPECT_FALSE(SitePattern::FromValue(make("domain", "")));
++  EXPECT_FALSE(SitePattern::FromValue(make("domain", "/path")));
++  EXPECT_FALSE(SitePattern::FromValue(make("domain", "chrome://settings")));
++  EXPECT_FALSE(SitePattern::FromValue(make("contains", "")));
++  EXPECT_FALSE(SitePattern::FromValue(make("contains", "   ")));
++  // Missing or mistyped fields.
++  EXPECT_FALSE(SitePattern::FromValue(base::DictValue().Set("type", "domain")));
++  EXPECT_FALSE(
++      SitePattern::FromValue(base::DictValue().Set("value", "a.test")));
++  EXPECT_FALSE(SitePattern::FromValue(
++      base::DictValue().Set("type", "domain").Set("value", 5)));
++  EXPECT_FALSE(SitePattern::FromValue(
++      base::DictValue().Set("type", 1).Set("value", "a.test")));
++
++  // Text that isn't canonical is cleaned up rather than kept as written.
++  const std::optional<SitePattern> cleaned =
++      SitePattern::FromValue(make("domain", "https://A.Test/x"));
++  ASSERT_TRUE(cleaned);
++  EXPECT_EQ("a.test", cleaned->value());
++  const std::optional<SitePattern> lowered =
++      SitePattern::FromValue(make("contains", "NeedLE"));
++  ASSERT_TRUE(lowered);
++  EXPECT_EQ("needle", lowered->value());
++}
++
++TEST(SitePatternTest, DomainIsStoresAnIdnHostAsPunycode) {
++  InitializeIcu();
++  // GURL canonicalizes an IDN host to punycode.
++  EXPECT_EQ("xn--bcher-kva.example", DomainValue("b\xC3\xBC"
++                                                 "cher.example"));
++  EXPECT_EQ("xn--bcher-kva.example", DomainValue("xn--bcher-kva.example"));
++
++  const std::optional<SitePattern> pattern =
++      SitePattern::Create(Type::kDomainIs,
++                          "b\xC3\xBC"
++                          "cher.example");
++  ASSERT_TRUE(pattern);
++  EXPECT_TRUE(pattern->Matches(GURL("https://xn--bcher-kva.example/")));
++  EXPECT_TRUE(
++      pattern->Matches(GURL("https://b\xC3\xBC"
++                            "cher.example/")));
++  EXPECT_TRUE(
++      pattern->Matches(GURL("https://app.b\xC3\xBC"
++                            "cher.example/")));
++  EXPECT_FALSE(
++      pattern->Matches(GURL("https://xn--bcher-kva.example.evil.test/")));
++}
++
++TEST(SitePatternTest, DomainIsHandlesAnIpv6Literal) {
++  // The canonical host keeps its brackets.
++  EXPECT_EQ("[::1]", DomainValue("[::1]"));
++  EXPECT_EQ("[::1]", DomainValue("http://[::1]:8080/x"));
++  EXPECT_EQ("[2001:db8::1]", DomainValue("[2001:DB8::1]"));
++  // A bare literal isn't a host without brackets.
++  EXPECT_FALSE(DomainValue("::1"));
++  EXPECT_FALSE(DomainValue("2001:db8::1"));
++
++  const std::optional<SitePattern> pattern =
++      SitePattern::Create(Type::kDomainIs, "[::1]");
++  ASSERT_TRUE(pattern);
++  EXPECT_TRUE(pattern->Matches(GURL("http://[::1]:8080/x")));
++  EXPECT_FALSE(pattern->Matches(GURL("http://[::2]/")));
++}
++
++TEST(SitePatternTest, DomainIsRefusesCredentialsAndBadPorts) {
++  // A pattern names a host, never a login.
++  EXPECT_FALSE(DomainValue("user@shop.example"));
++  EXPECT_FALSE(DomainValue("user:pass@shop.example"));
++  EXPECT_FALSE(DomainValue("https://user:pass@shop.example/x"));
++  // A port is fine to type, but a bad one kills the address.
++  EXPECT_EQ("shop.example", DomainValue("shop.example:8080"));
++  EXPECT_FALSE(DomainValue("shop.example:bad"));
++  EXPECT_FALSE(DomainValue("shop.example:99999"));
++}
++
++TEST(SitePatternTest, DomainIsStripsTabsButNotSpaces) {
++  // GURL removes tabs and newlines wherever they appear.
++  EXPECT_EQ("shop.example", DomainValue("shop.\texample"));
++  EXPECT_EQ("shop.example", DomainValue("shop.\nexample"));
++  // A space becomes %20 in the host, which no real host has.
++  EXPECT_FALSE(DomainValue("shop .example"));
++}
++
++TEST(SitePatternTest, DomainIsAllowsAnUnderscoreLabel) {
++  EXPECT_EQ("my_host.test", DomainValue("my_host.test"));
++  const std::optional<SitePattern> pattern =
++      SitePattern::Create(Type::kDomainIs, "my_host.test");
++  ASSERT_TRUE(pattern);
++  EXPECT_TRUE(pattern->Matches(GURL("https://my_host.test/")));
++  EXPECT_TRUE(pattern->Matches(GURL("https://a.my_host.test/")));
++}
++
++TEST(SitePatternTest, DomainIsStripsDotsAroundOddHosts) {
++  EXPECT_EQ("192.168.0.1", DomainValue("192.168.0.1."));
++  EXPECT_EQ("localhost", DomainValue(".localhost."));
++  EXPECT_EQ("shop.example", DomainValue("shop.example.."));
++  EXPECT_EQ("shop.example", DomainValue("*.SHOP.EXAMPLE."));
++}
++
++TEST(SitePatternTest, ForSiteOfTreatsEachBlogspotBlogAsASite) {
++  auto site_of = [](const char* spec) -> std::optional<std::string> {
++    std::optional<SitePattern> pattern = SitePattern::ForSiteOf(GURL(spec));
++    if (!pattern) {
++      return std::nullopt;
++    }
++    return pattern->value();
++  };
++  // blogspot.com is a private suffix, so each blog is its own site.
++  EXPECT_EQ("me.blogspot.com", site_of("https://me.blogspot.com/x"));
++  EXPECT_EQ("me.blogspot.com", site_of("https://a.b.me.blogspot.com/"));
++  // Credentials in the address don't change which site a page belongs to.
++  EXPECT_EQ("slack.com", site_of("https://user:pass@app.slack.com/"));
++}
++
++TEST(SitePatternTest, ForSiteOfGivesTheHostForAnIpv6Address) {
++  const std::optional<SitePattern> pattern =
++      SitePattern::ForSiteOf(GURL("http://[::1]:8080/x"));
++  ASSERT_TRUE(pattern);
++  EXPECT_EQ("[::1]", pattern->value());
++  EXPECT_TRUE(pattern->Matches(GURL("http://[::1]/")));
++  EXPECT_FALSE(pattern->Matches(GURL("http://[::2]/")));
++}
++
++TEST(SitePatternTest, UrlContainsMatchesPunctuationNeedles) {
++  const std::optional<SitePattern> fragment =
++      SitePattern::Create(Type::kUrlContains, "#Frag");
++  ASSERT_TRUE(fragment);
++  EXPECT_EQ("#frag", fragment->value());
++  EXPECT_TRUE(fragment->Matches(GURL("https://x.test/p#FRAG")));
++  EXPECT_FALSE(fragment->Matches(GURL("https://x.test/p")));
++
++  const std::optional<SitePattern> percent =
++      SitePattern::Create(Type::kUrlContains, "%");
++  ASSERT_TRUE(percent);
++  EXPECT_TRUE(percent->Matches(GURL("https://x.test/a b")));
++  EXPECT_FALSE(percent->Matches(GURL("https://x.test/ab")));
++
++  // Escapes are uppercase in the canonical address, but both sides are
++  // lower-cased before the substring test.
++  const std::optional<SitePattern> escape =
++      SitePattern::Create(Type::kUrlContains, "a%2Fb");
++  ASSERT_TRUE(escape);
++  EXPECT_EQ("a%2fb", escape->value());
++  EXPECT_TRUE(escape->Matches(GURL("https://x.test/a%2Fb")));
++}
++
++TEST(SitePatternTest, FromValueIgnoresKeysItDoesNotRead) {
++  base::DictValue dict =
++      base::DictValue().Set("type", "domain").Set("value", "a.test");
++  dict.Set("note", "hand-edited");
++  dict.Set("version", 2);
++  const std::optional<SitePattern> pattern = SitePattern::FromValue(dict);
++  ASSERT_TRUE(pattern);
++  EXPECT_EQ(Type::kDomainIs, pattern->type());
++  EXPECT_EQ("a.test", pattern->value());
++}
++
++TEST(SitePatternTest, FromValueRefusesASmuggledLoginOrPort) {
++  // The checks in Create() run again, so stored text can't sneak either in.
++  auto make = [](std::string_view type, std::string_view value) {
++    return base::DictValue().Set("type", type).Set("value", value);
++  };
++  EXPECT_FALSE(SitePattern::FromValue(make("domain", "u:p@a.test")));
++  EXPECT_FALSE(SitePattern::FromValue(make("domain", "a.test:bad")));
++  const std::optional<SitePattern> cleaned =
++      SitePattern::FromValue(make("domain", "A.TEST:8080/x"));
++  ASSERT_TRUE(cleaned);
++  EXPECT_EQ("a.test", cleaned->value());
++}
++
++TEST(SitePatternTest, DifferentTypedTextCanGiveTheSamePattern) {
++  InitializeIcu();
++  EXPECT_EQ(*SitePattern::Create(Type::kUrlContains, "ABC"),
++            *SitePattern::Create(Type::kUrlContains, " abc "));
++  EXPECT_EQ(*SitePattern::Create(Type::kDomainIs,
++                                 "b\xC3\xBC"
++                                 "cher.example"),
++            *SitePattern::Create(Type::kDomainIs, "xn--bcher-kva.example"));
++}
++
++}  // namespace
++}  // namespace rac
