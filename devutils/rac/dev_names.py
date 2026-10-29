@@ -13,6 +13,10 @@ before quilt touches any string file.
 sub also records a hash of each file the passes changed, so unsub can refuse
 to overwrite a string file that was edited while the names were applied.
 
+unsub saves each changed file's mtime and content hash; a later sub puts the
+mtime back on files the passes rewrite byte-identical, so the build doesn't
+reprocess ~2,700 unchanged string files after every sync.
+
 usage: dev_names.py <sub|unsub [--force]|status> [-t <build/src>]
 """
 
@@ -31,6 +35,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = '.rac_names'
 EXPECTED = 'expected.json'
+MTIMES = 'mtimes.json'
 # Applied in this order and reverted in reverse.
 PASSES = [
     ('helium', ROOT / 'helium-chromium' / 'utils' / 'name_substitution.py'),
@@ -130,6 +135,45 @@ def sub(tree):
         record_expected(tree)
         summary = result.stdout.strip().splitlines()[-1:] or ['done']
         print(f'dev_names: {name} pass: {summary[0]}')
+    restore_mtimes(tree)
+
+
+def build_marker(tree):
+    """When each build output folder last saved its state. A build between
+    unsub and sub records different content under the mtimes unsub saved, so
+    putting them back could hide a real change from the next build."""
+    return {str(state.relative_to(tree)): state.stat().st_mtime_ns
+            for pattern in ('out/*/.siso_fs_state', 'out/*/.ninja_log')
+            for state in sorted(tree.glob(pattern))}
+
+
+def restore_mtimes(tree):
+    """Puts back the mtimes unsub saved for files the passes wrote back
+    byte-identical, so the build doesn't reprocess them. Files whose content
+    differs, because a patch really changed them, keep their new mtime."""
+    path = tree / STATE_DIR / MTIMES
+    if not path.exists():
+        return
+    try:
+        record = json.loads(path.read_text())
+        saved, marker = record['files'], record['build']
+    except (ValueError, KeyError, TypeError):
+        saved, marker = None, None
+    path.unlink()
+    if saved is None or marker != build_marker(tree):
+        print('dev_names: not keeping mtimes: the saved ones are unusable or the '
+              'tree was built since unsub', file=sys.stderr)
+        return
+    kept = 0
+    for name, record in saved.items():
+        file = tree / name
+        if file_digest(file) != record['sha256']:
+            continue
+        stat_result = file.stat()
+        os.utime(file, ns=(stat_result.st_atime_ns, record['mtime_ns']))
+        kept += 1
+    print(f'dev_names: kept mtimes on {kept} unchanged files '
+          f'({len(saved) - kept} changed)')
 
 
 def unsub(tree, force=False):
@@ -143,10 +187,23 @@ def unsub(tree, force=False):
     expected = tree / STATE_DIR / EXPECTED
     if not backups:
         expected.unlink(missing_ok=True)
+        (tree / STATE_DIR / MTIMES).unlink(missing_ok=True)
         return
     counts = {name: archived_files(tree, backup) for name, backup in backups}
+    files = {file for files in counts.values() for file in files}
     if not force:
-        check_unchanged(tree, {file for files in counts.values() for file in files})
+        check_unchanged(tree, files)
+
+    # Taken while the names are still applied, but written only once the
+    # restore below has succeeded. A later sub puts these mtimes back on
+    # files it rewrites byte-identical.
+    marker = build_marker(tree)
+    snapshot = {}
+    for name in sorted(files):
+        path = tree / name
+        if path.is_file():
+            snapshot[name] = {'mtime_ns': path.stat().st_mtime_ns,
+                              'sha256': file_digest(path)}
 
     recovery = Path(tempfile.mkdtemp(prefix='.rac_names_unsub-', dir=tree.parent))
     moved = {}  # path -> its copy in recovery, or None if it didn't exist
@@ -176,6 +233,13 @@ def unsub(tree, force=False):
         for path in [backup for _, backup in backups] + [expected]:
             if path.exists():
                 move_aside(path, recovery / STATE_DIR / path.name)
+        # The mtime record goes after the restore, so an interrupt or a
+        # rollback above never leaves one for a sub that shouldn't see it.
+        record = tree / STATE_DIR / MTIMES
+        temporary = record.with_name(MTIMES + '.tmp')
+        temporary.write_text(json.dumps({'files': snapshot, 'build': marker},
+                                        indent=0, sort_keys=True))
+        temporary.replace(record)
     except BaseException as error:  # including Ctrl-C, which would leave half the files
         failed = []
         for path, copy in reversed(moved.items()):
