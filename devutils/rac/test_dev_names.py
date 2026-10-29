@@ -296,6 +296,60 @@ class NamesTest(unittest.TestCase):
         self.assertNotEqual(self.grd.stat().st_mtime_ns, 1_234_567_890_123_456_789)
         self.assertFalse((self.tree / dev_names.STATE_DIR / dev_names.MTIMES).exists())
 
+    def test_sub_drops_a_malformed_mtime_record(self):
+        os.utime(self.grd, ns=(1_234_567_890_123_456_789,) * 2)
+        dev_names.unsub(self.tree)
+        record = self.tree / dev_names.STATE_DIR / dev_names.MTIMES
+        shapes = {
+            'a list': '[]',
+            'missing files': '{"build": {}}',
+            'missing build': '{"files": {}}',
+            'files not a dict': '{"files": [], "build": {}}',
+            'entry not a dict': '{"files": {"ui/strings.grd": 5}, "build": {}}',
+            'entry missing mtime_ns':
+                '{"files": {"ui/strings.grd": {"sha256": "abc"}}, "build": {}}',
+            'entry missing sha256':
+                '{"files": {"ui/strings.grd": {"mtime_ns": 1}}, "build": {}}',
+            'mtime_ns not an int':
+                '{"files": {"ui/strings.grd": {"mtime_ns": "1", "sha256": "a"}}, "build": {}}',
+            'sha256 not a string':
+                '{"files": {"ui/strings.grd": {"mtime_ns": 1, "sha256": 2}}, "build": {}}',
+            'build not a dict': '{"files": {}, "build": "x"}',
+        }
+        for label, text in shapes.items():
+            with self.subTest(shape=label):
+                record.write_text(text)
+                with mock.patch('sys.stderr', new_callable=io.StringIO) as stderr, \
+                     mock.patch('sys.stdout', new_callable=io.StringIO) as stdout:
+                    self.run_passes()
+                self.assertIn('dev_names: not keeping mtimes', stderr.getvalue())
+                self.assertNotIn('kept mtimes', stdout.getvalue())
+                self.assertNotEqual(self.grd.stat().st_mtime_ns, 1_234_567_890_123_456_789)
+                self.assertFalse(record.exists())
+
+    def test_a_second_sub_without_a_record_changes_nothing(self):
+        dev_names.unsub(self.tree)
+        self.run_passes()
+        before = self.state()
+        self.run_passes()
+        self.assertEqual(self.state(), before)
+        self.assertFalse((self.tree / dev_names.STATE_DIR / dev_names.MTIMES).exists())
+
+    def test_a_retried_unsub_keeps_the_pending_mtime_record(self):
+        os.utime(self.grd, ns=(1_234_567_890_123_456_789,) * 2)
+        os.utime(self.xtb, ns=(1_234_000_000_000_000_000,) * 2)
+        dev_names.unsub(self.tree)
+        # The sync failed before sub ran, so the names are already reverted
+        # and the retried unsub has nothing to restore. The record must stay
+        # for the sub that eventually runs.
+        dev_names.unsub(self.tree)
+        self.assertTrue((self.tree / dev_names.STATE_DIR / dev_names.MTIMES).exists())
+        with mock.patch('sys.stdout', new_callable=io.StringIO) as stdout:
+            self.run_passes()
+        self.assertEqual(self.grd.stat().st_mtime_ns, 1_234_567_890_123_456_789)
+        self.assertEqual(self.xtb.stat().st_mtime_ns, 1_234_000_000_000_000_000)
+        self.assertIn('kept mtimes on 2 unchanged files (0 changed)', stdout.getvalue())
+
     def test_sub_without_a_mtime_record_leaves_the_new_mtimes(self):
         os.utime(self.grd, ns=(1_234_567_890_123_456_789, 1_234_567_890_123_456_789))
         dev_names.unsub(self.tree)

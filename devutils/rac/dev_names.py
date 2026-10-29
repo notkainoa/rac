@@ -159,8 +159,15 @@ def restore_mtimes(tree):
         saved, marker = record['files'], record['build']
     except (ValueError, KeyError, TypeError):
         saved, marker = None, None
+    usable = isinstance(saved, dict) and isinstance(marker, dict) and all(
+        isinstance(name, str)
+        and (tree / name).resolve().is_relative_to(tree.resolve())
+        and isinstance(entry, dict)
+        and isinstance(entry.get('mtime_ns'), int) and 0 <= entry['mtime_ns'] < 1 << 63
+        and isinstance(entry.get('sha256'), str)
+        for name, entry in saved.items())
     path.unlink()
-    if saved is None or marker != build_marker(tree):
+    if not usable or marker != build_marker(tree):
         print('dev_names: not keeping mtimes: the saved ones are unusable or the '
               'tree was built since unsub', file=sys.stderr)
         return
@@ -187,7 +194,9 @@ def unsub(tree, force=False):
     expected = tree / STATE_DIR / EXPECTED
     if not backups:
         expected.unlink(missing_ok=True)
-        (tree / STATE_DIR / MTIMES).unlink(missing_ok=True)
+        # A pending mtime record stays: a sync that failed after the last
+        # unsub retries unsub before its sub, and the record is what lets
+        # that sub keep the files' mtimes.
         return
     counts = {name: archived_files(tree, backup) for name, backup in backups}
     files = {file for files in counts.values() for file in files}
