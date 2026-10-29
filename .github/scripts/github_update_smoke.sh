@@ -97,8 +97,9 @@ _finish() {
     --title "Update smoke" --results "$_results" --out "$_out_dir/update-smoke.md"
 }
 
-# Mounts $1, copies rac.app to $2, detaches. On failure records a FAIL under
-# check-name $3 and returns 1.
+# Mounts $1 at $4, copies rac.app to $2, and leaves the mount in $_mounted
+# for _cleanup to detach. On failure records a FAIL under check-name $3 and
+# returns 1.
 _install() {
   _image="$1"; _dest="$2"; _check="$3"; _mount="$4"
   if ! hdiutil attach -nobrowse -readonly -mountpoint "$_mount" "$_image" >/dev/null; then
@@ -139,11 +140,31 @@ while [ "$_waited" -lt 60 ]; do
   _waited=$((_waited + 1))
 done
 sleep 2  # let it finish flushing the profile to disk
+# The profile files only count if the build stayed up: a build that writes
+# Preferences and then exits crashed on first run, which is a failed smoke
+# test even though the file exists.
+if kill -0 "$_pid" 2>/dev/null; then _old_alive=1; else _old_alive=0; fi
 _stop_app
-if [ -f "$_profile/Default/Preferences" ]; then
-  record PASS "first launch" "old build wrote a profile after ${_waited}s"
+if [ "$_old_alive" != 1 ]; then
+  record FAIL "first launch" "old build exited within ${_waited}s of launch (see log in the artifact)"
+  cp "$_work/rac-old.log" "$_out_dir/rac-old.log" 2>/dev/null || true
+  _finish
+  exit $?
+elif [ -f "$_profile/Default/Preferences" ]; then
+  record PASS "first launch" "old build stayed up and wrote a profile after ${_waited}s"
 else
   record FAIL "first launch" "old build left no Default/Preferences (see log in the artifact)"
+  cp "$_work/rac-old.log" "$_out_dir/rac-old.log" 2>/dev/null || true
+  _finish
+  exit $?
+fi
+
+# Seed a marker setting the update must not lose. Chromium keeps unknown
+# top-level prefs, so the same value after the new build runs is proof a
+# real setting carried over — not just that a file named Preferences exists.
+_marker="$(python3 -c 'import secrets; print(secrets.token_hex(8))')"
+if ! python3 "$_smoke_py" set-marker "$_profile/Default/Preferences" "$_marker"; then
+  record FAIL "first launch" "old profile's Default/Preferences would not take a marker pref"
   cp "$_work/rac-old.log" "$_out_dir/rac-old.log" 2>/dev/null || true
   _finish
   exit $?
@@ -183,7 +204,9 @@ else
   _shot_args=()
 fi
 
-# Relaunch on the same profile and keep it up for 20 seconds.
+# Relaunch on the same profile and keep it up for 20 seconds. A screenshot
+# from an earlier run must not satisfy this one's wait.
+rm -f "$_png"
 env BREAKPAD_DUMP_LOCATION="$_profile/Crashpad" \
   "$_exe" --user-data-dir="$_profile" --no-first-run --use-mock-keychain \
   --custom-update-server-url=http://127.0.0.1:9/ \
@@ -222,7 +245,13 @@ else
 fi
 _stop_app
 
-# The point of the whole exercise: the profile survived the swap.
+# The point of the whole exercise: the profile survived the swap, marker
+# setting included.
+if _marker_result="$(python3 "$_smoke_py" check-marker "$_profile/Default/Preferences" "$_marker")"; then
+  record PASS "setting carried over" "$_marker_result"
+else
+  record FAIL "setting carried over" "$_marker_result"
+fi
 for _piece in "Local State" "Default/Preferences"; do
   if _json_result="$(python3 "$_smoke_py" check-json "$_profile/$_piece")"; then
     record PASS "profile carried over" "$_json_result"

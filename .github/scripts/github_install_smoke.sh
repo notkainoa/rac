@@ -217,11 +217,10 @@ if [ -n "$_arch" ]; then
     else
       record FAIL "updater feed" "SUFeedURL is $_su_feed, expected $_feed_url"
     fi
-  elif grep -qF "releases/latest/download/" "$_strings" \
-      && grep -qF "appcast-$_arch.xml" "$_strings"; then
-    record PASS "updater feed" "SUFeedURL not in Info.plist; feed is compiled in (base URL + appcast-$_arch.xml found in the binary)"
+  elif _feed_result="$(python3 "$_smoke_py" check-feed "$_strings" "$_arch")"; then
+    record PASS "updater feed" "SUFeedURL not in Info.plist; $_feed_result"
   else
-    record FAIL "updater feed" "no SUFeedURL and no compiled feed for $_feed_url"
+    record FAIL "updater feed" "SUFeedURL not in Info.plist; $_feed_result"
   fi
 
   _http="$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$_feed_url" 2>/dev/null || echo 000)"
@@ -236,9 +235,11 @@ else
   record SKIP "updater feed" "skipped: architecture unknown"
 fi
 
-# Launch once against a throwaway profile.
+# Launch once against a throwaway profile. A screenshot from an earlier run
+# must not satisfy this one's wait, so the target PNG starts deleted.
 mkdir -p "$_profile/Crashpad"
 _log="$_work/rac.log"
+rm -f "$_png"
 if [ "$_has_screenshot" = 1 ]; then
   _mode="screenshot"
   env BREAKPAD_DUMP_LOCATION="$_profile/Crashpad" \
