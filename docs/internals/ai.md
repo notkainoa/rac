@@ -439,7 +439,7 @@ never counts as named.
 | Scroll, wait for the page, switch tabs | free | like a click | free |
 | Click or type on a named site | asks | plan card once, then the critic checks each step | free |
 | Navigate or click to a site the user didn't name | asks | asks | free |
-| Typing text that isn't in the user's messages | asks | asks | asks only on a site the user didn't name |
+| Typing text that isn't, exactly, in the user's message this turn | asks | asks | asks only on a site the user didn't name |
 | A plain text field or a select | asks | asks (the critic can't judge it) | free |
 | Risky (the list above) | asks | asks | asks |
 
@@ -457,7 +457,11 @@ sit on top of any level. `always` makes the origin count as named, so the
 `auto` typing rule and `careful`'s site check pass; risky actions still
 ask, and it covers only that exact origin. `never` blocks every action on
 the site, on any scheme or port, with a reason that names Settings ›
-Assistant. Reads stay free there. In Settings › Assistant the user adds a
+Assistant. The agent can't read it either: a snapshot, page text, or find
+on the site, or on a page showing a frame from it, is denied, a snapshot
+after a step that lands there is withheld, and the tab list leaves the tab
+out. Chat attachments are the exception (see Open concerns). In Settings ›
+Assistant the user adds a
 rule by typing a site (a bare host means https) and choosing Never or
 Always, and removes any rule from its chip. At `careful` and `auto`, a card
 offers "Always allow on <host>" only when a rule for the tab's site would
@@ -724,6 +728,19 @@ detach is posted.
   per-agent model pref, a `session/set_model` or `session/set_config_option`
   call between `session/new` and the prompt, and rows in the picker. That is
   a new capability, so it waits for its own phase.
+- **What the agent's data-flow rule doesn't cover.** A step that could
+  carry what the model read to a site that hasn't seen it asks, but some
+  bits still get through. Timing: when steps happen, and how long a wait
+  lasts (the model picks up to 10 seconds; waits are free and uncounted).
+  Choice: a turn's 12 free steps each pick among a few options a page sees
+  (which of the user's words, which field, which tab, which way to
+  scroll). Hosts: a card names `http://a` and `https://a` both as "a".
+- **Never sites in chat attachments.** A `never` rule stops the agent's
+  reads, but the chat page attaches tabs on its own path, so a never site's
+  text still reaches the model when the user attaches it, or when "attach
+  the current tab" is on and it's the current tab. Closing it means the
+  attach path asks the guard's rules (`ActionGuard::ReadBlockedReason`),
+  and deciding what an explicit attach of a never site should do.
 - **Rough edges in the tools.** `press_key` is Enter on an element only, and
   the guard always treats it as a possible submit. Forms that target a named
   window or a new window are denied. The agent can't close the user's own
