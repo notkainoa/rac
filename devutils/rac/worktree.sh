@@ -155,9 +155,12 @@ cmd_setup() {
   if [ ! -e "$root/helium-chromium/.git" ]; then
     # Take the submodule from the checkout being cloned: it has the Helium
     # commit this branch needs, which the main checkout may not (a newer base).
-    local modules
-    modules=$(git -C "$from/helium-chromium" rev-parse --absolute-git-dir 2>/dev/null) \
-      || modules="$base/.git/modules/helium-chromium"
+    # An uninitialized submodule folder would resolve to rac's own git dir, so
+    # use it only if it is a checkout of its own.
+    local modules="$base/.git/modules/helium-chromium"
+    if [ "$(git -C "$from/helium-chromium" rev-parse --show-toplevel 2>/dev/null)" = "$from/helium-chromium" ]; then
+      modules=$(git -C "$from/helium-chromium" rev-parse --absolute-git-dir)
+    fi
     log "checking out helium-chromium from $modules"
     git -C "$root" -c protocol.file.allow=always \
       -c "submodule.helium-chromium.url=$modules" \
