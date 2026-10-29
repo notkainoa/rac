@@ -1,0 +1,2216 @@
+Index: src/chrome/browser/prefs/browser_prefs.cc
+===================================================================
+--- src.orig/chrome/browser/prefs/browser_prefs.cc
++++ src/chrome/browser/prefs/browser_prefs.cc
+@@ -80,6 +80,7 @@
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/rac/pip/auto_pip_prefs.h"
+ #include "chrome/browser/rac/spaces/spaces_prefs.h"
++#include "chrome/browser/rac/storage/data_backups.h"
+ #include "chrome/browser/rac/updates/rac_updates.h"
+ #include "chrome/browser/rlz/chrome_rlz_tracker_delegate.h"
+ #include "chrome/browser/search/background/ntp_custom_background_service.h"
+@@ -1991,6 +1992,7 @@ void RegisterProfilePrefs(user_prefs::Pr
+       registry);
+   SearchPreloadService::RegisterProfilePrefs(registry);
+   rac::RegisterSpacesProfilePrefs(registry);
++  rac::DataBackups::RegisterProfilePrefs(registry);
+   rac::ai::RegisterProfilePrefs(registry);
+   rac::onboarding::RegisterProfilePrefs(registry);
+   SessionStartupPref::RegisterProfilePrefs(registry);
+Index: src/chrome/browser/profiles/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/profiles/BUILD.gn
++++ src/chrome/browser/profiles/BUILD.gn
+@@ -815,6 +815,7 @@ source_set("profiles_extra_parts_impl")
+     "//chrome/browser/push_messaging",
+     "//chrome/browser/rac/ai:browser",
+     "//chrome/browser/rac/spaces:browser",
++    "//chrome/browser/rac/storage:browser",
+     "//chrome/browser/reading_list",
+     "//chrome/browser/reduce_accept_language",
+     "//chrome/browser/regional_capabilities",
+Index: src/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+===================================================================
+--- src.orig/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
++++ src/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+@@ -209,6 +209,7 @@
+ #include "chrome/browser/push_messaging/push_messaging_service_factory.h"
+ #include "chrome/browser/rac/ai/ai_service_factory.h"
+ #include "chrome/browser/rac/spaces/spaces_service_factory.h"
++#include "chrome/browser/rac/storage/data_backups_factory.h"
+ #include "chrome/browser/reading_list/reading_list_model_factory.h"
+ #include "chrome/browser/reduce_accept_language/reduce_accept_language_factory.h"
+ #include "chrome/browser/regional_capabilities/regional_capabilities_service_factory.h"
+@@ -1381,6 +1382,7 @@ void ChromeBrowserMainExtraPartsProfiles
+   ReadAnythingServiceFactory::GetInstance();
+ #endif
+   rac::SpacesServiceFactory::GetInstance();
++  rac::DataBackupsFactory::GetInstance();
+   rac::ai::AiServiceFactory::GetInstance();
+   rac::SpacesWindowManagerFactory::GetInstance();
+   ReadingListModelFactory::GetInstance();
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn
++++ src/chrome/browser/ui/BUILD.gn
+@@ -3602,6 +3602,10 @@ static_library("ui") {
+       "//chrome/browser/resources/rac_ai:resources",
+     ]
+     sources += [
++      "rac/import/arc_dev_trigger.cc",
++      "rac/import/arc_dev_trigger.h",
++      "rac/import/arc_importer.cc",
++      "rac/import/arc_importer.h",
+       "rac/spaces/hidden_space.cc",
+       "rac/spaces/hidden_space.h",
+       "rac/spaces/move_tab_to_space_sub_menu_model.cc",
+@@ -3630,8 +3634,16 @@ static_library("ui") {
+       "rac/spaces/spaces_window_manager.h",
+       "rac/spaces/spaces_window_manager_factory.cc",
+       "rac/spaces/spaces_window_manager_factory.h",
++      "rac/storage/data_restorer.cc",
++      "rac/storage/data_restorer.h",
++    ]
++    deps += [
++      "//chrome/browser/rac/dev:buildflags",
++      "//chrome/browser/rac/import:apply",
++      "//chrome/browser/rac/import:arc_source",
++      "//chrome/browser/rac/spaces:browser",
++      "//chrome/browser/rac/storage:browser",
+     ]
+-    deps += [ "//chrome/browser/rac/spaces:browser" ]
+     sources += [
+       "views/rac/spaces/edit_space_bubble.cc",
+       "views/rac/spaces/edit_space_icons.cc",
+Index: src/chrome/browser/ui/rac/import/arc_dev_trigger.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/import/arc_dev_trigger.cc
+@@ -0,0 +1,91 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/import/arc_dev_trigger.h"
++
++#include "chrome/browser/rac/dev/buildflags.h"
++
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/logging.h"
++#include "base/memory/weak_ptr.h"
++#include "base/task/single_thread_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "base/time/time.h"
++#include "base/types/expected.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/import/arc_import_types.h"
++#include "chrome/browser/rac/import/arc_reader.h"
++#include "chrome/browser/rac/import/arc_source_root.h"
++#include "chrome/browser/rac/import/import_plan.h"
++#include "chrome/browser/ui/rac/import/arc_importer.h"
++#endif  // BUILDFLAG(RAC_DEV_SWITCHES)
++
++namespace rac {
++
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++
++namespace {
++
++// Not in release builds.
++constexpr char kImportArcNowSwitch[] = "rac-import-arc-now";
++// Long enough for the first window to be up, so the importer can show the
++// first imported space in it.
++constexpr base::TimeDelta kStartDelay = base::Seconds(3);
++
++bool g_started = false;
++
++void OnDone(const ArcImportResult& result) {
++  LOG(INFO) << "rac dev import finished";
++}
++
++void OnRead(base::WeakPtr<Profile> profile,
++            base::expected<ImportPlan, ArcReadError> plan) {
++  if (!profile) {
++    return;
++  }
++  if (!plan.has_value()) {
++    LOG(ERROR) << "rac dev import: Arc could not be read";
++    return;
++  }
++  ArcImportOptions options;
++  // The screenshots are about the sidebar. History would run Helium's
++  // importer.
++  options.history = false;
++  StartArcImport(profile.get(), std::move(plan.value()), options,
++                 base::DoNothing(), base::BindOnce(&OnDone));
++}
++
++void Start(base::WeakPtr<Profile> profile) {
++  if (!profile) {
++    return;
++  }
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce([] { return ReadArc(GetArcSourcePaths()); }),
++      base::BindOnce(&OnRead, std::move(profile)));
++}
++
++}  // namespace
++
++#endif  // BUILDFLAG(RAC_DEV_SWITCHES)
++
++void MaybeStartDevArcImport(Profile* profile) {
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++  if (g_started || !profile->IsRegularProfile() ||
++      !base::CommandLine::ForCurrentProcess()->HasSwitch(
++          kImportArcNowSwitch)) {
++    return;
++  }
++  g_started = true;
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE, base::BindOnce(&Start, profile->GetWeakPtr()), kStartDelay);
++#endif  // BUILDFLAG(RAC_DEV_SWITCHES)
++}
++
++}  // namespace rac
+Index: src/chrome/browser/ui/rac/import/arc_dev_trigger.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/import/arc_dev_trigger.h
+@@ -0,0 +1,21 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_IMPORT_ARC_DEV_TRIGGER_H_
++#define CHROME_BROWSER_UI_RAC_IMPORT_ARC_DEV_TRIGGER_H_
++
++class Profile;
++
++namespace rac {
++
++// Dev builds only. With --rac-import-arc-now, imports Arc into `profile`,
++// reading from --rac-import-source-root, a few seconds after startup, once
++// per run. It exists so the sidebar can be screenshotted before and after an
++// import without clicking through the import screens. Does nothing in
++// release builds, where the switch doesn't exist.
++void MaybeStartDevArcImport(Profile* profile);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_RAC_IMPORT_ARC_DEV_TRIGGER_H_
+Index: src/chrome/browser/ui/rac/import/arc_importer.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/import/arc_importer.cc
+@@ -0,0 +1,1413 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/import/arc_importer.h"
++
++#include <algorithm>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <variant>
++#include <vector>
++
++#include "base/check.h"
++#include "base/containers/flat_set.h"
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/hash/hash.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/stringprintf.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "base/time/time.h"
++#include "base/uuid.h"
++#include "base/values.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/favicon/favicon_service_factory.h"
++#include "chrome/browser/importer/brave_external_process_importer_host.h"
++#include "chrome/browser/importer/importer_progress_observer.h"
++#include "chrome/browser/importer/profile_writer.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/profiles/profile_observer.h"
++#include "chrome/browser/rac/import/arc_import_mapping.h"
++#include "chrome/browser/rac/import/arc_import_record.h"
++#include "chrome/browser/rac/import/arc_source_root.h"
++#include "chrome/browser/rac/spaces/space.h"
++#include "chrome/browser/rac/spaces/spaces_service.h"
++#include "chrome/browser/rac/spaces/spaces_service_factory.h"
++#include "chrome/browser/rac/spaces/spaces_store.h"
++#include "chrome/browser/rac/storage/data_backups.h"
++#include "chrome/browser/rac/storage/data_backups_factory.h"
++#include "chrome/browser/search/search.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/rac/sidebar/sidebar_items.h"
++#include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
++#include "chrome/browser/ui/rac/spaces/spaces_window_manager_factory.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/favicon/core/favicon_service.h"
++#include "components/favicon_base/favicon_types.h"
++#include "components/keyed_service/core/service_access_type.h"
++#include "components/sessions/core/serialized_navigation_entry.h"
++#include "components/tabs/public/tab_interface.h"
++#include "components/user_data_importer/common/importer_data_types.h"
++#include "components/user_data_importer/common/importer_type.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/web_contents.h"
++#include "services/data_decoder/public/cpp/data_decoder.h"
++#include "services/data_decoder/public/cpp/decode_image.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/gfx/geometry/size.h"
++#include "ui/gfx/image/image.h"
++#include "url/gurl.h"
++
++namespace rac {
++
++namespace {
++
++using ItemKind = ArcImportRecord::ItemKind;
++
++ArcProfileMaker* g_profile_maker = nullptr;
++
++constexpr char kSnapshotReason[] = "import-arc";
++// Arc's favicon cache holds small images. Anything larger isn't one.
++constexpr size_t kMaxFaviconBytes = 512 * 1024;
++constexpr size_t kMaxFavicons = 2000;
++constexpr int kFaviconSize = 32;
++
++scoped_refptr<base::SequencedTaskRunner> CreateFileTaskRunner() {
++  // USER_VISIBLE: the import screen waits on it. BLOCK_SHUTDOWN: a record
++  // write that has started must finish, or a rerun adds everything twice.
++  return base::ThreadPool::CreateSequencedTaskRunner(
++      {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
++       base::TaskShutdownBehavior::BLOCK_SHUTDOWN});
++}
++
++struct Services {
++  raw_ptr<DataBackups> backups = nullptr;
++  raw_ptr<SpacesService> spaces = nullptr;
++  raw_ptr<SidebarItems> items = nullptr;
++  raw_ptr<SpacesWindowManager> windows = nullptr;
++
++  bool ok() const { return backups && spaces && items && windows; }
++};
++
++Services GetServices(Profile* profile) {
++  Services services;
++  services.backups = DataBackupsFactory::GetForProfile(profile);
++  services.spaces = SpacesServiceFactory::GetForProfile(profile);
++  services.items = SidebarItems::Get(profile);
++  services.windows = SpacesWindowManagerFactory::GetForProfile(profile);
++  return services;
++}
++
++// Same test as SpacesWindowManager's IsUnusedInitialTab().
++bool IsUnusedTab(tabs::TabInterface* tab, Profile* profile) {
++  content::WebContents* contents = tab->GetContents();
++  return contents->GetController().IsInitialBlankNavigation() ||
++         search::IsNTPOrRelatedURL(contents->GetVisibleURL(), profile);
++}
++
++// The profile's only space, if a new profile would look like this: no name,
++// icon, theme, or pins, and nothing open but new-tab pages.
++bool IsBlankSpace(Profile* profile, const Space& space, const Services& s) {
++  const SpaceTheme fresh;
++  if (!space.name.empty() || !space.icon.empty() ||
++      space.theme.color1 != fresh.color1 ||
++      space.theme.color2 != fresh.color2 ||
++      space.theme.mode != SpaceTheme::Mode::kAuto ||
++      !space.theme.unknown_fields.empty() ||
++      !s.items->GetList(SidebarItems::PinnedListKey(space.id))
++           .entries.empty()) {
++    return false;
++  }
++  // A blank space with stored tabs has been used.
++  if (!s.windows->GetStoredTabs(space.id).empty()) {
++    return false;
++  }
++  // With one space, every unpinned tab is that space's. Favorites (Chromium
++  // pinned tabs) belong to the profile and stay.
++  bool unused = true;
++  ProfileBrowserCollection::GetForProfile(profile)->ForEach(
++      [&](BrowserWindowInterface* browser) {
++        TabStripModel* model = browser->GetTabStripModel();
++        if (!model) {
++          return true;
++        }
++        for (tabs::TabInterface* tab : *model) {
++          if (!tab->IsPinned() && !IsUnusedTab(tab, profile)) {
++            unused = false;
++            return false;
++          }
++        }
++        return true;
++      });
++  return unused;
++}
++
++ArcLiveSidebar GatherLive(Profile* profile, const Services& s) {
++  ArcLiveSidebar live;
++  for (const SidebarItem* item :
++       s.items->GetList(SidebarItems::kFavorites).AllItems()) {
++    live.sidebar_ids.insert(item->id);
++    live.favorite_urls.insert(item->url.spec());
++  }
++  for (const Space& space : s.spaces->spaces()) {
++    live.space_ids.insert(space.id.AsLowercaseString());
++    const SidebarList& list =
++        s.items->GetList(SidebarItems::PinnedListKey(space.id));
++    for (const SidebarList::Entry& entry : list.entries) {
++      if (const auto* folder = std::get_if<SidebarFolder>(&entry)) {
++        live.sidebar_ids.insert(folder->id);
++        for (const SidebarItem& item : folder->items) {
++          live.sidebar_ids.insert(item.id);
++        }
++      } else {
++        live.sidebar_ids.insert(std::get<SidebarItem>(entry).id);
++      }
++    }
++  }
++  if (s.spaces->spaces().size() == 1 &&
++      IsBlankSpace(profile, s.spaces->spaces().front(), s)) {
++    live.blank_space_id = s.spaces->spaces().front().id.AsLowercaseString();
++  }
++  return live;
++}
++
++// The pinned list holding folder `id`, or empty.
++std::string FindFolderListKey(const Services& s, std::string_view id) {
++  for (const Space& space : s.spaces->spaces()) {
++    std::string key = SidebarItems::PinnedListKey(space.id);
++    if (s.items->GetList(key).FindFolder(id)) {
++      return key;
++    }
++  }
++  return std::string();
++}
++
++StoredTab ToStoredTab(const ArcApplyTab& tab) {
++  // As SidebarWindowSync's GetItemNavigation(): one entry, never loaded.
++  sessions::SerializedNavigationEntry navigation;
++  navigation.set_index(0);
++  navigation.set_virtual_url(tab.url);
++  navigation.set_original_request_url(tab.url);
++  navigation.set_title(tab.name.empty() ? tab.page_title : tab.name);
++  navigation.set_transition_type(ui::PAGE_TRANSITION_AUTO_BOOKMARK);
++  if (!tab.created.is_null()) {
++    navigation.set_timestamp(tab.created);
++  }
++  StoredTab stored;
++  stored.navigations.push_back(std::move(navigation));
++  stored.selected_navigation = 0;
++  stored.last_active = tab.created;
++  return stored;
++}
++
++// What the run removed, and whether some of it couldn't be.
++struct Removal {
++  base::flat_set<std::string> removed;
++  bool partial = false;
++};
++
++// Takes out what `run` added to this profile, by id, wherever it is now.
++// Shared by Undo and by the rollback after a failed record write. `blank`
++// is the space the run replaced, put back first so the profile always has a
++// space and windows on an imported space fall back to it.
++Removal RemoveRun(const Services& s,
++                  const ArcImportRecord& record,
++                  const ArcImportRecord::Run& run,
++                  std::optional<Space> blank) {
++  Removal result;
++  if (blank && !s.spaces->FindSpace(blank->id)) {
++    s.spaces->RestoreSpace(std::move(*blank), 0);
++  }
++
++  const std::vector<std::string> run_spaces = record.SpacesOfRun(run.id);
++  // DeleteSpace does nothing to the last space. If the user deleted every
++  // space of their own since, keep the profile valid with a new blank one.
++  const bool only_run_spaces = std::ranges::all_of(
++      s.spaces->spaces(), [&](const Space& space) {
++        return std::ranges::contains(run_spaces, space.id.AsLowercaseString());
++      });
++  if (only_run_spaces) {
++    s.spaces->CreateSpace();
++  }
++
++  // Deleting a space closes its tabs into History, drops its stored tabs,
++  // and deletes its pinned list. Its tabs' space tags and session data go
++  // with the tabs, and windows showing it switch first, which rewrites the
++  // window's session space. A page that asks before closing keeps its space.
++  for (const std::string& id : run_spaces) {
++    const base::Uuid uuid = base::Uuid::ParseLowercase(id);
++    if (uuid.is_valid() && s.spaces->FindSpace(uuid)) {
++      s.windows->DeleteSpace(uuid);
++    }
++    if (uuid.is_valid() && s.spaces->FindSpace(uuid)) {
++      result.partial = true;
++    } else {
++      result.removed.insert(id);
++    }
++  }
++
++  // One save and one notification for the item removals. The batch isn't
++  // held across DeleteSpace, which closes tabs.
++  SidebarItems::ScopedBatch batch(s.items);
++  // Pins the run added to spaces that stay, such as one an earlier import
++  // made, or that the user moved out of an imported space; and favorites.
++  // A tab that stops being an item closes if idle and stays if in use.
++  for (ItemKind kind : {ItemKind::kPinnedTab, ItemKind::kFavorite}) {
++    for (const std::string& id : record.ItemsOfRun(run.id, kind)) {
++      if (s.items->FindItem(id)) {
++        s.items->RemoveItem(id);
++      }
++      result.removed.insert(id);
++    }
++  }
++  // A folder the run made goes when it's empty. One the user has since put
++  // their own pins in is theirs, and stays.
++  for (const std::string& id : record.ItemsOfRun(run.id, ItemKind::kFolder)) {
++    const std::string key = FindFolderListKey(s, id);
++    if (!key.empty() && s.items->GetList(key).FindFolder(id)->items.empty()) {
++      s.items->RemoveFolder(id);
++    }
++    result.removed.insert(id);
++  }
++  return result;
++}
++
++// Writes Arc's cached favicons to the favicon database. Decoding happens in
++// the data decoder service's sandboxed process, never in the browser. Only
++// for http and https pages, and only where no favicon is stored yet
++// (SetOnDemandFavicons doesn't overwrite, and marks the icon expired, so the
++// site's real icon replaces it on the first visit).
++class ArcFaviconWriter {
++ public:
++  struct Icon {
++    GURL page_url;
++    base::FilePath path;
++  };
++
++  ArcFaviconWriter(Profile* profile,
++                   scoped_refptr<base::SequencedTaskRunner> file_runner)
++      : profile_(profile), file_runner_(std::move(file_runner)) {}
++  ArcFaviconWriter(const ArcFaviconWriter&) = delete;
++  ArcFaviconWriter& operator=(const ArcFaviconWriter&) = delete;
++  ~ArcFaviconWriter() = default;
++
++  void Write(std::vector<Icon> icons, base::OnceClosure done) {
++    done_ = std::move(done);
++    std::erase_if(icons, [](const Icon& icon) {
++      return !icon.page_url.SchemeIsHTTPOrHTTPS() || icon.path.empty();
++    });
++    if (icons.size() > kMaxFavicons) {
++      icons.resize(kMaxFavicons);
++    }
++    if (icons.empty()) {
++      std::move(done_).Run();
++      return;
++    }
++    file_runner_->PostTaskAndReplyWithResult(
++        FROM_HERE, base::BindOnce(&ReadFiles, std::move(icons)),
++        base::BindOnce(&ArcFaviconWriter::OnRead, weak_factory_.GetWeakPtr()));
++  }
++
++ private:
++  using Files = std::vector<std::pair<GURL, std::string>>;
++
++  static Files ReadFiles(std::vector<Icon> icons) {
++    Files files;
++    for (const Icon& icon : icons) {
++      std::string bytes;
++      if (base::ReadFileToStringWithMaxSize(icon.path, &bytes,
++                                            kMaxFaviconBytes) &&
++          !bytes.empty()) {
++        files.emplace_back(icon.page_url, std::move(bytes));
++      }
++    }
++    return files;
++  }
++
++  void OnRead(Files files) {
++    pending_ = files.size();
++    if (pending_ == 0) {
++      std::move(done_).Run();
++      return;
++    }
++    for (auto& [page_url, bytes] : files) {
++      // A stable, made-up icon URL per image, so two pages of one site with
++      // different icons (Docs and Sheets) don't share one.
++      const GURL icon_url = page_url.GetWithEmptyPath().Resolve(
++          base::StringPrintf("/favicon.ico#rac-arc-%08x",
++                             base::PersistentHash(bytes)));
++      data_decoder::DecodeImage(
++          &decoder_, base::as_byte_span(bytes),
++          data_decoder::mojom::ImageCodec::kDefault, /*shrink_to_fit=*/true,
++          kMaxFaviconBytes, gfx::Size(kFaviconSize, kFaviconSize),
++          base::BindOnce(&ArcFaviconWriter::OnDecoded,
++                         weak_factory_.GetWeakPtr(), page_url, icon_url));
++    }
++  }
++
++  void OnDecoded(const GURL& page_url,
++                 const GURL& icon_url,
++                 const SkBitmap& bitmap) {
++    if (!bitmap.drawsNothing()) {
++      if (favicon::FaviconService* service =
++              FaviconServiceFactory::GetForProfile(
++                  profile_, ServiceAccessType::EXPLICIT_ACCESS)) {
++        service->SetOnDemandFavicons(
++            page_url, icon_url, favicon_base::IconType::kFavicon,
++            gfx::Image::CreateFrom1xBitmap(bitmap), base::DoNothing());
++      }
++    }
++    if (--pending_ == 0) {
++      std::move(done_).Run();
++    }
++  }
++
++  const raw_ptr<Profile> profile_;
++  const scoped_refptr<base::SequencedTaskRunner> file_runner_;
++  // One utility process for every icon of the import.
++  data_decoder::DataDecoder decoder_;
++  size_t pending_ = 0;
++  base::OnceClosure done_;
++  base::WeakPtrFactory<ArcFaviconWriter> weak_factory_{this};
++};
++
++// One Arc profile into one rac profile. Owns itself from Start() until it
++// runs `done`.
++class ArcProfileImport : public ProfileObserver,
++                         public importer::ImporterProgressObserver {
++ public:
++  static void Start(Profile* profile,
++                    ImportProfile source,
++                    ArcImportRun run,
++                    ArcImportProgressCallback progress,
++                    ArcProfileDoneCallback done) {
++    (new ArcProfileImport(profile, std::move(source), std::move(run),
++                          std::move(progress), std::move(done)))
++        ->Begin();
++  }
++
++ private:
++  ArcProfileImport(Profile* profile,
++                   ImportProfile source,
++                   ArcImportRun run,
++                   ArcImportProgressCallback progress,
++                   ArcProfileDoneCallback done)
++      : profile_(profile),
++        services_(GetServices(profile)),
++        source_(std::move(source)),
++        run_info_(std::move(run)),
++        progress_(std::move(progress)),
++        done_(std::move(done)),
++        file_runner_(CreateFileTaskRunner()) {
++    result_.source_key = source_.source_key;
++    result_.profile_path = profile_->GetPath();
++    result_.pinned_extensions =
++        static_cast<int>(source_.pinned_extension_ids.size());
++    run_.id = run_info_.id;
++    profile_observation_.Observe(profile_);
++  }
++
++  ~ArcProfileImport() override {
++    if (history_host_) {
++      history_host_->set_observer(nullptr);
++      history_host_->Cancel();
++    }
++  }
++
++  void Begin() {
++    if (!services_.ok()) {
++      Fail(ArcImportFailure::kProfileGone);
++      return;
++    }
++    operation_ = services_.backups->TryBeginOperation();
++    if (!operation_) {
++      Fail(ArcImportFailure::kBusy);
++      return;
++    }
++    // Stored tabs and DeleteSpace need the store loaded; it loads at
++    // profile start, so this is usually immediate.
++    services_.windows->RunWhenStoreReady(base::BindOnce(
++        &ArcProfileImport::ReadRecord, weak_factory_.GetWeakPtr()));
++  }
++
++  void ReadRecord() {
++    file_runner_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(&ArcImportRecord::Read, profile_->GetPath()),
++        base::BindOnce(&ArcProfileImport::OnRecordRead,
++                       weak_factory_.GetWeakPtr()));
++  }
++
++  void OnRecordRead(ArcImportRecord::ReadResult read) {
++    switch (read.status) {
++      case ArcImportRecord::ReadStatus::kTooNew:
++        Fail(ArcImportFailure::kRecordTooNew);
++        return;
++      case ArcImportRecord::ReadStatus::kCorrupt:
++        // Kept for a look by hand; a fresh record replaces it. Ordered on
++        // the same sequence before the write.
++        file_runner_->PostTask(
++            FROM_HERE, base::BindOnce(base::IgnoreResult(
++                                          &ArcImportRecord::MoveAside),
++                                      profile_->GetPath()));
++        break;
++      case ArcImportRecord::ReadStatus::kMissing:
++        break;
++      case ArcImportRecord::ReadStatus::kOk:
++        record_ = std::move(read.record);
++        break;
++    }
++
++    plan_ = MapArcProfile(source_, record_, GatherLive(profile_, services_),
++                          run_info_.options);
++    result_.counts = plan_.counts;
++    if (plan_.IsEmpty()) {
++      SendSpacesProgress();
++      result_.status = ArcProfileResult::Status::kNothingNew;
++      if (NeedsRecordWithoutSidebar()) {
++        FinalizeRecord(/*wrote_sidebar=*/false);
++        WriteRecord(base::BindOnce(&ArcProfileImport::AfterRecordSaved,
++                                   weak_factory_.GetWeakPtr(),
++                                   /*wrote_sidebar=*/false));
++        return;
++      }
++      ImportHistory();
++      return;
++    }
++    TakeSnapshot();
++  }
++
++  void TakeSnapshot() {
++    ArcImportProgress progress;
++    progress.step = ArcImportProgress::Step::kSnapshot;
++    progress_.Run(progress);
++    // The snapshot must hold the newest hidden tabs, so the store is written
++    // first.
++    services_.windows->FlushStore(base::BindOnce(
++        [](base::WeakPtr<ArcProfileImport> self) {
++          if (self) {
++            self->services_.backups->CreateSnapshot(
++                kSnapshotReason,
++                base::BindOnce(&ArcProfileImport::OnSnapshot, self));
++          }
++        },
++        weak_factory_.GetWeakPtr()));
++  }
++
++  void OnSnapshot(std::optional<std::string> id) {
++    if (!id) {
++      Fail(ArcImportFailure::kSnapshotFailed);
++      return;
++    }
++    // Keeps the snapshot cap from deleting it during the Undo window.
++    services_.backups->PinSnapshot(*id);
++    run_.snapshot_id = *id;
++    run_.snapshot_time = base::Time::Now();
++    run_.undo_until = run_.snapshot_time + DataBackups::kSnapshotLifetime;
++    result_.undo_until = run_.undo_until;
++    Apply();
++  }
++
++  // Everything visible, in one task, so no window shows half an import.
++  void Apply() {
++    if (plan_.record_was_stale) {
++      record_.ClearMappings();
++    }
++    std::optional<base::Uuid> first_new_space;
++    {
++      // Without the batch, every item saves the whole lists pref and wakes
++      // every window's sync.
++      SidebarItems::ScopedBatch batch(services_.items);
++      for (ArcApplySpace& space : plan_.spaces) {
++        const base::Uuid id =
++            space.is_new() ? CreateSpace(space)
++                           : base::Uuid::ParseLowercase(space.existing_id);
++        if (!first_new_space && space.is_new()) {
++          first_new_space = id;
++        }
++        AddPinned(id, space.pinned);
++        if (!space.open_tabs.empty()) {
++          open_tabs_.emplace_back(id, std::move(space.open_tabs));
++        }
++      }
++      for (const ArcApplyTab& favorite : plan_.favorites) {
++        AddTab(SidebarItems::kFavorites, SidebarPosition{}, favorite,
++               ItemKind::kFavorite, /*at_end_of=*/SidebarItems::kFavorites);
++      }
++    }
++
++    if (first_new_space && !plan_.replace_blank_space.empty()) {
++      ReplaceBlankSpace(base::Uuid::ParseLowercase(plan_.replace_blank_space),
++                        *first_new_space);
++    }
++
++    // Open tabs last, so a space a window now shows gets them as tabs in that
++    // window, and every other space in the store.
++    for (auto& [space, tabs] : open_tabs_) {
++      StoredSpace stored;
++      stored.space = space;
++      for (const ArcApplyTab& tab : tabs) {
++        stored.tabs.push_back(ToStoredTab(tab));
++        if (!tab.favicon_path.empty()) {
++          favicons_.push_back({tab.url, tab.favicon_path});
++        }
++      }
++      stored.active_tab = 0;
++      // Appends to the space's stored tabs, or, when a window holds the
++      // space's live tabs, adds them there deferred and unselected, so the
++      // active tab stays and nothing loads.
++      services_.windows->AddStoredTabs(std::move(stored));
++    }
++    open_tabs_.clear();
++
++    SendSpacesProgress();
++    result_.status = ArcProfileResult::Status::kDone;
++    FinalizeRecord(/*wrote_sidebar=*/true);
++    WriteRecord(base::BindOnce(&ArcProfileImport::AfterRecordSaved,
++                               weak_factory_.GetWeakPtr(),
++                               /*wrote_sidebar=*/true));
++  }
++
++  base::Uuid CreateSpace(ArcApplySpace& apply) {
++    Space space(base::Uuid::GenerateRandomV4(), std::move(apply.name));
++    space.icon = std::move(apply.icon);
++    if (apply.theme) {
++      space.theme = std::move(*apply.theme);
++    }
++    const base::Uuid id = space.id;
++    // Upserts by id, keeps the theme's custom stops and unknown fields, and
++    // notifies OnSpaceAdded.
++    services_.spaces->RestoreSpace(std::move(space),
++                                   services_.spaces->spaces().size());
++    record_.MapSpace(apply.source_id, id.AsLowercaseString(), run_.id);
++    return id;
++  }
++
++  void AddPinned(const base::Uuid& space,
++                 const std::vector<ArcApplyEntry>& entries) {
++    const std::string key = SidebarItems::PinnedListKey(space);
++    for (const ArcApplyEntry& entry : entries) {
++      if (const auto* tab = std::get_if<ArcApplyTab>(&entry)) {
++        AddTab(key, SidebarPosition{}, *tab, ItemKind::kPinnedTab, key);
++        continue;
++      }
++      const ArcApplyFolder& folder = std::get<ArcApplyFolder>(entry);
++      std::string folder_id = folder.existing_id;
++      std::string folder_key = key;
++      if (folder_id.empty()) {
++        folder_id = services_.items->AddFolder(
++            key, services_.items->GetList(key).entries.size(), folder.title);
++        record_.MapItem(folder.source_id, folder_id, ItemKind::kFolder,
++                        run_.id);
++      } else {
++        // The user may have moved it to another space since.
++        folder_key = FindFolderListKey(services_, folder_id);
++        if (folder_key.empty()) {
++          continue;
++        }
++      }
++      for (const ArcApplyTab& tab : folder.tabs) {
++        const SidebarFolder* live =
++            services_.items->GetList(folder_key).FindFolder(folder_id);
++        if (!live) {
++          break;
++        }
++        AddTab(folder_key, SidebarPosition{folder_id, live->items.size()}, tab,
++               ItemKind::kPinnedTab, std::string());
++      }
++    }
++  }
++
++  // Adds at `position`, or at the end of the top level of `at_end_of`.
++  void AddTab(std::string_view key,
++              SidebarPosition position,
++              const ArcApplyTab& tab,
++              ItemKind kind,
++              std::string_view at_end_of) {
++    if (!at_end_of.empty()) {
++      position = {std::string(),
++                  services_.items->GetList(at_end_of).entries.size()};
++    }
++    const std::string id =
++        services_.items->AddItem(key, position, tab.url, tab.page_title);
++    if (id.empty()) {
++      return;
++    }
++    if (!tab.name.empty()) {
++      services_.items->SetItemName(id, tab.name);
++    }
++    record_.MapItem(tab.source_id, id, kind, run_.id);
++    if (!tab.favicon_path.empty()) {
++      favicons_.push_back({tab.url, tab.favicon_path});
++    }
++  }
++
++  // The window showing the blank space shows Arc's first space instead, on
++  // a fresh new-tab page, so no Arc page loads. Then the blank space goes.
++  void ReplaceBlankSpace(const base::Uuid& blank, const base::Uuid& first) {
++    const Space* space = services_.spaces->FindSpace(blank);
++    if (!space) {
++      return;
++    }
++    blank_copy_ = Space::FromDict(space->ToDict());
++    if (BrowserWindowInterface* window =
++            services_.windows->GetWindowHoldingSpace(blank)) {
++      services_.windows->ShowSpace(window, first);
++    }
++    // Closes the blank space's new-tab pages.
++    services_.windows->DeleteSpace(blank);
++    if (!services_.spaces->FindSpace(blank)) {
++      run_.replaced_blank_space = blank.AsLowercaseString();
++    }
++  }
++
++  bool NeedsRecordWithoutSidebar() const {
++    return run_info_.origin && !run_info_.other_profiles.empty();
++  }
++
++  void FinalizeRecord(bool wrote_sidebar) {
++    const base::Time now = base::Time::Now();
++    run_.time = now;
++    if (!wrote_sidebar) {
++      // The run is recorded here only so Undo finds the other profiles.
++      run_.undo_until = run_info_.others_undo_until;
++    }
++    if (run_info_.origin) {
++      run_.other_profiles = run_info_.other_profiles;
++      record_.handoffs = run_info_.handoffs;
++    }
++    record_.AddRun(run_);
++    if (record_.first_import.is_null()) {
++      record_.first_import = now;
++    }
++    record_.last_import = now;
++    if (!source_.source_key.empty()) {
++      record_.arc_profile_key = source_.source_key;
++    }
++    if (!source_.pinned_extension_ids.empty()) {
++      record_.pinned_extension_ids = source_.pinned_extension_ids;
++    }
++  }
++
++  void WriteRecord(base::OnceCallback<void(bool)> done) {
++    file_runner_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(
++            [](ArcImportRecord record, base::FilePath dir) {
++              return record.Write(dir);
++            },
++            record_, profile_->GetPath()),
++        std::move(done));
++  }
++
++  void AfterRecordSaved(bool wrote_sidebar, bool saved) {
++    if (!saved && wrote_sidebar) {
++      // Without the record a rerun would add everything again, and Undo
++      // couldn't find it. Take it all back now.
++      RemoveRun(services_, record_, run_, std::move(blank_copy_));
++      services_.backups->UnpinSnapshot(run_.snapshot_id);
++      services_.backups->DeleteSnapshot(run_.snapshot_id);
++      result_.counts = ArcImportCounts();
++      result_.undo_until.reset();
++      Fail(ArcImportFailure::kRecordNotSaved);
++      return;
++    }
++    if (wrote_sidebar) {
++      operation_->MarkDataChanged();
++    }
++    favicon_writer_ =
++        std::make_unique<ArcFaviconWriter>(profile_, file_runner_);
++    favicon_writer_->Write(std::move(favicons_),
++                           base::BindOnce(&ArcProfileImport::ImportHistory,
++                                          weak_factory_.GetWeakPtr()));
++  }
++
++  // Helium's importer, history only. With items set to HISTORY, the host
++  // loads no bookmark model, runs no extension import, and shows no dialog;
++  // the utility process reads only the source's History file. Bookmarks off
++  // also keeps Arc's pins from arriving a second time.
++  void ImportHistory() {
++    if (!run_info_.options.history) {
++      result_.history = ArcProfileResult::History::kNotRequested;
++      Finish();
++      return;
++    }
++    if (!record_.history_imported.is_null()) {
++      result_.history = ArcProfileResult::History::kAlreadyImported;
++      Finish();
++      return;
++    }
++    if (source_.directory.empty() || run_info_.arc_support_dir.empty()) {
++      result_.history = ArcProfileResult::History::kNotAvailable;
++      Finish();
++      return;
++    }
++    // `directory` is a single folder name (import_plan.h).
++    const base::FilePath source_path =
++        run_info_.arc_support_dir.Append(FILE_PATH_LITERAL("User Data"))
++            .AppendASCII(source_.directory);
++    file_runner_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(&base::PathExists,
++                       source_path.Append(FILE_PATH_LITERAL("History"))),
++        base::BindOnce(&ArcProfileImport::StartHistory,
++                       weak_factory_.GetWeakPtr(), source_path));
++  }
++
++  void StartHistory(base::FilePath source_path, bool exists) {
++    if (!exists) {
++      result_.history = ArcProfileResult::History::kNotAvailable;
++      Finish();
++      return;
++    }
++    ArcImportProgress progress;
++    progress.step = ArcImportProgress::Step::kHistory;
++    progress_.Run(progress);
++
++    user_data_importer::SourceProfile source;
++    source.importer_name = u"Arc";
++    source.importer_type = user_data_importer::TYPE_ARC;
++    source.source_path = std::move(source_path);
++    source.services_supported = user_data_importer::HISTORY;
++    history_host_ = new BraveExternalProcessImporterHost();
++    history_host_->set_headless();
++    history_host_->set_observer(this);
++    history_host_->StartImportSettings(source, profile_,
++                                       user_data_importer::HISTORY,
++                                       new ProfileWriter(profile_));
++  }
++
++  // importer::ImporterProgressObserver:
++  void ImportStarted() override {}
++  void ImportItemStarted(user_data_importer::ImportItem item) override {}
++  void ImportItemEnded(user_data_importer::ImportItem item) override {
++    if (item == user_data_importer::HISTORY) {
++      history_ok_ = true;
++    }
++  }
++  void ImportEnded() override {
++    // The host deletes itself after this.
++    history_host_ = nullptr;
++    if (!history_ok_) {
++      result_.history = ArcProfileResult::History::kFailed;
++      Finish();
++      return;
++    }
++    result_.history = ArcProfileResult::History::kImported;
++    record_.history_imported = base::Time::Now();
++    WriteRecord(base::BindOnce([](base::WeakPtr<ArcProfileImport> self,
++                                  bool) {
++      if (self) {
++        self->Finish();
++      }
++    }, weak_factory_.GetWeakPtr()));
++  }
++
++  // ProfileObserver:
++  void OnProfileWillBeDestroyed(Profile* profile) override {
++    profile_observation_.Reset();
++    Fail(ArcImportFailure::kProfileGone);
++  }
++
++  void SendSpacesProgress() {
++    ArcImportProgress progress;
++    progress.step = ArcImportProgress::Step::kSpaces;
++    progress.total = run_info_.spaces_total;
++    int done = run_info_.spaces_before;
++    for (const ImportSpace& space : source_.spaces) {
++      progress.done = ++done;
++      progress.space_id = space.source_id;
++      const ArcImportRecord::SpaceMapping* mapping =
++          record_.FindSpace(space.source_id);
++      const std::optional<size_t> position =
++          mapping ? services_.spaces->GetIndex(
++                        base::Uuid::ParseLowercase(mapping->rac_id))
++                  : std::nullopt;
++      progress.space_title = base::UTF16ToUTF8(
++          ImportedSpaceTitle(space, position.value_or(0) + 1));
++      progress_.Run(progress);
++    }
++  }
++
++  void Fail(ArcImportFailure failure) {
++    result_.status = ArcProfileResult::Status::kFailed;
++    result_.failure = failure;
++    Finish();
++  }
++
++  void Finish() {
++    // Releasing the token lets DataBackups refresh its daily backup soon.
++    operation_.reset();
++    std::move(done_).Run(result_);
++    delete this;
++  }
++
++  const raw_ptr<Profile> profile_;
++  const Services services_;
++  const ImportProfile source_;
++  const ArcImportRun run_info_;
++  ArcImportProgressCallback progress_;
++  ArcProfileDoneCallback done_;
++  const scoped_refptr<base::SequencedTaskRunner> file_runner_;
++
++  std::unique_ptr<DataBackups::Operation> operation_;
++  ArcImportRecord record_;
++  ArcImportRecord::Run run_;
++  ArcApplyPlan plan_;
++  ArcProfileResult result_;
++  std::vector<std::pair<base::Uuid, std::vector<ArcApplyTab>>> open_tabs_;
++  std::vector<ArcFaviconWriter::Icon> favicons_;
++  std::optional<Space> blank_copy_;
++  std::unique_ptr<ArcFaviconWriter> favicon_writer_;
++  raw_ptr<BraveExternalProcessImporterHost> history_host_ = nullptr;
++  bool history_ok_ = false;
++
++  base::ScopedObservation<Profile, ProfileObserver> profile_observation_{this};
++  base::WeakPtrFactory<ArcProfileImport> weak_factory_{this};
++};
++
++// The whole import: other Arc profiles first, each into the profile the
++// sign-ins step makes, then the default one into the profile the import
++// started from. That order lets the starting profile's record name every
++// profile the import touched, in one write, while it holds its token.
++class ArcImportCoordinator {
++ public:
++  static void Start(Profile* profile,
++                    ImportPlan plan,
++                    ArcImportOptions options,
++                    ArcImportProgressCallback progress,
++                    ArcImportDoneCallback done) {
++    (new ArcImportCoordinator(profile, std::move(plan), std::move(options),
++                              std::move(progress), std::move(done)))
++        ->Next();
++  }
++
++ private:
++  ArcImportCoordinator(Profile* profile,
++                       ImportPlan plan,
++                       ArcImportOptions options,
++                       ArcImportProgressCallback progress,
++                       ArcImportDoneCallback done)
++      : origin_path_(profile->GetPath()),
++        plan_(std::move(plan)),
++        progress_(std::move(progress)),
++        done_(std::move(done)) {
++    run_.id = base::Uuid::GenerateRandomV4().AsLowercaseString();
++    // The plan carries the folder it was read from (ImportPlan::source_dir),
++    // so history comes from the same copy, such as a dev fixture.
++    run_.arc_support_dir = plan_.source_dir.empty()
++                               ? GetArcSourcePaths().support_dir
++                               : plan_.source_dir;
++    run_.options = std::move(options);
++    run_.handoffs = plan_.handoffs;
++    for (size_t i = 0; i < plan_.profiles.size(); ++i) {
++      const ImportProfile& source = plan_.profiles[i];
++      if (run_.options.skipped_profile_keys.contains(source.source_key)) {
++        continue;
++      }
++      run_.spaces_total += static_cast<int>(source.spaces.size());
++      if (source.is_default) {
++        default_index_ = i;
++      } else {
++        others_.push_back(i);
++      }
++    }
++    for (const ImportProfile& source : plan_.profiles) {
++      ArcProfileResult skipped;
++      skipped.source_key = source.source_key;
++      skipped.status = ArcProfileResult::Status::kSkipped;
++      results_.push_back(skipped);
++    }
++  }
++
++  ~ArcImportCoordinator() = default;
++
++  Profile* origin() const {
++    return g_browser_process->profile_manager()->GetProfileByPath(
++        origin_path_);
++  }
++
++  void Next() {
++    if (next_other_ < others_.size()) {
++      const size_t index = others_[next_other_++];
++      if (!g_profile_maker) {
++        results_[index].status = ArcProfileResult::Status::kNeedsProfile;
++        Next();
++        return;
++      }
++      g_profile_maker->MakeProfile(
++          plan_.profiles[index], ArcProfileName(plan_, index),
++          base::BindOnce(&ArcImportCoordinator::OnProfileMade,
++                         base::Unretained(this), index));
++      return;
++    }
++    if (!origin_started_) {
++      origin_started_ = true;
++      Profile* profile = origin();
++      if (!profile) {
++        Finish(ArcImportFailure::kProfileGone);
++        return;
++      }
++      ArcImportRun run = run_;
++      run.origin = true;
++      run.other_profiles = other_profiles_;
++      run.others_undo_until = others_undo_until_;
++      run.spaces_before = spaces_done_;
++      // With the default profile unchecked, the starting profile still
++      // records the run, for Undo and the hand-offs.
++      ImportProfile source;
++      if (default_index_) {
++        source = plan_.profiles[*default_index_];
++      }
++      ImportArcProfileInto(
++          profile, std::move(source), std::move(run), progress_,
++          base::BindOnce(&ArcImportCoordinator::OnProfileDone,
++                         base::Unretained(this), default_index_,
++                         /*new_profile=*/false));
++      return;
++    }
++    Finish(ArcImportFailure::kNone);
++  }
++
++  void OnProfileMade(size_t index, Profile* profile) {
++    if (!profile) {
++      results_[index].status = ArcProfileResult::Status::kFailed;
++      Next();
++      return;
++    }
++    ArcImportRun run = run_;
++    run.spaces_before = spaces_done_;
++    ImportArcProfileInto(
++        profile, plan_.profiles[index], std::move(run), progress_,
++        base::BindOnce(&ArcImportCoordinator::OnProfileDone,
++                       base::Unretained(this), std::optional<size_t>(index),
++                       /*new_profile=*/true));
++  }
++
++  void OnProfileDone(std::optional<size_t> index,
++                     bool new_profile,
++                     const ArcProfileResult& result) {
++    if (index) {
++      spaces_done_ += static_cast<int>(plan_.profiles[*index].spaces.size());
++      results_[*index] = result;
++      results_[*index].new_profile = new_profile;
++    }
++    if (new_profile && result.undo_until) {
++      other_profiles_.push_back(result.profile_path.BaseName().AsUTF8Unsafe());
++      others_undo_until_ = std::max(others_undo_until_, *result.undo_until);
++    }
++    if (!new_profile) {
++      origin_result_ = result;
++    }
++    Next();
++  }
++
++  void Finish(ArcImportFailure failure) {
++    if (failure == ArcImportFailure::kNone && origin_result_ &&
++        origin_result_->status == ArcProfileResult::Status::kFailed) {
++      failure = origin_result_->failure;
++    }
++    bool any_done = false;
++    bool any_failed = false;
++    for (const ArcProfileResult& result : results_) {
++      result_.counts += result.counts;
++      result_.pinned_extensions += result.pinned_extensions;
++      any_done |= result.status == ArcProfileResult::Status::kDone ||
++                  result.history == ArcProfileResult::History::kImported;
++      any_failed |= result.status == ArcProfileResult::Status::kFailed;
++      if (result.undo_until) {
++        result_.undo_until =
++            std::max(result_.undo_until.value_or(base::Time()),
++                     *result.undo_until);
++      }
++    }
++    result_.profiles = results_;
++    result_.failure = failure;
++    if (any_done) {
++      result_.status = ArcImportResult::Status::kDone;
++    } else if (any_failed || failure != ArcImportFailure::kNone) {
++      result_.status = ArcImportResult::Status::kFailed;
++    } else {
++      result_.status = ArcImportResult::Status::kNothingNew;
++    }
++    // Hand-offs live only in the starting profile's record.
++    result_.handoffs_saved =
++        origin_result_ &&
++        (origin_result_->status == ArcProfileResult::Status::kDone ||
++         origin_result_->status == ArcProfileResult::Status::kNothingNew) &&
++        (!plan_.handoffs.routing_rules_json.empty() ||
++         !plan_.handoffs.auto_archive_raw.empty());
++    std::move(done_).Run(result_);
++    delete this;
++  }
++
++  const base::FilePath origin_path_;
++  const ImportPlan plan_;
++  ArcImportProgressCallback progress_;
++  ArcImportDoneCallback done_;
++  ArcImportRun run_;
++  std::optional<size_t> default_index_;
++  std::vector<size_t> others_;
++  size_t next_other_ = 0;
++  bool origin_started_ = false;
++  int spaces_done_ = 0;
++  std::vector<std::string> other_profiles_;
++  base::Time others_undo_until_;
++  // The starting profile's own result, also when the default Arc profile
++  // was unchecked and it only recorded the run.
++  std::optional<ArcProfileResult> origin_result_;
++  std::vector<ArcProfileResult> results_;
++  ArcImportResult result_;
++};
++
++// Undo in one profile. `run_id` empty: this profile's newest undoable run.
++class ArcProfileUndo : public ProfileObserver {
++ public:
++  using Done = base::OnceCallback<void(ArcUndoResult,
++                                       const ArcImportRecord::Run* run)>;
++
++  static void Start(Profile* profile, std::string run_id, Done done) {
++    (new ArcProfileUndo(profile, std::move(run_id), std::move(done)))
++        ->Begin();
++  }
++
++ private:
++  ArcProfileUndo(Profile* profile, std::string run_id, Done done)
++      : profile_(profile),
++        services_(GetServices(profile)),
++        run_id_(std::move(run_id)),
++        done_(std::move(done)),
++        file_runner_(CreateFileTaskRunner()) {
++    profile_observation_.Observe(profile_);
++  }
++  ~ArcProfileUndo() override = default;
++
++  void Begin() {
++    if (!services_.ok()) {
++      Finish(ArcUndoResult::kFailed);
++      return;
++    }
++    operation_ = services_.backups->TryBeginOperation();
++    if (!operation_) {
++      Finish(ArcUndoResult::kBusy);
++      return;
++    }
++    // See ArcProfileImport::Begin().
++    services_.windows->RunWhenStoreReady(base::BindOnce(
++        [](base::WeakPtr<ArcProfileUndo> self) {
++          if (!self) {
++            return;
++          }
++          self->file_runner_->PostTaskAndReplyWithResult(
++              FROM_HERE,
++              base::BindOnce(&ArcImportRecord::Read,
++                             self->profile_->GetPath()),
++              base::BindOnce(&ArcProfileUndo::OnRecordRead, self));
++        },
++        weak_factory_.GetWeakPtr()));
++  }
++
++  void OnRecordRead(ArcImportRecord::ReadResult read) {
++    if (read.status == ArcImportRecord::ReadStatus::kMissing) {
++      Finish(ArcUndoResult::kNothingToUndo);
++      return;
++    }
++    if (read.status != ArcImportRecord::ReadStatus::kOk) {
++      Finish(ArcUndoResult::kFailed);
++      return;
++    }
++    record_ = std::move(read.record);
++    const base::Time now = base::Time::Now();
++    const ArcImportRecord::Run* run =
++        run_id_.empty() ? record_.UndoableRun(now) : record_.FindRun(run_id_);
++    if (!run) {
++      Finish(record_.runs().empty() ? ArcUndoResult::kNothingToUndo
++                                    : ArcUndoResult::kExpired);
++      return;
++    }
++    if (run->undone) {
++      Finish(ArcUndoResult::kNothingToUndo);
++      return;
++    }
++    if (now >= run->undo_until) {
++      Finish(ArcUndoResult::kExpired);
++      return;
++    }
++    run_ = *run;
++    if (run_.replaced_blank_space.empty() || run_.snapshot_id.empty()) {
++      Apply(std::nullopt);
++      return;
++    }
++    // The blank space comes back exactly as the snapshot has it.
++    services_.backups->ReadBackup(
++        run_.snapshot_id,
++        base::BindOnce(&ArcProfileUndo::OnSnapshotRead,
++                       weak_factory_.GetWeakPtr()));
++  }
++
++  void OnSnapshotRead(std::optional<DataBackups::Contents> contents) {
++    const base::Uuid blank =
++        base::Uuid::ParseLowercase(run_.replaced_blank_space);
++    std::optional<Space> space;
++    if (contents) {
++      if (const base::DictValue* spaces =
++              contents->prefs.FindDict(DataBackups::kSpacesPref)) {
++        if (const base::ListValue* list = spaces->FindList("spaces")) {
++          for (const base::Value& value : *list) {
++            if (const base::DictValue* dict = value.GetIfDict()) {
++              std::optional<Space> parsed = Space::FromDict(*dict);
++              if (parsed && parsed->id == blank) {
++                space = std::move(parsed);
++                break;
++              }
++            }
++          }
++        }
++      }
++    }
++    // Without the snapshot, a blank space with the same id is the same
++    // thing: that's what made it blank.
++    if (!space && blank.is_valid()) {
++      space.emplace(blank, std::string());
++    }
++    Apply(std::move(space));
++  }
++
++  void Apply(std::optional<Space> blank) {
++    const Removal removal =
++        RemoveRun(services_, record_, run_, std::move(blank));
++    partial_ = removal.partial;
++    record_.ForgetRemoved(run_.id, removal.removed);
++    operation_->MarkDataChanged();
++    file_runner_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(
++            [](ArcImportRecord record, base::FilePath dir) {
++              return record.Write(dir);
++            },
++            record_, profile_->GetPath()),
++        base::BindOnce(&ArcProfileUndo::OnRecordWritten,
++                       weak_factory_.GetWeakPtr()));
++  }
++
++  void OnRecordWritten(bool saved) {
++    if (!partial_ && !run_.snapshot_id.empty()) {
++      // The snapshot held open-tab URLs for Undo; it's no longer needed.
++      services_.backups->DeleteSnapshot(run_.snapshot_id);
++    }
++    // The sidebar is already undone. A record that couldn't be saved still
++    // maps the removed items, so a rerun skips them until it's saved again.
++    Finish(partial_ ? ArcUndoResult::kPartlyUndone
++           : saved  ? ArcUndoResult::kUndone
++                    : ArcUndoResult::kFailed);
++  }
++
++  // ProfileObserver:
++  void OnProfileWillBeDestroyed(Profile* profile) override {
++    profile_observation_.Reset();
++    Finish(ArcUndoResult::kFailed);
++  }
++
++  void Finish(ArcUndoResult result) {
++    operation_.reset();
++    std::move(done_).Run(result, run_.id.empty() ? nullptr : &run_);
++    delete this;
++  }
++
++  const raw_ptr<Profile> profile_;
++  const Services services_;
++  const std::string run_id_;
++  Done done_;
++  const scoped_refptr<base::SequencedTaskRunner> file_runner_;
++  std::unique_ptr<DataBackups::Operation> operation_;
++  ArcImportRecord record_;
++  ArcImportRecord::Run run_;
++  bool partial_ = false;
++  base::ScopedObservation<Profile, ProfileObserver> profile_observation_{this};
++  base::WeakPtrFactory<ArcProfileUndo> weak_factory_{this};
++};
++
++// Undo across profiles: the starting profile first, then each other profile
++// its run names, loaded if needed. Never deletes a profile.
++class ArcUndoCoordinator {
++ public:
++  static void Start(Profile* profile,
++                    base::OnceCallback<void(ArcUndoResult)> done) {
++    auto* self = new ArcUndoCoordinator(profile->GetPath(), std::move(done));
++    ArcProfileUndo::Start(
++        profile, std::string(),
++        base::BindOnce(&ArcUndoCoordinator::OnOriginDone,
++                       base::Unretained(self)));
++  }
++
++ private:
++  ArcUndoCoordinator(base::FilePath origin_path,
++                     base::OnceCallback<void(ArcUndoResult)> done)
++      : user_data_dir_(origin_path.DirName()), done_(std::move(done)) {}
++
++  void OnOriginDone(ArcUndoResult result, const ArcImportRecord::Run* run) {
++    result_ = result;
++    if (!run || (result != ArcUndoResult::kUndone &&
++                 result != ArcUndoResult::kPartlyUndone)) {
++      Finish();
++      return;
++    }
++    run_id_ = run->id;
++    others_ = run->other_profiles;
++    Next();
++  }
++
++  void Next() {
++    if (others_.empty()) {
++      Finish();
++      return;
++    }
++    const base::FilePath path = user_data_dir_.AppendASCII(others_.back());
++    others_.pop_back();
++    if (!g_browser_process->profile_manager()->LoadProfileByPath(
++            path, /*incognito=*/false,
++            base::BindOnce(&ArcUndoCoordinator::OnProfileLoaded,
++                           base::Unretained(this)))) {
++      // The user deleted that profile since. Nothing of it to undo.
++      Next();
++    }
++  }
++
++  void OnProfileLoaded(Profile* profile) {
++    if (!profile) {
++      Next();
++      return;
++    }
++    ArcProfileUndo::Start(
++        profile, run_id_,
++        base::BindOnce(
++            [](ArcUndoCoordinator* self, ArcUndoResult result,
++               const ArcImportRecord::Run*) {
++              if (result == ArcUndoResult::kPartlyUndone ||
++                  result == ArcUndoResult::kFailed ||
++                  result == ArcUndoResult::kBusy) {
++                self->result_ = ArcUndoResult::kPartlyUndone;
++              }
++              self->Next();
++            },
++            base::Unretained(this)));
++  }
++
++  void Finish() {
++    std::move(done_).Run(result_);
++    delete this;
++  }
++
++  const base::FilePath user_data_dir_;
++  base::OnceCallback<void(ArcUndoResult)> done_;
++  ArcUndoResult result_ = ArcUndoResult::kFailed;
++  std::string run_id_;
++  std::vector<std::string> others_;
++};
++
++}  // namespace
++
++ArcImportRun::ArcImportRun() = default;
++ArcImportRun::ArcImportRun(const ArcImportRun&) = default;
++ArcImportRun& ArcImportRun::operator=(const ArcImportRun&) = default;
++ArcImportRun::~ArcImportRun() = default;
++
++void SetArcProfileMaker(ArcProfileMaker* maker) {
++  g_profile_maker = maker;
++}
++
++void StartArcImport(Profile* profile,
++                    ImportPlan plan,
++                    ArcImportOptions options,
++                    ArcImportProgressCallback progress,
++                    ArcImportDoneCallback done) {
++  CHECK(profile);
++  CHECK(!profile->IsOffTheRecord());
++  ArcImportCoordinator::Start(profile, std::move(plan), std::move(options),
++                              std::move(progress), std::move(done));
++}
++
++void ImportArcProfileInto(Profile* target,
++                          ImportProfile source,
++                          ArcImportRun run,
++                          ArcImportProgressCallback progress,
++                          ArcProfileDoneCallback done) {
++  CHECK(target);
++  CHECK(!target->IsOffTheRecord());
++  ArcProfileImport::Start(target, std::move(source), std::move(run),
++                          std::move(progress), std::move(done));
++}
++
++void GetArcImportState(Profile* profile,
++                       base::OnceCallback<void(ArcImportState)> done) {
++  CreateFileTaskRunner()->PostTaskAndReplyWithResult(
++      FROM_HERE,
++      base::BindOnce(
++          [](base::FilePath dir) {
++            ArcImportState state;
++            ArcImportRecord::ReadResult read = ArcImportRecord::Read(dir);
++            if (read.status != ArcImportRecord::ReadStatus::kOk) {
++              return state;
++            }
++            if (!read.record.last_import.is_null()) {
++              state.last_import = read.record.last_import;
++            }
++            if (const ArcImportRecord::Run* run =
++                    read.record.UndoableRun(base::Time::Now())) {
++              state.undo_until = run->undo_until;
++              if (!run->snapshot_time.is_null()) {
++                state.undo_snapshot_time = run->snapshot_time;
++              }
++            }
++            return state;
++          },
++          profile->GetPath()),
++      std::move(done));
++}
++
++void UndoArcImport(Profile* profile,
++                   base::OnceCallback<void(ArcUndoResult)> done) {
++  CHECK(profile);
++  ArcUndoCoordinator::Start(profile, std::move(done));
++}
++
++std::u16string ImportedSpaceTitle(const ImportSpace& space, size_t position) {
++  const std::string name = ImportedSpaceName(space);
++  if (!name.empty()) {
++    return base::UTF8ToUTF16(name);
++  }
++  return l10n_util::GetStringFUTF16(IDS_RAC_SPACE_FALLBACK_NAME,
++                                    base::NumberToString16(position));
++}
++
++std::u16string ArcProfileName(const ImportPlan& plan, size_t index) {
++  const ArcProfileLabel label = ArcProfileLabelFor(plan, index);
++  switch (label.fallback) {
++    case ArcProfileLabel::Fallback::kNone:
++      return base::UTF8ToUTF16(label.name);
++    case ArcProfileLabel::Fallback::kDefault:
++      // English until the import screens land their strings.
++      return u"Your Arc profile";
++    case ArcProfileLabel::Fallback::kNumbered:
++      return u"Arc profile " + base::NumberToString16(label.number);
++  }
++}
++
++}  // namespace rac
+Index: src/chrome/browser/ui/rac/import/arc_importer.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/import/arc_importer.h
+@@ -0,0 +1,133 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_IMPORT_ARC_IMPORTER_H_
++#define CHROME_BROWSER_UI_RAC_IMPORT_ARC_IMPORTER_H_
++
++#include <cstddef>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "base/time/time.h"
++#include "chrome/browser/rac/import/arc_import_types.h"
++#include "chrome/browser/rac/import/import_plan.h"
++
++class Profile;
++
++namespace rac {
++
++using ArcImportProgressCallback =
++    base::RepeatingCallback<void(const ArcImportProgress&)>;
++using ArcImportDoneCallback = base::OnceCallback<void(const ArcImportResult&)>;
++using ArcProfileDoneCallback =
++    base::OnceCallback<void(const ArcProfileResult&)>;
++
++// Puts an Arc ImportPlan into rac. In each target profile it:
++//
++// 1. Takes DataBackups' operation token, and holds it to the end.
++// 2. Reads the import record and maps the Arc profile against it and the live
++//    sidebar (MapArcProfile). If nothing is new, it stops there: no snapshot,
++//    no write.
++// 3. Flushes the spaces store and takes a pinned "import-arc" snapshot. No
++//    snapshot, no import.
++// 4. Writes spaces, pinned tabs, folders, and favorites through
++//    SpacesService, SidebarItems, and SpacesWindowManager, in one UI task, so
++//    no window shows half an import. Open tabs go into the spaces store,
++//    unloaded, except in a space a window shows.
++// 5. Saves the record. If that fails, takes the import back and reports
++//    kFailed, so a rerun can't add everything twice.
++// 6. Writes Arc's cached favicons to the favicon database, decoded in the
++//    data decoder's sandbox. Nothing is fetched.
++// 7. Runs Helium's importer for history only, if asked and not done before.
++// 8. Operation::MarkDataChanged(), and releases the token.
++//
++// Nothing here makes a network request, installs an extension, or touches
++// AI data. Profiles are imported one at a time.
++
++// For the sign-ins step (plan 04 M2), which owns profile creation. It makes
++// the rac profile for an Arc profile that isn't the default one. Until it's
++// registered, those Arc profiles end as ArcProfileResult::kNeedsProfile.
++class ArcProfileMaker {
++ public:
++  virtual ~ArcProfileMaker() = default;
++  // Runs `done` with the new profile, fully initialized, or null if it
++  // couldn't be made. `name` is ArcProfileName() for it.
++  virtual void MakeProfile(const ImportProfile& source,
++                           const std::u16string& name,
++                           base::OnceCallback<void(Profile*)> done) = 0;
++};
++// Called once at startup by the sign-ins step. Not owned.
++void SetArcProfileMaker(ArcProfileMaker* maker);
++
++// What every profile of one import shares.
++struct ArcImportRun {
++  ArcImportRun();
++  ArcImportRun(const ArcImportRun&);
++  ArcImportRun& operator=(const ArcImportRun&);
++  ~ArcImportRun();
++
++  // A new UUID per import, the same in every profile's record, so Undo
++  // finds every profile's part.
++  std::string id;
++  // Arc's support folder, for the history step: the folder the plan was
++  // read from (ArcSourcePaths::support_dir).
++  base::FilePath arc_support_dir;
++  ArcImportOptions options;
++  // Set only for the profile the import started from: hand-offs live in its
++  // record.
++  bool origin = false;
++  ImportHandoffs handoffs;
++  // Origin only: the other profiles this import wrote into, as profile
++  // folder base names, and the latest of their Undo deadlines, so the
++  // starting profile's record leads Undo to them.
++  std::vector<std::string> other_profiles;
++  base::Time others_undo_until;
++  // For progress across profiles: Arc spaces handled before this profile,
++  // and in all.
++  int spaces_before = 0;
++  int spaces_total = 0;
++};
++
++// The import screens' entry point. `profile` receives the default Arc
++// profile; the other checked ones go through ArcProfileMaker. `progress`
++// runs on the UI thread, in bursts; `done` runs once.
++void StartArcImport(Profile* profile,
++                    ImportPlan plan,
++                    ArcImportOptions options,
++                    ArcImportProgressCallback progress,
++                    ArcImportDoneCallback done);
++
++// The per-profile entry point, for the sign-ins step when it drives
++// profiles itself: imports `source` into `target`, which must be a regular
++// profile. StartArcImport() calls it too.
++void ImportArcProfileInto(Profile* target,
++                          ImportProfile source,
++                          ArcImportRun run,
++                          ArcImportProgressCallback progress,
++                          ArcProfileDoneCallback done);
++
++// When this profile last received an Arc import, and whether and until when
++// it can be undone. Reads the import record on a background sequence.
++void GetArcImportState(Profile* profile,
++                       base::OnceCallback<void(ArcImportState)> done);
++
++// "Undo Arc import": removes what the newest import added, in every profile
++// it touched, and puts back the blank space it replaced. It never deletes a
++// profile and leaves history, favicons, and cookies in place. The spaces
++// it removes close their tabs, which stay in History. Things the user made
++// since the import, outside the imported spaces, are kept.
++void UndoArcImport(Profile* profile,
++                   base::OnceCallback<void(ArcUndoResult)> done);
++
++// What the sidebar calls an imported space: its name, or rac's own
++// "Space <position>" (1-based, switcher order) if Arc had none.
++std::u16string ImportedSpaceTitle(const ImportSpace& space, size_t position);
++// "Work", "Your Arc profile", or "Arc profile 2". Never the folder name.
++std::u16string ArcProfileName(const ImportPlan& plan, size_t index);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_RAC_IMPORT_ARC_IMPORTER_H_
+Index: src/chrome/browser/ui/rac/storage/data_restorer.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/storage/data_restorer.cc
+@@ -0,0 +1,349 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/storage/data_restorer.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/uuid.h"
++#include "base/values.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/profiles/profile_observer.h"
++#include "chrome/browser/rac/spaces/space.h"
++#include "chrome/browser/rac/spaces/spaces_service.h"
++#include "chrome/browser/rac/spaces/spaces_service_factory.h"
++#include "chrome/browser/rac/spaces/spaces_store.h"
++#include "chrome/browser/rac/storage/data_backups.h"
++#include "chrome/browser/rac/storage/data_backups_factory.h"
++#include "chrome/browser/rac/storage/restore_plan.h"
++#include "chrome/browser/ui/rac/sidebar/sidebar_items.h"
++#include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
++#include "chrome/browser/ui/rac/spaces/spaces_window_manager_factory.h"
++#include "components/prefs/pref_service.h"
++
++namespace rac {
++
++namespace {
++
++// One restore, from the operation token to the applied plan. It owns itself:
++// every step's callback holds a WeakPtr, and Finish() runs `done` and deletes
++// it. Deleting it also releases the Operation token, and pending steps whose
++// replies were dropped with their service die with it.
++class RestoreJob : public ProfileObserver {
++ public:
++  RestoreJob(Profile* profile,
++             RestoreMode mode,
++             bool resolve_offer,
++             DataRestorer::Callback done)
++      : mode_(mode),
++        resolve_offer_(resolve_offer),
++        profile_(profile),
++        done_(std::move(done)) {
++    if (profile_) {
++      profile_observation_.Observe(profile_);
++    }
++  }
++  RestoreJob(const RestoreJob&) = delete;
++  RestoreJob& operator=(const RestoreJob&) = delete;
++  ~RestoreJob() override = default;
++
++  // Steps 1 and 2: the token, then the backup in memory. A null `backup_id`
++  // reads the offered backup, which falls back to the next-best one.
++  void Begin(std::optional<std::string> backup_id) {
++    if (!ProfileAlive()) {
++      Finish(DataRestorer::Result::kProfileGone);
++      return;
++    }
++    DataBackups* backups = DataBackupsFactory::GetForProfile(profile_);
++    if (!backups) {
++      Finish(DataRestorer::Result::kProfileGone);
++      return;
++    }
++    operation_ = backups->TryBeginOperation();
++    if (!operation_) {
++      Finish(DataRestorer::Result::kBusy);
++      return;
++    }
++    auto read = base::BindOnce(&RestoreJob::OnBackupRead,
++                               weak_factory_.GetWeakPtr());
++    if (backup_id) {
++      backups->ReadBackup(*backup_id, std::move(read));
++    } else {
++      backups->ReadOfferedBackup(std::move(read));
++    }
++  }
++
++  // ProfileObserver:
++  void OnProfileWillBeDestroyed(Profile*) override {
++    profile_ = nullptr;
++    Finish(DataRestorer::Result::kProfileGone);
++  }
++
++ private:
++  // Step 3: wait for the store, look at what's live, and take the safety
++  // snapshot when the restore could lose something.
++  void OnBackupRead(std::optional<DataBackups::Contents> backup) {
++    if (!ProfileAlive()) {
++      Finish(DataRestorer::Result::kProfileGone);
++      return;
++    }
++    if (!backup) {
++      Finish(DataRestorer::Result::kBackupMissing);
++      return;
++    }
++    backup_ = std::move(*backup);
++    SpacesWindowManager* windows =
++        SpacesWindowManagerFactory::GetForProfile(profile_);
++    if (!windows) {
++      Finish(DataRestorer::Result::kProfileGone);
++      return;
++    }
++    windows->RunWhenStoreReady(base::BindOnce(&RestoreJob::OnStoreReady,
++                                            weak_factory_.GetWeakPtr()));
++  }
++
++  void OnStoreReady() {
++    if (!ProfileAlive()) {
++      Finish(DataRestorer::Result::kProfileGone);
++      return;
++    }
++    PrefService* prefs = profile_->GetPrefs();
++    SpacesService* spaces = SpacesServiceFactory::GetForProfile(profile_);
++    SpacesWindowManager* windows =
++        SpacesWindowManagerFactory::GetForProfile(profile_);
++    if (!prefs || !spaces || !windows) {
++      Finish(DataRestorer::Result::kProfileGone);
++      return;
++    }
++    GatherLive(*prefs, *spaces, *windows);
++    if (!NeedsSafetySnapshot(mode_, live_)) {
++      ApplyPlan();
++      return;
++    }
++    // The snapshot's copy of `rac spaces` must hold the tabs of every hidden
++    // space, so the store is written first.
++    windows->FlushStore(base::BindOnce(&RestoreJob::OnStoreFlushed,
++                                       weak_factory_.GetWeakPtr()));
++  }
++
++  void OnStoreFlushed() {
++    if (!ProfileAlive()) {
++      Finish(DataRestorer::Result::kProfileGone);
++      return;
++    }
++    DataBackups* backups = DataBackupsFactory::GetForProfile(profile_);
++    if (!backups) {
++      Finish(DataRestorer::Result::kProfileGone);
++      return;
++    }
++    backups->CreateSnapshot(
++        "restore", base::BindOnce(&RestoreJob::OnSafetySnapshot,
++                                  weak_factory_.GetWeakPtr()));
++  }
++
++  void OnSafetySnapshot(std::optional<std::string> id) {
++    if (!id) {
++      Finish(DataRestorer::Result::kSnapshotFailed);
++      return;
++    }
++    if (!ProfileAlive()) {
++      Finish(DataRestorer::Result::kProfileGone);
++      return;
++    }
++    ApplyPlan();
++  }
++
++  // Captured the same way a backup captures them: user values only, so an
++  // unset pref stays out and the planner treats it as the default.
++  void GatherLive(const PrefService& prefs,
++                  const SpacesService& spaces,
++                  const SpacesWindowManager& windows) {
++    for (const char* name : DataBackups::kBackedUpPrefs) {
++      if (const base::Value* value = prefs.GetUserPrefValue(name)) {
++        live_.prefs.Set(name, value->Clone());
++      }
++    }
++    for (const Space& space : spaces.spaces()) {
++      if (windows.HasLiveTabs(space.id)) {
++        live_.spaces_with_window_tabs.insert(space.id.AsLowercaseString());
++      }
++      if (!windows.GetStoredTabs(space.id).empty()) {
++        live_.spaces_with_stored_tabs.insert(space.id.AsLowercaseString());
++      }
++    }
++  }
++
++  // Steps 4-6: apply in this one task, so windows never paint a
++  // half-restored sidebar. Everything is re-fetched; the profile could have
++  // lost a service while a step was pending.
++  void ApplyPlan() {
++    PrefService* prefs = profile_->GetPrefs();
++    SpacesService* spaces = SpacesServiceFactory::GetForProfile(profile_);
++    SpacesWindowManager* windows =
++        SpacesWindowManagerFactory::GetForProfile(profile_);
++    SidebarItems* items = SidebarItems::Get(profile_);
++    DataBackups* backups = DataBackupsFactory::GetForProfile(profile_);
++    if (!prefs || !spaces || !windows || !items || !backups) {
++      Finish(DataRestorer::Result::kProfileGone);
++      return;
++    }
++
++    RestorePlan plan = MakeRestorePlan(*backup_, live_, mode_);
++
++    // The backup's spaces, in its order.
++    for (size_t i = 0; i < plan.spaces.size(); ++i) {
++      if (std::optional<Space> space = Space::FromDict(plan.spaces[i])) {
++        spaces->RestoreSpace(std::move(*space), i);
++      }
++    }
++
++    // The blank space a reset left hands its open tabs to the first restored
++    // space. Delete it only once its tabs moved: if the target couldn't be
++    // restored, keeping it loses nothing and closing it would lose tabs.
++    bool moved_placeholder = false;
++    if (plan.move_tabs_from) {
++      const base::Uuid from =
++          base::Uuid::ParseCaseInsensitive(*plan.move_tabs_from);
++      const base::Uuid to = base::Uuid::ParseCaseInsensitive(plan.move_tabs_to);
++      if (from.is_valid() && to.is_valid() && spaces->FindSpace(to)) {
++        windows->MoveWindowTabs(from, to);
++        moved_placeholder = true;
++      }
++    }
++    for (const std::string& id : plan.delete_spaces) {
++      if (!moved_placeholder && plan.move_tabs_from &&
++          id == *plan.move_tabs_from) {
++        continue;
++      }
++      const base::Uuid space = base::Uuid::ParseCaseInsensitive(id);
++      if (space.is_valid()) {
++        windows->DeleteSpace(space);
++      }
++    }
++
++    // Favorites and pinned tabs. The pref changes first, then the service
++    // that owns the live copy reloads it.
++    SetOrClearDict(prefs, kListsPref, plan.sidebar_lists);
++    items->ReloadFromPrefs();
++
++    // Hidden spaces' tabs. Only plans from a backup with `rac spaces` carry
++    // either list, so a daily or pre-reset copy leaves them alone.
++    for (const auto& [id, dict] : plan.restore_stored_tabs) {
++      const base::Uuid space = base::Uuid::ParseCaseInsensitive(id);
++      if (!space.is_valid()) {
++        continue;
++      }
++      std::optional<StoredSpace> stored = StoredSpace::FromDict(dict);
++      if (!stored) {
++        continue;
++      }
++      stored->space = space;
++      // AddStoredTabs appends; drop the live entry first so the backup's
++      // copy replaces it.
++      windows->RemoveStoredTabs(space);
++      windows->AddStoredTabs(std::move(*stored));
++    }
++    for (const std::string& id : plan.remove_stored_tabs) {
++      const base::Uuid space = base::Uuid::ParseCaseInsensitive(id);
++      if (space.is_valid()) {
++        windows->RemoveStoredTabs(space);
++      }
++    }
++
++    // Agent permissions. Only pref values change; no AI code runs.
++    SetOrClearDict(prefs, DataBackups::kAgentSiteRulesPref,
++                   plan.agent_site_rules);
++    SetOrClearString(prefs, DataBackups::kAgentPermissionLevelPref,
++                     plan.agent_permission_level);
++
++    operation_->MarkDataChanged();
++    if (resolve_offer_) {
++      backups->ResolveRestoreOffer();
++    }
++    Finish(DataRestorer::Result::kRestored);
++  }
++
++  // A nullopt from the plan clears the pref; anything unexpected falls back
++  // to clearing it too, since SidebarItems reads a non-dict as empty anyway.
++  static void SetOrClearDict(PrefService* prefs,
++                             std::string_view name,
++                             const std::optional<base::Value>& value) {
++    if (value && value->is_dict()) {
++      prefs->SetDict(name, value->GetDict().Clone());
++    } else {
++      prefs->ClearPref(name);
++    }
++  }
++
++  static void SetOrClearString(PrefService* prefs,
++                               std::string_view name,
++                               const std::optional<base::Value>& value) {
++    if (value && value->is_string()) {
++      prefs->SetString(name, value->GetString());
++    } else {
++      prefs->ClearPref(name);
++    }
++  }
++
++  // The observer fires for a real teardown; IsValidProfile also catches a
++  // profile that was never registered or is already half gone. It only
++  // compares pointers, so a stale `profile_` is safe to pass.
++  bool ProfileAlive() const {
++    ProfileManager* manager =
++        g_browser_process ? g_browser_process->profile_manager() : nullptr;
++    return profile_ && manager && manager->IsValidProfile(profile_);
++  }
++
++  void Finish(DataRestorer::Result result) {
++    // Free the token first, so `done` may start another operation.
++    operation_.reset();
++    profile_observation_.Reset();
++    if (done_) {
++      std::move(done_).Run(result);
++    }
++    delete this;
++  }
++
++  const RestoreMode mode_;
++  const bool resolve_offer_;
++  raw_ptr<Profile> profile_;
++  DataRestorer::Callback done_;
++  std::unique_ptr<DataBackups::Operation> operation_;
++  std::optional<DataBackups::Contents> backup_;
++  LiveSidebar live_;
++  base::ScopedObservation<Profile, ProfileObserver> profile_observation_{this};
++  base::WeakPtrFactory<RestoreJob> weak_factory_{this};
++};
++
++}  // namespace
++
++// static
++void DataRestorer::Restore(Profile* profile,
++                           std::string_view backup_id,
++                           Mode mode,
++                           Callback done) {
++  // Owns itself until `done` runs.
++  RestoreJob* job = new RestoreJob(profile, mode, /*resolve_offer=*/false,
++                                   std::move(done));
++  job->Begin(std::string(backup_id));
++}
++
++// static
++void DataRestorer::RestoreOffer(Profile* profile, Callback done) {
++  RestoreJob* job = new RestoreJob(profile, RestoreMode::kMerge,
++                                   /*resolve_offer=*/true, std::move(done));
++  job->Begin(std::nullopt);
++}
++
++}  // namespace rac
+Index: src/chrome/browser/ui/rac/storage/data_restorer.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/storage/data_restorer.h
+@@ -0,0 +1,74 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_STORAGE_DATA_RESTORER_H_
++#define CHROME_BROWSER_UI_RAC_STORAGE_DATA_RESTORER_H_
++
++#include <string_view>
++
++#include "base/functional/callback.h"
++#include "chrome/browser/rac/storage/restore_plan.h"
++
++class Profile;
++
++namespace rac {
++
++// Puts a DataBackups backup back into a live profile. It writes only through
++// the services that own the data (SpacesService, SidebarItems, and the
++// SpacesWindowManager's store), because they keep the live copy and would
++// overwrite a pref changed behind their back. Only ever called because the
++// user asked: "Undo Arc import", or "Restore" in the restore prompt.
++//
++// Every restore runs in this order:
++//
++// 1. Take DataBackups::TryBeginOperation(). If an import, Undo, or restore
++//    is already running, fail with kBusy. The token is held to the end.
++// 2. Read the backup into memory. Nothing after this can lose it: not the
++//    snapshot cap, not expiry.
++// 3. If NeedsSafetySnapshot(), flush the spaces store and take a "restore"
++//    snapshot of the live data, so the restore can itself be undone. If that
++//    fails, stop with kSnapshotFailed. A merge into an empty sidebar skips
++//    this step, so a full disk can't block getting data back.
++// 4. MakeRestorePlan(), then apply it in one UI task, so windows never show
++//    a half-restored sidebar.
++// 5. Operation::MarkDataChanged(), so the daily backup is refreshed soon.
++//
++// Nothing changes on any failure, and the offer stays.
++class DataRestorer {
++ public:
++  using Mode = RestoreMode;
++
++  enum class Result {
++    kRestored,
++    // Another import, Undo, or restore is running. Nothing changed.
++    kBusy,
++    // The backup (and, for the offer, every fallback) expired or can't be
++    // read. Nothing changed.
++    kBackupMissing,
++    // The safety snapshot of the current data couldn't be written. Nothing
++    // changed.
++    kSnapshotFailed,
++    // The profile went away first. Nothing changed.
++    kProfileGone,
++  };
++  using Callback = base::OnceCallback<void(Result)>;
++
++  // For Undo: restores `backup_id` in kExact mode. `apply` pins its
++  // pre-import snapshot (DataBackups::PinSnapshot) for the Undo window, so
++  // the snapshot cap can't delete it first.
++  static void Restore(Profile* profile,
++                      std::string_view backup_id,
++                      Mode mode,
++                      Callback done);
++
++  // For the restore prompt: restores the pending offer in kMerge mode, read
++  // with DataBackups::ReadOfferedBackup(), which falls back to the next-best
++  // backup if the offered one is gone. Calls ResolveRestoreOffer() only on
++  // kRestored. On any failure the offer stays, and the prompt says why.
++  static void RestoreOffer(Profile* profile, Callback done);
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_RAC_STORAGE_DATA_RESTORER_H_
+Index: src/chrome/browser/ui/rac/spaces/spaces_window_manager.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/spaces/spaces_window_manager.cc
++++ src/chrome/browser/ui/rac/spaces/spaces_window_manager.cc
+@@ -27,6 +27,7 @@
+ #include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
++#include "chrome/browser/ui/rac/import/arc_dev_trigger.h"
+ #include "chrome/browser/ui/rac/spaces/hidden_space.h"
+ #include "chrome/browser/ui/rac/spaces/space_elsewhere_dialog.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_snapshot.h"
+@@ -952,6 +953,7 @@ void SpacesWindowManager::OnStoreReady()
+   for (auto& callback : ready_callbacks) {
+     std::move(callback).Run();
+   }
++  MaybeStartDevArcImport(profile_);
+ }
+ 
+ void SpacesWindowManager::ReconcileWindow(BrowserWindowInterface* browser) {
