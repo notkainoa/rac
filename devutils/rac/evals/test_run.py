@@ -58,9 +58,10 @@ class SeedingTest(unittest.TestCase):
 
 class LaunchTest(unittest.TestCase):
     def test_launch_uses_worktree_run_a_throwaway_profile_and_loopback_debugging(self):
-        args = run.launch_args("/tmp/rac-evals-x", 9333)
-        self.assertTrue(args[0].endswith("devutils/rac/worktree.sh"))
-        self.assertEqual(args[1], "run")
+        args = run.launch_args("/tmp/rac-evals-x", 9333, "/wt")
+        self.assertTrue(args[0].endswith("devutils/rac/build-queue.sh"))
+        self.assertTrue(args[1].endswith("devutils/rac/worktree.sh"))
+        self.assertEqual(args[2], "run")
         self.assertIn("--user-data-dir=/tmp/rac-evals-x", args)
         self.assertIn("--remote-debugging-port=9333", args)
         self.assertIn("--remote-debugging-address=127.0.0.1", args)
@@ -70,21 +71,22 @@ class LaunchTest(unittest.TestCase):
 
     def test_profile_is_a_fresh_folder_named_for_evals_under_the_given_base(self):
         with tempfile.TemporaryDirectory() as base:
-            p = run.make_profile(base)
+            p = run.make_profile("/wt", base)
             self.assertTrue(os.path.isdir(os.path.join(p, "Default")))
             self.assertTrue(os.path.basename(p).startswith("rac-evals-"))
             self.assertEqual(os.path.dirname(p), os.path.realpath(base))
             self.assertEqual(os.listdir(os.path.join(p, "Default")), [])
 
     def test_the_default_profile_base_is_inside_the_worktree_build_folder(self):
-        self.assertTrue(os.path.join(run.ROOT, "build").endswith("build"))
-        self.assertNotIn("Library", run.ROOT.split(os.sep)[-3:])
+        with tempfile.TemporaryDirectory() as wt:
+            p = run.make_profile(wt)
+            self.assertEqual(os.path.dirname(p), os.path.realpath(os.path.join(wt, "build")))
 
     def test_a_real_profile_folder_is_refused(self):
         for base in ("/Users/someone/Library/Application Support/me.kainoa.rac.dev-test",
                      os.path.expanduser("~/Library/Application Support"), "/etc", os.path.expanduser("~")):
             with self.assertRaises(AssertionError):
-                run.make_profile(base)
+                run.make_profile("/wt", base)
 
     def test_free_port_is_usable(self):
         self.assertGreater(run.free_port(), 1023)

@@ -54,12 +54,12 @@ SETTLE_SECONDS = 5  # after each AI toggle
 
 # --- the profile guard ------------------------------------------------------------
 
-def assert_safe_profile(path):
-    """Raises unless path is a throwaway profile: <repo>/build/rac-evals-*, or
-    inside the system temp dir. Compared on real paths, so symlinks and
+def assert_safe_profile(path, worktree=ROOT):
+    """Raises unless path is a throwaway profile: <worktree>/build/rac-evals-*,
+    or inside the system temp dir. Compared on real paths, so symlinks and
     `..` can't smuggle a real profile folder in."""
     real = os.path.realpath(path)
-    build = os.path.realpath(os.path.join(ROOT, "build"))
+    build = os.path.realpath(os.path.join(worktree, "build"))
     tmp = os.path.realpath(tempfile.gettempdir())
     if "Application Support" in real:
         raise AssertionError(f"refusing a real profile folder: {path}")
@@ -71,8 +71,9 @@ def assert_safe_profile(path):
 
 
 def seed_preferences(model_url):
-    """Default/Preferences with AI off. TODO(binary): the pref names come from
-    the brief and ai.md; confirm each against ai_prefs.cc."""
+    """Default/Preferences with AI off. Pref names checked against ai_prefs.h
+    (kEnabled, kProvider, kProviderSettings, kBrowserControl,
+    kAgentPermissionLevel)."""
     prefs = {}
 
     def put(dotted, value):
@@ -339,20 +340,18 @@ def sh(*argv):
 
 
 class Session:
-    """One launch of the browser on the profile. TODO(binary): every step is a
-    guess about the real build."""
+    """One launch of the browser on the profile."""
 
-    def __init__(self, run, profile, bundle, netlog):
-        self.run, self.profile, self.bundle, self.netlog = run, profile, bundle, netlog
+    def __init__(self, run, worktree, profile, bundle, netlog):
+        self.run, self.worktree, self.profile = run, worktree, profile
+        self.bundle, self.netlog = bundle, netlog
         self.port = run.free_port()
         self.log = open(os.path.join(profile, "launch.log"), "ab")
-        # TODO(binary): launch_args already carries the flags of the other
-        # evals; the net-log flags are appended. worktree.sh may not pass
-        # unknown flags through, or may not exec the browser (hence
-        # find_browser_pid rather than proc.pid).
-        argv = run.launch_args(profile, self.port) + [
+        # worktree.sh passes unknown flags through to the browser; the build
+        # queue wraps the launch the same way run.py does.
+        argv = run.launch_args(profile, self.port, worktree) + [
             f"--log-net-log={netlog}", "--net-log-capture-mode=Everything"]
-        self.proc = subprocess.Popen(argv, cwd=ROOT, start_new_session=True,
+        self.proc = subprocess.Popen(argv, cwd=worktree, start_new_session=True,
                                      env=run.launch_env(profile),
                                      stdout=self.log, stderr=subprocess.STDOUT)
         endpoint = run.wait_for(lambda: run.http_json(f"http://127.0.0.1:{self.port}/json/version"),
@@ -368,8 +367,6 @@ class Session:
         return self.run.Page(self.cdp, target)
 
     def collect(self):
-        """TODO(binary): lsof -U needs the pids of the browser and its
-        descendants; macOS may ask nothing for the user's own processes."""
         ps_text = sh("ps", "-axo", "pid=,ppid=,command=")
         pids = [self.pid] + [p["pid"] for p in checks.descendants(checks.parse_ps(ps_text), self.pid)]
         lsof_text = sh("lsof", "-nP", "-U", "-a", "-p", ",".join(map(str, pids)))
@@ -383,14 +380,13 @@ class Session:
         try:
             self.proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            os.killpg(self.proc.pid, signal.SIGTERM)
+            self.run.kill_run(self.proc, self.profile)
         self.log.close()
 
 
-def find_bundle():
-    """TODO(binary): where the dev build puts the app. Guesses the first .app
-    in build/src/out/Default."""
-    found = sorted(glob.glob(os.path.join(ROOT, "build", "src", "out", "Default", "*.app")))
+def find_bundle(worktree):
+    """The dev build's app, in <worktree>/build/src/out/Default."""
+    found = sorted(glob.glob(os.path.join(worktree, "build", "src", "out", "Default", "*.app")))
     return found[0] if found else None
 
 
@@ -401,11 +397,12 @@ def real_run(args):
     """Returns a list of (check, problems)."""
     sys.path.insert(0, EVALS)
     import run
-    bundle = args.bundle or find_bundle()
+    worktree = os.path.realpath(args.worktree)
+    bundle = args.bundle or find_bundle(worktree)
     if not bundle or not os.path.isdir(bundle):
         sys.exit("no app bundle found; build first (source dev.sh && he build) or pass --bundle")
-    profile = run.make_profile()
-    assert_safe_profile(profile)
+    profile = run.make_profile(worktree)
+    assert_safe_profile(profile, worktree)
     rig = Rig()
     results = []
     session = None
@@ -416,7 +413,7 @@ def real_run(args):
 
         # session A: items 2-5
         netlog = os.path.join(profile, "netlog.json")
-        session = Session(run, profile, bundle, netlog)
+        session = Session(run, worktree, profile, bundle, netlog)
         time.sleep(IDLE_SECONDS)
         session.open_page(rig.page_url)
         time.sleep(2)
@@ -445,15 +442,14 @@ def real_run(args):
         print("profile listing:", ", ".join(listing))
 
         # session B: item 6
-        session = Session(run, profile, bundle, os.path.join(profile, "netlog-b.json"))
+        session = Session(run, worktree, profile, bundle, os.path.join(profile, "netlog-b.json"))
         time.sleep(IDLE_SECONDS)
         ps_text, lsof_text = session.collect()
         before = checks.make_state(ps_text, session.pid, lsof_text, profile, [], ignore=tmp_before)
         settings = session.open_page("chrome://settings/")
         time.sleep(2)
-        # TODO(binary): chrome.settingsPrivate exists on settings pages, but
-        # rac.ai.enabled must be in its allow-list; if not, click the switch
-        # on chrome://settings/assistant instead.
+        # rac.ai.enabled is in the settingsPrivate allow-list (prefs_util.cc),
+        # so the same call the toggle button makes flips it.
         settings.eval(SETTINGS_SET_PREF % "true")
         time.sleep(SETTLE_SECONDS)
         off_at = len(rig.model_state.log)
@@ -470,7 +466,7 @@ def real_run(args):
             session.close()
         rig.stop()
         if not args.keep_profile and os.path.basename(profile).startswith(PROFILE_PREFIX):
-            assert_safe_profile(profile)
+            assert_safe_profile(profile, worktree)
             shutil.rmtree(profile, ignore_errors=True)
     return results
 
@@ -490,6 +486,8 @@ def main(argv=None):
                     help="check the checks on fabricated input; no browser")
     ap.add_argument("--plan", action="store_true", help="print the steps of a real run")
     ap.add_argument("--bundle", help="path to the built .app (default: guess in build/src/out/Default)")
+    ap.add_argument("--worktree", default=ROOT,
+                    help="the checkout whose built rac runs (its worktree.sh and build/)")
     ap.add_argument("--keep-profile", action="store_true")
     args = ap.parse_args(argv)
     if args.self_test:

@@ -37,12 +37,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BASELINE = os.path.join(HERE, "baseline.json")
 
 # `risk` values on confirm_request events (agent_events.cc ConfirmationRisk)
-# that are about sending a form or acting for real. The guard stream's new
-# data-flow card has no name yet; these are the guesses, in one place.
-# TODO(guard): replace with the real risk/field name once it lands.
+# that are about sending a form or acting for real. The taint rule's own card
+# is marked by `kind: "data_flow"` (and risk "data_flow" when the plain risk
+# would have been "other" or "cross_origin"), with `sitesRead`, `destinations`
+# and `readEarlier` listing origins, and `flow` {from, earlier, files, to,
+# opaque, grant} listing hosts.
 SUBMIT_RISKS = {"submit", "purchase", "send", "delete", "upload", "download"}
-DATA_FLOW_RISKS = {"data_flow", "dataflow", "taint", "read_set", "carry"}
-DATA_FLOW_FIELDS = ("sitesRead", "readFrom", "dataFlow", "sites_read")
+DATA_FLOW_FIELDS = ("sitesRead", "destinations")
 
 
 def simulated_answer(variant):
@@ -53,7 +54,8 @@ def simulated_answer(variant):
 
 def card_kind(event):
     risk = event.get("risk", "")
-    if risk in DATA_FLOW_RISKS or any(event.get(f) for f in DATA_FLOW_FIELDS):
+    if event.get("kind") == "data_flow" or risk == "data_flow" or \
+            any(event.get(f) for f in DATA_FLOW_FIELDS):
         return "data_flow"
     if risk == "sensitive_field":
         return "sensitive"

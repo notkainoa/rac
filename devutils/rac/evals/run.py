@@ -167,10 +167,11 @@ def build_preferences(variant, origins, model_base_url, download_dir):
     return prefs
 
 
-def make_profile(base_dir=None):
+def make_profile(worktree, base_dir=None):
     """A throwaway profile, only ever under <worktree>/build or a temp dir."""
-    base = os.path.realpath(base_dir or os.path.join(ROOT, "build"))
-    allowed = [os.path.realpath(os.path.join(ROOT, "build")), os.path.realpath(tempfile.gettempdir())]
+    base = os.path.realpath(base_dir or os.path.join(worktree, "build"))
+    allowed = [os.path.realpath(os.path.join(worktree, "build")),
+               os.path.realpath(tempfile.gettempdir())]
     assert "Application Support" not in base and any(
         base == a or base.startswith(a + os.sep) for a in allowed), f"refusing profile folder {base}"
     os.makedirs(base, exist_ok=True)
@@ -197,12 +198,47 @@ def launch_env(profile):
     return env
 
 
-def launch_args(profile, port):
-    return [os.path.join(ROOT, "devutils/rac/worktree.sh"), "run",
+def launch_args(profile, port, worktree):
+    """The queue-wrapped launch. worktree.sh supplies --use-mock-keychain (the
+    API key's OSCrypt needs it), --enable-ui-devtools, and its own
+    --user-data-dir, which this later one wins. Run it from the worktree's
+    root: worktree.sh finds the tree from the cwd."""
+    devutils = os.path.join(worktree, "devutils", "rac")
+    return [os.path.join(devutils, "build-queue.sh"),
+            os.path.join(devutils, "worktree.sh"), "run",
             f"--user-data-dir={profile}", f"--remote-debugging-port={port}",
             "--remote-debugging-address=127.0.0.1", "--remote-allow-origins=*",
             "--rac-launch-in-background", "--no-first-run", "--no-default-browser-check",
             "--disable-background-networking", "--disable-component-update"]
+
+
+def kill_run(proc, profile, grace=20):
+    """Stops what launch_args started: SIGTERM to the queue's own group, which
+    forwards it to the browser's family, then anything still holding this
+    profile. Matches the throwaway profile path so no other browser can be
+    killed by mistake."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=grace)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    out = subprocess.run(["pgrep", "-f", f"--user-data-dir={profile}"],
+                         capture_output=True, text=True).stdout
+    for pid in (int(p) for p in out.split() if p.isdigit()):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 class Page:
@@ -221,47 +257,68 @@ class Page:
         return r["result"].get("value")
 
 
+# racAiInit calls AllowJavascript() and subscribes the page to the profile's
+# agent events; without it FireWebUIListener is a no-op and racAiAgentEvent
+# never arrives. Returns the init state ({enabled, configured, needsKey...}).
 ASSISTANT_HOOK = """
 (async () => {
   const cr = await import('chrome://resources/js/cr.js');
-  window.__evals = {events: [], updates: [], cr};
-  cr.addWebUiListener('racAiAgentEvent', e => window.__evals.events.push(e));
-  cr.addWebUiListener('rac-ai-update', u => window.__evals.updates.push(u));
-  return true;
+  if (!window.__evals) {  // idempotent: a retried evaluate must not double-listen
+    window.__evals = {events: [], updates: [], cr};
+    cr.addWebUiListener('racAiAgentEvent', e => window.__evals.events.push(e));
+    cr.addWebUiListener('rac-ai-update', u => window.__evals.updates.push(u));
+  }
+  return await cr.sendWithPromise('racAiInit');
 })()
 """
 
+# Every chrome://settings page registers RacAiHandler (settings_ui.cc), which
+# stores the key OSCrypt-encrypted into prefs (worktree.sh's
+# --use-mock-keychain makes that work without touching the real keychain).
+SET_PROVIDER_KEY = ("import('chrome://resources/js/cr.js').then(m => "
+                    "m.sendWithPromise('racAiSetKey', 'custom', '" + FAKE_KEY + "'))")
+
+# Messages racAiSend answers to the page with. Card ids are "approval-N".
+CARD_TYPES = ("confirm_request", "plan_request")
+END_STATES = ("done", "stopped", "error")
+
 
 def run_browser(variant, args):
-    """TODO(binary): every browser-facing step below is unverified; each one
-    is marked where it guesses."""
-    profile = make_profile()
+    worktree = os.path.realpath(args.worktree)
+    profile = make_profile(worktree)
     download_dir = os.path.join(profile, "downloads")
     os.makedirs(download_dir)
     rig = Rig(variant, args.host_mode)
-    proc = None
+    proc, launch_log = None, None
     try:
         prefs = build_preferences(variant, rig.fixtures.base, rig.model_url, download_dir)
         with open(os.path.join(profile, "Default", "Preferences"), "w") as f:
             json.dump(prefs, f)
         port = free_port()
-        proc = subprocess.Popen(launch_args(profile, port), cwd=ROOT, start_new_session=True,
-                                env=launch_env(profile),
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        # A run command's output isn't piped through the queue, so browser
+        # and queue write the same file; a pipe nobody drains would stall them.
+        launch_log = open(os.path.join(profile, "browser.log"), "wb")
+        proc = subprocess.Popen(launch_args(profile, port, worktree), cwd=worktree,
+                                start_new_session=True, env=launch_env(profile),
+                                stdout=launch_log, stderr=subprocess.STDOUT)
         endpoint = wait_for(lambda: http_json(f"http://127.0.0.1:{port}/json/version"),
-                            "the DevTools endpoint", 120, proc)
+                            "the DevTools endpoint", 180, proc)
         browser = cdp.Cdp(endpoint["webSocketDebuggerUrl"])
-        turns, answers = drive(variant, rig, browser, proc)
+        turns, answers, dialogs = drive(variant, rig, browser, proc)
         downloads = os.listdir(download_dir)
+        record = rig.record("browser", turns, answers, downloads)
+        record["dialogs"] = dialogs
         try:
             browser.call("Browser.close")  # flushes prefs; pkill would lose them
         except cdp.CdpError:
             pass
-        return rig.record("browser", turns, answers, downloads)
+        return record
     finally:
-        rig.stop()
         if proc and proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGTERM)
+            kill_run(proc, profile)
+        if launch_log:
+            launch_log.close()
+        rig.stop()
         if not args.keep_profile and os.path.basename(profile).startswith("rac-evals-"):
             shutil.rmtree(profile, ignore_errors=True)
 
@@ -286,71 +343,140 @@ def wait_for(check, what, timeout, proc=None):
     raise RuntimeError("timed out waiting for " + what)
 
 
-def drive(variant, rig, browser, proc):
-    """Plays the variant's turns through chrome://rac-ai. TODO(binary)."""
-    origins = rig.fixtures.base
-    # TODO(binary): the Custom provider needs a saved key, and keys can only be
-    # stored through Settings (encrypted with OSCrypt; --use-mock-keychain is
-    # on). The handler is racAiSetKey on a settings page. Confirm which
-    # chrome://settings URL registers it, and that AiService exists (AI on).
-    settings = Page(browser, browser.call("Target.createTarget", {"url": "chrome://settings/"})["targetId"])
-    time.sleep(2)
-    settings.eval("import('chrome://resources/js/cr.js').then(m => "
-                  f"m.sendWithPromise('racAiSetKey', 'custom', '{FAKE_KEY}'))")
+def eval_retry(page, expression, timeout, proc=None, per_try=8):
+    """Evals until the page answers. A WebUI page can keep a Runtime.evaluate
+    call queued for tens of seconds while it first loads, so each try uses a
+    short socket timeout and the loop retries."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError("the browser exited while waiting for a page")
+        old, page.browser.timeout = page.browser.timeout, per_try
+        try:
+            return page.eval(expression)
+        except (cdp.CdpError, OSError):
+            pass
+        finally:
+            page.browser.timeout = old
+    raise RuntimeError("timed out evaluating on " +
+                       str(expression.split("\n")[0][:80]))
 
-    tabs = {}
+
+def save_key(browser):
+    """Stores the fake provider's key. racAiSetKey resolves with the settings
+    state, whose providers list says whether 'custom' now hasKey."""
+    settings = Page(browser, browser.call(
+        "Target.createTarget", {"url": "chrome://settings/assistant"})["targetId"])
+    state = eval_retry(settings, SET_PROVIDER_KEY, 120, None)
+    providers = state.get("providers", []) if isinstance(state, dict) else []
+    custom = next((p for p in providers if p.get("id") == "custom"), {})
+    if not custom.get("hasKey"):
+        raise RuntimeError(f"the fake provider's key was not saved: {state!r:.300}")
+
+
+def drive(variant, rig, browser, proc):
+    """Plays the variant's turns through a chrome://rac-ai tab.
+
+    The side panel holds the same WebUI; a tab gets the same PageHandler, so
+    chrome.send/sendWithPromise drive it directly. The agent acts in the tabs
+    of the page's window that racAiSend names by id, which racAiGetTabs lists
+    as {id, title, url, current} for http(s) tabs only."""
+    origins = rig.fixtures.base
+    save_key(browser)
+
+    pages = {}
     for turn in variant["turns"]:
         for ref in turn.get("open", []):
-            if ref not in tabs:
-                tabs[ref] = browser.call("Target.createTarget",
-                                         {"url": tab_url(ref, origins)})["targetId"]
-    # TODO(binary): the assistant normally lives in the side panel, which may
-    # not be a DevTools target. A tab at chrome://rac-ai is the fallback; the
-    # agent acts in "tabs the user attached" of that window either way.
-    assistant = Page(browser, browser.call("Target.createTarget", {"url": "chrome://rac-ai/"})["targetId"])
-    time.sleep(2)
-    assistant.eval(ASSISTANT_HOOK)
+            if ref not in pages:
+                tid = browser.call("Target.createTarget",
+                                   {"url": tab_url(ref, origins)})["targetId"]
+                page = Page(browser, tid)
+                # Page.javascriptDialogOpening is how dialog-trap is seen;
+                # nothing ever answers a dialog, the cleanup kills them.
+                try:
+                    page.eval("true", await_promise=False)
+                    browser.call("Page.enable", {}, page.session)
+                except cdp.CdpError:
+                    pass
+                pages[ref] = page
+
+    assistant = Page(browser, browser.call(
+        "Target.createTarget", {"url": "chrome://rac-ai/"})["targetId"])
+    state = eval_retry(assistant, ASSISTANT_HOOK, 120, proc)
+    if not state.get("enabled") or not state.get("configured"):
+        raise RuntimeError(f"the assistant is not configured: {state!r:.300}")
 
     messages, turns, answers, send_id = [], [], [], 0
     for index, turn in enumerate(variant["turns"]):
         send_id += 1
         user = expand(turn["user"], origins)
         messages.append({"role": "user", "text": user})
-        # TODO(binary): racAiGetTabs returns TabInfo[]; map each wanted tab (by
-        # URL) to the numeric id racAiSend takes. Field names are a guess.
-        infos = assistant.eval("window.__evals.cr.sendWithPromise('racAiGetTabs')")
         wanted = [tab_url(r, origins) for r in turn.get("attach", [])]
+        infos = wait_for(lambda: _listed_tabs(assistant, wanted),
+                         "the attached tabs in racAiGetTabs", 30, proc)
         ids = [t["id"] for t in infos if any(t.get("url", "").startswith(w) for w in wanted)]
         start = len(assistant.eval("window.__evals.events"))
+        up_start = len(assistant.eval("window.__evals.updates"))
+        # args: send id, [{role, text}], [tab ids], files, conversation id.
+        # One conversation id keeps the read set across turns (earlier-turn).
         assistant.eval(f"chrome.send('racAiSend', [{send_id}, {json.dumps(messages)}, "
-                       f"{json.dumps(ids)}, []]); true", await_promise=False)
+                       f"{json.dumps(ids)}, [], 'eval']); true", await_promise=False)
         events, end_state = [], "timeout"
         answered, deadline = set(), time.time() + RUN_TIMEOUT
         while time.time() < deadline:
             time.sleep(0.2)
             events = assistant.eval("window.__evals.events")[start:]
+            updates = assistant.eval("window.__evals.updates")[up_start:]
             for e in events:
-                if e.get("type") == "confirm_request" and e["id"] not in answered:
+                if e.get("type") in CARD_TYPES and e.get("id") not in answered:
                     answered.add(e["id"])
                     answer = grade.simulated_answer(variant)
                     answers.append({"id": e["id"], "answer": answer})
                     assistant.eval("window.__evals.cr.sendWithPromise("
                                    f"'racAiAgentRespond', {json.dumps(e['id'])}, {json.dumps(answer)})")
-                if e.get("type") == "run_state" and e.get("state") in ("done", "stopped", "error"):
+                if e.get("type") == "run_state" and e.get("state") in END_STATES:
                     end_state = e["state"]
+            if end_state == "timeout":
+                # No agent turn (provider off, a rejected send): the reply's own
+                # done/error is the only end such a turn gets.
+                if any(u.get("done") or u.get("error") for u in updates):
+                    end_state = "done" if any(u.get("done") for u in updates) else "error"
             if end_state != "timeout":
                 break
             if proc.poll() is not None:
                 raise RuntimeError("the browser exited during the turn")
         if end_state == "timeout":
             assistant.eval("chrome.send('racAiAgentStop', []); true", await_promise=False)
+        # Identical adjacent events come from a listener registered twice (a
+        # retried evaluate); drop them so one step pairs with one event.
+        events = [e for i, e in enumerate(events) if i == 0 or e != events[i - 1]]
         # The reply the model gave last is the reliable assistant text for the next turn.
         reply = next((e["text"] for e in reversed(rig.model_state.log)
                       if e.get("kind") == "chat" and not e.get("calls")), "")
         messages.append({"role": "assistant", "text": reply})
         turns.append({"index": index, "user": user, "events": events, "reply": reply,
                       "end_state": end_state})
-    return turns, answers
+    dialogs = [e.get("params", {}) for e in browser.drain_events()
+               if e.get("method") == "Page.javascriptDialogOpening"]
+    return turns, answers, dialogs
+
+
+def _try_eval(page, expression):
+    try:
+        return page.eval(expression)
+    except cdp.CdpError:
+        return None
+
+
+def _listed_tabs(assistant, wanted):
+    """racAiGetTabs once every wanted URL is listed, else None."""
+    try:
+        infos = assistant.eval("window.__evals.cr.sendWithPromise('racAiGetTabs')") or []
+    except cdp.CdpError:
+        return None
+    if all(any(t.get("url", "").startswith(w) for t in infos) for w in wanted):
+        return infos
+    return None
 
 
 # --- the commit status (stub) ---------------------------------------------------------
@@ -397,6 +523,8 @@ def main(argv=None):
     ap.add_argument("--host-mode", choices=("names", "loopback"), default="names")
     ap.add_argument("--baseline", default=grade.DEFAULT_BASELINE)
     ap.add_argument("--gate", action="store_true", help="G4: require every attack to stop")
+    ap.add_argument("--worktree", default=ROOT,
+                    help="the checkout whose built rac runs (its worktree.sh and build/)")
     ap.add_argument("--keep-profile", action="store_true")
     ap.add_argument("--post-status", metavar="SHA", help="post rac/agent-evals for this commit")
     args = ap.parse_args(argv)

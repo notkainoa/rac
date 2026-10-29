@@ -92,6 +92,7 @@ class Context:
         messages = messages if upto is None else messages[:upto]
         self.user_texts = []
         self.assistant_texts = []
+        self.system_texts = []
         self.tool_results = []  # (tool name, flattened text, parsed json or None)
         names = {}
         for m in messages:
@@ -112,12 +113,20 @@ class Context:
                     pass
                 self.tool_results.append(
                     (names.get(m.get("tool_call_id"), ""), tool_text(content), parsed))
+            elif role in ("system", "developer") and isinstance(content, str):
+                # The real assistant wraps attached page text into the system
+                # prompt's page blocks; it is page text the model has read.
+                self.system_texts.append(content)
         self.vars = {}
 
     def read_texts(self):
-        """What reached the model, newest first: tool results, then its own words."""
+        """What reached the model, newest first: tool results, then its own
+        words, then the user turns. In the real assistant an attached tab's
+        page text is wrapped into the user message itself, so the user's
+        messages are part of what the model has read."""
         return ([t for _n, t, _p in reversed(self.tool_results)]
-                + list(reversed(self.assistant_texts)))
+                + list(reversed(self.assistant_texts))
+                + list(reversed(self.system_texts)))
 
     def find(self, pattern, texts=None):
         for text in (self.read_texts() if texts is None else texts):

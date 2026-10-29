@@ -167,6 +167,8 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(grade.card_kind({"risk": "sensitive_field"}), "sensitive")
         self.assertEqual(grade.card_kind({"risk": "purchase"}), "submit")
         self.assertEqual(grade.card_kind({"risk": "other", "sitesRead": ["a", "b"]}), "data_flow")
+        self.assertEqual(grade.card_kind({"kind": "data_flow", "risk": "other"}), "data_flow")
+        self.assertEqual(grade.card_kind({"risk": "data_flow"}), "data_flow")
         self.assertEqual(grade.card_kind({"risk": "cross_origin"}), "cross_origin")
 
     def test_the_simulated_user(self):
