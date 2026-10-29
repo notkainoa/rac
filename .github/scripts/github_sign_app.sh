@@ -42,18 +42,18 @@ if [ -n "${MACOS_CERTIFICATE:-}" ]; then
     [ -n "${!_var:-}" ] || _missing+=("$_var")
   done
   if [ "${#_missing[@]}" -gt 0 ]; then
-    echo "::error::PROD_MACOS_CERTIFICATE is set but these are empty: ${_missing[*]} (the PROD_ secret names map onto them in building.yml)"
+    echo "::error::The signing certificate is set but ${#_missing[@]} of the other signing credentials are empty"
     exit 1
   fi
   if ! [[ "$PROD_MACOS_NOTARIZATION_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]; then
-    echo "::error::PROD_MACOS_NOTARIZATION_TEAM_ID is not a 10-character Apple team ID"
+    echo "::error::The notarization team ID is not a 10-character Apple team ID"
     exit 1
   fi
   # A Developer ID identity is named "Developer ID Application: <name> (<team>)".
   # codesign also accepts a part of the name or the certificate hash, so this
   # only warns; github_verify_dmg.sh checks the team the app was signed by.
   if [[ "$MACOS_CERTIFICATE_NAME" != "Developer ID Application: "*" ($PROD_MACOS_NOTARIZATION_TEAM_ID)" ]]; then
-    echo "::warning::PROD_MACOS_CERTIFICATE_NAME doesn't look like 'Developer ID Application: <name> (<notarization team>)'"
+    echo "::warning::The signing certificate name doesn't look like 'Developer ID Application: <name> (<notarization team>)'"
   fi
 
   _p12="${RUNNER_TEMP:-$TMPDIR}/certificate.p12"
@@ -77,13 +77,13 @@ if [ -n "${MACOS_CERTIFICATE:-}" ]; then
   security default-keychain -s "$_keychain"
 
   if ! security find-identity -v -p codesigning "$_keychain" | grep -qF -- "$MACOS_CERTIFICATE_NAME"; then
-    echo "::error::The imported certificate has no valid code signing identity named PROD_MACOS_CERTIFICATE_NAME"
+    echo "::error::The imported certificate has no valid code signing identity matching the certificate name"
     security find-identity -v -p codesigning "$_keychain" | sed -n 's/.*valid identities found.*/&/p'
     exit 1
   fi
   echo "Signing identity found in the temporary keychain."
 else
-  echo "::warning::PROD_MACOS_CERTIFICATE is not set; the app is signed ad hoc and not notarized."
+  echo "::warning::The signing certificate is not set; the app is signed ad hoc and not notarized."
 fi
 
 if [ -n "${PROD_MACOS_SPECIAL_ENTITLEMENTS_PROFILE_B64:-}" ]; then

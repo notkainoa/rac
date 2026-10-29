@@ -17,7 +17,8 @@ set -eu -o pipefail
 
 _dmg="${1:?usage: $0 <path/to/rac.dmg>}"
 _notarized="${RAC_EXPECT_NOTARIZED:-1}"
-_team="${RAC_EXPECT_TEAM_ID:-}"
+# A secret pasted with a trailing newline or space would fail the team check.
+_team=$(printf '%s' "${RAC_EXPECT_TEAM_ID:-}" | tr -d '[:space:]')
 
 _mnt=$(mktemp -d "${TMPDIR:-/tmp}/rac-dmg.XXXXXX")
 _detach() {
@@ -48,7 +49,10 @@ echo "App team identifier: ${_app_team:-none}"
 # An app that claims a restricted entitlement without a provisioning profile
 # that grants it is killed at launch, and notarization doesn't catch that.
 echo "== entitlements (main executable)"
-codesign -d --entitlements - --xml "$_app" 2>/dev/null > "$_mnt.entitlements.plist" || true
+if ! codesign -d --entitlements - --xml "$_app" 2>/dev/null > "$_mnt.entitlements.plist"; then
+  echo "::error::Could not read the app entitlements from $_app"
+  exit 1
+fi
 _has_profile=0
 [ -f "$_app/Contents/embedded.provisionprofile" ] && _has_profile=1
 python3 - "$_mnt.entitlements.plist" "$_has_profile" "$_app_team" <<'EOF'
