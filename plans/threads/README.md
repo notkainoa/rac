@@ -14,7 +14,7 @@ Days count from approval, assumed on Wed 2026-10-28 (day 0). The target launch i
 
 Decisions outside group A are listed in each brief with the day they are needed.
 
-**How launching works.** The maintainer approves the plans, answers group A, and has started step 0 below. Then each thread is a T3 Code thread, started from its brief plus the master plan. A thread's lead opens one worktree per stream and runs each stream with Claude Code subagents (the Agent tool), working in that stream's worktree. Leads never create new threads: no `delegate_task`, `t3_thread_launch`, or `create_threads`. Free OpenCode models are called from the shell (`opencode run -m ...`), not as threads. The planning thread is the main thread over all five leads. The maintainer asked for this on 2026-10-27. All five threads start on day 0. The maintainer approves every merge.
+**How launching works.** The maintainer approves the plans, answers group A, and has started step 0 below. Then each thread is a T3 Code thread, started from its brief plus the master plan. A thread's lead opens one worktree per stream and runs each stream with Claude Code subagents (the Agent tool), working in that stream's worktree. Leads never create new threads: no `delegate_task`, `t3_thread_launch`, or `create_threads`. Devin SWE-2, OpenCode, and Cursor models are called from the shell, not as threads. The planning thread is the main thread over all five leads. The maintainer asked for this on 2026-10-27. All five threads start on day 0. The maintainer approves every merge.
 
 # Every thread
 
@@ -38,23 +38,34 @@ A stream is one worktree, one branch, and one lead agent with helpers. Streams a
 
 ## Which model does what
 
-The maintainer asked on 2026-10-27 to spend less Claude usage by pushing work that doesn't need a smart model to free models, while still using Claude subagents heavily. Pick the cheapest tier that can do the job well, and check anything a free model produces before you build on it.
+On 2026-10-29 the maintainer got Devin, with free SWE-2 in the Devin CLI through 2026-11-30, and asked to move a lot of work to it. Spend SWE-2 freely: more attempts, more reviewers, more checks. Claude Sonnet and Opus still do the parts where quality depends on judgment.
 
 | Tier | Models | Use it for |
 | --- | --- | --- |
-| Free | OpenCode: `opencode/deepseek-v4.1-flash-free`, `opencode/glm-5.3-flash-free`, `opencode/mimo-v2.6-flash-free` | Searching and reading code, summarizing files and logs, mapping where something lives in Chromium, first-pass reviews and second opinions, drafting tests from a written spec, boilerplate, doc wording, checking fixtures |
+| Default worker, free | Devin SWE-2: `swe-2-high`, `swe-2-max` for hard bugs, `swe-2-medium` for quick reads | Most code with a clear spec: logic, prefs, wiring, unit tests, Chromium mapping, porting to 156 APIs, fixing review findings, first-pass and council reviews, attack tests against security code |
+| Free backup | OpenCode `opencode/deepseek-v4.1-flash-free`, `opencode/glm-5.3-flash-free` | Second-family council votes, summaries, searches, and work SWE-2 is too slow for |
 | Free, vision | `opencode/nemotron-3.5-super-vl-free` | First look at screenshots: blank frames, overlap, clipped text, wrong theme. A Claude model makes the final call |
-| Free, when available | Cursor `grok-4.7-medium` (the only Grok on the free plan; often out of usage) | The same jobs as the free tier. If it errors, move on without retrying |
-| Cheap Claude | Haiku 5.5 | Mechanical edits, renames, running tests and builds and summarizing them, reformatting |
-| Claude | Sonnet 5.5 | Routine code with a clear spec, wiring, unit tests, most PR fixes |
-| Claude, strongest | Opus 5.5 | Security code (the guard, sign-in import, the Keychain), architecture, UI and motion design, final adversarial reviews, anything a free model got wrong |
+| When available | Cursor `grok-4.7-medium` (free plan, usually out of usage) | A council vote. If it errors, skip it without retrying |
+| Claude | Sonnet 5.5 | Routine UI code (UI goes to Claude), checking SWE-2 output before it lands, judging councils, running a stream |
+| Claude, strongest | Opus 5.5 | Security code (guard, sign-in import, Keychain), architecture, UI and motion design, the final review of every PR, anything SWE-2 failed at twice |
 
-How to call them:
-- OpenCode: `timeout 1200 opencode run -m <model> --dir <stream worktree> "<brief>"`. Cursor: `timeout 1200 cursor-agent -p --trust --model grok-4.7-medium --workspace <stream worktree> --output-format text "<brief>"`. Both run from the shell inside your own turn, never as threads.
-- Give them a complete brief: the goal, the exact files, what done looks like, and "read only" unless they must write one named file.
-- Free models are often slow when busy. Use a timeout. If one times out or gives a weak answer, use Haiku or Sonnet instead and don't retry it in a loop.
-- Free and Cursor models never write security-sensitive code, never see real user data or secrets, never commit, push, or open PRs, and never run builds through the queue. A Claude model reviews their output before it lands in a patch.
-- Never use OpenCode `auto` routing or Factory. Factory has no subscription right now.
+How to call them, always from the shell in your own turn, never as threads:
+- SWE-2: `cd <stream worktree> && timeout 1800 devin --model swe-2-high --permission-mode dangerous --respect-workspace-trust=false -p -- "<brief>"`, or `--prompt-file <brief.md>` instead of `-p -- "..."`. Run several in parallel when they touch different files. `devin` reads AGENTS.md.
+- OpenCode: `timeout 1200 opencode run -m <model> --dir <stream worktree> "<brief>"`. Cursor: `timeout 1200 cursor-agent -p --trust --model grok-4.7-medium --workspace <stream worktree> --output-format text "<brief>"`.
+- Give a complete brief: the goal, the exact files, the scorecard (see the hill-climb loop), what done looks like, and "read only" unless it must write.
+- SWE-2 may edit files in its stream worktree and build through `devutils/rac/build-queue.sh`. Non-Claude models never write security-sensitive code (they may attack-test it), never write UI or motion design, never see real user data or secrets, and never commit, push, or open PRs. A Claude model reads their diff before it is committed.
+- Never use OpenCode `auto` routing, Devin cloud sessions (not free), or the paid models inside Devin (its Claude, GPT, and Gemini options cost money).
+
+## Hill-climb loop
+
+Every batch climbs toward a written scorecard instead of stopping at "looks done."
+
+1. **Scorecard first.** Before code, the lead writes `build/scratch/scorecard.md` (`build/` is git-ignored) for the batch. List each check as pass or fail: it compiles, the named unit tests pass, `he validate series` passes, the hunk budget holds, each spec item from the plan is met, the screenshot matrix items that apply, AI off costs nothing, and for agent work the `feat/agent-evals` scores. Add a number to climb where one exists (tests passing, eval score, findings left).
+2. **Attempt.** SWE-2 implements against the scorecard. For risky or unclear work, run two or three attempts in parallel in separate scratch copies and keep the best.
+3. **Check.** Build once for the batch, then run every check. Record the round in `build/scratch/hillclimb.md`: the score, what failed, and the commit.
+4. **Council.** Three reviewers that don't see each other's answers: SWE-2 Max, an OpenCode model from a different family (or Grok when available), and Sonnet. Each returns findings with a severity and evidence: a line, a repro, or a screenshot. A Claude judge (Sonnet, or Opus for security and gate PRs) keeps only the findings it can confirm.
+5. **Climb.** SWE-2 fixes the confirmed findings. Keep a round only if the score went up. If it went down, reset to the last best WIP commit. Repeat from step 3.
+6. **Stop.** Stop when every scorecard item passes and the council has no confirmed blocking finding. If two rounds don't improve the score, escalate: Sonnet, then Opus, takes over the stuck item. Then comes the normal final review below.
 
 ## The build queue (D63)
 
@@ -79,8 +90,8 @@ Every local build goes through `devutils/rac/build-queue.sh`, never a bare `he b
 
 1. **Understand.** Read-only subagents (Haiku or Sonnet) read the plan section, the files it touches, and AGENTS.md, and return a short map.
 2. **Design.** Opus writes a one-page design (interfaces, hunk budget, test plan) before any code.
-3. **Implement.** Hard architecture and security go to Opus. Routine, scoped code and tests go to Sonnet or a strong open-weight model (`kimi-k3`, `glm-5.3`, `deepseek-v4-pro`, `minimax-m3`). UI work goes to Claude Opus (routine UI to Sonnet), never open-weight models. Parallel helpers work on separate files.
-4. **Verify.** Queue one build for the batch, then run, capture, and test. A Haiku subagent may run tests and summarize.
+3. **Implement.** SWE-2 by default, per the hill-climb loop. Architecture and security code go to Opus. UI goes to Claude: Opus for design and visible polish, Sonnet for routine UI. Parallel helpers work on separate files.
+4. **Verify.** Build once for the batch, then run the hill-climb checks and council until the scorecard passes.
 5. **Review.** Before every PR, a fresh Opus reviewer that hasn't seen the design tries to break the diff (attacks, edge cases, missed surfaces, hunk count), then run `/code-review`. Fix or answer every finding. Check subagent output before building on it. Reviews need no build, so they run while the next batch is queued.
 
 ## Verification standard
