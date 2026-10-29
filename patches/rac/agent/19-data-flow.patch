@@ -10,7 +10,7 @@
  #include "base/strings/string_number_conversions.h"
  #include "base/strings/string_util.h"
  #include "chrome/browser/rac/agent/agent_events.h"
-@@ -9,6 +12,15 @@
+@@ -9,6 +12,21 @@
  #include "url/gurl.h"
  #include "url/origin.h"
  namespace rac::agent {
@@ -21,40 +21,49 @@
 +// Past this many origins the record stops listing them and counts as
 +// unknown reads.
 +constexpr size_t kMaxReadOrigins = 256;
++
++std::string NeverReason(const std::string& origin) {
++  return "The user's site rules never allow the assistant on " +
++         DisplayHost(origin) +
++         ". Tell the user; the rule is in Settings > Assistant.";
++}
 +}  // namespace
 +
  bool IsNativeSubmitControl(std::string_view type) {
    using namespace optimization_guide::proto;
    return type == base::NumberToString(FORM_CONTROL_TYPE_BUTTON_SUBMIT) ||
-@@ -105,15 +117,85 @@ std::map<std::string, SiteRule> ParseSit
+@@ -105,15 +123,91 @@ std::map<std::string, SiteRule> ParseSit
    }
    return parsed;
  }
 +bool IsUsersOwnWords(std::string_view typed, std::string_view user_text) {
-+  const std::string text = base::ToLowerASCII(base::CollapseWhitespaceASCII(
-+      base::TrimWhitespaceASCII(typed, base::TRIM_ALL), false));
-+  if (text.empty()) {
++  // The text is typed as the model wrote it, so it is matched as written:
++  // case, inner spacing, and spaces at the ends would each spell something
++  // the user never wrote.
++  if (typed.empty()) {
 +    return true;
 +  }
-+  const std::string haystack =
-+      base::CollapseWhitespaceASCII(std::string(user_text), false);
++  if (base::IsAsciiWhitespace(typed.front()) ||
++      base::IsAsciiWhitespace(typed.back())) {
++    return false;
++  }
 +  auto word = [](char c) {
 +    return base::IsAsciiAlpha(c) || base::IsAsciiDigit(c) ||
 +           static_cast<unsigned char>(c) >= 0x80;
 +  };
 +  // Punctuation alone isn't a word of the user's: ".", "-", and "," are in
 +  // nearly every message, and could spell anything one mark at a time.
-+  if (std::ranges::none_of(text, word)) {
++  if (std::ranges::none_of(typed, word)) {
 +    return false;
 +  }
-+  for (size_t at = haystack.find(text); at != std::string::npos;
-+       at = haystack.find(text, at + 1)) {
-+    const size_t end = at + text.size();
++  for (size_t at = user_text.find(typed); at != std::string::npos;
++       at = user_text.find(typed, at + 1)) {
++    const size_t end = at + typed.size();
 +    // A match that starts or ends inside a word picks letters out of the
 +    // user's words, which can spell anything.
-+    if ((at == 0 || !word(haystack[at - 1]) || !word(text.front())) &&
-+        (end == haystack.size() || !word(haystack[end]) ||
-+         !word(text.back()))) {
++    if ((at == 0 || !word(user_text[at - 1]) || !word(typed.front())) &&
++        (end == user_text.size() || !word(user_text[end]) ||
++         !word(typed.back()))) {
 +      return true;
 +    }
 +  }
@@ -104,17 +113,20 @@
    plan_allowed_ = false;
 -  for (const auto& message : user_messages) {
 +  free_steps_left_ = kFreeStepsPerTurn;
-+  user_text_.clear();
++  // Only this turn's message is the user's words for this turn. Something
++  // the user wrote turns ago (a code, an address) carries like anything
++  // else the model holds.
++  user_text_ = user_messages.empty() ? std::string()
++                                     : WithoutPageBlocks(user_messages.back());
 +  for (const auto& raw : user_messages) {
 +    // A page block in a user turn ("Use the same page as before", a quoted
 +    // attachment) is page text: its URLs aren't named and its words aren't
 +    // the user's.
 +    const std::string message = WithoutPageBlocks(raw);
-+    user_text_ += base::ToLowerASCII(message) + "\n";
      size_t position = 0;
      while ((position = message.find("http", position)) != std::string::npos) {
        size_t end = message.find_first_of(" \t\n\r<>\"'`", position);
-@@ -121,6 +203,7 @@ void ActionGuard::BeginTurn(PermissionLe
+@@ -121,6 +215,7 @@ void ActionGuard::BeginTurn(PermissionLe
            position, end == std::string::npos ? end : end - position);
        if (IsAllowedAgentUrl(candidate)) {
          urls_.insert(GURL(candidate).spec());
@@ -122,7 +134,7 @@
        }
        while (!candidate.empty() &&
               (candidate.back() == '.' || candidate.back() == ')' ||
-@@ -129,11 +212,30 @@ void ActionGuard::BeginTurn(PermissionLe
+@@ -129,11 +224,30 @@ void ActionGuard::BeginTurn(PermissionLe
        }
        if (IsAllowedAgentUrl(candidate)) {
          urls_.insert(GURL(candidate).spec());
@@ -153,7 +165,7 @@
  }
  void ActionGuard::SetSiteRules(std::map<std::string, SiteRule> rules) {
    site_rules_ = std::move(rules);
-@@ -153,6 +255,56 @@ void ActionGuard::AllowPlan(const std::s
+@@ -153,6 +267,65 @@ void ActionGuard::AllowPlan(const std::s
    plan_allowed_ = true;
  }
  
@@ -170,11 +182,20 @@
 +      // which the caller records instead.
 +      continue;
 +    }
-+    if (flow.read.size() >= kMaxReadOrigins) {
-+      flow.earlier_unknown = true;
-+      return;
++    const std::string read = url::Origin::Create(url).Serialize();
++    if (flow.read.contains(read)) {
++      continue;
 +    }
-+    flow.read.insert(url::Origin::Create(url).Serialize());
++    if (flow.read.size() >= kMaxReadOrigins) {
++      // Past the cap a new site is only "earlier". A grant that covered
++      // "earlier" was for what its card showed, not this, so it asks again.
++      flow.earlier_unknown = true;
++      for (auto& [destination, sources] : flow.grants) {
++        sources.erase(kEarlierInConversation);
++      }
++      continue;
++    }
++    flow.read.insert(read);
 +  }
 +}
 +void ActionGuard::GrantFlow(const std::string& destination,
@@ -210,7 +231,24 @@
  bool ActionGuard::NeverOn(const std::string& origin) const {
    // A "never" rule covers the site on any scheme or port, and every
    // subdomain: a rule saved for https://bank.example also stops
-@@ -192,6 +344,70 @@ bool ActionGuard::OnNamedSites(const Act
+@@ -178,6 +351,16 @@ bool ActionGuard::NeverOn(const std::str
+   return false;
+ }
+ 
++std::string ActionGuard::ReadBlockedReason(
++    const std::set<std::string>& origins) const {
++  for (const std::string& origin : origins) {
++    if (NeverOn(origin)) {
++      return NeverReason(origin);
++    }
++  }
++  return std::string();
++}
++
+ bool ActionGuard::IsNamed(const std::string& origin) const {
+   const auto rule = site_rules_.find(origin);
+   // An opaque frame ("null": about:blank, srcdoc, data:) was built by a
+@@ -192,6 +375,70 @@ bool ActionGuard::OnNamedSites(const Act
           IsNamed(action.risk.target_origin);
  }
  
@@ -281,7 +319,7 @@
  namespace {
  // What made the action risky, in a few words, or empty.
  std::string RiskyBecause(const ActionMetadata& action) {
-@@ -222,6 +438,9 @@ std::string RiskyBecause(const ActionMet
+@@ -222,6 +469,9 @@ std::string RiskyBecause(const ActionMet
    }
    return "";
  }
@@ -291,7 +329,31 @@
  }  // namespace
  
  GuardResult ActionGuard::Evaluate(const ActionMetadata& action) const {
-@@ -270,6 +489,68 @@ GuardResult ActionGuard::Evaluate(const
+@@ -231,6 +481,12 @@ GuardResult ActionGuard::Evaluate(const
+             "Unknown browser tool."};
+   }
+   if (tool->kind == ToolKind::kRead) {
++    // A never site's text doesn't go to the model either.
++    if (const std::string reason =
++            ReadBlockedReason({action.risk.current_origin});
++        !reason.empty()) {
++      return {GuardDecision::kBlock, RiskClass::kConsequential, reason};
++    }
+     return {GuardDecision::kAllow, RiskClass::kNone, ""};
+   }
+   if (level_ == PermissionLevel::kReadOnly) {
+@@ -260,9 +516,7 @@ GuardResult ActionGuard::Evaluate(const
+         &action.risk.target_origin}) {
+     if (NeverOn(*origin)) {
+       return {GuardDecision::kBlock, RiskClass::kConsequential,
+-              "The user's site rules never allow the assistant on " +
+-                  DisplayHost(*origin) +
+-                  ". Tell the user; the rule is in Settings > Assistant."};
++              NeverReason(*origin)};
+     }
+   }
+   // Risky at every level: nothing below lets these through unasked.
+@@ -270,6 +524,77 @@ GuardResult ActionGuard::Evaluate(const
                       action.press_enter || action.unknown_target ||
                       action.closing_user_tab;
    const bool named = OnNamedSites(action);
@@ -315,8 +377,8 @@
 +  // goes. An opaque frame can't be named, so it gets Allow once only. A
 +  // grant covers exactly what the card shows, so every site read has to fit
 +  // on it.
-+  const bool grantable =
-+      flows && !risky && flow_to.size() <= 2 &&
++  const bool grant_fits =
++      !flow_to.empty() && !risky && flow_to.size() <= 2 &&
 +      level_ != PermissionLevel::kAsk &&
 +      std::ranges::count_if(flow_from,
 +                            [](const std::string& source) {
@@ -326,6 +388,7 @@
 +      std::ranges::all_of(flow_to, [](const std::string& origin) {
 +        return GURL(origin).SchemeIsHTTPOrHTTPS();
 +      });
++  const bool grantable = flows && grant_fits;
 +  auto with_flow = [&](GuardResult result) {
 +    if (flows) {
 +      result.flow_from = AsList(flow_from);
@@ -344,10 +407,18 @@
 +  const bool choice = !carries && !risky && !flow_to.empty() &&
 +                      action.risk.tool_name != "wait_for_settle";
 +  if (choice && free_steps_left_ <= 0) {
-+    return {GuardDecision::kConfirm, RiskClass::kLow,
-+            "This turn has used its free steps on sites that haven't seen "
-+            "what the assistant read.",
-+            false, "out of free steps"};
++    // A flow card like any other: what it read, and where the step goes.
++    GuardResult result{GuardDecision::kConfirm, RiskClass::kLow,
++                       "This turn has used its free steps on sites that "
++                       "haven't seen what the assistant read.",
++                       false, "out of free steps"};
++    result.flow_from = AsList(flow_from);
++    result.flow_to = AsList(flow_to);
++    result.offer_flow_grant = grant_fits;
++    result.flow_card = true;
++    // Allowed once, a scroll still moves by the fixed step only.
++    result.coarse_scroll = action.risk.tool_name == "scroll";
++    return result;
 +  }
 +  auto free_step = [&](GuardResult result) {
 +    if (choice && result.decision == GuardDecision::kAllow) {
@@ -360,7 +431,7 @@
    auto allowed = [&](const std::string& origin) {
      const auto rule = site_rules_.find(origin);
      return origin.empty() || origins_.contains(origin) ||
-@@ -289,13 +570,14 @@ GuardResult ActionGuard::Evaluate(const
+@@ -289,13 +614,14 @@ GuardResult ActionGuard::Evaluate(const
    // A confirmation that is only about the site, not the action, may become
    // a standing rule for that site.
    const bool may_offer_rule =
@@ -376,7 +447,7 @@
    switch (level_) {
      case PermissionLevel::kReadOnly:
        // Handled above.
-@@ -306,23 +588,25 @@ GuardResult ActionGuard::Evaluate(const
+@@ -306,23 +632,25 @@ GuardResult ActionGuard::Evaluate(const
        if (!risky && (action.risk.tool_name == "scroll" ||
                       action.risk.tool_name == "wait_for_settle" ||
                       action.risk.tool_name == "switch_tab")) {
@@ -415,7 +486,7 @@
            !allowed(action.risk.current_origin) ||
            !allowed(action.frame_origin)) {
          risk = RiskClass::kConsequential;
-@@ -335,26 +619,44 @@ GuardResult ActionGuard::Evaluate(const
+@@ -335,26 +663,44 @@ GuardResult ActionGuard::Evaluate(const
        if (risk != RiskClass::kLow) {
          std::string why = risky_because;
          if (why.empty()) {
@@ -470,7 +541,7 @@
        }
        if (action.unknown_text && !named) {
          return {GuardDecision::kConfirm, RiskClass::kConsequential,
-@@ -362,8 +664,8 @@ GuardResult ActionGuard::Evaluate(const
+@@ -362,8 +708,8 @@ GuardResult ActionGuard::Evaluate(const
                  "name.",
                  may_offer_rule, "typing text you didn't write"};
        }
@@ -524,15 +595,16 @@
  };
  // A standing rule for one origin, from the user (see kAgentSiteRules).
  enum class SiteRule { kAlways, kNever };
-@@ -66,11 +84,46 @@ std::map<std::string, SiteRule> ParseSit
+@@ -66,11 +84,47 @@ std::map<std::string, SiteRule> ParseSit
  // ".", read as best it can be when the key isn't a URL; "" when it names no
  // host. A never rule covers this host and its subdomains.
  std::string SiteRuleHost(std::string_view key);
-+// Whether `typed` is the user's own words: it appears in `user_text` (the
-+// turn's messages, lowercased) starting and ending on word boundaries, and
-+// has at least one letter or digit. A plain substring test let the model
-+// spell anything one letter at a time, and punctuation alone (".", "-")
-+// would spell it one mark at a time.
++// Whether `typed` is the user's own words: it appears exactly, case and
++// spacing as written, in `user_text` (this turn's message), starting and
++// ending on word boundaries; it has at least one letter or digit and no
++// space at either end. A plain substring test let the model spell anything
++// one letter at a time, punctuation alone (".", "-") would spell it one mark
++// at a time, and a loose match would spell it in capitals or spaces.
 +bool IsUsersOwnWords(std::string_view typed, std::string_view user_text);
 +// `message` without the page blocks rac put in it (WrapPageContent's
 +// "<<<page ...>>>" through its end marker): page text in a user turn is
@@ -572,11 +644,20 @@
    // Settings changed while a run is active. The controller calls it before
    // each step, never while a card is open, so a card can't get looser
    // under the user.
-@@ -89,8 +142,34 @@ class ActionGuard {
+@@ -83,14 +137,43 @@ class ActionGuard {
+   void RememberPageLink(const std::string& url);
+   void AllowPlan(const std::set<std::string>& additional_origins = {});
+   GuardResult Evaluate(const ActionMetadata& action) const;
++  // Why content from `origins` (a page and the frames it shows) mustn't
++  // reach the model: a never rule covers one of them. Empty when none does.
++  std::string ReadBlockedReason(const std::set<std::string>& origins) const;
+   const std::set<std::string>& origins() const { return origins_; }
+   PermissionLevel level() const { return level_; }
+   // Only the careful level shows a plan card and runs the critic.
    bool uses_plan_and_critic() const {
      return level_ == PermissionLevel::kCareful;
    }
-+  // Whether `typed` is in this turn's user messages (IsUsersOwnWords), page
++  // Whether `typed` is in this turn's user message (IsUsersOwnWords), page
 +  // blocks left out.
 +  bool IsOwnWords(std::string_view typed) const;
 +
@@ -607,7 +688,7 @@
    // Whether a "never" rule covers `origin`'s host.
    bool NeverOn(const std::string& origin) const;
    // Whether the user named `origin`: an attached tab, a URL in a message, a
-@@ -98,13 +177,33 @@ class ActionGuard {
+@@ -98,13 +181,33 @@ class ActionGuard {
    bool IsNamed(const std::string& origin) const;
    // Whether every origin the action touches is one the user named.
    bool OnNamedSites(const ActionMetadata& action) const;
@@ -635,7 +716,7 @@
 +  std::map<std::string, DataFlow> flows_;
 +  uint64_t turns_ = 0;
 +  std::string conversation_;
-+  // This turn's user messages, lowercased, page blocks left out.
++  // This turn's user message as written, page blocks left out.
 +  std::string user_text_;
 +  int free_steps_left_ = kFreeStepsPerTurn;
  };
@@ -817,10 +898,14 @@
    guard.SetSiteRules({{"https://trusted.com", SiteRule::kAlways},
                        {"https://banned.com", SiteRule::kNever}});
    auto typing = Low();
-@@ -328,6 +413,14 @@ TEST(ActionGuardSiteRuleTest, AlwaysMake
+@@ -326,8 +411,16 @@ TEST(ActionGuardSiteRuleTest, AlwaysMake
+   auto read = Low();
+   read.risk.tool_name = "snapshot";
    read.risk.current_origin = "https://banned.com";
-   EXPECT_EQ(guard.Evaluate(read).decision, GuardDecision::kAllow)
-       << "reads are not actions";
+-  EXPECT_EQ(guard.Evaluate(read).decision, GuardDecision::kAllow)
+-      << "reads are not actions";
++  EXPECT_EQ(guard.Evaluate(read).decision, GuardDecision::kBlock)
++      << "a never site's text doesn't reach the model either";
 +  // An "always" rule says the agent may act there, not that anything it
 +  // read anywhere may go there.
 +  guard.RecordRead({"https://mail.example"});
@@ -901,7 +986,7 @@
    ActionGuard careful;
    careful.BeginTurn(PermissionLevel::kCareful, {}, {"https://example.com"});
    EXPECT_EQ(careful.Evaluate(click).why, "the first step of a task");
-@@ -549,6 +653,312 @@ TEST(ActionGuardFailClosedTest, NeverWin
+@@ -549,6 +653,309 @@ TEST(ActionGuardFailClosedTest, NeverWin
    EXPECT_EQ(rules.at("https://a.com"), SiteRule::kNever);
  }
  
@@ -1052,13 +1137,10 @@
 +    const char* typed;
 +    bool own;
 +  } cases[] = {
-+      {"boston", true},     {"Boston", true},
-+      {"  boston  ", true}, {"to   boston", true},
-+      {"", true},           {"2", true},
-+      {"-5", true},         {"b", false},
-+      {"o", false},         {"bost", false},
-+      {"th", false},        {"25", false},
-+      {"oston", false},     {"boston on the 25th", true},
++      {"boston", true},   {"to boston", true}, {"", true},
++      {"2", true},        {"-5", true},        {"b", false},
++      {"o", false},       {"bost", false},     {"th", false},
++      {"25", false},      {"oston", false},    {"boston on the 25th", true},
 +      {"seattle", false},
 +  };
 +  for (const Case& c : cases) {
@@ -1214,7 +1296,7 @@
  // A never rule covers the host it names and every subdomain. A key that
  // isn't an exact origin still blocks the host it names as best it can be
  // read. Always stays exact-origin only.
-@@ -599,11 +1009,163 @@ TEST(ActionGuardFailClosedTest, NeverCov
+@@ -599,11 +1006,312 @@ TEST(ActionGuardFailClosedTest, NeverCov
    }
  }
  
@@ -1253,7 +1335,7 @@
 +  EXPECT_FALSE(guard.IsOwnWords("4417"));
 +  EXPECT_FALSE(guard.IsOwnWords("evil.example"));
 +  EXPECT_FALSE(guard.IsOwnWords("Code"));
-+  EXPECT_TRUE(guard.IsOwnWords("fill the form"));
++  EXPECT_TRUE(guard.IsOwnWords("Fill the form"));
 +  // A block with no end runs to the end of the message.
 +  EXPECT_EQ(WithoutPageBlocks("a <<<page from=x nonce=1>>> secret"), "a ");
 +  EXPECT_EQ(WithoutPageBlocks("a <<<page x>>>b<<<end page x>>>c"), "a \nc");
@@ -1352,6 +1434,155 @@
 +  EXPECT_EQ(card.flow_from, std::vector<std::string>{kEarlierInConversation});
 +}
 +
++// The model types its text exactly as written, so the user's words match
++// only as the user wrote them. Capitals, inner spacing, and spaces at the
++// ends would each spell something; so would whitespace alone.
++TEST(ActionGuardDataFlowTest, OwnWordsMatchOnlyAsWritten) {
++  const std::string user = "Fly to Boston on Friday";
++  for (const char* typed :
++       {"Boston", "Fly to Boston", "Boston on Friday", "Fly"}) {
++    EXPECT_TRUE(IsUsersOwnWords(typed, user)) << typed;
++  }
++  for (const char* typed :
++       {"boston", "BOSTON", "BoStOn", "fly to boston", "Fly  to Boston",
++        "Fly\tto Boston", " Boston", "Boston ", "  Boston  ", "Boston\n", " ",
++        "   ", "\t", "\n\n", "Fly to\nBoston"}) {
++    EXPECT_FALSE(IsUsersOwnWords(typed, user)) << '"' << typed << '"';
++  }
++  // The hidden value on a password card follows the same match, so a
++  // variant of the user's words is shown.
++  ActionGuard guard;
++  guard.BeginTurn(PermissionLevel::kAuto, {"my password is Hunter2"},
++                  {"https://a.example"}, "L");
++  EXPECT_TRUE(guard.IsOwnWords("Hunter2"));
++  EXPECT_FALSE(guard.IsOwnWords("hunter2"));
++  EXPECT_FALSE(guard.IsOwnWords("HUNTER2"));
++  EXPECT_FALSE(guard.IsOwnWords("Hunter2 "));
++}
++
++// Only this turn's message is the user's words. A code the user wrote turns
++// ago carries like anything else the model holds; a URL from an earlier
++// turn stays named.
++TEST(ActionGuardDataFlowTest, OwnWordsComeFromThisTurnOnly) {
++  ActionGuard guard;
++  guard.BeginTurn(PermissionLevel::kAuto,
++                  {"my code is 4417, see https://named.example/"},
++                  {"https://a.example"}, "M");
++  EXPECT_TRUE(guard.IsOwnWords("4417"));
++  guard.BeginTurn(
++      PermissionLevel::kAuto,
++      {"my code is 4417, see https://named.example/", "now fill in the form"},
++      {"https://a.example"}, "M");
++  EXPECT_FALSE(guard.IsOwnWords("4417"));
++  EXPECT_TRUE(guard.IsOwnWords("fill in the form"));
++  guard.RecordRead({"https://mail.example"});
++  auto type = Low();
++  type.risk.current_origin = type.frame_origin = "https://evil.example";
++  type.unknown_text = !guard.IsOwnWords("4417");
++  GuardResult result = guard.Evaluate(type);
++  EXPECT_EQ(result.decision, GuardDecision::kConfirm);
++  EXPECT_TRUE(result.flow_card);
++  auto navigate = Low();
++  navigate.risk.tool_name = "navigate";
++  navigate.url = "https://named.example/";
++  navigate.risk.target_origin = "https://named.example";
++  EXPECT_NE(guard.Evaluate(navigate).decision, GuardDecision::kBlock)
++      << "a URL the user typed in an earlier turn is still the user's";
++}
++
++// A never site's content doesn't reach the model: reads there are blocked,
++// and so is a page showing a frame from one.
++TEST(ActionGuardDataFlowTest, NeverSitesAreNotRead) {
++  ActionGuard guard;
++  guard.BeginTurn(PermissionLevel::kAuto, {"go"}, {"https://a.example"}, "N");
++  guard.SetSiteRules(
++      ParseSiteRules(base::DictValue().Set("bank.example", "never")));
++  for (const char* tool : {"snapshot", "get_page_text", "find_in_page"}) {
++    ActionMetadata read;
++    read.risk.tool_name = tool;
++    read.risk.current_origin = "https://www.bank.example";
++    const GuardResult result = guard.Evaluate(read);
++    EXPECT_EQ(result.decision, GuardDecision::kBlock) << tool;
++    EXPECT_NE(result.reason.find("bank.example"), std::string::npos);
++    read.risk.current_origin = "https://a.example";
++    EXPECT_EQ(guard.Evaluate(read).decision, GuardDecision::kAllow) << tool;
++  }
++  EXPECT_TRUE(guard.ReadBlockedReason({"https://a.example"}).empty());
++  EXPECT_FALSE(
++      guard.ReadBlockedReason({"https://a.example", "http://bank.example:8080"})
++          .empty())
++      << "a frame from a never site";
++  EXPECT_TRUE(guard.ReadBlockedReason({}).empty());
++}
++
++// Out of free steps, the card names what it read and where the step goes,
++// like any flow card, and a scroll allowed once still moves by the fixed
++// step.
++TEST(ActionGuardDataFlowTest, OutOfFreeStepsCardNamesTheFlow) {
++  ActionGuard guard;
++  guard.BeginTurn(PermissionLevel::kAuto, {"go"}, {}, "O");
++  guard.RecordRead({"https://a.example"});
++  auto scroll = LinkClick("https://b.example");
++  scroll.risk.tool_name = "scroll";
++  scroll.risk.element_role.clear();
++  for (int i = 0; i < kFreeStepsPerTurn; ++i) {
++    guard.SpendFreeStep();
++  }
++  GuardResult card = guard.Evaluate(scroll);
++  ASSERT_EQ(card.decision, GuardDecision::kConfirm);
++  EXPECT_EQ(card.flow_from, std::vector<std::string>{"https://a.example"});
++  EXPECT_EQ(card.flow_to, std::vector<std::string>{"https://b.example"});
++  EXPECT_TRUE(card.flow_card);
++  EXPECT_TRUE(card.offer_flow_grant);
++  EXPECT_TRUE(card.coarse_scroll);
++  guard.GrantFlow("https://b.example", card.flow_from);
++  EXPECT_EQ(guard.Evaluate(scroll).decision, GuardDecision::kAllow)
++      << "the grant settles it";
++  auto own_words = Low();
++  own_words.risk.current_origin = own_words.frame_origin = "https://c.example";
++  card = guard.Evaluate(own_words);
++  ASSERT_EQ(card.decision, GuardDecision::kConfirm);
++  EXPECT_EQ(card.flow_to, std::vector<std::string>{"https://c.example"});
++  EXPECT_FALSE(card.coarse_scroll);
++  guard.SetLevel(PermissionLevel::kAsk);
++  card = guard.Evaluate(scroll);
++  EXPECT_TRUE(card.flow_to.empty()) << "granted above";
++  scroll.risk.current_origin = scroll.frame_origin = "https://d.example";
++  card = guard.Evaluate(scroll);
++  ASSERT_EQ(card.decision, GuardDecision::kConfirm);
++  EXPECT_EQ(card.flow_to, std::vector<std::string>{"https://d.example"});
++  EXPECT_FALSE(card.offer_flow_grant) << "ask offers no grant";
++}
++
++// A grant that covered "earlier" was for what its card showed. A site read
++// past the cap is counted as earlier too, so it takes that grant back.
++TEST(ActionGuardDataFlowTest, ReadsPastTheCapTakeBackEarlierGrants) {
++  ActionGuard guard;
++  guard.BeginTurn(PermissionLevel::kAuto, {"one", "two"}, {}, "P");
++  GuardResult card = guard.Evaluate(LinkClick("https://dest.example"));
++  ASSERT_EQ(card.flow_from, std::vector<std::string>{kEarlierInConversation});
++  guard.GrantFlow("https://dest.example", card.flow_from);
++  EXPECT_EQ(guard.Evaluate(LinkClick("https://dest.example")).decision,
++            GuardDecision::kAllow);
++  std::set<std::string> many;
++  for (int i = 0; i < 256; ++i) {
++    many.insert("https://s" + base::NumberToString(i) + ".example");
++  }
++  guard.RecordRead(many);
++  guard.GrantFlow("https://dest.example",
++                  guard.Evaluate(LinkClick("https://dest.example")).flow_from);
++  EXPECT_EQ(guard.Evaluate(LinkClick("https://dest.example")).decision,
++            GuardDecision::kAllow);
++  guard.RecordRead({"https://s0.example"});
++  EXPECT_EQ(guard.Evaluate(LinkClick("https://dest.example")).decision,
++            GuardDecision::kAllow)
++      << "a site already listed changes nothing";
++  guard.RecordRead({"https://secret.example"});
++  card = guard.Evaluate(LinkClick("https://dest.example"));
++  EXPECT_EQ(card.decision, GuardDecision::kConfirm);
++  EXPECT_EQ(card.flow_from, std::vector<std::string>{kEarlierInConversation});
++}
++
 +// Past 256 origins the record stops listing them and counts the rest as
 +// unknown reads, which still ask.
 +TEST(ActionGuardDataFlowTest, ReadOriginsPastTheCapCountAsEarlier) {
@@ -1380,7 +1611,7 @@
    auto type = Low();
    type.risk.current_origin = "https://a.example";
    EXPECT_EQ(guard.Evaluate(type).decision, GuardDecision::kAllow);
-@@ -617,5 +1179,8 @@ TEST(ActionGuardLevelTest, SettingsChang
+@@ -617,5 +1325,8 @@ TEST(ActionGuardLevelTest, SettingsChang
    guard.SetSiteRules({});
    guard.SetLevel(PermissionLevel::kAsk);
    EXPECT_EQ(guard.Evaluate(type).decision, GuardDecision::kConfirm);
@@ -1457,12 +1688,18 @@
      if (current_->browser) {
        for (const auto& tab : TabTools(current_->browser.get()).ListTabs()) {
          if (!current_->tabs.contains(tab.tab_id)) {
-@@ -442,12 +447,15 @@ void AgentController::ProcessTool() {
+@@ -442,12 +447,21 @@ void AgentController::ProcessTool() {
          if (list.size() >= 20) {
            continue;
          }
++        const std::string origin = url::Origin::Create(tab.url).Serialize();
++        if (!guard_.ReadBlockedReason({origin}).empty()) {
++          // A never site's title is page text the model mustn't get.
++          ++other_tabs;
++          continue;
++        }
 +        // A title is page text.
-+        shown.insert(url::Origin::Create(tab.url).Serialize());
++        shown.insert(origin);
          list.Append(tab.tab_id);
          lines += base::StrCat({"- ", tab.tab_id, ": \"",
                                 EscapeSnapshotText(tab.title, 100), "\" ",
@@ -1473,17 +1710,40 @@
      rac::ai::PageAttachment page;
      page.title = "Attached tabs";
      page.text = std::move(lines);
-@@ -553,6 +561,9 @@ void AgentController::OnPageRead(
+@@ -464,6 +478,15 @@ void AgentController::ProcessTool() {
+     return;
+   }
+   if (FindToolDefinition(pending_.name)->kind == ToolKind::kRead) {
++    // A never site's text doesn't go to the model, any more than the agent
++    // acts there.
++    if (const std::string blocked =
++            guard_.ReadBlockedReason({Origin(TargetTab())});
++        !blocked.empty()) {
++      step_guard_ = "Blocked: " + blocked;
++      Finish(Error("denied", blocked));
++      return;
++    }
+     ReadPage(false);
+     return;
+   }
+@@ -553,6 +576,16 @@ void AgentController::OnPageRead(
      Authorize();
      return;
    }
 +  // Everything below reaches the model: the page and every frame on it
-+  // whose content it shows.
-+  guard_.RecordRead(PageContentOrigins(result->proto));
++  // whose content it shows. A frame from a never site keeps it all back.
++  const std::set<std::string> read = PageContentOrigins(result->proto);
++  if (const std::string blocked = guard_.ReadBlockedReason(read);
++      !blocked.empty()) {
++    step_guard_ = "Blocked: " + blocked;
++    Finish(Error("denied", blocked));
++    return;
++  }
++  guard_.RecordRead(read);
    rac::ai::PageAttachment page;
    page.title = snapshot.title;
    page.url = snapshot.url;
-@@ -634,11 +645,8 @@ ActionMetadata AgentController::Metadata
+@@ -634,11 +667,8 @@ ActionMetadata AgentController::Metadata
        // The critic never sees typed text. Text the user didn't write (an
        // address from another tab, say) could leak to the page's script on
        // input, so it needs the user's confirmation in any field.
@@ -1497,18 +1757,20 @@
      }
      if (pending_.name == "click") {
        meta.url = entry->link_url;
-@@ -700,6 +708,10 @@ void AgentController::Authorize() {
+@@ -700,6 +730,12 @@ void AgentController::Authorize() {
    step_guard_ =
        (decision.decision == GuardDecision::kAllow ? "Allowed: " : "Asked: ") +
        decision.why;
 +  if (decision.spends_free_step) {
 +    guard_.SpendFreeStep();
-+    coarse_scroll_ = decision.coarse_scroll;
 +  }
++  // Also when the step asks: allowed once, it still scrolls by the fixed
++  // step.
++  coarse_scroll_ = decision.coarse_scroll;
    if (decision.decision == GuardDecision::kPlan) {
      awaiting_plan_ = true;
      approval_id_ = "approval-" + base::NumberToString(++next_id_);
-@@ -721,7 +733,8 @@ void AgentController::Authorize() {
+@@ -721,7 +757,8 @@ void AgentController::Authorize() {
      return;
    }
    if (decision.decision == GuardDecision::kConfirm) {
@@ -1518,7 +1780,7 @@
      return;
    }
    CheckCritic();
-@@ -812,10 +825,16 @@ void AgentController::CriticFinished(boo
+@@ -812,10 +849,16 @@ void AgentController::CriticFinished(boo
  }
  void AgentController::RequestConfirmation(std::string reason,
                                            bool held_by_critic,
@@ -1536,7 +1798,7 @@
    approval_id_ = "approval-" + base::NumberToString(++next_id_);
    if (const auto* entry =
            current_->refs.Lookup(String(pending_.arguments, "ref"))) {
-@@ -842,6 +861,16 @@ void AgentController::RequestConfirmatio
+@@ -842,6 +885,16 @@ void AgentController::RequestConfirmatio
    input.no_fast_model = guard_.uses_plan_and_critic() &&
                          (!direct || !direct->HasUsableDirectProvider());
    input.always_allow_origin = always_allow_origin_;
@@ -1553,7 +1815,7 @@
    Emit(ConfirmRequestEvent(input));
    critic_note_.clear();
  }
-@@ -855,10 +884,11 @@ bool AgentController::TryRespond(const s
+@@ -855,10 +908,11 @@ bool AgentController::TryRespond(const s
      return false;
    }
    const Decision parsed = ParseDecision(decision);
@@ -1568,7 +1830,7 @@
      return false;
    }
    approval_id_.clear();
-@@ -909,6 +939,15 @@ bool AgentController::TryRespond(const s
+@@ -909,6 +963,15 @@ bool AgentController::TryRespond(const s
      Finish(Error("denied", now.reason));
      return false;
    }
@@ -1584,7 +1846,7 @@
    ++confirmed_;
    step_confirmed_ = true;
    if (const std::string frame = Metadata().frame_origin;
-@@ -922,6 +961,60 @@ bool AgentController::TryRespond(const s
+@@ -922,6 +985,60 @@ bool AgentController::TryRespond(const s
    RevalidateAndDispatch();
    return true;
  }
@@ -1645,7 +1907,7 @@
  void AgentController::Dispatch() {
    if (!done_ || !active_ || !current_ || !current_->browser ||
        !IsBrowserControlAllowed(profile_->GetPrefs(), profile_)) {
-@@ -962,10 +1055,18 @@ void AgentController::Dispatch() {
+@@ -962,10 +1079,18 @@ void AgentController::Dispatch() {
          String(args, "key"),
          ref.ref.empty() ? std::nullopt : std::make_optional(ref)};
    } else if (pending_.name == "scroll") {
@@ -1668,7 +1930,7 @@
    } else {
      request.action = WaitAction{base::Milliseconds(std::clamp(
          args.FindDouble("timeout_ms").value_or(4000), 0.0, 10000.0))};
-@@ -1017,6 +1118,7 @@ void AgentController::Dispatch() {
+@@ -1017,6 +1142,7 @@ void AgentController::Dispatch() {
        }
      }
    }
@@ -1676,7 +1938,22 @@
    action_dispatched_ = true;
    current_->runner->Run(std::move(request),
                          base::BindOnce(&AgentController::OnActionDone,
-@@ -1061,6 +1163,7 @@ void AgentController::OnActionDone(Actio
+@@ -1056,11 +1182,22 @@ void AgentController::OnActionDone(Actio
+   out.may_have_acted = result.may_have_acted;
+   out.data.Set("settled", result.settled);
+   out.data.Set("timed_out", result.timed_out);
++  // The page the step left the tab on may show a never site (a frame, a
++  // redirect the step didn't choose). The model doesn't get that snapshot.
++  std::string never_shown;
+   if (result.next_snapshot_id && current_->runner) {
++    never_shown = guard_.ReadBlockedReason(
++        current_->runner->last_snapshot()->content_origins);
++    if (!never_shown.empty()) {
++      out.data.Set("snapshot_withheld", never_shown);
++    }
++  }
++  if (result.next_snapshot_id && current_->runner && never_shown.empty()) {
+     const auto& snapshot = *current_->runner->last_snapshot();
      current_->snapshot_id =
          std::max(current_->snapshot_id, snapshot.snapshot_id);
      current_->snapshots[TargetAlias()] = snapshot;
@@ -1684,7 +1961,7 @@
      rac::ai::PageAttachment page;
      page.title = snapshot.title;
      page.url = snapshot.url;
-@@ -1084,8 +1187,10 @@ void AgentController::Finish(ToolResult
+@@ -1084,8 +1221,10 @@ void AgentController::Finish(ToolResult
    if (!done_) {
      return;
    }
@@ -1696,7 +1973,7 @@
    if (current_ && (action_dispatched_ || pending_.name == "snapshot") &&
        result.data.contains("snapshot_id") && result.data.contains("text")) {
      const auto found = current_->snapshots.find(TargetAlias());
-@@ -1201,6 +1306,9 @@ void AgentController::Cancel() {
+@@ -1201,6 +1340,9 @@ void AgentController::Cancel() {
    approved_fingerprint_.clear();
    approval_origin_.clear();
    always_allow_origin_.clear();
