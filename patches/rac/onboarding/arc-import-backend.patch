@@ -1,0 +1,2084 @@
+Index: src/chrome/browser/ui/rac/onboarding/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/rac/onboarding/BUILD.gn
++++ src/chrome/browser/ui/rac/onboarding/BUILD.gn
+@@ -2,6 +2,8 @@
+ # You can use, redistribute, and/or modify this source code under
+ # the terms of the GPL-3.0 license that can be found in the LICENSE file.
+ 
++import("//chrome/browser/rac/dev/dev_switches.gni")
++
+ assert(!is_android)
+ 
+ # The pref the welcome tour owns. Separate so //chrome/browser can register
+@@ -14,22 +16,49 @@ source_set("prefs") {
+   deps = [ "//components/prefs" ]
+ }
+ 
+-# The welcome tour's message handler. The page itself is served by Helium's
++# The welcome tour's message handlers. The page itself is served by Helium's
+ # chrome://setup controller, which rac points at
+ # //chrome/browser/resources/rac_onboarding.
+ source_set("onboarding") {
+   sources = [
++    "arc_import_backend.cc",
++    "arc_import_backend.h",
++    "arc_import_handler.cc",
++    "arc_import_handler.h",
+     "onboarding_handler.cc",
+     "onboarding_handler.h",
++    "onboarding_window.h",
++    "real_arc_import_backend.cc",
++    "real_arc_import_backend.h",
+   ]
++
++  # The scripted fixture exists only where the dev switches do.
++  if (rac_dev_switches) {
++    sources += [
++      "fixture_arc_import_backend.cc",
++      "fixture_arc_import_backend.h",
++    ]
++  }
++
+   deps = [
+     ":prefs",
+     "//base",
++    "//chrome/app:generated_resources",
++    "//chrome/browser:browser_process",
+     "//chrome/browser/profiles:profile",
++    "//chrome/browser/profiles:profile_manager",
+     "//chrome/browser/rac/ai:core",
++    "//chrome/browser/rac/dev:buildflags",
++    "//chrome/browser/rac/import:apply",
++    "//chrome/browser/rac/import:arc_reader",
++    "//chrome/browser/rac/import:arc_source",
+     "//chrome/browser/rac/spaces:browser",
++    "//chrome/browser/rac/storage:browser",
++    "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/rac:sidebar_address_bar_prefs",
+     "//components/prefs",
+     "//content/public/browser",
++    "//ui/base",
++    "//url",
+   ]
+ }
+Index: src/chrome/browser/ui/rac/onboarding/arc_import_backend.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/onboarding/arc_import_backend.cc
+@@ -0,0 +1,86 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/onboarding/arc_import_backend.h"
++
++#include <memory>
++
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/logging.h"
++#include "chrome/browser/rac/dev/buildflags.h"
++#include "chrome/browser/ui/rac/onboarding/real_arc_import_backend.h"
++
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++#include "base/command_line.h"
++#include "chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.h"
++#endif
++
++namespace rac::onboarding {
++
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++namespace {
++
++// Not in release builds, so a release can only ever read real Arc data.
++constexpr char kArcImportFixtureSwitch[] = "rac-arc-import-fixture";
++
++// The scripted backend, or null if the file can't be read or isn't a JSON
++// object. Fields (all optional):
++//
++//   state: {found, signInsAvailable, importedDaysAgo, undoUntilDays,
++//           undoSnapshotHoursAgo}
++//   arcRunning, arcQuitAfterMs — the sign-ins quit gate, scripted
++//   readError — racArcImportRead fails
++//   preview — the page's preview dictionary, verbatim
++//   report — ImportReport counts for the result's skip and damage lines
++//   progress — a list of {step, done, total, spaceId, spaceTitle}; without
++//              it, events are made from the preview's spaces
++//   progressIntervalMs — between events, 150 default
++//   result — ArcImportResult's fields: status, the ArcImportCounts names,
++//            history, handoffsSaved, pinnedExtensions, undoUntilDays,
++//            failure, and a profiles list of {key, status, newProfile,
++//            path, history, undoUntilDays, pinnedExtensions, <counts>}
++//   undoResult — 'undone'|'partlyUndone'|'busy'|'expired'|'nothingToUndo'|
++//                'failed'
++//   restoreOffer — {createdHoursAgo, counts, spaces:[{name, emoji, light,
++//            dark}]}
++//
++std::unique_ptr<ArcImportBackend> FixtureFromSwitch() {
++  const base::CommandLine& command_line =
++      *base::CommandLine::ForCurrentProcess();
++  if (!command_line.HasSwitch(kArcImportFixtureSwitch)) {
++    return nullptr;
++  }
++  const base::FilePath path =
++      command_line.GetSwitchValuePath(kArcImportFixtureSwitch);
++  std::string json;
++  if (!path.IsAbsolute() || !base::ReadFileToString(path, &json)) {
++    LOG(ERROR) << "--" << kArcImportFixtureSwitch
++               << " needs an absolute path to a readable file";
++    return nullptr;
++  }
++  std::optional<base::Value> parsed = base::JSONReader::Read(json);
++  if (!parsed || !parsed->is_dict()) {
++    LOG(ERROR) << "--" << kArcImportFixtureSwitch
++               << ": the fixture isn't a JSON object";
++    return nullptr;
++  }
++  return std::make_unique<FixtureArcImportBackend>(
++      std::move(*parsed).TakeDict());
++}
++
++}  // namespace
++#endif
++
++std::unique_ptr<ArcImportBackend> CreateArcImportBackend(Profile* profile) {
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++  if (std::unique_ptr<ArcImportBackend> fixture = FixtureFromSwitch()) {
++    return fixture;
++  }
++#endif
++  return std::make_unique<RealArcImportBackend>(profile);
++}
++
++}  // namespace rac::onboarding
+Index: src/chrome/browser/ui/rac/onboarding/arc_import_backend.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/onboarding/arc_import_backend.h
+@@ -0,0 +1,155 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_ONBOARDING_ARC_IMPORT_BACKEND_H_
++#define CHROME_BROWSER_UI_RAC_ONBOARDING_ARC_IMPORT_BACKEND_H_
++
++#include <memory>
++#include <optional>
++
++#include "base/functional/callback.h"
++#include "base/types/expected.h"
++#include "base/values.h"
++#include "chrome/browser/rac/import/arc_import_types.h"
++#include "chrome/browser/rac/import/arc_reader.h"
++#include "chrome/browser/rac/import/import_plan.h"
++#include "chrome/browser/rac/storage/data_backups.h"
++
++class Profile;
++
++namespace base {
++class FilePath;
++}  // namespace base
++
++namespace rac {
++
++// The same aliases as Data's arc_importer.h, so the two agree when it lands.
++using ArcImportProgressCallback =
++    base::RepeatingCallback<void(const ArcImportProgress&)>;
++using ArcImportDoneCallback = base::OnceCallback<void(const ArcImportResult&)>;
++
++}  // namespace rac
++
++namespace rac::onboarding {
++
++// What the Arc import and restore screens talk to. The methods mirror the
++// applier's interface (chrome/browser/ui/rac/import/arc_importer.h, from
++// Data's `apply` stream) one to one: detection, reading the plan, starting
++// an import, progress, the result, Undo, the async import state, the
++// restore offer, and the Arc-quit gate for sign-ins.
++//
++// The interface exists so the screens can land before the applier does and
++// so they can run against a scripted import in dev builds. Two
++// implementations:
++//
++// - RealArcImportBackend uses what's already in the tree: the reader
++//   (ArcSourceExists, ReadArc), the import record (ArcImportRecord), the
++//   mapping (ToSpaceTheme, ImportedSpaceName, ArcProfileLabelFor), and
++//   DataBackups' restore offer. What isn't there yet — StartArcImport,
++//   UndoArcImport, DataRestorer::RestoreOffer, IsArcRunning and
++//   ArcQuitWatcher — is forwarded to Data's code once its patches land;
++//   until then it answers "not available" (a failed result, no restore),
++//   never NOTIMPLEMENTED().
++// - FixtureArcImportBackend, compiled only under RAC_DEV_SWITCHES and
++//   chosen by --rac-arc-import-fixture=<path>, replays a JSON script in
++//   the shape of .scratch/mocks/fixture.js, with timed progress events so
++//   the progress state can be filmed. It is never chosen when the switch
++//   is unset.
++//
++// All callbacks run on the UI thread. Nothing here makes a network
++// request.
++class ArcImportBackend {
++ public:
++  // The wait on Arc quitting, for the sign-ins row. Dropping it cancels
++  // the call, like destroying an ArcQuitWatcher.
++  class QuitWait {
++   public:
++    virtual ~QuitWait() = default;
++  };
++
++  virtual ~ArcImportBackend() = default;
++
++  // ArcSourceExists(): whether Arc's sidebar file is there. One stat, no
++  // parse, on a MayBlock sequence.
++  virtual void CheckSource(base::OnceCallback<void(bool exists)> done) = 0;
++
++  // ReadArc(): the plan the preview shows and StartImport() applies.
++  virtual void ReadPlan(
++      base::OnceCallback<void(base::expected<ImportPlan, ArcReadError>)>
++          done) = 0;
++
++  // The plan as the page's preview dictionary (ArcPreview in
++  // arc_import_proxy.ts): profiles in order with source keys, resolved or
++  // fallback-marked names, favorites as letter tiles, spaces with the
++  // applier's own theme stops and per-space counts, and the open-tab
++  // total. The fixture returns its scripted dictionary.
++  virtual base::DictValue PlanToPreviewValue(const ImportPlan& plan) = 0;
++
++  // GetArcImportState(): when this profile last received an Arc import,
++  // and until when it can be undone. Async: the record is on disk.
++  virtual void GetImportState(
++      base::OnceCallback<void(const ArcImportState&)> done) = 0;
++
++  // ArcSignInsAvailable(): whether this build has the sign-ins step
++  // (plan 04 M2). The sign-ins row is hidden while it doesn't.
++  virtual bool SignInsAvailable() const = 0;
++
++  // StartArcImport(). `plan` is the one ReadPlan() returned. `progress`
++  // runs on the UI thread, in bursts; `done` runs once. A backend without
++  // an applier runs `done` with ArcImportResult::kFailed /
++  // ArcImportFailure::kNone ("not available").
++  virtual void StartImport(ImportPlan plan,
++                           ArcImportOptions options,
++                           ArcImportProgressCallback progress,
++                           ArcImportDoneCallback done) = 0;
++
++  // RetryArcSignIns() (04 M2): retries only the sign-ins, with the same
++  // callbacks as StartImport().
++  virtual void RetrySignIns(ArcImportProgressCallback progress,
++                            ArcImportDoneCallback done) = 0;
++
++  // UndoArcImport(): removes what the newest import added, in every
++  // profile it touched, and puts back the blank space it replaced. Never
++  // deletes a profile.
++  virtual void UndoImport(base::OnceCallback<void(ArcUndoResult)> done) = 0;
++
++  // Opens a browser window on a profile this import created.
++  // `profile_path` is one of the paths a result's `newProfiles` carried.
++  virtual void OpenProfile(const base::FilePath& profile_path,
++                           base::OnceCallback<void(bool)> done) = 0;
++
++  // The pending restore offer (DataBackups::restore_offer()), or nullopt
++  // while none or while an operation hides it.
++  virtual std::optional<DataBackups::RestoreOffer> GetRestoreOffer() = 0;
++
++  // `changed` runs when the offer appears, is answered, or lapses, and
++  // when an operation hides or reveals it (DataBackups::Observer).
++  virtual void SetRestoreOfferChangedCallback(
++      base::RepeatingClosure changed) = 0;
++
++  // The prompt's answer. `restore` false resolves the offer without
++  // restoring; `restore` true restores it (DataRestorer, kMerge). `done`
++  // runs with whether the user's data came back.
++  virtual void AnswerRestoreOffer(
++      bool restore,
++      base::OnceCallback<void(bool restored)> done) = 0;
++
++  // IsArcRunning(): Arc must be quit before sign-ins (cookies) come over;
++  // its cookie store stays open while it runs.
++  virtual bool IsArcRunning() = 0;
++
++  // An ArcQuitWatcher: `on_quit` runs once, when Arc is not running. If it
++  // already isn't, `on_quit` still runs, from a posted task, never from
++  // this call. Drop the returned wait to cancel it.
++  virtual std::unique_ptr<QuitWait> WatchArcQuit(
++      base::OnceClosure on_quit) = 0;
++};
++
++// The backend for `profile`: the fixture when --rac-arc-import-fixture
++// named a readable JSON file (dev builds only), else the real one.
++std::unique_ptr<ArcImportBackend> CreateArcImportBackend(Profile* profile);
++
++}  // namespace rac::onboarding
++
++#endif  // CHROME_BROWSER_UI_RAC_ONBOARDING_ARC_IMPORT_BACKEND_H_
+Index: src/chrome/browser/ui/rac/onboarding/arc_import_handler.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/onboarding/arc_import_handler.cc
+@@ -0,0 +1,407 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/onboarding/arc_import_handler.h"
++
++#include <string>
++#include <utility>
++
++#include "base/files/file_path.h"
++#include "base/functional/bind.h"
++#include "base/i18n/time_formatting.h"
++#include "base/types/expected.h"
++#include "chrome/browser/ui/rac/onboarding/arc_import_backend.h"
++#include "chrome/browser/ui/rac/onboarding/onboarding_window.h"
++#include "content/public/browser/web_ui.h"
++
++namespace rac::onboarding {
++
++namespace {
++
++// "Tuesday, November 3" and "Monday, October 26 at 9:14 PM", in the
++// user's locale.
++std::u16string Day(base::Time time) {
++  return base::LocalizedTimeFormatWithPattern(time, "EEEEMMMMd");
++}
++std::u16string DayAndTime(base::Time time) {
++  return base::LocalizedTimeFormatWithPattern(time, "EEEEMMMMdjmm");
++}
++
++base::ListValue StopsValue(std::string_view first, std::string_view second) {
++  base::ListValue pair;
++  pair.Append(std::string(first));
++  pair.Append(std::string(second));
++  return pair;
++}
++
++void SetLabel(base::DictValue& value, const ArcProfileLabel& label) {
++  value.Set("name", label.name);
++  static constexpr const char* kFallbacks[] = {"none", "default", "numbered"};
++  value.Set("nameFallback", kFallbacks[std::to_underlying(label.fallback)]);
++  value.Set("nameNumber", label.number);
++}
++
++}  // namespace
++
++ArcImportHandler::ArcImportHandler(Profile* profile)
++    : backend_(CreateArcImportBackend(profile)) {}
++
++ArcImportHandler::~ArcImportHandler() = default;
++
++void ArcImportHandler::RegisterMessages() {
++  const auto add = [this](const char* name, auto method) {
++    web_ui()->RegisterMessageCallback(
++        name, base::BindRepeating(method, base::Unretained(this)));
++  };
++  add("racArcImportGetState", &ArcImportHandler::HandleGetState);
++  add("racArcImportRead", &ArcImportHandler::HandleRead);
++  add("racArcImportStart", &ArcImportHandler::HandleStart);
++  add("racArcImportRetrySignIns", &ArcImportHandler::HandleRetrySignIns);
++  add("racArcImportUndo", &ArcImportHandler::HandleUndo);
++  add("racArcImportOpenProfile", &ArcImportHandler::HandleOpenProfile);
++  add("racArcImportIsRunning", &ArcImportHandler::HandleIsArcRunning);
++  add("racArcImportWatchQuit", &ArcImportHandler::HandleWatchArcQuit);
++  add("racRestoreGetOffer", &ArcImportHandler::HandleGetRestoreOffer);
++  add("racRestoreAnswer", &ArcImportHandler::HandleAnswerRestore);
++  add("racOnboardingClose", &ArcImportHandler::HandleClose);
++}
++
++void ArcImportHandler::OnJavascriptAllowed() {
++  backend_->SetRestoreOfferChangedCallback(
++      base::BindRepeating(&ArcImportHandler::OnRestoreOfferChanged,
++                          weak_factory_.GetWeakPtr()));
++}
++
++void ArcImportHandler::OnJavascriptDisallowed() {
++  backend_->SetRestoreOfferChangedCallback(base::RepeatingClosure());
++  weak_factory_.InvalidateWeakPtrs();
++  // A reload mid-import drops the finish callback; the backend still refuses
++  // a second import while the first runs.
++  importing_ = false;
++  quit_wait_.reset();
++}
++
++void ArcImportHandler::HandleGetState(const base::ListValue& args) {
++  AllowJavascript();
++  backend_->CheckSource(
++      base::BindOnce(&ArcImportHandler::OnSourceChecked,
++                     weak_factory_.GetWeakPtr(), args[0].Clone()));
++}
++
++void ArcImportHandler::OnSourceChecked(base::Value callback_id, bool found) {
++  backend_->GetImportState(base::BindOnce(
++      [](base::WeakPtr<ArcImportHandler> self, base::Value callback_id,
++         bool found, const ArcImportState& state) {
++        if (!self) {
++          return;
++        }
++        base::DictValue value;
++        value.Set("found", found);
++        value.Set("importedAt",
++                  state.last_import ? base::Value(Day(*state.last_import))
++                                    : base::Value());
++        value.Set("undoUntil",
++                  state.undo_until ? base::Value(Day(*state.undo_until))
++                                   : base::Value());
++        // For the Undo prompt's "Your sidebar goes back to how it was on…".
++        value.Set("undoSnapshot",
++                  state.undo_snapshot_time
++                      ? base::Value(DayAndTime(*state.undo_snapshot_time))
++                      : base::Value());
++        value.Set("signInsAvailable", self->backend_->SignInsAvailable());
++        self->ResolveJavascriptCallback(callback_id, std::move(value));
++      },
++      weak_factory_.GetWeakPtr(), std::move(callback_id), found));
++}
++
++void ArcImportHandler::HandleRead(const base::ListValue& args) {
++  AllowJavascript();
++  backend_->ReadPlan(base::BindOnce(&ArcImportHandler::OnRead,
++                                    weak_factory_.GetWeakPtr(),
++                                    args[0].Clone()));
++}
++
++void ArcImportHandler::OnRead(
++    base::Value callback_id,
++    base::expected<ImportPlan, ArcReadError> plan) {
++  base::DictValue reply;
++  if (!plan.has_value()) {
++    plan_.reset();
++    reply.Set("error", true);
++  } else {
++    reply.Set("preview", backend_->PlanToPreviewValue(*plan));
++    plan_ = std::move(*plan);
++  }
++  ResolveJavascriptCallback(callback_id, std::move(reply));
++}
++
++void ArcImportHandler::HandleStart(const base::ListValue& args) {
++  CHECK_EQ(2U, args.size());
++  AllowJavascript();
++  const base::DictValue* dict = args[1].GetIfDict();
++  if (!plan_ || importing_ || !dict) {
++    RejectJavascriptCallback(args[0], base::Value());
++    return;
++  }
++  ArcImportOptions options;
++  if (const base::ListValue* skipped = dict->FindList("skippedProfileKeys")) {
++    for (const base::Value& key : *skipped) {
++      if (key.is_string()) {
++        options.skipped_profile_keys.insert(key.GetString());
++      }
++    }
++  }
++  options.open_tabs = dict->FindBool("openTabs").value_or(true);
++  options.history = dict->FindBool("history").value_or(true);
++  options.sign_ins = backend_->SignInsAvailable() &&
++                     dict->FindBool("signIns").value_or(false);
++
++  importing_ = true;
++  created_profiles_.clear();
++  backend_->StartImport(
++      *plan_, options,
++      base::BindRepeating(&ArcImportHandler::OnProgress,
++                          weak_factory_.GetWeakPtr()),
++      base::BindOnce(&ArcImportHandler::OnFinished,
++                     weak_factory_.GetWeakPtr(), args[0].Clone()));
++}
++
++void ArcImportHandler::OnProgress(const ArcImportProgress& progress) {
++  static constexpr const char* kSteps[] = {"snapshot", "spaces", "history",
++                                           "signIns", "waitingForMac"};
++  base::DictValue value;
++  value.Set("step", kSteps[static_cast<size_t>(progress.step)]);
++  value.Set("done", progress.done);
++  value.Set("total", progress.total);
++  value.Set("spaceId", progress.space_id);
++  value.Set("spaceTitle", progress.space_title);
++  FireWebUIListener("rac-arc-import-progress", value);
++}
++
++void ArcImportHandler::OnFinished(base::Value callback_id,
++                                  const ArcImportResult& result) {
++  importing_ = false;
++  for (const ArcProfileResult& profile : result.profiles) {
++    if (profile.new_profile && !profile.profile_path.empty()) {
++      created_profiles_.insert(profile.profile_path.value());
++    }
++  }
++  ResolveJavascriptCallback(callback_id, ResultToValue(result));
++}
++
++void ArcImportHandler::HandleRetrySignIns(const base::ListValue& args) {
++  CHECK_EQ(1U, args.size());
++  AllowJavascript();
++  if (!backend_->SignInsAvailable() || importing_) {
++    RejectJavascriptCallback(args[0], base::Value());
++    return;
++  }
++  importing_ = true;
++  backend_->RetrySignIns(
++      base::BindRepeating(&ArcImportHandler::OnProgress,
++                          weak_factory_.GetWeakPtr()),
++      base::BindOnce(&ArcImportHandler::OnFinished,
++                     weak_factory_.GetWeakPtr(), args[0].Clone()));
++}
++
++ArcProfileLabel ArcImportHandler::LabelFor(const std::string& source_key,
++                                           size_t index) const {
++  if (plan_) {
++    for (size_t i = 0; i < plan_->profiles.size(); ++i) {
++      if (plan_->profiles[i].source_key == source_key) {
++        return ArcProfileLabelFor(*plan_, i);
++      }
++    }
++  }
++  ArcProfileLabel label;
++  label.fallback = ArcProfileLabel::Fallback::kNumbered;
++  label.number = static_cast<int>(index) + 2;
++  return label;
++}
++
++base::DictValue ArcImportHandler::ResultToValue(
++    const ArcImportResult& result) const {
++  static constexpr const char* kStatuses[] = {"done", "nothingNew", "failed"};
++  static constexpr const char* kFailures[] = {
++      "none",          "busy",          "snapshotFailed",
++      "recordTooNew",  "recordNotSaved", "profileGone"};
++
++  base::DictValue value;
++  value.Set("status", kStatuses[static_cast<size_t>(result.status)]);
++  value.Set("failure", kFailures[static_cast<size_t>(result.failure)]);
++
++  const ArcImportCounts& counts = result.counts;
++  value.Set("spaces", counts.spaces);
++  value.Set("pinnedTabs", counts.pinned_tabs);
++  value.Set("favorites", counts.favorites);
++  value.Set("openTabs", counts.open_tabs);
++  value.Set("folders", counts.folders);
++  value.Set("nestedFolders", counts.nested_folders);
++  value.Set("firstFlattenedName", counts.first_flattened_name);
++  value.Set("splitViews", counts.split_views);
++  value.Set("tabGroups", counts.tab_groups);
++  value.Set("invalidUrls", counts.invalid_urls);
++  value.Set("unsupportedUrls", counts.unsupported_urls);
++  value.Set("favoritesAlreadyThere", counts.favorites_already_there);
++  value.Set("alreadyImported", counts.already_imported);
++  value.Set("removedSince", counts.removed_since);
++  value.Set("openTabsNotReopened", counts.open_tabs_not_reopened);
++
++  // What the reader left out or couldn't read; the applier's rejected URLs
++  // join the damage line.
++  const ImportReport& report = plan_ ? plan_->report : ImportReport();
++  value.Set("skippedLiveFolders", report.skipped_live_folders);
++  value.Set("skippedEasels", report.skipped_easels);
++  value.Set("skippedNotes", report.skipped_notes);
++  value.Set("skippedUnknown", report.skipped_unknown);
++  value.Set("skippedTabsWithoutUrl", report.skipped_tabs_without_url);
++  value.Set("damaged", report.damage_total() + counts.invalid_urls);
++  value.Set("firstNestedFolderPath", report.first_nested_folder_path);
++
++  bool history_failed = false;
++  bool history_imported = false;
++  for (const ArcProfileResult& profile : result.profiles) {
++    switch (profile.history) {
++      case ArcProfileResult::History::kFailed:
++        history_failed = true;
++        break;
++      case ArcProfileResult::History::kImported:
++      case ArcProfileResult::History::kAlreadyImported:
++        history_imported = true;
++        break;
++      default:
++        break;
++    }
++  }
++  value.Set("history", history_failed    ? "failed"
++                       : history_imported ? "imported"
++                                          : "skipped");
++  // The sign-ins step (04 M2) isn't in this build.
++  value.Set("signIns", "notAvailable");
++  value.Set("passwords", "notOffered");
++  value.Set("pinnedExtensions", result.pinned_extensions);
++  value.Set("handoffsSaved", result.handoffs_saved);
++
++  base::ListValue new_profiles;
++  for (const ArcProfileResult& profile : result.profiles) {
++    if (!profile.new_profile ||
++        profile.status != ArcProfileResult::Status::kDone ||
++        profile.profile_path.empty()) {
++      continue;
++    }
++    base::DictValue created;
++    created.Set("key", profile.source_key);
++    SetLabel(created, LabelFor(profile.source_key, new_profiles.size()));
++    created.Set("spaces", profile.counts.spaces);
++    created.Set("path", profile.profile_path.value());
++    new_profiles.Append(std::move(created));
++  }
++  value.Set("newProfiles", std::move(new_profiles));
++  value.Set("undoUntil",
++            result.undo_until ? base::Value(Day(*result.undo_until))
++                              : base::Value());
++  return value;
++}
++
++void ArcImportHandler::HandleUndo(const base::ListValue& args) {
++  AllowJavascript();
++  backend_->UndoImport(base::BindOnce(
++      [](base::WeakPtr<ArcImportHandler> self, base::Value callback_id,
++         ArcUndoResult result) {
++        if (!self) {
++          return;
++        }
++        static constexpr const char* kResults[] = {
++            "undone",  "partlyUndone", "busy",
++            "expired", "nothingToUndo", "failed"};
++        self->ResolveJavascriptCallback(
++            callback_id, base::Value(kResults[static_cast<size_t>(result)]));
++      },
++      weak_factory_.GetWeakPtr(), args[0].Clone()));
++}
++
++void ArcImportHandler::HandleOpenProfile(const base::ListValue& args) {
++  AllowJavascript();
++  const std::string* path = args[0].GetIfString();
++  if (!path || !created_profiles_.contains(*path)) {
++    return;
++  }
++  backend_->OpenProfile(base::FilePath(*path),
++                        base::BindOnce([](bool) {}));
++}
++
++void ArcImportHandler::HandleIsArcRunning(const base::ListValue& args) {
++  AllowJavascript();
++  ResolveJavascriptCallback(args[0], base::Value(backend_->IsArcRunning()));
++}
++
++void ArcImportHandler::HandleWatchArcQuit(const base::ListValue& args) {
++  AllowJavascript();
++  // One watch at a time; a second request replaces the first.
++  quit_wait_ = backend_->WatchArcQuit(
++      base::BindOnce([](base::WeakPtr<ArcImportHandler> self) {
++        if (self) {
++          self->FireWebUIListener("rac-arc-quit");
++        }
++      }, weak_factory_.GetWeakPtr()));
++}
++
++base::Value ArcImportHandler::RestoreOfferToValue() const {
++  const std::optional<DataBackups::RestoreOffer> offer =
++      backend_->GetRestoreOffer();
++  if (!offer) {
++    return base::Value();
++  }
++  base::DictValue value;
++  value.Set("created", DayAndTime(offer->created));
++  base::DictValue counts;
++  counts.Set("spaces", static_cast<int>(offer->counts.spaces));
++  counts.Set("pinnedTabs", static_cast<int>(offer->counts.pinned_tabs));
++  counts.Set("favorites", static_cast<int>(offer->counts.favorites));
++  value.Set("counts", std::move(counts));
++  base::ListValue spaces;
++  for (const DataBackups::SpaceSummary& source : offer->spaces) {
++    base::DictValue space;
++    space.Set("name", source.name);
++    space.Set("emoji", source.emoji);
++    // SpaceSummary carries no dark stops: the prompt paints the same pair.
++    space.Set("light", StopsValue(source.color1, source.color2));
++    space.Set("dark", StopsValue(source.color1, source.color2));
++    spaces.Append(std::move(space));
++  }
++  value.Set("spaces", std::move(spaces));
++  return base::Value(std::move(value));
++}
++
++void ArcImportHandler::HandleGetRestoreOffer(const base::ListValue& args) {
++  AllowJavascript();
++  ResolveJavascriptCallback(args[0], RestoreOfferToValue());
++}
++
++void ArcImportHandler::OnRestoreOfferChanged() {
++  FireWebUIListener("rac-restore-offer-changed", RestoreOfferToValue());
++}
++
++void ArcImportHandler::HandleAnswerRestore(const base::ListValue& args) {
++  CHECK_EQ(2U, args.size());
++  AllowJavascript();
++  const bool restore = args[1].GetIfBool().value_or(false);
++  backend_->AnswerRestoreOffer(
++      restore,
++      base::BindOnce(
++          [](base::WeakPtr<ArcImportHandler> self, base::Value callback_id,
++             bool restored) {
++            if (self) {
++              self->ResolveJavascriptCallback(callback_id,
++                                              base::Value(restored));
++            }
++          },
++          weak_factory_.GetWeakPtr(), args[0].Clone()));
++}
++
++void ArcImportHandler::HandleClose(const base::ListValue& args) {
++  CloseWelcomeTour(web_ui()->GetWebContents());
++}
++
++}  // namespace rac::onboarding
+Index: src/chrome/browser/ui/rac/onboarding/arc_import_handler.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/onboarding/arc_import_handler.h
+@@ -0,0 +1,88 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_ONBOARDING_ARC_IMPORT_HANDLER_H_
++#define CHROME_BROWSER_UI_RAC_ONBOARDING_ARC_IMPORT_HANDLER_H_
++
++#include <memory>
++#include <optional>
++
++#include "base/containers/flat_set.h"
++#include "base/memory/weak_ptr.h"
++#include "base/types/expected.h"
++#include "base/values.h"
++#include "chrome/browser/rac/import/arc_import_mapping.h"
++#include "chrome/browser/rac/import/arc_import_types.h"
++#include "chrome/browser/rac/import/arc_reader.h"
++#include "chrome/browser/rac/import/import_plan.h"
++#include "chrome/browser/rac/storage/data_backups.h"
++#include "content/public/browser/web_ui_message_handler.h"
++
++class Profile;
++
++namespace rac::onboarding {
++
++class ArcImportBackend;
++
++// The page side of the Arc import and the restore prompt
++// (arc_import_proxy.ts). Every state-changing or file-touching call goes to
++// the page's ArcImportBackend: the real one, or the scripted fixture under
++// --rac-arc-import-fixture in dev builds. Added to chrome://setup and to
++// Settings, next to OnboardingHandler. It loads no AI code and makes no
++// network request: favorites are sent as letters, never as icons.
++class ArcImportHandler : public content::WebUIMessageHandler {
++ public:
++  explicit ArcImportHandler(Profile* profile);
++  ArcImportHandler(const ArcImportHandler&) = delete;
++  ArcImportHandler& operator=(const ArcImportHandler&) = delete;
++  ~ArcImportHandler() override;
++
++  // content::WebUIMessageHandler:
++  void RegisterMessages() override;
++  void OnJavascriptAllowed() override;
++  void OnJavascriptDisallowed() override;
++
++ private:
++  void HandleGetState(const base::ListValue& args);
++  void HandleRead(const base::ListValue& args);
++  void HandleStart(const base::ListValue& args);
++  void HandleRetrySignIns(const base::ListValue& args);
++  void HandleUndo(const base::ListValue& args);
++  void HandleOpenProfile(const base::ListValue& args);
++  void HandleIsArcRunning(const base::ListValue& args);
++  void HandleWatchArcQuit(const base::ListValue& args);
++  void HandleGetRestoreOffer(const base::ListValue& args);
++  void HandleAnswerRestore(const base::ListValue& args);
++  void HandleClose(const base::ListValue& args);
++
++  void OnSourceChecked(base::Value callback_id, bool found);
++  void OnRead(base::Value callback_id,
++              base::expected<ImportPlan, ArcReadError> plan);
++  void OnProgress(const ArcImportProgress& progress);
++  void OnFinished(base::Value callback_id, const ArcImportResult& result);
++  void OnRestoreOfferChanged();
++
++  // The result and the restore offer, as the page's dictionaries.
++  base::DictValue ResultToValue(const ArcImportResult& result) const;
++  base::Value RestoreOfferToValue() const;
++  // The label ArcProfileLabelFor gives the plan's profile `source_key`, or
++  // a `number`ed fallback at `index` when the plan doesn't have it.
++  ArcProfileLabel LabelFor(const std::string& source_key, size_t index) const;
++
++  const std::unique_ptr<ArcImportBackend> backend_;
++  // The plan the preview showed, so Import applies exactly that.
++  std::optional<ImportPlan> plan_;
++  bool importing_ = false;
++  // The profile paths the finished import created; OpenProfile refuses any
++  // other path.
++  base::flat_set<std::string> created_profiles_;
++  // While the sign-ins row waits on Arc quitting.
++  std::unique_ptr<ArcImportBackend::QuitWait> quit_wait_;
++
++  base::WeakPtrFactory<ArcImportHandler> weak_factory_{this};
++};
++
++}  // namespace rac::onboarding
++
++#endif  // CHROME_BROWSER_UI_RAC_ONBOARDING_ARC_IMPORT_HANDLER_H_
+Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
+@@ -0,0 +1,607 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.h"
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/files/file_path.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/memory/raw_ptr.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
++#include "base/timer/timer.h"
++#include "base/types/expected.h"
++
++namespace rac::onboarding {
++
++namespace {
++
++// Days or hours as numbers, so the script's dates stay fresh.
++base::Time DaysAgo(const base::DictValue& dict, std::string_view key) {
++  return base::Time::Now() -
++         base::Days(static_cast<int64_t>(dict.FindDouble(key).value_or(0)));
++}
++base::Time DaysAhead(const base::DictValue& dict, std::string_view key) {
++  return base::Time::Now() +
++         base::Days(static_cast<int64_t>(dict.FindDouble(key).value_or(0)));
++}
++base::Time HoursAgo(const base::DictValue& dict, std::string_view key) {
++  return base::Time::Now() -
++         base::Hours(static_cast<int64_t>(dict.FindDouble(key).value_or(0)));
++}
++
++std::optional<ArcImportProgress::Step> ParseStep(std::string_view step) {
++  static constexpr std::pair<std::string_view, ArcImportProgress::Step>
++      kSteps[] = {
++          {"snapshot", ArcImportProgress::Step::kSnapshot},
++          {"spaces", ArcImportProgress::Step::kSpaces},
++          {"history", ArcImportProgress::Step::kHistory},
++          {"signIns", ArcImportProgress::Step::kSignIns},
++          {"waitingForMac", ArcImportProgress::Step::kWaitingForMac},
++      };
++  for (const auto& [name, value] : kSteps) {
++    if (step == name) {
++      return value;
++    }
++  }
++  return std::nullopt;
++}
++
++ArcImportResult::Status ParseStatus(const std::string* status) {
++  if (status && *status == "nothingNew") {
++    return ArcImportResult::Status::kNothingNew;
++  }
++  if (status && *status == "failed") {
++    return ArcImportResult::Status::kFailed;
++  }
++  return ArcImportResult::Status::kDone;
++}
++
++ArcImportFailure ParseFailure(const std::string* failure) {
++  static constexpr std::pair<std::string_view, ArcImportFailure> kFailures[] =
++      {{"busy", ArcImportFailure::kBusy},
++       {"snapshotFailed", ArcImportFailure::kSnapshotFailed},
++       {"recordTooNew", ArcImportFailure::kRecordTooNew},
++       {"recordNotSaved", ArcImportFailure::kRecordNotSaved},
++       {"profileGone", ArcImportFailure::kProfileGone}};
++  if (failure) {
++    for (const auto& [name, value] : kFailures) {
++      if (*failure == name) {
++        return value;
++      }
++    }
++  }
++  return ArcImportFailure::kNone;
++}
++
++ArcProfileResult::Status ParseProfileStatus(const std::string* status) {
++  static constexpr std::pair<std::string_view, ArcProfileResult::Status>
++      kStatuses[] = {
++          {"done", ArcProfileResult::Status::kDone},
++          {"nothingNew", ArcProfileResult::Status::kNothingNew},
++          {"skipped", ArcProfileResult::Status::kSkipped},
++          {"needsProfile", ArcProfileResult::Status::kNeedsProfile},
++          {"failed", ArcProfileResult::Status::kFailed},
++      };
++  if (status) {
++    for (const auto& [name, value] : kStatuses) {
++      if (*status == name) {
++        return value;
++      }
++    }
++  }
++  return ArcProfileResult::Status::kDone;
++}
++
++ArcProfileResult::History ParseHistory(const std::string* history) {
++  static constexpr std::pair<std::string_view, ArcProfileResult::History>
++      kValues[] = {
++          {"notRequested", ArcProfileResult::History::kNotRequested},
++          {"imported", ArcProfileResult::History::kImported},
++          {"alreadyImported", ArcProfileResult::History::kAlreadyImported},
++          {"notAvailable", ArcProfileResult::History::kNotAvailable},
++          {"failed", ArcProfileResult::History::kFailed},
++      };
++  if (history) {
++    for (const auto& [name, value] : kValues) {
++      if (*history == name) {
++        return value;
++      }
++    }
++  }
++  return ArcProfileResult::History::kNotRequested;
++}
++
++ArcUndoResult ParseUndoResult(const std::string* result) {
++  static constexpr std::pair<std::string_view, ArcUndoResult> kResults[] = {
++      {"undone", ArcUndoResult::kUndone},
++      {"partlyUndone", ArcUndoResult::kPartlyUndone},
++      {"busy", ArcUndoResult::kBusy},
++      {"expired", ArcUndoResult::kExpired},
++      {"nothingToUndo", ArcUndoResult::kNothingToUndo},
++      {"failed", ArcUndoResult::kFailed},
++  };
++  if (result) {
++    for (const auto& [name, value] : kResults) {
++      if (*result == name) {
++        return value;
++      }
++    }
++  }
++  return ArcUndoResult::kUndone;
++}
++
++int IntAt(const base::DictValue& dict, std::string_view key) {
++  return static_cast<int>(dict.FindDouble(key).value_or(0));
++}
++
++void CountsFromJson(const base::DictValue& json, ArcImportCounts& counts) {
++  counts.spaces = IntAt(json, "spaces");
++  counts.pinned_tabs = IntAt(json, "pinnedTabs");
++  counts.folders = IntAt(json, "folders");
++  counts.favorites = IntAt(json, "favorites");
++  counts.open_tabs = IntAt(json, "openTabs");
++  counts.nested_folders = IntAt(json, "nestedFolders");
++  if (const std::string* name = json.FindString("firstFlattenedName")) {
++    counts.first_flattened_name = *name;
++  }
++  counts.split_views = IntAt(json, "splitViews");
++  counts.tab_groups = IntAt(json, "tabGroups");
++  counts.invalid_urls = IntAt(json, "invalidUrls");
++  counts.unsupported_urls = IntAt(json, "unsupportedUrls");
++  counts.favorites_already_there = IntAt(json, "favoritesAlreadyThere");
++  counts.already_imported = IntAt(json, "alreadyImported");
++  counts.removed_since = IntAt(json, "removedSince");
++  counts.open_tabs_not_reopened = IntAt(json, "openTabsNotReopened");
++}
++
++// The page dict's preview becomes a real plan's skeleton: the result's
++// profile names resolve against it, and the report feeds the result's
++// skip and damage lines.
++ImportPlan PlanFromScript(const base::DictValue& preview,
++                          const base::DictValue* report) {
++  ImportPlan plan;
++  if (const base::ListValue* profiles = preview.FindList("profiles")) {
++    for (const base::Value& entry : *profiles) {
++      const base::DictValue* dict = entry.GetIfDict();
++      if (!dict) {
++        continue;
++      }
++      ImportProfile profile;
++      if (const std::string* key = dict->FindString("key")) {
++        profile.source_key = *key;
++      }
++      if (const std::string* name = dict->FindString("name")) {
++        profile.display_name = *name;
++      }
++      profile.is_default = dict->FindBool("isDefault").value_or(false);
++      plan.profiles.push_back(std::move(profile));
++    }
++  }
++  if (report) {
++    ImportReport& out = plan.report;
++    out.skipped_live_folders = IntAt(*report, "skippedLiveFolders");
++    out.skipped_easels = IntAt(*report, "skippedEasels");
++    out.skipped_notes = IntAt(*report, "skippedNotes");
++    out.skipped_unknown = IntAt(*report, "skippedUnknown");
++    out.skipped_tabs_without_url = IntAt(*report, "skippedTabsWithoutUrl");
++    out.missing_items = IntAt(*report, "missingItems");
++    out.repeated_items = IntAt(*report, "repeatedItems");
++    out.too_deep = IntAt(*report, "tooDeep");
++    out.malformed_entries = IntAt(*report, "malformedEntries");
++    out.invalid_urls = IntAt(*report, "invalidUrls");
++    out.open_tabs = IntAt(*report, "openTabs");
++    if (const std::string* path = report->FindString("firstNestedFolderPath")) {
++      out.first_nested_folder_path = *path;
++    }
++  }
++  return plan;
++}
++
++ArcImportResult ResultFromScript(const base::DictValue& json) {
++  ArcImportResult result;
++  result.status = ParseStatus(json.FindString("status"));
++  result.failure = ParseFailure(json.FindString("failure"));
++  CountsFromJson(json, result.counts);
++  result.handoffs_saved = json.FindBool("handoffsSaved").value_or(false);
++  result.pinned_extensions = IntAt(json, "pinnedExtensions");
++  if (json.FindDouble("undoUntilDays")) {
++    result.undo_until = DaysAhead(json, "undoUntilDays");
++  }
++  const std::string* history = json.FindString("history");
++  if (const base::ListValue* profiles = json.FindList("profiles")) {
++    for (const base::Value& entry : *profiles) {
++      const base::DictValue* dict = entry.GetIfDict();
++      if (!dict) {
++        continue;
++      }
++      ArcProfileResult profile;
++      if (const std::string* key = dict->FindString("key")) {
++        profile.source_key = *key;
++      }
++      profile.status = ParseProfileStatus(dict->FindString("status"));
++      profile.failure = ParseFailure(dict->FindString("failure"));
++      profile.new_profile = dict->FindBool("newProfile").value_or(false);
++      if (const std::string* path = dict->FindString("path")) {
++        profile.profile_path = base::FilePath(*path);
++      }
++      CountsFromJson(*dict, profile.counts);
++      profile.history =
++          ParseHistory(dict->FindString("history") ? dict->FindString("history")
++                                                 : history);
++      if (dict->FindDouble("undoUntilDays")) {
++        profile.undo_until = DaysAhead(*dict, "undoUntilDays");
++      }
++      profile.pinned_extensions = IntAt(*dict, "pinnedExtensions");
++      result.profiles.push_back(profile);
++    }
++  } else if (history) {
++    // No per-profile rows: history still applies to the import as a whole.
++    ArcProfileResult profile;
++    profile.status = ArcProfileResult::Status::kDone;
++    profile.history = ParseHistory(history);
++    result.profiles.push_back(profile);
++  }
++  return result;
++}
++
++ArcImportState StateFromScript(const base::DictValue& state) {
++  ArcImportState out;
++  if (state.FindDouble("importedDaysAgo")) {
++    out.last_import = DaysAgo(state, "importedDaysAgo");
++  }
++  if (state.FindDouble("undoUntilDays")) {
++    out.undo_until = DaysAhead(state, "undoUntilDays");
++    out.undo_snapshot_time = state.FindDouble("undoSnapshotHoursAgo")
++                                 ? HoursAgo(state, "undoSnapshotHoursAgo")
++                                 : out.undo_until;
++  }
++  return out;
++}
++
++std::optional<DataBackups::RestoreOffer> OfferFromScript(
++    const base::DictValue* offer) {
++  if (!offer) {
++    return std::nullopt;
++  }
++  DataBackups::RestoreOffer out;
++  out.backup_id = "fixture";
++  out.created = offer->FindDouble("createdHoursAgo")
++                    ? HoursAgo(*offer, "createdHoursAgo")
++                    : base::Time::Now();
++  out.detected = out.created;
++  if (const base::DictValue* counts = offer->FindDict("counts")) {
++    out.counts.spaces = static_cast<size_t>(IntAt(*counts, "spaces"));
++    out.counts.pinned_tabs = static_cast<size_t>(IntAt(*counts, "pinnedTabs"));
++    out.counts.favorites = static_cast<size_t>(IntAt(*counts, "favorites"));
++  }
++  if (const base::ListValue* spaces = offer->FindList("spaces")) {
++    for (const base::Value& entry : *spaces) {
++      const base::DictValue* dict = entry.GetIfDict();
++      if (!dict) {
++        continue;
++      }
++      DataBackups::SpaceSummary space;
++      if (const std::string* name = dict->FindString("name")) {
++        space.name = *name;
++      }
++      if (const std::string* emoji = dict->FindString("emoji")) {
++        space.emoji = *emoji;
++      }
++      if (const base::ListValue* light = dict->FindList("light")) {
++        if (light->size() >= 2 && (*light)[0].is_string() &&
++            (*light)[1].is_string()) {
++          space.color1 = (*light)[0].GetString();
++          space.color2 = (*light)[1].GetString();
++        }
++      }
++      out.spaces.push_back(std::move(space));
++    }
++  }
++  return out;
++}
++
++// A QuitWait on a timer, or one that never fires (Arc running, no scripted
++// quit), or one that runs from a posted task (Arc not running). Like
++// ArcQuitWatcher: destroyed to cancel, `on_quit` never from the constructor.
++class FixtureQuitWait : public ArcImportBackend::QuitWait {
++ public:
++  // `delay` nullopt: never fires.
++  FixtureQuitWait(FixtureArcImportBackend* backend,
++                  std::optional<base::TimeDelta> delay,
++                  base::OnceClosure on_quit)
++      : backend_(backend), on_quit_(std::move(on_quit)) {
++    if (delay) {
++      timer_.Start(FROM_HERE, *delay,
++                   base::BindOnce(&FixtureQuitWait::Run,
++                                  base::Unretained(this)));
++    }
++  }
++
++ private:
++  void Run() {
++    backend_->SetArcNotRunning();
++    if (on_quit_) {
++      std::move(on_quit_).Run();
++    }
++  }
++
++  const raw_ptr<FixtureArcImportBackend> backend_;
++  base::OnceClosure on_quit_;
++  base::OneShotTimer timer_;
++};
++
++}  // namespace
++
++FixtureArcImportBackend::FixtureArcImportBackend(base::DictValue script)
++    : script_(std::move(script)),
++      preview_(script_.FindDict("preview") ? script_.FindDict("preview")->Clone()
++                                           : base::DictValue()),
++      plan_(PlanFromScript(preview_, script_.FindDict("report"))) {
++  const base::DictValue* state = script_.FindDict("state");
++  found_ = state ? state->FindBool("found").value_or(true) : true;
++  sign_ins_available_ =
++      state ? state->FindBool("signInsAvailable").value_or(false) : false;
++  state_ = state ? StateFromScript(*state) : ArcImportState();
++  read_error_ = script_.FindBool("readError").value_or(false);
++  arc_running_ = script_.FindBool("arcRunning").value_or(false);
++  const std::optional<double> quit_after = script_.FindDouble("arcQuitAfterMs");
++  arc_quit_after_set_ = quit_after.has_value();
++  arc_quit_after_ =
++      base::Milliseconds(static_cast<int64_t>(quit_after.value_or(0)));
++  read_delay_ = base::Milliseconds(
++      static_cast<int64_t>(script_.FindDouble("readDelayMs").value_or(30)));
++  progress_interval_ = base::Milliseconds(static_cast<int64_t>(
++      script_.FindDouble("progressIntervalMs").value_or(150)));
++  offer_ = OfferFromScript(script_.FindDict("restoreOffer"));
++  undo_result_ = ParseUndoResult(script_.FindString("undoResult"));
++  result_ = script_.FindDict("result")
++                ? ResultFromScript(*script_.FindDict("result"))
++                : ArcImportResult();
++}
++
++FixtureArcImportBackend::~FixtureArcImportBackend() = default;
++
++void FixtureArcImportBackend::CheckSource(
++    base::OnceCallback<void(bool exists)> done) {
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(std::move(done), found_));
++}
++
++void FixtureArcImportBackend::ReadPlan(
++    base::OnceCallback<void(base::expected<ImportPlan, ArcReadError>)> done) {
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(
++          [](base::WeakPtr<FixtureArcImportBackend> self,
++             base::OnceCallback<void(
++                 base::expected<ImportPlan, ArcReadError>)> done) {
++            if (!self) {
++              return;
++            }
++            if (self->read_error_) {
++              std::move(done).Run(
++                  base::unexpected(ArcReadError::kUnreadable));
++            } else {
++              std::move(done).Run(base::ok(self->plan_));
++            }
++          },
++          weak_factory_.GetWeakPtr(), std::move(done)),
++      read_delay_);
++}
++
++base::DictValue FixtureArcImportBackend::PlanToPreviewValue(
++    const ImportPlan& plan) {
++  // The script's preview is already the page's dictionary.
++  return preview_.Clone();
++}
++
++void FixtureArcImportBackend::GetImportState(
++    base::OnceCallback<void(const ArcImportState&)> done) {
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(std::move(done), state_));
++}
++
++bool FixtureArcImportBackend::SignInsAvailable() const {
++  return sign_ins_available_;
++}
++
++std::vector<ArcImportProgress> FixtureArcImportBackend::ProgressEvents(
++    const ArcImportOptions& options) const {
++  std::vector<ArcImportProgress> events;
++  if (const base::ListValue* scripted = script_.FindList("progress")) {
++    for (const base::Value& entry : *scripted) {
++      const base::DictValue* dict = entry.GetIfDict();
++      const std::string* step_name =
++          dict ? dict->FindString("step") : nullptr;
++      std::optional<ArcImportProgress::Step> step =
++          step_name ? ParseStep(*step_name) : std::nullopt;
++      if (!step) {
++        continue;
++      }
++      ArcImportProgress progress;
++      progress.step = *step;
++      progress.done = IntAt(*dict, "done");
++      progress.total = IntAt(*dict, "total");
++      if (const std::string* id = dict->FindString("spaceId")) {
++        progress.space_id = *id;
++      }
++      if (const std::string* title = dict->FindString("spaceTitle")) {
++        progress.space_title = *title;
++      }
++      events.push_back(std::move(progress));
++    }
++    return events;
++  }
++
++  ArcImportProgress snapshot;
++  snapshot.step = ArcImportProgress::Step::kSnapshot;
++  events.push_back(snapshot);
++
++  // One kSpaces per space of every checked profile, in preview order.
++  const auto is_checked = [&options](const base::DictValue* profile) {
++    const std::string* key = profile ? profile->FindString("key") : nullptr;
++    return key && !options.skipped_profile_keys.contains(*key);
++  };
++  int total = 0;
++  if (const base::ListValue* profiles = preview_.FindList("profiles")) {
++    for (const base::Value& entry : *profiles) {
++      const base::DictValue* profile = entry.GetIfDict();
++      if (!is_checked(profile)) {
++        continue;
++      }
++      if (const base::ListValue* spaces = profile->FindList("spaces")) {
++        total += static_cast<int>(spaces->size());
++      }
++    }
++    int done = 0;
++    for (const base::Value& entry : *profiles) {
++      const base::DictValue* profile = entry.GetIfDict();
++      if (!is_checked(profile)) {
++        continue;
++      }
++      const base::ListValue* spaces = profile->FindList("spaces");
++      if (!spaces) {
++        continue;
++      }
++      for (const base::Value& space_entry : *spaces) {
++        const base::DictValue* space = space_entry.GetIfDict();
++        if (!space) {
++          continue;
++        }
++        ArcImportProgress progress;
++        progress.step = ArcImportProgress::Step::kSpaces;
++        progress.done = ++done;
++        progress.total = total;
++        if (const std::string* id = space->FindString("id")) {
++          progress.space_id = *id;
++        }
++        if (const std::string* title = space->FindString("title")) {
++          progress.space_title = *title;
++        }
++        events.push_back(std::move(progress));
++      }
++    }
++  }
++  if (options.history) {
++    ArcImportProgress history;
++    history.step = ArcImportProgress::Step::kHistory;
++    events.push_back(history);
++  }
++  return events;
++}
++
++void FixtureArcImportBackend::StartImport(
++    ImportPlan plan,
++    ArcImportOptions options,
++    ArcImportProgressCallback progress,
++    ArcImportDoneCallback done) {
++  pending_ = ProgressEvents(options);
++  next_event_ = 0;
++  progress_ = std::move(progress);
++  done_ = std::move(done);
++  SendNextProgress();
++}
++
++void FixtureArcImportBackend::RetrySignIns(
++    ArcImportProgressCallback progress,
++    ArcImportDoneCallback done) {
++  ArcImportProgress event;
++  event.step = ArcImportProgress::Step::kSignIns;
++  pending_.assign(1, std::move(event));
++  next_event_ = 0;
++  progress_ = std::move(progress);
++  done_ = std::move(done);
++  SendNextProgress();
++}
++
++void FixtureArcImportBackend::SendNextProgress() {
++  if (next_event_ >= pending_.size()) {
++    ArcImportDoneCallback done = std::move(done_);
++    progress_.Reset();
++    timer_.Stop();
++    std::move(done).Run(result_);
++    return;
++  }
++  progress_.Run(pending_[next_event_++]);
++  timer_.Start(FROM_HERE, progress_interval_, this,
++               &FixtureArcImportBackend::SendNextProgress);
++}
++
++void FixtureArcImportBackend::UndoImport(
++    base::OnceCallback<void(ArcUndoResult)> done) {
++  if (undo_result_ == ArcUndoResult::kUndone ||
++      undo_result_ == ArcUndoResult::kPartlyUndone) {
++    state_.undo_until.reset();
++    state_.undo_snapshot_time.reset();
++  }
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE, base::BindOnce(std::move(done), undo_result_),
++      progress_interval_ * 2);
++}
++
++void FixtureArcImportBackend::OpenProfile(
++    const base::FilePath& profile_path,
++    base::OnceCallback<void(bool)> done) {
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(std::move(done), true));
++}
++
++std::optional<DataBackups::RestoreOffer>
++FixtureArcImportBackend::GetRestoreOffer() {
++  return offer_;
++}
++
++void FixtureArcImportBackend::SetRestoreOfferChangedCallback(
++    base::RepeatingClosure changed) {
++  offer_changed_ = std::move(changed);
++  // A real offer arrives after startup; the scripted one announces itself
++  // once, shortly after the page starts listening.
++  if (offer_ && !offer_announced_) {
++    offer_announced_ = true;
++    base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(&FixtureArcImportBackend::FireOfferChanged,
++                       weak_factory_.GetWeakPtr()),
++        progress_interval_);
++  }
++}
++
++void FixtureArcImportBackend::FireOfferChanged() {
++  if (offer_changed_) {
++    offer_changed_.Run();
++  }
++}
++
++void FixtureArcImportBackend::AnswerRestoreOffer(
++    bool restore,
++    base::OnceCallback<void(bool restored)> done) {
++  offer_.reset();
++  FireOfferChanged();
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE, base::BindOnce(std::move(done), restore),
++      progress_interval_ * 2);
++}
++
++bool FixtureArcImportBackend::IsArcRunning() {
++  return arc_running_;
++}
++
++std::unique_ptr<ArcImportBackend::QuitWait>
++FixtureArcImportBackend::WatchArcQuit(base::OnceClosure on_quit) {
++  std::optional<base::TimeDelta> delay;
++  if (!arc_running_) {
++    delay.emplace(base::Milliseconds(0));
++  } else if (arc_quit_after_set_) {
++    delay = arc_quit_after_;
++  }
++  return std::make_unique<FixtureQuitWait>(this, delay, std::move(on_quit));
++}
++
++}  // namespace rac::onboarding
+Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.h
+@@ -0,0 +1,102 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_ONBOARDING_FIXTURE_ARC_IMPORT_BACKEND_H_
++#define CHROME_BROWSER_UI_RAC_ONBOARDING_FIXTURE_ARC_IMPORT_BACKEND_H_
++
++#include <optional>
++#include <vector>
++
++#include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
++#include "base/values.h"
++#include "chrome/browser/ui/rac/onboarding/arc_import_backend.h"
++
++namespace rac::onboarding {
++
++// Replays a scripted Arc import for the screens' development, from the JSON
++// file --rac-arc-import-fixture points at (in the shape of
++// .scratch/mocks/fixture.js; see arc_import_backend.cc for the fields).
++// Progress events are sent on a timer, so the progress state can be filmed.
++// Compiled out of release builds with the rest of the dev switches.
++class FixtureArcImportBackend : public ArcImportBackend {
++ public:
++  explicit FixtureArcImportBackend(base::DictValue script);
++  FixtureArcImportBackend(const FixtureArcImportBackend&) = delete;
++  FixtureArcImportBackend& operator=(const FixtureArcImportBackend&) = delete;
++  ~FixtureArcImportBackend() override;
++
++  // ArcImportBackend:
++  void CheckSource(base::OnceCallback<void(bool exists)> done) override;
++  void ReadPlan(
++      base::OnceCallback<void(base::expected<ImportPlan, ArcReadError>)> done)
++      override;
++  base::DictValue PlanToPreviewValue(const ImportPlan& plan) override;
++  void GetImportState(
++      base::OnceCallback<void(const ArcImportState&)> done) override;
++  bool SignInsAvailable() const override;
++  void StartImport(ImportPlan plan,
++                   ArcImportOptions options,
++                   ArcImportProgressCallback progress,
++                   ArcImportDoneCallback done) override;
++  void RetrySignIns(ArcImportProgressCallback progress,
++                    ArcImportDoneCallback done) override;
++  void UndoImport(base::OnceCallback<void(ArcUndoResult)> done) override;
++  void OpenProfile(const base::FilePath& profile_path,
++                   base::OnceCallback<void(bool)> done) override;
++  std::optional<DataBackups::RestoreOffer> GetRestoreOffer() override;
++  void SetRestoreOfferChangedCallback(
++      base::RepeatingClosure changed) override;
++  void AnswerRestoreOffer(bool restore,
++                          base::OnceCallback<void(bool restored)> done)
++      override;
++  bool IsArcRunning() override;
++  std::unique_ptr<QuitWait> WatchArcQuit(base::OnceClosure on_quit) override;
++
++  // A scripted quit leaves Arc not running for later IsArcRunning() calls.
++  void SetArcNotRunning() { arc_running_ = false; }
++
++ private:
++  // The events StartImport() will send: the script's `progress` list if it
++  // has one, else a snapshot step, one kSpaces per space of every profile
++  // `options` leaves checked, and a history step when `options.history`.
++  std::vector<ArcImportProgress> ProgressEvents(
++      const ArcImportOptions& options) const;
++  void SendNextProgress();
++  void FireOfferChanged();
++
++  const base::DictValue script_;
++  const base::DictValue preview_;
++  // The synthesized plan ReadPlan() returns: profile keys, names, and the
++  // import report, so the handler's result fields work like the real path.
++  ImportPlan plan_;
++
++  bool found_;
++  bool sign_ins_available_;
++  bool read_error_;
++  bool arc_running_;
++  bool arc_quit_after_set_;
++  base::TimeDelta read_delay_;
++  base::TimeDelta progress_interval_;
++  base::TimeDelta arc_quit_after_;
++  ArcImportState state_;
++  std::optional<DataBackups::RestoreOffer> offer_;
++  ArcImportResult result_;
++  ArcUndoResult undo_result_;
++
++  // The in-flight import or retry.
++  std::vector<ArcImportProgress> pending_;
++  size_t next_event_ = 0;
++  ArcImportProgressCallback progress_;
++  ArcImportDoneCallback done_;
++  base::OneShotTimer timer_;
++
++  base::RepeatingClosure offer_changed_;
++  bool offer_announced_ = false;
++  base::WeakPtrFactory<FixtureArcImportBackend> weak_factory_{this};
++};
++
++}  // namespace rac::onboarding
++
++#endif  // CHROME_BROWSER_UI_RAC_ONBOARDING_FIXTURE_ARC_IMPORT_BACKEND_H_
+Index: src/chrome/browser/ui/rac/onboarding/onboarding_window.h
+===================================================================
+--- src.orig/chrome/browser/ui/rac/onboarding/onboarding_window.h
++++ src/chrome/browser/ui/rac/onboarding/onboarding_window.h
+@@ -43,6 +43,11 @@ void ShowWelcomeTourAtLaunch(Profile* pr
+ bool FinishWelcomeTour(content::WebContents* web_contents,
+                        bool open_assistant_settings);
+ 
++// Closes the tour window when `web_contents` is its page, without marking
++// the tour done: the standalone Arc step and restore prompt finish with it.
++// Returns false when the page runs in an ordinary tab.
++bool CloseWelcomeTour(content::WebContents* web_contents);
++
+ }  // namespace rac::onboarding
+ 
+ #endif  // CHROME_BROWSER_UI_RAC_ONBOARDING_ONBOARDING_WINDOW_H_
+Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
+@@ -0,0 +1,384 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/onboarding/real_arc_import_backend.h"
++
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/i18n/case_conversion.h"
++#include "base/location.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "base/time/time.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/profiles/profile_window.h"
++#include "chrome/browser/rac/import/arc_import_mapping.h"
++#include "chrome/browser/rac/import/arc_import_record.h"
++#include "chrome/browser/rac/import/arc_source_root.h"
++#include "chrome/browser/rac/spaces/spaces_service.h"
++#include "chrome/browser/rac/spaces/spaces_service_factory.h"
++#include "chrome/browser/rac/storage/data_backups_factory.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/grit/generated_resources.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "url/gurl.h"
++
++namespace rac::onboarding {
++
++namespace {
++
++// The name the sidebar shows an imported space: Arc's title, or rac's own
++// "Space <position>" fallback when Arc had none. Forwards to Data's
++// ImportedSpaceTitle(space, position) when arc_importer.h lands.
++std::u16string ImportedSpaceTitle(const ImportSpace& space, size_t position) {
++  const std::string name = ImportedSpaceName(space);
++  if (!name.empty()) {
++    return base::UTF8ToUTF16(name);
++  }
++  return l10n_util::GetStringFUTF16(IDS_RAC_SPACE_FALLBACK_NAME,
++                                    base::NumberToString16(position));
++}
++
++base::ListValue StopsValue(std::string_view first, std::string_view second) {
++  base::ListValue pair;
++  pair.Append(std::string(first));
++  pair.Append(std::string(second));
++  return pair;
++}
++
++// A favorite's tile letter: the custom name's first letter, else the page
++// title's, else the host's. Never an icon, so nothing is read or fetched for
++// the preview.
++std::string Letter(const ImportItem& item) {
++  std::u16string text =
++      base::UTF8ToUTF16(!item.title.empty()     ? item.title
++                        : !item.page_title.empty() ? item.page_title
++                                                   : GURL(item.url).host());
++  if (text.empty()) {
++    return "·";
++  }
++  return base::UTF16ToUTF8(base::i18n::ToUpper(text.substr(0, 1)));
++}
++
++// Tabs count wherever they sit; split views and tab groups aren't folders
++// to the user, since they arrive as plain tabs.
++void Count(const std::vector<ImportItem>& items, int& tabs, int& folders) {
++  for (const ImportItem& item : items) {
++    if (item.kind == ImportItem::Kind::kTab) {
++      ++tabs;
++      continue;
++    }
++    if (item.group == ImportItem::Group::kNone) {
++      ++folders;
++    }
++    Count(item.children, tabs, folders);
++  }
++}
++
++// GetArcImportState()'s file work: reads the import record on a MayBlock
++// sequence. Until Data's applier owns this, a corrupt or too-new record
++// reads as "never imported" — no import could have run anyway.
++ArcImportState ReadImportState(const base::FilePath& profile_dir) {
++  ArcImportState state;
++  ArcImportRecord::ReadResult read = ArcImportRecord::Read(profile_dir);
++  if (read.status != ArcImportRecord::ReadStatus::kOk) {
++    return state;
++  }
++  if (!read.record.last_import.is_null()) {
++    state.last_import = read.record.last_import;
++  }
++  if (const ArcImportRecord::Run* run =
++          read.record.UndoableRun(base::Time::Now())) {
++    state.undo_until = run->undo_until;
++    state.undo_snapshot_time = run->snapshot_time;
++  }
++  return state;
++}
++
++// A QuitWait for a build without the Arc-quit watcher: Arc can't be running
++// for sign-ins purposes yet, so `on_quit` runs from a posted task, matching
++// ArcQuitWatcher's contract for an app that isn't running.
++class PostedQuitWait : public ArcImportBackend::QuitWait {
++ public:
++  explicit PostedQuitWait(base::OnceClosure on_quit)
++      : on_quit_(std::move(on_quit)) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&PostedQuitWait::Run,
++                                  weak_factory_.GetWeakPtr()));
++  }
++
++ private:
++  void Run() {
++    if (on_quit_) {
++      std::move(on_quit_).Run();
++    }
++  }
++
++  base::OnceClosure on_quit_;
++  base::WeakPtrFactory<PostedQuitWait> weak_factory_{this};
++};
++
++}  // namespace
++
++RealArcImportBackend::RealArcImportBackend(Profile* profile)
++    : profile_(profile) {
++  if (DataBackups* service = backups()) {
++    backups_observation_.Observe(service);
++  }
++}
++
++RealArcImportBackend::~RealArcImportBackend() = default;
++
++DataBackups* RealArcImportBackend::backups() {
++  return DataBackupsFactory::GetForProfile(profile_);
++}
++
++void RealArcImportBackend::CheckSource(
++    base::OnceCallback<void(bool exists)> done) {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&ArcSourceExists, GetArcSourcePaths()),
++      std::move(done));
++}
++
++void RealArcImportBackend::ReadPlan(
++    base::OnceCallback<void(base::expected<ImportPlan, ArcReadError>)> done) {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&ReadArc, GetArcSourcePaths(), ArcReadLimits()),
++      std::move(done));
++}
++
++size_t RealArcImportBackend::SpacePositionBase(
++    const ImportProfile& source) const {
++  if (!source.is_default) {
++    // A checked non-default profile becomes a new rac profile, where the
++    // import replaces the blank space: positions start at 1.
++    return 0;
++  }
++  SpacesService* spaces = SpacesServiceFactory::GetForProfile(profile_);
++  if (!spaces) {
++    return 0;
++  }
++  const std::vector<Space>& existing = spaces->spaces();
++  // The import replaces the one unnamed space of a fresh profile, so the
++  // first imported space is still "Space 1".
++  if (existing.size() == 1 && existing.front().name.empty() &&
++      existing.front().icon.empty()) {
++    return 0;
++  }
++  return existing.size();
++}
++
++base::DictValue RealArcImportBackend::PlanToPreviewValue(
++    const ImportPlan& plan) {
++  base::ListValue profiles;
++  for (size_t i = 0; i < plan.profiles.size(); ++i) {
++    const ImportProfile& source = plan.profiles[i];
++    base::DictValue profile;
++    profile.Set("key", source.source_key);
++    // The label's fallback is data, not a settled string: the page writes
++    // the "Your Arc profile" / "Arc profile N" copy.
++    const ArcProfileLabel label = ArcProfileLabelFor(plan, i);
++    profile.Set("name", label.name);
++    static constexpr const char* kFallbacks[] = {"none", "default",
++                                                 "numbered"};
++    profile.Set("nameFallback", kFallbacks[std::to_underlying(label.fallback)]);
++    profile.Set("nameNumber", label.number);
++    profile.Set("isDefault", source.is_default);
++
++    base::ListValue favorites;
++    for (const ImportItem& item : source.favorites) {
++      base::DictValue favorite;
++      favorite.Set("letter", Letter(item));
++      favorite.Set("title",
++                   !item.title.empty() ? item.title : item.page_title);
++      favorites.Append(std::move(favorite));
++    }
++    profile.Set("favorites", std::move(favorites));
++
++    base::ListValue spaces;
++    const size_t base_position = SpacePositionBase(source);
++    for (size_t j = 0; j < source.spaces.size(); ++j) {
++      const ImportSpace& source_space = source.spaces[j];
++      base::DictValue space;
++      space.Set("id", source_space.source_id);
++      space.Set("title",
++                ImportedSpaceTitle(source_space, base_position + j + 1));
++      space.Set("emoji", source_space.emoji);
++      // The applier's own mapping, so the tile is the space's real color.
++      const SpaceTheme theme = ToSpaceTheme(source_space.theme);
++      space.Set("light", StopsValue(theme.color1, theme.color2));
++      // Arc's dark stops ride in unknown_fields; a single-look theme shows
++      // its light stops (or the matching preset's dark pair) in dark mode.
++      const std::string* dark1 =
++          theme.unknown_fields.FindString(kDarkStop1Key);
++      const std::string* dark2 =
++          theme.unknown_fields.FindString(kDarkStop2Key);
++      if (dark1 && dark2) {
++        space.Set("dark", StopsValue(*dark1, *dark2));
++      } else {
++        const auto [first, second] = theme.GetStops(/*dark=*/true);
++        space.Set("dark", StopsValue(first, second));
++      }
++      int pinned = 0;
++      int folders = 0;
++      int open = 0;
++      int ignored = 0;
++      Count(source_space.pinned, pinned, folders);
++      Count(source_space.open_tabs, open, ignored);
++      space.Set("pinned", pinned);
++      space.Set("folders", folders);
++      space.Set("openTabs", open);
++      spaces.Append(std::move(space));
++    }
++    profile.Set("spaces", std::move(spaces));
++    profiles.Append(std::move(profile));
++  }
++  base::DictValue preview;
++  preview.Set("profiles", std::move(profiles));
++  preview.Set("openTabs", plan.report.open_tabs);
++  return preview;
++}
++
++void RealArcImportBackend::GetImportState(
++    base::OnceCallback<void(const ArcImportState&)> done) {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&ReadImportState, profile_->GetPath()), std::move(done));
++}
++
++bool RealArcImportBackend::SignInsAvailable() const {
++  // HOOK(signins): ArcSignInsAvailable(), when the sign-ins step lands.
++  return false;
++}
++
++void RealArcImportBackend::StartImport(
++    ImportPlan plan,
++    ArcImportOptions options,
++    ArcImportProgressCallback progress,
++    ArcImportDoneCallback done) {
++  // HOOK(arc_importer): rac::StartArcImport(profile_, std::move(plan),
++  // options, progress, done). Until the applier lands, report "not
++  // available": a failed result with no failure cause.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(
++                     [](ArcImportDoneCallback done) {
++                       ArcImportResult result;
++                       result.status = ArcImportResult::Status::kFailed;
++                       std::move(done).Run(result);
++                     },
++                     std::move(done)));
++}
++
++void RealArcImportBackend::RetrySignIns(ArcImportProgressCallback progress,
++                                        ArcImportDoneCallback done) {
++  // HOOK(signins): RetryArcSignIns(). Same "not available" as StartImport.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(
++                     [](ArcImportDoneCallback done) {
++                       ArcImportResult result;
++                       result.status = ArcImportResult::Status::kFailed;
++                       std::move(done).Run(result);
++                     },
++                     std::move(done)));
++}
++
++void RealArcImportBackend::UndoImport(
++    base::OnceCallback<void(ArcUndoResult)> done) {
++  // HOOK(arc_importer): rac::UndoArcImport(profile_, done).
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce([](base::OnceCallback<void(ArcUndoResult)> done) {
++        std::move(done).Run(ArcUndoResult::kFailed);
++      }, std::move(done)));
++}
++
++void RealArcImportBackend::OpenProfile(const base::FilePath& profile_path,
++                                       base::OnceCallback<void(bool)> done) {
++  ProfileManager* manager = g_browser_process->profile_manager();
++  if (!manager) {
++    std::move(done).Run(false);
++    return;
++  }
++  manager->LoadProfileByPath(
++      profile_path, /*incognito=*/false,
++      base::BindOnce(
++          [](base::OnceCallback<void(bool)> done, Profile* loaded) {
++            if (!loaded) {
++              std::move(done).Run(false);
++              return;
++            }
++            profiles::OpenBrowserWindowForProfile(
++                base::BindOnce(
++                    [](base::OnceCallback<void(bool)> done,
++                       BrowserWindowInterface* browser) {
++                      std::move(done).Run(browser != nullptr);
++                    },
++                    std::move(done)),
++                /*always_create=*/true, /*is_new_profile=*/false,
++                /*open_command_line_urls=*/false, loaded);
++          },
++          std::move(done)));
++}
++
++std::optional<DataBackups::RestoreOffer>
++RealArcImportBackend::GetRestoreOffer() {
++  DataBackups* service = backups();
++  if (!service || !service->ShouldShowRestoreOffer()) {
++    return std::nullopt;
++  }
++  return service->restore_offer();
++}
++
++void RealArcImportBackend::SetRestoreOfferChangedCallback(
++    base::RepeatingClosure changed) {
++  offer_changed_ = std::move(changed);
++}
++
++void RealArcImportBackend::AnswerRestoreOffer(
++    bool restore,
++    base::OnceCallback<void(bool restored)> done) {
++  DataBackups* service = backups();
++  if (!restore) {
++    if (service) {
++      service->ResolveRestoreOffer();
++    }
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(done), false));
++    return;
++  }
++  // HOOK(data_restorer): DataRestorer::RestoreOffer(profile_, done ->
++  // result == kRestored). Until it lands, restoring reports failure; the
++  // offer stays pending so it can be tried again.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(std::move(done), false));
++}
++
++bool RealArcImportBackend::IsArcRunning() {
++  // HOOK(appstate): rac::import::IsArcRunning(). Sign-ins aren't in this
++  // build, so Arc doesn't have to be quit for anything.
++  return false;
++}
++
++std::unique_ptr<ArcImportBackend::QuitWait>
++RealArcImportBackend::WatchArcQuit(base::OnceClosure on_quit) {
++  // HOOK(appstate): wrap rac::import::ArcQuitWatcher.
++  return std::make_unique<PostedQuitWait>(std::move(on_quit));
++}
++
++void RealArcImportBackend::OnRestoreOfferChanged() {
++  if (offer_changed_) {
++    offer_changed_.Run();
++  }
++}
++
++}  // namespace rac::onboarding
+Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.h
+@@ -0,0 +1,76 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_ONBOARDING_REAL_ARC_IMPORT_BACKEND_H_
++#define CHROME_BROWSER_UI_RAC_ONBOARDING_REAL_ARC_IMPORT_BACKEND_H_
++
++#include <optional>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/rac/storage/data_backups.h"
++#include "chrome/browser/ui/rac/onboarding/arc_import_backend.h"
++
++namespace rac::onboarding {
++
++// The real Arc import backend: the reader, the import record, the mapping,
++// and DataBackups, which are in the tree today; the applier, DataRestorer,
++// and the Arc-quit watcher once their patches land. See arc_import_backend.h
++// for what reports "not available" until then.
++class RealArcImportBackend : public ArcImportBackend,
++                             public DataBackups::Observer {
++ public:
++  explicit RealArcImportBackend(Profile* profile);
++  RealArcImportBackend(const RealArcImportBackend&) = delete;
++  RealArcImportBackend& operator=(const RealArcImportBackend&) = delete;
++  ~RealArcImportBackend() override;
++
++  // ArcImportBackend:
++  void CheckSource(base::OnceCallback<void(bool exists)> done) override;
++  void ReadPlan(
++      base::OnceCallback<void(base::expected<ImportPlan, ArcReadError>)> done)
++      override;
++  base::DictValue PlanToPreviewValue(const ImportPlan& plan) override;
++  void GetImportState(
++      base::OnceCallback<void(const ArcImportState&)> done) override;
++  bool SignInsAvailable() const override;
++  void StartImport(ImportPlan plan,
++                   ArcImportOptions options,
++                   ArcImportProgressCallback progress,
++                   ArcImportDoneCallback done) override;
++  void RetrySignIns(ArcImportProgressCallback progress,
++                    ArcImportDoneCallback done) override;
++  void UndoImport(base::OnceCallback<void(ArcUndoResult)> done) override;
++  void OpenProfile(const base::FilePath& profile_path,
++                   base::OnceCallback<void(bool)> done) override;
++  std::optional<DataBackups::RestoreOffer> GetRestoreOffer() override;
++  void SetRestoreOfferChangedCallback(
++      base::RepeatingClosure changed) override;
++  void AnswerRestoreOffer(bool restore,
++                          base::OnceCallback<void(bool restored)> done)
++      override;
++  bool IsArcRunning() override;
++  std::unique_ptr<QuitWait> WatchArcQuit(base::OnceClosure on_quit) override;
++
++  // DataBackups::Observer:
++  void OnRestoreOfferChanged() override;
++
++ private:
++  DataBackups* backups();
++  // The profile's place in the space switcher where `source`'s first space
++  // lands: after the existing spaces, or at the top when the only space is
++  // the blank one the import replaces.
++  size_t SpacePositionBase(const ImportProfile& source) const;
++
++  const raw_ptr<Profile> profile_;
++  base::RepeatingClosure offer_changed_;
++  base::ScopedObservation<DataBackups, DataBackups::Observer>
++      backups_observation_{this};
++  base::WeakPtrFactory<RealArcImportBackend> weak_factory_{this};
++};
++
++}  // namespace rac::onboarding
++
++#endif  // CHROME_BROWSER_UI_RAC_ONBOARDING_REAL_ARC_IMPORT_BACKEND_H_
+Index: src/chrome/browser/ui/views/rac/onboarding/onboarding_window.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/onboarding/onboarding_window.cc
++++ src/chrome/browser/ui/views/rac/onboarding/onboarding_window.cc
+@@ -289,4 +289,12 @@ bool FinishWelcomeTour(content::WebConte
+   return true;
+ }
+ 
++bool CloseWelcomeTour(content::WebContents* web_contents) {
++  if (!g_tour || g_tour->web_contents() != web_contents) {
++    return false;
++  }
++  g_tour->Close();
++  return true;
++}
++
+ }  // namespace rac::onboarding
+Index: src/chrome/browser/ui/webui/onboarding/onboarding_page_ui.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/onboarding/onboarding_page_ui.cc
++++ src/chrome/browser/ui/webui/onboarding/onboarding_page_ui.cc
+@@ -7,6 +7,7 @@
+ #include "base/strings/strcat.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/rac/onboarding/arc_import_handler.h"
+ #include "chrome/browser/ui/rac/onboarding/onboarding_handler.h"
+ #include "chrome/browser/ui/webui/onboarding/onboarding_handler.h"
+ #include "chrome/browser/ui/webui/settings/brave_import_data_handler.h"
+@@ -60,6 +61,8 @@ HeliumOnboardingPage::HeliumOnboardingPa
+       std::make_unique<settings::BraveImportDataHandler>());
+   web_ui->AddMessageHandler(
+       std::make_unique<rac::onboarding::OnboardingHandler>(profile));
++  web_ui->AddMessageHandler(
++      std::make_unique<rac::onboarding::ArcImportHandler>(profile));
+ }
+ 
+ HeliumOnboardingPage::~HeliumOnboardingPage() = default;
+Index: src/chrome/browser/ui/webui/settings/settings_ui.cc
+===================================================================
+--- src.orig/chrome/browser/ui/webui/settings/settings_ui.cc
++++ src/chrome/browser/ui/webui/settings/settings_ui.cc
+@@ -51,6 +51,7 @@
+ #include "chrome/browser/ui/hats/hats_service_factory.h"
+ #include "chrome/browser/ui/managed_ui.h"
+ #include "chrome/browser/ui/passwords/ui_utils.h"
++#include "chrome/browser/ui/rac/onboarding/arc_import_handler.h"
+ #include "chrome/browser/ui/rac/onboarding/onboarding_handler.h"
+ #include "chrome/browser/ui/toasts/toast_features.h"
+ #include "chrome/browser/ui/ui_features.h"
+@@ -286,6 +287,8 @@ SettingsUI::SettingsUI(content::WebUI* w
+   AddSettingsPageUIHandler(std::make_unique<RacAiHandler>(profile));
+   AddSettingsPageUIHandler(
+       std::make_unique<rac::onboarding::OnboardingHandler>(profile));
++  AddSettingsPageUIHandler(
++      std::make_unique<rac::onboarding::ArcImportHandler>(profile));
+   AddSettingsPageUIHandler(std::make_unique<PeopleHandler>(profile));
+   AddSettingsPageUIHandler(std::make_unique<ProfileInfoHandler>(profile));
+   AddSettingsPageUIHandler(std::make_unique<ProtocolHandlersHandler>(profile));
