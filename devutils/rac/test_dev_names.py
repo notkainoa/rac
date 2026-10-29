@@ -231,6 +231,80 @@ class NamesTest(unittest.TestCase):
         self.assertEqual((recovery / 'files' / 'ui' / 'strings_fr.xtb').read_bytes(),
                          b'Helium fr\n')
 
+    def run_passes(self, grd=b'rac\n', xtb=b'Helium fr\n'):
+        """sub() with passes that brand the files they changed, like the real
+        passes: helium writes both, then rac overwrites the .grd."""
+        def fake_pass(command, **_kwargs):
+            backup = Path(command[command.index('--backup-path') + 1])
+            if backup.stem == 'helium':
+                make_archive(self.tree, 'helium', {
+                    'ui/strings.grd': b'Chromium\n',
+                    'ui/strings_fr.xtb': b'Chromium fr\n'
+                })
+                self.grd.write_bytes(b'Helium\n')
+                self.xtb.write_bytes(xtb)
+            else:
+                make_archive(self.tree, 'rac', {'ui/strings.grd': b'Helium\n'})
+                self.grd.write_bytes(grd)
+            return subprocess.CompletedProcess(command, 0, 'Modified 1 files\n', '')
+
+        with mock.patch.object(dev_names.subprocess, 'run', side_effect=fake_pass):
+            dev_names.sub(self.tree)
+
+    def test_sub_keeps_mtimes_on_roundtripped_files(self):
+        mtimes = {}
+        for path, mtime in ((self.grd, 1_234_567_890_123_456_789),
+                            (self.xtb, 1_234_000_000_000_000_000)):
+            os.utime(path, ns=(mtime, mtime))
+            mtimes[path] = mtime
+        dev_names.unsub(self.tree)
+        record = self.tree / dev_names.STATE_DIR / dev_names.MTIMES
+        self.assertTrue(record.exists())
+        with mock.patch('sys.stdout', new_callable=io.StringIO) as stdout:
+            self.run_passes()
+        for path, mtime in mtimes.items():
+            self.assertEqual(path.stat().st_mtime_ns, mtime)
+        self.assertIn('kept mtimes on 2 unchanged files (0 changed)', stdout.getvalue())
+        self.assertFalse(record.exists())
+
+    def test_sub_keeps_the_new_mtime_when_a_patch_changed_the_file(self):
+        for path, mtime in ((self.grd, 1_234_567_890_123_456_789),
+                            (self.xtb, 1_234_000_000_000_000_000)):
+            os.utime(path, ns=(mtime, mtime))
+        dev_names.unsub(self.tree)
+        # A pushed patch changed the original between unsub and sub.
+        self.grd.write_bytes(b'Chromium\nChromium menu\n')
+        with mock.patch('sys.stdout', new_callable=io.StringIO) as stdout:
+            self.run_passes(grd=b'rac\nrac menu\n')
+        self.assertNotEqual(self.grd.stat().st_mtime_ns, 1_234_567_890_123_456_789)
+        self.assertEqual(self.xtb.stat().st_mtime_ns, 1_234_000_000_000_000_000)
+        self.assertIn('kept mtimes on 1 unchanged files (1 changed)', stdout.getvalue())
+
+    def test_sub_drops_the_mtime_record_when_the_tree_was_built_since_unsub(self):
+        state = self.tree / 'out' / 'Default' / '.siso_fs_state'
+        state.parent.mkdir(parents=True)
+        state.write_bytes(b'one')
+        os.utime(state, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(self.grd, ns=(1_234_567_890_123_456_789, 1_234_567_890_123_456_789))
+        dev_names.unsub(self.tree)
+        # A build between unsub and sub saved its state.
+        os.utime(state, ns=(2_000_000_000, 2_000_000_000))
+        with mock.patch('sys.stdout', new_callable=io.StringIO) as stdout, \
+             mock.patch('sys.stderr', new_callable=io.StringIO):
+            self.run_passes()
+        self.assertNotIn('kept mtimes', stdout.getvalue())
+        self.assertNotEqual(self.grd.stat().st_mtime_ns, 1_234_567_890_123_456_789)
+        self.assertFalse((self.tree / dev_names.STATE_DIR / dev_names.MTIMES).exists())
+
+    def test_sub_without_a_mtime_record_leaves_the_new_mtimes(self):
+        os.utime(self.grd, ns=(1_234_567_890_123_456_789, 1_234_567_890_123_456_789))
+        dev_names.unsub(self.tree)
+        (self.tree / dev_names.STATE_DIR / dev_names.MTIMES).unlink()
+        with mock.patch('sys.stdout', new_callable=io.StringIO) as stdout:
+            self.run_passes()
+        self.assertNotIn('kept mtimes', stdout.getvalue())
+        self.assertNotEqual(self.grd.stat().st_mtime_ns, 1_234_567_890_123_456_789)
+
     def test_sub_records_hashes_of_the_branded_files(self):
         dev_names.unsub(self.tree)
 
