@@ -91,6 +91,8 @@ devutils/rac/build-queue.sh log          # recent starts, ends, and refusals
   `--priority` to go ahead of other waiters.
 - **Full builds.** A full build the maintainer approved takes both build
   slots: `build-queue.sh --full "D6 item 2: sync cold build" he build`.
+- **File descriptors.** `--pass-fds 3,4` hands open file descriptors to
+  the command, for `--remote-debugging-pipe`.
 - **Guards.** The queue refuses to start a build with less than 20 GB free,
   and waits while memory pressure is critical. It stops a build that shows
   more than 20,000 steps, since that means something invalidated the tree.
