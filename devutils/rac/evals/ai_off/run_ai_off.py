@@ -309,7 +309,7 @@ class Rig:
             def log_message(self, *_):
                 pass
 
-        self.web = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Page)
+        self.web = fake_model.QuietHTTPServer(("127.0.0.1", 0), Page)
         threading.Thread(target=self.web.serve_forever, daemon=True).start()
 
     @property

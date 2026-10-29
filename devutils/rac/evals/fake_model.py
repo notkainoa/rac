@@ -512,10 +512,16 @@ def make_handler(state):
     return Handler
 
 
+class QuietHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        pass  # keep-alive connections reset while streaming are not a log line
+
+
 def serve(port=0, log_file=None):
     state = State(log_file)
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(state))
-    server.daemon_threads = True
+    server = QuietHTTPServer(("127.0.0.1", port), make_handler(state))
     return server, state
 
 

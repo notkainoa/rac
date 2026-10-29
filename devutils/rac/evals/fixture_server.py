@@ -90,6 +90,13 @@ def _inject_eval(html):
     return html.replace("</body>", tag + "</body>", 1) if "</body>" in html else html + tag
 
 
+class QuietHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        pass  # the browser resets keep-alive connections on navigation; not a log line
+
+
 class FixtureServer:
     def __init__(self, variant, host_mode="names", host="127.0.0.1"):
         self.variant = variant
@@ -106,14 +113,12 @@ class FixtureServer:
     # -- lifecycle --
     def start(self):
         for name, spec in self.variant["origins"].items():
-            server = ThreadingHTTPServer((self.host, 0), self._handler(name))
-            server.daemon_threads = True
+            server = QuietHTTPServer((self.host, 0), self._handler(name))
             self.servers[name] = server
             self.ports[name] = server.server_address[1]
             self.base[name] = origin_base(name, spec, self.ports[name], self.host_mode)
             threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
-        self.control = ThreadingHTTPServer((self.host, 0), self._control_handler())
-        self.control.daemon_threads = True
+        self.control = QuietHTTPServer((self.host, 0), self._control_handler())
         threading.Thread(target=self.control.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         return self
 

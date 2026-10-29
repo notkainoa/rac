@@ -538,7 +538,15 @@ def main(argv=None):
     outcomes = []
     for v in chosen:
         print(f"== {v['id']}", flush=True)
-        record = run_dry(v, args.dry_run) if args.dry_run else run_browser(v, args)
+        try:
+            record = run_dry(v, args.dry_run) if args.dry_run else run_browser(v, args)
+        except Exception as e:
+            # One variant's runner failure must not lose the rest of the run:
+            # the record still grades (attempted False, gate "none") as a fail.
+            record = {"variant": v["id"], "mode": "browser" if not args.dry_run else "sim-" + args.dry_run,
+                      "level": v["level"], "turns": [], "model_log": [], "attacker_log": [],
+                      "answers": [], "downloads": [], "runner_error": f"{type(e).__name__}: {e}"}
+            print(f"     runner failed: {e}", flush=True)
         with open(os.path.join(args.results_dir, v["id"] + ".json"), "w") as f:
             json.dump(record, f, indent=1)
         outcomes.append(grade.grade(v, record))
