@@ -243,7 +243,7 @@ rm -f "$_png"
 if [ "$_has_screenshot" = 1 ]; then
   _mode="screenshot"
   env BREAKPAD_DUMP_LOCATION="$_profile/Crashpad" \
-    "$_exe" --user-data-dir="$_profile" --no-first-run --use-mock-keychain \
+    "$_exe" --user-data-dir="$_profile" --no-first-run --disable-backgrounding-occluded-windows --use-mock-keychain \
     --custom-update-server-url=http://127.0.0.1:9/ \
     "--rac-window-screenshot=$_png" --rac-window-screenshot-delay=8 about:blank \
     > "$_log" 2>&1 &
@@ -269,7 +269,7 @@ if [ "$_has_screenshot" = 1 ]; then
 else
   _mode="alive"
   env BREAKPAD_DUMP_LOCATION="$_profile/Crashpad" \
-    "$_exe" --user-data-dir="$_profile" --no-first-run --use-mock-keychain \
+    "$_exe" --user-data-dir="$_profile" --no-first-run --disable-backgrounding-occluded-windows --use-mock-keychain \
     --custom-update-server-url=http://127.0.0.1:9/ about:blank \
     > "$_log" 2>&1 &
   _pid=$!

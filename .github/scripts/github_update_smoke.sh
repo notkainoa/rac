@@ -128,7 +128,7 @@ record PASS "old build" "installed rac ${_old_version:-unknown} from $(basename 
 
 # First launch: give the old build a profile to leave behind.
 env BREAKPAD_DUMP_LOCATION="$_profile/Crashpad" \
-  "$_installed/Contents/MacOS/rac" --user-data-dir="$_profile" --no-first-run \
+  "$_installed/Contents/MacOS/rac" --user-data-dir="$_profile" --no-first-run --disable-backgrounding-occluded-windows \
   --use-mock-keychain --custom-update-server-url=http://127.0.0.1:9/ \
   about:blank > "$_work/rac-old.log" 2>&1 &
 _pid=$!
@@ -208,7 +208,7 @@ fi
 # from an earlier run must not satisfy this one's wait.
 rm -f "$_png"
 env BREAKPAD_DUMP_LOCATION="$_profile/Crashpad" \
-  "$_exe" --user-data-dir="$_profile" --no-first-run --use-mock-keychain \
+  "$_exe" --user-data-dir="$_profile" --no-first-run --disable-backgrounding-occluded-windows --use-mock-keychain \
   --custom-update-server-url=http://127.0.0.1:9/ \
   ${_shot_args[@]+"${_shot_args[@]}"} about:blank > "$_work/rac-new.log" 2>&1 &
 _pid=$!
