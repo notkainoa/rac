@@ -1,0 +1,413 @@
+--- a/chrome/browser/devtools/BUILD.gn
++++ b/chrome/browser/devtools/BUILD.gn
+@@ -300,6 +300,7 @@ static_library("devtools") {
+       "//chrome/app/theme:theme_resources",
+       "//chrome/browser/infobars",
+       "//chrome/browser/media/router:media_router_feature",
++      "//chrome/browser/rac/devtools",
+       "//chrome/browser/ui:tab_modal_confirm_dialog",
+       "//chrome/browser/ui/exclusive_access",
+       "//chrome/browser/ui/navigator",
+--- a/chrome/browser/devtools/features.cc
++++ b/chrome/browser/devtools/features.cc
+@@ -205,8 +205,9 @@ BASE_FEATURE(kDevToolsEnableDurableMessa
+ BASE_FEATURE(kDevToolsAcceptDebuggingConnections,
+              base::FEATURE_DISABLED_BY_DEFAULT);
+ #else
++// rac: off, so chrome://inspect can't open a door on the real profile (D20).
+ BASE_FEATURE(kDevToolsAcceptDebuggingConnections,
+-             base::FEATURE_ENABLED_BY_DEFAULT);
++             base::FEATURE_DISABLED_BY_DEFAULT);
+ #endif  // BUILDFLAG(IS_CHROMEOS)
+ 
+ BASE_FEATURE(kDevToolsAiAssistanceContextSelectionAgent,
+--- a/chrome/browser/devtools/remote_debugging_server.cc
++++ b/chrome/browser/devtools/remote_debugging_server.cc
+@@ -25,6 +25,7 @@
+ #include "chrome/browser/devtools/devtools_window.h"
+ #include "chrome/browser/devtools/features.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/devtools/default_dir.h"
+ #include "chrome/common/chrome_paths.h"
+ #include "chrome/common/chrome_paths_internal.h"
+ #include "chrome/common/chrome_switches.h"
+@@ -169,12 +170,12 @@ IsRemoteDebuggingAllowed(const std::opti
+ #if BUILDFLAG(GOOGLE_CHROME_BRANDING)
+   constexpr bool default_user_data_dir_check_enabled = true;
+ #else
+-  const bool default_user_data_dir_check_enabled =
+-      g_enable_default_user_data_dir_check_for_chromium_branding_for_testing;
++  // rac: always refuse the debug doors on the real profile (D20).
++  const bool default_user_data_dir_check_enabled = true;
+ #endif
+ 
+   if (default_user_data_dir_check_enabled &&
+-      is_default_user_data_dir.value_or(true)) {
++      rac::IsDefaultUserDataDir(is_default_user_data_dir)) {
+     return base::unexpected(
+         RemoteDebuggingServer::NotStartedReason::kDisabledByDefaultUserDataDir);
+   }
+--- a/chrome/browser/devtools/remote_debugging_server_unittest.cc
++++ b/chrome/browser/devtools/remote_debugging_server_unittest.cc
+@@ -11,6 +11,7 @@
+ #include "base/run_loop.h"
+ #include "base/test/scoped_feature_list.h"
+ #include "chrome/browser/devtools/features.h"
++#include "chrome/common/chrome_paths_internal.h"
+ #include "chrome/common/pref_names.h"
+ #include "chrome/test/base/testing_browser_process.h"
+ #include "chrome/test/base/testing_profile_manager.h"
+@@ -24,6 +25,7 @@
+ #include "content/public/browser/devtools_agent_host.h"
+ #include "content/public/browser/devtools_socket_factory.h"
+ #include "content/public/common/content_constants.h"
++#include "content/public/common/content_switches.h"
+ #include "content/public/test/browser_task_environment.h"
+ #include "testing/gmock/include/gmock/gmock.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+@@ -197,3 +199,29 @@ TEST_F(RemoteDebuggingServerTest, Return
+   auto server = RemoteDebuggingServer::GetInstance(local_state);
+   EXPECT_TRUE(server.has_value());
+ }
++
++// rac: both debug doors are refused on the default user data dir (D20),
++// without EnableDefaultUserDataDirCheckForTesting().
++TEST_F(RemoteDebuggingServerTest, RefusesPortOnDefaultUserDataDir) {
++  chrome::SetUsingDefaultUserDataDirectoryForTesting(true);
++  base::CommandLine::ForCurrentProcess()->AppendSwitchASCII(
++      ::switches::kRemoteDebuggingPort, "0");
++  auto server = RemoteDebuggingServer::GetInstance(
++      TestingBrowserProcess::GetGlobal()->GetTestingLocalState());
++  EXPECT_EQ(
++      server.error(),
++      RemoteDebuggingServer::NotStartedReason::kDisabledByDefaultUserDataDir);
++  chrome::SetUsingDefaultUserDataDirectoryForTesting(std::nullopt);
++}
++
++TEST_F(RemoteDebuggingServerTest, RefusesPipeOnDefaultUserDataDir) {
++  chrome::SetUsingDefaultUserDataDirectoryForTesting(true);
++  base::CommandLine::ForCurrentProcess()->AppendSwitch(
++      ::switches::kRemoteDebuggingPipe);
++  auto server = RemoteDebuggingServer::GetInstance(
++      TestingBrowserProcess::GetGlobal()->GetTestingLocalState());
++  EXPECT_EQ(
++      server.error(),
++      RemoteDebuggingServer::NotStartedReason::kDisabledByDefaultUserDataDir);
++  chrome::SetUsingDefaultUserDataDirectoryForTesting(std::nullopt);
++}
+--- /dev/null
++++ b/chrome/browser/rac/devtools/BUILD.gn
+@@ -0,0 +1,35 @@
++# Copyright 2026 The rac Authors
++# Use of this source code is governed by a GPL-3.0 license.
++
++import("//testing/test.gni")
++
++# Refuses Chromium's debug doors on the real profile (decision D20).
++source_set("devtools") {
++  sources = [
++    "default_dir.cc",
++    "default_dir.h",
++  ]
++  deps = [
++    "//base",
++    "//chrome/common:constants",
++  ]
++}
++
++test("rac_devtools_unittests") {
++  sources = [
++    "default_dir_unittest.cc",
++
++    # Compiled in here, not linked from //chrome/browser/devtools, so the test
++    # checks the feature default that rac ships without that whole library.
++    "//chrome/browser/devtools/features.cc",
++    "//chrome/browser/devtools/features.h",
++  ]
++  deps = [
++    ":devtools",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//chrome/common:constants",
++    "//testing/gtest",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/rac/devtools/default_dir.cc
+@@ -0,0 +1,68 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/devtools/default_dir.h"
++
++#include <errno.h>
++#include <sys/stat.h>
++
++#include "base/files/file_path.h"
++#include "base/path_service.h"
++#include "base/threading/scoped_blocking_call.h"
++#include "chrome/common/chrome_paths.h"
++#include "chrome/common/chrome_paths_internal.h"
++
++namespace rac {
++
++namespace {
++
++enum class Lookup { kFound, kMissing, kUnreadable };
++
++// stat() follows symlinks, and on a case-insensitive volume a case variant
++// names the same inode, so both land on the directory they point to.
++Lookup StatPath(const base::FilePath& path, struct stat* info) {
++  base::ScopedBlockingCall blocking(FROM_HERE, base::BlockingType::MAY_BLOCK);
++  if (stat(path.value().c_str(), info) == 0) {
++    return Lookup::kFound;
++  }
++  const int error = errno;
++  return error == ENOENT || error == ENOTDIR ? Lookup::kMissing
++                                             : Lookup::kUnreadable;
++}
++
++}  // namespace
++
++bool IsSameDirectoryAsDefault(const base::FilePath& user_data_dir,
++                              const base::FilePath& default_dir) {
++  struct stat default_info = {};
++  switch (StatPath(default_dir, &default_info)) {
++    case Lookup::kFound:
++      break;
++    case Lookup::kMissing:
++      return false;
++    case Lookup::kUnreadable:
++      return true;
++  }
++
++  struct stat user_info = {};
++  if (StatPath(user_data_dir, &user_info) != Lookup::kFound) {
++    return true;
++  }
++  return user_info.st_dev == default_info.st_dev &&
++         user_info.st_ino == default_info.st_ino;
++}
++
++bool IsDefaultUserDataDir(std::optional<bool> is_default_by_path) {
++  if (is_default_by_path.value_or(true)) {
++    return true;
++  }
++  base::FilePath user_data_dir;
++  base::FilePath default_dir;
++  if (!base::PathService::Get(chrome::DIR_USER_DATA, &user_data_dir) ||
++      !chrome::GetDefaultUserDataDirectory(&default_dir)) {
++    return true;
++  }
++  return IsSameDirectoryAsDefault(user_data_dir, default_dir);
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/devtools/default_dir.h
+@@ -0,0 +1,35 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_DEVTOOLS_DEFAULT_DIR_H_
++#define CHROME_BROWSER_RAC_DEVTOOLS_DEFAULT_DIR_H_
++
++#include <optional>
++
++namespace base {
++class FilePath;
++}  // namespace base
++
++namespace rac {
++
++// Whether the browser runs on the default user data dir, the user's real
++// profile, where rac refuses Chromium's debug doors (--remote-debugging-port
++// and --remote-debugging-pipe, decision D20). `is_default_by_path` is
++// chrome::IsUsingDefaultDataDirectory(), a plain path compare; unknown
++// (nullopt) counts as default. When the paths differ, DIR_USER_DATA still
++// counts as default if it is the same directory on disk, so a symlink, a
++// case variant, a firmlink, or a `..` path to the real profile is refused
++// too. Only called when one of those switches is on the command line, so a
++// normal launch does no file I/O here.
++bool IsDefaultUserDataDir(std::optional<bool> is_default_by_path);
++
++// The identity check behind IsDefaultUserDataDir(): true if both paths are
++// the same directory (same device and inode). False if `default_dir` doesn't
++// exist, since then there's no real profile to protect. True if either path
++// can't be read for any other reason, so an unknown answer is refused.
++bool IsSameDirectoryAsDefault(const base::FilePath& user_data_dir,
++                              const base::FilePath& default_dir);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_DEVTOOLS_DEFAULT_DIR_H_
+--- /dev/null
++++ b/chrome/browser/rac/devtools/default_dir_unittest.cc
+@@ -0,0 +1,166 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/devtools/default_dir.h"
++
++#include <optional>
++
++#include "base/base_paths.h"
++#include "base/feature_list.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/strings/string_util.h"
++#include "base/test/scoped_path_override.h"
++#include "chrome/browser/devtools/features.h"
++#include "chrome/common/chrome_paths.h"
++#include "chrome/common/chrome_paths_internal.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++// Every path here lives in a temp dir: base::DIR_APP_DATA is overridden, so
++// the "default" user data dir is a temp folder, never the real profile.
++class RacDefaultDirTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    ASSERT_TRUE(temp_dir_.CreateUniqueTempDir());
++    // Resolved, so /var -> /private/var doesn't change any path below.
++    root_ = base::MakeAbsoluteFilePath(temp_dir_.GetPath());
++    ASSERT_FALSE(root_.empty());
++    app_data_.emplace(base::DIR_APP_DATA, root_.AppendASCII("AppData"),
++                      /*is_absolute=*/true, /*create=*/true);
++    ASSERT_TRUE(chrome::GetDefaultUserDataDirectory(&default_dir_));
++    ASSERT_TRUE(root_.IsParent(default_dir_)) << default_dir_;
++    ASSERT_TRUE(base::CreateDirectory(default_dir_));
++  }
++
++  void TearDown() override {
++    chrome::SetUsingDefaultUserDataDirectoryForTesting(std::nullopt);
++  }
++
++  // Sets DIR_USER_DATA to `path` exactly as given. PathService would
++  // otherwise resolve it with realpath(), hiding what this test checks.
++  void UseUserDataDir(const base::FilePath& path) {
++    user_data_dir_.reset();
++    user_data_dir_.emplace(chrome::DIR_USER_DATA, path, /*is_absolute=*/true,
++                           /*create=*/false);
++  }
++
++  // What IsRemoteDebuggingAllowed() decides for the port and the pipe alike:
++  // both pass it the same chrome::IsUsingDefaultDataDirectory() value.
++  bool Refused() {
++    return IsDefaultUserDataDir(chrome::IsUsingDefaultDataDirectory());
++  }
++
++  base::ScopedTempDir temp_dir_;
++  base::FilePath root_;
++  base::FilePath default_dir_;
++  std::optional<base::ScopedPathOverride> app_data_;
++  std::optional<base::ScopedPathOverride> user_data_dir_;
++};
++
++TEST_F(RacDefaultDirTest, RefusedWhenUsingTheDefaultDir) {
++  chrome::SetUsingDefaultUserDataDirectoryForTesting(true);
++  EXPECT_TRUE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, RefusedWhenUnknown) {
++  EXPECT_TRUE(IsDefaultUserDataDir(std::nullopt));
++}
++
++TEST_F(RacDefaultDirTest, RefusedOnTheDefaultPath) {
++  UseUserDataDir(default_dir_);
++  EXPECT_EQ(chrome::IsUsingDefaultDataDirectory(), true);
++  EXPECT_TRUE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, AllowedWithAnotherDir) {
++  const base::FilePath other = root_.AppendASCII("profile");
++  ASSERT_TRUE(base::CreateDirectory(other));
++  UseUserDataDir(other);
++  EXPECT_EQ(chrome::IsUsingDefaultDataDirectory(), false);
++  EXPECT_FALSE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, AllowedWhenTheDefaultDirDoesNotExist) {
++  const base::FilePath other = root_.AppendASCII("profile");
++  ASSERT_TRUE(base::CreateDirectory(other));
++  ASSERT_TRUE(base::DeletePathRecursively(default_dir_));
++  UseUserDataDir(other);
++  EXPECT_FALSE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, RefusedThroughASymlink) {
++  const base::FilePath link = root_.AppendASCII("link");
++  ASSERT_TRUE(base::CreateSymbolicLink(default_dir_, link));
++  UseUserDataDir(link);
++  // The path compare alone misses it.
++  EXPECT_EQ(chrome::IsUsingDefaultDataDirectory(), false);
++  EXPECT_TRUE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, RefusedThroughASymlinkedParent) {
++  const base::FilePath link = root_.AppendASCII("link");
++  ASSERT_TRUE(base::CreateSymbolicLink(default_dir_.DirName(), link));
++  UseUserDataDir(link.Append(default_dir_.BaseName()));
++  EXPECT_EQ(chrome::IsUsingDefaultDataDirectory(), false);
++  EXPECT_TRUE(Refused());
++}
++
++// The real profile moved to another disk and linked back: the path compare
++// sees the link, the switch names where it points.
++TEST_F(RacDefaultDirTest, RefusedWhenTheDefaultIsASymlink) {
++  const base::FilePath moved = root_.AppendASCII("moved");
++  ASSERT_TRUE(base::DeletePathRecursively(default_dir_));
++  ASSERT_TRUE(base::CreateDirectory(moved));
++  ASSERT_TRUE(base::CreateSymbolicLink(moved, default_dir_));
++  UseUserDataDir(moved);
++  EXPECT_EQ(chrome::IsUsingDefaultDataDirectory(), false);
++  EXPECT_TRUE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, RefusedThroughACaseVariant) {
++  const base::FilePath variant = default_dir_.DirName().AppendASCII(
++      base::ToUpperASCII(default_dir_.BaseName().value()));
++  ASSERT_NE(variant, default_dir_);
++  if (!base::DirectoryExists(variant)) {
++    GTEST_SKIP() << "The temp volume is case-sensitive.";
++  }
++  UseUserDataDir(variant);
++  EXPECT_EQ(chrome::IsUsingDefaultDataDirectory(), false);
++  EXPECT_TRUE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, RefusedThroughDotDot) {
++  const base::FilePath sibling = default_dir_.DirName().AppendASCII("other");
++  ASSERT_TRUE(base::CreateDirectory(sibling));
++  UseUserDataDir(sibling.AppendASCII("..").Append(default_dir_.BaseName()));
++  EXPECT_EQ(chrome::IsUsingDefaultDataDirectory(), false);
++  EXPECT_TRUE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, RefusedWhenTheUserDataDirCannotBeRead) {
++  UseUserDataDir(root_.AppendASCII("missing"));
++  EXPECT_TRUE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, SameDirectoryAsDefault) {
++  const base::FilePath other = root_.AppendASCII("profile");
++  ASSERT_TRUE(base::CreateDirectory(other));
++  EXPECT_TRUE(IsSameDirectoryAsDefault(default_dir_, default_dir_));
++  EXPECT_FALSE(IsSameDirectoryAsDefault(other, default_dir_));
++  EXPECT_FALSE(
++      IsSameDirectoryAsDefault(other, root_.AppendASCII("no-default")));
++}
++
++// With the feature off, RemoteDebuggingServer::GetInstance() never starts
++// chrome://inspect's approval mode, and chrome://inspect hides its toggle.
++TEST(RacDebugDoorsTest, ApprovalModeIsOffByDefault) {
++  EXPECT_FALSE(base::FeatureList::IsEnabled(
++      features::kDevToolsAcceptDebuggingConnections));
++}
++
++}  // namespace
++}  // namespace rac
