@@ -11,8 +11,18 @@
 #   push <worktree>                   push its committed state, making or
 #                                     updating its clone
 #   build <worktree> [-- targets...]  build the clone through the remote queue
-#   run <worktree> [--timeout S] [-- args...]
-#                                     launch the clone's browser, then stop it
+#   run <worktree> [--timeout S] [--requests-file F] [--fresh-profile]
+#       [-- args...]                  launch the clone's browser, then stop it;
+#                                     --fresh-profile first deletes the clone's
+#                                     throwaway build/profile (never while a
+#                                     browser from the clone runs);
+#                                     F is a screenshot-requests line on the
+#                                     Air, checked by remote_requests.py. A
+#                                     --rac-window-screenshot= path is under
+#                                     the clone's build/shots; the inputs
+#                                     --rac-arc-import-fixture= and
+#                                     --rac-import-source-root= are relative to
+#                                     the clone and must exist there
 #   pull <worktree> <remote path> <local path>
 #                                     rsync a file inside the clone back
 #   log [lines]                       the base's bootstrap phases and the
@@ -33,6 +43,7 @@ set -euo pipefail
 die() { echo "rac remote: $*" >&2; exit 1; }
 refuse() { echo "rac remote: refusing: $*" >&2; exit 2; }
 log() { echo "rac remote: $*" >&2; }
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 
 host=${RAC_REMOTE_HOST:-kainoas-macbook-pro}
 # A host starting with - or holding spaces would reach ssh as options.
@@ -1034,17 +1045,26 @@ check_run_arg() {
 }
 
 cmd_run() {
-  local name=$1 timeout=90
+  local name=$1 timeout=90 requests='' outputs='' fresh=0 checked
   shift
   while [ $# -gt 0 ]; do
     case "$1" in
+      --requests-file)
+        [ $# -ge 2 ] || die "run: --requests-file needs a file on this Mac"
+        # The checked line, then one `file REL` / `dir REL` per path in it.
+        checked=$(python3 "$here/remote_requests.py" "$2") || exit 2
+        requests=${checked%%$'\n'*}
+        outputs=
+        case "$checked" in *$'\n'*) outputs=${checked#*$'\n'} ;; esac
+        shift 2 ;;
+      --fresh-profile) fresh=1; shift ;;
       --timeout)
         [ $# -ge 2 ] || die "run: --timeout needs seconds"
         case "$2" in '' | *[!0-9]*) die "run: --timeout needs seconds" ;; esac
         timeout=$2
         shift 2 ;;
       --) shift; break ;;
-      *) die "usage: remote-build.sh run <worktree> [--timeout S] [-- args...]" ;;
+      *) die "usage: remote-build.sh run <worktree> [--timeout S] [--requests-file F] [--fresh-profile] [-- args...]" ;;
     esac
   done
   case "$queue_wait" in
@@ -1054,13 +1074,16 @@ cmd_run() {
   for arg in "$@"; do
     check_run_arg "$arg"
   done
-  remote "$name" "$timeout" "$queue_wait" "$@" <<'EOS'
+  remote "$name" "$timeout" "$queue_wait" "$requests" "$outputs" "$fresh" "$@" <<'EOS'
 set -e
 safe_name "$1" || { echo "rac remote: bad clone name '$1'" >&2; exit 2; }
 clone="$HOME/rac-remote/wt/$1"
 timeout=$2
 queue_wait=$3
-shift 3
+requests=$4
+outputs=$5
+fresh=$6
+shift 6
 [ -d "$clone" ] || {
   echo "rac remote: no clone at $clone; run push first" >&2
   exit 1
@@ -1074,11 +1097,23 @@ check_toolchain_record "$clone"
 # that stay inside it.
 shot=
 args=()
+# The files a requests run waits for; the first shot alone ends a plain run.
+expected=()
 for arg in "$@"; do
   case "$arg" in
     --rac-window-screenshot=*)
       shot="$clone/build/shots/${arg#--rac-window-screenshot=}"
       arg="--rac-window-screenshot=$shot" ;;
+    # Inputs rac reads Arc data from, which need absolute paths: relative
+    # to the clone, existing, and still inside it once symlinks resolve.
+    # Nothing is created for them.
+    --rac-arc-import-fixture=* | --rac-import-source-root=*)
+      input=${arg#*=}
+      [ -n "$input" ] || { echo "rac remote: refusing: ${arg%%=*} needs a path in the clone" >&2; exit 2; }
+      input="$clone/$input"
+      [ -e "$input" ] || { echo "rac remote: refusing: ${arg%%=*}: no $input" >&2; exit 2; }
+      inside_clone "$clone" "$input" || { echo "rac remote: refusing: ${arg%%=*} leaves the clone ($input)" >&2; exit 2; }
+      arg="${arg%%=*}=$input" ;;
   esac
   args+=("$arg")
 done
@@ -1103,6 +1138,54 @@ if [ -n "$shot" ]; then
   }
   # A shot left by an earlier run would end the wait at once.
   rm -f "$shot"
+fi
+if [ -n "$requests" ]; then
+  # The Air checked the line and listed every path in it, each relative to
+  # build/shots and marked @SHOTS@ in the line. The harness splits on
+  # spaces, so the clone's own path has to be one plain word.
+  case "$clone" in
+    *[!A-Za-z0-9._/-]*)
+      echo "rac remote: refusing: requests need a clone path without spaces or symbols ($clone)" >&2
+      exit 2 ;;
+  esac
+  shots="$clone/build/shots"
+  for dir in "$shots" "$clone/build/req"; do
+    [ ! -L "$dir" ] || { echo "rac remote: refusing: $dir is a symlink" >&2; exit 2; }
+    inside_clone "$clone" "$dir" || { echo "rac remote: refusing: $dir leaves the clone" >&2; exit 2; }
+    mkdir -p "$dir"
+  done
+  # Each destination stays in the clone before and after its folder is
+  # made. Read from the list, never by splitting the line: typed text in
+  # it would glob. `expect` files are the screenshots the run waits for.
+  while read -r kind rel; do
+    [ -n "$kind" ] || continue
+    case "$rel" in
+      '' | /* | *[!A-Za-z0-9._/-]* | . | .. | ./* | ../* | */. | */.. | */./* | */../* | *//*)
+        echo "rac remote: refusing: bad requests path '$rel'" >&2
+        exit 2 ;;
+    esac
+    word="$shots/$rel"
+    inside_clone "$clone" "$word" || { echo "rac remote: refusing: $word leaves the clone" >&2; exit 2; }
+    case "$kind" in
+      dir) mkdir -p "$word" ;;
+      file | expect) mkdir -p "$(dirname "$word")" ;;
+      *) echo "rac remote: refusing: bad requests output '$kind'" >&2; exit 2 ;;
+    esac
+    inside_clone "$clone" "$word" || { echo "rac remote: refusing: $word leaves the clone" >&2; exit 2; }
+    # A shot left by an earlier run would look like this run's.
+    case "$kind/$word" in file/*.png | expect/*) rm -f "$word" ;; esac
+    [ "$kind" != expect ] || expected+=("$word")
+  done <<<"$outputs"
+  requests=${requests//@SHOTS@/$shots}
+  # Write beside the file and rename, so the polling harness never reads
+  # half a line; remove both names first so neither can be a symlink the
+  # write or the rename would follow.
+  req="$clone/build/req/req.txt"
+  rm -f "$req.tmp" "$req"
+  (set -C; printf '%s\n' "$requests" > "$req.tmp")
+  mv -f "$req.tmp" "$req"
+  args+=("--rac-window-screenshot-requests=$req")
+  [ -z "$shot" ] || expected+=("$shot")
 fi
 # Every process running from the clone's app, never anything else.
 app="$clone/build/src/out/Default/rac.app/"
@@ -1156,6 +1239,22 @@ stop_own() {
     kill -9 -- "-$p" 2>/dev/null || true
   done
 }
+if [ "$fresh" = 1 ]; then
+  # Only the clone's own throwaway profile, the --user-data-dir worktree.sh
+  # run gives it, and never one a running browser holds.
+  [ -n "$clone" ] && [ "$clone" != / ] || { echo "rac remote: refusing: no clone path" >&2; exit 2; }
+  profile="$clone/build/profile"
+  for dir in "$clone/build" "$profile"; do
+    [ ! -L "$dir" ] || { echo "rac remote: refusing --fresh-profile: $dir is a symlink" >&2; exit 2; }
+  done
+  inside_clone "$clone" "$profile" || { echo "rac remote: refusing --fresh-profile: $profile leaves the clone" >&2; exit 2; }
+  [ -z "$(clone_pids)" ] || {
+    echo "rac remote: refusing --fresh-profile: a browser from this clone is running" >&2
+    exit 2
+  }
+  rm -rf -- "$profile"
+  echo "rac remote: deleted $profile" >&2
+fi
 launcher=
 browser_pids=
 spawned=
@@ -1179,6 +1278,14 @@ spawned=$launcher
 end=
 deadline=$((SECONDS + queue_wait + timeout))
 last=-1
+settled_at=0
+# The expected files not yet written, one per line.
+missing_outputs() {
+  local f
+  for f in ${expected[@]+"${expected[@]}"}; do
+    [ -s "$f" ] || printf '%s\n' "$f"
+  done
+}
 while [ "$SECONDS" -lt "$deadline" ]; do
   fam=$(family_pids)
   [ -n "$fam" ] && spawned=$fam
@@ -1192,6 +1299,19 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     fi
   elif [ "$SECONDS" -ge "$end" ]; then
     break
+  elif [ -n "$requests" ]; then
+    # The harness only reads requests after the first shot, so a requests
+    # run ends when every file it expects is there and none has changed
+    # size for 2s. With none expected, it runs to the timeout.
+    if [ "${#expected[@]}" -gt 0 ] && [ -z "$(missing_outputs)" ]; then
+      sizes=$(stat -f %z "${expected[@]}" 2>/dev/null | tr '\n' ' ' || true)
+      if [ "$sizes" != "$last" ]; then
+        last=$sizes
+        settled_at=$SECONDS
+      elif [ $((SECONDS - settled_at)) -ge 2 ]; then
+        break
+      fi
+    fi
   elif [ -n "$shot" ] && [ -f "$shot" ]; then
     size=$(stat -f %z "$shot" 2>/dev/null || echo 0)
     # Settled: a real file whose size stopped changing between checks.
@@ -1217,6 +1337,12 @@ if [ -z "$launched" ]; then
   exit 1
 fi
 [ "$killed" = 0 ] || status=0
+missing=$(missing_outputs)
+if [ -n "$requests" ] && [ -n "$missing" ]; then
+  echo "rac remote: after ${timeout}s, still no:" >&2
+  printf '%s\n' "$missing" | sed 's/^/  /' >&2
+  exit 1
+fi
 if [ -n "$shot" ]; then
   if [ -s "$shot" ]; then
     echo "rac remote: screenshot: $shot" >&2
@@ -1342,7 +1468,7 @@ case "${1:-}" in
     shift 2
     cmd_build "$name" "$@" ;;
   run)
-    [ $# -ge 2 ] || die "usage: remote-build.sh run <worktree> [--timeout S] [-- args...]"
+    [ $# -ge 2 ] || die "usage: remote-build.sh run <worktree> [--timeout S] [--requests-file F] [--fresh-profile] [-- args...]"
     name=$(clone_name "$2")
     shift 2
     cmd_run "$name" "$@" ;;

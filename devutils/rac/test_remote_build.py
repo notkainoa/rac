@@ -153,6 +153,34 @@ if [ "$1" = "run" ]; then
     sleep "${SHOT_DELAY:-1}"
     echo png > "$shot"
   fi
+  # Like the harness, read the requests only after the first shot, then
+  # write the screenshots they name REQ_DELAY later, all but REQ_SKIP.
+  req=
+  for arg in "$@"; do
+    case "$arg" in --rac-window-screenshot-requests=*) req="${arg#*=}" ;; esac
+  done
+  if [ -n "$req" ]; then
+    (sleep "${REQ_DELAY:-0}"; python3 - "$req" <<'PY'
+import os, sys
+skip = os.environ.get('REQ_SKIP', '')
+for request in open(sys.argv[1]).read().strip().split(' ; '):
+    words = request.split()
+    while len(words) > 2 and words[0] == 'after':
+        words = words[2:]
+    outs = []
+    if len(words) == 1 and words[0].endswith('.png'):
+        outs = [words[0]]
+    elif words[0] == 'capture-window':
+        outs = [words[2]]
+    elif words[0] == 'burst':
+        outs = [f'{words[1]}/f{i:02d}.png' for i in range(int(words[2]))]
+    for out in outs:
+        if not (skip and out.endswith(skip)):
+            with open(out, 'w') as f:
+                f.write('png\\n')
+PY
+    ) &
+  fi
   # Stand in for the browser: a sleeper titled with this clone's app path
   # so the run command's pgrep finds it and nothing else.
   exec bash -c 'exec -a "$1" sleep 600' _ \
@@ -1340,6 +1368,218 @@ class RunTest(RemoteBuildTest):
         self.assertIsNone(survivor.returncode)
         self.assertIsNone(rogue.poll())
 
+    def test_run_writes_a_checked_requests_file(self):
+        # The line's paths are relative on the Air and land, absolute, in the
+        # clone's build/shots on the Pro; the browser gets the file's path.
+        req = self.folder / 'req.txt'
+        write(req, 'after 500 nspress t cmd ; after 900 nstype quokka/x ; '
+                   'after 1500 bar/first.png ; burst frames 3 100\n')
+        shot = self.clone / 'build/shots/x.png'
+        self.run_rb('run', self.wt, '--timeout', '30', '--requests-file', req,
+                    '--', '--rac-window-screenshot=x.png', success=True)
+        written = (self.clone / 'build/req/req.txt').read_text()
+        shots = f'{os.path.realpath(self.clone)}/build/shots'
+        self.assertIn(f'after 1500 {shots}/bar/first.png', written)
+        self.assertIn(f'burst {shots}/frames 3 100', written)
+        self.assertIn('nstype quokka/x', written)
+        self.assertNotIn('@SHOTS@', written)
+        self.assertTrue((self.clone / 'build/shots/bar').is_dir())
+        # The harness writes a burst's frames into DIR without making it.
+        self.assertTrue((self.clone / 'build/shots/frames').is_dir())
+        self.assertIn(f'--rac-window-screenshot-requests={os.path.realpath(self.clone)}'
+                      '/build/req/req.txt', self.log.read_text())
+        self.assertTrue(shot.exists())
+
+    def test_run_refuses_unsafe_requests_files(self):
+        for line in ('/tmp/x.png', '../x.png', '~/x.png', 'burst /tmp 3 100',
+                     'capture-window app /tmp/a.png', 'open-urls file:///etc/hosts',
+                     'key ../x.json', 'a.png\nb.png', '@SHOTS@/x.png',
+                     'record /tmp 500', 'after 5 unknown'):
+            req = self.folder / 'bad.txt'
+            write(req, line + '\n')
+            result = self.run_rb('run', self.wt, '--requests-file', req, success=False)
+            self.assertEqual(result.returncode, 2, line)
+            self.assertIn('requests file', result.stderr, line)
+        # Refused on the Air: nothing reached the Pro.
+        self.assertNotIn('worktree.sh run', self.log.read_text() if self.log.exists() else '')
+
+    def test_run_refuses_a_symlinked_requests_dir(self):
+        outside = self.folder / 'outside'
+        outside.mkdir()
+        (self.clone / 'build').mkdir(exist_ok=True)
+        (self.clone / 'build/req').symlink_to(outside)
+        req = self.folder / 'req.txt'
+        write(req, 'x.png\n')
+        result = self.run_rb('run', self.wt, '--requests-file', req, success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse((outside / 'req.txt').exists())
+
+    def test_run_waits_for_every_requested_shot(self):
+        # The harness reads requests only after the first shot; the run
+        # must not end on that shot while the requested ones are pending.
+        req = self.folder / 'req.txt'
+        write(req, 'after 500 a.png ; burst frames 3 100 ; '
+                   'capture-window first win.png\n')
+        shots = self.clone / 'build/shots'
+        for stale in ('a.png', 'frames/f00.png', 'win.png'):
+            write(shots / stale, 'old\n')
+        started = time.monotonic()
+        result = self.run_rb('run', self.wt, '--timeout', '30', '--requests-file', req,
+                             '--', '--rac-window-screenshot=x.png', success=True,
+                             REQ_DELAY='5')
+        self.assertGreaterEqual(time.monotonic() - started, 5, result.stderr)
+        self.assertLess(time.monotonic() - started, 30, result.stderr)
+        for name in ('x.png', 'a.png', 'frames/f00.png', 'frames/f01.png',
+                     'frames/f02.png', 'win.png'):
+            self.assertEqual((shots / name).read_text(), 'png\n', name)
+
+    def test_run_names_requested_shots_missing_at_the_timeout(self):
+        req = self.folder / 'req.txt'
+        write(req, 'after 0 a.png ; burst frames 3 100\n')
+        result = self.run_rb('run', self.wt, '--timeout', '6', '--requests-file', req,
+                             '--', '--rac-window-screenshot=x.png', success=False,
+                             REQ_SKIP='f02.png')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('still no', result.stderr)
+        self.assertIn('build/shots/frames/f02.png', result.stderr)
+        self.assertNotIn('f01.png', result.stderr)
+
+    def test_run_never_globs_typed_text(self):
+        # Typed text reaches the Pro inside the line; a `*` in it must not
+        # expand to the clone's files, and nothing it names is touched.
+        keep = self.clone / 'build/shots/keep.png'
+        write(keep, 'old\n')
+        req = self.folder / 'req.txt'
+        write(req, f'type {os.path.realpath(self.clone)}/build/shots/*.png\n')
+        self.run_rb('run', self.wt, '--timeout', '3', '--requests-file', req,
+                    success=True)
+        self.assertTrue(keep.exists())
+        written = (self.clone / 'build/req/req.txt').read_text()
+        self.assertIn('/build/shots/*.png', written)
+
+    def test_run_writes_the_requests_file_through_no_symlink(self):
+        # A planted req.txt.tmp or req.txt symlink must not redirect the
+        # write or the rename out of the clone.
+        outside = self.folder / 'outside'
+        outside.mkdir()
+        target = outside / 'victim.txt'
+        write(target, 'keep\n')
+        reqdir = self.clone / 'build/req'
+        reqdir.mkdir(parents=True)
+        (reqdir / 'req.txt.tmp').symlink_to(target)
+        (reqdir / 'req.txt').symlink_to(outside)
+        req = self.folder / 'req.txt'
+        write(req, 'x.png\n')
+        self.run_rb('run', self.wt, '--timeout', '3', '--requests-file', req,
+                    success=True)
+        self.assertEqual(target.read_text(), 'keep\n')
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ['victim.txt'])
+        self.assertFalse((reqdir / 'req.txt').is_symlink())
+
+    def test_run_refuses_requests_for_a_clone_path_with_spaces(self):
+        # The harness splits the line on spaces, so a shots path with one
+        # would reach the browser as two words.
+        self.remote_clone('odd')
+        spaced = self.remote / 'rac-remote/wt/sp ace'
+        spaced.mkdir()
+        (self.remote / 'rac-remote/wt/odd').rename(spaced / 'odd')
+        (self.remote / 'rac-remote/wt/odd').symlink_to(spaced / 'odd')
+        wt = self.make_repo(self.folder / 'odd', branch='feat/odd')
+        req = self.folder / 'req.txt'
+        write(req, 'x.png\n')
+        result = self.run_rb('run', wt, '--timeout', '3', '--requests-file', req,
+                             success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('without spaces', result.stderr)
+        self.assertFalse((spaced / 'odd/build/req/req.txt').exists())
+
+    def test_run_maps_arc_import_inputs_into_the_clone(self):
+        write(self.clone / 'devutils/fixtures/arc/StorableSidebar.json', '{}\n')
+        (self.clone / 'build/arc-root').mkdir(parents=True)
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    '--rac-arc-import-fixture=devutils/fixtures/arc/StorableSidebar.json',
+                    '--rac-import-source-root=build/arc-root', success=True)
+        clone = os.path.realpath(self.clone)
+        calls = self.calls()
+        self.assertIn('--rac-arc-import-fixture='
+                      f'{clone}/devutils/fixtures/arc/StorableSidebar.json', calls)
+        self.assertIn(f'--rac-import-source-root={clone}/build/arc-root', calls)
+
+    def test_run_refuses_arc_import_inputs_outside_the_clone(self):
+        outside = self.folder / 'outside'
+        outside.mkdir()
+        write(outside / 'StorableSidebar.json', '{}\n')
+        (self.clone / 'escape').symlink_to(outside)
+        for args, why in [
+            (('--rac-arc-import-fixture=escape/StorableSidebar.json',), 'leaves the clone'),
+            (('--rac-import-source-root=escape',), 'leaves the clone'),
+            (('--rac-arc-import-fixture=missing.json',), 'no '),
+            (('--rac-import-source-root=build/none',), 'no '),
+            (('--rac-import-source-root=',), 'needs a path'),
+        ]:
+            result = self.run_rb('run', self.wt, '--timeout', '3', '--', *args,
+                                 success=False)
+            self.assertEqual(result.returncode, 2, (args, result.stderr))
+            self.assertIn(why, result.stderr, args)
+        self.assertNotIn('worktree.sh run', self.calls())
+        # Inputs are only read: nothing was made for the missing ones.
+        self.assertFalse((self.clone / 'build/none').exists())
+        # On the Air, absolute, ~ and .. values stay refused.
+        for value in ('/tmp/x.json', '~/x.json', '../x.json'):
+            result = self.run_rb('run', self.wt, '--',
+                                 f'--rac-arc-import-fixture={value}', success=False)
+            self.assertEqual(result.returncode, 2, value)
+
+    def test_run_fresh_profile_deletes_only_the_clones_profile(self):
+        # Data's import test: a clean profile and a source root in the clone.
+        write(self.clone / 'build/profile/Default/Preferences', '{}\n')
+        keep = self.clone / 'build/shots/keep.png'
+        write(keep, 'old\n')
+        sample = 'build/src/chrome/test/data/rac/import/arc/maintainer_sample'
+        (self.clone / sample).mkdir(parents=True)
+        result = self.run_rb('run', self.wt, '--timeout', '3', '--fresh-profile',
+                             '--', f'--rac-import-source-root={sample}', success=True)
+        self.assertFalse((self.clone / 'build/profile').exists(), result.stderr)
+        self.assertTrue(keep.exists())
+        self.assertIn(f'--rac-import-source-root={os.path.realpath(self.clone)}/{sample}',
+                      self.calls())
+
+    def test_run_fresh_profile_refuses_a_symlinked_profile(self):
+        outside = self.folder / 'outside'
+        write(outside / 'Default/Preferences', 'keep\n')
+        (self.clone / 'build').mkdir()
+        (self.clone / 'build/profile').symlink_to(outside)
+        result = self.run_rb('run', self.wt, '--timeout', '3', '--fresh-profile',
+                             success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('symlink', result.stderr)
+        self.assertEqual((outside / 'Default/Preferences').read_text(), 'keep\n')
+        self.assertTrue((self.clone / 'build/profile').is_symlink())
+        self.assertNotIn('worktree.sh run', self.calls())
+
+    def test_run_fresh_profile_refuses_a_symlinked_build_dir(self):
+        outside = self.folder / 'outside'
+        write(outside / 'profile/Default/Preferences', 'keep\n')
+        (self.clone / 'build').symlink_to(outside)
+        result = self.run_rb('run', self.wt, '--timeout', '3', '--fresh-profile',
+                             success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertTrue((outside / 'profile/Default/Preferences').exists())
+
+    def test_run_fresh_profile_refuses_while_a_clone_browser_runs(self):
+        write(self.clone / 'build/profile/Default/Preferences', '{}\n')
+        app = f'{self.clone}/build/src/out/Default/rac.app/'
+        running = subprocess.Popen(
+            ['bash', '-c', 'exec -a "$1" sleep 300', '_', f'{app}Contents/MacOS/rac'])
+        self.addCleanup(lambda: (running.kill(), running.wait()))
+        time.sleep(0.3)
+        result = self.run_rb('run', self.wt, '--timeout', '3', '--fresh-profile',
+                             success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('is running', result.stderr)
+        self.assertTrue((self.clone / 'build/profile/Default/Preferences').exists())
+        self.assertIsNone(running.poll())
+
     def test_run_ignores_a_stale_screenshot(self):
         # An earlier run's shot must not end the wait before the new one.
         write(self.clone / 'build/shots/x.png', 'old\n')
@@ -1635,6 +1875,78 @@ class DryRunTest(RemoteBuildTest):
         result = self.run_rb('--dry-run', 'push', wt, success=True)
         self.assertIn('push --force', result.stderr)
         self.assertFalse((self.remote_root / 'wt/sync-wt').exists())
+
+
+class RemoteRequestsTest(unittest.TestCase):
+    """remote_requests.py against the harness's grammar (window_screenshot.mm
+    and dev/*): every path it writes is marked, and nothing it can't
+    recognise passes."""
+
+    def setUp(self):
+        sys.path.insert(0, str(HERE))
+        self.addCleanup(sys.path.remove, str(HERE))
+        import remote_requests
+        self.rr = remote_requests
+
+    def ok(self, line):
+        return self.rr.check_line(line)
+
+    def refused(self, line):
+        with self.assertRaises(self.rr.Refused, msg=repr(line)):
+            self.rr.check_line(line)
+
+    def test_marks_every_path_the_harness_writes(self):
+        for line, out, outputs in [
+            ('a/b.png', '@SHOTS@/a/b.png', ['expect a/b.png']),
+            ('hit 10 20 views.txt', 'hit 10 20 @SHOTS@/views.txt', ['file views.txt']),
+            ('windows list', 'windows @SHOTS@/list', ['file list']),
+            ('record rec 500 0.5', 'record @SHOTS@/rec 500 0.5', ['dir rec']),
+            ('burst b 3 100', 'burst @SHOTS@/b 3 100',
+             ['dir b', 'expect b/f00.png', 'expect b/f01.png', 'expect b/f02.png']),
+            ('burst b 0 100', 'burst @SHOTS@/b 0 100', ['dir b']),
+            ('capture-window app:x c.png', 'capture-window app:x @SHOTS@/c.png',
+             ['expect c.png']),
+            ('after 5 after 6 d.png', 'after 5 after 6 @SHOTS@/d.png', ['expect d.png']),
+            ('click 1 2 ; after 10 e.png', 'click 1 2 ; after 10 @SHOTS@/e.png',
+             ['expect e.png']),
+        ]:
+            self.assertEqual(self.ok(line), (out, outputs), line)
+
+    def test_passes_input_verbs_unchanged(self):
+        for line in ('command 34000', 'move 1 2', 'click -1 2', 'wheel 1 2 -3',
+                     'key escape', 'nspress t cmd,shift', 'nspress pagedown',
+                     'nskey tab down ctrl', 'nsflags none', 'swipe 1 2 end',
+                     'swipe 1 2 -4.5 10 hold', 'appearance dark', 'contrast on',
+                     'space-theme 3 dark', 'space-theme -', 'space-new',
+                     'pointer off', 'pointer 1.5 2', 'pointer-path 0 0 10 10 200',
+                     'target name:x', 'target #2', 'profile-window Profile_2',
+                     'open-urls https://example.com/a?b chrome://settings about:blank',
+                     'type hello / world.png ~', 'nstype a*b'):
+            self.assertEqual(self.ok(line), (line, []), line)
+
+    def test_refuses_what_the_harness_would_misread(self):
+        for line in [
+            # Whitespace the harness keeps inside a word would let the
+            # checker see one request (typed text) where it sees two.
+            'type\u00a0;\u00a0after 0 x.png', 'type a\u2003; b.png',
+            # An `after` whose request the harness doesn't recognise is
+            # captured to a file named after the request's text.
+            'after 5 unknown words', 'after 5 click a b', 'after 5 windows x',
+            'after 5 hit 1 2 x', 'after 99999999999 x.png', 'after \u00b2 x.png',
+            # Paths in every verb that writes one.
+            'hit 1 2 /tmp/x', 'windows /tmp/x', 'windows ../x', 'record /tmp 5',
+            'record ../x 5', 'burst ~/x 1 1', 'capture-window app ../x.png',
+            'capture-window app x.txt', 'x.PNG', 'a//b.png', './a.png',
+            # Downloads land outside the clone.
+            'open-urls data:application/octet-stream,x', 'open-urls javascript:x',
+            'open-urls file:///etc/hosts', 'open-urls example.com',
+            # Unknown verbs and arguments, a bare PNG among several requests,
+            # a lone ';' in typed text, and too many burst frames.
+            'rm x', 'click 1', 'key ../x.json', 'appearance x', 'a.png ; b.png',
+            'type a ; ; b.png', 'nstype ;', 'burst b 100000 1', 'hit 1 2 x ; key tab',
+            '', 'x.png\ny.png', '@SHOTS@/x.png', 'type a\tb',
+        ]:
+            self.refused(line)
 
 
 if __name__ == '__main__':
