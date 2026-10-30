@@ -2979,7 +2979,7 @@ chrome/browser/rac/import/BUILD.gn.
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_source_root.cc
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,108 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -2989,9 +2989,14 @@ chrome/browser/rac/import/BUILD.gn.
 +#include "chrome/browser/rac/dev/buildflags.h"
 +
 +#if BUILDFLAG(RAC_DEV_SWITCHES)
++#include <optional>
++#include <string>
++
 +#include "base/command_line.h"
 +#include "base/files/file_path.h"
++#include "base/files/file_util.h"
 +#include "base/logging.h"
++#include "base/strings/string_util.h"
 +#endif
 +
 +namespace rac {
@@ -3005,30 +3010,87 @@ chrome/browser/rac/import/BUILD.gn.
 +
 +}  // namespace
 +
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++namespace internal {
++
++std::optional<base::FilePath> SafeDevSourceRoot(
++    const base::FilePath& root,
++    const base::FilePath& real_arc_dir) {
++  if (!root.IsAbsolute()) {
++    LOG(ERROR) << "--" << kImportSourceRootSwitch
++               << " needs an absolute path";
++    return std::nullopt;
++  }
++  // Resolves symlinks and "..". Only the given root is looked at; the real
++  // Arc folder is compared by its path and never opened.
++  const base::FilePath resolved = base::MakeAbsoluteFilePath(root);
++  if (resolved.empty() || !base::DirectoryExists(resolved)) {
++    LOG(ERROR) << "--" << kImportSourceRootSwitch
++               << " must be an existing folder";
++    return std::nullopt;
++  }
++  // The Mac's disk is usually case-insensitive, so compare that way.
++  const std::string candidate = base::ToLowerASCII(resolved.value());
++  const std::string real = base::ToLowerASCII(real_arc_dir.value());
++  if (candidate == real ||
++      base::StartsWith(candidate, real + "/", base::CompareCase::SENSITIVE)) {
++    LOG(ERROR) << "--" << kImportSourceRootSwitch
++               << " points at the real Arc folder; reading nothing";
++    return std::nullopt;
++  }
++  return resolved;
++}
++
++}  // namespace internal
++
++namespace {
++
++base::FilePath RealArcSupportDirForComparison() {
++  // The home folder is resolved, so a symlinked home still matches. The Arc
++  // folder under it is only ever a string here.
++  base::FilePath home = base::MakeAbsoluteFilePath(base::GetHomeDir());
++  if (home.empty()) {
++    home = base::GetHomeDir();
++  }
++  return home.Append(FILE_PATH_LITERAL("Library"))
++      .Append(FILE_PATH_LITERAL("Application Support"))
++      .Append(FILE_PATH_LITERAL("Arc"));
++}
++
++}  // namespace
++#endif  // BUILDFLAG(RAC_DEV_SWITCHES)
++
 +ArcSourcePaths GetArcSourcePaths() {
 +#if BUILDFLAG(RAC_DEV_SWITCHES)
 +  const base::CommandLine& command_line =
 +      *base::CommandLine::ForCurrentProcess();
 +  if (command_line.HasSwitch(kImportSourceRootSwitch)) {
-+    const base::FilePath root =
-+        command_line.GetSwitchValuePath(kImportSourceRootSwitch);
-+    if (root.IsAbsolute()) {
-+      return ArcSourcePaths::ForSourceRoot(root);
++    std::optional<base::FilePath> root = internal::SafeDevSourceRoot(
++        command_line.GetSwitchValuePath(kImportSourceRootSwitch),
++        RealArcSupportDirForComparison());
++    if (root) {
++      return ArcSourcePaths::ForSourceRoot(*root);
 +    }
 +    // Never fall back to the real Arc when a copy was asked for. ReadArc()
 +    // finds nothing at empty paths.
-+    LOG(ERROR) << "--" << kImportSourceRootSwitch
-+               << " needs an absolute path";
 +    return ArcSourcePaths();
 +  }
 +#endif
 +  return ArcSourcePaths::ForCurrentUser();
 +}
 +
++bool HasDevArcSourceRootSwitch(const base::CommandLine& command_line) {
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++  return command_line.HasSwitch(kImportSourceRootSwitch);
++#else
++  return false;
++#endif
++}
++
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_source_root.h
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,52 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -3036,7 +3098,15 @@ chrome/browser/rac/import/BUILD.gn.
 +#ifndef CHROME_BROWSER_RAC_IMPORT_ARC_SOURCE_ROOT_H_
 +#define CHROME_BROWSER_RAC_IMPORT_ARC_SOURCE_ROOT_H_
 +
++#include <optional>
++
++#include "base/files/file_path.h"
++#include "chrome/browser/rac/dev/buildflags.h"
 +#include "chrome/browser/rac/import/arc_reader.h"
++
++namespace base {
++class CommandLine;
++}  // namespace base
 +
 +namespace rac {
 +
@@ -3044,14 +3114,38 @@ chrome/browser/rac/import/BUILD.gn.
 +// `--rac-import-source-root=<absolute dir>` points it at a copy laid out like
 +// Arc's support folder instead (ArcSourcePaths::ForSourceRoot()), such as a
 +// scrubbed sample. Release builds don't have the switch.
++//
++// In dev builds the copy must be an existing folder, given as an absolute
++// path, that isn't the current user's real Arc folder or inside it (symlinks
++// are resolved; the real folder is compared by path and never opened). Any
++// other value reads nothing, never the real Arc. Checking the copy touches
++// the disk, so call this where blocking is allowed.
 +ArcSourcePaths GetArcSourcePaths();
++
++// Whether the process was given --rac-import-source-root, without checking
++// its value or touching the disk. The dev import trigger refuses to start
++// without it. Always false in release builds.
++bool HasDevArcSourceRootSwitch(const base::CommandLine& command_line);
++
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++namespace internal {
++
++// The checks above, with the real Arc folder passed in so tests can stand in
++// a temporary one. Returns the resolved copy, or nullopt if it must not be
++// read.
++std::optional<base::FilePath> SafeDevSourceRoot(
++    const base::FilePath& root,
++    const base::FilePath& real_arc_dir);
++
++}  // namespace internal
++#endif  // BUILDFLAG(RAC_DEV_SWITCHES)
 +
 +}  // namespace rac
 +
 +#endif  // CHROME_BROWSER_RAC_IMPORT_ARC_SOURCE_ROOT_H_
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_source_root_unittest.cc
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,153 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -3060,6 +3154,9 @@ chrome/browser/rac/import/BUILD.gn.
 +
 +#include "base/command_line.h"
 +#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/strings/string_util.h"
 +#include "base/test/scoped_command_line.h"
 +#include "chrome/browser/rac/dev/buildflags.h"
 +#include "testing/gtest/include/gtest/gtest.h"
@@ -3083,8 +3180,10 @@ chrome/browser/rac/import/BUILD.gn.
 +#if BUILDFLAG(RAC_DEV_SWITCHES)
 +
 +TEST(ArcSourceRootTest, SwitchPointsAtCopy) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath root = base::MakeAbsoluteFilePath(temp.GetPath());
 +  base::test::ScopedCommandLine command_line;
-+  const base::FilePath root("/tmp/rac-arc-sample");
 +  command_line.GetProcessCommandLine()->AppendSwitchPath(kSwitch, root);
 +  ArcSourcePaths paths = GetArcSourcePaths();
 +  EXPECT_EQ(paths.support_dir, root);
@@ -3100,6 +3199,90 @@ chrome/browser/rac/import/BUILD.gn.
 +  ArcSourcePaths paths = GetArcSourcePaths();
 +  EXPECT_TRUE(paths.support_dir.empty());
 +  EXPECT_TRUE(paths.defaults_plist.empty());
++}
++
++TEST(ArcSourceRootTest, MissingFolderReadsNothing) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  base::test::ScopedCommandLine command_line;
++  command_line.GetProcessCommandLine()->AppendSwitchPath(
++      kSwitch, temp.GetPath().Append("missing"));
++  EXPECT_TRUE(GetArcSourcePaths().support_dir.empty());
++}
++
++// The dev import trigger needs the switch; without it nothing is read.
++TEST(ArcSourceRootTest, TriggerNeedsSourceRootSwitch) {
++  base::test::ScopedCommandLine command_line;
++  command_line.GetProcessCommandLine()->AppendSwitch("rac-import-arc-now");
++  EXPECT_FALSE(HasDevArcSourceRootSwitch(
++      *base::CommandLine::ForCurrentProcess()));
++  command_line.GetProcessCommandLine()->AppendSwitchPath(
++      kSwitch, base::FilePath("/x"));
++  EXPECT_TRUE(HasDevArcSourceRootSwitch(
++      *base::CommandLine::ForCurrentProcess()));
++}
++
++// A temporary folder stands in for the real Arc one, so the test never
++// touches the user's Arc data.
++class SafeDevSourceRootTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    ASSERT_TRUE(temp_.CreateUniqueTempDir());
++    base_ = base::MakeAbsoluteFilePath(temp_.GetPath());
++    real_arc_ = base_.Append("Application Support").Append("Arc");
++    ASSERT_TRUE(base::CreateDirectory(real_arc_));
++    copy_ = base_.Append("copy");
++    ASSERT_TRUE(base::CreateDirectory(copy_));
++  }
++
++  base::ScopedTempDir temp_;
++  base::FilePath base_;
++  base::FilePath real_arc_;
++  base::FilePath copy_;
++};
++
++TEST_F(SafeDevSourceRootTest, AcceptsACopy) {
++  EXPECT_EQ(internal::SafeDevSourceRoot(copy_, real_arc_), copy_);
++}
++
++TEST_F(SafeDevSourceRootTest, RefusesTheRealArcFolder) {
++  EXPECT_FALSE(internal::SafeDevSourceRoot(real_arc_, real_arc_));
++}
++
++TEST_F(SafeDevSourceRootTest, RefusesTheRealArcFolderInAnyCase) {
++  const base::FilePath upper(base::ToUpperASCII(real_arc_.value()));
++  EXPECT_FALSE(internal::SafeDevSourceRoot(real_arc_, upper));
++}
++
++TEST_F(SafeDevSourceRootTest, RefusesAFolderInsideTheRealArc) {
++  const base::FilePath inside = real_arc_.Append("User Data");
++  ASSERT_TRUE(base::CreateDirectory(inside));
++  EXPECT_FALSE(internal::SafeDevSourceRoot(inside, real_arc_));
++}
++
++TEST_F(SafeDevSourceRootTest, RefusesASymlinkToTheRealArc) {
++  const base::FilePath link = base_.Append("link");
++  ASSERT_TRUE(base::CreateSymbolicLink(real_arc_, link));
++  EXPECT_FALSE(internal::SafeDevSourceRoot(link, real_arc_));
++}
++
++TEST_F(SafeDevSourceRootTest, RefusesDotDotIntoTheRealArc) {
++  const base::FilePath sneaky =
++      copy_.Append("..").Append("Application Support").Append("Arc");
++  EXPECT_FALSE(internal::SafeDevSourceRoot(sneaky, real_arc_));
++}
++
++TEST_F(SafeDevSourceRootTest, AcceptsASiblingWithASharedPrefix) {
++  const base::FilePath sibling =
++      base_.Append("Application Support").Append("Arc copy");
++  ASSERT_TRUE(base::CreateDirectory(sibling));
++  EXPECT_EQ(internal::SafeDevSourceRoot(sibling, real_arc_), sibling);
++}
++
++TEST_F(SafeDevSourceRootTest, RefusesAFile) {
++  const base::FilePath file = base_.Append("file");
++  ASSERT_TRUE(base::WriteFile(file, "x"));
++  EXPECT_FALSE(internal::SafeDevSourceRoot(file, real_arc_));
 +}
 +
 +#else
