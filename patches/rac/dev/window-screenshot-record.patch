@@ -15,7 +15,7 @@
  
 --- /dev/null
 +++ b/chrome/browser/ui/views/rac/dev/window_record.cc
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,353 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -25,8 +25,10 @@
 +#include <algorithm>
 +#include <memory>
 +#include <optional>
++#include <string_view>
 +#include <utility>
 +
++#include "base/files/file_enumerator.h"
 +#include "base/files/file_path.h"
 +#include "base/files/file_util.h"
 +#include "base/functional/bind.h"
@@ -35,6 +37,7 @@
 +#include "base/memory/weak_ptr.h"
 +#include "base/scoped_observation.h"
 +#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
 +#include "base/strings/stringprintf.h"
 +#include "base/task/sequenced_task_runner.h"
 +#include "base/task/thread_pool.h"
@@ -82,9 +85,44 @@
 +  }
 +  if (!base::WriteFile(path, *png)) {
 +    LOG(ERROR) << "rac window screenshot write failed: " << path;
++    // A half-written frame must not stay behind like a captured one.
++    base::DeleteFile(path);
 +    return false;
 +  }
 +  return true;
++}
++
++// Frame files are named f%04d.png (and wider past frame 9999), so a name is
++// f, four or more digits, .png -- nothing else may be deleted as one.
++bool IsFrameFileName(std::string_view name) {
++  if (name.size() < std::string_view("f0000.png").size() ||
++      name.front() != 'f' || !name.ends_with(".png")) {
++    return false;
++  }
++  for (char c :
++       name.substr(1, name.size() - std::string_view("f.png").size())) {
++    if (!base::IsAsciiDigit(c)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// Creates the recording's dir, drops an earlier recording's frames from it,
++// and starts a fresh frames.jsonl. Runs on the recording's write sequence.
++bool PrepareDir(const base::FilePath& dir) {
++  if (!base::CreateDirectory(dir)) {
++    return false;
++  }
++  base::FileEnumerator files(dir, /*recursive=*/false,
++                             base::FileEnumerator::FILES,
++                             FILE_PATH_LITERAL("f*.png"));
++  for (base::FilePath path = files.Next(); !path.empty(); path = files.Next()) {
++    if (IsFrameFileName(path.BaseName().AsUTF8Unsafe())) {
++      base::DeleteFile(path);
++    }
++  }
++  return base::WriteFile(dir.AppendASCII("frames.jsonl"), "");
 +}
 +
 +// Records one window's frames for a fixed time, then writes a last "done"
@@ -100,20 +138,13 @@
 +        dir_(std::move(dir)),
 +        scale_(scale),
 +        log_(base::ThreadPool::CreateSequencedTaskRunner(kWriteTraits)) {
-+    log_->PostTask(FROM_HERE, base::BindOnce(
-+                                  [](const base::FilePath& dir) {
-+                                    base::CreateDirectory(dir);
-+                                    base::WriteFile(
-+                                        dir.AppendASCII("frames.jsonl"), "");
-+                                  },
-+                                  dir_));
 +    widget_observation_.Observe(widget);
-+    compositor_observation_.Observe(widget->GetCompositor());
-+    // Its own deadline, since commits stop when the window can't draw.
-+    deadline_.Start(FROM_HERE, duration,
-+                    base::BindOnce(&Recorder::Finish, base::Unretained(this)));
-+    LOG(ERROR) << "rac window record started -> " << dir_;
-+    RequestFrame();
++    // Capture starts when the dir is ready, so a frame is never written
++    // before its folder exists.
++    log_->PostTaskAndReplyWithResult(
++        FROM_HERE, base::BindOnce(&PrepareDir, dir_),
++        base::BindOnce(&Recorder::OnDirReady, weak_factory_.GetWeakPtr(),
++                       duration));
 +  }
 +
 +  // ui::CompositorObserver:
@@ -133,6 +164,27 @@
 +  void OnWidgetDestroying(views::Widget* widget) override { Abandon(); }
 +
 + private:
++  // Runs on the UI sequence once the write sequence has the dir ready.
++  void OnDirReady(base::TimeDelta duration, bool ready) {
++    if (!ready) {
++      LOG(ERROR) << "rac window record: cannot write to " << dir_;
++      // Deleted at once: a posted delete would leave the widget observed,
++      // and Abandon() would post a second one if the window closed first.
++      delete this;
++      return;
++    }
++    if (widget_->IsClosed() || !widget_->GetCompositor()) {
++      Abandon();
++      return;
++    }
++    compositor_observation_.Observe(widget_->GetCompositor());
++    // Its own deadline, since commits stop when the window can't draw.
++    deadline_.Start(FROM_HERE, duration,
++                    base::BindOnce(&Recorder::Finish, base::Unretained(this)));
++    LOG(ERROR) << "rac window record started -> " << dir_;
++    RequestFrame();
++  }
++
 +  void RequestFrame() {
 +    if (finished_) {
 +      return;
@@ -177,8 +229,7 @@
 +               std::unique_ptr<viz::CopyOutputResult> result) {
 +    const base::TimeTicks now = base::TimeTicks::Now();
 +    if (!result || result->IsEmpty()) {
-+      ++skipped_;
-+      OnWritten(bytes, std::string());
++      OnWritten(bytes, std::string(), /*written=*/false);
 +      return;
 +    }
 +    SkBitmap bitmap = result->ScopedAccessSkBitmap().GetOutScopedBitmap();
@@ -189,11 +240,11 @@
 +        static_cast<long long>(Micros(now)), bitmap.width(), bitmap.height(),
 +        skipped_);
 +    // Frames encode in parallel; each line is logged once its PNG exists.
-+    base::ThreadPool::PostTaskAndReply(
++    base::ThreadPool::PostTaskAndReplyWithResult(
 +        FROM_HERE, kWriteTraits,
 +        base::BindOnce(
 +            [](SkBitmap bitmap, base::FilePath path) {
-+              EncodeAndWrite(bitmap, path, /*fast=*/true);
++              return EncodeAndWrite(bitmap, path, /*fast=*/true);
 +            },
 +            std::move(bitmap),
 +            dir_.AppendASCII(base::StringPrintf("f%04d.png", index))),
@@ -201,10 +252,12 @@
 +                       std::move(line)));
 +  }
 +
-+  void OnWritten(int64_t bytes, std::string line) {
++  void OnWritten(int64_t bytes, std::string line, bool written) {
 +    --pending_;
 +    pending_bytes_ -= bytes;
-+    if (!line.empty()) {
++    if (!written) {
++      ++skipped_;
++    } else {
 +      log_->PostTask(FROM_HERE,
 +                     base::BindOnce(
 +                         [](base::FilePath path, std::string line) {
