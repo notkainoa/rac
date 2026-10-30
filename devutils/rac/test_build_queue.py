@@ -18,6 +18,7 @@ import fcntl
 import importlib.util
 import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -81,6 +82,35 @@ def boom(self):
     raise RuntimeError('planted bug')
 build_queue.Queue.update_holders = boom
 sys.exit(build_queue.main(sys.argv[1:]))
+'''
+
+# Writes a line to fd argv[1], closes it, then waits for a release file.
+# The pipe's other end sees EOF only once every other copy of the write
+# fd is gone too.
+FD_CLOSER = '''
+import os, pathlib, sys, time
+os.write(int(sys.argv[1]), b'ready')
+os.close(int(sys.argv[1]))
+while not pathlib.Path(sys.argv[2]).exists():
+    time.sleep(0.02)
+'''
+
+# Lists its open fds, then echoes a pipe read on argv[1] to a write on
+# argv[2], like a --remote-debugging-pipe client. Skips the echo when the
+# fds never arrived.
+FD_PROBE = '''
+import os, sys
+read_fd, write_fd = int(sys.argv[1]), int(sys.argv[2])
+open_fds = []
+for fd in range(3, 256):
+    try:
+        os.fstat(fd)
+    except OSError:
+        continue
+    open_fds.append(fd)
+print(f'open fds {open_fds}', flush=True)
+if read_fd in open_fds and write_fd in open_fds:
+    os.write(write_fd, os.read(read_fd, 64))
 '''
 
 PROGRESS = '[0/100] 0.01s S CXX obj/fake.o'
@@ -640,6 +670,84 @@ class QueueTest(unittest.TestCase):
         result = self.queue('/nonexistent/command')
         self.assertEqual(result.returncode, 127)
         self.assertEqual(self.held(), [])
+
+    # File descriptors.
+
+    def fd_pair(self):
+        """Pipes a queued command reads and writes, plus the test's ends."""
+        command_read, test_write = os.pipe()
+        test_read, command_write = os.pipe()
+        for fd in (command_read, command_write, test_write, test_read):
+            self.addCleanup(os.close, fd)
+        return command_read, command_write, test_write, test_read
+
+    def test_pass_fds_reach_the_command(self):
+        for options in ((), ('--run',)):
+            with self.subTest(options=options):
+                read_fd, write_fd, test_write, test_read = self.fd_pair()
+                proc = self.popen(
+                    [str(QUEUE), *options, '--pass-fds',
+                     f'{read_fd},{write_fd}', sys.executable, '-c', FD_PROBE,
+                     str(read_fd), str(write_fd)],
+                    pass_fds=(read_fd, write_fd))
+                os.write(test_write, b'ping')
+                ready, _, _ = select.select([test_read], [], [], 15)
+                self.assertTrue(ready)
+                self.assertEqual(os.read(test_read, 64), b'ping')
+                out, _ = proc.communicate(timeout=10)
+                self.assertEqual(proc.returncode, 0, out)
+                # Only the passed fds arrive; the queue's lock files stay
+                # close-on-exec.
+                self.assertIn(f'open fds {sorted((read_fd, write_fd))}', out)
+
+    def test_queue_drops_its_copies_of_pass_fds(self):
+        for options in ((), ('--run',)):
+            with self.subTest(options=options):
+                read_fd, write_fd = os.pipe()
+                self.addCleanup(os.close, read_fd)
+                release = self.tmp / f'release-eof-{len(options)}'
+                proc = self.popen(
+                    [str(QUEUE), *options, '--pass-fds', str(write_fd),
+                     sys.executable, '-c', FD_CLOSER, str(write_fd),
+                     str(release)],
+                    pass_fds=(write_fd,))
+                # The caller's own copy is gone before the child runs.
+                os.close(write_fd)
+                ready, _, _ = select.select([read_fd], [], [], 15)
+                self.assertTrue(ready)
+                self.assertEqual(os.read(read_fd, 64), b'ready')
+                # The child closed its end but is still running. EOF only
+                # arrives if the queue dropped its own copy too.
+                ready, _, _ = select.select([read_fd], [], [], 10)
+                self.assertTrue(ready)
+                self.assertEqual(os.read(read_fd, 64), b'')
+                release.touch()
+                out, _ = proc.communicate(timeout=10)
+                self.assertEqual(proc.returncode, 0, out)
+
+    def test_fds_stay_closed_without_pass_fds(self):
+        for options in ((), ('--run',)):
+            with self.subTest(options=options):
+                read_fd, write_fd, _, _ = self.fd_pair()
+                proc = self.popen(
+                    [str(QUEUE), *options, sys.executable, '-c', FD_PROBE,
+                     str(read_fd), str(write_fd)],
+                    pass_fds=(read_fd, write_fd))
+                out, _ = proc.communicate(timeout=15)
+                self.assertEqual(proc.returncode, 0, out)
+                self.assertIn('open fds []', out)
+
+    def test_pass_fds_refuses_bad_values(self):
+        read_fd, write_fd = os.pipe()
+        closed = fcntl.fcntl(read_fd, fcntl.F_DUPFD_CLOEXEC, 100)
+        for fd in (read_fd, write_fd, closed):
+            os.close(fd)
+        for value in ('2', 'abc', str(closed), '2147483648'):
+            with self.subTest(value=value):
+                result = self.queue('--pass-fds', value, 'true')
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('--pass-fds', result.stderr)
+        self.assertEqual(self.waiting(), 0)
 
     # Log.
 
