@@ -61,9 +61,15 @@ class RemoteRequestsTest(unittest.TestCase):
                      'space-theme 3 dark', 'space-theme -', 'space-new',
                      'pointer off', 'pointer 1.5 2', 'pointer-path 0 0 10 10 200',
                      'target name:x', 'target #2', 'profile-window Profile_2',
-                     'open-urls https://example.com/a?b chrome://settings about:blank',
                      'type hello world', 'nstype a*b'):
             self.assertEqual(self.ok(line), (line, []), line)
+        # Internal pages also report themselves so the Air can check a
+        # chrome://setup run carries an import input.
+        self.assertEqual(
+            self.ok('open-urls https://example.com/a?b chrome://settings '
+                    'about:blank'),
+            ('open-urls https://example.com/a?b chrome://settings about:blank',
+             ['pages chrome://settings']))
 
     def test_refuses_what_the_harness_would_misread(self):
         for line in [
@@ -127,20 +133,89 @@ class RemoteRequestsTest(unittest.TestCase):
                      'open-urls localhost:8000/x',
                      'open-urls localhost:@evil.com/x.dmg'):
             self.refused(line)
-        for line in ('open-urls chrome://settings',
-                     'open-urls chrome://version about:blank rac:welcome',
-                     'open-urls http://localhost/',
-                     'open-urls http://localhost:8000/x',
-                     'open-urls HTTP://LOCALHOST:8000/x',
-                     'open-urls http://127.0.0.1:3000/',
-                     'open-urls http://[::1]:8080/',
-                     'open-urls https://example.com/x',
-                     'open-urls https://www.example.org/a?b=1',
-                     'open-urls https://app.example.net:8443/x',
-                     'open-urls https://myapp.test/',
-                     'open-urls http://foo.test/bar',
-                     'open-urls https://dev.localhost/'):
-            self.assertEqual(self.ok(line), (line, []), line)
+        for line, outputs in (
+                ('open-urls chrome://settings', ['pages chrome://settings']),
+                ('open-urls chrome://version about:blank rac://newtab',
+                 ['pages chrome://version', 'pages rac://newtab']),
+                ('open-urls http://localhost/', []),
+                ('open-urls http://localhost:8000/x', []),
+                ('open-urls HTTP://LOCALHOST:8000/x', []),
+                ('open-urls http://127.0.0.1:3000/', []),
+                ('open-urls http://[::1]:8080/', []),
+                ('open-urls https://example.com/x', []),
+                ('open-urls https://www.example.org/a?b=1', []),
+                ('open-urls https://app.example.net:8443/x', []),
+                ('open-urls https://myapp.test/', []),
+                ('open-urls http://foo.test/bar', []),
+                ('open-urls https://dev.localhost/', [])):
+            self.assertEqual(self.ok(line), (line, outputs), line)
+
+    def test_internal_pages_are_an_exact_allowlist(self):
+        # Every internal page the browser may open is named; anything
+        # else chrome:/rac:/about: is refused outright.
+        for line, outputs in (
+                ('open-urls chrome://setup', ['pages chrome://setup']),
+                ('open-urls chrome://setup/arc-import-1',
+                 ['pages chrome://setup/arc-import-1']),
+                ('open-urls CHROME://Setup/X9', ['pages CHROME://Setup/X9']),
+                ('open-urls chrome://setup/', ['pages chrome://setup/']),
+                ('open-urls chrome://version', ['pages chrome://version']),
+                ('open-urls chrome://newtab', ['pages chrome://newtab']),
+                ('open-urls chrome://settings chrome://settings/assistant '
+                 'chrome://settings/privacy chrome://settings/appearance',
+                 ['pages chrome://settings',
+                  'pages chrome://settings/assistant',
+                  'pages chrome://settings/privacy',
+                  'pages chrome://settings/appearance']),
+                ('open-urls chrome://settings/', ['pages chrome://settings/']),
+                ('open-urls chrome://rac-ai', ['pages chrome://rac-ai']),
+                ('open-urls rac://version rac://settings/privacy rac://rac-ai',
+                 ['pages rac://version', 'pages rac://settings/privacy',
+                  'pages rac://rac-ai']),
+                ('open-urls about:blank ABOUT:Blank', [])):
+            self.assertEqual(self.ok(line), (line, outputs), line)
+        for line in ('open-urls chrome://settings/importData',
+                     'open-urls chrome://settings/passwords',
+                     'open-urls chrome://settings/clearBrowserData',
+                     'open-urls chrome://extensions',
+                     'open-urls chrome://inspect',
+                     'open-urls chrome://flags',
+                     'open-urls chrome://net-internals',
+                     'open-urls chrome://downloads',
+                     'open-urls chrome://history',
+                     'open-urls chrome://settings/autofill',
+                     'open-urls chrome://prefs-internals',
+                     'open-urls chrome://local-state',
+                     'open-urls chrome://policy',
+                     'open-urls chrome://settings/people',
+                     'open-urls chrome://settings/syncSetup',
+                     'open-urls chrome://settings/resetProfileSettings',
+                     'open-urls chrome://devtools',
+                     'open-urls chrome://chrome-urls',
+                     'open-urls chrome://about',
+                     'open-urls chrome://view-source',
+                     'open-urls rac://flags',
+                     'open-urls rac://settings/importData',
+                     # Not the exact page: deeper paths, queries,
+                     # fragments, '..', escapes, extra slashes, and
+                     # anything past one path segment on setup.
+                     'open-urls chrome://settings/appearance/x',
+                     'open-urls chrome://version?x',
+                     'open-urls chrome://version#x',
+                     'open-urls chrome://settings/../version',
+                     'open-urls chrome://version%2fsetup',
+                     'open-urls chrome://version//',
+                     'open-urls chrome://setup/a/b',
+                     'open-urls chrome://version.',
+                     'open-urls chrome://version:80/',
+                     'open-urls chrome://version@evil/',
+                     # about: is about:blank only.
+                     'open-urls about:',
+                     'open-urls about:version',
+                     'open-urls about://blank',
+                     'open-urls rac:welcome',
+                     'open-urls chrome:version'):
+            self.refused(line)
 
     def test_open_urls_env_allowed_hosts(self):
         # RAC_REMOTE_ALLOWED_HOSTS adds exact names and *.suffixes.
@@ -218,6 +293,42 @@ class RemoteRequestsTest(unittest.TestCase):
                      'type x ; nspress t cmd ; type .test'):
             self.assertEqual(self.ok(line), (line, []), line)
 
+    def test_typed_text_cannot_edit_into_a_denied_page(self):
+        # The review's follow-up: after open-urls lands on an allowed
+        # page, focusing the omnibox and typing onto the end of its URL
+        # reaches a denied page without typing a scheme. The joined
+        # typed text, squashed of spaces and punctuation, may never
+        # spell a denied page name.
+        for line in ('open-urls chrome://settings/ ; nspress end '
+                     '; type importData ; key return',
+                     'open-urls chrome://settings/ ; key end '
+                     '; type importData ; key return',
+                     'open-urls chrome://version ; nspress end '
+                     '; type /importData ; key return',
+                     'type import ; type Data',
+                     'type import ; nstype Data',
+                     'type im ; type portData',
+                     'type IMPORT ; nspress d ; type ATA',
+                     'type import- ; type data ; key return',
+                     'nstype pass ; nstype words',
+                     'type my pass ; type words ; key return',
+                     'type view ; type source',
+                     'type the flags page',
+                     'type chrome ; nstype urls',
+                     'type about',
+                     # 'people' and 'about' are denied page names, so
+                     # even innocuous text spelling them is refused.
+                     'type the people i know',
+                     'type download ; nspress s',
+                     'type local ; type state',
+                     'type reset profile ; type settings'):
+            self.refused(line)
+        for line in ('type hello world',
+                     'type Summarize this page.',
+                     'type load a fixture',
+                     'type settings ; key return'):
+            self.assertEqual(self.ok(line), (line, []), line)
+
     def test_shortcuts_and_commands_that_leave_the_clone(self):
         # Paste (the Pro's clipboard), open/print dialogs, DevTools, view
         # source and services that hand text to other apps.
@@ -238,6 +349,48 @@ class RemoteRequestsTest(unittest.TestCase):
                      'nspress left cmd,alt', 'nspress t cmd,shift',
                      'command 34000', 'command 39001', 'command 34014'):
             self.assertEqual(self.ok(line), (line, []), line)
+
+    def test_commands_are_an_allowlist(self):
+        # History, downloads, clear data, import, settings, passwords,
+        # about, the app menu, extensions, task manager, cast, translate,
+        # Helium services, open in Chrome: none is on COMMANDS_ALLOWED.
+        for line in ('command 40010', 'command 40012', 'command 40013',
+                     'command 40014', 'command 40015', 'command 40017',
+                     'command 40018', 'command 40021', 'command 40022',
+                     'command 40006', 'command 35011', 'command 35009',
+                     'command 40700', 'command 34072', 'command 35041',
+                     'command 99999', 'after 5 command 40010'):
+            self.refused(line)
+        for line in ('command 34014', 'command 034014', 'command 40721',
+                     'command 37000', 'command 38001'):
+            self.assertEqual(self.ok(line), (line, []), line)
+
+    def test_cmd_chords_to_unlisted_pages(self):
+        # Cmd+Y history, Opt+Cmd+L downloads, Opt+Cmd+B bookmark manager,
+        # Shift+Cmd+Backspace clear browsing data.
+        for line in ('nspress y cmd', 'nspress l cmd,alt', 'nspress b cmd,alt',
+                     'nspress backspace cmd,shift', 'nspress backspace cmd',
+                     'after 5 nspress y cmd'):
+            self.refused(line)
+        for line in ('nspress backspace', 'nspress y', 'nspress b cmd,shift',
+                     'nspress l cmd'):
+            self.assertEqual(self.ok(line), (line, []), line)
+
+    def test_typed_text_is_ascii(self):
+        # The omnibox maps full-width letters and dots onto ASCII hosts and
+        # page names, which the ASCII token and host checks would miss.
+        for line in ('type \uff49\uff4d\uff50\uff4f\uff52\uff54',
+                     'type \uff45\uff56\uff49\uff4c\u3002com',
+                     'type caf\u00e9'):
+            self.refused(line)
+
+    def test_typed_text_never_spells_setup_or_import(self):
+        # Editing chrome://version into chrome://setup would open the Arc
+        # import screen on the Pro's real Arc data; import reaches the
+        # import dialog through the settings search box.
+        for line in ('open-urls chrome://version ; key end ; type setup ; key return',
+                     'type set ; type up', 'type import', 'nstype chrome'):
+            self.refused(line)
 
     def test_lists_every_verb_the_line_uses(self):
         # The Pro refuses a verb missing from the clone's harness sources;

@@ -17,14 +17,20 @@
 #                                     throwaway build/profile (never while a
 #                                     browser from the clone runs);
 #                                     F is a screenshot-requests line on the
-#                                     Air, checked by remote_requests.py. A
-#                                     --rac-window-screenshot= path is under
-#                                     the clone's build/shots; the inputs
+#                                     Air, checked by remote_requests.py. After
+#                                     --, args are a fixed allowlist:
+#                                     --no-first-run and
+#                                     --rac-launch-in-background,
+#                                     --rac-window-screenshot=<path> (a shot
+#                                     under the clone's build/shots) and
+#                                     --rac-window-screenshot-delay=<1-4
+#                                     digits>, and the inputs
 #                                     --rac-arc-import-fixture= and
-#                                     --rac-import-source-root= are relative to
-#                                     the clone and must exist there; a bare
-#                                     arg (a URL to Chromium) and a URL-valued
-#                                     switch take the same URL allowlist
+#                                     --rac-import-source-root= (paths relative
+#                                     to the clone that must exist there); a
+#                                     bare arg is a URL and gets open-urls'
+#                                     allowlist. A run that opens
+#                                     chrome://setup needs an import input.
 #   pull <worktree> <remote path> <local path>
 #                                     rsync a file inside the clone back
 #   log [lines]                       the base's bootstrap phases and the
@@ -1003,76 +1009,79 @@ exec nice -n 10 taskpolicy -c utility devutils/rac/build-queue.sh \
 EOS
 }
 
-# Refuses a browser argument that could reach outside the clone or into
-# the foreground. Chromium takes `-switch` as well as `--switch`, and the
-# last copy of a switch wins, so the checks cover both spellings; paths
-# are compared without case, as APFS does.
+# Browser args after `--` are a fixed allowlist, not a denylist: a
+# denylist always misses a switch (Chromium takes `-s` as well as `--s`,
+# and the last copy of a switch wins), so only the spellings below pass
+# and every other argument starting with `-` is refused. Paths are
+# compared without case, as APFS does. The tool's own switches never go
+# through here: worktree.sh run adds the clone's --user-data-dir itself,
+# and the Pro adds --rac-window-screenshot-requests for a requests run.
 check_run_arg() {
-  local arg=$1 lower name value
+  local arg=$1 lower value
   lower=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
   case "$lower" in
     *"application support"* | *me.kainoa.rac* | *net.imput.helium*)
       refuse "run args may not touch a real profile folder ($arg)" ;;
   esac
   case "$arg" in
-    --) return 0 ;;
-    -[!-]*) refuse "spell switches with two dashes, not '$arg'" ;;
+    --no-first-run | --rac-launch-in-background) return 0 ;;
+    --rac-window-screenshot=?* | --rac-arc-import-fixture=?* | \
+      --rac-import-source-root=?*)
+      value=${arg#*=} ;;
+    --rac-window-screenshot | --rac-window-screenshot=)
+      refuse "give the screenshot file as --rac-window-screenshot=<name>.png" ;;
+    --rac-arc-import-fixture= | --rac-import-source-root=)
+      refuse "${arg%%=*} needs a path in the clone" ;;
+    --rac-window-screenshot-delay=*)
+      value=${arg#*=}
+      case "$value" in
+        '' | *[!0-9]* | ?????*)
+          refuse "--rac-window-screenshot-delay takes 1-4 digits, not '$value'" ;;
+      esac
+      return 0 ;;
+    -*)
+      refuse "'$arg' is not an allowed run arg; ask Ship to allow it" ;;
+    *)
+      # A bare argument is a URL Chromium opens: the same allowlist the
+      # requests file's open-urls gets, including chrome://setup, which
+      # the run then has to pair with an Arc import input.
+      python3 "$here/remote_requests.py" --url "$arg" || exit 2
+      return 0 ;;
   esac
-  name=${lower#--}
-  name=${name%%=*}
-  case "$lower" in
-    --*)
-      case "$name" in
-        user-data-dir) refuse "worktree.sh run sets the clone's own --user-data-dir" ;;
-        rac-window-screenshot-activate)
-          refuse "--rac-window-screenshot-activate takes the foreground on the Pro" ;;
-        rac-window-screenshot-requests)
-          refuse "--rac-window-screenshot-requests hands the browser unchecked output paths" ;;
-        rac-window-screenshot)
-          case "$arg" in
-            *=?*) ;;
-            *) refuse "give the screenshot file as --rac-window-screenshot=<name>.png" ;;
-          esac ;;
-        # Ways around the requests checks: DevTools or a debugging port
-        # drive the browser freely, and these open local files to pages.
-        remote-debugging-* | auto-open-devtools-for-tabs | \
-          allow-file-access-from-files | disable-web-security | no-sandbox)
-          refuse "--$name drives or unsandboxes the browser on the Pro" ;;
-      esac ;;
-  esac
-  value=$arg
-  case "$arg" in --*=*) value=${arg#*=} ;; esac
-  # Relative paths resolve in the clone, where the browser runs.
+  # Path values resolve in the clone, where the browser runs.
   case "$value" in
     /* | '~'*)
       refuse "run args can't name absolute paths ($arg); relative ones land in the clone" ;;
     .. | ../* | */../* | */..)
       refuse "run args can't leave the clone ($arg)" ;;
+    *[!A-Za-z0-9._/-]*)
+      refuse "run arg paths may only use letters, digits, '.', '_', '-' and '/' ($arg)" ;;
   esac
-  # Chromium opens a bare argument as a URL (file: and view-source:
-  # included), and some switches take one: both get the URL allowlist.
-  case "$lower" in
-    --*://* | --*=file:* | --*=data:* | --*=javascript:* | --*=view-source:* | \
-      --*=filesystem:* | --*=blob:*)
-      python3 "$here/remote_requests.py" --url "$value" || exit 2 ;;
-    --*) ;;
-    *) python3 "$here/remote_requests.py" --url "$value" || exit 2 ;;
+  case "$arg" in
+    --rac-window-screenshot=*.png) ;;
+    --rac-window-screenshot=*)
+      refuse "a screenshot path ends in .png ($arg)" ;;
   esac
 }
 
 cmd_run() {
   local name=$1 timeout=90 requests='' outputs='' fresh=0 checked
+  local req_pages='' import_input=0 setup_page=0
   shift
   while [ $# -gt 0 ]; do
     case "$1" in
       --requests-file)
         [ $# -ge 2 ] || die "run: --requests-file needs a file on this Mac"
-        # The checked line, then `verbs VERB...` and one `file REL` /
-        # `dir REL` / `expect REL` per path in it.
+        # The checked line, then `verbs VERB...`, a `pages URL` per
+        # internal page open-urls visits, and one `file REL` / `dir REL`
+        # / `expect REL` per path in it. The pages are read back here for
+        # the setup check and stripped from the stream the Pro gets.
         checked=$(python3 "$here/remote_requests.py" "$2") || exit 2
         requests=${checked%%$'\n'*}
         outputs=
         case "$checked" in *$'\n'*) outputs=${checked#*$'\n'} ;; esac
+        req_pages=$(printf '%s\n' "$outputs" | awk '$1 == "pages" { print $2 }')
+        outputs=$(printf '%s\n' "$outputs" | awk '$1 != "pages"')
         shift 2 ;;
       --fresh-profile) fresh=1; shift ;;
       --timeout)
@@ -1087,10 +1096,30 @@ cmd_run() {
   case "$queue_wait" in
     '' | *[!0-9]*) die "RAC_REMOTE_QUEUE_WAIT must be whole seconds, not '$queue_wait'" ;;
   esac
-  local arg
+  local arg lower
   for arg in "$@"; do
     check_run_arg "$arg"
+    case "$arg" in
+      --rac-arc-import-fixture=* | --rac-import-source-root=*) import_input=1 ;;
+    esac
+    lower=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
+    case "$lower" in
+      chrome://setup | chrome://setup/* | rac://setup | rac://setup/*)
+        setup_page=1 ;;
+    esac
   done
+  for arg in $req_pages; do
+    lower=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
+    case "$lower" in
+      chrome://setup | chrome://setup/* | rac://setup | rac://setup/*)
+        setup_page=1 ;;
+    esac
+  done
+  # chrome://setup is the Arc import screen: without an import input in
+  # the same run it would read the maintainer's real Arc data.
+  if [ "$setup_page" = 1 ] && [ "$import_input" = 0 ]; then
+    refuse "opening chrome://setup needs --rac-arc-import-fixture= or --rac-import-source-root= in the same run, so the import screen reads a fixture, not the Pro's real Arc data"
+  fi
   remote "$name" "$timeout" "$queue_wait" "$requests" "$outputs" "$fresh" "$@" <<'EOS'
 set -e
 safe_name "$1" || { echo "rac remote: bad clone name '$1'" >&2; exit 2; }

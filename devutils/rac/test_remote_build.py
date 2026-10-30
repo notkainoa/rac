@@ -1329,55 +1329,152 @@ class RunTest(RemoteBuildTest):
         for args, why in [
             (('--', '--user-data-dir=/tmp/x'), '--user-data-dir'),
             (('--', '--user-data-dir', '/tmp/x'), '--user-data-dir'),
-            (('--', '--flag', '~/Library/Application Support/x'), 'Application Support'),
-            (('--', '--rac-window-screenshot-activate'), 'foreground'),
-            (('--', '-user-data-dir=/tmp/x'), 'two dashes'),
-            (('--', '-rac-window-screenshot-activate'), 'two dashes'),
+            (('--', '~/Library/Application Support/x'), 'Application Support'),
             (('--', '--x=/Users/k/library/APPLICATION SUPPORT/me.kainoa.rac'),
              'real profile'),
             (('--', '--x=~/Library/Application%20Support/net.imput.helium'),
              'real profile'),
             (('--', '--rac-window-screenshot=/Users/k/Desktop/x.png'), 'absolute'),
-            # The requests file hands the browser unchecked output paths;
-            # it is refused in every form Chromium accepts, not only when
-            # its value looks like a bad path.
-            (('--', '--rac-window-screenshot-requests=/Users/k/notes.txt'),
-             'requests'),
-            (('--', '--rac-window-screenshot-requests=x.txt'), 'requests'),
-            (('--', '--rac-window-screenshot-requests'), 'requests'),
-            (('--', '--rac-window-screenshot-requests', 'x.txt'), 'requests'),
-            (('--', '-rac-window-screenshot-requests=x.txt'), 'two dashes'),
-            (('--', '--RAC-WINDOW-SCREENSHOT-REQUESTS=x.txt'), 'requests'),
             (('--', '--rac-window-screenshot=../../x.png'), 'leave the clone'),
             (('--', '--rac-window-screenshot', 'x.png'), '--rac-window-screenshot='),
-            (('--', '--disk-cache-dir=/tmp/c'), 'absolute'),
+            (('--', '--rac-window-screenshot='), '--rac-window-screenshot='),
+            (('--', '--rac-arc-import-fixture='), 'needs a path'),
+            (('--', '--rac-import-source-root='), 'needs a path'),
+            # The delay takes 1-4 digits only.
+            (('--', '--rac-window-screenshot-delay=x'), '1-4 digits'),
+            (('--', '--rac-window-screenshot-delay='), '1-4 digits'),
+            (('--', '--rac-window-screenshot-delay=12345'), '1-4 digits'),
+            (('--', '--rac-window-screenshot-delay=1.5'), '1-4 digits'),
             # Chromium opens a bare argument as a URL, so it gets the
-            # requests file's URL allowlist, as do URL-valued switches.
+            # requests file's URL allowlist.
             (('--', 'file:///Users/k/.ssh/id_rsa', '--rac-window-screenshot=x.png'),
              'may only open'),
             (('--', 'view-source:file:///etc/hosts'), 'may only open'),
             (('--', 'https://evil.com/x.dmg'), 'may only open'),
             (('--', 'evil.com'), 'may only open'),
             (('--', 'notes.txt'), 'may only open'),
-            (('--', '--app=file:///Users/k/.ssh/id_rsa'), 'may only open'),
-            (('--', '--homepage=https://evil.com/'), 'may only open'),
-            (('--', '--x=JavaScript:alert(1)'), 'may only open'),
-            # DevTools and a debugging port drive the browser freely.
-            (('--', '--remote-debugging-port=9222'), 'drives'),
-            (('--', '--remote-debugging-pipe'), 'drives'),
-            (('--', '--auto-open-devtools-for-tabs'), 'drives'),
-            (('--', '--allow-file-access-from-files'), 'drives'),
+            (('--', 'chrome://settings/importData'), 'may only open'),
+            (('--', 'chrome://flags'), 'may only open'),
+            (('--', 'about:version'), 'may only open'),
         ]:
             result = self.run_rb('run', self.wt, *args, success=False)
             self.assertEqual(result.returncode, 2, (args, result.stderr))
             self.assertIn(why, result.stderr)
         self.assertEqual(self.calls(), '')
 
+    def test_run_refuses_every_switch_off_the_allowlist(self):
+        # After `--` only the allowlisted spellings pass; every other
+        # switch — including the rest of the --rac-window-screenshot-*
+        # family, single-dash forms and anything not spelled --foo=bar —
+        # is refused with a pointer at the maintainer.
+        for arg in (
+            # The screenshot harness's own dangerous switches: a command
+            # id it runs, foreground, unchecked output paths.
+            '--rac-window-screenshot-command=40256',  # paste and go
+            '--rac-window-screenshot-command=35006',  # email page location
+            '--rac-window-screenshot-command=40004',  # DevTools
+            '--rac-window-screenshot-command=40014',  # import settings
+            '--rac-window-screenshot-command=35002',  # view source
+            '--rac-window-screenshot-activate',
+            '--rac-window-screenshot-requests=x.txt',
+            '--rac-window-screenshot-requests',
+            '--rac-window-screenshot-occlusion',
+            # Driving, unsandboxing or reconfiguring the browser.
+            '--remote-debugging-port=9222',
+            '--remote-debugging-pipe',
+            '--auto-open-devtools-for-tabs',
+            '--allow-file-access-from-files',
+            '--disable-web-security',
+            '--no-sandbox',
+            '--proxy-server=http://evil.com:8080',
+            '--host-resolver-rules=MAP localhost 10.0.0.9',
+            '--load-extension=ext',
+            '--user-agent=x',
+            '--js-flags=--expose-gc',
+            '--enable-features=Foo',
+            '--gpu-launcher=/bin/sh',
+            '--utility-cmd-prefix=/bin/sh',
+            '--app=file:///Users/k/.ssh/id_rsa',
+            '--homepage=https://evil.com/',
+            '--x=JavaScript:alert(1)',
+            '--disk-cache-dir=/tmp/c',
+            '--user-data-dir=/tmp/x',
+            '-foo',
+            '-rac-window-screenshot-requests=x.txt',
+            '--RAC-WINDOW-SCREENSHOT-REQUESTS=x.txt',
+            '--no-screenshot-run',
+            '--rac-x=odd',
+        ):
+            result = self.run_rb('run', self.wt, '--', arg, success=False)
+            self.assertEqual(result.returncode, 2, (arg, result.stderr))
+            self.assertIn('ask Ship to allow it', result.stderr, arg)
+        # The bare and two-token forms refuse too.
+        for args in (('--', '--rac-window-screenshot-requests', 'x.txt'),
+                     ('--', '--user-data-dir', '/tmp/x'),
+                     ('--', '--host-resolver-rules', 'MAP localhost x')):
+            result = self.run_rb('run', self.wt, *args, success=False)
+            self.assertEqual(result.returncode, 2, (args, result.stderr))
+            self.assertIn('ask Ship to allow it', result.stderr, args)
+        self.assertEqual(self.calls(), '')
+
     def test_run_opens_allowed_url_args(self):
         self.run_rb('run', self.wt, '--timeout', '3', '--',
                     'http://localhost:8000/x', 'chrome://settings',
-                    '--enable-features=A:b/c', success=True)
+                    'chrome://version', 'about:blank', 'rac://rac-ai',
+                    success=True)
         self.assertIn('http://localhost:8000/x chrome://settings', self.calls())
+
+    def test_run_accepts_the_allowlisted_switches(self):
+        write(self.clone / 'devutils/fixtures/arc/StorableSidebar.json', '{}\n')
+        (self.clone / 'build/arc-root').mkdir(parents=True)
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    '--no-first-run', '--rac-launch-in-background',
+                    '--rac-window-screenshot=x.png',
+                    '--rac-window-screenshot-delay=1',
+                    '--rac-window-screenshot-delay=9999',
+                    '--rac-arc-import-fixture=devutils/fixtures/arc/StorableSidebar.json',
+                    '--rac-import-source-root=build/arc-root',
+                    success=True)
+        calls = self.calls()
+        for arg in ('--no-first-run', '--rac-window-screenshot-delay=1',
+                    '--rac-window-screenshot-delay=9999'):
+            self.assertIn(arg, calls, arg)
+
+    def test_run_opening_chrome_setup_needs_an_import_input(self):
+        # The Arc import screen would read the Pro's real Arc data, so a
+        # run may open chrome://setup (requests file or URL arg) only
+        # while also passing an import input.
+        req = self.folder / 'req.txt'
+        for line in ('open-urls chrome://setup', 'open-urls chrome://setup/a-1',
+                     'open-urls rac://setup', 'open-urls chrome://version '
+                     'chrome://setup'):
+            write(req, line + '\n')
+            result = self.run_rb('run', self.wt, '--requests-file', req,
+                                 success=False)
+            self.assertEqual(result.returncode, 2, line)
+            self.assertIn('import', result.stderr, line)
+        for arg in ('chrome://setup', 'chrome://setup/x-1', 'rac://setup',
+                    'CHROME://SETUP'):
+            result = self.run_rb('run', self.wt, '--', arg, success=False)
+            self.assertEqual(result.returncode, 2, arg)
+            self.assertIn('import', result.stderr, arg)
+        self.assertEqual(self.calls(), '')
+        # With either import input the setup page runs; other pages and
+        # other pairs need no input.
+        write(self.clone / 'devutils/fixtures/arc/StorableSidebar.json', '{}\n')
+        (self.clone / 'build/arc-root').mkdir(parents=True)
+        write(req, 'open-urls chrome://setup\n')
+        self.run_rb('run', self.wt, '--requests-file', req, '--timeout', '3',
+                    '--', '--rac-arc-import-fixture=devutils/fixtures/arc/StorableSidebar.json',
+                    success=True)
+        self.run_rb('run', self.wt, '--timeout', '3', '--', 'chrome://setup',
+                    '--rac-import-source-root=build/arc-root', success=True)
+        write(req, 'open-urls chrome://version\n')
+        self.run_rb('run', self.wt, '--requests-file', req, '--timeout', '3',
+                    success=True)
+        # The pages lines never reach the Pro's path list.
+        written = (self.clone / 'build/req/req.txt').read_text()
+        self.assertNotIn('pages', written)
 
     def test_run_refuses_a_malformed_allowed_hosts_list(self):
         req = self.folder / 'req.txt'
@@ -1759,13 +1856,29 @@ class RunTest(RemoteBuildTest):
         self.assertEqual((self.clone / 'build/shots/x.png').read_text(), 'png\n')
 
     def test_run_passes_odd_args_through_intact(self):
-        odd = "--rac-x=it's $HOME `id` *"
-        self.run_rb('run', self.wt, '--timeout', '3', '--', odd, success=True)
-        self.assertIn(f'--rac-launch-in-background {odd}', self.calls())
+        # An allowed URL holding shell metacharacters reaches the Pro's
+        # browser verbatim, through ssh and the Pro's own shell.
+        odd = "http://localhost:8000/it's$HOME`id`*;x"
+        self.run_rb('run', self.wt, '--timeout', '4', '--', odd, success=True)
+        self.assertIn(odd, self.calls())
+
+    def test_run_arg_paths_are_plain_names(self):
+        # Path values take the requests file's characters only, and a
+        # screenshot ends in .png.
+        for arg, why in [
+            ("--rac-window-screenshot=it's $HOME `id` *.png", 'may only use'),
+            ('--rac-window-screenshot=a.png --rac-window-screenshot-command=40256',
+             'may only use'),
+            ('--rac-window-screenshot=a\nb.png', 'may only use'),
+            ('--rac-window-screenshot=x.txt', 'ends in .png'),
+            ('--rac-import-source-root=build/a b', 'may only use'),
+        ]:
+            result = self.run_rb('run', self.wt, '--', arg, success=False)
+            self.assertIn(why, result.stderr, arg)
 
     def test_run_timeout_stops_the_browser(self):
         result = self.run_rb('run', self.wt, '--timeout', '4', '--',
-                             '--no-screenshot-run', success=True)
+                             '--no-first-run', success=True)
         self.assertIn('queue', self.calls())
 
     def test_run_refuses_a_symlinked_shots_dir(self):
@@ -1809,7 +1922,7 @@ class RunTest(RemoteBuildTest):
         # browser still gets its full timeout afterwards.
         started = time.monotonic()
         self.run_rb('run', self.wt, '--timeout', '4', '--',
-                    '--no-screenshot-run', success=True, QUEUE_DELAY='5')
+                    '--no-first-run', success=True, QUEUE_DELAY='5')
         self.assertGreaterEqual(time.monotonic() - started, 8)
 
     def test_run_refuses_on_toolchain_drift(self):
@@ -1830,13 +1943,13 @@ class RunTest(RemoteBuildTest):
         app = f'{self.clone}/build/src/out/Default/rac.app/'
         env = self.env()
         a = subprocess.Popen(['/bin/bash', SCRIPT, 'run', str(self.wt),
-                              '--timeout', '8', '--', '--no-screenshot-run'],
+                              '--timeout', '8', '--', '--no-first-run'],
                              env=env, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True)
         try:
             a_pids = self.wait_for(lambda: self.procs_starting(app))
             b = subprocess.Popen(['/bin/bash', SCRIPT, 'run', str(self.wt),
-                                  '--timeout', '120', '--', '--no-screenshot-run'],
+                                  '--timeout', '120', '--', '--no-first-run'],
                                  env=env, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True,
                                  start_new_session=True)

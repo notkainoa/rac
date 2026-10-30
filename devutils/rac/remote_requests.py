@@ -21,11 +21,14 @@ usage: remote_requests.py <file>
 
 Prints the checked line, a `verbs VERB...` line listing every request
 verb it uses (the Pro checks each is a string literal in the clone's own
-harness sources), then one line per path in it, REL under build/shots/,
-so the Pro side never has to parse the line: `file REL` (a file it
-writes), `dir REL` (a folder it writes into) or `expect REL` (a
-screenshot the run waits for: bare PNG paths, capture-window's OUT, and
-each of a burst's DIR/fNN.png frames). Exits 2 on a refusal.
+harness sources), a `pages URL` line per chrome:/rac: page open-urls
+visits (the Air reads them back: a run that opens chrome://setup needs
+an Arc import input in the same run), then one line per path in it, REL
+under build/shots/, so the Pro side never has to parse the line:
+`file REL` (a file it writes), `dir REL` (a folder it writes into) or
+`expect REL` (a screenshot the run waits for: bare PNG paths,
+capture-window's OUT, and each of a burst's DIR/fNN.png frames). Exits 2
+on a refusal.
 """
 
 import os
@@ -39,16 +42,31 @@ MAX_BURST = 1000
 INT = re.compile(r'-?[0-9]{1,9}')
 NUMBER = re.compile(r'-?[0-9]{1,9}(\.[0-9]{1,6})?')
 PATH = re.compile(r'[A-Za-z0-9._/-]+')
-# URLs open-urls may send the browser to. chrome:, rac: and about: never
-# leave it; http(s) only to loopback and the reserved test names (anything
-# else could fetch a payload or open an external scheme). There is no
-# userinfo, backslash or non-ASCII, so the host checked is the host the
-# browser connects to. RAC_REMOTE_ALLOWED_HOSTS (comma-separated hostnames
-# or *.suffixes) adds hosts for a setup that needs them; a malformed entry
-# is refused, never skipped.
-FREE_URL = re.compile(r'(chrome|rac|about):[!-\[\]-~]*', re.ASCII | re.I)
+# URLs open-urls may send the browser to. http(s) only reaches loopback
+# and the reserved test names (anything else could fetch a payload or
+# open an external scheme). There is no userinfo, backslash or
+# non-ASCII, so the host checked is the host the browser connects to.
+# RAC_REMOTE_ALLOWED_HOSTS (comma-separated hostnames or *.suffixes)
+# adds hosts for a setup that needs them; a malformed entry is refused,
+# never skipped. chrome: and rac: match only INTERNAL_PAGES (plus the
+# setup/<segment> import screens), and about: only about:blank: a page
+# like chrome://flags or chrome://settings/importData does as much harm
+# as a fetch, so internal URLs are a fixed list, not "any chrome: page".
 HTTP_URL = re.compile(r'https?://(?P<host>\[::1\]|[A-Za-z0-9.-]+)(:[0-9]{1,5})?'
                       r'([/?#][!-\[\]-~]*)?', re.ASCII | re.I)
+# The internal pages a run may open, as host+path after chrome:// or
+# rac:// (the Arc import screens live under setup/, matched by
+# SETUP_STEP). Matching is case-insensitive on scheme and host with one
+# optional trailing slash; a query, fragment, ".." or percent-escape can
+# never match. Never add pages that read the maintainer's data or open
+# the browser to control (importData, passwords, flags, downloads,
+# history, devtools, ...).
+INTERNAL_PAGES = frozenset((
+    'setup', 'version', 'newtab', 'settings', 'settings/assistant',
+    'settings/privacy', 'settings/appearance', 'rac-ai',
+))
+INTERNAL_URL = re.compile(r'(?:chrome|rac)://([!-\[\]-~]*)', re.ASCII | re.I)
+SETUP_STEP = re.compile(r'setup/[A-Za-z0-9-]+')
 TEST_HOSTS = {'localhost', '127.0.0.1', '[::1]',
               'example.com', 'example.org', 'example.net'}
 TEST_SUFFIXES = ('.test', '.localhost',
@@ -64,6 +82,22 @@ NSPRESS_KEYS = KEYS | {'space', 'home', 'end', 'pageup', 'pagedown'}
 # dialog. Without these it can't spell a scheme or a path, however the
 # pieces are typed, edited or submitted (return, a click on a suggestion).
 UNTYPABLE = set(':/\\~%')
+# The denied page names typed text may never spell, even spread over
+# several type/nstype/nspress pieces and with spaces and punctuation
+# removed: after `open-urls chrome://settings/` an End, `type
+# importData` and return edits the open page's URL into a denied one
+# without ever typing a scheme. `about` is on the list because
+# about:blank is the only allowed about: page.
+TYPED_PAGE_TOKENS = frozenset((
+    'importdata', 'passwords', 'password', 'clearbrowserdata',
+    'extensions', 'inspect', 'flags', 'netinternals', 'downloads',
+    'history', 'autofill', 'prefsinternals', 'localstate', 'policy',
+    'syncsetup', 'resetprofilesettings', 'devtools', 'people',
+    'viewsource', 'chromeurls', 'about',
+    # The Arc import screens and the import dialog read the Mac's own
+    # browser data (also found through the settings search box).
+    'setup', 'import', 'chrome',
+))
 # Cmd shortcuts that reach outside the clone: the open and print dialogs,
 # the clipboard (paste, copy, cut, find pasteboard), view source,
 # DevTools, mailing the page; with Shift, the Search With Google and
@@ -72,22 +106,30 @@ UNTYPABLE = set(':/\\~%')
 # in the clone profile, so its Save Page fallback can't pick a folder.
 CMD_DENIED = set('ceijopuvx')
 CMD_SHIFT_DENIED = CMD_DENIED | set('ly')
-# chrome_command_ids.h: commands that open a file dialog or another app,
-# write outside the clone (app shims), touch the clipboard, read another
-# browser's data, or open DevTools / view source.
-COMMANDS_DENIED = {
-    34071,  # IDC_COPY_URL
-    35002,  # IDC_VIEW_SOURCE
-    35003, 35007,  # IDC_PRINT, IDC_BASIC_PRINT
-    35004,  # IDC_SAVE_PAGE
-    35006,  # IDC_EMAIL_PAGE_LOCATION
-    35016, 35021, 35028, 35031,  # send to self, QR code, sharing hub
-    36000, 36001, 36003, 40256,  # cut, copy, paste, paste and go
-    40000,  # IDC_OPEN_FILE
-    40002, 40254,  # IDC_CREATE_SHORTCUT, IDC_INSTALL_PWA
-    40004, 40005, 40007, 40023, 40237, 40301,  # DevTools
-    40014,  # IDC_IMPORT_SETTINGS
-}
+# Cmd chords (accelerators_cocoa.mm, global_keyboard_shortcuts_mac.mm)
+# that open an internal page off the allowlist: history (Cmd+Y),
+# downloads (Opt+Cmd+L), the bookmark manager (Opt+Cmd+B) and clear
+# browsing data (Shift+Cmd+Backspace; any Cmd+Backspace is refused).
+CMD_CHORDS_DENIED = (('y', set()), ('l', {'alt'}), ('b', {'alt'}),
+                     ('backspace', set()))
+# chrome_command_ids.h: the only commands a run may send. A fixed list,
+# like the run args: a denylist of ~300 ids always misses one that opens
+# an internal page (history, downloads, settings, extensions, passwords),
+# a dialog, another app, the clipboard or DevTools.
+COMMANDS_ALLOWED = frozenset((
+    33000, 33001, 33002, 33003, 33006, 33007,  # back, forward, reload, home, stop
+    34000, 34001, 34012, 34014, 34015, 34016, 34017,  # windows and tabs
+    *range(34018, 34027), 34027, 34028, 34030, 34032, 34033,
+    34046, 34047, 34052, 34056, 34057, 34058, 34060, 34061, 34062, 34063,
+    *range(34082, 34087), 34091,  # layouts, zen mode pin
+    *range(34100, 34106), 34107, 34108,  # tab groups
+    37000, 37001, 37002, 37003,  # find
+    38001, 38002, 38003,  # zoom
+    39000, 39001, 39002, 39004, 39005, 39006, 39009,  # focus
+    40009,  # bookmark bar
+    40701,  # rac assistant
+    *range(40710, 40727),  # rac spaces, favorites, pinned tabs
+))
 
 
 class Refused(Exception):
@@ -119,10 +161,30 @@ def host_allowed(host):
                for entry in extra_allowed_hosts())
 
 
+def internal_page(word):
+    """The internal page a chrome:/rac: `word` opens when it is
+    allowlisted, else None. Scheme and host are case-insensitive and one
+    trailing slash is optional; a query, fragment, '..' or
+    percent-escape can never match, since host+path must come out to an
+    INTERNAL_PAGES entry or setup/<one segment of [A-Za-z0-9-]>."""
+    match = INTERNAL_URL.fullmatch(word)
+    if not match:
+        return None
+    page = match.group(1)
+    if page.endswith('/'):
+        page = page[:-1]
+    host, slash, path = page.partition('/')
+    page = host.lower() + slash + path
+    if page in INTERNAL_PAGES or SETUP_STEP.fullmatch(page):
+        return page
+    return None
+
+
 def url_allowed(word):
-    """True for a URL open-urls (or a run's URL argument) may open: a
-    chrome:/rac:/about: URL, or http(s) to an allowed host and port."""
-    if FREE_URL.fullmatch(word):
+    """True for a URL open-urls (or a run's URL argument) may open: an
+    allowlisted internal page, about:blank, or http(s) to an allowed
+    host and port."""
+    if internal_page(word) is not None or word.lower() == 'about:blank':
         return True
     match = HTTP_URL.fullmatch(word)
     return bool(match) and host_allowed(match.group('host'))
@@ -131,6 +193,11 @@ def url_allowed(word):
 def check_typed(text):
     """Refuses typed text that could spell a scheme or a path, or name a
     host outside the allowlist (`evil.com` then return navigates)."""
+    # `type` inserts any text into the focused field, and the omnibox maps
+    # full-width and other non-ASCII look-alikes onto ASCII hosts and
+    # page names, past every check below.
+    if not text.isascii():
+        raise Refused(f'typed text must be ASCII: {text!r}')
     bad = sorted(UNTYPABLE.intersection(text))
     if bad:
         raise Refused(f'typed text may not hold {" ".join(bad)} (open URLs '
@@ -258,10 +325,17 @@ class Checker:
             need(n >= 1, 'URL...')
             for url in args:
                 if not url_allowed(url):
-                    raise Refused('open-urls takes chrome:, rac: and about: '
-                                  'URLs, or http(s) to an allowed host '
-                                  f'(localhost, 127.0.0.1, [::1], example.*, '
-                                  f'*.test, *.localhost): {url!r}')
+                    raise Refused('open-urls may open the allowlisted '
+                                  'internal pages (chrome://version, '
+                                  'chrome://settings, chrome://setup, '
+                                  'rac://..., about:blank) or http(s) to '
+                                  'an allowed host (localhost, '
+                                  '127.0.0.1, [::1], example.*, *.test, '
+                                  f'*.localhost): {url!r}')
+                # The Air checks pages it opened against the run args: a
+                # chrome://setup run needs an Arc import input.
+                if internal_page(url) is not None:
+                    self.outputs.append(f'pages {url}')
             return words
         simple = {
             'command': n == 1 and ints(*args),
@@ -291,9 +365,15 @@ class Checker:
         if verb not in simple:
             raise Refused(f'unknown request verb {verb!r}')
         need(simple[verb], 'other arguments (see window_screenshot.mm)')
-        if verb == 'command' and int(args[0]) in COMMANDS_DENIED:
-            raise Refused(f'command {args[0]} opens a dialog, another app, '
-                          'the clipboard or DevTools')
+        if verb == 'command' and int(args[0]) not in COMMANDS_ALLOWED:
+            raise Refused(f'command {args[0]} is not an allowed command id '
+                          '(see COMMANDS_ALLOWED); ask Ship to allow it')
+        if verb == 'nspress':
+            held = set(args[1].split(',')) if n == 2 else set()
+            if 'cmd' in held and any(args[0] == key and mods <= held
+                                     for key, mods in CMD_CHORDS_DENIED):
+                raise Refused(f'nspress {" ".join(args)} opens an internal '
+                              'page that is not on the allowlist')
         if verb == 'nspress' and len(args[0]) == 1:
             held = set(args[1].split(',')) if n == 2 else set()
             if 'cmd' in held and args[0] in (
@@ -330,6 +410,14 @@ def check_line(text):
     if [harness_words(r) for r in harness_requests(out)] != checked:
         raise Refused('the request line splits differently in the browser')
     check_typed(checker.typed)
+    # Across the whole script the typed pieces join into whatever the
+    # omnibox shows; a denied page name spelled in pieces or in one piece
+    # edits an open page's URL into it (End, type, return).
+    squashed = re.sub(r'[^a-z0-9]', '', checker.typed.lower())
+    denied = sorted(token for token in TYPED_PAGE_TOKENS if token in squashed)
+    if denied:
+        raise Refused('typed text spells a page the browser may not open: '
+                      + ', '.join(denied))
     return out, checker.outputs, sorted(checker.verbs)
 
 
@@ -339,9 +427,10 @@ def main(argv):
             extra_allowed_hosts()
             if url_allowed(argv[2]):
                 return 0
-            print('rac remote: refusing: a run may only open chrome:, rac:, '
-                  'about: or http(s) URLs to an allowed host, not '
-                  f'{argv[2]!r}', file=sys.stderr)
+            print('rac remote: refusing: a run may only open the '
+                  'allowlisted internal pages, about:blank or http(s) '
+                  f'URLs to an allowed host, not {argv[2]!r}',
+                  file=sys.stderr)
         except Refused as e:
             print(f'rac remote: refusing: {e}', file=sys.stderr)
         return 2
