@@ -2313,11 +2313,12 @@ class EvalsTest(RemoteBuildTest):
         self.assertIn(self.runner_sha, result.stderr)
 
     def test_evals_accepts_the_allowlisted_args(self):
-        self.run_evals('--', '--gate', '--keep-profile', '--variants=a1,b2',
+        self.run_evals('--', '--gate', '--keep-profile', '--screenshots',
+                       '--variants=a1,b2',
                        '--variants', 'c3-d4,e5', '--host-mode=names',
                        '--host-mode', 'loopback', '--list', success=True)
         calls = self.calls()
-        for arg in ('--gate', '--keep-profile', '--variants=a1,b2',
+        for arg in ('--gate', '--keep-profile', '--screenshots', '--variants=a1,b2',
                     '--variants c3-d4,e5', '--host-mode=names',
                     '--host-mode loopback', '--list'):
             self.assertIn(arg, calls, arg)
@@ -2349,7 +2350,8 @@ class EvalsTest(RemoteBuildTest):
             # An id list that reads as the runner's next switch.
             ('--variants', '--dry-run'), ('--variants', '-x'),
             ('--variants=-x',),
-            ('--keep-profile=x',), ('--gate=x',),
+            ('--keep-profile=x',), ('--gate=x',), ('--screenshots=x',),
+            ('--screenshot',),
         ):
             result = self.run_evals('--', *args, success=False)
             self.assertEqual(result.returncode, 2, (args, result.stderr))

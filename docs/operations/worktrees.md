@@ -229,13 +229,14 @@ throwaway profile under the clone's `build/` (its `TMPDIR` is
 `build/evals/tmp`), one launch at a time, killing each before the next.
 Core owns that side of the runner. `RAC_EVALS_NO_QUEUE=1` keeps it from
 taking a second queue slot for those launches, and the verb's allowlist
-after `--` (`--gate`, `--keep-profile`, `--list`, `--variants=<ids>`,
-`--host-mode=names|loopback`) is all that reaches it. When the runner
+after `--` (`--gate`, `--keep-profile`, `--screenshots`, `--list`,
+`--variants=<ids>`, `--host-mode=names|loopback`) is all that reaches it. When the runner
 ends, fails, times out, or is interrupted, the verb kills its process
 group and every browser from the clone, then exits with the runner's own
 status.
 
-Results land in the clone's `build/evals/results` (old `*.json` there is
+Results land in the clone's `build/evals/results`, and `--screenshots`
+PNGs in `build/evals/results/shots` (old `*.json` and `*.png` there are
 cleared first). Fetch them with:
 
 ```sh

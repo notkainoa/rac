@@ -78,7 +78,9 @@
 #                                     build/evals/results; pull fetches
 #                                     them. After --, args are an
 #                                     allowlist: --gate, --keep-profile,
-#                                     --list, --variants=<ids>, and
+#                                     --screenshots (PNGs land in
+#                                     results/shots), --list,
+#                                     --variants=<ids>, and
 #                                     --host-mode=names|loopback (each also
 #                                     as two words).
 #   pull <worktree> <remote path> <local path>
@@ -1698,7 +1700,7 @@ cmd_evals() {
   local -a args=()
   while [ $# -gt 0 ]; do
     case "$1" in
-      --gate | --keep-profile | --list)
+      --gate | --keep-profile | --screenshots | --list)
         args+=("$1"); shift ;;
       --variants=*)
         case "${1#*=}" in '' | -* | *[!A-Za-z0-9_,-]*)
@@ -1832,8 +1834,14 @@ for dir in "$evals_dir" "$results" "$tmp"; do
     exit 2
   }
 done
-# An old eval's JSON isn't this one's: only those, never the folder.
+# An old eval's JSON and screenshots aren't this one's: only those,
+# never the folders.
 rm -f "$results"/*.json
+[ ! -L "$results/shots" ] || {
+  echo "rac remote: refusing: $results/shots is a symlink" >&2
+  exit 2
+}
+[ ! -d "$results/shots" ] || rm -f "$results"/shots/*.png
 # The runner's tree (the snapshot the wait loop keeps in $spawned, since
 # orphans leave the family once the launcher is gone), every browser from
 # the clone, and anything still running out of this clone's runner dir
