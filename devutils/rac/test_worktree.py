@@ -529,9 +529,37 @@ class SyncTest(WorktreeTestCase):
         new = 1_700_000_000_000_000_000
         os.utime(marker, ns=(new, new))
         (self.patches / 'b.patch').write_text(saved_b)
-        self.worktree('sync')
+        result = self.worktree('sync')
+        self.assertIn('the tree was built since the last snapshot', result.stderr)
         self.assertEqual((self.tree / 'two').read_text(), 'saved two\n')
         self.assertGreater((self.tree / 'two').stat().st_mtime_ns, old)
+
+    def test_interrupted_restore_keeps_the_record_for_a_retry(self):
+        old = 1_234_567_890_000_000_000
+        for name in ('one', 'two'):
+            os.utime(self.tree / name, ns=(old, old))
+        record = self.tree / '.pc' / worktree_state.MTIMES
+        worktree_state.snapshot(self.tree, 0)
+        for name in ('one', 'two'):
+            os.utime(self.tree / name)  # what a pop and push leave behind
+        real_utime = os.utime
+        calls = []
+
+        def utime_then_interrupt(path, *args, **kwargs):
+            calls.append(path)
+            if len(calls) == 2:
+                raise KeyboardInterrupt  # Ctrl-C partway through the loop
+            return real_utime(path, *args, **kwargs)
+
+        with mock.patch('os.utime', side_effect=utime_then_interrupt), \
+             self.assertRaises(KeyboardInterrupt):
+            worktree_state.restore(self.tree)
+        self.assertTrue(record.exists(), 'an interrupted restore keeps its record')
+        with mock.patch('sys.stderr'):
+            worktree_state.restore(self.tree)
+        self.assertFalse(record.exists())
+        for name in ('one', 'two'):
+            self.assertEqual((self.tree / name).stat().st_mtime_ns, old)
 
 
 @unittest.skipUnless(sys.platform == 'darwin',

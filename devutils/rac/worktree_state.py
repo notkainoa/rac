@@ -302,6 +302,9 @@ def snapshot(tree, keep):
     files = {}
     if pending is not None and pending['build'] == marker:
         files = pending['files']
+    elif pending is not None:
+        print('rac worktree: the tree was built since the last snapshot; '
+              'dropping it', file=sys.stderr)
     for name in applied(tree)[keep:]:
         for file in touched(tree, name):
             path = tree / file
@@ -351,13 +354,15 @@ def restore(tree):
     """Gives the recorded mtime back to each file a pop and push left with
     the same bytes, so mtime-based builds see no change. Runs after the push
     while the name passes are still reverted, matching the state snapshot()
-    saw. The record is used once, then deleted."""
+    saw. The record is used once, then deleted. If the loop is interrupted
+    (Ctrl-C, a failed utime), the record stays so a retry can finish: files
+    already given back their mtime still match their digest."""
     path = tree / '.pc' / MTIMES
     record = read_mtimes(tree)
     if record is None:
         return
-    path.unlink()
     if record['build'] != build_marker(tree):
+        path.unlink()
         print('rac worktree: the tree was built since the snapshot; '
               'keeping the new mtimes', file=sys.stderr)
         return
@@ -370,6 +375,7 @@ def restore(tree):
             continue
         os.utime(target, ns=(target.stat().st_atime_ns, entry['mtime_ns']))
         kept += 1
+    path.unlink()
     print(f'rac worktree: kept mtimes on {kept} unchanged files ({changed} changed)',
           file=sys.stderr)
 
