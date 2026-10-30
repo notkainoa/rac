@@ -413,6 +413,126 @@ class SyncTest(WorktreeTestCase):
         }
         self.assertEqual(copies, recorded)
 
+    # Files a pop and push rewrite with the same bytes keep their mtimes, so
+    # siso doesn't rebuild them.
+
+    def test_sync_keeps_mtimes_on_files_rewritten_identically(self):
+        old = 1_234_567_890_000_000_000
+        os.utime(self.tree / 'two', ns=(old, old))
+        strings_mtime = (self.tree / 'strings.grd').stat().st_mtime_ns
+        self.write_patch('s.patch', 'strings.grd', 'Chromium browser\n',
+                         'Chromium browser\nChromium tabs\n')
+        result = self.worktree('sync')
+        self.assertIn('kept mtimes on 1 unchanged files (1 changed)', result.stderr)
+        # b.patch's file came back with the same bytes: its mtime is restored.
+        self.assertEqual((self.tree / 'two').stat().st_mtime_ns, old)
+        # s.patch's own file changed, so it keeps its new mtime.
+        self.assertGreater((self.tree / 'strings.grd').stat().st_mtime_ns, strings_mtime)
+        self.assertFalse((self.tree / '.pc' / '.rac_mtimes.json').exists())
+
+    def test_dropping_an_empty_patch_keeps_every_mtime(self):
+        # Put an empty patch in the middle of the applied stack.
+        self.names('unsub')
+        self.quilt('pop', '-q', 'a.patch')
+        self.quilt('new', 'e.patch')
+        self.quilt('push', '-a', '-q')
+        self.names('sub')
+        self.state('record')
+        self.assertEqual(self.applied(), ['a.patch', 'e.patch', 's.patch', 'b.patch'])
+        old = 1_234_567_890_000_000_000
+        for name in ('one', 'two'):
+            os.utime(self.tree / name, ns=(old, old))
+        # quilt new doesn't write the patch file until a refresh, so dropping
+        # the patch is only a series change.
+        self.series(['a.patch', 's.patch', 'b.patch'])
+        result = self.worktree('sync')
+        self.assertIn('kept mtimes on 2 unchanged files (0 changed)', result.stderr)
+        self.assertEqual((self.tree / 'two').stat().st_mtime_ns, old)
+        self.assertEqual((self.tree / 'one').stat().st_mtime_ns, old)
+        self.assertFalse((self.tree / '.pc' / '.rac_mtimes.json').exists())
+
+    def test_malformed_mtime_record_warns_and_is_dropped(self):
+        record = self.tree / '.pc' / '.rac_mtimes.json'
+        record.write_text('{not json\n')
+        result = self.worktree('sync')
+        self.assertIn('malformed', result.stderr)
+        self.assertIn('.rac_mtimes.json', result.stderr)
+        self.assertFalse(record.exists())
+
+    def test_build_between_snapshot_and_restore_keeps_new_mtimes(self):
+        out = self.tree / 'out' / 'Default'
+        out.mkdir(parents=True)
+        marker = out / '.siso_fs_state'
+        marker.write_text('state\n')
+        old = 1_234_567_890_000_000_000
+        os.utime(self.tree / 'two', ns=(old, old))
+        self.state('snapshot', '0')
+        new = 1_700_000_000_000_000_000
+        # The push's rewrite, then a build before restore runs.
+        os.utime(self.tree / 'two', ns=(new, new))
+        os.utime(marker, ns=(new, new))
+        result = self.state('restore')
+        self.assertIn('built since the snapshot', result.stderr)
+        self.assertEqual((self.tree / 'two').stat().st_mtime_ns, new)
+        self.assertFalse((self.tree / '.pc' / '.rac_mtimes.json').exists())
+
+    def test_gn_gen_between_snapshot_and_restore_keeps_new_mtimes(self):
+        # build.ninja made from a popped BUILD.gn would look newer than the
+        # restored file, so a gn gen alone must count as a build.
+        out = self.tree / 'out' / 'Default'
+        out.mkdir(parents=True)
+        stamp = out / 'build.ninja.stamp'
+        stamp.write_text('')
+        old = 1_234_567_890_000_000_000
+        os.utime(self.tree / 'two', ns=(old, old))
+        self.state('snapshot', '0')
+        new = 1_700_000_000_000_000_000
+        os.utime(self.tree / 'two', ns=(new, new))
+        os.utime(stamp, ns=(new, new))
+        result = self.state('restore')
+        self.assertIn('built since the snapshot', result.stderr)
+        self.assertEqual((self.tree / 'two').stat().st_mtime_ns, new)
+
+    def test_retry_after_a_failed_push_keeps_the_first_snapshot(self):
+        old = 1_234_567_890_000_000_000
+        os.utime(self.tree / 'two', ns=(old, old))
+        saved_b = (self.patches / 'b.patch').read_text()
+        self.write_patch('s.patch', 'strings.grd', 'Chromium browser\n',
+                         'Chromium browser\nChromium tabs\n')
+        self.write_patch('b.patch', 'two', 'other two\n', 'broken two\n')
+        result = self.worktree('sync', success=False)
+        self.assertIn('quilt push failed', result.stderr)
+        self.assertEqual(self.applied(), ['a.patch', 's.patch'])
+        # The retry pops only s.patch, whose new version isn't recorded yet.
+        # b.patch's file was rewritten by the first pop, so only the first
+        # snapshot knows its old mtime.
+        (self.patches / 'b.patch').write_text(saved_b)
+        result = self.worktree('sync')
+        self.assertIn('kept mtimes on 1 unchanged files (1 changed)', result.stderr)
+        self.assertEqual((self.tree / 'two').read_text(), 'saved two\n')
+        self.assertEqual((self.tree / 'two').stat().st_mtime_ns, old)
+        self.assertFalse((self.tree / '.pc' / '.rac_mtimes.json').exists())
+
+    def test_retry_after_a_build_drops_the_first_snapshot(self):
+        out = self.tree / 'out' / 'Default'
+        out.mkdir(parents=True)
+        marker = out / '.siso_fs_state'
+        marker.write_text('state\n')
+        old = 1_234_567_890_000_000_000
+        os.utime(self.tree / 'two', ns=(old, old))
+        saved_b = (self.patches / 'b.patch').read_text()
+        self.write_patch('s.patch', 'strings.grd', 'Chromium browser\n',
+                         'Chromium browser\nChromium tabs\n')
+        self.write_patch('b.patch', 'two', 'other two\n', 'broken two\n')
+        self.worktree('sync', success=False)
+        # A build of the half-synced tree saw b.patch's file without it.
+        new = 1_700_000_000_000_000_000
+        os.utime(marker, ns=(new, new))
+        (self.patches / 'b.patch').write_text(saved_b)
+        self.worktree('sync')
+        self.assertEqual((self.tree / 'two').read_text(), 'saved two\n')
+        self.assertGreater((self.tree / 'two').stat().st_mtime_ns, old)
+
 
 @unittest.skipUnless(sys.platform == 'darwin',
                      'setup clones the tree with APFS clonefile(2) from libSystem')
