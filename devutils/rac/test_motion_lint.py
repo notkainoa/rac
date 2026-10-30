@@ -61,6 +61,9 @@ class LiteralTest(unittest.TestCase):
             'constexpr base::TimeDelta kLong = base::Milliseconds(60 * 1000);': ['duration'],
             'constexpr int kGap{8};': ['gap'],
             'constexpr int kPanelRadius(12);': ['radius'],
+            '/* nudge */ constexpr int kGap = 6;': ['gap'],
+            '/* a */ constexpr int kGap = 6; /* b */': ['gap'],
+            '/* a // b */ SetBetweenChildSpacing(6);': ['gap'],
         }
         for line, kinds in cases.items():
             with self.subTest(line=line):
@@ -78,6 +81,9 @@ class LiteralTest(unittest.TestCase):
                 '// Fades over base::Milliseconds(100), as Dia.',
                 ' * corner radius 12',
                 '#include "ui/gfx/geometry/insets.h"',
+                '/* constexpr int kGap = 6; */',
+                '/* a */ // constexpr int kGap = 6;',
+                '/* starts a comment about kGap = 6;',
                 'constexpr int kMaxRows = 12;',
         ]:
             with self.subTest(line=line):
@@ -125,10 +131,42 @@ class LiteralTest(unittest.TestCase):
             '/* padding: 8px; */': [],
             ' * transition 150ms ease': [],
             'transition-duration: 0ms;': [],
+            'margin: 8px;': ['gap'],
+            'margin-inline: 12px 6px;': ['gap'],
+            'margin: 0 auto;': [],
+            'margin-top: var(--rac-spacing-8);': [],
+            'top: 6px;': ['inset'],
+            'left: calc(50% - 5px);': ['inset'],
+            'right: 0;': [],
+            'bottom: -2px;': ['inset'],
+            'width: 24px;': ['size'],
+            'min-height: 34px;': ['size'],
+            'max-width: 480px;': ['size'],
+            'width: 100%;': [],
+            'width: 1px;': [],
+            'height: var(--rac-row-height);': [],
+            'line-height: 20px;': [],
+            'stroke-width: 2px;': [],
+            'border-width: 2px;': ['size'],
+            'border-inline-start-width: 3px;': ['size'],
+            'border-width: 1px;': [],
+            '@media (min-width: 600px) {': [],
+            'transform: translateY(6px);': ['inset'],
+            'transform: translate(0, 2px) scale(1.4);': ['inset'],
+            'translate: 0 6px;': ['inset'],
+            'transform: translateX(-100%);': [],
+            'transform: translate(-50%, -50%);': [],
+            'transform: scale(1.04);': [],
+            '/* c */ gap: 6px;': ['gap'],
+            '/* c */ margin: 8px; /* d */': ['gap'],
         }
         for line, kinds in cases.items():
             with self.subTest(line=line):
                 self.assertEqual(self.kinds(line, CSS), kinds)
+
+    def test_script_media_queries_are_not_sizes(self):
+        path = 'chrome/browser/resources/settings/settings_ui/settings_ui.ts'
+        self.assertEqual(self.kinds("const NARROW = '(max-width: 830px)';", path), [])
 
     def test_script(self):
         path = 'chrome/browser/resources/rac_ai/app.ts'
@@ -269,6 +307,25 @@ class CommandTest(unittest.TestCase):
         # Rewording an allowed line keeps its file's count, so it may refresh.
         self.write('constexpr int kGap =  6;  // Wider.')
         self.assertEqual(self.lint('--refresh').returncode, 0)
+
+    def test_base_needs_an_allowlist_in_the_repository(self):
+        # A path outside the repository (here the temporary folder, and a
+        # relative one that resolves there) is a clean error, not a traceback.
+        self.write('constexpr int kGap = 6;')
+        self.assertEqual(self.lint('--init').returncode, 0)
+        for allowlist in (str(self.allowlist), 'allowlist.txt'):
+            with self.subTest(allowlist=allowlist):
+                result = subprocess.run(
+                    [sys.executable,
+                     str(SCRIPT), '--allowlist', allowlist, '--base', 'HEAD',
+                     str(self.patch)],
+                    cwd=self.folder,
+                    capture_output=True,
+                    text=True,
+                    check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('--base needs an allowlist inside', result.stderr)
+                self.assertNotIn('Traceback', result.stderr)
 
     def test_drafts_as_files(self):
         folder = self.folder / 'drafts' / 'sidebar'

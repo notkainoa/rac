@@ -5,7 +5,7 @@
 # the terms of the GPL-3.0 license that can be found in the LICENSE file.
 """Flags design literals that rac's patches add instead of using tokens.
 
-Durations, curves, corner radii, insets, gaps, and padding belong in
+Durations, curves, corner radii, insets, gaps, padding, and sizes belong in
 rac_tokens.h (C++) or rac_tokens.css (WebUI). This reads the rac patches in
 series order, keeps the lines they still add once later patches have run,
 and flags literals of those kinds in UI files: C++ under chrome/browser/ui/
@@ -17,6 +17,16 @@ Literals that were there before the lint are listed in
 motion_lint_allowlist.txt. The list may only shrink: --refresh rewrites it
 from the current literals but refuses if any file gains one, and --base
 checks the same against another commit's list.
+
+The allowlist pins (kind, file, count), not values. Rewording an allowlisted
+literal, or swapping it for another of the same kind in the same file, passes
+silently, and so does replacing it with a different number. It catches a new
+literal, not a changed one. After a rebase, an entry whose line a patch no
+longer adds is stale and fails the lint until `--refresh` drops it.
+
+CSS length rules: margin, top/left/right/bottom, translate, width, height, and
+border widths count. Hairlines (1px, 0.5px) and percentages don't count for
+sizes, and a percentage doesn't count for sizes or translate.
 
 A duration that isn't motion, such as a network timeout in UI code, can say
 so on its line: `// motion-lint: not motion (why)`. Nothing else can be
@@ -38,7 +48,7 @@ PATCHES = ROOT / 'patches'
 SERIES = PATCHES / 'series'
 ALLOWLIST = Path(__file__).resolve().parent / 'motion_lint_allowlist.txt'
 
-KINDS = ('duration', 'curve', 'radius', 'inset', 'gap', 'padding')
+KINDS = ('duration', 'curve', 'radius', 'inset', 'gap', 'padding', 'size')
 
 TOKEN_FILES = {
     'chrome/browser/ui/views/rac/rac_tokens.h',
@@ -96,7 +106,14 @@ WEB_RULES = [
     ('padding', re.compile(r'(?<![\w-])(?:--[\w-]*)?padding(?:-[\w-]+)?\s*:\s*([^;]*)')),
     ('gap', re.compile(r'(?<![\w-])(?:--[\w-]*|grid-)?(?:row-|column-)?gap\s*:\s*([^;]*)')),
     ('inset', re.compile(r'(?<![\w-])(?:--[\w-]*)?inset(?:-[\w-]+)?\s*:\s*([^;]*)')),
+    ('gap', re.compile(r'(?<![\w-])(?:--[\w-]*)?margin(?:-[\w-]+)?\s*:\s*([^;]*)')),
+    ('inset', re.compile(r'(?<![\w-])(?:top|left|right|bottom)\s*:\s*([^;]*)')),
 ]
+# Rules whose lengths follow their own exemptions (see has_length).
+TRANSLATE = re.compile(r'(?<![\w-])translate\s*:\s*([^;]*)|'
+                       r'translate(?:3d|[XYZ])?\(([^)]*)\)')
+SIZE = re.compile(r'(?<![\w-])(?:(?:min|max)-)?(?:width|height)\s*:\s*([^;]*)|'
+                  r'(?<![\w-])border(?:-[\w-]+)?-width\s*:\s*([^;]*)')
 WEB_DURATION_LINE = re.compile(r'(?:transition|animation|duration|delay)', re.I)
 # The Web Animations API takes milliseconds without a unit.
 SCRIPT_DURATION = re.compile(r'\b(?:duration|delay)\s*:\s*([1-9]\d*)\b')
@@ -130,11 +147,16 @@ def in_scope(path):
     return path.endswith(WEB)
 
 
-def has_length(values):
-    """Whether a CSS value holds a length other than 0 (or 50% for circles)."""
+def has_length(values, hairlines=False, percents=True):
+    """Whether a CSS value holds a length other than 0 (or 50% for circles).
+
+    `hairlines` also lets 1px and 0.5px through, and `percents` False lets
+    every percentage through."""
     for match in re.finditer(_LENGTH, re.sub(r'var\([^)]*\)|calc\(', ' ', values)):
         number, unit = float(match.group(1)), match.group(2) or ''
-        if number == 0 or (unit == '%' and number == 50):
+        if number == 0 or (unit == '%' and (number == 50 or not percents)):
+            continue
+        if hairlines and unit == 'px' and abs(number) in (0.5, 1):
             continue
         # Unitless numbers in CSS are factors, not lengths.
         if unit:
@@ -152,7 +174,8 @@ def literals(path, line):
     """The kinds of literal on one added line of `path`."""
     kinds = []
     if path.endswith(CXX):
-        code = re.sub(r'//.*$', '', line)
+        # Closed block comments go first, so `/* c */ code` still counts.
+        code = re.sub(r'//.*$', '', re.sub(r'/\*.*?\*/', ' ', line))
         if not code.strip() or code.lstrip().startswith(('*', '/*', '#include')):
             return kinds
         for kind, rule in CXX_RULES:
@@ -185,6 +208,16 @@ def literals(path, line):
         if match.groups() and not has_length(match.group(1)):
             continue
         kinds.append(kind)
+    # Media and container queries name breakpoints, not design sizes.
+    queries = re.search(r'@|\((?:min|max)-(?:width|height)\s*:', code)
+    for kind, rule, options in (('inset', TRANSLATE, {'percents': False}),
+                                ('size', SIZE, {'hairlines': True, 'percents': False})):
+        if kind in kinds or (kind == 'size' and queries):
+            continue
+        for match in rule.finditer(plain):
+            if any(has_length(span, **options) for span in match.groups() if span):
+                kinds.append(kind)
+                break
     return kinds
 
 
@@ -352,7 +385,10 @@ def print_counts(findings):
 
 
 def git_show(ref, path):
-    relative = path.relative_to(ROOT).as_posix()
+    try:
+        relative = path.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        raise ValueError(f'--base needs an allowlist inside {ROOT}, not {path}') from None
     result = subprocess.run(['git', '-C', str(ROOT), 'show', f'{ref}:{relative}'],
                             capture_output=True,
                             text=True,
@@ -412,7 +448,10 @@ def main():
         return
 
     if args.base:
-        base = read_allowlist(git_show(args.base, args.allowlist))
+        try:
+            base = read_allowlist(git_show(args.base, args.allowlist))
+        except ValueError as error:
+            sys.exit(f'motion_lint: {error}')
         for kind, path, old, new in growth(base, allowed):
             print(f'{path}: allowlisted {kind} literals grew from {old} to {new} since '
                   f'{args.base}')
