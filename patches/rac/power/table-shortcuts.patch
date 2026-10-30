@@ -1,0 +1,1121 @@
+Index: src/chrome/browser/rac/power/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/power/BUILD.gn
++++ src/chrome/browser/rac/power/BUILD.gn
+@@ -22,21 +22,46 @@ source_set("power") {
+   deps = [ "//components/url_formatter" ]
+ }
+ 
++# Turns the action table's default shortcuts into entries for Helium's browser
++# shortcut service. Separate from "power" because it needs prefs and ui, which
++# the pure-text logic above doesn't.
++source_set("table_shortcuts") {
++  sources = [
++    "table_shortcuts.cc",
++    "table_shortcuts.h",
++  ]
++  public_deps = [
++    "//base",
++    "//chrome/browser/rac/actions:core",
++    "//ui/base",
++    "//ui/events:events_base",
++  ]
++  deps = [ "//components/prefs" ]
++}
++
+ # Build with `autoninja -C out/Default
+ # chrome/browser/rac/power:rac_power_unittests`. It also runs the SitePattern
+ # tests, so one binary covers both. It's separate from Chromium's unit_tests,
+ # which takes hours to build.
+ test("rac_power_unittests") {
+-  sources = [ "markdown_link_unittest.cc" ]
++  sources = [
++    "markdown_link_unittest.cc",
++    "table_shortcuts_prefs_unittest.cc",
++    "table_shortcuts_unittest.cc",
++  ]
+   deps = [
+     ":power",
++    ":table_shortcuts",
+     "third_party/ardia:unit_tests",
+     "third_party/stedding:unit_tests",
+     "//base",
+     "//base/test:run_all_unittests",
+     "//base/test:test_support",
+     "//chrome/browser/rac/site_pattern:unit_tests",
++    "//components/prefs",
++    "//components/prefs:test_support",
+     "//testing/gtest",
++    "//ui/base",
+     "//url",
+   ]
+ }
+Index: src/chrome/browser/rac/power/table_shortcuts.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/power/table_shortcuts.cc
+@@ -0,0 +1,173 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/power/table_shortcuts.h"
++
++#include <algorithm>
++
++#include "base/strings/string_number_conversions.h"
++#include "base/values.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "components/prefs/pref_service.h"
++#include "ui/events/keycodes/keyboard_codes.h"
++
++namespace rac::power {
++
++namespace {
++
++// A ranged row whose last id comes before its first. It is a table bug, so it
++// gets no default, no label, and no listing.
++bool IsMalformed(const action_table::Action& row) {
++  return row.command_id_last != 0 && row.command_id_last < row.command_id;
++}
++
++// The last command id of a row: a single command is its own last.
++int LastCommandId(const action_table::Action& row) {
++  return row.command_id_last != 0 ? row.command_id_last : row.command_id;
++}
++
++bool IsDigitKey(ui::KeyboardCode key) {
++  return key >= ui::VKEY_0 && key <= ui::VKEY_9;
++}
++
++// Whether the row's shortcut can be expanded across its whole range.
++bool RangeKeysFit(const action_table::Action& row) {
++  const int count = LastCommandId(row) - row.command_id;
++  const int first = row.default_shortcut.key;
++  return IsDigitKey(row.default_shortcut.key) &&
++         IsDigitKey(static_cast<ui::KeyboardCode>(first + count));
++}
++
++bool IsShortcutRow(const action_table::Action& row) {
++  return row.surfaces.Has(action_table::Surface::kShortcut) &&
++         !IsMalformed(row);
++}
++
++bool IsListedRow(const action_table::Action& row) {
++  return IsShortcutRow(row) && row.command_id != 0;
++}
++
++bool PrefOn(const action_table::Action& row, PrefIsOn pref_is_on) {
++  return row.shortcut_pref.empty() || pref_is_on(row.shortcut_pref);
++}
++
++// Whether the row's table data allows a default, ignoring its pref.
++bool HasUsableDefault(const action_table::Action& row) {
++  if (row.default_shortcut.empty()) {
++    return false;
++  }
++  return row.command_id_last == 0 ||
++         (row.default_shortcut.replaces_command_id == 0 && RangeKeysFit(row));
++}
++
++// Whether the row contributes defaults at all.
++bool RowIsEnabled(const action_table::Action& row, PrefIsOn pref_is_on) {
++  return IsListedRow(row) && HasUsableDefault(row) && PrefOn(row, pref_is_on);
++}
++
++}  // namespace
++
++std::vector<TableShortcut> EnabledTableShortcuts(
++    base::span<const action_table::Action> rows,
++    PrefIsOn pref_is_on) {
++  std::vector<TableShortcut> result;
++  for (const action_table::Action& row : rows) {
++    if (!RowIsEnabled(row, pref_is_on)) {
++      continue;
++    }
++    const int count = LastCommandId(row) - row.command_id;
++    for (int i = 0; i <= count; ++i) {
++      result.push_back(
++          {.command_id = row.command_id + i,
++           .accelerator = ui::Accelerator(
++               static_cast<ui::KeyboardCode>(row.default_shortcut.key + i),
++               row.default_shortcut.modifiers),
++           .replaces_command_id = row.default_shortcut.replaces_command_id});
++    }
++  }
++  return result;
++}
++
++std::vector<int> TableCommandsWithoutDefault(
++    base::span<const action_table::Action> rows,
++    PrefIsOn pref_is_on) {
++  std::vector<int> result;
++  for (const action_table::Action& row : rows) {
++    // A row whose pref is off is inactive, not empty: it adds nothing.
++    if (!IsListedRow(row) || !PrefOn(row, pref_is_on) ||
++        HasUsableDefault(row)) {
++      continue;
++    }
++    for (int id = row.command_id; id <= LastCommandId(row); ++id) {
++      result.push_back(id);
++    }
++  }
++  return result;
++}
++
++std::vector<std::string_view> TableShortcutPrefs(
++    base::span<const action_table::Action> rows) {
++  std::vector<std::string_view> result;
++  for (const action_table::Action& row : rows) {
++    if (row.surfaces.Has(action_table::Surface::kShortcut) &&
++        !row.shortcut_pref.empty() &&
++        std::ranges::find(result, row.shortcut_pref) == result.end()) {
++      result.push_back(row.shortcut_pref);
++    }
++  }
++  return result;
++}
++
++std::optional<TableLabel> TableLabelFor(
++    base::span<const action_table::Action> rows,
++    int command_id) {
++  if (command_id == 0) {
++    return std::nullopt;
++  }
++  for (const action_table::Action& row : rows) {
++    if (!IsListedRow(row) || command_id < row.command_id ||
++        command_id > LastCommandId(row)) {
++      continue;
++    }
++    TableLabel label;
++    label.message_id =
++        row.menu_label_id != 0 ? row.menu_label_id : row.label_id;
++    if (label.message_id == 0) {
++      return std::nullopt;
++    }
++    if (row.command_id_last != 0) {
++      label.replacement =
++          base::NumberToString16(command_id - row.command_id + 1);
++    }
++    return label;
++  }
++  return std::nullopt;
++}
++
++void ObserveTableShortcutPrefs(base::span<const action_table::Action> rows,
++                               PrefChangeRegistrar& registrar,
++                               const base::RepeatingClosure& callback) {
++  for (std::string_view pref : TableShortcutPrefs(rows)) {
++    const std::string name(pref);
++    if (!registrar.IsObserved(name)) {
++      registrar.Add(name, callback);
++    }
++  }
++}
++
++bool IsShortcutPrefOn(const PrefService* prefs, std::string_view pref) {
++  if (pref.empty()) {
++    return true;
++  }
++  if (!prefs) {
++    return false;
++  }
++  const PrefService::Preference* preference = prefs->FindPreference(pref);
++  if (!preference || preference->GetType() != base::Value::Type::BOOLEAN) {
++    return false;
++  }
++  return prefs->GetBoolean(pref);
++}
++
++}  // namespace rac::power
+Index: src/chrome/browser/rac/power/table_shortcuts.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/power/table_shortcuts.h
+@@ -0,0 +1,200 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_POWER_TABLE_SHORTCUTS_H_
++#define CHROME_BROWSER_RAC_POWER_TABLE_SHORTCUTS_H_
++
++#include <algorithm>
++#include <map>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/flat_set.h"
++#include "base/containers/span.h"
++#include "base/functional/callback.h"
++#include "base/functional/function_ref.h"
++#include "chrome/browser/rac/actions/rac_actions.h"
++#include "ui/base/accelerators/accelerator.h"
++
++class PrefChangeRegistrar;
++class PrefService;
++
++namespace rac::power {
++
++// One default shortcut the action table asks for. A ranged row (Show Space
++// 1-9) expands to one of these per command id.
++struct TableShortcut {
++  int command_id = 0;
++  ui::Accelerator accelerator;
++  // The command whose default this one takes over, or 0.
++  int replaces_command_id = 0;
++};
++
++// Whether Helium's shortcut page can name the command (it has a label).
++using HasLabel = base::FunctionRef<bool(int command_id)>;
++// Whether Helium can store the accelerator (it has a serialized form).
++using CanStore = base::FunctionRef<bool(const ui::Accelerator&)>;
++
++// Says whether the boolean pref called `pref` is on. Only called with a
++// non-empty name.
++using PrefIsOn = base::FunctionRef<bool(std::string_view pref)>;
++
++// The default shortcuts to add, in table order. A row counts when it has the
++// kShortcut surface, a command id, a non-empty default shortcut, and its
++// shortcut_pref is on ("" counts as on).
++//
++// A ranged row (command_id_last != 0) gives command id `command_id + i` the
++// key `key + i`. It only counts when the first and last keys are both in
++// VKEY_0..VKEY_9; otherwise the whole range gets nothing. A ranged row can't
++// replace another command, so one that tries gets nothing too.
++std::vector<TableShortcut> EnabledTableShortcuts(
++    base::span<const action_table::Action> rows,
++    PrefIsOn pref_is_on);
++
++// Every command id of the kShortcut rows that are on but got no usable default
++// (empty shortcut, a range whose keys don't fit, a range with a replacement).
++// They are still listed on the shortcut page, so the user can bind them.
++//
++// A row whose pref is off is inactive, not empty: it is in neither list, so
++// its command is absent from Helium's defaults. Helium keeps the saved
++// rebinds of commands that are absent (PersistToPrefs preserves the deltas of
++// inactive commands). Listing the command with an empty vector would make
++// the next load wipe the user's rebind on every pref flip. A malformed range
++// (command_id_last < command_id) is in neither list.
++std::vector<int> TableCommandsWithoutDefault(
++    base::span<const action_table::Action> rows,
++    PrefIsOn pref_is_on);
++
++// The distinct non-empty shortcut_pref names of the kShortcut rows, in table
++// order.
++std::vector<std::string_view> TableShortcutPrefs(
++    base::span<const action_table::Action> rows);
++
++struct TableLabel {
++  int message_id = 0;
++  // The text for $1 in the message, when the row is a numbered set.
++  std::optional<std::u16string> replacement;
++};
++
++// The label the shortcut page shows for `command_id`. Finds the kShortcut row
++// whose command id range holds it. The message is menu_label_id, or label_id
++// when that is 0. A ranged row's replacement is the ordinal ("1".."9"). Returns
++// nullopt when no row holds the id or the row has no label.
++std::optional<TableLabel> TableLabelFor(
++    base::span<const action_table::Action> rows,
++    int command_id);
++
++// Watches every name from TableShortcutPrefs with `callback`. A name the
++// registrar already observes (a row reusing one of Helium's prefs) is
++// skipped, because adding it twice DCHECKs.
++void ObserveTableShortcutPrefs(base::span<const action_table::Action> rows,
++                               PrefChangeRegistrar& registrar,
++                               const base::RepeatingClosure& callback);
++
++// Reads a boolean pref. "" is always on. A pref that isn't registered, isn't
++// a boolean, or a null `prefs` is off; this never CHECKs.
++bool IsShortcutPrefOn(const PrefService* prefs, std::string_view pref);
++
++// Adds `shortcuts` to Helium's default accelerators. `Entry` is Helium's
++// BrowserShortcutService::AcceleratorEntry; tests use a fake with the same
++// two fields: {ui::Accelerator accelerator; bool user_modifiable;}.
++//
++// For each shortcut, in order:
++// 0. If `has_label` says the command has no label, skip it and change nothing
++//    (Helium's insert_default does the same). If `can_store` says the
++//    accelerator can't be stored, skip it but keep the command listed.
++// 1. With replaces_command_id: if that command holds the same accelerator
++//    and it is locked, skip the shortcut and keep the command listed. If it
++//    is not locked, erase that entry. The replaced command stays in
++//    `defaults`, even with no entries, so it stays listed and rebindable.
++// 2. Otherwise, if `seen` already holds the accelerator, skip the shortcut
++//    (keeping the command listed): it never takes a key from an unrelated
++//    command. If not, add it to `seen`.
++// 3. Add the entry to the command, keeping its vector sorted and free of
++//    duplicates.
++// Last, every labelled id in `without_default` gets an empty list if it has
++// none.
++template <typename Entry>
++void ApplyTableShortcuts(base::span<const TableShortcut> shortcuts,
++                         base::span<const int> without_default,
++                         std::map<int, std::vector<Entry>>& defaults,
++                         base::flat_set<ui::Accelerator>& seen,
++                         HasLabel has_label,
++                         CanStore can_store) {
++  for (const TableShortcut& shortcut : shortcuts) {
++    if (!has_label(shortcut.command_id)) {
++      continue;
++    }
++    if (!can_store(shortcut.accelerator)) {
++      defaults.try_emplace(shortcut.command_id);
++      continue;
++    }
++    bool replaced = false;
++    if (shortcut.replaces_command_id != 0) {
++      auto replaced_it = defaults.find(shortcut.replaces_command_id);
++      if (replaced_it != defaults.end()) {
++        std::vector<Entry>& held = replaced_it->second;
++        auto held_it =
++            std::ranges::find(held, shortcut.accelerator, &Entry::accelerator);
++        if (held_it != held.end()) {
++          if (!held_it->user_modifiable) {
++            // Keep the row listed, with no key, so it can still be bound.
++            defaults.try_emplace(shortcut.command_id);
++            continue;
++          }
++          held.erase(held_it);
++          replaced = true;
++        }
++      }
++    }
++    if (!seen.insert(shortcut.accelerator).second && !replaced) {
++      // Another command owns these keys; never take them.
++      defaults.try_emplace(shortcut.command_id);
++      continue;
++    }
++
++    std::vector<Entry>& entries = defaults[shortcut.command_id];
++    auto insert_at =
++        std::ranges::lower_bound(entries, shortcut.accelerator,
++                                 std::ranges::less(), &Entry::accelerator);
++    if (insert_at != entries.end() &&
++        insert_at->accelerator == shortcut.accelerator) {
++      continue;
++    }
++    entries.insert(insert_at, Entry{shortcut.accelerator, true});
++  }
++  for (int command_id : without_default) {
++    if (has_label(command_id)) {
++      defaults.try_emplace(command_id);
++    }
++  }
++}
++
++// The call the browser shortcut service makes at the end of
++// BuildCurrentDefaults(): reads the action table and the prefs. The service
++// passes its own label and storage checks. It is a template so the table's
++// code is only linked into the one place that instantiates it.
++template <typename Entry>
++void ApplyTableShortcuts(const PrefService* prefs,
++                         std::map<int, std::vector<Entry>>& defaults,
++                         base::flat_set<ui::Accelerator>& seen,
++                         HasLabel has_label,
++                         CanStore can_store) {
++  auto pref_is_on = [prefs](std::string_view pref) {
++    return IsShortcutPrefOn(prefs, pref);
++  };
++  const base::span<const action_table::Action> rows = action_table::All();
++  const std::vector<TableShortcut> shortcuts =
++      EnabledTableShortcuts(rows, pref_is_on);
++  const std::vector<int> without_default =
++      TableCommandsWithoutDefault(rows, pref_is_on);
++  ApplyTableShortcuts<Entry>(shortcuts, without_default, defaults, seen,
++                             has_label, can_store);
++}
++
++}  // namespace rac::power
++
++#endif  // CHROME_BROWSER_RAC_POWER_TABLE_SHORTCUTS_H_
+Index: src/chrome/browser/rac/power/table_shortcuts_prefs_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/power/table_shortcuts_prefs_unittest.cc
+@@ -0,0 +1,127 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include <string_view>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "chrome/browser/rac/power/table_shortcuts.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/testing_pref_service.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::power {
++
++namespace {
++
++using action_table::Action;
++using action_table::Surface;
++using action_table::Surfaces;
++
++Action PrefRow(int command_id, std::string_view pref) {
++  return {.id = "row",
++          .command_id = command_id,
++          .shortcut_pref = pref,
++          .surfaces = Surfaces{Surface::kShortcut}};
++}
++
++}  // namespace
++
++TEST(IsShortcutPrefOnTest, EmptyNameIsOn) {
++  TestingPrefServiceSimple prefs;
++  EXPECT_TRUE(IsShortcutPrefOn(&prefs, ""));
++  EXPECT_TRUE(IsShortcutPrefOn(nullptr, ""));
++}
++
++TEST(IsShortcutPrefOnTest, ReadsABooleanPref) {
++  TestingPrefServiceSimple prefs;
++  prefs.registry()->RegisterBooleanPref("rac.on", true);
++  prefs.registry()->RegisterBooleanPref("rac.off", false);
++  EXPECT_TRUE(IsShortcutPrefOn(&prefs, "rac.on"));
++  EXPECT_FALSE(IsShortcutPrefOn(&prefs, "rac.off"));
++  prefs.SetBoolean("rac.off", true);
++  EXPECT_TRUE(IsShortcutPrefOn(&prefs, "rac.off"));
++}
++
++TEST(IsShortcutPrefOnTest, UnregisteredPrefIsOff) {
++  TestingPrefServiceSimple prefs;
++  EXPECT_FALSE(IsShortcutPrefOn(&prefs, "rac.missing"));
++}
++
++TEST(IsShortcutPrefOnTest, NonBooleanPrefIsOff) {
++  TestingPrefServiceSimple prefs;
++  prefs.registry()->RegisterIntegerPref("rac.int", 1);
++  prefs.registry()->RegisterStringPref("rac.string", "true");
++  EXPECT_FALSE(IsShortcutPrefOn(&prefs, "rac.int"));
++  EXPECT_FALSE(IsShortcutPrefOn(&prefs, "rac.string"));
++}
++
++TEST(IsShortcutPrefOnTest, NullPrefServiceIsOff) {
++  EXPECT_FALSE(IsShortcutPrefOn(nullptr, "rac.on"));
++}
++
++TEST(ObserveTableShortcutPrefsTest, FiresTheCallbackOnAChange) {
++  TestingPrefServiceSimple prefs;
++  prefs.registry()->RegisterBooleanPref("rac.a", false);
++  PrefChangeRegistrar registrar;
++  registrar.Init(&prefs);
++  int calls = 0;
++  const std::vector<Action> rows = {PrefRow(1, "rac.a")};
++  ObserveTableShortcutPrefs(rows, registrar,
++                            base::BindRepeating([](int* n) { ++*n; }, &calls));
++  EXPECT_TRUE(registrar.IsObserved("rac.a"));
++  prefs.SetBoolean("rac.a", true);
++  EXPECT_EQ(1, calls);
++}
++
++TEST(ObserveTableShortcutPrefsTest, ADuplicateNameIsAddedOnce) {
++  TestingPrefServiceSimple prefs;
++  prefs.registry()->RegisterBooleanPref("rac.a", false);
++  prefs.registry()->RegisterBooleanPref("rac.b", false);
++  PrefChangeRegistrar registrar;
++  registrar.Init(&prefs);
++  int calls = 0;
++  const std::vector<Action> rows = {PrefRow(1, "rac.a"), PrefRow(2, "rac.b"),
++                                    PrefRow(3, "rac.a"), PrefRow(4, "")};
++  ObserveTableShortcutPrefs(rows, registrar,
++                            base::BindRepeating([](int* n) { ++*n; }, &calls));
++  EXPECT_TRUE(registrar.IsObserved("rac.a"));
++  EXPECT_TRUE(registrar.IsObserved("rac.b"));
++  prefs.SetBoolean("rac.a", true);
++  EXPECT_EQ(1, calls);
++}
++
++TEST(ObserveTableShortcutPrefsTest, AnAlreadyObservedNameIsLeftAlone) {
++  TestingPrefServiceSimple prefs;
++  prefs.registry()->RegisterBooleanPref("rac.a", false);
++  PrefChangeRegistrar registrar;
++  registrar.Init(&prefs);
++  int helium_calls = 0;
++  int rac_calls = 0;
++  registrar.Add("rac.a",
++                base::BindRepeating([](int* n) { ++*n; }, &helium_calls));
++  const std::vector<Action> rows = {PrefRow(1, "rac.a")};
++  // Adding it again would DCHECK.
++  ObserveTableShortcutPrefs(
++      rows, registrar, base::BindRepeating([](int* n) { ++*n; }, &rac_calls));
++  prefs.SetBoolean("rac.a", true);
++  EXPECT_EQ(1, helium_calls);
++  EXPECT_EQ(0, rac_calls);
++}
++
++TEST(ObserveTableShortcutPrefsTest, MenuOnlyRowsAreNotObserved) {
++  TestingPrefServiceSimple prefs;
++  prefs.registry()->RegisterBooleanPref("rac.menu", false);
++  PrefChangeRegistrar registrar;
++  registrar.Init(&prefs);
++  Action row = PrefRow(1, "rac.menu");
++  row.surfaces = Surfaces{Surface::kMenu};
++  const std::vector<Action> rows = {row};
++  ObserveTableShortcutPrefs(rows, registrar, base::DoNothing());
++  EXPECT_FALSE(registrar.IsObserved("rac.menu"));
++}
++
++}  // namespace rac::power
+Index: src/chrome/browser/rac/power/table_shortcuts_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/power/table_shortcuts_unittest.cc
+@@ -0,0 +1,549 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/power/table_shortcuts.h"
++
++#include <map>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/flat_set.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/base/accelerators/accelerator.h"
++#include "ui/events/event_constants.h"
++#include "ui/events/keycodes/keyboard_codes.h"
++
++namespace rac::power {
++
++namespace {
++
++using action_table::Action;
++using action_table::ShortcutSpec;
++using action_table::Surface;
++using action_table::Surfaces;
++
++constexpr int kA = 100;
++constexpr int kB = 200;
++constexpr int kOther = 300;
++constexpr int kSpace0 = 400;
++constexpr int kSpace8 = 408;
++
++// Stands in for BrowserShortcutService::AcceleratorEntry.
++struct FakeEntry {
++  ui::Accelerator accelerator;
++  bool user_modifiable = true;
++  bool operator==(const FakeEntry&) const = default;
++};
++using FakeDefaults = std::map<int, std::vector<FakeEntry>>;
++
++ui::Accelerator Ctrl(ui::KeyboardCode key) {
++  return ui::Accelerator(key, ui::EF_CONTROL_DOWN);
++}
++
++Action ShortcutRow(int command_id,
++                   ShortcutSpec shortcut,
++                   std::string_view pref = "") {
++  return {.id = "row",
++          .command_id = command_id,
++          .default_shortcut = shortcut,
++          .shortcut_pref = pref,
++          .surfaces = Surfaces{Surface::kShortcut}};
++}
++
++ShortcutSpec CtrlKey(ui::KeyboardCode key, int replaces = 0) {
++  return {.key = key,
++          .modifiers = ui::EF_CONTROL_DOWN,
++          .replaces_command_id = replaces};
++}
++
++Action SpaceRow(ui::KeyboardCode key = ui::VKEY_1) {
++  Action row = ShortcutRow(kSpace0, CtrlKey(key));
++  row.command_id_last = kSpace8;
++  return row;
++}
++
++std::vector<TableShortcut> Enabled(const std::vector<Action>& rows,
++                                   bool pref_on = true) {
++  return EnabledTableShortcuts(rows, [&](std::string_view) { return pref_on; });
++}
++
++std::vector<int> WithoutDefault(const std::vector<Action>& rows,
++                                bool pref_on = true) {
++  return TableCommandsWithoutDefault(rows,
++                                     [&](std::string_view) { return pref_on; });
++}
++
++std::vector<int> Commands(const std::vector<TableShortcut>& shortcuts) {
++  std::vector<int> ids;
++  for (const TableShortcut& s : shortcuts) {
++    ids.push_back(s.command_id);
++  }
++  return ids;
++}
++
++// Runs the shortcuts the way the service hook does, with every command
++// labelled and every accelerator storable.
++void Apply(const std::vector<TableShortcut>& shortcuts,
++           const std::vector<int>& without_default,
++           FakeDefaults& defaults,
++           base::flat_set<ui::Accelerator>& seen) {
++  ApplyTableShortcuts<FakeEntry>(
++      shortcuts, without_default, defaults, seen, [](int) { return true; },
++      [](const ui::Accelerator&) { return true; });
++}
++
++}  // namespace
++
++TEST(TableShortcutsTest, EmptyTableGivesNothing) {
++  EXPECT_TRUE((Enabled({})).empty());
++  EXPECT_TRUE((WithoutDefault({})).empty());
++}
++
++TEST(TableShortcutsTest, SingleRowWithPrefOn) {
++  std::vector<std::string_view> asked;
++  const std::vector<Action> rows = {
++      ShortcutRow(kA, CtrlKey(ui::VKEY_K), "rac.pref")};
++  std::vector<TableShortcut> got =
++      EnabledTableShortcuts(rows, [&](std::string_view pref) {
++        asked.push_back(pref);
++        return true;
++      });
++  ASSERT_EQ(1u, got.size());
++  EXPECT_EQ(kA, got[0].command_id);
++  EXPECT_EQ(Ctrl(ui::VKEY_K), got[0].accelerator);
++  EXPECT_EQ(0, got[0].replaces_command_id);
++  EXPECT_EQ((std::vector<std::string_view>{"rac.pref"}), asked);
++  EXPECT_TRUE((WithoutDefault(rows)).empty());
++}
++
++TEST(TableShortcutsTest, PrefOffRowIsInactiveNotEmpty) {
++  const std::vector<Action> rows = {
++      ShortcutRow(kA, CtrlKey(ui::VKEY_K), "rac.pref"),
++      ShortcutRow(kB, ShortcutSpec(), "rac.pref")};
++  EXPECT_TRUE((Enabled(rows, /*pref_on=*/false)).empty());
++  EXPECT_TRUE((WithoutDefault(rows, /*pref_on=*/false)).empty());
++}
++
++TEST(TableShortcutsTest, PrefOffRowIsAbsentFromDefaultsEvenWithASpec) {
++  // Helium keeps the saved rebinds of commands that are absent from its
++  // defaults, so a pref flip must not list the command with an empty vector.
++  Action space = SpaceRow();
++  space.shortcut_pref = "rac.pref";
++  const std::vector<Action> rows = {
++      ShortcutRow(kA, CtrlKey(ui::VKEY_K), "rac.pref"), space};
++  FakeDefaults defaults;
++  base::flat_set<ui::Accelerator> seen;
++  auto off = [](std::string_view) { return false; };
++  Apply(EnabledTableShortcuts(rows, off),
++        TableCommandsWithoutDefault(rows, off), defaults, seen);
++  EXPECT_FALSE(defaults.contains(kA));
++  EXPECT_FALSE(defaults.contains(kSpace0));
++  EXPECT_TRUE(defaults.empty());
++  EXPECT_TRUE(seen.empty());
++}
++
++TEST(TableShortcutsTest, EmptyPrefNameCountsAsOnAndIsNeverAsked) {
++  const std::vector<Action> rows = {ShortcutRow(kA, CtrlKey(ui::VKEY_K), "")};
++  bool asked = false;
++  auto got = EnabledTableShortcuts(rows, [&](std::string_view) {
++    asked = true;
++    return false;
++  });
++  EXPECT_EQ(1u, got.size());
++  EXPECT_FALSE(asked);
++}
++
++TEST(TableShortcutsTest, PrefsAreAskedPerRow) {
++  const std::vector<Action> rows = {
++      ShortcutRow(kA, CtrlKey(ui::VKEY_K), "on"),
++      ShortcutRow(kB, CtrlKey(ui::VKEY_J), "off")};
++  auto pref_is_on = [](std::string_view pref) { return pref == "on"; };
++  EXPECT_EQ((std::vector<int>{kA}),
++            Commands(EnabledTableShortcuts(rows, pref_is_on)));
++  EXPECT_TRUE((TableCommandsWithoutDefault(rows, pref_is_on)).empty());
++}
++
++TEST(TableShortcutsTest, EmptyShortcutIsListedWithoutDefault) {
++  const std::vector<Action> rows = {ShortcutRow(kA, ShortcutSpec())};
++  EXPECT_TRUE((Enabled(rows)).empty());
++  EXPECT_EQ((std::vector<int>{kA}), WithoutDefault(rows));
++}
++
++TEST(TableShortcutsTest, RowWithoutShortcutSurfaceIsIgnored) {
++  Action row = ShortcutRow(kA, CtrlKey(ui::VKEY_K));
++  row.surfaces = Surfaces{Surface::kMenu, Surface::kCommandBar};
++  EXPECT_TRUE((Enabled({row})).empty());
++  EXPECT_TRUE((WithoutDefault({row})).empty());
++}
++
++TEST(TableShortcutsTest, CommandIdZeroIsIgnored) {
++  const std::vector<Action> rows = {ShortcutRow(0, CtrlKey(ui::VKEY_K))};
++  EXPECT_TRUE((Enabled(rows)).empty());
++  EXPECT_TRUE((WithoutDefault(rows)).empty());
++}
++
++TEST(TableShortcutsTest, ReplacementIsCarried) {
++  const std::vector<Action> rows = {
++      ShortcutRow(kA, CtrlKey(ui::VKEY_T, kOther))};
++  auto got = Enabled(rows);
++  ASSERT_EQ(1u, got.size());
++  EXPECT_EQ(kOther, got[0].replaces_command_id);
++}
++
++TEST(TableShortcutsTest, TableOrderIsKept) {
++  const std::vector<Action> rows = {ShortcutRow(kB, CtrlKey(ui::VKEY_Z)),
++                                    ShortcutRow(kA, CtrlKey(ui::VKEY_A))};
++  EXPECT_EQ((std::vector<int>{kB, kA}), Commands(Enabled(rows)));
++}
++
++TEST(TableShortcutsTest, RangeExpandsCtrl1To9) {
++  const std::vector<Action> rows = {SpaceRow()};
++  auto got = Enabled(rows);
++  ASSERT_EQ(9u, got.size());
++  for (int i = 0; i < 9; ++i) {
++    EXPECT_EQ(kSpace0 + i, got[i].command_id);
++    EXPECT_EQ(Ctrl(static_cast<ui::KeyboardCode>(ui::VKEY_1 + i)),
++              got[i].accelerator);
++    EXPECT_EQ(0, got[i].replaces_command_id);
++  }
++  EXPECT_TRUE((WithoutDefault(rows)).empty());
++}
++
++TEST(TableShortcutsTest, RangeStartingAtZeroFitsWhenItEndsAtNine) {
++  Action row = SpaceRow(ui::VKEY_0);
++  row.command_id_last = kSpace0 + 9;
++  auto got = Enabled({row});
++  ASSERT_EQ(10u, got.size());
++  EXPECT_EQ(Ctrl(ui::VKEY_9), got[9].accelerator);
++}
++
++TEST(TableShortcutsTest, RangeWithALetterKeyGetsNothing) {
++  const std::vector<Action> rows = {SpaceRow(ui::VKEY_A)};
++  EXPECT_TRUE((Enabled(rows)).empty());
++  std::vector<int> ids = WithoutDefault(rows);
++  ASSERT_EQ(9u, ids.size());
++  EXPECT_EQ(kSpace0, ids.front());
++  EXPECT_EQ(kSpace8, ids.back());
++}
++
++TEST(TableShortcutsTest, RangeRunningPastNineGetsNothing) {
++  const std::vector<Action> rows = {SpaceRow(ui::VKEY_2)};
++  EXPECT_TRUE((Enabled(rows)).empty());
++  EXPECT_EQ(9u, WithoutDefault(rows).size());
++}
++
++TEST(TableShortcutsTest, RangeWithReplacementGetsNothing) {
++  Action row = SpaceRow();
++  row.default_shortcut.replaces_command_id = kOther;
++  EXPECT_TRUE((Enabled({row})).empty());
++  EXPECT_EQ(9u, WithoutDefault({row}).size());
++}
++
++TEST(TableShortcutsTest, RangePrefOffAddsNothing) {
++  Action row = SpaceRow();
++  row.shortcut_pref = "rac.pref";
++  EXPECT_TRUE((Enabled({row}, /*pref_on=*/false)).empty());
++  EXPECT_TRUE((WithoutDefault({row}, /*pref_on=*/false)).empty());
++}
++
++TEST(TableShortcutsTest, MalformedRangeGetsNothingAnywhere) {
++  Action row = SpaceRow();
++  row.command_id_last = kSpace0 - 1;
++  row.label_id = 22;
++  EXPECT_TRUE((Enabled({row})).empty());
++  EXPECT_TRUE((WithoutDefault({row})).empty());
++  EXPECT_FALSE(TableLabelFor({row}, kSpace0));
++  EXPECT_FALSE(TableLabelFor({row}, kSpace0 - 1));
++}
++
++TEST(TableShortcutsTest, MalformedRangeWithAnEmptyShortcutIsNotListed) {
++  Action row = ShortcutRow(kSpace0, ShortcutSpec());
++  row.command_id_last = kSpace0 - 5;
++  EXPECT_TRUE((WithoutDefault({row})).empty());
++}
++
++TEST(TableShortcutsTest, PrefsAreDistinctAndInTableOrder) {
++  std::vector<Action> rows = {
++      ShortcutRow(kA, CtrlKey(ui::VKEY_A), "b.pref"),
++      ShortcutRow(kB, CtrlKey(ui::VKEY_B), ""),
++      ShortcutRow(kOther, CtrlKey(ui::VKEY_C), "a.pref"),
++      ShortcutRow(500, CtrlKey(ui::VKEY_D), "b.pref")};
++  EXPECT_EQ((std::vector<std::string_view>{"b.pref", "a.pref"}),
++            TableShortcutPrefs(rows));
++  EXPECT_TRUE((TableShortcutPrefs({})).empty());
++}
++
++TEST(TableShortcutsTest, MenuOnlyRowHasNoLabelAndItsPrefIsNotReturned) {
++  Action row = {.id = "menu",
++                .command_id = kA,
++                .label_id = 11,
++                .shortcut_pref = "menu.pref",
++                .surfaces = Surfaces{Surface::kMenu}};
++  EXPECT_FALSE(TableLabelFor({row}, kA));
++  EXPECT_TRUE((TableShortcutPrefs({row})).empty());
++}
++
++TEST(TableShortcutsTest, ApplyAddsAnEntry) {
++  FakeDefaults defaults;
++  base::flat_set<ui::Accelerator> seen;
++  Apply({{kA, Ctrl(ui::VKEY_K), 0}}, {}, defaults, seen);
++  EXPECT_EQ((std::vector<FakeEntry>{FakeEntry{Ctrl(ui::VKEY_K), true}}),
++            defaults[kA]);
++  EXPECT_TRUE(seen.contains(Ctrl(ui::VKEY_K)));
++}
++
++TEST(TableShortcutsTest, ApplyReplacementTakesTheKeyAndKeepsTheEmptyEntry) {
++  FakeDefaults defaults;
++  defaults[kOther] = {{Ctrl(ui::VKEY_T), true}};
++  base::flat_set<ui::Accelerator> seen = {Ctrl(ui::VKEY_T)};
++  Apply({{kA, Ctrl(ui::VKEY_T), kOther}}, {}, defaults, seen);
++  ASSERT_TRUE(defaults.contains(kOther));
++  EXPECT_TRUE((defaults[kOther]).empty());
++  EXPECT_EQ((std::vector<FakeEntry>{FakeEntry{Ctrl(ui::VKEY_T), true}}),
++            defaults[kA]);
++  EXPECT_TRUE(seen.contains(Ctrl(ui::VKEY_T)));
++}
++
++TEST(TableShortcutsTest, ApplyReplacementKeepsTheReplacedCommandsOtherKeys) {
++  FakeDefaults defaults;
++  defaults[kOther] = {{Ctrl(ui::VKEY_N), true}, {Ctrl(ui::VKEY_T), true}};
++  base::flat_set<ui::Accelerator> seen = {Ctrl(ui::VKEY_N), Ctrl(ui::VKEY_T)};
++  Apply({{kA, Ctrl(ui::VKEY_T), kOther}}, {}, defaults, seen);
++  EXPECT_EQ((std::vector<FakeEntry>{FakeEntry{Ctrl(ui::VKEY_N), true}}),
++            defaults[kOther]);
++}
++
++TEST(TableShortcutsTest, ApplyLockedReplacedEntryIsLeftAlone) {
++  FakeDefaults defaults;
++  defaults[kOther] = {{Ctrl(ui::VKEY_T), false}};
++  base::flat_set<ui::Accelerator> seen = {Ctrl(ui::VKEY_T)};
++  Apply({{kA, Ctrl(ui::VKEY_T), kOther}}, {}, defaults, seen);
++  EXPECT_EQ((std::vector<FakeEntry>{FakeEntry{Ctrl(ui::VKEY_T), false}}),
++            defaults[kOther]);
++  // The row stays listed with no key, so it can still be bound.
++  EXPECT_EQ(std::vector<FakeEntry>(), defaults.at(kA));
++  EXPECT_EQ(1u, seen.size());
++}
++
++TEST(TableShortcutsTest, ApplyReplacementWithoutThoseKeysDoesNotSteal) {
++  // kOther holds Ctrl+N, but the row asks for Ctrl+T. Ctrl+T belongs to
++  // somebody else, so the row gets nothing.
++  FakeDefaults defaults;
++  defaults[kOther] = {{Ctrl(ui::VKEY_N), true}};
++  defaults[kB] = {{Ctrl(ui::VKEY_T), true}};
++  base::flat_set<ui::Accelerator> seen = {Ctrl(ui::VKEY_N), Ctrl(ui::VKEY_T)};
++  Apply({{kA, Ctrl(ui::VKEY_T), kOther}}, {}, defaults, seen);
++  EXPECT_EQ(std::vector<FakeEntry>(), defaults.at(kA));
++  EXPECT_EQ((std::vector<FakeEntry>{FakeEntry{Ctrl(ui::VKEY_T), true}}),
++            defaults[kB]);
++  EXPECT_EQ((std::vector<FakeEntry>{FakeEntry{Ctrl(ui::VKEY_N), true}}),
++            defaults[kOther]);
++}
++
++TEST(TableShortcutsTest, ApplyReplacementWithoutThoseKeysTakesAFreeKey) {
++  FakeDefaults defaults;
++  defaults[kOther] = {{Ctrl(ui::VKEY_N), true}};
++  base::flat_set<ui::Accelerator> seen = {Ctrl(ui::VKEY_N)};
++  Apply({{kA, Ctrl(ui::VKEY_T), kOther}}, {}, defaults, seen);
++  EXPECT_EQ((std::vector<FakeEntry>{FakeEntry{Ctrl(ui::VKEY_T), true}}),
++            defaults[kA]);
++  EXPECT_EQ((std::vector<FakeEntry>{FakeEntry{Ctrl(ui::VKEY_N), true}}),
++            defaults[kOther]);
++}
++
++TEST(TableShortcutsTest, ApplyNeverStealsAKeyFromAnUnrelatedCommand) {
++  FakeDefaults defaults;
++  defaults[kOther] = {{Ctrl(ui::VKEY_K), true}};
++  base::flat_set<ui::Accelerator> seen = {Ctrl(ui::VKEY_K)};
++  Apply({{kA, Ctrl(ui::VKEY_K), 0}}, {}, defaults, seen);
++  EXPECT_EQ(std::vector<FakeEntry>(), defaults.at(kA));
++  EXPECT_EQ((std::vector<FakeEntry>{FakeEntry{Ctrl(ui::VKEY_K), true}}),
++            defaults[kOther]);
++}
++
++TEST(TableShortcutsTest, ApplyKeyReservedWithoutAnEntryIsNotTaken) {
++  // Helium reserves some keys in `seen` for commands it doesn't list.
++  FakeDefaults defaults;
++  base::flat_set<ui::Accelerator> seen = {Ctrl(ui::VKEY_K)};
++  Apply({{kA, Ctrl(ui::VKEY_K), 0}}, {}, defaults, seen);
++  EXPECT_EQ(1u, defaults.size());
++  EXPECT_EQ(std::vector<FakeEntry>(), defaults.at(kA));
++}
++
++TEST(TableShortcutsTest, ApplyFirstRowWinsOnTheSameKeys) {
++  FakeDefaults defaults;
++  base::flat_set<ui::Accelerator> seen;
++  Apply({{kA, Ctrl(ui::VKEY_K), 0}, {kB, Ctrl(ui::VKEY_K), 0}}, {}, defaults,
++        seen);
++  EXPECT_EQ((std::vector<FakeEntry>{FakeEntry{Ctrl(ui::VKEY_K), true}}),
++            defaults[kA]);
++  EXPECT_EQ(std::vector<FakeEntry>(), defaults.at(kB));
++}
++
++TEST(TableShortcutsTest, ApplyKeepsEntriesSortedWithoutDuplicates) {
++  FakeDefaults defaults;
++  base::flat_set<ui::Accelerator> seen;
++  Apply({{kA, Ctrl(ui::VKEY_Z), 0},
++         {kA, Ctrl(ui::VKEY_A), 0},
++         {kA, Ctrl(ui::VKEY_M), 0},
++         {kA, Ctrl(ui::VKEY_M), 0}},
++        {}, defaults, seen);
++  EXPECT_EQ((std::vector<FakeEntry>{{Ctrl(ui::VKEY_A), true},
++                                    {Ctrl(ui::VKEY_M), true},
++                                    {Ctrl(ui::VKEY_Z), true}}),
++            defaults[kA]);
++}
++
++TEST(TableShortcutsTest, ApplyInsertsIntoAnExistingSortedVector) {
++  FakeDefaults defaults;
++  defaults[kA] = {{Ctrl(ui::VKEY_B), false}, {Ctrl(ui::VKEY_Y), true}};
++  base::flat_set<ui::Accelerator> seen = {Ctrl(ui::VKEY_B), Ctrl(ui::VKEY_Y)};
++  Apply({{kA, Ctrl(ui::VKEY_M), 0}}, {}, defaults, seen);
++  EXPECT_EQ((std::vector<FakeEntry>{{Ctrl(ui::VKEY_B), false},
++                                    {Ctrl(ui::VKEY_M), true},
++                                    {Ctrl(ui::VKEY_Y), true}}),
++            defaults[kA]);
++}
++
++TEST(TableShortcutsTest, ApplyAddsEmptyEntriesForWithoutDefault) {
++  FakeDefaults defaults;
++  defaults[kB] = {{Ctrl(ui::VKEY_B), true}};
++  base::flat_set<ui::Accelerator> seen;
++  Apply({}, {kA, kB}, defaults, seen);
++  EXPECT_TRUE((defaults[kA]).empty());
++  EXPECT_EQ((std::vector<FakeEntry>{FakeEntry{Ctrl(ui::VKEY_B), true}}),
++            defaults[kB]);
++  EXPECT_EQ(2u, defaults.size());
++}
++
++TEST(TableShortcutsTest, ApplyEndToEndFromRows) {
++  const std::vector<Action> rows = {
++      ShortcutRow(kA, CtrlKey(ui::VKEY_T, kOther), "on"),
++      ShortcutRow(kB, CtrlKey(ui::VKEY_J), "off"), SpaceRow()};
++  auto pref_is_on = [](std::string_view pref) { return pref == "on"; };
++  FakeDefaults defaults;
++  defaults[kOther] = {{Ctrl(ui::VKEY_T), true}};
++  base::flat_set<ui::Accelerator> seen = {Ctrl(ui::VKEY_T)};
++  Apply(EnabledTableShortcuts(rows, pref_is_on),
++        TableCommandsWithoutDefault(rows, pref_is_on), defaults, seen);
++  EXPECT_TRUE((defaults[kOther]).empty());
++  EXPECT_EQ((std::vector<FakeEntry>{FakeEntry{Ctrl(ui::VKEY_T), true}}),
++            defaults[kA]);
++  EXPECT_FALSE(defaults.contains(kB));
++  for (int id = kSpace0; id <= kSpace8; ++id) {
++    EXPECT_EQ(1u, defaults[id].size()) << id;
++  }
++}
++
++TEST(TableShortcutsTest, ApplyUnlabelledCommandGetsNothingAtAll) {
++  FakeDefaults defaults;
++  base::flat_set<ui::Accelerator> seen;
++  ApplyTableShortcuts<FakeEntry>(
++      std::vector<TableShortcut>{{kA, Ctrl(ui::VKEY_K), 0},
++                                 {kB, Ctrl(ui::VKEY_J), 0}},
++      std::vector<int>{kA, kOther}, defaults, seen,
++      [](int id) { return id == kB; },
++      [](const ui::Accelerator&) { return true; });
++  EXPECT_FALSE(defaults.contains(kA));
++  EXPECT_FALSE(defaults.contains(kOther));
++  EXPECT_FALSE(seen.contains(Ctrl(ui::VKEY_K)));
++  EXPECT_EQ((std::vector<FakeEntry>{FakeEntry{Ctrl(ui::VKEY_J), true}}),
++            defaults[kB]);
++}
++
++TEST(TableShortcutsTest, ApplyUnlabelledReplacementLeavesTheReplacedKey) {
++  FakeDefaults defaults;
++  defaults[kOther] = {{Ctrl(ui::VKEY_T), true}};
++  base::flat_set<ui::Accelerator> seen = {Ctrl(ui::VKEY_T)};
++  ApplyTableShortcuts<FakeEntry>(
++      std::vector<TableShortcut>{{kA, Ctrl(ui::VKEY_T), kOther}},
++      std::vector<int>{}, defaults, seen, [](int) { return false; },
++      [](const ui::Accelerator&) { return true; });
++  EXPECT_EQ(1u, defaults[kOther].size());
++  EXPECT_FALSE(defaults.contains(kA));
++}
++
++TEST(TableShortcutsTest, ApplyUnstorableShortcutIsSkippedButTheRowStaysListed) {
++  FakeDefaults defaults;
++  defaults[kOther] = {{Ctrl(ui::VKEY_T), true}};
++  base::flat_set<ui::Accelerator> seen = {Ctrl(ui::VKEY_T)};
++  ApplyTableShortcuts<FakeEntry>(
++      std::vector<TableShortcut>{{kA, Ctrl(ui::VKEY_T), kOther},
++                                 {kB, Ctrl(ui::VKEY_J), 0}},
++      std::vector<int>{}, defaults, seen, [](int) { return true; },
++      [](const ui::Accelerator& a) { return a != Ctrl(ui::VKEY_T); });
++  EXPECT_TRUE(defaults.contains(kA));
++  EXPECT_TRUE((defaults[kA]).empty());
++  // The replaced command keeps its key: the replacement never happened.
++  EXPECT_EQ(1u, defaults[kOther].size());
++  EXPECT_EQ(1u, defaults[kB].size());
++  EXPECT_TRUE(seen.contains(Ctrl(ui::VKEY_J)));
++}
++
++TEST(TableShortcutsTest, LabelForASingleRow) {
++  Action row = ShortcutRow(kA, ShortcutSpec());
++  row.label_id = 11;
++  auto label = TableLabelFor({row}, kA);
++  ASSERT_TRUE(label);
++  EXPECT_EQ(11, label->message_id);
++  EXPECT_FALSE(label->replacement);
++}
++
++TEST(TableShortcutsTest, LabelForARangeUsesTheOrdinal) {
++  Action row = SpaceRow();
++  row.label_id = 22;
++  const std::vector<Action> rows = {row};
++  auto first = TableLabelFor(rows, kSpace0);
++  auto last = TableLabelFor(rows, kSpace8);
++  auto middle = TableLabelFor(rows, kSpace0 + 4);
++  ASSERT_TRUE(first && last && middle);
++  EXPECT_EQ(22, first->message_id);
++  EXPECT_EQ(u"1", first->replacement);
++  EXPECT_EQ(u"9", last->replacement);
++  EXPECT_EQ(u"5", middle->replacement);
++  EXPECT_FALSE(TableLabelFor(rows, kSpace8 + 1));
++  EXPECT_FALSE(TableLabelFor(rows, kSpace0 - 1));
++}
++
++TEST(TableShortcutsTest, MenuLabelWinsOverLabel) {
++  Action row = ShortcutRow(kA, ShortcutSpec());
++  row.label_id = 11;
++  row.menu_label_id = 12;
++  EXPECT_EQ(12, TableLabelFor({row}, kA)->message_id);
++}
++
++TEST(TableShortcutsTest, LabelFallsBackToLabelWhenMenuLabelIsZero) {
++  Action row = ShortcutRow(kA, ShortcutSpec());
++  row.label_id = 11;
++  row.menu_label_id = 0;
++  EXPECT_EQ(11, TableLabelFor({row}, kA)->message_id);
++}
++
++TEST(TableShortcutsTest, MenuLabelAloneIsEnough) {
++  Action row = ShortcutRow(kA, ShortcutSpec());
++  row.menu_label_id = 12;
++  EXPECT_EQ(12, TableLabelFor({row}, kA)->message_id);
++}
++
++TEST(TableShortcutsTest, NoLabelGivesNothing) {
++  const std::vector<Action> rows = {ShortcutRow(kA, ShortcutSpec())};
++  EXPECT_FALSE(TableLabelFor(rows, kA));
++}
++
++TEST(TableShortcutsTest, UnknownIdGivesNothing) {
++  Action row = ShortcutRow(kA, ShortcutSpec());
++  row.label_id = 11;
++  EXPECT_FALSE(TableLabelFor({row}, kB));
++  EXPECT_FALSE(TableLabelFor({row}, 0));
++  EXPECT_FALSE(TableLabelFor({}, kA));
++}
++
++TEST(TableShortcutsTest, LabelIgnoresRowsWithoutACommand) {
++  Action row = ShortcutRow(0, ShortcutSpec());
++  row.label_id = 11;
++  EXPECT_FALSE(TableLabelFor({row}, 0));
++}
++
++}  // namespace rac::power
