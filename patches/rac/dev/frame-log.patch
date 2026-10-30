@@ -1,0 +1,375 @@
+--- a/chrome/browser/ui/views/rac/BUILD.gn
++++ b/chrome/browser/ui/views/rac/BUILD.gn
+@@ -2,10 +2,13 @@
+ # You can use, redistribute, and/or modify this source code under
+ # the terms of the GPL-3.0 license that can be found in the LICENSE file.
+ 
++import("//chrome/browser/rac/dev/dev_switches.gni")
++
+ assert(!is_android)
+ 
+ source_set("look") {
+   sources = [
++    "dev/frame_log.h",
+     "rac_look.cc",
+     "rac_look.h",
+     "top_bar.cc",
+@@ -36,6 +39,12 @@ source_set("look") {
+     "//ui/gfx/geometry",
+     "//ui/views",
+   ]
++
++  # Developer tools behind the screenshot harness. Official builds leave
++  # them out (see //chrome/browser/rac/dev).
++  if (rac_dev_switches) {
++    sources += [ "dev/frame_log.cc" ]
++  }
+ }
+ 
+ # The space emoji picker's table, built from the tree's CLDR and ICU data so
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/dev/frame_log.cc
+@@ -0,0 +1,268 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/dev/frame_log.h"
++
++#include <set>
++#include <string>
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/json/string_escape.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "base/scoped_observation.h"
++#include "base/strings/stringprintf.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "base/time/time.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "ui/compositor/compositor.h"
++#include "ui/compositor/compositor_observer.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/presentation_feedback.h"
++#include "ui/views/view.h"
++#include "ui/views/view_tracker.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/widget/widget_observer.h"
++
++namespace rac::dev {
++namespace {
++
++constexpr char kFrameLogSwitch[] = "rac-frame-log";
++
++int64_t Micros(base::TimeTicks ticks) {
++  return ticks.since_origin().InMicroseconds();
++}
++
++// Appends lines to the log file on a background sequence, so the UI thread
++// never touches the disk.
++class LogFile {
++ public:
++  static LogFile* Get() {
++    static base::NoDestructor<std::unique_ptr<LogFile>> file([] {
++      const base::FilePath path =
++          base::CommandLine::ForCurrentProcess()->GetSwitchValuePath(
++              kFrameLogSwitch);
++      return path.empty() ? nullptr : std::make_unique<LogFile>(path);
++    }());
++    return file->get();
++  }
++
++  explicit LogFile(base::FilePath path)
++      : path_(std::move(path)),
++        runner_(base::ThreadPool::CreateSequencedTaskRunner(
++            {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
++             base::TaskShutdownBehavior::BLOCK_SHUTDOWN})) {
++    // Pairs this log's clock with the wall clock, so page times
++    // (performance.timeOrigin + performance.now()) can be put on it.
++    Write(base::StringPrintf(
++              "{\"ev\":\"clock\",\"ticks_us\":%lld,\"wall_ms\":%.3f}",
++              static_cast<long long>(Micros(base::TimeTicks::Now())),
++              base::Time::Now().InMillisecondsFSinceUnixEpoch()),
++          /*truncate=*/true);
++  }
++
++  void Write(std::string line, bool truncate = false) {
++    line += '\n';
++    runner_->PostTask(FROM_HERE, base::BindOnce(
++                                     [](const base::FilePath& path,
++                                        std::string line, bool truncate) {
++                                       if (truncate) {
++                                         base::WriteFile(path, line);
++                                       } else {
++                                         base::AppendToFile(path, line);
++                                       }
++                                     },
++                                     path_, std::move(line), truncate));
++  }
++
++ private:
++  const base::FilePath path_;
++  const scoped_refptr<base::SequencedTaskRunner> runner_;
++};
++
++std::string Quoted(std::string_view text) {
++  std::string out;
++  base::EscapeJSONString(text, /*put_in_quotes=*/true, &out);
++  return out;
++}
++
++// Where `view` is drawn in its widget. ConvertRectToWidget() applies each
++// view's transform, so a layer slide is already in `x`.
++std::string Probe(const views::View* view) {
++  if (!view || !view->GetWidget()) {
++    return "null";
++  }
++  const gfx::Rect bounds = view->ConvertRectToWidget(view->GetLocalBounds());
++  return base::StringPrintf(
++      "{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"drawn\":%s}", bounds.x(),
++      bounds.y(), bounds.width(), bounds.height(),
++      view->IsDrawn() ? "true" : "false");
++}
++
++views::View* FindByClassName(views::View* root, std::string_view name) {
++  if (!root) {
++    return nullptr;
++  }
++  if (root->GetClassName() == name) {
++    return root;
++  }
++  for (views::View* child : root->children()) {
++    if (views::View* found = FindByClassName(child, name)) {
++      return found;
++    }
++  }
++  return nullptr;
++}
++
++// Logs each frame one window presents, and the layout each commit sends to
++// the screen. Deletes itself with the widget.
++//
++// Two kinds of line, both stamped with the time the frame reached the
++// screen:
++//   "frame": every presented frame, for idle-frame budgets.
++//   "layout": the sidebar's and page's bounds as committed, paired with the
++//             frame that commit produced. Reading bounds when the frame is
++//             presented instead would be one to three frames late.
++class FrameObserver : public ui::CompositorObserver,
++                      public views::WidgetObserver {
++ public:
++  FrameObserver(views::Widget* widget, int id) : widget_(widget), id_(id) {
++    widget_observation_.Observe(widget);
++    compositor_observation_.Observe(widget->GetCompositor());
++  }
++
++  static std::set<views::Widget*>& Observed() {
++    static base::NoDestructor<std::set<views::Widget*>> observed;
++    return *observed;
++  }
++
++  // ui::CompositorObserver:
++  void OnCompositingDidCommit(ui::Compositor* compositor) override {
++    UpdateProbes();
++    compositor->RequestPresentationTimeForNextFrame(base::BindOnce(
++        &FrameObserver::OnLayoutPresented, weak_factory_.GetWeakPtr(),
++        Micros(base::TimeTicks::Now()),
++        base::StringPrintf("\"sidebar\":%s,\"page\":%s",
++                           Probe(sidebar_.view()).c_str(),
++                           Probe(page_.view()).c_str())));
++  }
++
++  void OnDidPresentCompositorFrame(
++      ui::Compositor* compositor,
++      uint32_t frame_token,
++      const gfx::PresentationFeedback& feedback) override {
++    if (LogFile* file = LogFile::Get()) {
++      file->Write(base::StringPrintf(
++          "{\"ev\":\"frame\",\"win\":%d,\"token\":%u,\"t_us\":%lld,"
++          "\"now_us\":%lld,\"interval_us\":%lld,\"flags\":%u}",
++          id_, frame_token, static_cast<long long>(Micros(feedback.timestamp)),
++          static_cast<long long>(Micros(base::TimeTicks::Now())),
++          static_cast<long long>(feedback.interval.InMicroseconds()),
++          feedback.flags));
++    }
++  }
++
++  void OnCompositingShuttingDown(ui::Compositor* compositor) override {
++    compositor_observation_.Reset();
++  }
++
++  // views::WidgetObserver:
++  void OnWidgetDestroying(views::Widget* widget) override {
++    Observed().erase(widget_);
++    delete this;
++  }
++
++ private:
++  void OnLayoutPresented(int64_t commit_us,
++                         std::string probes,
++                         const gfx::PresentationFeedback& feedback) {
++    if (LogFile* file = LogFile::Get(); file && !feedback.failed()) {
++      file->Write(base::StringPrintf(
++          "{\"ev\":\"layout\",\"win\":%d,\"t_us\":%lld,"
++          "\"commit_us\":%lld,%s}",
++          id_, static_cast<long long>(Micros(feedback.timestamp)),
++          static_cast<long long>(commit_us), probes.c_str()));
++    }
++  }
++
++  // The views are found again whenever one goes away, since layouts swap
++  // them. A window without them (an app window) is searched at most once a
++  // second, so the search doesn't slow the frames being measured.
++  void UpdateProbes() {
++    if (sidebar_.view() && page_.view()) {
++      return;
++    }
++    const base::TimeTicks now = base::TimeTicks::Now();
++    if (now - last_search_ < base::Seconds(1)) {
++      return;
++    }
++    last_search_ = now;
++    BrowserView* browser_view =
++        BrowserView::GetBrowserViewForNativeWindow(widget_->GetNativeWindow());
++    if (!browser_view) {
++      return;
++    }
++    if (!sidebar_.view()) {
++      sidebar_.SetView(
++          FindByClassName(browser_view, "VerticalTabStripRegionView"));
++    }
++    if (!page_.view()) {
++      page_.SetView(browser_view->contents_container());
++    }
++  }
++
++  const raw_ptr<views::Widget> widget_;
++  const int id_;
++  base::TimeTicks last_search_;
++  views::ViewTracker sidebar_;
++  views::ViewTracker page_;
++  base::ScopedObservation<views::Widget, views::WidgetObserver>
++      widget_observation_{this};
++  base::ScopedObservation<ui::Compositor, ui::CompositorObserver>
++      compositor_observation_{this};
++  base::WeakPtrFactory<FrameObserver> weak_factory_{this};
++};
++
++}  // namespace
++
++void MaybeLogFrames(views::Widget* widget) {
++  LogFile* file = LogFile::Get();
++  if (!file || !widget || !widget->GetCompositor() ||
++      !FrameObserver::Observed().insert(widget).second) {
++    return;
++  }
++  static int next_id = 0;
++  const int id = next_id++;
++  file->Write(base::StringPrintf(
++      "{\"ev\":\"window\",\"win\":%d,\"name\":%s,\"t_us\":%lld}", id,
++      Quoted(widget->GetName()).c_str(),
++      static_cast<long long>(Micros(base::TimeTicks::Now()))));
++  new FrameObserver(widget, id);
++}
++
++void LogRequest(std::string_view request) {
++  if (LogFile* file = LogFile::Get()) {
++    file->Write(base::StringPrintf(
++        "{\"ev\":\"req\",\"t_us\":%lld,\"line\":%s}",
++        static_cast<long long>(Micros(base::TimeTicks::Now())),
++        Quoted(request).c_str()));
++  }
++}
++
++void LogAnimationStep(std::string_view name, double value) {
++  if (LogFile* file = LogFile::Get()) {
++    file->Write(base::StringPrintf(
++        "{\"ev\":\"step\",\"t_us\":%lld,\"name\":%s,\"v\":%.6f}",
++        static_cast<long long>(Micros(base::TimeTicks::Now())),
++        Quoted(name).c_str(), value));
++  }
++}
++
++}  // namespace rac::dev
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/dev/frame_log.h
+@@ -0,0 +1,44 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_DEV_FRAME_LOG_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_DEV_FRAME_LOG_H_
++
++#include <string_view>
++
++#include "chrome/browser/rac/dev/buildflags.h"
++
++namespace views {
++class Widget;
++}
++
++namespace rac::dev {
++
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++
++// With --rac-frame-log=PATH, appends one JSON line to PATH for every frame
++// `widget` presents, with where its sidebar and page sit. Safe to call more
++// than once for a widget. No-op without the switch.
++void MaybeLogFrames(views::Widget* widget);
++
++// Notes a harness request in the frame log, so a log shows when each input
++// was sent. No-op without the switch.
++void LogRequest(std::string_view request);
++
++// Notes one step of a rac animation, such as a spring's value, in the frame
++// log. rac's own motion code may call it anywhere: official builds compile
++// it to nothing, and developer builds do nothing without the switch.
++void LogAnimationStep(std::string_view name, double value);
++
++#else
++
++inline void MaybeLogFrames(views::Widget* widget) {}
++inline void LogRequest(std::string_view request) {}
++inline void LogAnimationStep(std::string_view name, double value) {}
++
++#endif  // BUILDFLAG(RAC_DEV_SWITCHES)
++
++}  // namespace rac::dev
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_DEV_FRAME_LOG_H_
+--- a/chrome/browser/ui/views/rac/window_screenshot.mm
++++ b/chrome/browser/ui/views/rac/window_screenshot.mm
+@@ -33,6 +33,7 @@
+ #include "chrome/browser/rac/dev/buildflags.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/rac/dev/frame_log.h"
+ #include "components/viz/common/frame_sinks/copy_output_request.h"
+ #include "components/viz/common/frame_sinks/copy_output_result.h"
+ #include "skia/ext/skia_utils_mac.h"
+@@ -612,6 +613,9 @@ void OnRequest(base::WeakPtr<views::Widg
+   if (!widget || widget->IsClosed()) {
+     return;
+   }
++  if (path) {
++    dev::LogRequest(path->value());
++  }
+   // "hit X Y OUT" writes the views that a click at window point X,Y goes to,
+   // which is how AppKit decides between the views and the page under them.
+   std::vector<std::string> hit =
+@@ -728,6 +732,7 @@ void MaybeKeepInBackground(views::Widget
+ }
+ 
+ void MaybeScheduleWindowScreenshot(views::Widget* widget) {
++  dev::MaybeLogFrames(widget);
+   const base::FilePath path =
+       base::CommandLine::ForCurrentProcess()->GetSwitchValuePath(
+           kWindowScreenshotSwitch);

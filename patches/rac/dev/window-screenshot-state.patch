@@ -1,0 +1,568 @@
+--- a/chrome/browser/ui/views/rac/BUILD.gn
++++ b/chrome/browser/ui/views/rac/BUILD.gn
+@@ -31,6 +31,7 @@ source_set("look") {
+     "//components/viz/common",
+     "//components/vector_icons",
+     "//content/public/browser",
++    "//content/public/common",
+     "//skia",
+     "//ui/color",
+     "//ui/compositor",
+@@ -51,6 +52,8 @@ source_set("look") {
+       "dev/window_record.h",
+       "dev/window_select.h",
+       "dev/window_select.mm",
++      "dev/window_state.h",
++      "dev/window_state.mm",
+     ]
+     deps += [ "//components/helium_services" ]
+   }
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/dev/window_state.h
+@@ -0,0 +1,37 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_DEV_WINDOW_STATE_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_DEV_WINDOW_STATE_H_
++
++#include <string>
++#include <vector>
++
++namespace views {
++class Widget;
++}
++
++namespace rac::dev {
++
++// Handles the requests that set up state or move the pointer for `widget`:
++//   space-theme PRESET|- [auto|light|dark]  sets the active space's colors
++//                                           (PRESET 0-7, - keeps them) and
++//                                           light/dark mode
++//   space-new                  adds a space and shows it in the window
++//   open-urls URL...           opens URLs the way macOS hands them to rac
++//                              (-[NSApplicationDelegate application:openURLs:])
++//   pointer X Y                puts the pointer at window point X,Y, as the
++//                              real mouse would: [NSEvent mouseLocation]
++//                              reports it, a native mouse-moved event goes
++//                              to AppKit's monitors, and the window's views
++//                              get the move. The real cursor never moves
++//   pointer-path X0 Y0 X1 Y1 MS  moves it in a line over MS ms at 120 Hz
++//   pointer off                gives the real pointer back
++// Returns false for other requests.
++bool HandleStateRequest(views::Widget* widget,
++                        const std::vector<std::string>& words);
++
++}  // namespace rac::dev
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_DEV_WINDOW_STATE_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/dev/window_state.mm
+@@ -0,0 +1,281 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/dev/window_state.h"
++
++#import <Cocoa/Cocoa.h>
++#include <objc/runtime.h>
++
++#include <algorithm>
++#include <optional>
++
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/sys_string_conversions.h"
++#include "base/synchronization/lock.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/thread_annotations.h"
++#include "base/time/time.h"
++#include "chrome/browser/rac/spaces/space.h"
++#include "chrome/browser/rac/spaces/spaces_service.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/rac/dev/frame_log.h"
++#include "ui/events/base_event_utils.h"
++#include "ui/events/event.h"
++#include "ui/gfx/geometry/point.h"
++#include "ui/gfx/geometry/point_conversions.h"
++#include "ui/gfx/geometry/point_f.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/mac/coordinate_conversion.h"
++#include "ui/views/widget/widget.h"
++
++namespace rac::dev {
++namespace {
++
++// A trackpad reports at 120 Hz.
++constexpr base::TimeDelta kPointerStep = base::Microseconds(8333);
++
++BrowserWindowInterface* BrowserFor(views::Widget* widget) {
++  BrowserView* browser_view =
++      BrowserView::GetBrowserViewForNativeWindow(widget->GetNativeWindow());
++  return browser_view ? browser_view->browser() : nullptr;
++}
++
++// --- Spaces ---------------------------------------------------------------
++
++bool SetSpaceTheme(views::Widget* widget,
++                   const std::vector<std::string>& words) {
++  BrowserWindowInterface* browser = BrowserFor(widget);
++  SpacesWindowManager* manager =
++      browser ? SpacesWindowManager::From(browser) : nullptr;
++  std::optional<SpaceId> space =
++      manager ? manager->GetActiveSpaceId(browser) : std::nullopt;
++  if (!space) {
++    LOG(ERROR) << "rac window screenshot: the window shows no space";
++    return false;
++  }
++  // Reject the whole request unless every argument checks out; a bad mode
++  // must not leave a new preset saved.
++  size_t preset = 0;
++  if (words[1] != "-" && (!base::StringToSizeT(words[1], &preset) ||
++                          preset >= SpaceTheme::kPresetCount)) {
++    LOG(ERROR) << "rac window screenshot: bad preset " << words[1];
++    return false;
++  }
++  std::optional<SpaceTheme::Mode> mode;
++  if (words.size() == 3) {
++    if (words[2] == "auto") {
++      mode = SpaceTheme::Mode::kAuto;
++    } else if (words[2] == "light") {
++      mode = SpaceTheme::Mode::kLight;
++    } else if (words[2] == "dark") {
++      mode = SpaceTheme::Mode::kDark;
++    } else {
++      LOG(ERROR) << "rac window screenshot: bad mode " << words[2];
++      return false;
++    }
++  }
++  if (words[1] != "-" &&
++      !manager->spaces()->SetSpaceThemePreset(*space, preset)) {
++    LOG(ERROR) << "rac window screenshot: bad preset " << words[1];
++    return false;
++  }
++  if (mode) {
++    manager->spaces()->SetSpaceThemeMode(*space, *mode);
++  }
++  return true;
++}
++
++void NewSpace(views::Widget* widget) {
++  BrowserWindowInterface* browser = BrowserFor(widget);
++  if (SpacesWindowManager* manager =
++          browser ? SpacesWindowManager::From(browser) : nullptr) {
++    manager->CreateAndShowSpace(browser);
++  } else {
++    LOG(ERROR) << "rac window screenshot: the window has no spaces";
++  }
++}
++
++// --- open-urls --------------------------------------------------------------
++
++void OpenUrls(const std::vector<std::string>& words) {
++  NSMutableArray<NSURL*>* urls = [NSMutableArray array];
++  for (size_t i = 1; i < words.size(); ++i) {
++    if (NSURL* url = [NSURL URLWithString:base::SysUTF8ToNSString(words[i])]) {
++      [urls addObject:url];
++    }
++  }
++  id<NSApplicationDelegate> delegate = NSApp.delegate;
++  if (urls.count == 0 ||
++      ![delegate respondsToSelector:@selector(application:openURLs:)]) {
++    LOG(ERROR) << "rac window screenshot: can't open the URLs";
++    return;
++  }
++  [delegate application:NSApp openURLs:urls];
++}
++
++// --- pointer ----------------------------------------------------------------
++
++// Where +[NSEvent mouseLocation] says the pointer is, in AppKit screen
++// coordinates, while a test holds it. Any thread may ask, so it's locked.
++struct HeldPointer {
++  base::Lock lock;
++  std::optional<NSPoint> point GUARDED_BY(lock);
++};
++
++HeldPointer& Held() {
++  static base::NoDestructor<HeldPointer> held;
++  return *held;
++}
++
++void SetHeldPointer(std::optional<NSPoint> point) {
++  base::AutoLock lock(Held().lock);
++  Held().point = point;
++}
++
++// Every pointer command supersedes the last. A running path checks this
++// before each step, so `pointer off` or a new command stops it instead of
++// racing the newer one. Only touched on the UI sequence.
++int& PointerGeneration() {
++  static int generation = 0;
++  return generation;
++}
++
++// Routes +[NSEvent mouseLocation] through Held(). Views read the pointer
++// there (display::Screen::GetCursorScreenPoint), including the hidden
++// sidebar's edge reveal.
++void HoldPointerLocation() {
++  static bool installed = false;
++  if (installed) {
++    return;
++  }
++  installed = true;
++  Method method =
++      class_getClassMethod([NSEvent class], @selector(mouseLocation));
++  using MouseLocation = NSPoint (*)(id, SEL);
++  static MouseLocation original =
++      reinterpret_cast<MouseLocation>(method_getImplementation(method));
++  method_setImplementation(method,
++                           imp_implementationWithBlock(^NSPoint(id cls) {
++                             {
++                               base::AutoLock lock(Held().lock);
++                               if (Held().point) {
++                                 return *Held().point;
++                               }
++                             }
++                             return original(cls, @selector(mouseLocation));
++                           }));
++}
++
++void MovePointer(views::Widget* widget, const gfx::PointF& point) {
++  NSWindow* window = widget->GetNativeWindow().GetNativeNSWindow();
++  if (!window) {
++    return;
++  }
++  HoldPointerLocation();
++  LogAnimationStep("pointer.x", point.x());
++  LogAnimationStep("pointer.y", point.y());
++  const gfx::Point origin = widget->GetWindowBoundsInScreen().origin();
++  const NSPoint screen = gfx::ScreenPointToNSPoint(gfx::ToRoundedPoint(
++      gfx::PointF(origin.x() + point.x(), origin.y() + point.y())));
++  SetHeldPointer(screen);
++  // The native event reaches AppKit's event monitors, as the mouse would.
++  // Views only track the mouse in the active app, so they get the move
++  // directly too, for hover.
++  NSEvent* event =
++      [NSEvent mouseEventWithType:NSEventTypeMouseMoved
++                         location:[window convertPointFromScreen:screen]
++                    modifierFlags:0
++                        timestamp:NSProcessInfo.processInfo.systemUptime
++                     windowNumber:window.windowNumber
++                          context:nil
++                      eventNumber:0
++                       clickCount:0
++                         pressure:0];
++  [NSApp postEvent:event atStart:NO];
++  const gfx::Point local = gfx::ToRoundedPoint(point);
++  ui::MouseEvent move(ui::EventType::kMouseMoved, local, local,
++                      ui::EventTimeForNow(), ui::EF_NONE, ui::EF_NONE);
++  widget->OnMouseEvent(&move);
++}
++
++void MovePointerAlong(base::WeakPtr<views::Widget> widget,
++                      gfx::PointF from,
++                      gfx::PointF to,
++                      int step,
++                      int steps,
++                      int generation) {
++  if (!widget || widget->IsClosed() || generation != PointerGeneration()) {
++    return;
++  }
++  const float t = static_cast<float>(step) / steps;
++  MovePointer(widget.get(), gfx::PointF(from.x() + (to.x() - from.x()) * t,
++                                        from.y() + (to.y() - from.y()) * t));
++  if (step < steps) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(&MovePointerAlong, widget, from, to, step + 1, steps,
++                       generation),
++        kPointerStep);
++  }
++}
++
++}  // namespace
++
++bool HandleStateRequest(views::Widget* widget,
++                        const std::vector<std::string>& words) {
++  if (words.empty()) {
++    return false;
++  }
++  const std::string& verb = words[0];
++  if (verb == "space-theme" && (words.size() == 2 || words.size() == 3)) {
++    SetSpaceTheme(widget, words);
++    return true;
++  }
++  if (verb == "space-new" && words.size() == 1) {
++    NewSpace(widget);
++    return true;
++  }
++  if (verb == "open-urls" && words.size() >= 2) {
++    OpenUrls(words);
++    return true;
++  }
++  if (verb == "pointer" && words.size() == 2 && words[1] == "off") {
++    ++PointerGeneration();
++    SetHeldPointer(std::nullopt);
++    return true;
++  }
++  double x = 0;
++  double y = 0;
++  if (verb == "pointer" && words.size() == 3 &&
++      base::StringToDouble(words[1], &x) &&
++      base::StringToDouble(words[2], &y)) {
++    ++PointerGeneration();
++    MovePointer(widget, gfx::PointF(x, y));
++    return true;
++  }
++  double x1 = 0;
++  double y1 = 0;
++  int ms = 0;
++  if (verb == "pointer-path" && words.size() == 6 &&
++      base::StringToDouble(words[1], &x) &&
++      base::StringToDouble(words[2], &y) &&
++      base::StringToDouble(words[3], &x1) &&
++      base::StringToDouble(words[4], &y1) && base::StringToInt(words[5], &ms) &&
++      ms >= 0) {
++    MovePointerAlong(
++        widget->GetWeakPtr(), gfx::PointF(x, y), gfx::PointF(x1, y1), 0,
++        std::max(1, static_cast<int>(base::Milliseconds(ms) / kPointerStep)),
++        ++PointerGeneration());
++    return true;
++  }
++  return false;
++}
++
++}  // namespace rac::dev
+--- a/chrome/browser/ui/views/rac/window_screenshot.mm
++++ b/chrome/browser/ui/views/rac/window_screenshot.mm
+@@ -27,6 +27,7 @@
+ #include "base/strings/stringprintf.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/task/bind_post_task.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "base/time/time.h"
+@@ -37,8 +38,12 @@
+ #include "chrome/browser/ui/views/rac/dev/frame_log.h"
+ #include "chrome/browser/ui/views/rac/dev/window_record.h"
+ #include "chrome/browser/ui/views/rac/dev/window_select.h"
++#include "chrome/browser/ui/views/rac/dev/window_state.h"
+ #include "components/viz/common/frame_sinks/copy_output_request.h"
+ #include "components/viz/common/frame_sinks/copy_output_result.h"
++#include "content/public/browser/render_widget_host_view.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/common/content_switches.h"
+ #include "skia/ext/skia_utils_mac.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
+ #include "third_party/skia/include/core/SkCanvas.h"
+@@ -52,6 +57,7 @@
+ #include "ui/gfx/codec/png_codec.h"
+ #include "ui/gfx/geometry/rect.h"
+ #include "ui/views/controls/textfield/textfield.h"
++#include "ui/views/controls/webview/webview.h"
+ #include "ui/views/focus/focus_manager.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_utils.h"
+@@ -266,6 +272,82 @@ void DrawPopupsAndWrite(base::WeakPtr<vi
+   }
+ }
+ 
++// A drawn WebView's page, with the window point it shows at.
++struct WebViewShot {
++  gfx::Rect bounds;
++  base::WeakPtr<content::WebContents> contents;
++};
++
++// A views::WebView can draw its WebContents through a surface of its own
++// instead of the widget's compositor (the welcome tour's window works that
++// way), so the root layer copy leaves the page out. Each drawn WebView's
++// contents is painted over the bitmap where it sits on screen. Browser
++// windows skip this: their pages are already in the copy, and painting them
++// again would square off the content card's corners, cover views drawn over
++// the page (such as the revealed sidebar) and mix in a later frame.
++void CollectWebViews(views::View* view, std::vector<WebViewShot>* out) {
++  if (!view || !view->IsDrawn()) {
++    return;
++  }
++  if (auto* web_view = views::AsViewClass<views::WebView>(view)) {
++    if (content::WebContents* contents = web_view->web_contents()) {
++      out->push_back({web_view->GetBoundsInScreen(), contents->GetWeakPtr()});
++    }
++  }
++  for (views::View* child : view->children()) {
++    CollectWebViews(child, out);
++  }
++}
++
++void DrawWebViews(base::WeakPtr<views::Widget> widget,
++                  SkBitmap bitmap,
++                  std::vector<WebViewShot> webviews,
++                  base::OnceCallback<void(SkBitmap)> done) {
++  while (!webviews.empty() && !webviews.back().contents) {
++    webviews.pop_back();
++  }
++  if (!widget || webviews.empty()) {
++    std::move(done).Run(std::move(bitmap));
++    return;
++  }
++  const WebViewShot shot = webviews.back();
++  webviews.pop_back();
++  content::RenderWidgetHostView* view =
++      shot.contents->GetRenderWidgetHostView();
++  if (!view) {
++    DrawWebViews(widget, std::move(bitmap), std::move(webviews),
++                 std::move(done));
++    return;
++  }
++  const gfx::Rect window = widget->GetWindowBoundsInScreen();
++  const float scale = window.width() > 0
++                          ? static_cast<float>(bitmap.width()) / window.width()
++                          : 1.0f;
++  const gfx::Size pixels = gfx::ScaleToRoundedSize(shot.bounds.size(), scale);
++  auto draw = base::BindOnce(
++      [](base::WeakPtr<views::Widget> widget, SkBitmap bitmap,
++         std::vector<WebViewShot> webviews,
++         base::OnceCallback<void(SkBitmap)> done, gfx::Rect dest, float scale,
++         const content::CopyFromSurfaceResult& result) {
++        if (widget && result.has_value() && !result->bitmap.drawsNothing()) {
++          SkCanvas canvas(bitmap);
++          canvas.drawImageRect(
++              result->bitmap.asImage(),
++              SkRect::MakeXYWH(dest.x() * scale, dest.y() * scale,
++                               dest.width() * scale, dest.height() * scale),
++              SkSamplingOptions(SkFilterMode::kLinear));
++        }
++        DrawWebViews(widget, std::move(bitmap), std::move(webviews),
++                     std::move(done));
++      },
++      widget, std::move(bitmap), std::move(webviews), std::move(done),
++      shot.bounds - window.OffsetFromOrigin(), scale);
++  // The result may arrive on another sequence; the widget, the WebContents
++  // and the bitmap are only touched on this one.
++  view->CopyFromSurface(gfx::Rect(shot.bounds.size()), pixels, base::Seconds(2),
++                        base::BindPostTaskToCurrentDefault(std::move(draw)));
++}
++
+ void CaptureCompositor(base::WeakPtr<views::Widget> widget,
+                        const base::FilePath& path) {
+   const bool requested = CopyRootLayer(
+@@ -284,9 +366,25 @@ void CaptureCompositor(base::WeakPtr<vie
+               WriteBitmap(*bitmap, path);
+               return;
+             }
+-            DrawWindowButtons(widget.get(), &*bitmap);
+-            DrawPopupsAndWrite(widget, std::move(*bitmap),
+-                               VisiblePopups(widget.get()), path);
++            std::vector<WebViewShot> webviews;
++            if (!BrowserView::GetBrowserViewForNativeWindow(
++                    widget->GetNativeWindow())) {
++              CollectWebViews(widget->GetRootView(), &webviews);
++            }
++            DrawWebViews(widget, std::move(*bitmap), std::move(webviews),
++                         base::BindOnce(
++                             [](base::WeakPtr<views::Widget> widget,
++                                base::FilePath path, SkBitmap bitmap) {
++                               if (!widget) {
++                                 WriteBitmap(bitmap, path);
++                                 return;
++                               }
++                               DrawWindowButtons(widget.get(), &bitmap);
++                               DrawPopupsAndWrite(widget, std::move(bitmap),
++                                                  VisiblePopups(widget.get()),
++                                                  path);
++                             },
++                             widget, path));
+           },
+           widget, path));
+   if (!requested) {
+@@ -487,6 +585,10 @@ bool HandleInput(views::Widget* widget,
+   if (dev::HandleAppearanceRequest(words)) {
+     return true;
+   }
++  //   space-theme, space-new, open-urls, pointer: see window_state.h
++  if (dev::HandleStateRequest(widget, words)) {
++    return true;
++  }
+   //   capture-window SEL OUT  captures another window, e.g. an app's
+   if (words[0] == "capture-window" && words.size() == 3) {
+     if (views::Widget* window = dev::FindWindow(words[1])) {
+@@ -659,8 +761,13 @@ void OnRequest(base::WeakPtr<views::Widg
+              base::SPLIT_WANT_NONEMPTY)) {
+       std::vector<std::string> words = base::SplitString(
+           request, " ", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
+-      if (!words.empty() && !dev::HandleWindowRequest(first.get(), words)) {
+-        HandleInput(dev::TargetWindow(first.get()), words, request);
++      // A request may close the first window.
++      if (!first) {
++        return;
++      }
++      if (!words.empty() && !dev::HandleWindowRequest(first.get(), words) &&
++          !HandleInput(dev::TargetWindow(first.get()), words, request)) {
++        LOG(ERROR) << "rac window screenshot: unknown request: " << request;
+       }
+     }
+   } else if (!hit.empty() && dev::HandleWindowRequest(first.get(), hit)) {
+@@ -668,8 +775,10 @@ void OnRequest(base::WeakPtr<views::Widg
+   } else if (!hit.empty() &&
+              HandleInput(widget.get(), hit, path ? path->value() : "")) {
+     // Done.
+-  } else if (path) {
++  } else if (path && path->IsAbsolute() && path->Extension() == ".png") {
+     Capture(widget, *path);
++  } else if (path) {
++    LOG(ERROR) << "rac window screenshot: unknown request: " << path->value();
+   }
+   base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
+       FROM_HERE, base::BindOnce(&PollRequests, first, requests),
+@@ -734,12 +843,40 @@ void StopAppActivation() {
+   }
+ }
+ 
++// An occluded window stops painting, and a window a test shoots often reads
++// as occluded on a shared screen. A --rac-window-screenshot* switch means the
++// run wants real pixels, so it takes the same way out browser tests take.
++// This runs before the first browser window shows, and WebContents reads
++// the switch whenever its visibility changes.
++void MaybeKeepOccludedWindowsPainting() {
++  static bool checked = false;
++  if (checked) {
++    return;
++  }
++  checked = true;
++  base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  for (const auto& [name, value] : command_line->GetSwitches()) {
++    if (name.starts_with("rac-window-screenshot")) {
++      command_line->AppendSwitch(
++          switches::kDisableBackgroundingOccludedWindowsForTesting);
++      return;
++    }
++  }
++}
++
+ }  // namespace
+ 
+ void MaybeKeepInBackground(views::Widget* widget) {
++  MaybeKeepOccludedWindowsPainting();
+   dev::MaybeForceAppearance();
+-  if (!widget || !base::CommandLine::ForCurrentProcess()->HasSwitch(
+-                     kLaunchInBackgroundSwitch)) {
++  // A test that drives the browser with requests stays in the background
++  // too, since requests open windows, unless it asks to be activated.
++  const base::CommandLine* command_line =
++      base::CommandLine::ForCurrentProcess();
++  if (!widget ||
++      !(command_line->HasSwitch(kLaunchInBackgroundSwitch) ||
++        (command_line->HasSwitch(kWindowScreenshotRequestSwitch) &&
++         !command_line->HasSwitch(kWindowScreenshotActivateSwitch)))) {
+     return;
+   }
+   static bool stopped = false;
