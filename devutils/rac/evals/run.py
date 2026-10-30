@@ -245,7 +245,7 @@ class Page:
     """One DevTools page session."""
 
     def __init__(self, browser, target_id):
-        self.browser = browser
+        self.browser, self.target_id = browser, target_id
         self.session = browser.call("Target.attachToTarget",
                                     {"targetId": target_id, "flatten": True})["sessionId"]
 
@@ -427,13 +427,25 @@ def drive(variant, rig, browser, proc):
         # Attach reads page text at send time; a tab that has committed its
         # URL but not finished loading yields an empty read and the send's
         # page block silently drops the planted lines. Best effort only —
-        # the send still has to go out on a slow page.
+        # the send still has to go out on a slow page. A page with iframes
+        # also needs them committed (the cross-origin frame joins the
+        # snapshot), and only "complete" covers that: a slow frame holds
+        # window.onload open. The tab is activated first — a user attaches
+        # the tab they're looking at, and a background tab defers subframe
+        # loads past every wait here.
         for ref in turn.get("attach", []):
             p = pages.get(ref)
             if p is not None:
                 try:
+                    browser.call("Target.activateTarget", {"targetId": p.target_id})
+                except cdp.CdpError:
+                    pass
+                try:
                     wait_for(lambda p=p: (_try_eval(p, "document.readyState") or "loading") != "loading",
                              f"the attached tab {ref} to parse", 20, proc)
+                    if _try_eval(p, "!!document.querySelector('iframe,frame')"):
+                        wait_for(lambda p=p: _try_eval(p, "document.readyState") == "complete",
+                                 f"the attached tab {ref}'s frames to load", 20, proc)
                 except RuntimeError:
                     pass
         start = len(assistant.eval("window.__evals.events"))

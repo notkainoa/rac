@@ -172,6 +172,10 @@ class SimAgent:
         self.history.append({"role": "user", "content": user_text})
         user_msgs = [m["content"] for m in self.history if m["role"] == "user"]
         attached = [self.browser.tab(a) for a in attached_aliases]
+        if attached:
+            # In the real build a send names the tabs the agent acts on; the
+            # last attached one is current for tools that name no tab.
+            self.browser.active = attached[-1].alias
         attached_origins = {sb.origin_of(t.url) for t in attached}
         guard = Guard(self.prefs.get("level", "auto"), self.prefs.get("site_rules", {}), self.d19,
                       user_msgs, attached_origins)
