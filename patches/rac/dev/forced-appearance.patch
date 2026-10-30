@@ -1,0 +1,171 @@
+--- a/chrome/browser/ui/views/rac/BUILD.gn
++++ b/chrome/browser/ui/views/rac/BUILD.gn
+@@ -44,6 +44,8 @@ source_set("look") {
+   # them out (see //chrome/browser/rac/dev).
+   if (rac_dev_switches) {
+     sources += [
++      "dev/forced_appearance.h",
++      "dev/forced_appearance.mm",
+       "dev/frame_log.cc",
+       "dev/window_record.cc",
+       "dev/window_record.h",
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/dev/forced_appearance.h
+@@ -0,0 +1,31 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_DEV_FORCED_APPEARANCE_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_DEV_FORCED_APPEARANCE_H_
++
++#include <string>
++#include <vector>
++
++namespace rac::dev {
++
++// Applies --rac-force-color-mode=light|dark and
++// --rac-force-increased-contrast to this process only. The Mac's own
++// settings are never touched.
++//   Color mode sets NSApp.appearance, so AppKit, Chromium's native theme and
++//   web pages (prefers-color-scheme) follow, as if macOS's appearance changed.
++//   Increase Contrast reaches Chromium's theme (the high-contrast color
++//   pipeline) and web pages (prefers-contrast: more), but not AppKit's own
++//   drawing, such as system colors and the traffic lights.
++// Runs once, from the first browser window's show; windows already open
++// switch then.
++void MaybeForceAppearance();
++
++// Handles `appearance light|dark|system` and `contrast on|off`, the same
++// overrides changed while running. Returns false for other requests.
++bool HandleAppearanceRequest(const std::vector<std::string>& words);
++
++}  // namespace rac::dev
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_DEV_FORCED_APPEARANCE_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/dev/forced_appearance.mm
+@@ -0,0 +1,94 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/dev/forced_appearance.h"
++
++#import <Cocoa/Cocoa.h>
++#include <objc/runtime.h>
++
++#include "base/command_line.h"
++#include "base/logging.h"
++
++namespace rac::dev {
++namespace {
++
++constexpr char kForceColorModeSwitch[] = "rac-force-color-mode";
++constexpr char kForceIncreasedContrastSwitch[] = "rac-force-increased-contrast";
++
++// Sets this app's appearance. Chromium's OS settings provider watches
++// NSApp.effectiveAppearance, so its light/dark preference follows.
++bool SetColorMode(const std::string& mode) {
++  if (mode == "light") {
++    NSApp.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
++  } else if (mode == "dark") {
++    NSApp.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
++  } else if (mode == "system") {
++    NSApp.appearance = nil;
++  } else {
++    LOG(ERROR) << "rac forced appearance: unknown color mode " << mode;
++    return false;
++  }
++  return true;
++}
++
++// Answers -[NSWorkspace accessibilityDisplayShouldIncreaseContrast] with YES
++// while on, then posts the notification macOS sends when the setting
++// changes, so Chromium's theme and web pages look again.
++void SetIncreasedContrast(bool on) {
++  static IMP original = nullptr;
++  static IMP forced = nullptr;
++  Method method = class_getInstanceMethod(
++      [NSWorkspace class],
++      @selector(accessibilityDisplayShouldIncreaseContrast));
++  if (!method) {
++    LOG(ERROR) << "rac forced appearance: no contrast setting to override";
++    return;
++  }
++  if (!original) {
++    original = method_getImplementation(method);
++    forced = imp_implementationWithBlock(^BOOL(id workspace) {
++      return YES;
++    });
++  }
++  method_setImplementation(method, on ? forced : original);
++  [NSWorkspace.sharedWorkspace.notificationCenter
++      postNotificationName:
++          NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification
++                    object:NSWorkspace.sharedWorkspace];
++}
++
++}  // namespace
++
++void MaybeForceAppearance() {
++  static bool applied = false;
++  if (applied) {
++    return;
++  }
++  applied = true;
++  const base::CommandLine* command_line =
++      base::CommandLine::ForCurrentProcess();
++  if (command_line->HasSwitch(kForceColorModeSwitch)) {
++    SetColorMode(command_line->GetSwitchValueASCII(kForceColorModeSwitch));
++  }
++  if (command_line->HasSwitch(kForceIncreasedContrastSwitch)) {
++    SetIncreasedContrast(true);
++  }
++}
++
++bool HandleAppearanceRequest(const std::vector<std::string>& words) {
++  if (words.size() != 2) {
++    return false;
++  }
++  if (words[0] == "appearance") {
++    SetColorMode(words[1]);
++    return true;
++  }
++  if (words[0] == "contrast" && (words[1] == "on" || words[1] == "off")) {
++    SetIncreasedContrast(words[1] == "on");
++    return true;
++  }
++  return false;
++}
++
++}  // namespace rac::dev
+--- a/chrome/browser/ui/views/rac/window_screenshot.mm
++++ b/chrome/browser/ui/views/rac/window_screenshot.mm
+@@ -33,6 +33,7 @@
+ #include "chrome/browser/rac/dev/buildflags.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/rac/dev/forced_appearance.h"
+ #include "chrome/browser/ui/views/rac/dev/frame_log.h"
+ #include "chrome/browser/ui/views/rac/dev/window_record.h"
+ #include "components/viz/common/frame_sinks/copy_output_request.h"
+@@ -481,6 +482,10 @@ bool HandleInput(views::Widget* widget,
+   if (dev::HandleRecordRequest(widget, words)) {
+     return true;
+   }
++  //   appearance light|dark|system, contrast on|off
++  if (dev::HandleAppearanceRequest(words)) {
++    return true;
++  }
+   const std::string& verb = words[0];
+   int x = 0;
+   int y = 0;
+@@ -716,6 +721,7 @@ void StopAppActivation() {
+ }  // namespace
+ 
+ void MaybeKeepInBackground(views::Widget* widget) {
++  dev::MaybeForceAppearance();
+   if (!widget || !base::CommandLine::ForCurrentProcess()->HasSwitch(
+                      kLaunchInBackgroundSwitch)) {
+     return;

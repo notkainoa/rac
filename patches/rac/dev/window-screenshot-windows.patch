@@ -1,0 +1,407 @@
+--- a/chrome/browser/ui/views/rac/BUILD.gn
++++ b/chrome/browser/ui/views/rac/BUILD.gn
+@@ -49,7 +49,10 @@ source_set("look") {
+       "dev/frame_log.cc",
+       "dev/window_record.cc",
+       "dev/window_record.h",
++      "dev/window_select.h",
++      "dev/window_select.mm",
+     ]
++    deps += [ "//components/helium_services" ]
+   }
+ }
+ 
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/dev/window_select.h
+@@ -0,0 +1,41 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_DEV_WINDOW_SELECT_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_DEV_WINDOW_SELECT_H_
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace views {
++class Widget;
++}
++
++namespace rac::dev {
++
++// The window a selector names, or null. Selectors:
++//   #N             the Nth window in `windows` output
++//   first          the window that polls for requests
++//   normal         the first normal browser window
++//   app[:ID]       an installed web app's window (that app's, with ID)
++//   incognito      an incognito browser window
++//   profile:NAME   a browser window of the profile in folder NAME
++//   pip            a picture-in-picture window
++//   onboarding     the welcome tour
++//   name:NAME      the widget named NAME
++views::Widget* FindWindow(std::string_view selector);
++
++// The window input requests act on: the one `target` chose while it's
++// open, else `first`, the window that polls for requests.
++views::Widget* TargetWindow(views::Widget* first);
++
++// Handles `windows OUT.txt`, `target SEL` and `profile-window NAME`. Returns
++// false for other requests.
++bool HandleWindowRequest(views::Widget* first,
++                         const std::vector<std::string>& words);
++
++}  // namespace rac::dev
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_DEV_WINDOW_SELECT_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/dev/window_select.mm
+@@ -0,0 +1,275 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/dev/window_select.h"
++
++#import <Cocoa/Cocoa.h>
++
++#include <utility>
++
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/logging.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
++#include "base/strings/sys_string_conversions.h"
++#include "base/task/thread_pool.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/profiles/profile_window.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/rac/dev/frame_log.h"
++#include "chrome/browser/ui/web_applications/app_browser_controller.h"
++#include "components/helium_services/pref_names.h"
++#include "components/prefs/pref_service.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/native_ui_types.h"
++#include "ui/views/view.h"
++#include "ui/views/widget/widget.h"
++
++namespace rac::dev {
++namespace {
++
++struct WindowInfo {
++  raw_ptr<views::Widget> widget;
++  std::string kind;
++  std::string app_id;
++  std::string profile;
++};
++
++bool HasViewNamed(const views::View* view, std::string_view class_name) {
++  if (!view) {
++    return false;
++  }
++  if (view->GetClassName() == class_name) {
++    return true;
++  }
++  for (const views::View* child : view->children()) {
++    if (HasViewNamed(child, class_name)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++WindowInfo Describe(views::Widget* widget) {
++  WindowInfo info{widget, "other", "", ""};
++  BrowserView* browser_view =
++      BrowserView::GetBrowserViewForNativeWindow(widget->GetNativeWindow());
++  if (browser_view && browser_view->GetWidget() == widget) {
++    BrowserWindowInterface* browser = browser_view->browser();
++    Profile* profile = browser->GetProfile();
++    info.profile = profile->GetBaseName().AsUTF8Unsafe();
++    switch (browser->GetType()) {
++      case BrowserWindowInterface::TYPE_NORMAL:
++        info.kind = profile->IsOffTheRecord() ? "incognito" : "normal";
++        break;
++      case BrowserWindowInterface::TYPE_APP:
++      case BrowserWindowInterface::TYPE_APP_POPUP:
++        info.kind = "app";
++        break;
++      case BrowserWindowInterface::TYPE_POPUP:
++        info.kind = "popup";
++        break;
++      case BrowserWindowInterface::TYPE_DEVTOOLS:
++        info.kind = "devtools";
++        break;
++      case BrowserWindowInterface::TYPE_PICTURE_IN_PICTURE:
++        info.kind = "pip";
++        break;
++      default:
++        info.kind = "browser";
++        break;
++    }
++    if (const auto* app = web_app::AppBrowserController::From(browser)) {
++      info.app_id = app->app_id();
++    }
++    return info;
++  }
++  if (HasViewNamed(widget->GetRootView(), "OverlayWindowFrameView")) {
++    info.kind = "pip";
++  } else if (HasViewNamed(widget->GetRootView(), "TourView")) {
++    info.kind = "onboarding";
++  } else if (widget->parent()) {
++    info.kind = "child";
++  }
++  return info;
++}
++
++// Every widget with its own NSWindow, in AppKit's window list order.
++std::vector<WindowInfo> AllWindows() {
++  std::vector<WindowInfo> windows;
++  for (NSWindow* window in NSApp.windows) {
++    if (views::Widget* widget =
++            views::Widget::GetWidgetForNativeWindow(gfx::NativeWindow(window));
++        widget && widget->GetNativeWindow().GetNativeNSWindow() == window &&
++        !widget->IsClosed()) {
++      windows.push_back(Describe(widget));
++    }
++  }
++  return windows;
++}
++
++base::WeakPtr<views::Widget>& Target() {
++  static base::NoDestructor<base::WeakPtr<views::Widget>> target;
++  return *target;
++}
++
++// The window that polls for requests, kept by TargetWindow().
++base::WeakPtr<views::Widget>& First() {
++  static base::NoDestructor<base::WeakPtr<views::Widget>> first;
++  return *first;
++}
++
++bool IsSafeFolderName(std::string_view name) {
++  if (name.empty() || name == "." || name == "..") {
++    return false;
++  }
++  for (char c : name) {
++    if (!base::IsAsciiAlphaNumeric(c) && c != '-' && c != '_') {
++      return false;
++    }
++  }
++  return true;
++}
++
++}  // namespace
++
++views::Widget* FindWindow(std::string_view selector) {
++  if (selector == "first") {
++    return First().get();
++  }
++  std::vector<WindowInfo> windows = AllWindows();
++  size_t index = 0;
++  if (selector.starts_with("#")) {
++    if (base::StringToSizeT(selector.substr(1), &index) &&
++        index < windows.size()) {
++      return windows[index].widget;
++    }
++    return nullptr;
++  }
++  for (const WindowInfo& info : windows) {
++    if (!info.widget->IsVisible()) {
++      continue;
++    }
++    if (selector == info.kind ||
++        (selector.starts_with("app:") && info.kind == "app" &&
++         selector.substr(4) == info.app_id) ||
++        (selector.starts_with("profile:") && info.kind == "normal" &&
++         selector.substr(8) == info.profile) ||
++        (selector.starts_with("name:") &&
++         selector.substr(5) == info.widget->GetName())) {
++      return info.widget;
++    }
++  }
++  return nullptr;
++}
++
++views::Widget* TargetWindow(views::Widget* first) {
++  if (first && First().get() != first) {
++    First() = first->GetWeakPtr();
++  }
++  views::Widget* target = Target().get();
++  return target && !target->IsClosed() ? target : first;
++}
++
++bool HandleWindowRequest(views::Widget* first,
++                         const std::vector<std::string>& words) {
++  if (words.size() != 2) {
++    return false;
++  }
++  //   windows OUT.txt   lists every window: index, kind, app, profile,
++  //                     visibility, bounds and name, tab separated
++  if (words[0] == "windows") {
++    std::string out;
++    size_t index = 0;
++    for (const WindowInfo& info : AllWindows()) {
++      const gfx::Rect bounds = info.widget->GetWindowBoundsInScreen();
++      out += base::StringPrintf(
++          "#%zu\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", index++, info.kind.c_str(),
++          info.app_id.empty() ? "-" : info.app_id.c_str(),
++          info.profile.empty() ? "-" : info.profile.c_str(),
++          info.widget->IsVisible() ? "visible" : "hidden",
++          info.widget == TargetWindow(first) ? "target" : "-",
++          bounds.ToString().c_str(), info.widget->GetName().c_str());
++    }
++    base::ThreadPool::PostTask(
++        FROM_HERE, {base::MayBlock()},
++        base::BindOnce([](base::FilePath path,
++                          std::string out) { base::WriteFile(path, out); },
++                       base::FilePath(words[1]), std::move(out)));
++    return true;
++  }
++  //   target SEL        later input requests act on that window
++  if (words[0] == "target") {
++    views::Widget* widget = FindWindow(words[1]);
++    if (!widget) {
++      LOG(ERROR) << "rac window screenshot: no window matches " << words[1];
++      return true;
++    }
++    if (widget == first) {
++      Target().reset();
++    } else {
++      Target() = widget->GetWeakPtr();
++    }
++    MaybeLogFrames(widget);
++    return true;
++  }
++  //   profile-window NAME   opens a window of the profile in folder NAME
++  //                         of --user-data-dir, creating the profile
++  if (words[0] == "profile-window") {
++    if (!IsSafeFolderName(words[1])) {
++      LOG(ERROR) << "rac window screenshot: bad profile folder " << words[1];
++      return true;
++    }
++    // Refuse a folder that exists but isn't a profile, such as Crashpad.
++    const base::FilePath path =
++        g_browser_process->profile_manager()->user_data_dir().AppendASCII(
++            words[1]);
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE, {base::MayBlock()},
++        base::BindOnce(
++            [](const base::FilePath& path) {
++              return !base::PathExists(path) ||
++                     base::PathExists(path.AppendASCII("Preferences"));
++            },
++            path),
++        base::BindOnce(
++            [](const base::FilePath& path, bool ok) {
++              if (!ok) {
++                LOG(ERROR) << "rac window screenshot: not a profile: " << path;
++                return;
++              }
++              g_browser_process->profile_manager()->CreateProfileAsync(
++                  path, base::BindOnce([](Profile* profile) {
++                    if (!profile) {
++                      LOG(ERROR) << "rac window screenshot: no profile";
++                      return;
++                    }
++                    // A fresh profile shows the welcome tour instead of a
++                    // browser window, so mark its tour finished the way
++                    // finishing it does.
++                    profile->GetPrefs()->SetBoolean(prefs::kHeliumDidOnboarding,
++                                                    true);
++                    profiles::OpenBrowserWindowForProfile(
++                        base::DoNothing(), /*always_create=*/true,
++                        /*is_new_profile=*/false,
++                        /*open_command_line_urls=*/false, profile);
++                  }));
++            },
++            path));
++    return true;
++  }
++  return false;
++}
++
++}  // namespace rac::dev
+--- a/chrome/browser/ui/views/rac/window_screenshot.mm
++++ b/chrome/browser/ui/views/rac/window_screenshot.mm
+@@ -36,6 +36,7 @@
+ #include "chrome/browser/ui/views/rac/dev/forced_appearance.h"
+ #include "chrome/browser/ui/views/rac/dev/frame_log.h"
+ #include "chrome/browser/ui/views/rac/dev/window_record.h"
++#include "chrome/browser/ui/views/rac/dev/window_select.h"
+ #include "components/viz/common/frame_sinks/copy_output_request.h"
+ #include "components/viz/common/frame_sinks/copy_output_result.h"
+ #include "skia/ext/skia_utils_mac.h"
+@@ -486,6 +487,15 @@ bool HandleInput(views::Widget* widget,
+   if (dev::HandleAppearanceRequest(words)) {
+     return true;
+   }
++  //   capture-window SEL OUT  captures another window, e.g. an app's
++  if (words[0] == "capture-window" && words.size() == 3) {
++    if (views::Widget* window = dev::FindWindow(words[1])) {
++      Capture(window->GetWeakPtr(), base::FilePath(words[2]));
++    } else {
++      LOG(ERROR) << "rac window screenshot: no window matches " << words[1];
++    }
++    return true;
++  }
+   const std::string& verb = words[0];
+   int x = 0;
+   int y = 0;
+@@ -609,12 +619,15 @@ bool HandleInput(views::Widget* widget,
+   return false;
+ }
+ 
+-void OnRequest(base::WeakPtr<views::Widget> widget,
++void OnRequest(base::WeakPtr<views::Widget> first,
+                base::FilePath requests,
+                std::optional<base::FilePath> path) {
+-  if (!widget || widget->IsClosed()) {
++  if (!first || first->IsClosed()) {
+     return;
+   }
++  // Input goes to the window `target` chose; the first window keeps polling.
++  base::WeakPtr<views::Widget> widget =
++      dev::TargetWindow(first.get())->GetWeakPtr();
+   if (path) {
+     dev::LogRequest(path->value());
+   }
+@@ -644,11 +657,14 @@ void OnRequest(base::WeakPtr<views::Widg
+     for (const std::string& request : base::SplitStringUsingSubstr(
+              path->value(), " ; ", base::TRIM_WHITESPACE,
+              base::SPLIT_WANT_NONEMPTY)) {
+-      HandleInput(widget.get(),
+-                  base::SplitString(request, " ", base::TRIM_WHITESPACE,
+-                                    base::SPLIT_WANT_NONEMPTY),
+-                  request);
++      std::vector<std::string> words = base::SplitString(
++          request, " ", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++      if (!words.empty() && !dev::HandleWindowRequest(first.get(), words)) {
++        HandleInput(dev::TargetWindow(first.get()), words, request);
++      }
+     }
++  } else if (!hit.empty() && dev::HandleWindowRequest(first.get(), hit)) {
++    // Done.
+   } else if (!hit.empty() &&
+              HandleInput(widget.get(), hit, path ? path->value() : "")) {
+     // Done.
+@@ -656,7 +672,7 @@ void OnRequest(base::WeakPtr<views::Widg
+     Capture(widget, *path);
+   }
+   base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
+-      FROM_HERE, base::BindOnce(&PollRequests, widget, requests),
++      FROM_HERE, base::BindOnce(&PollRequests, first, requests),
+       kRequestPollInterval);
+ }
+ 
