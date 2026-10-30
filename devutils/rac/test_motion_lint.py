@@ -58,6 +58,9 @@ class LiteralTest(unittest.TestCase):
             'layout->SetBetweenChildSpacing(6);': ['gap'],
             'views::BoxLayout::Orientation::kHorizontal, gfx::Insets(), 8));': ['gap'],
             'gfx::Insets::VH(0, 10), 6));': ['inset', 'gap'],
+            'constexpr base::TimeDelta kLong = base::Milliseconds(60 * 1000);': ['duration'],
+            'constexpr int kGap{8};': ['gap'],
+            'constexpr int kPanelRadius(12);': ['radius'],
         }
         for line, kinds in cases.items():
             with self.subTest(line=line):
@@ -112,6 +115,12 @@ class LiteralTest(unittest.TestCase):
             'row-gap: calc(var(--rac-spacing-4) * 2);': [],
             'inset: 0;': [],
             'inset-inline-start: 8px;': ['inset'],
+            'inset: -4px;': ['inset'],
+            'animation-delay: -0.5s;': ['duration'],
+            '--row-gap: 6px;': ['gap'],
+            'grid-gap: 6px;': ['gap'],
+            '--composer-inset: 8px;': ['inset'],
+            'width: calc(var(--x-8px) + var(--rac-spacing-4));': [],
             'box-shadow: inset 0 1px 0 var(--rac-hairline);': [],
             '/* padding: 8px; */': [],
             ' * transition 150ms ease': [],

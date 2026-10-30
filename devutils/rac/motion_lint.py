@@ -58,6 +58,8 @@ EXCUSE = re.compile(r'motion-lint:\s*not motion\s*\(\s*\S[^)]*\)')
 
 # A number that isn't part of a name, a hex color, or arithmetic on a token.
 _NUM = r'(?<![\w.#])(?<![*/]\s)(?<![*/])(\d+\.?\d*|\.\d+)f?(?![\w.]|\s*[*/])'
+# Any number, for arithmetic on literals alone, such as 60 * 1000.
+_ANY_NUM = r'(?<![\w.#])(\d+\.?\d*|\.\d+)f?(?![\w.])'
 # Numbers that never need a token: none, a half-pixel nudge, one.
 TRIVIAL = {0.0, 0.5, 1.0}
 
@@ -69,31 +71,31 @@ CXX_RULES = [
     ('curve', re.compile(r'gfx::Tween::[A-Z][A-Z0-9_]+')),
     ('curve', re.compile(r'(?:gfx::CubicBezier\b(?:\s+\w+)?\s*|'
                          r'CubicBezierTimingFunction::Create)[({]([^)}]*)')),
-    ('radius', re.compile(r'\bk\w*(?:Radius|Corner)\w*\s*=\s*([^;]*)')),
+    ('radius', re.compile(r'\bk\w*(?:Radius|Corner)\w*\s*(?:=\s*|[{(])([^;]*)')),
     ('radius', re.compile(r'(?:SetRoundedCornerRadius|RoundedCornersF|DrawRoundRect|RoundRect|'
                           r'CreateRoundedRectBackground|CreateThemedRoundedRectBackground|'
                           r'CreateRoundedRectBorder|CreateThemedRoundedRectBorder|'
                           r'SetCornerRadius|set_corner_radius|setRectXY|MakeRectXY)\b\s*'
                           r'(?:\(|\{)(.*)')),
-    ('inset', re.compile(r'\bk\w*(?:Inset|Outset)\w*\s*=\s*([^;]*)')),
+    ('inset', re.compile(r'\bk\w*(?:Inset|Outset)\w*\s*(?:=\s*|[{(])([^;]*)')),
     ('inset', re.compile(r'(?:gfx::Insets|gfx::Outsets)(?:::\w+)?\(([^()]*)')),
     ('inset', re.compile(r'(?:CreateEmptyBorder|CreatePaddedBorder)\(([^()]*)\)')),
-    ('padding', re.compile(r'\bk\w*Padding\w*\s*=\s*([^;]*)')),
-    ('gap', re.compile(r'\bk\w*(?:Gap|Spacing|Margin)\w*\s*=\s*([^;]*)')),
+    ('padding', re.compile(r'\bk\w*Padding\w*\s*(?:=\s*|[{(])([^;]*)')),
+    ('gap', re.compile(r'\bk\w*(?:Gap|Spacing|Margin)\w*\s*(?:=\s*|[{(])([^;]*)')),
     ('gap', re.compile(r'(?:SetBetweenChildSpacing|set_between_child_spacing)\(([^()]*)\)')),
     # BoxLayout(orientation, insets, between_child_spacing).
     ('gap', re.compile(r'gfx::Insets(?:::\w+)?\([^()]*\)\s*,\s*([^,()]*)')),
 ]
 
-_LENGTH = r'(?<![\w.#-])(\d+\.?\d*|\.\d+)(px|rem|em|%)?(?![\w.%])'
-_CSS_TIME = re.compile(r'(?<![\w.#-])(\d+\.?\d*|\.\d+)(ms|s)\b')
+_LENGTH = r'(?<![\w.#-])(-?\d+\.?\d*|-?\.\d+)(px|rem|em|%)?(?![\w.%])'
+_CSS_TIME = re.compile(r'(?<![\w.#-])(-?\d+\.?\d*|-?\.\d+)(ms|s)\b')
 WEB_RULES = [
     ('curve', re.compile(r'cubic-bezier\(|\blinear\(\s*-?[\d.]|'
                          r'(?:transition|animation)[\w-]*\s*:[^;]*\bease(?:-in-out|-in|-out)?\b')),
     ('radius', re.compile(r'(?:border(?:-[\w-]+)?-radius|--[\w-]*radius[\w-]*)\s*:\s*([^;]*)')),
     ('padding', re.compile(r'(?<![\w-])(?:--[\w-]*)?padding(?:-[\w-]+)?\s*:\s*([^;]*)')),
-    ('gap', re.compile(r'(?<![\w-])(?:row-|column-)?gap\s*:\s*([^;]*)')),
-    ('inset', re.compile(r'(?<![\w-])inset(?:-[\w-]+)?\s*:\s*([^;]*)')),
+    ('gap', re.compile(r'(?<![\w-])(?:--[\w-]*|grid-)?(?:row-|column-)?gap\s*:\s*([^;]*)')),
+    ('inset', re.compile(r'(?<![\w-])(?:--[\w-]*)?inset(?:-[\w-]+)?\s*:\s*([^;]*)')),
 ]
 WEB_DURATION_LINE = re.compile(r'(?:transition|animation|duration|delay)', re.I)
 # The Web Animations API takes milliseconds without a unit.
@@ -160,7 +162,8 @@ def literals(path, line):
                 if match.re.groups and not any(
                         float(n) not in TRIVIAL
                         for span in match.groups() if span
-                        for n in re.findall(_NUM, span)):
+                        for n in re.findall(
+                            _NUM if re.search(r'[A-Za-z_]', span) else _ANY_NUM, span)):
                     continue
                 kinds.append(kind)
                 break
