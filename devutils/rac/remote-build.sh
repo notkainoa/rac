@@ -48,7 +48,9 @@
 #                                     --rac-force-color-mode=light|dark|
 #                                     system. A bare arg is a URL and gets
 #                                     open-urls' allowlist. A run that opens
-#                                     chrome://setup needs an import input; a
+#                                     chrome://setup (or setup?arc, the
+#                                     tour's Arc import step) needs an
+#                                     import input; a
 #                                     run that opens a settings page may only
 #                                     take screenshots, so its requests file
 #                                     may not send input. In the requests
@@ -1174,7 +1176,8 @@ cmd_run() {
     esac
     lower=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
     case "$lower" in
-      chrome://setup | chrome://setup/* | rac://setup | rac://setup/*)
+      chrome://setup | chrome://setup/* | rac://setup | rac://setup/* | \
+        'chrome://setup?arc' | 'rac://setup?arc')
         setup_page=1 ;;
       chrome://settings | chrome://settings/* | rac://settings | rac://settings/*)
         settings_page=1 ;;
@@ -1183,7 +1186,8 @@ cmd_run() {
   for arg in $req_pages; do
     lower=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
     case "$lower" in
-      chrome://setup | chrome://setup/* | rac://setup | rac://setup/*)
+      chrome://setup | chrome://setup/* | rac://setup | rac://setup/* | \
+        'chrome://setup?arc' | 'rac://setup?arc')
         setup_page=1 ;;
       chrome://settings | chrome://settings/* | rac://settings | rac://settings/*)
         settings_page=1 ;;

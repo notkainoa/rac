@@ -182,8 +182,8 @@ UI-control WebSocket — with `--user-data-dir` at the clone's throwaway
 
 The requests file a run feeds the screenshot harness is one checked
 line. Pages and command ids are allowlists, and a run that opens
-`chrome://setup` needs an import input in the same run. Typed text is
-plain words only (ASCII letters, digits, spaces, `-`, `_`), and a script
+`chrome://setup` (or `chrome://setup?arc`, the tour's Arc import step)
+needs an import input in the same run. Typed text is plain words only (ASCII letters, digits, spaces, `-`, `_`), and a script
 that types may not also move the caret or click — at most one
 `key return`, after the last `type`. A run that opens a settings page
 (the only allowed ones are `settings/assistant`, `settings/appearance`,
