@@ -11,8 +11,52 @@
 #   push <worktree>                   push its committed state, making or
 #                                     updating its clone
 #   build <worktree> [-- targets...]  build the clone through the remote queue
-#   run <worktree> [--timeout S] [-- args...]
-#                                     launch the clone's browser, then stop it
+#   run <worktree> [--timeout S] [--requests-file F] [--fresh-profile]
+#       [-- args...]                  launch the clone's browser directly (no
+#                                     UI DevTools: worktree.sh run's
+#                                     --enable-ui-devtools is never passed),
+#                                     then stop it; --fresh-profile first
+#                                     deletes the clone's throwaway
+#                                     build/profile (never while a browser
+#                                     from the clone runs); F is a
+#                                     screenshot-requests line on the Air,
+#                                     checked by remote_requests.py. After
+#                                     --, args are a fixed allowlist:
+#                                     --no-first-run (skip first-run UI),
+#                                     --rac-launch-in-background (never
+#                                     activate the browser),
+#                                     --rac-import-arc-now (import at startup,
+#                                     only with --rac-import-source-root=),
+#                                     --rac-arc-import-fixture=<path> and
+#                                     --rac-import-source-root=<path> (Arc
+#                                     import inputs, relative to the clone,
+#                                     that must exist there),
+#                                     --rac-window-screenshot=<name>.png
+#                                     (first shot; lands in build/shots) and
+#                                     --rac-window-screenshot-delay=<1-4
+#                                     digits> (ms before it fires),
+#                                     --log-net-log=<name>.json and
+#                                     --rac-frame-log=<name>.log (logs; land
+#                                     in build/logs),
+#                                     --net-log-capture-mode=Default|
+#                                     IncludeSensitive|Everything,
+#                                     --enable-logging=stderr,
+#                                     --vmodule=<spec> (verbose logging),
+#                                     --force-prefers-reduced-motion,
+#                                     --rac-force-increased-contrast,
+#                                     --disable-backgrounding-occluded-windows,
+#                                     --rac-force-color-mode=light|dark|
+#                                     system. A bare arg is a URL and gets
+#                                     open-urls' allowlist. A run that opens
+#                                     chrome://setup needs an import input; a
+#                                     run that opens a settings page may only
+#                                     take screenshots, so its requests file
+#                                     may not send input. In the requests
+#                                     line, pages and command ids are
+#                                     allowlists, typed text is plain words
+#                                     only, and a script that types may not
+#                                     move the caret or click (at most one
+#                                     `key return`, after the last type).
 #   pull <worktree> <remote path> <local path>
 #                                     rsync a file inside the clone back
 #   log [lines]                       the base's bootstrap phases and the
@@ -33,6 +77,11 @@ set -euo pipefail
 die() { echo "rac remote: $*" >&2; exit 1; }
 refuse() { echo "rac remote: refusing: $*" >&2; exit 2; }
 log() { echo "rac remote: $*" >&2; }
+# The comment block at the top of this file is the manual.
+usage() {
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+}
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 
 host=${RAC_REMOTE_HOST:-kainoas-macbook-pro}
 # A host starting with - or holding spaces would reach ssh as options.
@@ -990,77 +1039,189 @@ exec nice -n 10 taskpolicy -c utility devutils/rac/build-queue.sh \
 EOS
 }
 
-# Refuses a browser argument that could reach outside the clone or into
-# the foreground. Chromium takes `-switch` as well as `--switch`, and the
-# last copy of a switch wins, so the checks cover both spellings; paths
-# are compared without case, as APFS does.
+# Browser args after `--` are a fixed allowlist, not a denylist: a
+# denylist always misses a switch (Chromium takes `-s` as well as `--s`,
+# and the last copy of a switch wins), so only the spellings below pass
+# and every other argument starting with `-` is refused. Paths are
+# compared without case, as APFS does. The tool's own switches never go
+# through here: the Pro's launch adds the clone's --user-data-dir itself,
+# and --rac-window-screenshot-requests for a requests run.
 check_run_arg() {
-  local arg=$1 lower name value
+  local arg=$1 lower value
   lower=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
   case "$lower" in
     *"application support"* | *me.kainoa.rac* | *net.imput.helium*)
       refuse "run args may not touch a real profile folder ($arg)" ;;
   esac
   case "$arg" in
-    --) return 0 ;;
-    -[!-]*) refuse "spell switches with two dashes, not '$arg'" ;;
+    --no-first-run | --rac-launch-in-background | --rac-import-arc-now | \
+      --force-prefers-reduced-motion | --rac-force-increased-contrast | \
+      --disable-backgrounding-occluded-windows)
+      return 0 ;;
+    --rac-window-screenshot=?* | --rac-arc-import-fixture=?* | \
+      --rac-import-source-root=?* | --log-net-log=?* | --rac-frame-log=?*)
+      value=${arg#*=} ;;
+    --rac-window-screenshot | --rac-window-screenshot=)
+      refuse "give the screenshot file as --rac-window-screenshot=<name>.png" ;;
+    --log-net-log | --log-net-log=)
+      refuse "give the net log as --log-net-log=<name>.json" ;;
+    --rac-frame-log | --rac-frame-log=)
+      refuse "give the frame log as --rac-frame-log=<name>.log" ;;
+    --rac-arc-import-fixture= | --rac-import-source-root=)
+      refuse "${arg%%=*} needs a path in the clone" ;;
+    --rac-window-screenshot-delay=*)
+      value=${arg#*=}
+      case "$value" in
+        '' | *[!0-9]* | ?????*)
+          refuse "--rac-window-screenshot-delay takes 1-4 digits, not '$value'" ;;
+      esac
+      return 0 ;;
+    --net-log-capture-mode=*)
+      case "${arg#*=}" in
+        Default | IncludeSensitive | Everything) return 0 ;;
+      esac
+      refuse "--net-log-capture-mode takes Default, IncludeSensitive or Everything, not '${arg#*=}'" ;;
+    --enable-logging=*)
+      [ "$arg" = --enable-logging=stderr ] \
+        || refuse "--enable-logging only takes stderr, not '${arg#*=}'"
+      return 0 ;;
+    --vmodule=*)
+      value=${arg#*=}
+      case "$value" in
+        '' | *[!A-Za-z0-9_=,\*/-]*)
+          refuse "--vmodule takes a spec of letters, digits and _=,*/-, not '$value'" ;;
+      esac
+      [ "${#value}" -le 200 ] \
+        || refuse "--vmodule takes at most 200 characters"
+      return 0 ;;
+    --rac-force-color-mode=*)
+      case "${arg#*=}" in
+        light | dark | system) return 0 ;;
+      esac
+      refuse "--rac-force-color-mode takes light, dark or system, not '${arg#*=}'" ;;
+    -*)
+      refuse "'$arg' is not an allowed run arg; ask Ship to allow it" ;;
+    *)
+      # A bare argument is a URL Chromium opens: the same allowlist the
+      # requests file's open-urls gets, including chrome://setup, which
+      # the run then has to pair with an Arc import input.
+      python3 "$here/remote_requests.py" --url "$arg" || exit 2
+      return 0 ;;
   esac
-  name=${lower#--}
-  name=${name%%=*}
-  case "$lower" in
-    --*)
-      case "$name" in
-        user-data-dir) refuse "worktree.sh run sets the clone's own --user-data-dir" ;;
-        rac-window-screenshot-activate)
-          refuse "--rac-window-screenshot-activate takes the foreground on the Pro" ;;
-        rac-window-screenshot-requests)
-          refuse "--rac-window-screenshot-requests hands the browser unchecked output paths" ;;
-        rac-window-screenshot)
-          case "$arg" in
-            *=?*) ;;
-            *) refuse "give the screenshot file as --rac-window-screenshot=<name>.png" ;;
-          esac ;;
-      esac ;;
-  esac
-  value=$arg
-  case "$arg" in --*=*) value=${arg#*=} ;; esac
-  # Relative paths resolve in the clone, where the browser runs.
+  # Path values resolve in the clone, where the browser runs.
   case "$value" in
     /* | '~'*)
       refuse "run args can't name absolute paths ($arg); relative ones land in the clone" ;;
     .. | ../* | */../* | */..)
       refuse "run args can't leave the clone ($arg)" ;;
+    *[!A-Za-z0-9._/-]*)
+      refuse "run arg paths may only use letters, digits, '.', '_', '-' and '/' ($arg)" ;;
+  esac
+  case "$arg" in
+    --rac-window-screenshot=*.png) ;;
+    --rac-window-screenshot=*)
+      refuse "a screenshot path ends in .png ($arg)" ;;
+    --log-net-log=*.json) ;;
+    --log-net-log=*)
+      refuse "a net log path ends in .json ($arg)" ;;
+    --rac-frame-log=*.log) ;;
+    --rac-frame-log=*)
+      refuse "a frame log path ends in .log ($arg)" ;;
   esac
 }
 
 cmd_run() {
-  local name=$1 timeout=90
+  local name=$1 timeout=90 requests='' outputs='' fresh=0 checked
+  local req_pages='' req_verbs='' import_input=0 setup_page=0 source_root=0
+  local arc_now=0 settings_page=0
   shift
   while [ $# -gt 0 ]; do
     case "$1" in
+      --requests-file)
+        [ $# -ge 2 ] || die "run: --requests-file needs a file on this Mac"
+        # The checked line, then `verbs VERB...`, a `pages URL` per
+        # internal page open-urls visits, and one `file REL` / `dir REL`
+        # / `expect REL` per path in it. The pages are read back here for
+        # the setup check and stripped from the stream the Pro gets.
+        checked=$(python3 "$here/remote_requests.py" "$2") || exit 2
+        requests=${checked%%$'\n'*}
+        outputs=
+        case "$checked" in *$'\n'*) outputs=${checked#*$'\n'} ;; esac
+        req_pages=$(printf '%s\n' "$outputs" | awk '$1 == "pages" { print $2 }')
+        req_verbs=$(printf '%s\n' "$outputs" | awk '$1 == "verbs" { $1=""; print }')
+        outputs=$(printf '%s\n' "$outputs" | awk '$1 != "pages"')
+        shift 2 ;;
+      --fresh-profile) fresh=1; shift ;;
       --timeout)
         [ $# -ge 2 ] || die "run: --timeout needs seconds"
         case "$2" in '' | *[!0-9]*) die "run: --timeout needs seconds" ;; esac
         timeout=$2
         shift 2 ;;
       --) shift; break ;;
-      *) die "usage: remote-build.sh run <worktree> [--timeout S] [-- args...]" ;;
+      *) die "usage: remote-build.sh run <worktree> [--timeout S] [--requests-file F] [--fresh-profile] [-- args...]" ;;
     esac
   done
   case "$queue_wait" in
     '' | *[!0-9]*) die "RAC_REMOTE_QUEUE_WAIT must be whole seconds, not '$queue_wait'" ;;
   esac
-  local arg
+  local arg lower
   for arg in "$@"; do
     check_run_arg "$arg"
+    case "$arg" in
+      --rac-arc-import-fixture=*) import_input=1 ;;
+      --rac-import-source-root=*) import_input=1; source_root=1 ;;
+      --rac-import-arc-now) arc_now=1 ;;
+    esac
+    lower=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
+    case "$lower" in
+      chrome://setup | chrome://setup/* | rac://setup | rac://setup/*)
+        setup_page=1 ;;
+      chrome://settings | chrome://settings/* | rac://settings | rac://settings/*)
+        settings_page=1 ;;
+    esac
   done
-  remote "$name" "$timeout" "$queue_wait" "$@" <<'EOS'
+  for arg in $req_pages; do
+    lower=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
+    case "$lower" in
+      chrome://setup | chrome://setup/* | rac://setup | rac://setup/*)
+        setup_page=1 ;;
+      chrome://settings | chrome://settings/* | rac://settings | rac://settings/*)
+        settings_page=1 ;;
+    esac
+  done
+  # chrome://setup is the Arc import screen: without an import input in
+  # the same run it would read the maintainer's real Arc data.
+  if [ "$setup_page" = 1 ] && [ "$import_input" = 0 ]; then
+    refuse "opening chrome://setup needs --rac-arc-import-fixture= or --rac-import-source-root= in the same run, so the import screen reads a fixture, not the Pro's real Arc data"
+  fi
+  # --rac-import-arc-now imports at startup from --rac-import-source-root,
+  # and from the maintainer's real Arc when that switch is missing.
+  if [ "$arc_now" = 1 ] && [ "$source_root" = 0 ]; then
+    refuse "--rac-import-arc-now needs --rac-import-source-root= in the same run, or it imports the Pro's real Arc data"
+  fi
+  # A run that opens a settings page may only take screenshots. A script
+  # that opens settings itself was refused by the checker if it carries
+  # input; a settings page passed as a run arg is checked against the
+  # requests file's verbs here.
+  if [ "$settings_page" = 1 ]; then
+    for arg in $req_verbs; do
+      case "$arg" in
+        click | command | key | move | nspress | nsflags | nskey | nstype | \
+        pointer | pointer-path | swipe | type | wheel)
+          refuse "a run that opens a settings page may only take screenshots; the requests file may not send input" ;;
+      esac
+    done
+  fi
+  remote "$name" "$timeout" "$queue_wait" "$requests" "$outputs" "$fresh" "$@" <<'EOS'
 set -e
 safe_name "$1" || { echo "rac remote: bad clone name '$1'" >&2; exit 2; }
 clone="$HOME/rac-remote/wt/$1"
 timeout=$2
 queue_wait=$3
-shift 3
+requests=$4
+outputs=$5
+fresh=$6
+shift 6
 [ -d "$clone" ] || {
   echo "rac remote: no clone at $clone; run push first" >&2
   exit 1
@@ -1074,11 +1235,31 @@ check_toolchain_record "$clone"
 # that stay inside it.
 shot=
 args=()
+# The files a requests run waits for; the first shot alone ends a plain run.
+expected=()
+# Log files the browser is asked to write, mapped under build/logs.
+logfiles=()
 for arg in "$@"; do
   case "$arg" in
     --rac-window-screenshot=*)
       shot="$clone/build/shots/${arg#--rac-window-screenshot=}"
       arg="--rac-window-screenshot=$shot" ;;
+    # Logs land in build/logs under the same checks screenshots get in
+    # build/shots: never inside build/profile.
+    --log-net-log=* | --rac-frame-log=*)
+      log="$clone/build/logs/${arg#*=}"
+      arg="${arg%%=*}=$log"
+      logfiles+=("$log") ;;
+    # Inputs rac reads Arc data from, which need absolute paths: relative
+    # to the clone, existing, and still inside it once symlinks resolve.
+    # Nothing is created for them.
+    --rac-arc-import-fixture=* | --rac-import-source-root=*)
+      input=${arg#*=}
+      [ -n "$input" ] || { echo "rac remote: refusing: ${arg%%=*} needs a path in the clone" >&2; exit 2; }
+      input="$clone/$input"
+      [ -e "$input" ] || { echo "rac remote: refusing: ${arg%%=*}: no $input" >&2; exit 2; }
+      inside_clone "$clone" "$input" || { echo "rac remote: refusing: ${arg%%=*} leaves the clone ($input)" >&2; exit 2; }
+      arg="${arg%%=*}=$input" ;;
   esac
   args+=("$arg")
 done
@@ -1104,11 +1285,109 @@ if [ -n "$shot" ]; then
   # A shot left by an earlier run would end the wait at once.
   rm -f "$shot"
 fi
+if [ "${#logfiles[@]}" -gt 0 ]; then
+  # The same checks screenshots get: a symlinked build/logs, or a symlink
+  # anywhere on the way, would write the log outside the clone -- and
+  # build/logs can never be build/profile.
+  [ ! -L "$clone/build/logs" ] || {
+    echo "rac remote: refusing: $clone/build/logs is a symlink" >&2
+    exit 2
+  }
+  for log in ${logfiles[@]+"${logfiles[@]}"}; do
+    inside_clone "$clone" "$log" || {
+      echo "rac remote: refusing: $log leaves the clone through a symlink" >&2
+      exit 2
+    }
+    mkdir -p "$(dirname "$log")"
+    inside_clone "$clone" "$log" || {
+      echo "rac remote: refusing: $log leaves the clone through a symlink" >&2
+      exit 2
+    }
+    # A stale log isn't this run's output.
+    rm -f "$log"
+  done
+fi
 # Every process running from the clone's app, never anything else.
 app="$clone/build/src/out/Default/rac.app/"
 clone_pids() {
   ps -axo pid=,command= | P="$app" awk '{ pid = $1; sub(/^ *[0-9]+ +/, ""); if (index($0, ENVIRON["P"]) == 1) print pid }'
 }
+if [ -n "$requests" ]; then
+  # A browser already running from this clone polls the same req.txt and
+  # would take this line, under whatever profile settings it started with.
+  [ -z "$(clone_pids)" ] || {
+    echo "rac remote: refusing requests: a browser from this clone is running" >&2
+    exit 2
+  }
+  # The Air checked the line and listed every path in it, each relative to
+  # build/shots and marked @SHOTS@ in the line. The harness splits on
+  # spaces, so the clone's own path has to be one plain word.
+  case "$clone" in
+    *[!A-Za-z0-9._/-]*)
+      echo "rac remote: refusing: requests need a clone path without spaces or symbols ($clone)" >&2
+      exit 2 ;;
+  esac
+  shots="$clone/build/shots"
+  for dir in "$shots" "$clone/build/req"; do
+    [ ! -L "$dir" ] || { echo "rac remote: refusing: $dir is a symlink" >&2; exit 2; }
+    inside_clone "$clone" "$dir" || { echo "rac remote: refusing: $dir leaves the clone" >&2; exit 2; }
+    mkdir -p "$dir"
+  done
+  # Each destination stays in the clone before and after its folder is
+  # made. Read from the list, never by splitting the line: typed text in
+  # it would glob. `expect` files are the screenshots the run waits for.
+  verbs=
+  while read -r kind rel; do
+    [ -n "$kind" ] || continue
+    # The checker lists the line's verbs for the harness check below.
+    if [ "$kind" = verbs ]; then
+      verbs=$rel
+      continue
+    fi
+    case "$rel" in
+      '' | /* | *[!A-Za-z0-9._/-]* | . | .. | ./* | ../* | */. | */.. | */./* | */../* | *//*)
+        echo "rac remote: refusing: bad requests path '$rel'" >&2
+        exit 2 ;;
+    esac
+    word="$shots/$rel"
+    inside_clone "$clone" "$word" || { echo "rac remote: refusing: $word leaves the clone" >&2; exit 2; }
+    case "$kind" in
+      dir) mkdir -p "$word" ;;
+      file | expect) mkdir -p "$(dirname "$word")" ;;
+      *) echo "rac remote: refusing: bad requests output '$kind'" >&2; exit 2 ;;
+    esac
+    inside_clone "$clone" "$word" || { echo "rac remote: refusing: $word leaves the clone" >&2; exit 2; }
+    # A shot left by an earlier run would look like this run's.
+    case "$kind/$word" in file/*.png | expect/*) rm -f "$word" ;; esac
+    [ "$kind" != expect ] || expected+=("$word")
+  done <<<"$outputs"
+  # Every verb the Air's checker saw must be a string literal in this
+  # clone's own harness sources: a verb the clone never built would run
+  # as an output path inside `after`.
+  harness=$clone/build/src/chrome/browser/ui/views/rac
+  for verb in $verbs; do
+    case "$verb" in
+      '' | *[!A-Za-z-]*)
+        echo "rac remote: refusing: bad verb '$verb'" >&2
+        exit 2 ;;
+    esac
+    if ! grep -F -q "\"$verb\"" "$harness/window_screenshot.mm" \
+         "$harness"/dev/*.mm "$harness"/dev/*.cc 2>/dev/null; then
+      echo "rac remote: refusing: the clone's harness has no \"$verb\" request" >&2
+      exit 2
+    fi
+  done
+  requests=${requests//@SHOTS@/$shots}
+  # Write beside the file and rename, so the polling harness never reads
+  # half a line; remove both names first so neither can be a symlink the
+  # write or the rename would follow.
+  req="$clone/build/req/req.txt"
+  rm -f "$req.tmp" "$req"
+  (set -C; printf '%s\n' "$requests" > "$req.tmp")
+  mv -f "$req.tmp" "$req"
+  args+=("--rac-window-screenshot-requests=$req")
+  [ -z "$shot" ] || expected+=("$shot")
+fi
 # $launcher plus every descendant: the queue starts the browser in a new
 # session, so only a parent-pid walk finds its whole tree.
 family_pids() {
@@ -1156,6 +1435,83 @@ stop_own() {
     kill -9 -- "-$p" 2>/dev/null || true
   done
 }
+if [ "$fresh" = 1 ]; then
+  # Only the clone's own throwaway profile, the --user-data-dir the launch
+  # below gives it, and never one a running browser holds.
+  [ -n "$clone" ] && [ "$clone" != / ] || { echo "rac remote: refusing: no clone path" >&2; exit 2; }
+  profile="$clone/build/profile"
+  for dir in "$clone/build" "$profile"; do
+    [ ! -L "$dir" ] || { echo "rac remote: refusing --fresh-profile: $dir is a symlink" >&2; exit 2; }
+  done
+  inside_clone "$clone" "$profile" || { echo "rac remote: refusing --fresh-profile: $profile leaves the clone" >&2; exit 2; }
+  [ -z "$(clone_pids)" ] || {
+    echo "rac remote: refusing --fresh-profile: a browser from this clone is running" >&2
+    exit 2
+  }
+  rm -rf -- "$profile"
+  echo "rac remote: deleted $profile" >&2
+fi
+# Downloads land only in the clone: a URL the harness opens can start
+# one, and the default folder is the Pro's own Downloads. Before every
+# launch, point the clone profile's downloads and saves at build/downloads
+# and turn file dialogs off (Local State's select_file_dialogs.allowed,
+# the AllowFileSelectionDialogs policy's pref), so no open, save or upload
+# dialog can be steered to the Pro's own files. A browser already running
+# from this clone (another run's, which did the same; a requests run
+# refused above) read its prefs at startup and rewrites them on exit.
+profile=$clone/build/profile
+downloads=$clone/build/downloads
+if [ -n "$(clone_pids)" ]; then
+  echo "rac remote: a browser from this clone is running; its profile already points downloads inside the clone" >&2
+else
+  for path in "$clone/build" "$profile" "$profile/Default" "$downloads" \
+              "$profile/Default/Preferences" "$profile/Local State"; do
+    [ ! -L "$path" ] || { echo "rac remote: refusing: $path is a symlink" >&2; exit 2; }
+    inside_clone "$clone" "$path" || { echo "rac remote: refusing: $path leaves the clone" >&2; exit 2; }
+  done
+  mkdir -p "$profile/Default" "$downloads"
+  # Keep every other preference; a missing or unreadable file starts
+  # empty. Write a new file beside each (never through a planted link)
+  # and rename it over, so the browser never reads half a file.
+  python3 - "$profile" "$downloads" <<'PY'
+import json, os, sys
+profile, downloads = sys.argv[1:3]
+
+def patch(path, values):
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    for dotted, value in values.items():
+        section, key = dotted.split('.')
+        if not isinstance(data.get(section), dict):
+            data[section] = {}
+        data[section][key] = value
+    tmp = path + '.tmp'
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+patch(os.path.join(profile, 'Default', 'Preferences'), {
+    'download.default_directory': downloads,
+    'download.prompt_for_download': False,
+    'download.directory_upgrade': True,
+    'savefile.default_directory': downloads,
+    'selectfile.last_directory': downloads,
+})
+patch(os.path.join(profile, 'Local State'), {
+    'select_file_dialogs.allowed': False,
+})
+PY
+fi
 launcher=
 browser_pids=
 spawned=
@@ -1168,17 +1524,38 @@ cleanup() {
   stop_own
 }
 trap 'cleanup; exit 130' INT TERM HUP
+# The clone's own worktree.sh run would add --enable-ui-devtools: a
+# full-UI-control WebSocket a mistake in a request could drive the whole
+# browser with. Launch the built binary directly instead, with exactly
+# worktree.sh's own flags minus that one. The queue gets --run: nothing
+# in this command still says "worktree.sh run".
+app_bin="$clone/build/src/out/Default/rac.app/Contents/MacOS/rac"
+[ -x "$app_bin" ] || {
+  echo "rac remote: no built browser at $app_bin; run build first" >&2
+  exit 1
+}
 # setsid gives the launcher its own session, so a signal that hits this
 # script's process group can't take the tree down before the trap can
 # choose what to stop.
 python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-  nice -n 10 taskpolicy -c utility devutils/rac/build-queue.sh \
-  devutils/rac/worktree.sh run --rac-launch-in-background ${args[@]+"${args[@]}"} &
+  env BREAKPAD_DUMP_LOCATION="$clone/build/profile/Crashpad" \
+  nice -n 10 taskpolicy -c utility devutils/rac/build-queue.sh --run \
+  "$app_bin" --user-data-dir="$clone/build/profile" --use-mock-keychain \
+  --disable-features=DialMediaRouteProvider --rac-launch-in-background \
+  ${args[@]+"${args[@]}"} &
 launcher=$!
 spawned=$launcher
 end=
 deadline=$((SECONDS + queue_wait + timeout))
 last=-1
+settled_at=0
+# The expected files not yet written, one per line.
+missing_outputs() {
+  local f
+  for f in ${expected[@]+"${expected[@]}"}; do
+    [ -s "$f" ] || printf '%s\n' "$f"
+  done
+}
 while [ "$SECONDS" -lt "$deadline" ]; do
   fam=$(family_pids)
   [ -n "$fam" ] && spawned=$fam
@@ -1192,6 +1569,19 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     fi
   elif [ "$SECONDS" -ge "$end" ]; then
     break
+  elif [ -n "$requests" ]; then
+    # The harness only reads requests after the first shot, so a requests
+    # run ends when every file it expects is there and none has changed
+    # size for 2s. With none expected, it runs to the timeout.
+    if [ "${#expected[@]}" -gt 0 ] && [ -z "$(missing_outputs)" ]; then
+      sizes=$(stat -f %z "${expected[@]}" 2>/dev/null | tr '\n' ' ' || true)
+      if [ "$sizes" != "$last" ]; then
+        last=$sizes
+        settled_at=$SECONDS
+      elif [ $((SECONDS - settled_at)) -ge 2 ]; then
+        break
+      fi
+    fi
   elif [ -n "$shot" ] && [ -f "$shot" ]; then
     size=$(stat -f %z "$shot" 2>/dev/null || echo 0)
     # Settled: a real file whose size stopped changing between checks.
@@ -1217,6 +1607,12 @@ if [ -z "$launched" ]; then
   exit 1
 fi
 [ "$killed" = 0 ] || status=0
+missing=$(missing_outputs)
+if [ -n "$requests" ] && [ -n "$missing" ]; then
+  echo "rac remote: after ${timeout}s, still no:" >&2
+  printf '%s\n' "$missing" | sed 's/^/  /' >&2
+  exit 1
+fi
 if [ -n "$shot" ]; then
   if [ -s "$shot" ]; then
     echo "rac remote: screenshot: $shot" >&2
@@ -1283,6 +1679,8 @@ if [ "${1:-}" = "--dry-run" ]; then
   shift
 fi
 case "${1:-}" in
+  help | --help | -h)
+    usage ;;
   setup-host)
     [ $# = 1 ] || die "usage: remote-build.sh setup-host"
     cmd_setup_host ;;
@@ -1342,7 +1740,7 @@ case "${1:-}" in
     shift 2
     cmd_build "$name" "$@" ;;
   run)
-    [ $# -ge 2 ] || die "usage: remote-build.sh run <worktree> [--timeout S] [-- args...]"
+    [ $# -ge 2 ] || die "usage: remote-build.sh run <worktree> [--timeout S] [--requests-file F] [--fresh-profile] [-- args...]"
     name=$(clone_name "$2")
     shift 2
     cmd_run "$name" "$@" ;;

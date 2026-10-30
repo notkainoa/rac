@@ -141,23 +141,62 @@ fi
 if [ "$1" = sync ] && [ -f build/src/.pc/applied-patches ]; then
   cp build/src/.pc/applied-patches build/src/.pc/.rac_applied
 fi
+# `run` is not stubbed: remote runs launch the app binary (STUB_APP)
+# directly, so a worktree.sh run call must fail, not quietly pass.
 if [ "$1" = "run" ]; then
-  # A launch that never produces a browser-shaped process.
-  [ -z "${NEVER_LAUNCH:-}" ] || exec sleep "$NEVER_LAUNCH"
-  shot=
-  for arg in "$@"; do
-    case "$arg" in --rac-window-screenshot=*) shot="${arg#--rac-window-screenshot=}" ;; esac
-  done
-  if [ -n "$shot" ]; then
-    mkdir -p "$(dirname "$shot")"
-    sleep "${SHOT_DELAY:-1}"
-    echo png > "$shot"
-  fi
-  # Stand in for the browser: a sleeper titled with this clone's app path
-  # so the run command's pgrep finds it and nothing else.
-  exec bash -c 'exec -a "$1" sleep 600' _ \
-    "$PWD/build/src/out/Default/rac.app/Contents/MacOS/rac"
+  echo "worktree.sh run is not allowed in remote runs" >&2
+  exec sleep "${NEVER_LAUNCH:-600}"
 fi
+'''
+# The built browser stand-in, seeded as each clone's
+# build/src/out/Default/rac.app/Contents/MacOS/rac: the run command
+# launches it directly. It logs its BREAKPAD setting and args, fakes the
+# first screenshot and the requested ones, then sleeps titled with its
+# own path so the run command's pgrep finds it and nothing else.
+STUB_APP = '''\
+echo "app BREAKPAD_DUMP_LOCATION=${BREAKPAD_DUMP_LOCATION:-} $*" >> "$RAC_FAKE_LOG"
+# A launch that never produces a browser-shaped process.
+[ -z "${NEVER_LAUNCH:-}" ] || exec sleep "$NEVER_LAUNCH"
+shot=
+for arg in "$@"; do
+  case "$arg" in --rac-window-screenshot=*) shot="${arg#--rac-window-screenshot=}" ;; esac
+done
+if [ -n "$shot" ]; then
+  mkdir -p "$(dirname "$shot")"
+  sleep "${SHOT_DELAY:-1}"
+  echo png > "$shot"
+fi
+# Like the harness, read the requests only after the first shot, then
+# write the screenshots they name REQ_DELAY later, all but REQ_SKIP.
+req=
+for arg in "$@"; do
+  case "$arg" in --rac-window-screenshot-requests=*) req="${arg#*=}" ;; esac
+done
+if [ -n "$req" ]; then
+  (sleep "${REQ_DELAY:-0}"; python3 - "$req" <<'PY'
+import os, sys
+skip = os.environ.get('REQ_SKIP', '')
+for request in open(sys.argv[1]).read().strip().split(' ; '):
+    words = request.split()
+    while len(words) > 2 and words[0] == 'after':
+        words = words[2:]
+    outs = []
+    if len(words) == 1 and words[0].endswith('.png'):
+        outs = [words[0]]
+    elif words[0] == 'capture-window':
+        outs = [words[2]]
+    elif words[0] == 'burst':
+        outs = [f'{words[1]}/f{i:02d}.png' for i in range(int(words[2]))]
+    for out in outs:
+        if not (skip and out.endswith(skip)):
+            with open(out, 'w') as f:
+                f.write('png\\n')
+PY
+  ) &
+fi
+# Stand in for the browser: a sleeper titled with this app's own path so
+# the run command's pgrep finds it and nothing else.
+exec bash -c 'exec -a "$1" sleep 600' _ "$0"
 '''
 STUB_QUEUE_SH = '''\
 echo "queue $*" >> "$RAC_FAKE_LOG"
@@ -407,10 +446,13 @@ class RemoteBuildTest(unittest.TestCase):
         return repo
 
     def remote_clone(self, name='feature'):
-        """A clone on the remote, as push would leave it."""
+        """A clone on the remote, as push would leave it, with a built
+        browser: the STUB_APP stand-in at the real binary's path."""
         clone = self.remote / 'rac-remote/wt' / name
         src = self.make_repo(self.folder / f'remote-src-{name}')
         shutil.copytree(src, clone, ignore=shutil.ignore_patterns('.git'))
+        tool(clone / 'build/src/out/Default/rac.app/Contents/MacOS/rac',
+             STUB_APP)
         return clone
 
 
@@ -1277,42 +1319,341 @@ class BuildTest(RemoteBuildTest):
                     'remote-build.sh drives macOS hosts')
 class RunTest(RemoteBuildTest):
 
+    # Every verb the deployed harness knows, as the checker lists them.
+    HARNESS_VERBS = '''after appearance burst capture-window click command
+        contrast hit key move nsflags nskey nspress nstype open-urls
+        pointer pointer-path profile-window record space-new space-theme
+        swipe target type wheel windows'''.split()
+
     def setUp(self):
         super().setUp()
         self.remote_root = self.seed_remote()
         self.clone = self.remote_clone('feature')
         self.wt = self.make_repo(self.folder / 'feature', branch='feat/x')
+        self.seed_harness()
+
+    def seed_harness(self, without=()):
+        """The verbs the fake clone's harness knows, as string literals."""
+        rac = self.clone / 'build/src/chrome/browser/ui/views/rac'
+        write(rac / 'window_screenshot.mm',
+              ''.join(f'if (verb == "{verb}") {{\n' for verb in
+                      self.HARNESS_VERBS if verb not in without))
 
     def test_run_refuses_profile_and_foreground_args(self):
         for args, why in [
             (('--', '--user-data-dir=/tmp/x'), '--user-data-dir'),
             (('--', '--user-data-dir', '/tmp/x'), '--user-data-dir'),
-            (('--', '--flag', '~/Library/Application Support/x'), 'Application Support'),
-            (('--', '--rac-window-screenshot-activate'), 'foreground'),
-            (('--', '-user-data-dir=/tmp/x'), 'two dashes'),
-            (('--', '-rac-window-screenshot-activate'), 'two dashes'),
+            (('--', '~/Library/Application Support/x'), 'Application Support'),
             (('--', '--x=/Users/k/library/APPLICATION SUPPORT/me.kainoa.rac'),
              'real profile'),
             (('--', '--x=~/Library/Application%20Support/net.imput.helium'),
              'real profile'),
             (('--', '--rac-window-screenshot=/Users/k/Desktop/x.png'), 'absolute'),
-            # The requests file hands the browser unchecked output paths;
-            # it is refused in every form Chromium accepts, not only when
-            # its value looks like a bad path.
-            (('--', '--rac-window-screenshot-requests=/Users/k/notes.txt'),
-             'requests'),
-            (('--', '--rac-window-screenshot-requests=x.txt'), 'requests'),
-            (('--', '--rac-window-screenshot-requests'), 'requests'),
-            (('--', '--rac-window-screenshot-requests', 'x.txt'), 'requests'),
-            (('--', '-rac-window-screenshot-requests=x.txt'), 'two dashes'),
-            (('--', '--RAC-WINDOW-SCREENSHOT-REQUESTS=x.txt'), 'requests'),
             (('--', '--rac-window-screenshot=../../x.png'), 'leave the clone'),
             (('--', '--rac-window-screenshot', 'x.png'), '--rac-window-screenshot='),
-            (('--', '--disk-cache-dir=/tmp/c'), 'absolute'),
+            (('--', '--rac-window-screenshot='), '--rac-window-screenshot='),
+            (('--', '--rac-arc-import-fixture='), 'needs a path'),
+            (('--', '--rac-import-source-root='), 'needs a path'),
+            # The delay takes 1-4 digits only.
+            (('--', '--rac-window-screenshot-delay=x'), '1-4 digits'),
+            (('--', '--rac-window-screenshot-delay='), '1-4 digits'),
+            (('--', '--rac-window-screenshot-delay=12345'), '1-4 digits'),
+            (('--', '--rac-window-screenshot-delay=1.5'), '1-4 digits'),
+            # Chromium opens a bare argument as a URL, so it gets the
+            # requests file's URL allowlist.
+            (('--', 'file:///Users/k/.ssh/id_rsa', '--rac-window-screenshot=x.png'),
+             'may only open'),
+            (('--', 'view-source:file:///etc/hosts'), 'may only open'),
+            (('--', 'https://evil.com/x.dmg'), 'may only open'),
+            (('--', 'evil.com'), 'may only open'),
+            (('--', 'notes.txt'), 'may only open'),
+            (('--', 'chrome://settings/importData'), 'may only open'),
+            (('--', 'chrome://flags'), 'may only open'),
+            (('--', 'about:version'), 'may only open'),
         ]:
             result = self.run_rb('run', self.wt, *args, success=False)
             self.assertEqual(result.returncode, 2, (args, result.stderr))
             self.assertIn(why, result.stderr)
+        self.assertEqual(self.calls(), '')
+
+    def test_run_refuses_every_switch_off_the_allowlist(self):
+        # After `--` only the allowlisted spellings pass; every other
+        # switch — including the rest of the --rac-window-screenshot-*
+        # family, single-dash forms and anything not spelled --foo=bar —
+        # is refused with a pointer at the maintainer.
+        for arg in (
+            # The screenshot harness's own dangerous switches: a command
+            # id it runs, foreground, unchecked output paths.
+            '--rac-window-screenshot-command=40256',  # paste and go
+            '--rac-window-screenshot-command=35006',  # email page location
+            '--rac-window-screenshot-command=40004',  # DevTools
+            '--rac-window-screenshot-command=40014',  # import settings
+            '--rac-window-screenshot-command=35002',  # view source
+            '--rac-window-screenshot-activate',
+            '--rac-window-screenshot-requests=x.txt',
+            '--rac-window-screenshot-requests',
+            '--rac-window-screenshot-occlusion',
+            # Driving, unsandboxing or reconfiguring the browser.
+            '--remote-debugging-port=9222',
+            '--remote-debugging-pipe',
+            '--auto-open-devtools-for-tabs',
+            '--allow-file-access-from-files',
+            '--disable-web-security',
+            '--no-sandbox',
+            '--proxy-server=http://evil.com:8080',
+            '--host-resolver-rules=MAP localhost 10.0.0.9',
+            '--load-extension=ext',
+            '--user-agent=x',
+            '--js-flags=--expose-gc',
+            '--enable-features=Foo',
+            '--gpu-launcher=/bin/sh',
+            '--utility-cmd-prefix=/bin/sh',
+            '--app=file:///Users/k/.ssh/id_rsa',
+            '--homepage=https://evil.com/',
+            '--x=JavaScript:alert(1)',
+            '--disk-cache-dir=/tmp/c',
+            '--user-data-dir=/tmp/x',
+            '-foo',
+            '-rac-window-screenshot-requests=x.txt',
+            '--RAC-WINDOW-SCREENSHOT-REQUESTS=x.txt',
+            '--no-screenshot-run',
+            '--rac-x=odd',
+        ):
+            result = self.run_rb('run', self.wt, '--', arg, success=False)
+            self.assertEqual(result.returncode, 2, (arg, result.stderr))
+            self.assertIn('ask Ship to allow it', result.stderr, arg)
+        # The bare and two-token forms refuse too.
+        for args in (('--', '--rac-window-screenshot-requests', 'x.txt'),
+                     ('--', '--user-data-dir', '/tmp/x'),
+                     ('--', '--host-resolver-rules', 'MAP localhost x')):
+            result = self.run_rb('run', self.wt, *args, success=False)
+            self.assertEqual(result.returncode, 2, (args, result.stderr))
+            self.assertIn('ask Ship to allow it', result.stderr, args)
+        self.assertEqual(self.calls(), '')
+
+    def test_run_opens_allowed_url_args(self):
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    'http://localhost:8000/x', 'chrome://settings/appearance',
+                    'chrome://version', 'about:blank', 'rac://rac-ai',
+                    success=True)
+        self.assertIn('http://localhost:8000/x chrome://settings/appearance',
+                      self.calls())
+        # The settings root is no longer on the internal-page allowlist.
+        result = self.run_rb('run', self.wt, '--', 'chrome://settings',
+                             success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('may only open', result.stderr)
+
+    def test_run_accepts_the_allowlisted_switches(self):
+        write(self.clone / 'devutils/fixtures/arc/StorableSidebar.json', '{}\n')
+        (self.clone / 'build/arc-root').mkdir(parents=True)
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    '--no-first-run', '--rac-launch-in-background',
+                    '--rac-window-screenshot=x.png',
+                    '--rac-window-screenshot-delay=1',
+                    '--rac-window-screenshot-delay=9999',
+                    '--rac-arc-import-fixture=devutils/fixtures/arc/StorableSidebar.json',
+                    '--rac-import-source-root=build/arc-root',
+                    success=True)
+        calls = self.calls()
+        for arg in ('--no-first-run', '--rac-window-screenshot-delay=1',
+                    '--rac-window-screenshot-delay=9999'):
+            self.assertIn(arg, calls, arg)
+
+    def test_run_launches_the_browser_without_ui_devtools(self):
+        # The run launches the clone's built binary directly through the
+        # queue's run slot, with worktree.sh run's flags minus
+        # --enable-ui-devtools (its WebSocket is full UI control).
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    '--no-first-run', success=True)
+        calls = self.calls()
+        app = f'{os.path.realpath(self.clone)}/build/src/out/Default/rac.app/Contents/MacOS/rac'
+        self.assertIn(f'queue --run {app}', calls)
+        self.assertIn(f'--user-data-dir={os.path.realpath(self.clone)}/build/profile',
+                      calls)
+        self.assertIn('--use-mock-keychain', calls)
+        self.assertIn('--disable-features=DialMediaRouteProvider', calls)
+        self.assertIn('--rac-launch-in-background', calls)
+        self.assertIn('BREAKPAD_DUMP_LOCATION='
+                      f'{os.path.realpath(self.clone)}/build/profile/Crashpad',
+                      calls)
+        self.assertNotIn('--enable-ui-devtools', calls)
+        self.assertNotIn('worktree.sh run', calls)
+        self.assertIn('nice -n 10', calls)
+        self.assertIn('taskpolicy -c utility', calls)
+
+    def test_run_refuses_without_a_built_browser(self):
+        (self.clone / 'build/src/out/Default/rac.app/Contents/MacOS/rac').unlink()
+        result = self.run_rb('run', self.wt, '--timeout', '3', success=False)
+        self.assertIn('no built browser', result.stderr)
+
+    def test_run_accepts_log_and_diagnostic_switches(self):
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    '--log-net-log=net.json',
+                    '--rac-frame-log=sub/frame.log',
+                    '--net-log-capture-mode=Default',
+                    '--net-log-capture-mode=IncludeSensitive',
+                    '--net-log-capture-mode=Everything',
+                    '--enable-logging=stderr',
+                    '--vmodule=blink=2,*/foo/bar=1',
+                    '--force-prefers-reduced-motion',
+                    '--rac-force-increased-contrast',
+                    '--disable-backgrounding-occluded-windows',
+                    '--rac-force-color-mode=light',
+                    '--rac-force-color-mode=dark',
+                    '--rac-force-color-mode=system',
+                    success=True)
+        clone = os.path.realpath(self.clone)
+        calls = self.calls()
+        # Log paths land in the clone's build/logs, made on the Pro.
+        self.assertIn(f'--log-net-log={clone}/build/logs/net.json', calls)
+        self.assertIn(f'--rac-frame-log={clone}/build/logs/sub/frame.log', calls)
+        self.assertTrue((self.clone / 'build/logs').is_dir())
+        for arg in ('--net-log-capture-mode=Everything',
+                    '--enable-logging=stderr', '--vmodule=blink=2',
+                    '--force-prefers-reduced-motion',
+                    '--rac-force-increased-contrast',
+                    '--disable-backgrounding-occluded-windows',
+                    '--rac-force-color-mode=system'):
+            self.assertIn(arg, calls, arg)
+
+    def test_run_refuses_bad_log_and_diagnostic_switches(self):
+        for args, why in [
+            (('--log-net-log=/tmp/x.json',), 'absolute'),
+            (('--log-net-log=../x.json',), 'leave the clone'),
+            (('--log-net-log=a/../x.json',), 'leave the clone'),
+            (('--log-net-log=x.txt',), 'ends in .json'),
+            (('--log-net-log=',), '--log-net-log='),
+            (('--log-net-log',), '--log-net-log='),
+            (('--rac-frame-log=x.json',), 'ends in .log'),
+            (('--rac-frame-log=',), '--rac-frame-log='),
+            (('--rac-frame-log=a b.log',), 'may only use'),
+            (('--net-log-capture-mode=everything',), 'IncludeSensitive'),
+            (('--net-log-capture-mode=',), 'IncludeSensitive'),
+            (('--enable-logging=file',), 'stderr'),
+            (('--enable-logging',), 'allowed run arg'),
+            (('--vmodule=',), 'vmodule'),
+            (('--vmodule=a b',), 'vmodule'),
+            (('--vmodule=' + 'x' * 201,), '200'),
+            (('--rac-force-color-mode=blue',), 'dark'),
+            (('--force-prefers-reduced-motion=1',), 'allowed run arg'),
+            (('--rac-force-increased-contrast=1',), 'allowed run arg'),
+            # The wide-open spellings stay refused.
+            (('--log-file=/tmp/x.log',), 'allowed run arg'),
+            (('--v=2',), 'allowed run arg'),
+            (('--remote-debugging-port=9223',), 'allowed run arg'),
+            (('--remote-debugging-pipe',), 'allowed run arg'),
+        ]:
+            result = self.run_rb('run', self.wt, '--', *args, success=False)
+            self.assertEqual(result.returncode, 2, (args, result.stderr))
+            self.assertIn(why, result.stderr, args)
+        self.assertEqual(self.calls(), '')
+
+    def test_run_refuses_a_symlinked_logs_dir(self):
+        outside = self.folder / 'outside'
+        outside.mkdir()
+        (self.clone / 'build').mkdir(exist_ok=True)
+        (self.clone / 'build/logs').symlink_to(outside)
+        result = self.run_rb('run', self.wt, '--timeout', '3', '--',
+                             '--log-net-log=x.json', success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('symlink', result.stderr)
+        self.assertFalse((outside / 'x.json').exists())
+
+    def test_run_opening_a_settings_page_is_screenshot_only(self):
+        # A settings page as a run arg allows only capture verbs in the
+        # requests file: the Air refuses input before anything launches.
+        req = self.folder / 'req.txt'
+        for line in ('key tab\n', 'click 1 2\n', 'type x\n', 'nspress a\n',
+                     'after 5 key return\n'):
+            write(req, line)
+            result = self.run_rb('run', self.wt, '--requests-file', req,
+                                 '--', 'chrome://settings/assistant',
+                                 success=False)
+            self.assertEqual(result.returncode, 2, line)
+            self.assertIn('screenshots', result.stderr, line)
+        # Case, a trailing slash and rac:// don't dodge the detection.
+        write(req, 'key tab\n')
+        for url in ('CHROME://SETTINGS/assistant', 'rac://settings/privacy/'):
+            result = self.run_rb('run', self.wt, '--requests-file', req,
+                                 '--', url, success=False)
+            self.assertEqual(result.returncode, 2, url)
+            self.assertIn('screenshots', result.stderr, url)
+        # A capture-only requests file runs on a settings page.
+        write(req, 'burst shots 2 100\n')
+        self.run_rb('run', self.wt, '--requests-file', req, '--timeout', '5',
+                    '--', 'chrome://settings/assistant', success=True)
+        # And a script opening settings itself is screenshot-only too.
+        write(req, 'open-urls chrome://settings/privacy ; click 1 2\n')
+        result = self.run_rb('run', self.wt, '--requests-file', req,
+                             success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_run_opening_chrome_setup_needs_an_import_input(self):
+        # The Arc import screen would read the Pro's real Arc data, so a
+        # run may open chrome://setup (requests file or URL arg) only
+        # while also passing an import input.
+        req = self.folder / 'req.txt'
+        for line in ('open-urls chrome://setup', 'open-urls chrome://setup/a-1',
+                     'open-urls rac://setup', 'open-urls chrome://version '
+                     'chrome://setup'):
+            write(req, line + '\n')
+            result = self.run_rb('run', self.wt, '--requests-file', req,
+                                 success=False)
+            self.assertEqual(result.returncode, 2, line)
+            self.assertIn('import', result.stderr, line)
+        for arg in ('chrome://setup', 'chrome://setup/x-1', 'rac://setup',
+                    'CHROME://SETUP'):
+            result = self.run_rb('run', self.wt, '--', arg, success=False)
+            self.assertEqual(result.returncode, 2, arg)
+            self.assertIn('import', result.stderr, arg)
+        self.assertEqual(self.calls(), '')
+        # With either import input the setup page runs; other pages and
+        # other pairs need no input.
+        write(self.clone / 'devutils/fixtures/arc/StorableSidebar.json', '{}\n')
+        (self.clone / 'build/arc-root').mkdir(parents=True)
+        write(req, 'open-urls chrome://setup\n')
+        self.run_rb('run', self.wt, '--requests-file', req, '--timeout', '3',
+                    '--', '--rac-arc-import-fixture=devutils/fixtures/arc/StorableSidebar.json',
+                    success=True)
+        self.run_rb('run', self.wt, '--timeout', '3', '--', 'chrome://setup',
+                    '--rac-import-source-root=build/arc-root', success=True)
+        write(req, 'open-urls chrome://version\n')
+        self.run_rb('run', self.wt, '--requests-file', req, '--timeout', '3',
+                    success=True)
+        # The pages lines never reach the Pro's path list.
+        written = (self.clone / 'build/req/req.txt').read_text()
+        self.assertNotIn('pages', written)
+
+    def test_run_import_arc_now_needs_a_source_root(self):
+        # Without --rac-import-source-root the dev import reads the Pro's
+        # real Arc, and an Arc fixture file is not a source root.
+        write(self.clone / 'devutils/fixtures/arc/StorableSidebar.json', '{}\n')
+        (self.clone / 'build/arc-root').mkdir(parents=True)
+        for extra in ([], ['--rac-arc-import-fixture=devutils/fixtures/arc/StorableSidebar.json']):
+            result = self.run_rb('run', self.wt, '--', '--no-first-run',
+                                 '--rac-import-arc-now', *extra, success=False)
+            self.assertEqual(result.returncode, 2, extra)
+            self.assertIn('real Arc', result.stderr, extra)
+        for bad in ('--rac-import-arc-now=1', '--rac-import-arc-now=',
+                    '-rac-import-arc-now', '--RAC-IMPORT-ARC-NOW'):
+            result = self.run_rb('run', self.wt, '--',
+                                 '--rac-import-source-root=build/arc-root', bad,
+                                 success=False)
+            self.assertEqual(result.returncode, 2, bad)
+        self.assertEqual(self.calls(), '')
+        self.run_rb('run', self.wt, '--timeout', '3', '--', '--no-first-run',
+                    '--rac-import-source-root=build/arc-root',
+                    '--rac-import-arc-now', success=True)
+        self.assertIn('--rac-import-arc-now', self.calls())
+
+    def test_run_refuses_a_malformed_allowed_hosts_list(self):
+        req = self.folder / 'req.txt'
+        write(req, 'key tab\n')
+        result = self.run_rb('run', self.wt, '--requests-file', req,
+                             success=False, RAC_REMOTE_ALLOWED_HOSTS='evil.com/x')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('RAC_REMOTE_ALLOWED_HOSTS', result.stderr)
         self.assertEqual(self.calls(), '')
 
     def test_run_screenshots_and_stops_the_clone(self):
@@ -1340,6 +1681,349 @@ class RunTest(RemoteBuildTest):
         self.assertIsNone(survivor.returncode)
         self.assertIsNone(rogue.poll())
 
+    def test_run_writes_a_checked_requests_file(self):
+        # The line's paths are relative on the Air and land, absolute, in the
+        # clone's build/shots on the Pro; the browser gets the file's path.
+        req = self.folder / 'req.txt'
+        write(req, 'type quokka ; after 1500 bar/first.png ; '
+                   'burst frames 3 100\n')
+        shot = self.clone / 'build/shots/x.png'
+        self.run_rb('run', self.wt, '--timeout', '30', '--requests-file', req,
+                    '--', '--rac-window-screenshot=x.png', success=True)
+        written = (self.clone / 'build/req/req.txt').read_text()
+        shots = f'{os.path.realpath(self.clone)}/build/shots'
+        self.assertIn(f'after 1500 {shots}/bar/first.png', written)
+        self.assertIn(f'burst {shots}/frames 3 100', written)
+        self.assertIn('type quokka', written)
+        self.assertNotIn('@SHOTS@', written)
+        self.assertTrue((self.clone / 'build/shots/bar').is_dir())
+        # The harness writes a burst's frames into DIR without making it.
+        self.assertTrue((self.clone / 'build/shots/frames').is_dir())
+        self.assertIn(f'--rac-window-screenshot-requests={os.path.realpath(self.clone)}'
+                      '/build/req/req.txt', self.log.read_text())
+        self.assertTrue(shot.exists())
+
+    def test_run_refuses_a_verb_the_clone_harness_lacks(self):
+        # The Air's table can't know what this clone built: a verb absent
+        # from the clone's harness sources would run as an output path
+        # inside `after`, so the Pro refuses it before writing req.txt.
+        self.seed_harness(without=('nspress',))
+        req = self.folder / 'req.txt'
+        write(req, 'after 5 nspress t cmd ; capture-window first x.png\n')
+        result = self.run_rb('run', self.wt, '--requests-file', req, success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('nspress', result.stderr)
+        self.assertFalse((self.clone / 'build/req/req.txt').exists())
+        # With the verb in the clone's harness sources the same line runs.
+        self.seed_harness()
+        self.run_rb('run', self.wt, '--requests-file', req, success=True)
+
+    def test_run_confines_downloads_to_the_clone(self):
+        # A URL the harness opens can start a download; before the browser
+        # launches, its profile Preferences must send downloads inside the
+        # clone — never the Pro's own Downloads folder.
+        prefs = self.clone / 'build/profile/Default/Preferences'
+        write(prefs, '{"ui": {"scale": 2},'
+                    ' "download": {"other": 1, "prompt_for_download": true}}\n')
+        self.run_rb('run', self.wt, '--timeout', '3', success=True)
+        data = json.loads(prefs.read_text())
+        downloads = str(os.path.realpath(self.clone / 'build/downloads'))
+        self.assertEqual(data['download']['default_directory'], downloads)
+        self.assertEqual(data['download']['prompt_for_download'], False)
+        self.assertEqual(data['download']['directory_upgrade'], True)
+        self.assertEqual(data['savefile']['default_directory'], downloads)
+        self.assertEqual(data['selectfile']['last_directory'], downloads)
+        # No open, save or upload dialog can be walked to the Pro's files.
+        state = json.loads((self.clone / 'build/profile/Local State').read_text())
+        self.assertEqual(state['select_file_dialogs']['allowed'], False)
+        # Every unrelated preference survives.
+        self.assertEqual(data['download']['other'], 1)
+        self.assertEqual(data['ui']['scale'], 2)
+        self.assertTrue((self.clone / 'build/downloads').is_dir())
+        self.assertFalse((self.remote / 'Downloads').exists())
+
+    def test_run_patches_preferences_for_a_fresh_profile(self):
+        prefs = self.clone / 'build/profile/Default/Preferences'
+        write(prefs, '{"ui": {"scale": 2}}\n')
+        self.run_rb('run', self.wt, '--timeout', '3', '--fresh-profile',
+                    success=True)
+        data = json.loads(prefs.read_text())
+        downloads = str(os.path.realpath(self.clone / 'build/downloads'))
+        self.assertEqual(data['download']['default_directory'], downloads)
+        self.assertEqual(data['savefile']['default_directory'], downloads)
+
+    def test_run_refuses_a_symlinked_preferences(self):
+        prefs = self.clone / 'build/profile/Default/Preferences'
+        write(prefs, '{}')
+        target = self.folder / 'outside-prefs.json'
+        write(target, '{"keep": true}')
+        prefs.unlink()
+        prefs.symlink_to(target)
+        result = self.run_rb('run', self.wt, '--timeout', '3', success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('symlink', result.stderr)
+        self.assertEqual(target.read_text(), '{"keep": true}')
+        self.assertFalse((self.remote / 'Downloads').exists())
+
+    def test_run_keeps_local_state_and_refuses_a_symlinked_one(self):
+        state = self.clone / 'build/profile/Local State'
+        write(state, '{"browser": {"x": 1}, "select_file_dialogs": 5}')
+        self.run_rb('run', self.wt, '--timeout', '3', success=True)
+        data = json.loads(state.read_text())
+        self.assertEqual(data['browser'], {'x': 1})
+        self.assertEqual(data['select_file_dialogs'], {'allowed': False})
+        target = self.folder / 'outside-state.json'
+        write(target, '{"keep": true}')
+        state.unlink()
+        state.symlink_to(target)
+        result = self.run_rb('run', self.wt, '--timeout', '3', success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('symlink', result.stderr)
+        self.assertEqual(target.read_text(), '{"keep": true}')
+
+    def test_run_writes_prefs_through_no_planted_tmp_link(self):
+        target = self.folder / 'outside-tmp.json'
+        write(target, 'keep')
+        prefs = self.clone / 'build/profile/Default/Preferences'
+        write(prefs, '{}')
+        (self.clone / 'build/profile/Default/Preferences.tmp').symlink_to(target)
+        self.run_rb('run', self.wt, '--timeout', '3', success=True)
+        self.assertEqual(target.read_text(), 'keep')
+        self.assertFalse(prefs.is_symlink())
+        self.assertIn('default_directory', prefs.read_text())
+
+    def test_run_refuses_a_symlinked_downloads_dir(self):
+        outside = self.folder / 'outside-downloads'
+        outside.mkdir()
+        (self.clone / 'build').mkdir(exist_ok=True)
+        (self.clone / 'build/downloads').symlink_to(outside)
+        result = self.run_rb('run', self.wt, '--timeout', '3', success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('symlink', result.stderr)
+
+    def test_run_skips_the_prefs_patch_while_a_clone_browser_runs(self):
+        # A running browser read its profile's Preferences at startup and
+        # rewrites them on exit — patching them now would be lost anyway.
+        app = f'{self.clone}/build/src/out/Default/rac.app/'
+        rogue = subprocess.Popen(
+            ['bash', '-c', 'exec -a "$1" sleep 60', '_',
+             f'{app}Contents/MacOS/rac'])
+        self.addCleanup(lambda: (rogue.kill(), rogue.wait()))
+        time.sleep(0.3)
+        prefs = self.clone / 'build/profile/Default/Preferences'
+        write(prefs, '{"keep": true}')
+        self.run_rb('run', self.wt, '--timeout', '3', success=True)
+        self.assertEqual(prefs.read_text(), '{"keep": true}')
+        # That browser polls the same req.txt: a requests run would hand it
+        # the line under settings this run never saw, so it is refused.
+        req = self.folder / 'req.txt'
+        write(req, 'key tab\n')
+        result = self.run_rb('run', self.wt, '--requests-file', req, success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('a browser from this clone is running', result.stderr)
+        self.assertFalse((self.clone / 'build/req/req.txt').exists())
+
+    def test_run_refuses_unsafe_requests_files(self):
+        for line in ('/tmp/x.png', '../x.png', '~/x.png', 'burst /tmp 3 100',
+                     'capture-window app /tmp/a.png', 'open-urls file:///etc/hosts',
+                     'key ../x.json', 'a.png\nb.png', '@SHOTS@/x.png',
+                     'record /tmp 500', 'after 5 unknown'):
+            req = self.folder / 'bad.txt'
+            write(req, line + '\n')
+            result = self.run_rb('run', self.wt, '--requests-file', req, success=False)
+            self.assertEqual(result.returncode, 2, line)
+            self.assertIn('requests file', result.stderr, line)
+        # Refused on the Air: nothing reached the Pro.
+        self.assertNotIn('worktree.sh run', self.log.read_text() if self.log.exists() else '')
+
+    def test_run_refuses_a_symlinked_requests_dir(self):
+        outside = self.folder / 'outside'
+        outside.mkdir()
+        (self.clone / 'build').mkdir(exist_ok=True)
+        (self.clone / 'build/req').symlink_to(outside)
+        req = self.folder / 'req.txt'
+        write(req, 'x.png\n')
+        result = self.run_rb('run', self.wt, '--requests-file', req, success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse((outside / 'req.txt').exists())
+
+    def test_run_waits_for_every_requested_shot(self):
+        # The harness reads requests only after the first shot; the run
+        # must not end on that shot while the requested ones are pending.
+        req = self.folder / 'req.txt'
+        write(req, 'after 500 a.png ; burst frames 3 100 ; '
+                   'capture-window first win.png\n')
+        shots = self.clone / 'build/shots'
+        for stale in ('a.png', 'frames/f00.png', 'win.png'):
+            write(shots / stale, 'old\n')
+        started = time.monotonic()
+        result = self.run_rb('run', self.wt, '--timeout', '30', '--requests-file', req,
+                             '--', '--rac-window-screenshot=x.png', success=True,
+                             REQ_DELAY='5')
+        self.assertGreaterEqual(time.monotonic() - started, 5, result.stderr)
+        self.assertLess(time.monotonic() - started, 30, result.stderr)
+        for name in ('x.png', 'a.png', 'frames/f00.png', 'frames/f01.png',
+                     'frames/f02.png', 'win.png'):
+            self.assertEqual((shots / name).read_text(), 'png\n', name)
+
+    def test_run_names_requested_shots_missing_at_the_timeout(self):
+        req = self.folder / 'req.txt'
+        write(req, 'after 0 a.png ; burst frames 3 100\n')
+        result = self.run_rb('run', self.wt, '--timeout', '6', '--requests-file', req,
+                             '--', '--rac-window-screenshot=x.png', success=False,
+                             REQ_SKIP='f02.png')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('still no', result.stderr)
+        self.assertIn('build/shots/frames/f02.png', result.stderr)
+        self.assertNotIn('f01.png', result.stderr)
+
+    def test_run_never_globs_typed_text(self):
+        # Typed text is plain words now: a `*` never leaves the Air, and
+        # the plain words that reach the Pro can't glob either.
+        req = self.folder / 'req.txt'
+        write(req, 'type *.png * build shots\n')
+        result = self.run_rb('run', self.wt, '--requests-file', req,
+                             success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('plain words', result.stderr)
+        keep = self.clone / 'build/shots/keep.png'
+        write(keep, 'old\n')
+        write(req, 'type keep png build shots\n')
+        self.run_rb('run', self.wt, '--timeout', '3', '--requests-file', req,
+                    success=True)
+        self.assertTrue(keep.exists())
+        written = (self.clone / 'build/req/req.txt').read_text()
+        self.assertIn('type keep png build shots', written)
+
+    def test_run_writes_the_requests_file_through_no_symlink(self):
+        # A planted req.txt.tmp or req.txt symlink must not redirect the
+        # write or the rename out of the clone.
+        outside = self.folder / 'outside'
+        outside.mkdir()
+        target = outside / 'victim.txt'
+        write(target, 'keep\n')
+        reqdir = self.clone / 'build/req'
+        reqdir.mkdir(parents=True)
+        (reqdir / 'req.txt.tmp').symlink_to(target)
+        (reqdir / 'req.txt').symlink_to(outside)
+        req = self.folder / 'req.txt'
+        write(req, 'x.png\n')
+        self.run_rb('run', self.wt, '--timeout', '3', '--requests-file', req,
+                    success=True)
+        self.assertEqual(target.read_text(), 'keep\n')
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ['victim.txt'])
+        self.assertFalse((reqdir / 'req.txt').is_symlink())
+
+    def test_run_refuses_requests_for_a_clone_path_with_spaces(self):
+        # The harness splits the line on spaces, so a shots path with one
+        # would reach the browser as two words.
+        self.remote_clone('odd')
+        spaced = self.remote / 'rac-remote/wt/sp ace'
+        spaced.mkdir()
+        (self.remote / 'rac-remote/wt/odd').rename(spaced / 'odd')
+        (self.remote / 'rac-remote/wt/odd').symlink_to(spaced / 'odd')
+        wt = self.make_repo(self.folder / 'odd', branch='feat/odd')
+        req = self.folder / 'req.txt'
+        write(req, 'x.png\n')
+        result = self.run_rb('run', wt, '--timeout', '3', '--requests-file', req,
+                             success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('without spaces', result.stderr)
+        self.assertFalse((spaced / 'odd/build/req/req.txt').exists())
+
+    def test_run_maps_arc_import_inputs_into_the_clone(self):
+        write(self.clone / 'devutils/fixtures/arc/StorableSidebar.json', '{}\n')
+        (self.clone / 'build/arc-root').mkdir(parents=True)
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    '--rac-arc-import-fixture=devutils/fixtures/arc/StorableSidebar.json',
+                    '--rac-import-source-root=build/arc-root', success=True)
+        clone = os.path.realpath(self.clone)
+        calls = self.calls()
+        self.assertIn('--rac-arc-import-fixture='
+                      f'{clone}/devutils/fixtures/arc/StorableSidebar.json', calls)
+        self.assertIn(f'--rac-import-source-root={clone}/build/arc-root', calls)
+
+    def test_run_refuses_arc_import_inputs_outside_the_clone(self):
+        outside = self.folder / 'outside'
+        outside.mkdir()
+        write(outside / 'StorableSidebar.json', '{}\n')
+        (self.clone / 'escape').symlink_to(outside)
+        for args, why in [
+            (('--rac-arc-import-fixture=escape/StorableSidebar.json',), 'leaves the clone'),
+            (('--rac-import-source-root=escape',), 'leaves the clone'),
+            (('--rac-arc-import-fixture=missing.json',), 'no '),
+            (('--rac-import-source-root=build/none',), 'no '),
+            (('--rac-import-source-root=',), 'needs a path'),
+        ]:
+            result = self.run_rb('run', self.wt, '--timeout', '3', '--', *args,
+                                 success=False)
+            self.assertEqual(result.returncode, 2, (args, result.stderr))
+            self.assertIn(why, result.stderr, args)
+        self.assertNotIn('worktree.sh run', self.calls())
+        # Inputs are only read: nothing was made for the missing ones.
+        self.assertFalse((self.clone / 'build/none').exists())
+        # On the Air, absolute, ~ and .. values stay refused.
+        for value in ('/tmp/x.json', '~/x.json', '../x.json'):
+            result = self.run_rb('run', self.wt, '--',
+                                 f'--rac-arc-import-fixture={value}', success=False)
+            self.assertEqual(result.returncode, 2, value)
+
+    def test_run_fresh_profile_deletes_only_the_clones_profile(self):
+        # Data's import test: a clean profile and a source root in the clone.
+        write(self.clone / 'build/profile/Default/Preferences', '{}\n')
+        keep = self.clone / 'build/shots/keep.png'
+        write(keep, 'old\n')
+        sample = 'build/src/chrome/test/data/rac/import/arc/maintainer_sample'
+        (self.clone / sample).mkdir(parents=True)
+        result = self.run_rb('run', self.wt, '--timeout', '3', '--fresh-profile',
+                             '--', f'--rac-import-source-root={sample}', success=True)
+        # The run then points a fresh profile's downloads inside the clone
+        # and turns its file dialogs off.
+        self.assertEqual(
+            sorted(str(p.relative_to(self.clone / 'build/profile'))
+                   for p in (self.clone / 'build/profile').rglob('*')),
+            ['Default', 'Default/Preferences', 'Local State'], result.stderr)
+        self.assertTrue(keep.exists())
+        self.assertIn(f'--rac-import-source-root={os.path.realpath(self.clone)}/{sample}',
+                      self.calls())
+
+    def test_run_fresh_profile_refuses_a_symlinked_profile(self):
+        outside = self.folder / 'outside'
+        write(outside / 'Default/Preferences', 'keep\n')
+        (self.clone / 'build').mkdir(exist_ok=True)
+        (self.clone / 'build/profile').symlink_to(outside)
+        result = self.run_rb('run', self.wt, '--timeout', '3', '--fresh-profile',
+                             success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('symlink', result.stderr)
+        self.assertEqual((outside / 'Default/Preferences').read_text(), 'keep\n')
+        self.assertTrue((self.clone / 'build/profile').is_symlink())
+        self.assertNotIn('worktree.sh run', self.calls())
+
+    def test_run_fresh_profile_refuses_a_symlinked_build_dir(self):
+        outside = self.folder / 'outside'
+        write(outside / 'profile/Default/Preferences', 'keep\n')
+        shutil.rmtree(self.clone / 'build')
+        (self.clone / 'build').symlink_to(outside)
+        result = self.run_rb('run', self.wt, '--timeout', '3', '--fresh-profile',
+                             success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertTrue((outside / 'profile/Default/Preferences').exists())
+
+    def test_run_fresh_profile_refuses_while_a_clone_browser_runs(self):
+        write(self.clone / 'build/profile/Default/Preferences', '{}\n')
+        app = f'{self.clone}/build/src/out/Default/rac.app/'
+        running = subprocess.Popen(
+            ['bash', '-c', 'exec -a "$1" sleep 300', '_', f'{app}Contents/MacOS/rac'])
+        self.addCleanup(lambda: (running.kill(), running.wait()))
+        time.sleep(0.3)
+        result = self.run_rb('run', self.wt, '--timeout', '3', '--fresh-profile',
+                             success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('is running', result.stderr)
+        self.assertTrue((self.clone / 'build/profile/Default/Preferences').exists())
+        self.assertIsNone(running.poll())
+
     def test_run_ignores_a_stale_screenshot(self):
         # An earlier run's shot must not end the wait before the new one.
         write(self.clone / 'build/shots/x.png', 'old\n')
@@ -1348,20 +2032,36 @@ class RunTest(RemoteBuildTest):
         self.assertEqual((self.clone / 'build/shots/x.png').read_text(), 'png\n')
 
     def test_run_passes_odd_args_through_intact(self):
-        odd = "it's $HOME `id` *"
-        self.run_rb('run', self.wt, '--timeout', '3', '--', odd, success=True)
-        self.assertIn(f'--rac-launch-in-background {odd}', self.calls())
+        # An allowed URL holding shell metacharacters reaches the Pro's
+        # browser verbatim, through ssh and the Pro's own shell.
+        odd = "http://localhost:8000/it's$HOME`id`*;x"
+        self.run_rb('run', self.wt, '--timeout', '4', '--', odd, success=True)
+        self.assertIn(odd, self.calls())
+
+    def test_run_arg_paths_are_plain_names(self):
+        # Path values take the requests file's characters only, and a
+        # screenshot ends in .png.
+        for arg, why in [
+            ("--rac-window-screenshot=it's $HOME `id` *.png", 'may only use'),
+            ('--rac-window-screenshot=a.png --rac-window-screenshot-command=40256',
+             'may only use'),
+            ('--rac-window-screenshot=a\nb.png', 'may only use'),
+            ('--rac-window-screenshot=x.txt', 'ends in .png'),
+            ('--rac-import-source-root=build/a b', 'may only use'),
+        ]:
+            result = self.run_rb('run', self.wt, '--', arg, success=False)
+            self.assertIn(why, result.stderr, arg)
 
     def test_run_timeout_stops_the_browser(self):
         result = self.run_rb('run', self.wt, '--timeout', '4', '--',
-                             '--no-screenshot-run', success=True)
+                             '--no-first-run', success=True)
         self.assertIn('queue', self.calls())
 
     def test_run_refuses_a_symlinked_shots_dir(self):
         # build/shots -> outside the clone would write the PNG anywhere.
         outside = self.folder / 'outside'
         outside.mkdir()
-        (self.clone / 'build').mkdir()
+        (self.clone / 'build').mkdir(exist_ok=True)
         (self.clone / 'build/shots').symlink_to(outside)
         result = self.run_rb('run', self.wt, '--timeout', '5', '--',
                              '--rac-window-screenshot=x.png', success=False)
@@ -1374,6 +2074,7 @@ class RunTest(RemoteBuildTest):
         # makes build/shots outside the clone first.
         outside = self.folder / 'outside'
         outside.mkdir()
+        shutil.rmtree(self.clone / 'build')
         (self.clone / 'build').symlink_to(outside)
         result = self.run_rb('run', self.wt, '--timeout', '5', '--',
                              '--rac-window-screenshot=x.png', success=False)
@@ -1397,7 +2098,7 @@ class RunTest(RemoteBuildTest):
         # browser still gets its full timeout afterwards.
         started = time.monotonic()
         self.run_rb('run', self.wt, '--timeout', '4', '--',
-                    '--no-screenshot-run', success=True, QUEUE_DELAY='5')
+                    '--no-first-run', success=True, QUEUE_DELAY='5')
         self.assertGreaterEqual(time.monotonic() - started, 8)
 
     def test_run_refuses_on_toolchain_drift(self):
@@ -1418,13 +2119,13 @@ class RunTest(RemoteBuildTest):
         app = f'{self.clone}/build/src/out/Default/rac.app/'
         env = self.env()
         a = subprocess.Popen(['/bin/bash', SCRIPT, 'run', str(self.wt),
-                              '--timeout', '8', '--', '--no-screenshot-run'],
+                              '--timeout', '8', '--', '--no-first-run'],
                              env=env, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True)
         try:
             a_pids = self.wait_for(lambda: self.procs_starting(app))
             b = subprocess.Popen(['/bin/bash', SCRIPT, 'run', str(self.wt),
-                                  '--timeout', '120', '--', '--no-screenshot-run'],
+                                  '--timeout', '120', '--', '--no-first-run'],
                                  env=env, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True,
                                  start_new_session=True)
@@ -1498,7 +2199,7 @@ class PullTest(RemoteBuildTest):
         outside = self.folder / 'outside'
         write(outside / 'real.png', 'png\n')
         build = self.remote_root / 'wt/feature/build'
-        build.mkdir(parents=True)
+        build.mkdir(parents=True, exist_ok=True)
         (build / 'shots').symlink_to(outside)
         dest = self.folder / 'real.png'
         result = self.run_rb('pull', self.wt, 'build/shots/real.png', dest,
@@ -1533,6 +2234,8 @@ class RemotePathTest(RemoteBuildTest):
         clone = self.remote_root / 'wt/feature'
         write(clone / 'build/src/third_party/depot_tools/autoninja.py',
               STUB_AUTONINJA)
+        tool(clone / 'build/src/out/Default/rac.app/Contents/MacOS/rac',
+             STUB_APP)
         for args in (['build', self.wt], ['run', self.wt, '--timeout', '3']):
             self.log.unlink(missing_ok=True)
             self.run_rb(*[str(a) for a in args], success=True)
@@ -1635,7 +2338,6 @@ class DryRunTest(RemoteBuildTest):
         result = self.run_rb('--dry-run', 'push', wt, success=True)
         self.assertIn('push --force', result.stderr)
         self.assertFalse((self.remote_root / 'wt/sync-wt').exists())
-
 
 if __name__ == '__main__':
     unittest.main()

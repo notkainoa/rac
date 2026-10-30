@@ -154,6 +154,48 @@ invalidates every tree built there (new compiler flags and SDK path), so
 keep Xcode pinned on build machines; `build`, `run` and `push` refuse when
 the Pro's Xcode differs from the one its base recorded.
 
+### What a remote run may do
+
+A remote run launches the clone's built binary directly — never
+`worktree.sh run`, whose `--enable-ui-devtools` would open a full
+UI-control WebSocket — with `--user-data-dir` at the clone's throwaway
+`build/profile`, `--use-mock-keychain`,
+`--disable-features=DialMediaRouteProvider`, and
+`--rac-launch-in-background`. After `--`, args are a fixed allowlist:
+
+- `--no-first-run`, `--rac-launch-in-background`,
+  `--force-prefers-reduced-motion`, `--rac-force-increased-contrast`,
+  `--disable-backgrounding-occluded-windows`.
+- `--rac-import-arc-now` (only with `--rac-import-source-root=`),
+  `--rac-arc-import-fixture=<path>` and `--rac-import-source-root=<path>`,
+  Arc import inputs that must exist inside the clone.
+- `--rac-window-screenshot=<name>.png` and
+  `--rac-window-screenshot-delay=<1-4 digits>`; the shot lands in
+  `build/shots/`.
+- `--log-net-log=<name>.json` and `--rac-frame-log=<name>.log`; the logs
+  land in `build/logs/`, never in `build/profile`.
+- `--net-log-capture-mode=Default|IncludeSensitive|Everything`,
+  `--enable-logging=stderr`, `--vmodule=<spec>`,
+  `--rac-force-color-mode=light|dark|system`.
+- A bare arg is a URL and gets the same allowlist `open-urls` gets:
+  loopback and test hosts, the named internal pages, `about:blank`.
+
+The requests file a run feeds the screenshot harness is one checked
+line. Pages and command ids are allowlists, and a run that opens
+`chrome://setup` needs an import input in the same run. Typed text is
+plain words only (ASCII letters, digits, spaces, `-`, `_`), and a script
+that types may not also move the caret or click — at most one
+`key return`, after the last `type`. A run that opens a settings page
+(the only allowed ones are `settings/assistant`, `settings/appearance`,
+and `settings/privacy`) may take screenshots only, so its requests file
+may not send input.
+
+Known limits: import-input paths are checked with `inside_clone`
+before launch, but a path swapped for a symlink between the check and the
+browser reading it isn't caught — accepted, since our own agents write
+the scripts. A `sandbox-exec` profile for remote runs is the planned
+longer-term fix.
+
 ## Updating the base
 
 After merging features into `main`, update the main checkout so new
