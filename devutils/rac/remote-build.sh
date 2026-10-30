@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Runs rac's heavy work — Chromium compiles and browser launches for
-# screenshots — on the maintainer's MacBook Pro over ssh, so the shared
-# Air stays responsive. Threads, git, and reviews stay on the Air.
+# Runs rac's heavy work — Chromium compiles, browser launches for
+# screenshots, and agent-safety evals — on the maintainer's MacBook Pro
+# over ssh, so the shared Air stays responsive. Threads, git, and reviews
+# stay on the Air.
 #
 # usage: devutils/rac/remote-build.sh [--dry-run] <command> [args...]
 #   setup-host                        check the Pro and create ~/rac-remote
@@ -59,6 +60,27 @@
 #                                     only, and a script that types may not
 #                                     move the caret or click (at most one
 #                                     `key return`, after the last type).
+#   evals <worktree> [--ref BRANCH] [--timeout S] [-- args...]
+#                                     fetch the agent-safety eval runner
+#                                     from the rac repo's BRANCH (default
+#                                     feat/agent-evals) into
+#                                     ~/rac-remote/evals/<clone> and run it
+#                                     on the Pro against the clone's built
+#                                     browser, holding one run slot for the
+#                                     whole eval (default 3600s, at most
+#                                     14400). This is the only verb that may
+#                                     hand the browser a remote-debugging
+#                                     port: the runner is reviewed code
+#                                     fetched from a branch, not an
+#                                     agent-written script, and it launches
+#                                     the browser directly itself. Results
+#                                     land in the clone's
+#                                     build/evals/results; pull fetches
+#                                     them. After --, args are an
+#                                     allowlist: --gate, --keep-profile,
+#                                     --list, --variants=<ids>, and
+#                                     --host-mode=names|loopback (each also
+#                                     as two words).
 #   pull <worktree> <remote path> <local path>
 #                                     rsync a file inside the clone back
 #   verify-series [--keep] <branch>   fetch <branch> from GitHub on the Pro
@@ -77,8 +99,9 @@
 # the bare repos rac.git and helium-chromium.git, a base/ checkout that
 # build-base fetched from GitHub and cold-built natively (the Air→Pro link
 # is far too slow to copy a built tree), one clone per feature worktree in
-# wt/<name>, the build queue's state in build-queue/, and the bootstrap and
-# cold-build logs in logs/. The Pro is the maintainer's own Mac: no command
+# wt/<name>, the build queue's state in build-queue/, the eval runner
+# extracted into evals/<clone>, and the bootstrap and cold-build logs in
+# logs/. The Pro is the maintainer's own Mac: no command
 # here deletes anything outside ~/rac-remote, starts a build outside the
 # queue, or launches a browser other than a clone's own, in the background.
 set -euo pipefail
@@ -292,6 +315,31 @@ tree_procs() {
   real=$(cd "$1" 2>/dev/null && pwd -P) || real=$1
   ps -axo pid=,command= | P="$1/" P2="$real/" SELF="$$" \
     awk '(index($0, ENVIRON["P"]) || index($0, ENVIRON["P2"])) && $1 != ENVIRON["SELF"] { print $1 }'
+}
+
+# Prints the pids of every process running from the clone's app at $app,
+# never anything else.
+clone_pids() {
+  ps -axo pid=,command= | P="$app" awk '{ pid = $1; sub(/^ *[0-9]+ +/, ""); if (index($0, ENVIRON["P"]) == 1) print pid }'
+}
+
+# Prints $launcher plus every descendant: the queue starts its command in
+# a new session, so only a parent-pid walk finds the whole tree.
+family_pids() {
+  ps -axo pid=,ppid= | ROOT="$launcher" awk '
+    { kids[$2] = kids[$2] " " $1 }
+    END {
+      root = ENVIRON["ROOT"]; seen[root] = 1; out = root
+      n = split(kids[root], q, " ")
+      for (i = 1; i <= n; i++) {
+        p = q[i]
+        if (p == "" || (p in seen)) continue
+        seen[p] = 1; out = out " " p
+        m = split(kids[p], k, " ")
+        for (j = 1; j <= m; j++) q[++n] = k[j]
+      }
+      printf "%s", out
+    }'
 }
 
 # A base whose bootstrap finished: patches merged and applied through quilt,
@@ -1318,11 +1366,8 @@ if [ "${#logfiles[@]}" -gt 0 ]; then
     rm -f "$log"
   done
 fi
-# Every process running from the clone's app, never anything else.
+# $app names the clone's app for clone_pids, from REMOTE_LIB.
 app="$clone/build/src/out/Default/rac.app/"
-clone_pids() {
-  ps -axo pid=,command= | P="$app" awk '{ pid = $1; sub(/^ *[0-9]+ +/, ""); if (index($0, ENVIRON["P"]) == 1) print pid }'
-}
 if [ -n "$requests" ]; then
   # A browser already running from this clone polls the same req.txt and
   # would take this line, under whatever profile settings it started with.
@@ -1399,24 +1444,6 @@ if [ -n "$requests" ]; then
   args+=("--rac-window-screenshot-requests=$req")
   [ -z "$shot" ] || expected+=("$shot")
 fi
-# $launcher plus every descendant: the queue starts the browser in a new
-# session, so only a parent-pid walk finds its whole tree.
-family_pids() {
-  ps -axo pid=,ppid= | ROOT="$launcher" awk '
-    { kids[$2] = kids[$2] " " $1 }
-    END {
-      root = ENVIRON["ROOT"]; seen[root] = 1; out = root
-      n = split(kids[root], q, " ")
-      for (i = 1; i <= n; i++) {
-        p = q[i]
-        if (p == "" || (p in seen)) continue
-        seen[p] = 1; out = out " " p
-        m = split(kids[p], k, " ")
-        for (j = 1; j <= m; j++) q[++n] = k[j]
-      }
-      printf "%s", out
-    }'
-}
 # Clone-app pids this launch started; a browser from another run of the
 # same clone isn't in this family and is left alone.
 our_pids() {
@@ -1631,6 +1658,263 @@ if [ -n "$shot" ]; then
     echo "rac remote: no screenshot at $shot after ${timeout}s" >&2
     exit 1
   fi
+fi
+exit "$status"
+EOS
+}
+
+# The eval runner's args after `--` are a fixed allowlist, like run's:
+# the runner is reviewed code fetched from a branch, but its switches
+# could still aim it at other paths or change what it does with the
+# browser, so only the spellings below pass.
+cmd_evals() {
+  local name=$1 wt=$2 ref=feat/agent-evals timeout=3600
+  shift 2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ref)
+        [ $# -ge 2 ] || die "evals: --ref needs a branch name"
+        ref=$2
+        shift 2 ;;
+      --timeout)
+        [ $# -ge 2 ] || die "evals: --timeout needs seconds"
+        case "$2" in '' | *[!0-9]*) die "evals: --timeout needs seconds" ;; esac
+        timeout=$2
+        shift 2 ;;
+      --) shift; break ;;
+      *) die "usage: remote-build.sh evals <worktree> [--ref BRANCH] [--timeout S] [-- args...]" ;;
+    esac
+  done
+  case "$ref" in
+    '' | -* | /* | */ | *..* | *[!A-Za-z0-9._/-]*)
+      die "evals: --ref takes a branch name, not '$ref'" ;;
+  esac
+  # 1 to 14400 written plainly: 0 would kill the eval at once, and the
+  # Pro's arithmetic reads a leading 0 as octal.
+  case "$timeout" in
+    0* | ??????*) refuse "evals: --timeout takes 1 to 14400 seconds, not '$timeout'" ;;
+  esac
+  [ "$timeout" -le 14400 ] || refuse "evals: --timeout takes 1 to 14400 seconds, not '$timeout'"
+  local -a args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --gate | --keep-profile | --list)
+        args+=("$1"); shift ;;
+      --variants=*)
+        case "${1#*=}" in '' | -* | *[!A-Za-z0-9_,-]*)
+          refuse "evals: --variants takes ids of letters, digits and _,- not '${1#*=}'" ;;
+        esac
+        args+=("$1"); shift ;;
+      --variants)
+        [ $# -ge 2 ] || die "evals: --variants needs an id list"
+        # An id list starting with - would read as the runner's next switch.
+        case "$2" in '' | -* | *[!A-Za-z0-9_,-]*)
+          refuse "evals: --variants takes ids of letters, digits and _,- not '$2'" ;;
+        esac
+        args+=("$1" "$2"); shift 2 ;;
+      --host-mode=names | --host-mode=loopback)
+        args+=("$1"); shift ;;
+      --host-mode)
+        [ $# -ge 2 ] || die "evals: --host-mode needs names or loopback"
+        case "$2" in
+          names | loopback) args+=("$1" "$2"); shift 2 ;;
+          *) refuse "evals: --host-mode takes names or loopback, not '$2'" ;;
+        esac ;;
+      --host-mode=*)
+        refuse "evals: --host-mode takes names or loopback, not '${1#*=}'" ;;
+      *)
+        refuse "'$1' is not an allowed evals arg; ask Ship to allow it" ;;
+    esac
+  done
+  remote "$name" "$ref" "$timeout" "$repo_url" "$wt" ${args[@]+"${args[@]}"} <<'EOS'
+set -e
+safe_name "$1" || { echo "rac remote: bad clone name '$1'" >&2; exit 2; }
+name=$1
+clone="$HOME/rac-remote/wt/$name"
+ref=$2
+timeout=$3
+repo_url=$4
+wt=$5
+shift 5
+# The branch name is checked again here: the remote side is the trust
+# boundary, and it lands in a fetch refspec.
+case "$ref" in
+  '' | -* | /* | */ | *..* | *[!A-Za-z0-9._/-]*)
+    echo "rac remote: refusing: bad evals branch '$ref'" >&2
+    exit 2 ;;
+esac
+# And the timeout, which lands in $(( )): arithmetic on a non-number can
+# run commands.
+case "$timeout" in
+  '' | 0* | ??????* | *[!0-9]*)
+    echo "rac remote: refusing: bad evals timeout '$timeout'" >&2
+    exit 2 ;;
+esac
+[ "$timeout" -le 14400 ] || {
+  echo "rac remote: refusing: bad evals timeout '$timeout'" >&2
+  exit 2
+}
+[ -d "$clone" ] || {
+  echo "rac remote: no clone at $clone; run push first" >&2
+  exit 1
+}
+clone=$(cd "$clone" && pwd -P)
+cd "$clone"
+# The eval drives the clone's own built browser over DevTools. It has to
+# exist, and to be idle: a browser already running from this clone would
+# fight the runner's launches, so refuse before touching anything.
+app="$clone/build/src/out/Default/rac.app/"
+app_bin="${app}Contents/MacOS/rac"
+[ -x "$app_bin" ] || {
+  echo "rac remote: refusing: no built browser at $app_bin; run build first" >&2
+  exit 2
+}
+[ -z "$(clone_pids)" ] || {
+  echo "rac remote: refusing: a browser from this clone is running" >&2
+  exit 2
+}
+if busy=$(queue_busy "$clone"); then
+  echo "rac remote: refusing: the Pro's queue already holds or queues work" >&2
+  echo "  for $clone ($busy); let it finish first" >&2
+  exit 2
+fi
+# The runner is reviewed code: fetch the branch into the same bare
+# rac.git push fills, then archive out only its devutils/rac/evals tree
+# into a fresh runner dir -- never a checkout of the whole branch. Each
+# clone gets its own: two clones' evals may run at once, and one's fresh
+# extraction or cleanup must not reach the other's.
+[ -d "$HOME/rac-remote/rac.git" ] || git init --bare -q "$HOME/rac-remote/rac.git"
+git -C "$HOME/rac-remote/rac.git" fetch -q --no-recurse-submodules \
+  "$repo_url" "+refs/heads/$ref:refs/remotes/origin/$ref" || {
+  echo "rac remote: couldn't fetch $ref from $repo_url" >&2
+  exit 1
+}
+commit=$(git -C "$HOME/rac-remote/rac.git" rev-parse "refs/remotes/origin/$ref")
+echo "rac remote: evals runner at $commit ($ref)" >&2
+runner_root="$HOME/rac-remote/evals"
+runner="$runner_root/$name"
+for dir in "$runner_root" "$runner"; do
+  [ ! -L "$dir" ] || {
+    echo "rac remote: refusing: $dir is a symlink" >&2
+    exit 2
+  }
+done
+rm -rf -- "$runner"
+mkdir -p "$runner"
+if ! git -C "$HOME/rac-remote/rac.git" archive \
+     "refs/remotes/origin/$ref" devutils/rac/evals | tar -x -C "$runner"; then
+  echo "rac remote: $ref has no devutils/rac/evals to run" >&2
+  exit 1
+fi
+[ -f "$runner/devutils/rac/evals/run.py" ] || {
+  echo "rac remote: $ref has no devutils/rac/evals/run.py" >&2
+  exit 1
+}
+# Results and the runner's TMPDIR live in the clone's build/evals, under
+# the same symlink checks screenshots get.
+evals_dir="$clone/build/evals"
+results="$evals_dir/results"
+tmp="$evals_dir/tmp"
+for dir in "$clone/build" "$evals_dir" "$results" "$tmp"; do
+  [ ! -L "$dir" ] || {
+    echo "rac remote: refusing: $dir is a symlink" >&2
+    exit 2
+  }
+  inside_clone "$clone" "$dir" || {
+    echo "rac remote: refusing: $dir leaves the clone through a symlink" >&2
+    exit 2
+  }
+done
+mkdir -p "$results" "$tmp"
+for dir in "$evals_dir" "$results" "$tmp"; do
+  inside_clone "$clone" "$dir" || {
+    echo "rac remote: refusing: $dir leaves the clone through a symlink" >&2
+    exit 2
+  }
+done
+# An old eval's JSON isn't this one's: only those, never the folder.
+rm -f "$results"/*.json
+# The runner's tree (the snapshot the wait loop keeps in $spawned, since
+# orphans leave the family once the launcher is gone), every browser from
+# the clone, and anything still running out of this clone's runner dir
+# (the runner names its run.py by absolute path for that). The queue
+# starts its command in a new session, so members may lead their own
+# groups and each one gets its group signaled too.
+stop_evals() {
+  local i p left
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    left=
+    for p in $spawned $(clone_pids) $(tree_procs "$runner"); do
+      kill -0 "$p" 2>/dev/null || continue
+      left="$left $p"
+    done
+    [ -n "$left" ] || return 0
+    kill $left 2>/dev/null || true
+    for p in $left; do kill -- "-$p" 2>/dev/null || true; done
+    sleep 1
+  done
+  for p in $left; do
+    kill -9 "$p" 2>/dev/null || true
+    kill -9 -- "-$p" 2>/dev/null || true
+  done
+}
+launcher=
+spawned=
+cleanup() {
+  if [ -n "$launcher" ]; then
+    kill "$launcher" 2>/dev/null || true
+    kill -- "-$launcher" 2>/dev/null || true
+    wait "$launcher" 2>/dev/null || true
+    launcher=
+  fi
+  stop_evals
+}
+trap 'cleanup; exit 130' INT TERM HUP
+# The queue runs from the clone so its run slot records the right
+# worktree; the command it holds then cd's to the runner dir, so nothing
+# runs from the clone. RAC_EVALS_NO_QUEUE keeps the runner's own browser
+# launches bare, off the slot this command already holds. python3 -I
+# ignores PYTHON* variables, user site-packages, and the cwd -- and the
+# script's own folder too, so run.py's `import cdp` and friends would
+# fail; the -c shim puts back exactly that one folder, the extracted
+# runner's, and runs run.py as __main__. One line, so ps shows the
+# process on one line and tree_procs finds it by run.py's path.
+run_main='import os, runpy, sys; sys.argv = sys.argv[1:]; sys.path.insert(0, os.path.dirname(sys.argv[0])); runpy.run_path(sys.argv[0], run_name="__main__")'
+python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+  env RAC_EVALS_NO_QUEUE=1 "TMPDIR=$tmp" \
+  nice -n 10 taskpolicy -c utility devutils/rac/build-queue.sh --run \
+  bash -c 'cd "$1" && shift && exec "$@"' rac-evals "$runner" \
+  python3 -I -c "$run_main" "$runner/devutils/rac/evals/run.py" \
+  --worktree "$clone" --results-dir "$results" "$@" &
+launcher=$!
+spawned=$launcher
+# The timeout covers the whole eval, queue wait included.
+deadline=$((SECONDS + timeout))
+timed_out=0
+while kill -0 "$launcher" 2>/dev/null; do
+  fam=$(family_pids)
+  [ -n "$fam" ] && spawned=$fam
+  if [ "$SECONDS" -ge "$deadline" ]; then
+    timed_out=1
+    break
+  fi
+  sleep 1
+done
+if kill -0 "$launcher" 2>/dev/null; then
+  kill "$launcher" 2>/dev/null || true
+  kill -- "-$launcher" 2>/dev/null || true
+fi
+status=0
+wait "$launcher" || status=$?
+launcher=
+stop_evals
+echo "rac remote: results in $results on the Pro" >&2
+echo "  fetch them with:" >&2
+echo "    devutils/rac/remote-build.sh pull $wt build/evals/results <local dir>" >&2
+if [ "$timed_out" = 1 ]; then
+  echo "rac remote: the eval hit its ${timeout}s timeout; killed the" >&2
+  echo "  runner and every browser from the clone" >&2
+  exit 124
 fi
 exit "$status"
 EOS
@@ -1952,6 +2236,12 @@ case "${1:-}" in
     name=$(clone_name "$2")
     shift 2
     cmd_run "$name" "$@" ;;
+  evals)
+    [ $# -ge 2 ] || die "usage: remote-build.sh evals <worktree> [--ref BRANCH] [--timeout S] [-- args...]"
+    name=$(clone_name "$2")
+    wt=$2
+    shift 2
+    cmd_evals "$name" "$wt" "$@" ;;
   pull)
     [ $# = 4 ] || die "usage: remote-build.sh pull <worktree> <remote path> <local path>"
     name=$(clone_name "$2")
@@ -1995,5 +2285,5 @@ case "${1:-}" in
         refuse "verify-series takes a branch name of letters, digits, '.', '_', '-' and '/', not '$branch'" ;;
     esac
     cmd_verify_series "$branch" "$keep" ;;
-  *) die "usage: remote-build.sh [--dry-run] <setup-host|build-base|push|build|run|pull|log|status|verify-series>" ;;
+  *) die "usage: remote-build.sh [--dry-run] <setup-host|build-base|push|build|run|evals|pull|log|status|verify-series>" ;;
 esac
