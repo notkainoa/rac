@@ -1,0 +1,1308 @@
+Index: src/chrome/browser/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/BUILD.gn
++++ src/chrome/browser/BUILD.gn
+@@ -2125,6 +2125,7 @@ source_set("browser") {
+     "//chrome/browser/rac/ai:browser",
+     "//chrome/browser/ui/rac/onboarding:prefs",
+     "//chrome/browser/rac/agent:agent",
++    "//chrome/browser/rac/power",
+     "//chrome/browser/rac/agent:controller",
+     "//chrome/browser/autocomplete",
+     "//chrome/browser/autocomplete:impl",
+Index: src/chrome/browser/rac/power/BUILD.gn
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/power/BUILD.gn
+@@ -0,0 +1,38 @@
++# Copyright 2026 The rac Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import("//testing/test.gni")
++
++# Pure logic for the power features: copying a clean link, writing a Markdown
++# link, and naming a tab group. Code taken from other projects sits in
++# third_party/, each with its README.chromium and LICENSE, so about:credits
++# lists it.
++source_set("power") {
++  sources = [
++    "markdown_link.cc",
++    "markdown_link.h",
++  ]
++  public_deps = [
++    "//base",
++    "//url",
++    "third_party/stedding",
++  ]
++  deps = [ "//components/url_formatter" ]
++}
++
++# Build with `autoninja -C out/Default
++# chrome/browser/rac/power:rac_power_unittests`. It's separate from Chromium's
++# unit_tests, which takes hours to build.
++test("rac_power_unittests") {
++  sources = [ "markdown_link_unittest.cc" ]
++  deps = [
++    ":power",
++    "third_party/stedding:unit_tests",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//testing/gtest",
++    "//url",
++  ]
++}
+Index: src/chrome/browser/rac/power/markdown_link.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/power/markdown_link.cc
+@@ -0,0 +1,156 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/power/markdown_link.h"
++
++#include <string>
++#include <string_view>
++
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/rac/power/third_party/stedding/clean_link.h"
++#include "components/url_formatter/url_formatter.h"
++
++namespace rac {
++
++namespace {
++
++// True when every `)` closes an earlier `(` and every `(` is closed.
++bool ParenthesesAreBalanced(std::string_view text) {
++  int depth = 0;
++  for (char c : text) {
++    if (c == '(') {
++      ++depth;
++    } else if (c == ')' && --depth < 0) {
++      return false;
++    }
++  }
++  return depth == 0;
++}
++
++// True when `text` opens with an entity reference, which CommonMark decodes
++// in link text and in a link destination: `&name;`, `&#123;`, or `&#x7B;`.
++// Only the shape counts, not whether the name is a real entity.
++bool StartsEntityLikeRun(std::u16string_view text) {
++  if (text.size() < 3 || text[0] != u'&') {
++    return false;
++  }
++  if (text[1] == u'#') {
++    size_t i = 2;
++    const bool hex = i < text.size() && (text[i] == u'x' || text[i] == u'X');
++    if (hex) {
++      ++i;
++    }
++    const size_t first_digit = i;
++    while (i < text.size() &&
++           (hex ? base::IsHexDigit(text[i]) : base::IsAsciiDigit(text[i]))) {
++      ++i;
++    }
++    return i > first_digit && i < text.size() && text[i] == u';';
++  }
++  if (!base::IsAsciiAlpha(text[1])) {
++    return false;
++  }
++  size_t i = 2;
++  while (i < text.size() && base::IsAsciiAlphaNumeric(text[i])) {
++    ++i;
++  }
++  return i < text.size() && text[i] == u';';
++}
++
++std::u16string EscapeLabel(std::u16string_view label) {
++  std::u16string escaped;
++  escaped.reserve(label.size());
++  for (size_t i = 0; i < label.size(); ++i) {
++    const char16_t c = label[i];
++    // A backtick could open a code span, which outranks the link, and a `<`
++    // an autolink or inline HTML. An `&` that starts an entity-like run
++    // would be decoded in the link text.
++    if (c == u'\\' || c == u'[' || c == u']' || c == u'`' || c == u'<' ||
++        (c == u'&' && StartsEntityLikeRun(label.substr(i)))) {
++      escaped.push_back(u'\\');
++    }
++    escaped.push_back(c);
++  }
++  return escaped;
++}
++
++std::u16string EscapeDestination(std::string_view spec) {
++  const bool escape_parentheses = !ParenthesesAreBalanced(spec);
++  const std::u16string wide = base::UTF8ToUTF16(spec);
++  std::u16string escaped;
++  escaped.reserve(wide.size());
++  for (size_t i = 0; i < wide.size(); ++i) {
++    const char16_t c = wide[i];
++    // GURL leaves a backslash, a backtick, or an `&` in a query as it was.
++    // Markdown would read the first as an escape, the second as a code
++    // span, and the third as an entity when it starts an entity-like run.
++    if (c == u'`') {
++      escaped += u"%60";
++      continue;
++    }
++    // A data: or javascript: address keeps its spaces, and a space would end
++    // the destination. %20 means the same address.
++    if (c == u' ') {
++      escaped += u"%20";
++      continue;
++    }
++    // Those addresses keep `<` and `>` raw where a web address would carry
++    // them percent-encoded, and a raw one could read as an autolink or
++    // inline HTML. %3C and %3E mean the same address.
++    if (c == u'<') {
++      escaped += u"%3C";
++      continue;
++    }
++    if (c == u'>') {
++      escaped += u"%3E";
++      continue;
++    }
++    if (c == u'\\' || (escape_parentheses && (c == u'(' || c == u')')) ||
++        (c == u'&' &&
++         StartsEntityLikeRun(std::u16string_view(wide).substr(i)))) {
++      escaped.push_back(u'\\');
++    }
++    escaped.push_back(c);
++  }
++  return escaped;
++}
++
++}  // namespace
++
++std::u16string MarkdownLink(std::u16string_view title, const GURL& url) {
++  const GURL clean = CleanLink(url);
++  // GURL::spec() DCHECKs on an invalid URL.
++  const std::string_view spec =
++      clean.is_valid() ? std::string_view(clean.spec()) : std::string_view();
++
++  // A title that is just the address would put back what CleanLink() took
++  // out, so it counts as no title.
++  std::u16string label(title);
++  if (label == base::UTF8ToUTF16(url.possibly_invalid_spec())) {
++    label.clear();
++  }
++  base::ReplaceChars(label, u"\r\n", u" ", &label);
++  std::u16string_view trimmed = base::TrimWhitespace(label, base::TRIM_ALL);
++  std::u16string fallback;
++  if (trimmed.empty()) {
++    // The host as a reader knows it: Unicode for an IDN that passes
++    // Chromium's spoof checks.
++    fallback = clean.is_valid() ? url_formatter::IDNToUnicode(clean.host())
++                                : std::u16string();
++    if (fallback.empty()) {
++      fallback = base::UTF8ToUTF16(spec);
++    }
++    trimmed = fallback;
++  }
++
++  std::u16string link = u"[";
++  link += EscapeLabel(trimmed);
++  link += u"](";
++  link += EscapeDestination(spec);
++  link += u")";
++  return link;
++}
++
++}  // namespace rac
+Index: src/chrome/browser/rac/power/markdown_link.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/power/markdown_link.h
+@@ -0,0 +1,40 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_POWER_MARKDOWN_LINK_H_
++#define CHROME_BROWSER_RAC_POWER_MARKDOWN_LINK_H_
++
++#include <string>
++#include <string_view>
++
++#include "url/gurl.h"
++
++namespace rac {
++
++// Returns `[label](destination)` for a page. Callers pass the page's own
++// title, or "" when it has none, never WebContents::GetTitle()'s fallback to
++// the address, which would carry the tracking parameters CleanLink() removes.
++// A title equal to `url`'s spec counts as none.
++//
++// The destination is CleanLink(`url`).spec(). The label is `title` with each
++// CR and LF turned into a space and the ends trimmed; when that leaves
++// nothing it falls back to the host and then to the spec. A backslash, `[`,
++// `]`, a backtick, a `<`, and an `&` that starts an entity-like run
++// (`&amp;`, `&#38;`, `&#x26;`) in the label are backslash-escaped, so the
++// label can't end the link early, open a code span, start an autolink or
++// inline HTML, or be decoded as an entity.
++//
++// In the destination, a backslash is backslash-escaped, a backtick becomes
++// `%60`, a space (kept by data: and javascript: addresses) becomes `%20`,
++// a `<` and a `>` (kept raw by those addresses too) become `%3C` and `%3E`,
++// and an `&` that starts an entity-like run (`&amp;`, `&#38;`,
++// `&#x26;`) is backslash-escaped because CommonMark decodes those. `(` and
++// `)` are backslash-escaped only when they are unbalanced, so an address
++// such as `https://en.wikipedia.org/wiki/Foo_(bar)` stays readable. An
++// invalid `url` has an empty destination: `[label]()`.
++std::u16string MarkdownLink(std::u16string_view title, const GURL& url);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_POWER_MARKDOWN_LINK_H_
+Index: src/chrome/browser/rac/power/markdown_link_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/power/markdown_link_unittest.cc
+@@ -0,0 +1,300 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/power/markdown_link.h"
++
++#include <string_view>
++
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace rac {
++namespace {
++
++// Asserts `link` is one link: a single unescaped `](` between the label
++// and the destination, and a closing `)` at the end.
++void ExpectLinkShape(std::u16string_view link) {
++  EXPECT_TRUE(link.ends_with(u")"));
++  size_t joins = 0;
++  for (size_t i = 0; i + 1 < link.size(); ++i) {
++    if (link[i] != u']' || link[i + 1] != u'(') {
++      continue;
++    }
++    // An odd run of backslashes escapes the `]`.
++    size_t slashes = 0;
++    for (size_t j = i; j > 0 && link[j - 1] == u'\\'; --j) {
++      ++slashes;
++    }
++    if (slashes % 2 == 0) {
++      ++joins;
++    }
++  }
++  EXPECT_EQ(1u, joins);
++}
++
++TEST(MarkdownLinkTest, TitleAndAddress) {
++  EXPECT_EQ(u"[Example Domain](https://example.com/)",
++            MarkdownLink(u"Example Domain", GURL("https://example.com")));
++  EXPECT_EQ(u"[A page](https://example.com/a/b?c=d#e)",
++            MarkdownLink(u"A page", GURL("https://example.com/a/b?c=d#e")));
++}
++
++TEST(MarkdownLinkTest, TheAddressIsCleaned) {
++  EXPECT_EQ(u"[T](https://x.com/a?id=3#c)",
++            MarkdownLink(u"T", GURL("https://x.com/a?utm_source=y&id=3#c")));
++  EXPECT_EQ(u"[T](https://x.com/a)",
++            MarkdownLink(u"T", GURL("https://x.com/a?fbclid=1")));
++}
++
++TEST(MarkdownLinkTest, TheLabelEscapesBracketsAndBackslashes) {
++  const GURL url("https://example.com/");
++  EXPECT_EQ(u"[a \\[b\\] c](https://example.com/)",
++            MarkdownLink(u"a [b] c", url));
++  EXPECT_EQ(u"[a\\\\b](https://example.com/)", MarkdownLink(u"a\\b", url));
++  EXPECT_EQ(u"[\\[\\[x\\]\\]](https://example.com/)",
++            MarkdownLink(u"[[x]]", url));
++  // Parentheses, and other Markdown characters, are left as they are.
++  EXPECT_EQ(u"[f(x) *y* _z_](https://example.com/)",
++            MarkdownLink(u"f(x) *y* _z_", url));
++}
++
++TEST(MarkdownLinkTest, LineBreaksInTheTitleBecomeSpaces) {
++  const GURL url("https://example.com/");
++  EXPECT_EQ(u"[a b](https://example.com/)", MarkdownLink(u"a\nb", url));
++  EXPECT_EQ(u"[a b](https://example.com/)", MarkdownLink(u"a\rb", url));
++  EXPECT_EQ(u"[a  b](https://example.com/)", MarkdownLink(u"a\r\nb", url));
++  // The ends are trimmed, including a break at either end.
++  EXPECT_EQ(u"[a](https://example.com/)", MarkdownLink(u"\n  a \r\n", url));
++}
++
++TEST(MarkdownLinkTest, ATitleWithNothingInItGivesTheHost) {
++  EXPECT_EQ(u"[example.com](https://example.com/p)",
++            MarkdownLink(u"", GURL("https://example.com/p")));
++  EXPECT_EQ(u"[example.com](https://example.com/p)",
++            MarkdownLink(u" \t\r\n ", GURL("https://example.com/p")));
++  EXPECT_EQ(u"[www.example.com](https://www.example.com/)",
++            MarkdownLink(u"", GURL("https://www.example.com")));
++  EXPECT_EQ(u"[192.168.0.1](http://192.168.0.1:8080/)",
++            MarkdownLink(u"", GURL("http://192.168.0.1:8080")));
++  // The host is escaped like any other label.
++  EXPECT_EQ(u"[\\[::1\\]](http://[::1]/)",
++            MarkdownLink(u"", GURL("http://[::1]/")));
++}
++
++TEST(MarkdownLinkTest, WithNoHostTheLabelIsTheAddress) {
++  EXPECT_EQ(u"[mailto:a@example.com](mailto:a@example.com)",
++            MarkdownLink(u"", GURL("mailto:a@example.com")));
++  EXPECT_EQ(u"[file:///tmp/a.txt](file:///tmp/a.txt)",
++            MarkdownLink(u"", GURL("file:///tmp/a.txt")));
++}
++
++TEST(MarkdownLinkTest, BalancedParenthesesStayReadable) {
++  EXPECT_EQ(
++      u"[Foo](https://en.wikipedia.org/wiki/Foo_(bar))",
++      MarkdownLink(u"Foo", GURL("https://en.wikipedia.org/wiki/Foo_(bar)")));
++  EXPECT_EQ(u"[F](https://x.test/a_(b)_(c(d)))",
++            MarkdownLink(u"F", GURL("https://x.test/a_(b)_(c(d))")));
++  EXPECT_EQ(u"[F](https://x.test/p?q=(1)&r=2)",
++            MarkdownLink(u"F", GURL("https://x.test/p?q=(1)&r=2")));
++}
++
++TEST(MarkdownLinkTest, UnbalancedParenthesesAreEscaped) {
++  EXPECT_EQ(u"[F](https://x.test/a\\)b)",
++            MarkdownLink(u"F", GURL("https://x.test/a)b")));
++  EXPECT_EQ(u"[F](https://x.test/a\\(b)",
++            MarkdownLink(u"F", GURL("https://x.test/a(b")));
++  // A close before its open is unbalanced even when the counts are equal.
++  EXPECT_EQ(u"[F](https://x.test/\\)a\\()",
++            MarkdownLink(u"F", GURL("https://x.test/)a(")));
++  // Every parenthesis is escaped, the matched pair included.
++  EXPECT_EQ(u"[F](https://x.test/\\(a\\)\\))",
++            MarkdownLink(u"F", GURL("https://x.test/(a))")));
++}
++
++TEST(MarkdownLinkTest, ParenthesesAreCountedAfterTheAddressIsCleaned) {
++  // The tracking parameter holds the stray parenthesis, so nothing is left
++  // to escape once it is dropped.
++  EXPECT_EQ(u"[F](https://x.test/a_(b))",
++            MarkdownLink(u"F", GURL("https://x.test/a_(b)?fbclid=)")));
++}
++
++TEST(MarkdownLinkTest, ATitleThatIsTheAddressCountsAsNone) {
++  const GURL url("https://x.com/a?utm_source=y&id=3");
++  EXPECT_EQ(u"[x.com](https://x.com/a?id=3)",
++            MarkdownLink(u"https://x.com/a?utm_source=y&id=3", url));
++}
++
++TEST(MarkdownLinkTest, BackticksCannotOpenACodeSpan) {
++  EXPECT_EQ(u"[Use \\` here](https://x.test/?q=%60a)",
++            MarkdownLink(u"Use ` here", GURL("https://x.test/?q=`a")));
++}
++
++TEST(MarkdownLinkTest, ABackslashInTheAddressIsEscaped) {
++  EXPECT_EQ(u"[F](https://x.test/?q=a\\\\_b)",
++            MarkdownLink(u"F", GURL("https://x.test/?q=a\\_b")));
++  EXPECT_EQ(u"[F](https://x.test/?q=a\\\\\\(b)",
++            MarkdownLink(u"F", GURL("https://x.test/?q=a\\(b")));
++}
++
++TEST(MarkdownLinkTest, AnInvalidAddressGivesAnEmptyDestination) {
++  EXPECT_EQ(u"[T]()", MarkdownLink(u"T", GURL()));
++  EXPECT_EQ(u"[]()", MarkdownLink(u"", GURL("not a url")));
++}
++
++TEST(MarkdownLinkTest, EmojiAndNonAsciiAreLeftAlone) {
++  EXPECT_EQ(u"[🎉 launch](https://example.com/)",
++            MarkdownLink(u"🎉 launch", GURL("https://example.com/")));
++  // Non-ASCII in the address is percent-encoded by GURL.
++  EXPECT_EQ(u"[F](https://example.com/%C3%BC)",
++            MarkdownLink(u"F", GURL("https://example.com/ü")));
++}
++
++// An escaped bracket can neither end the label nor open a link of its own.
++TEST(MarkdownLinkTest, TheLabelCannotBeBrokenOutOf) {
++  const GURL url("https://example.com/");
++  EXPECT_EQ(u"[\\[\\]](https://example.com/)", MarkdownLink(u"[]", url));
++  EXPECT_EQ(u"[x\\](https://e.test](https://example.com/)",
++            MarkdownLink(u"x](https://e.test", url));
++}
++
++// Schemes without a host give the whole address as the label, and balanced
++// parentheses inside a javascript: address are left alone.
++TEST(MarkdownLinkTest, JavascriptAndDataUrls) {
++  EXPECT_EQ(u"[javascript:alert(1)](javascript:alert(1))",
++            MarkdownLink(u"", GURL("javascript:alert(1)")));
++  EXPECT_EQ(u"[data:text/plain,hi](data:text/plain,hi)",
++            MarkdownLink(u"", GURL("data:text/plain,hi")));
++}
++
++// data: and javascript: addresses keep `<` and `>` raw, where the same
++// characters in a web address would already be percent-encoded. A raw one
++// could read as an autolink or inline HTML, so they become %3C and %3E.
++TEST(MarkdownLinkTest, AngleBracketsInTheAddressAreEncoded) {
++  EXPECT_EQ(u"[data:text/html,\\<a>b\\</a>](data:text/html,%3Ca%3Eb%3C/a%3E)",
++            MarkdownLink(u"", GURL("data:text/html,<a>b</a>")));
++  EXPECT_EQ(u"[F](javascript:alert('%3Cx%3E'))",
++            MarkdownLink(u"F", GURL("javascript:alert('<x>')")));
++}
++
++// Whatever the address held, the output is still one link.
++TEST(MarkdownLinkTest, EveryDestinationKeepsTheLinkShape) {
++  const char* const kSpecs[] = {
++      "https://example.com/",
++      "https://x.test/a_(b)_(c(d))",
++      "https://x.test/a)b",
++      "https://x.test/a(b",
++      "https://x.test/)a(",
++      "https://x.test/(a))",
++      "https://x.test/a#b)c",
++      "https://en.wikipedia.org/wiki/Foo_(bar)",
++      "https://x.test/?q=a\\_b",
++      "https://x.test/?q=a\\(b",
++      "https://x.test/?a=1&amp;b=2",
++      "https://x.test/a#b&#38;c",
++      "javascript:alert(1)",
++      "javascript:alert('<x>')",
++      "data:text/html,<a>b</a>",
++      "data:text/html,hello world",
++      "not a url",
++  };
++  for (const char* spec : kSpecs) {
++    SCOPED_TRACE(spec);
++    ExpectLinkShape(MarkdownLink(u"F", GURL(spec)));
++  }
++}
++
++// GURL itself percent-escapes a backtick in the path, so the destination
++// escaper never sees one.
++TEST(MarkdownLinkTest, ABacktickInThePathIsCanonicalized) {
++  EXPECT_EQ(u"[F](https://x.test/%60a)",
++            MarkdownLink(u"F", GURL("https://x.test/`a")));
++}
++
++// Only a title equal to the address as typed counts as none. The cleaned
++// address, or the address with a stray space, stays as the label.
++TEST(MarkdownLinkTest, ATitleEqualToTheCleanedAddressIsKept) {
++  const GURL url("https://x.com/a?utm_source=y");
++  EXPECT_EQ(u"[https://x.com/a](https://x.com/a)",
++            MarkdownLink(u"https://x.com/a", url));
++  EXPECT_EQ(u"[https://x.com/a?utm_source=y](https://x.com/a)",
++            MarkdownLink(u"https://x.com/a?utm_source=y ", url));
++}
++
++// CleanLink() only touches http and https, so a tracker on another scheme
++// stays in the destination.
++TEST(MarkdownLinkTest, NonHttpUrlsAreNotCleaned) {
++  EXPECT_EQ(u"[x.com](ftp://x.com/?utm_source=y)",
++            MarkdownLink(u"", GURL("ftp://x.com/?utm_source=y")));
++  EXPECT_EQ(u"[settings](chrome://settings/)",
++            MarkdownLink(u"", GURL("chrome://settings/")));
++}
++
++// Parentheses are balanced over the whole address, fragment included.
++TEST(MarkdownLinkTest, AParenthesisInTheFragmentCounts) {
++  EXPECT_EQ(u"[F](https://x.test/a#b\\)c)",
++            MarkdownLink(u"F", GURL("https://x.test/a#b)c")));
++}
++
++// A `<` in the title could open an autolink or inline HTML inside the link
++// text, so it is escaped like a bracket.
++TEST(MarkdownLinkTest, AngleBracketsInTheTitleAreEscaped) {
++  const GURL url("https://example.com/");
++  EXPECT_EQ(u"[\\<https://a.example>](https://example.com/)",
++            MarkdownLink(u"<https://a.example>", url));
++  EXPECT_EQ(u"[\\<em>x\\</em>](https://example.com/)",
++            MarkdownLink(u"<em>x</em>", url));
++}
++
++// CommonMark decodes `&name;`, `&#123;`, and `&#x7B;` in a destination, so
++// a literal `&` that starts one takes a backslash. `&#` can only sit in the
++// fragment: anywhere earlier the `#` would open it.
++TEST(MarkdownLinkTest, EntityLikeRunsInTheAddressAreEscaped) {
++  EXPECT_EQ(u"[F](https://x.test/?a=1\\&amp;b=2)",
++            MarkdownLink(u"F", GURL("https://x.test/?a=1&amp;b=2")));
++  EXPECT_EQ(u"[F](https://x.test/a#b\\&#38;c)",
++            MarkdownLink(u"F", GURL("https://x.test/a#b&#38;c")));
++  EXPECT_EQ(u"[F](https://x.test/a#b\\&#x26;c)",
++            MarkdownLink(u"F", GURL("https://x.test/a#b&#x26;c")));
++}
++
++// CommonMark decodes entity references in link text too, so an `&` that
++// opens an entity-like run in the label takes a backslash, while a plain
++// `&` stays as it was.
++TEST(MarkdownLinkTest, EntityLikeRunsInTheLabelAreEscaped) {
++  const GURL url("https://example.com/");
++  EXPECT_EQ(u"[Using \\&nbsp; and \\&copy; in HTML](https://example.com/)",
++            MarkdownLink(u"Using &nbsp; and &copy; in HTML", url));
++  EXPECT_EQ(u"[Tom & Jerry](https://example.com/)",
++            MarkdownLink(u"Tom & Jerry", url));
++}
++
++// An `&` that isn't an entity's shape stays as it was.
++TEST(MarkdownLinkTest, APlainAmpersandIsLeftAlone) {
++  EXPECT_EQ(u"[F](https://x.test/?a=1&b=2)",
++            MarkdownLink(u"F", GURL("https://x.test/?a=1&b=2")));
++  EXPECT_EQ(u"[F](https://x.test/?a=1&;b=2)",
++            MarkdownLink(u"F", GURL("https://x.test/?a=1&;b=2")));
++  EXPECT_EQ(u"[F](https://x.test/a#b&#;c)",
++            MarkdownLink(u"F", GURL("https://x.test/a#b&#;c")));
++  // No closing `;`, no entity.
++  EXPECT_EQ(u"[F](https://x.test/?a=1&amp)",
++            MarkdownLink(u"F", GURL("https://x.test/?a=1&amp")));
++}
++
++// data: and javascript: addresses keep their spaces; a raw space would end
++// the destination, so it becomes %20.
++TEST(MarkdownLinkTest, ASpaceInTheAddressIsEncoded) {
++  EXPECT_EQ(u"[x](data:text/html,hello%20world)",
++            MarkdownLink(u"x", GURL("data:text/html,hello world")));
++}
++
++// With no title, the label is the host in Unicode; the destination stays
++// the canonical punycode address.
++TEST(MarkdownLinkTest, AnUntitledIdnPageIsLabelledInUnicode) {
++  EXPECT_EQ(u"[b\u00fccher.example](https://xn--bcher-kva.example/)",
++            MarkdownLink(u"", GURL("https://xn--bcher-kva.example/")));
++}
++
++}  // namespace
++}  // namespace rac
+Index: src/chrome/browser/rac/power/third_party/stedding/BUILD.gn
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/power/third_party/stedding/BUILD.gn
+@@ -0,0 +1,27 @@
++# Copyright 2026 The rac Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++# Stedding's tracking-parameter table and CleanLink(). See README.chromium.
++source_set("stedding") {
++  sources = [
++    "clean_link.cc",
++    "clean_link.h",
++  ]
++  public_deps = [
++    "//base",
++    "//url",
++  ]
++}
++
++source_set("unit_tests") {
++  testonly = true
++  sources = [ "clean_link_unittest.cc" ]
++  deps = [
++    ":stedding",
++    "//base",
++    "//base:i18n",
++    "//testing/gtest",
++    "//url",
++  ]
++}
+Index: src/chrome/browser/rac/power/third_party/stedding/LICENSE
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/power/third_party/stedding/LICENSE
+@@ -0,0 +1,28 @@
++BSD 3-Clause License
++
++Copyright (c) 2026, Yevhen Salitrynskyi
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice, this
++   list of conditions and the following disclaimer.
++
++2. Redistributions in binary form must reproduce the above copyright notice,
++   this list of conditions and the following disclaimer in the documentation
++   and/or other materials provided with the distribution.
++
++3. Neither the name of the copyright holder nor the names of its
++   contributors may be used to endorse or promote products derived from
++   this software without specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+Index: src/chrome/browser/rac/power/third_party/stedding/README.chromium
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/power/third_party/stedding/README.chromium
+@@ -0,0 +1,23 @@
++Name: Stedding clean links
++Short Name: stedding
++URL: https://github.com/ysalitrynskyi/stedding-browser
++Version: N/A
++Revision: f301a37ce926c042d56ce115abb2b7517a8300f7
++Update Mechanism: Manual
++License: BSD-3-Clause
++License File: LICENSE
++Security Critical: no
++Shipped: yes
++
++Description:
++The tracking-parameter table and CleanLink() from Stedding's
++chrome/browser/ui/stedding/clean_link.cc (copy-link behaviour L2). rac uses
++it to drop tracking parameters from a link the user copies.
++
++Local Modifications:
++Only CleanLink() and its table were taken, into namespace rac. Redirect
++unwrapping, kept sites, and SafeSearch were left out. Added gbraid, wbraid,
++ttclid, li_fat_id, _ga, and _gl; si on open.spotify.com and
++youtube-nocookie.com; igsh on instagram.com; mibextid on facebook.com.
++ref_src is stripped only on twitter.com and x.com. Only http and https
++addresses are touched.
+Index: src/chrome/browser/rac/power/third_party/stedding/clean_link.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/power/third_party/stedding/clean_link.cc
+@@ -0,0 +1,122 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Derived from Stedding's CleanLink at
++// https://github.com/ysalitrynskyi/stedding-browser, commit
++// f301a37ce926c042d56ce115abb2b7517a8300f7, changed by the rac Authors.
++// Stedding's licence follows.
++//
++// BSD 3-Clause License
++//
++// Copyright (c) 2026, Yevhen Salitrynskyi
++//
++// Redistribution and use in source and binary forms, with or without
++// modification, are permitted provided that the following conditions are met:
++//
++// 1. Redistributions of source code must retain the above copyright notice,
++//    this list of conditions and the following disclaimer.
++//
++// 2. Redistributions in binary form must reproduce the above copyright notice,
++//    this list of conditions and the following disclaimer in the documentation
++//    and/or other materials provided with the distribution.
++//
++// 3. Neither the name of the copyright holder nor the names of its
++//    contributors may be used to endorse or promote products derived from
++//    this software without specific prior written permission.
++//
++// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
++// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++// POSSIBILITY OF SUCH DAMAGE.
++
++#include "chrome/browser/rac/power/third_party/stedding/clean_link.h"
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++
++namespace rac {
++
++namespace {
++
++// A parameter is dropped when its lower-cased name matches an entry exactly,
++// or starts with an entry that ends in "_" (the utm_ family).
++constexpr std::string_view kTrackingParameters[] = {
++    "utm_",   "fbclid", "gclid",     "dclid",  "gbraid", "wbraid",  "msclkid",
++    "mc_eid", "mc_cid", "igshid",    "_hsenc", "_hsmi",  "mkt_tok", "yclid",
++    "twclid", "ttclid", "li_fat_id", "_ga",    "_gl",
++};
++
++// Parameters that track only on one site. `domain` matches the host and its
++// subdomains.
++struct SiteParameter {
++  std::string_view name;
++  std::string_view domain;
++};
++constexpr SiteParameter kSiteParameters[] = {
++    {"si", "youtube.com"},          {"si", "youtu.be"},
++    {"si", "youtube-nocookie.com"}, {"si", "open.spotify.com"},
++    {"igsh", "instagram.com"},      {"mibextid", "facebook.com"},
++    {"ref_src", "twitter.com"},     {"ref_src", "x.com"},
++};
++
++bool IsTracking(std::string_view raw_name, const GURL& url) {
++  const std::string name = base::ToLowerASCII(raw_name);
++  for (std::string_view entry : kTrackingParameters) {
++    if (entry.back() == '_' ? base::StartsWith(name, entry) : name == entry) {
++      return true;
++    }
++  }
++  for (const SiteParameter& entry : kSiteParameters) {
++    if (name == entry.name && url.DomainIs(entry.domain)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
++GURL CleanLink(const GURL& url) {
++  if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS() || !url.has_query()) {
++    return url;
++  }
++  // Work on the raw query so what survives keeps its encoding byte for byte.
++  // Empty parts (`a=1&&b=2`) carry nothing, so a rewrite drops them.
++  std::vector<std::string_view> kept;
++  bool changed = false;
++  for (std::string_view part :
++       base::SplitStringPiece(url.query(), "&", base::KEEP_WHITESPACE,
++                              base::SPLIT_WANT_NONEMPTY)) {
++    const std::string_view name = part.substr(0, part.find('='));
++    if (IsTracking(name, url)) {
++      changed = true;
++    } else {
++      kept.push_back(part);
++    }
++  }
++  if (!changed) {
++    return url;
++  }
++  GURL::Replacements replacements;
++  const std::string query = base::JoinString(kept, "&");
++  if (query.empty()) {
++    replacements.ClearQuery();
++  } else {
++    replacements.SetQueryStr(query);
++  }
++  return url.ReplaceComponents(replacements);
++}
++
++}  // namespace rac
+Index: src/chrome/browser/rac/power/third_party/stedding/clean_link.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/power/third_party/stedding/clean_link.h
+@@ -0,0 +1,32 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++//
++// Derived from Stedding's clean_link.h
++// (https://github.com/ysalitrynskyi/stedding-browser, commit f301a37c).
++// BSD-3-Clause; see LICENSE beside this file.
++
++#ifndef CHROME_BROWSER_RAC_POWER_THIRD_PARTY_STEDDING_CLEAN_LINK_H_
++#define CHROME_BROWSER_RAC_POWER_THIRD_PARTY_STEDDING_CLEAN_LINK_H_
++
++#include "url/gurl.h"
++
++namespace rac {
++
++// Returns `url` without the query parameters that only exist to track the
++// reader: the utm_ family, ad-click ids (fbclid, gclid, ...), mail-merge ids,
++// and the share ids of a few sites (YouTube, Spotify, Instagram, X).
++//
++// It only touches a valid http or https URL that has a query. Parameters are
++// found in the raw query, split on `&`, and named by the text before the
++// first `=`, compared ASCII case-insensitively and without decoding (so
++// `utm%5Fsource` is not `utm_source`). When nothing is a tracking parameter
++// the result is `url` itself, unchanged — empty query parts (`a=1&&b=2`)
++// included. A rewrite keeps every surviving parameter's order and encoding
++// byte for byte, drops empty parts, never touches the fragment, and removes
++// the query when nothing is left.
++GURL CleanLink(const GURL& url);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_POWER_THIRD_PARTY_STEDDING_CLEAN_LINK_H_
+Index: src/chrome/browser/rac/power/third_party/stedding/clean_link_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/power/third_party/stedding/clean_link_unittest.cc
+@@ -0,0 +1,480 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Derived from the tests for Stedding's CleanLink at
++// https://github.com/ysalitrynskyi/stedding-browser, commit
++// f301a37ce926c042d56ce115abb2b7517a8300f7, changed by the rac Authors.
++// Stedding's licence follows.
++//
++// BSD 3-Clause License
++//
++// Copyright (c) 2026, Yevhen Salitrynskyi
++//
++// Redistribution and use in source and binary forms, with or without
++// modification, are permitted provided that the following conditions are met:
++//
++// 1. Redistributions of source code must retain the above copyright notice,
++//    this list of conditions and the following disclaimer.
++//
++// 2. Redistributions in binary form must reproduce the above copyright notice,
++//    this list of conditions and the following disclaimer in the documentation
++//    and/or other materials provided with the distribution.
++//
++// 3. Neither the name of the copyright holder nor the names of its
++//    contributors may be used to endorse or promote products derived from
++//    this software without specific prior written permission.
++//
++// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
++// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++// POSSIBILITY OF SUCH DAMAGE.
++
++#include "chrome/browser/rac/power/third_party/stedding/clean_link.h"
++
++#include <string>
++
++#include "base/containers/span.h"
++#include "base/i18n/icu_util.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace rac {
++namespace {
++
++struct Case {
++  const char* in;
++  const char* out;
++};
++
++void ExpectCases(base::span<const Case> cases) {
++  for (const Case& row : cases) {
++    SCOPED_TRACE(row.in);
++    EXPECT_EQ(row.out, CleanLink(GURL(row.in)).spec());
++  }
++}
++
++void ExpectUnchanged(base::span<const char* const> specs) {
++  for (const char* spec : specs) {
++    SCOPED_TRACE(spec);
++    const GURL url(spec);
++    EXPECT_EQ(url, CleanLink(url));
++    EXPECT_EQ(url.spec(), CleanLink(url).spec());
++  }
++}
++
++TEST(CleanLinkTest, DropsTheAcceptanceCaseParameter) {
++  EXPECT_EQ("https://x.com/a?id=3#c",
++            CleanLink(GURL("https://x.com/a?utm_source=y&id=3#c")).spec());
++}
++
++TEST(CleanLinkTest, DropsEveryFamilyInTheTable) {
++  const Case kCases[] = {
++      {"https://a.test/p?utm_source=x&utm_medium=y&q=1",
++       "https://a.test/p?q=1"},
++      {"https://a.test/p?utm_campaign=x&utm_term=y&utm_content=z&utm_id=1",
++       "https://a.test/p"},
++      {"https://a.test/p?fbclid=abc", "https://a.test/p"},
++      {"https://a.test/p?q=1&gclid=1&dclid=2&msclkid=3",
++       "https://a.test/p?q=1"},
++      {"https://a.test/p?gbraid=1&wbraid=2&q=1", "https://a.test/p?q=1"},
++      {"https://a.test/p?mc_eid=1&mc_cid=2&igshid=3&q=1",
++       "https://a.test/p?q=1"},
++      {"https://a.test/p?_hsenc=1&_hsmi=2&mkt_tok=3&q=1",
++       "https://a.test/p?q=1"},
++      {"https://a.test/p?yclid=4&twclid=5&ttclid=6&li_fat_id=7&q=1",
++       "https://a.test/p?q=1"},
++      // Google's cross-domain linker parameters.
++      {"https://a.test/p?_ga=1&_gl=2&q=1", "https://a.test/p?q=1"},
++      {"https://x.com/p?ref_src=twsrc%5Etfw", "https://x.com/p"},
++      {"https://twitter.com/p?ref_src=twsrc%5Etfw", "https://twitter.com/p"},
++      // A name with no value is still a name.
++      {"https://a.test/p?fbclid&q=1", "https://a.test/p?q=1"},
++      {"https://a.test/p?q=1&fbclid", "https://a.test/p?q=1"},
++      // Plain http, a port, and a path-less address.
++      {"http://a.test:8080/p?gclid=1&q=1", "http://a.test:8080/p?q=1"},
++      {"https://a.test?utm_source=x", "https://a.test/"},
++  };
++  ExpectCases(kCases);
++}
++
++TEST(CleanLinkTest, NamesAreMatchedWithoutRegardToCase) {
++  const Case kCases[] = {
++      {"https://a.test/p?UTM_Source=y&k=v", "https://a.test/p?k=v"},
++      {"https://a.test/p?Utm_Medium=y&k=v", "https://a.test/p?k=v"},
++      {"https://a.test/p?FBCLID=y&k=v", "https://a.test/p?k=v"},
++      {"https://a.test/p?GClid=y&k=v", "https://a.test/p?k=v"},
++      // The values keep their case.
++      {"https://a.test/p?K=V&utm_source=Y", "https://a.test/p?K=V"},
++  };
++  ExpectCases(kCases);
++}
++
++TEST(CleanLinkTest, KeptParametersKeepTheirOrderAndEncodingByteForByte) {
++  const Case kCases[] = {
++      {"https://a.test/?z=1&utm_x=1&a=2", "https://a.test/?z=1&a=2"},
++      {"https://a.test/?b=%20x&utm_medium=m&a=1+2",
++       "https://a.test/?b=%20x&a=1+2"},
++      {"https://a.test/?q=a%20b&r=%2F&utm_source=x&s=%e2%82%ac",
++       "https://a.test/?q=a%20b&r=%2F&s=%e2%82%ac"},
++      // A truncated escape stays byte-exact: "%" is a query character and
++      // passes canonicalization untouched.
++      {"https://a.test/?q=%2&utm_source=x", "https://a.test/?q=%2"},
++      {"https://a.test/?a=1&a=2&utm_source=x&a=3",
++       "https://a.test/?a=1&a=2&a=3"},
++      {"https://a.test/?k=v=w&utm_source=x", "https://a.test/?k=v=w"},
++      // A rewrite drops empty parts, so no stray `&` is left behind.
++      {"https://a.test/?a=1&&utm_x=1&b=2", "https://a.test/?a=1&b=2"},
++      {"https://a.test/?a=1&&utm_source=x", "https://a.test/?a=1"},
++  };
++  ExpectCases(kCases);
++}
++
++TEST(CleanLinkTest, TheFragmentIsNeverTouched) {
++  const Case kCases[] = {
++      {"https://a.test/p?a=1&fbclid=x#frag", "https://a.test/p?a=1#frag"},
++      {"https://a.test/p?utm_source=1#utm_source=x&b=2",
++       "https://a.test/p#utm_source=x&b=2"},
++  };
++  ExpectCases(kCases);
++  const char* const kUnchanged[] = {
++      "https://a.test/p?a=1#utm_source=x",
++      "https://a.test/p#utm_source=x",
++      "https://a.test/p?a=1#?fbclid=x",
++  };
++  ExpectUnchanged(kUnchanged);
++}
++
++TEST(CleanLinkTest, AnEmptiedQueryIsRemoved) {
++  const Case kCases[] = {
++      {"https://a.test/p?fbclid=abc", "https://a.test/p"},
++      {"https://a.test/p?utm_source=a&utm_medium=b", "https://a.test/p"},
++      {"https://a.test/p?utm_source=a&", "https://a.test/p"},
++      {"https://a.test/p?fbclid=abc#frag", "https://a.test/p#frag"},
++  };
++  ExpectCases(kCases);
++  EXPECT_FALSE(CleanLink(GURL("https://a.test/p?fbclid=abc")).has_query());
++}
++
++TEST(CleanLinkTest, TheShareIdIsOnlyTrackingOnItsSites) {
++  const Case kTracking[] = {
++      {"https://www.youtube.com/watch?v=abc&si=track",
++       "https://www.youtube.com/watch?v=abc"},
++      {"https://youtube.com/watch?si=track&v=abc",
++       "https://youtube.com/watch?v=abc"},
++      {"https://m.youtube.com/watch?v=abc&SI=track",
++       "https://m.youtube.com/watch?v=abc"},
++      {"https://youtu.be/abc?si=track", "https://youtu.be/abc"},
++      {"https://youtu.be/abc?t=30&si=track", "https://youtu.be/abc?t=30"},
++      {"https://music.youtube.com/watch?v=abc&si=track",
++       "https://music.youtube.com/watch?v=abc"},
++      {"https://www.youtube.com/watch?v=x&si=t&pp=abc",
++       "https://www.youtube.com/watch?v=x&pp=abc"},
++      {"https://www.youtube-nocookie.com/embed/abc?si=track",
++       "https://www.youtube-nocookie.com/embed/abc"},
++      {"https://www.facebook.com/p/1?mibextid=track",
++       "https://www.facebook.com/p/1"},
++      {"https://m.facebook.com/p/1?mibextid=track&q=1",
++       "https://m.facebook.com/p/1?q=1"},
++      {"https://open.spotify.com/track/1?si=track",
++       "https://open.spotify.com/track/1"},
++      {"https://www.instagram.com/p/abc/?igsh=track",
++       "https://www.instagram.com/p/abc/"},
++      {"https://instagram.com/p/abc/?igsh=track&hl=en",
++       "https://instagram.com/p/abc/?hl=en"},
++  };
++  ExpectCases(kTracking);
++  const char* const kKept[] = {
++      "https://example.com/p?si=keep",
++      "https://example.com/p?igsh=keep",
++      "https://www.spotify.com/p?si=keep",
++      "https://notyoutube.com/watch?si=keep",
++      "https://youtube.com.evil.test/watch?si=keep",
++      "https://notinstagram.com/p?igsh=keep",
++      // The other site's id doesn't count.
++      "https://www.instagram.com/p/abc/?si=keep",
++      "https://www.youtube.com/watch?igsh=keep",
++      "https://open.spotify.com/track/1?igsh=keep",
++      "https://example.com/p?mibextid=keep",
++      "https://notfacebook.com/p?mibextid=keep",
++  };
++  ExpectUnchanged(kKept);
++}
++
++TEST(CleanLinkTest, LooksLikeTrackingButIsNot) {
++  const char* const kUnchanged[] = {
++      "https://a.test/p?id=1",
++      "https://a.test/p?ref=home",
++      "https://a.test/p?source=newsletter",
++      "https://a.test/p?utm=1",
++      "https://a.test/p?utmsource=1",
++      "https://a.test/p?q=utm_source",
++      "https://a.test/p?q=utm_source%3Dx&fbclid_x=1",
++      "https://a.test/p?gclid_x=1",
++      "https://a.test/p?xgclid=1",
++      "https://a.test/p?my_utm_source=1",
++      "https://a.test/p?ref_srcs=1",
++      // ref_src is Twitter's; elsewhere it may be a working parameter.
++      "https://a.test/p?ref_src=twsrc%5Etfw",
++      "https://a.test/p?q=1&page=2",
++      "https://a.test/p?q=a%20b&r=%2F",
++      "https://a.test/p?si=keep",
++      // The name is compared as written, not decoded.
++      "https://a.test/p?utm%5Fsource=x",
++      "https://a.test/p?%75tm_source=x",
++      // Tracking text in the path is not a parameter.
++      "https://a.test/utm_source=x/?q=1",
++      "https://a.test/p/fbclid=1",
++      // Nothing was dropped, so nothing is rewritten.
++      "https://a.test/p?a=1&&b=2",
++      "https://a.test/p?&a=1&",
++      "https://a.test/p",
++      "https://a.test/p?",
++      "https://a.test/?",
++  };
++  ExpectUnchanged(kUnchanged);
++}
++
++// Every name added beyond the plan's list is matched exactly, so working
++// parameters that only look like one stay. Several are real: Google
++// Calendar's `eid`, Yandex's `clid`, and the `cid` many shops use.
++TEST(CleanLinkTest, NamesNearTheAddedEntriesAreKept) {
++  const char* const kKept[] = {
++      // gbraid, wbraid.
++      "https://a.test/p?braid=1",
++      "https://a.test/p?gbraid_v=1",
++      // mc_cid, mc_eid.
++      "https://shop.test/p?cid=42",
++      "https://calendar.google.com/calendar/event?eid=abc",
++      "https://a.test/p?mc_cid_x=1",
++      // _hsmi.
++      "https://a.test/p?hsmi=1",
++      // yclid, twclid, ttclid.
++      "https://yandex.ru/search/?clid=123&text=a",
++      "https://a.test/p?tclid=1",
++      "https://a.test/p?yclid2=1",
++      // li_fat_id.
++      "https://www.linkedin.com/jobs/view/1?li=1",
++      "https://a.test/p?fat_id=1",
++      "https://a.test/p?li_fat=1",
++      // ref_src stays on hosts that only look like X or Twitter.
++      "https://box.com/p?ref_src=keep",
++      "https://x.com.evil.test/p?ref_src=keep",
++      "https://nottwitter.com/p?ref_src=keep",
++      // _ga and _gl are exact names: look-alike and working parameters stay.
++      "https://a.test/p?ga=1",
++      "https://a.test/p?gl=us",
++      "https://a.test/p?_gal=1",
++      // spm was considered and left out: sites use it for real content.
++      "https://a.test/p?spm=a2.1",
++  };
++  ExpectUnchanged(kKept);
++}
++
++TEST(CleanLinkTest, OnlyWebAddressesAreTouched) {
++  const char* const kUnchanged[] = {
++      "mailto:a@b.test?utm_source=x&subject=hi",
++      "file:///tmp/a.html?utm_source=x",
++      "data:text/html,a?utm_source=x",
++      "chrome://settings/?utm_source=x",
++      "about:blank?utm_source=x",
++      "ftp://a.test/p?utm_source=x",
++      "ws://a.test/p?utm_source=x",
++      "wss://a.test/p?utm_source=x",
++      "blob:https://a.test/0000?utm_source=x",
++      "javascript:alert(1)?utm_source=x",
++  };
++  ExpectUnchanged(kUnchanged);
++}
++
++TEST(CleanLinkTest, InvalidInputComesBackUnchanged) {
++  for (const char* spec : {"", "not a url", "https://", "http://[::1"}) {
++    SCOPED_TRACE(spec);
++    const GURL url(spec);
++    EXPECT_FALSE(url.is_valid());
++    const GURL cleaned = CleanLink(url);
++    EXPECT_FALSE(cleaned.is_valid());
++    EXPECT_EQ(url, cleaned);
++  }
++  EXPECT_FALSE(CleanLink(GURL()).is_valid());
++}
++
++// The share sites match on any subdomain, and GURL::DomainIs ignores a
++// host's trailing dot, but only ever on a label boundary.
++TEST(CleanLinkTest, SiteIdsApplyToSubdomainsAndTrailingDots) {
++  const Case kCases[] = {
++      {"https://a.b.youtube.com/watch?si=t&v=1",
++       "https://a.b.youtube.com/watch?v=1"},
++      {"https://www.youtu.be/v/abc?si=t", "https://www.youtu.be/v/abc"},
++      {"https://a.open.spotify.com/track/1?si=t",
++       "https://a.open.spotify.com/track/1"},
++      {"https://de.instagram.com/p/abc/?igsh=t",
++       "https://de.instagram.com/p/abc/"},
++      {"https://m.twitter.com/p?ref_src=t", "https://m.twitter.com/p"},
++      {"https://www.x.com/p?ref_src=t", "https://www.x.com/p"},
++      // A trailing dot doesn't hide the domain.
++      {"https://youtube.com./watch?si=t&v=1", "https://youtube.com./watch?v=1"},
++      {"https://open.spotify.com./track/1?si=t",
++       "https://open.spotify.com./track/1"},
++      {"https://x.com./p?ref_src=t", "https://x.com./p"},
++      // A global name doesn't care what the host looks like.
++      {"https://a.test./p?utm_source=x", "https://a.test./p"},
++  };
++  ExpectCases(kCases);
++  const char* const kKept[] = {
++      "https://instagram.com.evil.test/p/abc/?igsh=keep",
++      "https://youtu.be.evil.test/v/abc?si=keep",
++      "https://open.spotify.com.evil.test/track/1?si=keep",
++      // "ax.com" ends in "x.com" but not on a label boundary.
++      "https://ax.com/p?ref_src=keep",
++  };
++  ExpectUnchanged(kKept);
++}
++
++// GURL lowercases the scheme and host before CleanLink sees them.
++TEST(CleanLinkTest, SiteIdsMatchHostsCanonicalizedToLowercase) {
++  const Case kCases[] = {
++      {"HTTPS://WWW.YOUTUBE.COM/Watch?si=t&v=abc",
++       "https://www.youtube.com/Watch?v=abc"},
++      {"https://Open.Spotify.COM/track/1?si=t",
++       "https://open.spotify.com/track/1"},
++      {"https://WWW.INSTAGRAM.COM/p/abc/?igsh=t&hl=en",
++       "https://www.instagram.com/p/abc/?hl=en"},
++      {"https://A.TEST/p?utm_source=x", "https://a.test/p"},
++  };
++  ExpectCases(kCases);
++}
++
++TEST(CleanLinkTest, UserinfoPortsAndIpv6HostsArePreserved) {
++  const Case kCases[] = {
++      {"https://user:pass@a.test/p?utm_source=x&q=1",
++       "https://user:pass@a.test/p?q=1"},
++      {"https://a.test:8443/p?utm_source=x&q=1", "https://a.test:8443/p?q=1"},
++      // 443 is https's default port, so canonicalization drops it.
++      {"https://a.test:443/p?utm_source=x", "https://a.test/p"},
++      {"https://[2001:db8::1]/p?gclid=1&k=v", "https://[2001:db8::1]/p?k=v"},
++      // A site id still applies on its site with userinfo and a port.
++      {"https://u@youtube.com:8443/watch?si=t&v=1",
++       "https://u@youtube.com:8443/watch?v=1"},
++  };
++  ExpectCases(kCases);
++  const char* const kUnchanged[] = {
++      // Tracking-looking text in the userinfo is not a parameter.
++      "https://utm_source:x@a.test/p?q=1",
++      // An IP host is no site's domain, so the site ids stay.
++      "https://[2001:db8::1]/p?si=keep",
++  };
++  ExpectUnchanged(kUnchanged);
++}
++
++// An IDN host canonicalizes to punycode before CleanLink sees the spec.
++TEST(CleanLinkTest, IdnHostsAreCanonicalizedFirst) {
++  // IDN canonicalization needs ICU's data. base::TestSuite loads it in the
++  // real binary; this also covers a plain gtest main.
++  base::i18n::AllowMultipleInitializeCallsForTesting();
++  ASSERT_TRUE(base::i18n::InitializeICU());
++  const Case kCases[] = {
++      // "bücher" and "münchen".
++      {"https://bücher.example/p?utm_source=x&q=1",
++       "https://xn--bcher-kva.example/p?q=1"},
++      {"https://münchen.example/p?fbclid=1&k=v",
++       "https://xn--mnchen-3ya.example/p?k=v"},
++  };
++  ExpectCases(kCases);
++}
++
++// Only "&" splits the query; a ";" inside a part is just text.
++TEST(CleanLinkTest, SemicolonsDoNotSplitParameters) {
++  const Case kCases[] = {
++      {"https://a.test/p?a=1;utm_source=x&utm_medium=y",
++       "https://a.test/p?a=1;utm_source=x"},
++      // A part starting with a tracking name drops as a whole.
++      {"https://a.test/p?utm_source=x;y=1&q=1", "https://a.test/p?q=1"},
++  };
++  ExpectCases(kCases);
++}
++
++TEST(CleanLinkTest, PartsWithNoValueAndEmptyNames) {
++  const Case kCases[] = {
++      // A part may be "=" with an empty name.
++      {"https://a.test/p?=x&utm_source=y", "https://a.test/p?=x"},
++      {"https://a.test/p?q=1&=&utm_source=y", "https://a.test/p?q=1&="},
++      // A tracking name needs no value.
++      {"https://a.test/p?q=1&utm_source", "https://a.test/p?q=1"},
++      {"https://a.test/p?q=1&utm_source=", "https://a.test/p?q=1"},
++      // The bare utm_ prefix is a name itself.
++      {"https://a.test/p?q=1&utm_", "https://a.test/p?q=1"},
++      {"https://a.test/p?utm_&q=1", "https://a.test/p?q=1"},
++  };
++  ExpectCases(kCases);
++}
++
++TEST(CleanLinkTest, EveryCopyOfATrackingNameIsDropped) {
++  const Case kCases[] = {
++      {"https://a.test/p?utm_source=a&utm_source=b", "https://a.test/p"},
++      {"https://a.test/p?q=1&utm_source=a&r=2&utm_source=b",
++       "https://a.test/p?q=1&r=2"},
++      {"https://a.test/p?q=1&utm_source=x&&&utm_medium=y",
++       "https://a.test/p?q=1"},
++  };
++  ExpectCases(kCases);
++}
++
++// The name comparison never decodes, and a kept part's value is never
++// decoded either.
++TEST(CleanLinkTest, EncodedTextIsTreatedByteForByte) {
++  const Case kCases[] = {
++      // An encoded "&name=" inside a value is not another parameter.
++      {"https://a.test/p?next=%2Fp%3Futm_source%3Dx%26fbclid%3Dy&fbclid=z",
++       "https://a.test/p?next=%2Fp%3Futm_source%3Dx%26fbclid%3Dy"},
++      {"https://a.test/p?q=a%26b&utm_source=x", "https://a.test/p?q=a%26b"},
++  };
++  ExpectCases(kCases);
++  const char* const kUnchanged[] = {
++      // "+" and "%3D" inside a name mean it isn't that name.
++      "https://a.test/p?utm+source=x",
++      "https://a.test/p?fbclid%3D=x",
++  };
++  ExpectUnchanged(kUnchanged);
++}
++
++// Empty query markers carry no parts and are never rewritten.
++TEST(CleanLinkTest, EmptyQueryMarkersStayPut) {
++  const Case kCases[] = {
++      // Cleaning in front of an empty fragment leaves the "#".
++      {"https://a.test/p?utm_source=x#", "https://a.test/p#"},
++      // Only empty parts are left, so the query goes away whole.
++      {"https://a.test/p?&utm_source=x&", "https://a.test/p"},
++  };
++  ExpectCases(kCases);
++  const char* const kUnchanged[] = {
++      "https://a.test/p?#frag",
++      "https://a.test/p?#",
++      "https://a.test/p?&",
++  };
++  ExpectUnchanged(kUnchanged);
++}
++
++TEST(CleanLinkTest, LongQueriesAreScannedToTheEnd) {
++  // A tracker at the end of a long query is still found, and every kept
++  // parameter keeps its place.
++  std::string query;
++  for (int i = 0; i < 100; ++i) {
++    if (!query.empty()) {
++      query += '&';
++    }
++    query += "p" + std::to_string(i) + "=v" + std::to_string(i);
++  }
++  const GURL url("https://a.test/p?" + query + "&utm_source=x&gclid=1");
++  EXPECT_EQ("https://a.test/p?" + query, CleanLink(url).spec());
++}
++
++}  // namespace
++}  // namespace rac
