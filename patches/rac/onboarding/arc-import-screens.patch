@@ -398,7 +398,7 @@ Index: src/chrome/browser/resources/rac_onboarding/app.ts
  import {acceptLatestSchema, finishTour, getHeliumPrefs, getRacState, importProfile, LAYOUT_SIDEBAR, LAYOUT_TOP_BAR, listImportableProfiles, onHeliumPrefsChanged, setAssistant, setHeliumPref, setLayout, setTheme} from './browser_proxy.js';
  import type {BrowserProfile, HeliumPrefKey, HeliumPrefs, Layout, RacState} from './browser_proxy.js';
 +import {ArcStep, renderRestore, showRestoreFailed} from './arc_import.js';
-+import {answerRestoreOffer, closeTourWindow, getArcState, getRestoreOffer} from './arc_import_proxy.js';
++import {answerRestoreOffer, closeTourWindow, getArcState, getRestoreOffer, onRestoreOfferChanged} from './arc_import_proxy.js';
 +import type {RestoreOffer} from './arc_import_proxy.js';
 +
 +type Screen = 'restore'|'welcome'|'arc'|'layout'|'theme'|'import'|
@@ -442,7 +442,7 @@ Index: src/chrome/browser/resources/rac_onboarding/app.ts
    private readonly darkMedia = matchMedia('(prefers-color-scheme: dark)');
    private readonly reducedMotion =
        matchMedia('(prefers-reduced-motion: reduce)');
-@@ -86,15 +108,26 @@ class Tour {
+@@ -86,15 +108,44 @@ class Tour {
    async start() {
      // The tour window has no browser chrome, only the traffic lights over
      // the page's top edge; leave room for them.
@@ -452,27 +452,45 @@ Index: src/chrome/browser/resources/rac_onboarding/app.ts
 +    const params = new URLSearchParams(location.search);
 +    document.body.classList.toggle('tour-window', params.has('tour'));
 +    this.mode = params.has('arc') ? 'arc' : 'tour';
-+    const [state, prefs, profiles, arcState, restoreOffer] = await Promise.all([
++    let started = false;
++    if (this.mode === 'tour') {
++      // Listening before asking: the reply and the changes arrive in order,
++      // so the newest offer is the one kept.
++      onRestoreOfferChanged(offer => {
++        if (started) {
++          this.onRestoreOfferChanged(offer);
++        } else {
++          this.restoreOffer = offer;
++        }
++      });
++    }
++    const [state, prefs, profiles, arcState] = await Promise.all([
        getRacState(),
        getHeliumPrefs(),
        listImportableProfiles(),
 +      getArcState(),
-+      this.mode === 'tour' ? getRestoreOffer() : Promise.resolve(null),
++      this.mode === 'tour' ?
++          getRestoreOffer().then(offer => {
++            this.restoreOffer = offer;
++          }) :
++          null,
      ]);
      this.state = state;
      this.prefs = prefs;
-+    this.restoreOffer = restoreOffer;
-+    // Arc is read only if its step will show: found and never imported into
-+    // this profile (Settings offers "Import again" for that), or opened from
-+    // Settings.
++    // The step shows if Arc is there and was never imported into this
++    // profile (Settings offers "Import again" for that), or when Settings
++    // opened it. Arc itself is read only once the person heads to the step
++    // (Settings' Import… is that), never just because the tour opened.
 +    if (this.mode === 'arc' || (arcState.found && !arcState.importedAt)) {
 +      this.arc = new ArcStep(() => this.renderChrome());
-+      await this.arc.load();
++      if (this.mode === 'arc') {
++        await this.arc.ensureLoaded();
++      }
 +    }
      // Chromium lists "Bookmarks HTML file" as a browser; the tour only
      // imports from installed browsers.
      this.profiles = profiles.filter(
-@@ -106,31 +139,57 @@ class Tour {
+@@ -106,31 +157,87 @@ class Tour {
      this.renderAssistant();
      this.renderServices();
      this.applyWash();
@@ -505,7 +523,37 @@ Index: src/chrome/browser/resources/rac_onboarding/app.ts
      this.screens = this.visibleScreens();
      this.app.hidden = false;
 -    this.show('welcome');
++    started = true;
 +    this.show(this.screens[0] ?? 'welcome');
++  }
++
++  // A restore offer that arrived late, lapsed, or was answered in another
++  // window. A late one takes over only while Welcome is still the first
++  // thing on screen; nothing changes under an answer in progress.
++  private onRestoreOfferChanged(offer: RestoreOffer|null) {
++    if (this.restored || this.advancing) {
++      return;
++    }
++    if (offer) {
++      if (this.current === 'restore') {
++        this.restoreOffer = offer;
++        renderRestore(offer);
++      } else if (this.current === 'welcome' && !this.moving) {
++        this.restoreOffer = offer;
++        renderRestore(offer);
++        this.screens = this.visibleScreens();
++        this.show('restore');
++      }
++      return;
++    }
++    if (!this.restoreOffer) {
++      return;
++    }
++    this.restoreOffer = null;
++    this.screens = this.visibleScreens();
++    if (this.current === 'restore') {
++      this.show('welcome');
++    }
    }
  
    // Screens that don't apply are left out rather than shown empty: import
@@ -534,7 +582,7 @@ Index: src/chrome/browser/resources/rac_onboarding/app.ts
          case 'assistant':
            return !!this.state && !this.state.assistantEnabled &&
                !this.state.skipAssistant;
-@@ -252,11 +311,41 @@ class Tour {
+@@ -252,11 +359,41 @@ class Tour {
  
      let primary = 'Continue';
      let secondary: string|null = null;
@@ -576,7 +624,7 @@ Index: src/chrome/browser/resources/rac_onboarding/app.ts
        case 'import':
          primary = this.importing         ? 'Importing…' :
              this.pendingImports().length ? 'Import and continue' :
-@@ -273,13 +362,20 @@ class Tour {
+@@ -273,15 +410,25 @@ class Tour {
          break;
      }
      this.primaryLabel.textContent = primary;
@@ -598,8 +646,24 @@ Index: src/chrome/browser/resources/rac_onboarding/app.ts
 +    }
      const index = this.screens.indexOf(this.current);
      const target = this.screens[index - 1];
++    if (target === 'arc') {
++      this.arc?.ensureLoaded();
++    }
      if (target) {
-@@ -301,6 +397,39 @@ class Tour {
+       this.show(target);
+     }
+@@ -290,6 +437,10 @@ class Tour {
+   private async next() {
+     const index = this.screens.indexOf(this.current);
+     const target = this.screens[index + 1];
++    if (target === 'arc') {
++      // Continue on the step before is what reads Arc.
++      await this.arc?.ensureLoaded();
++    }
+     if (target) {
+       await this.show(target);
+     }
+@@ -301,6 +452,39 @@ class Tour {
      this.show('services');
    }
  
@@ -639,7 +703,7 @@ Index: src/chrome/browser/resources/rac_onboarding/app.ts
    private async advance() {
      // A step that waits on the browser (consent, finishing) must not run
      // twice from a double click, and no click may answer a step before it
-@@ -318,6 +447,22 @@ class Tour {
+@@ -318,6 +502,22 @@ class Tour {
  
    private async runStep() {
      switch (this.current) {
@@ -662,7 +726,7 @@ Index: src/chrome/browser/resources/rac_onboarding/app.ts
        case 'import':
          if (this.pendingImports().length) {
            await this.runImports();
-@@ -369,6 +514,37 @@ class Tour {
+@@ -369,6 +569,37 @@ class Tour {
      }
    }
  
@@ -700,7 +764,7 @@ Index: src/chrome/browser/resources/rac_onboarding/app.ts
    // Layout
  
    private renderLayout() {
-@@ -454,9 +630,17 @@ class Tour {
+@@ -454,9 +685,17 @@ class Tour {
      return [...this.selected].filter(index => !this.imported.has(index));
    }
  
@@ -723,7 +787,7 @@ Index: src/chrome/browser/resources/rac_onboarding/arc_import.ts
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/resources/rac_onboarding/arc_import.ts
-@@ -0,0 +1,599 @@
+@@ -0,0 +1,609 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -879,6 +943,7 @@ Index: src/chrome/browser/resources/rac_onboarding/arc_import.ts
 +  private preview: ArcPreview|null = null;
 +  private result: ArcResult|null = null;
 +  private readonly skipped = new Set<string>();
++  private loading: Promise<boolean>|null = null;
 +
 +  private readonly profiles = byId<HTMLElement>('arcProfiles');
 +  private readonly left = byId<HTMLElement>('arcLeftBehind');
@@ -894,6 +959,15 @@ Index: src/chrome/browser/resources/rac_onboarding/arc_import.ts
 +
 +  // `onChange` re-renders the tour's buttons.
 +  constructor(private readonly onChange: () => void) {}
++
++  /**
++   * Reads Arc once, the first time the step is on its way in, so opening the
++   * tour reads nothing but whether Arc is there.
++   */
++  ensureLoaded(): Promise<boolean> {
++    this.loading ??= this.load();
++    return this.loading;
++  }
 +
 +  /** Reads Arc. Resolves false if it couldn't be read. */
 +  async load(): Promise<boolean> {
@@ -1327,7 +1401,7 @@ Index: src/chrome/browser/resources/rac_onboarding/arc_import_proxy.ts
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/resources/rac_onboarding/arc_import_proxy.ts
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,187 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1489,6 +1563,15 @@ Index: src/chrome/browser/resources/rac_onboarding/arc_import_proxy.ts
 +
 +export function getRestoreOffer(): Promise<RestoreOffer|null> {
 +  return sendWithPromise('racRestoreGetOffer');
++}
++
++/**
++ * The offer as it changes: it can arrive after the page asked, lapse, or be
++ * answered elsewhere. `null` once there's none.
++ */
++export function onRestoreOfferChanged(
++    listener: (offer: RestoreOffer|null) => void): WebUiListener {
++  return addWebUiListener('rac-restore-offer-changed', listener);
 +}
 +
 +/**
