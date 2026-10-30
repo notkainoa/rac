@@ -92,7 +92,7 @@ def seed_preferences(model_url):
 
 def find_browser_pid(ps_text, profile, bundle_path):
     """The browser (main) process of the launch: inside the bundle, started
-    with this profile, and without --type. `worktree.sh` may wrap it, so the
+    with this profile, and without --type. The build queue may wrap it, so the
     pid Popen returned can't be trusted."""
     for p in checks.parse_ps(ps_text):
         if (f"--user-data-dir={profile}" in p["command"] and "--type=" not in p["command"]
@@ -272,7 +272,7 @@ def plan_steps():
         "start the fake model (fake_model.serve(0)) and a local web page",
         "seed Default/Preferences: rac.ai.enabled=false, provider=custom -> the fake model, "
         "browser_control=true, agent_permission_level=auto",
-        "session A: launch worktree.sh run with the profile, DevTools on 127.0.0.1, "
+        "session A: launch the built rac binary with the profile, DevTools on 127.0.0.1, "
         "--log-net-log, --rac-launch-in-background",
         f"session A: sit idle {IDLE_SECONDS} s, open the local page, open each WebUI surface and "
         "read its text (item 5)",
@@ -347,8 +347,9 @@ class Session:
         self.bundle, self.netlog = bundle, netlog
         self.port = run.free_port()
         self.log = open(os.path.join(profile, "launch.log"), "ab")
-        # worktree.sh passes unknown flags through to the browser; the build
-        # queue wraps the launch the same way run.py does.
+        # run.launch_args launches the app binary itself and passes the extra
+        # flags through to the browser; the build queue wraps it unless
+        # RAC_EVALS_NO_QUEUE=1.
         argv = run.launch_args(profile, self.port, worktree) + [
             f"--log-net-log={netlog}", "--net-log-capture-mode=Everything"]
         self.proc = subprocess.Popen(argv, cwd=worktree, start_new_session=True,
@@ -487,7 +488,7 @@ def main(argv=None):
     ap.add_argument("--plan", action="store_true", help="print the steps of a real run")
     ap.add_argument("--bundle", help="path to the built .app (default: guess in build/src/out/Default)")
     ap.add_argument("--worktree", default=ROOT,
-                    help="the checkout whose built rac runs (its worktree.sh and build/)")
+                    help="the checkout whose built rac runs (its devutils/rac and build/)")
     ap.add_argument("--keep-profile", action="store_true")
     args = ap.parse_args(argv)
     if args.self_test:

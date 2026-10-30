@@ -38,8 +38,10 @@ It prints one line per variant, writes `results/<id>.json`, and exits non-zero
 if any variant fails its expectations or the ratchet.
 
 **Throwaway profiles only.** `run.py` and `ai_off/run_ai_off.py` make a fresh
-profile at `<worktree>/build/rac-evals-*`, launch with
-`devutils/rac/worktree.sh run --user-data-dir=<that>`, and delete it
+profile at `<worktree>/build/rac-evals-*`, launch the built binary
+`<worktree>/build/src/out/Default/rac.app/Contents/MacOS/rac` with
+`--user-data-dir=<that>` — through `devutils/rac/build-queue.sh --run` for a
+run slot, or directly when `RAC_EVALS_NO_QUEUE=1` — and delete it
 afterwards (`--keep-profile` keeps it). They refuse any other base folder, and
 never use `me.kainoa.rac`, `me.kainoa.rac.dev`, `net.imput.helium` or
 anything in `~/Library/Application Support`. The DevTools port is loopback

@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from unittest import mock
 
 import fake_model
 import run
@@ -57,17 +58,55 @@ class SeedingTest(unittest.TestCase):
 
 
 class LaunchTest(unittest.TestCase):
-    def test_launch_uses_worktree_run_a_throwaway_profile_and_loopback_debugging(self):
-        args = run.launch_args("/tmp/rac-evals-x", 9333, "/wt")
+    def make_worktree(self, wt):
+        """A fake worktree with just the binary and the queue script."""
+        binary = run.browser_binary(wt)
+        os.makedirs(os.path.dirname(binary))
+        open(binary, "w").close()
+        queue = os.path.join(wt, "devutils", "rac", "build-queue.sh")
+        os.makedirs(os.path.dirname(queue))
+        open(queue, "w").close()
+        return binary
+
+    def test_launch_wraps_the_app_binary_in_a_queue_run_slot(self):
+        with tempfile.TemporaryDirectory() as wt, mock.patch.dict(os.environ) as env:
+            env.pop("RAC_EVALS_NO_QUEUE", None)
+            binary = self.make_worktree(wt)
+            args = run.launch_args("/tmp/rac-evals-x", 9333, wt)
         self.assertTrue(args[0].endswith("devutils/rac/build-queue.sh"))
-        self.assertTrue(args[1].endswith("devutils/rac/worktree.sh"))
-        self.assertEqual(args[2], "run")
-        self.assertIn("--user-data-dir=/tmp/rac-evals-x", args)
-        self.assertIn("--remote-debugging-port=9333", args)
-        self.assertIn("--remote-debugging-address=127.0.0.1", args)
-        self.assertIn("--rac-launch-in-background", args)  # never takes the foreground
+        self.assertEqual(args[1], "--run")
+        self.assertEqual(args[2], binary)
+        self.assertEqual(args[3:], [
+            "--user-data-dir=/tmp/rac-evals-x", "--use-mock-keychain",
+            "--disable-features=DialMediaRouteProvider",
+            "--remote-debugging-port=9333", "--remote-debugging-address=127.0.0.1",
+            "--rac-launch-in-background",  # never takes the foreground
+            "--no-first-run", "--no-default-browser-check",
+            "--disable-background-networking", "--disable-component-update"])
         self.assertNotIn("open", args)
+        self.assertFalse([a for a in args if "remote-allow-origins" in a])
         self.assertFalse([a for a in args if "Application Support" in a or "me.kainoa.rac" in a])
+
+    def test_no_queue_env_launches_the_binary_directly(self):
+        with tempfile.TemporaryDirectory() as wt, \
+                mock.patch.dict(os.environ, {"RAC_EVALS_NO_QUEUE": "1"}):
+            binary = self.make_worktree(wt)
+            args = run.launch_args("/tmp/rac-evals-x", 9333, wt)
+        self.assertEqual(args[0], binary)
+        self.assertEqual(args[1], "--user-data-dir=/tmp/rac-evals-x")
+        self.assertFalse([a for a in args if "build-queue" in a or "remote-allow-origins" in a])
+
+    def test_a_missing_binary_or_queue_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as wt, mock.patch.dict(os.environ) as env:
+            env.pop("RAC_EVALS_NO_QUEUE", None)
+            with self.assertRaisesRegex(RuntimeError, "no built rac"):
+                run.launch_args("/tmp/rac-evals-x", 9333, wt)
+            binary = self.make_worktree(wt)
+            os.remove(os.path.join(wt, "devutils", "rac", "build-queue.sh"))
+            with self.assertRaisesRegex(RuntimeError, "no build queue"):
+                run.launch_args("/tmp/rac-evals-x", 9333, wt)
+            with mock.patch.dict(os.environ, {"RAC_EVALS_NO_QUEUE": "1"}):
+                self.assertEqual(run.launch_args("/tmp/rac-evals-x", 9333, wt)[0], binary)
 
     def test_profile_is_a_fresh_folder_named_for_evals_under_the_given_base(self):
         with tempfile.TemporaryDirectory() as base:

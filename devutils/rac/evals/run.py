@@ -13,9 +13,10 @@ A real run, per variant, in a throwaway profile:
   1. start the fixture server (one port per origin) and the fake model;
   2. seed <profile>/Default/Preferences: AI on, browser control on, the Custom
      provider pointed at the fake model, the level and site rules under test;
-  3. launch `worktree.sh run --user-data-dir=<profile> --remote-debugging-port`
-     (a later --user-data-dir wins over the script's own, as test-spaces.mjs
-     relies on), save the fake provider's key through Settings;
+  3. launch the built binary `build/src/out/Default/rac.app/Contents/MacOS/rac`
+     with `--user-data-dir=<profile> --remote-debugging-port` (through the
+     build queue's run slot unless RAC_EVALS_NO_QUEUE=1), save the fake
+     provider's key through Settings;
   4. open the fixture tabs, open chrome://rac-ai, send each turn with
      racAiSend, answer every card as grade.simulated_answer says, wait for
      the run to end;
@@ -198,25 +199,41 @@ def launch_env(profile):
     return env
 
 
+def browser_binary(worktree):
+    """The dev build's binary inside the app bundle."""
+    return os.path.join(worktree, "build", "src", "out", "Default",
+                        "rac.app", "Contents", "MacOS", "rac")
+
+
 def launch_args(profile, port, worktree):
-    """The queue-wrapped launch. worktree.sh supplies --use-mock-keychain (the
-    API key's OSCrypt needs it), --enable-ui-devtools, and its own
-    --user-data-dir, which this later one wins. Run it from the worktree's
-    root: worktree.sh finds the tree from the cwd."""
-    devutils = os.path.join(worktree, "devutils", "rac")
-    return [os.path.join(devutils, "build-queue.sh"),
-            os.path.join(devutils, "worktree.sh"), "run",
-            f"--user-data-dir={profile}", f"--remote-debugging-port={port}",
-            "--remote-debugging-address=127.0.0.1", "--remote-allow-origins=*",
+    """The launch command: the app binary itself, so a remote eval host needs
+    only the build output, not the checkout's run scripts. --use-mock-keychain
+    lets OSCrypt store the fake provider's key without the real keychain (what
+    worktree.sh supplied). The build queue wraps the launch in a run slot;
+    RAC_EVALS_NO_QUEUE=1 runs the binary directly."""
+    binary = browser_binary(worktree)
+    if not os.path.exists(binary):
+        raise RuntimeError(f"no built rac at {binary}; build the worktree first")
+    argv = [binary,
+            f"--user-data-dir={profile}", "--use-mock-keychain",
+            "--disable-features=DialMediaRouteProvider",
+            f"--remote-debugging-port={port}", "--remote-debugging-address=127.0.0.1",
             "--rac-launch-in-background", "--no-first-run", "--no-default-browser-check",
             "--disable-background-networking", "--disable-component-update"]
+    if os.environ.get("RAC_EVALS_NO_QUEUE") == "1":
+        return argv
+    queue = os.path.join(worktree, "devutils", "rac", "build-queue.sh")
+    if not os.path.exists(queue):
+        raise RuntimeError(f"no build queue at {queue}; set RAC_EVALS_NO_QUEUE=1 to go without it")
+    return [queue, "--run"] + argv
 
 
 def kill_run(proc, profile, grace=20):
-    """Stops what launch_args started: SIGTERM to the queue's own group, which
-    forwards it to the browser's family, then anything still holding this
-    profile. Matches the throwaway profile path so no other browser can be
-    killed by mistake."""
+    """Stops what launch_args started: SIGTERM to the launch's own group (the
+    queue forwards it to the browser's family; without the queue the group is
+    the browser's family), then anything still holding this profile. Matches
+    the throwaway profile path so no other browser can be killed by
+    mistake."""
     if proc.poll() is not None:
         return
     try:
@@ -561,7 +578,7 @@ def main(argv=None):
     ap.add_argument("--baseline", default=grade.DEFAULT_BASELINE)
     ap.add_argument("--gate", action="store_true", help="G4: require every attack to stop")
     ap.add_argument("--worktree", default=ROOT,
-                    help="the checkout whose built rac runs (its worktree.sh and build/)")
+                    help="the checkout whose built rac runs (its devutils/rac and build/)")
     ap.add_argument("--keep-profile", action="store_true")
     ap.add_argument("--post-status", metavar="SHA", help="post rac/agent-evals for this commit")
     args = ap.parse_args(argv)

@@ -74,10 +74,12 @@ Each is marked `TODO(binary)` in the code.
    spaces in COMMAND come as `\x20` or plain spaces.
 3. **Bundle path.** `find_bundle` takes the first `.app` in
    `build/src/out/Default`. Pass `--bundle` otherwise.
-4. **`worktree.sh run` passes flags through** (`--log-net-log`,
-   `--net-log-capture-mode`) and its browser process can be found by its
-   `--user-data-dir=<profile>` (it may not exec the browser, so the pid
-   `Popen` returns is not used).
+4. **The launch goes through `run.launch_args`**: the app binary itself
+   (`build/src/out/Default/rac.app/Contents/MacOS/rac`), wrapped in
+   `build-queue.sh --run` unless `RAC_EVALS_NO_QUEUE=1`, with the net-log
+   flags appended (`--log-net-log`, `--net-log-capture-mode`). The browser
+   process is found by its `--user-data-dir=<profile>` (the queue doesn't
+   exec the browser, so the pid `Popen` returns is not used).
 5. **Pref names** in `seed_preferences`: `rac.ai.enabled`,
    `rac.ai.provider`, `rac.ai.provider_settings.custom.base_url`,
    `rac.ai.browser_control`, `rac.ai.agent_permission_level`.
