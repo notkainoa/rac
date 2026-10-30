@@ -296,6 +296,22 @@ class NamesTest(unittest.TestCase):
         self.assertNotEqual(self.grd.stat().st_mtime_ns, 1_234_567_890_123_456_789)
         self.assertFalse((self.tree / dev_names.STATE_DIR / dev_names.MTIMES).exists())
 
+    def test_sub_drops_the_mtime_record_after_a_gn_gen_since_unsub(self):
+        # gn reads .grd files, so a gn gen between unsub and sub counts as a
+        # build even when siso saved nothing.
+        ninja = self.tree / 'out' / 'Default' / 'build.ninja'
+        ninja.parent.mkdir(parents=True)
+        ninja.write_bytes(b'rules')
+        os.utime(ninja, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(self.grd, ns=(1_234_567_890_123_456_789, 1_234_567_890_123_456_789))
+        dev_names.unsub(self.tree)
+        os.utime(ninja, ns=(2_000_000_000, 2_000_000_000))
+        with mock.patch('sys.stdout', new_callable=io.StringIO) as stdout, \
+             mock.patch('sys.stderr', new_callable=io.StringIO):
+            self.run_passes()
+        self.assertNotIn('kept mtimes', stdout.getvalue())
+        self.assertNotEqual(self.grd.stat().st_mtime_ns, 1_234_567_890_123_456_789)
+
     def test_sub_drops_a_malformed_mtime_record(self):
         os.utime(self.grd, ns=(1_234_567_890_123_456_789,) * 2)
         dev_names.unsub(self.tree)
