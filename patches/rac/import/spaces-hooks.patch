@@ -1,0 +1,931 @@
+Index: src/chrome/browser/rac/spaces/spaces_service.cc
+===================================================================
+--- src.orig/chrome/browser/rac/spaces/spaces_service.cc
++++ src/chrome/browser/rac/spaces/spaces_service.cc
+@@ -163,6 +163,47 @@ bool SpacesService::MoveSpace(const base
+   return true;
+ }
+ 
++void SpacesService::RestoreSpace(Space space, size_t index) {
++  CHECK(space.id.is_valid());
++  const base::Uuid id = space.id;
++  auto it = FindIterator(id);
++  if (it == spaces_.end()) {
++    index = std::min(index, spaces_.size());
++    spaces_.insert(spaces_.begin() + index, std::move(space));
++    Save();
++    for (Observer& observer : observers_) {
++      observer.OnSpaceAdded(id);
++    }
++    return;
++  }
++
++  // Upsert: take the old entry out, put `space` where it should be, and
++  // report only what changed.
++  const size_t old_index = static_cast<size_t>(it - spaces_.begin());
++  const bool renamed = it->name != space.name;
++  const bool appearance = it->icon != space.icon ||
++                          it->theme.ToDict() != space.theme.ToDict();
++  spaces_.erase(it);
++  index = std::min(index, spaces_.size());
++  spaces_.insert(spaces_.begin() + index, std::move(space));
++  Save();
++  if (appearance) {
++    for (Observer& observer : observers_) {
++      observer.OnSpaceAppearanceChanged(id);
++    }
++  }
++  if (renamed) {
++    for (Observer& observer : observers_) {
++      observer.OnSpaceRenamed(id);
++    }
++  }
++  if (index != old_index) {
++    for (Observer& observer : observers_) {
++      observer.OnSpacesReordered();
++    }
++  }
++}
++
+ void SpacesService::MarkSpaceActive(const base::Uuid& id) {
+   auto it = FindIterator(id);
+   if (it == spaces_.end()) {
+Index: src/chrome/browser/rac/spaces/spaces_service.h
+===================================================================
+--- src.orig/chrome/browser/rac/spaces/spaces_service.h
++++ src/chrome/browser/rac/spaces/spaces_service.h
+@@ -75,6 +75,15 @@ class SpacesService : public KeyedServic
+   // range.
+   bool MoveSpace(const base::Uuid& id, size_t index);
+ 
++  // Inserts `space` at `index`, replacing any space with the same ID.
++  // Every field is kept as given, including theme.unknown_fields; `index`
++  // is clamped to the end of the list. Saves once, then reports the
++  // change: OnSpaceAdded for a new ID, or OnSpaceAppearanceChanged,
++  // OnSpaceRenamed, and OnSpacesReordered for whichever of icon, theme,
++  // name, and position actually changed. A restore path uses this to put
++  // a space back where it was. The list can never end up empty.
++  void RestoreSpace(Space space, size_t index);
++
+   // Records that a window just showed `id`.
+   void MarkSpaceActive(const base::Uuid& id);
+ 
+Index: src/chrome/browser/rac/spaces/spaces_service_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/rac/spaces/spaces_service_unittest.cc
++++ src/chrome/browser/rac/spaces/spaces_service_unittest.cc
+@@ -10,11 +10,13 @@
+ 
+ #include "base/scoped_observation.h"
+ #include "base/strings/string_util.h"
++#include "base/test/bind.h"
+ #include "base/test/simple_test_clock.h"
+ #include "base/time/time.h"
+ #include "base/uuid.h"
+ #include "base/values.h"
+ #include "chrome/browser/rac/spaces/spaces_prefs.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "components/prefs/testing_pref_service.h"
+ #include "testing/gmock/include/gmock/gmock.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+@@ -343,5 +345,137 @@ TEST_F(SpacesServiceTest, NothingUsableS
+   EXPECT_TRUE(service->spaces()[0].id.is_valid());
+ }
+ 
++TEST_F(SpacesServiceTest, RestoreSpaceInsertsAtIndexAndClamps) {
++  auto service = MakeService();
++  const base::Uuid a = service->spaces()[0].id;
++  const base::Uuid b = service->CreateSpace("B");
++  const base::Uuid c = service->CreateSpace("C");
++
++  Space imported(base::Uuid::GenerateRandomV4(), "Imported");
++  const base::Uuid imported_id = imported.id;
++  service->RestoreSpace(std::move(imported), 1);
++  EXPECT_THAT(Ids(*service), ElementsAre(a, imported_id, b, c));
++  EXPECT_EQ(service->FindSpace(imported_id)->name, "Imported");
++
++  // An index past the end appends.
++  Space last(base::Uuid::GenerateRandomV4(), "Last");
++  const base::Uuid last_id = last.id;
++  service->RestoreSpace(std::move(last), 100);
++  EXPECT_THAT(Ids(*service), ElementsAre(a, imported_id, b, c, last_id));
++}
++
++TEST_F(SpacesServiceTest, RestoreSpaceUpsertReportsOnlyWhatChanged) {
++  auto service = MakeService();
++  const base::Uuid a = service->spaces()[0].id;
++  const base::Uuid b = service->CreateSpace("B");
++  const base::Uuid c = service->CreateSpace("C");
++  RecordingObserver observer;
++  service->AddObserver(&observer);
++
++  // A new ID is an addition, not a reorder.
++  Space imported(base::Uuid::GenerateRandomV4(), "Imported");
++  const base::Uuid imported_id = imported.id;
++  service->RestoreSpace(std::move(imported), 1);
++  EXPECT_THAT(observer.added, ElementsAre(imported_id));
++  EXPECT_TRUE(observer.renamed.empty());
++  EXPECT_TRUE(observer.appearance.empty());
++  EXPECT_EQ(observer.reordered, 0);
++
++  // Same spot, new name: only a rename.
++  Space renamed(imported_id, "Renamed");
++  service->RestoreSpace(std::move(renamed), 1);
++  EXPECT_THAT(observer.renamed, ElementsAre(imported_id));
++  EXPECT_TRUE(observer.appearance.empty());
++  EXPECT_EQ(observer.reordered, 0);
++  EXPECT_EQ(observer.added.size(), 1u);
++
++  // A new icon or theme and a new spot: appearance and reorder.
++  Space themed(imported_id, "Renamed");
++  themed.icon = "🌊";
++  themed.theme.color1 = "#123456";
++  service->RestoreSpace(std::move(themed), 0);
++  EXPECT_THAT(observer.appearance, ElementsAre(imported_id));
++  EXPECT_EQ(observer.renamed.size(), 1u);
++  EXPECT_EQ(observer.reordered, 1);
++  EXPECT_THAT(Ids(*service), ElementsAre(imported_id, a, b, c));
++
++  // Restoring the very same space reports nothing.
++  Space same(imported_id, "Renamed");
++  same.icon = "🌊";
++  same.theme.color1 = "#123456";
++  service->RestoreSpace(std::move(same), 0);
++  EXPECT_EQ(observer.appearance.size(), 1u);
++  EXPECT_EQ(observer.renamed.size(), 1u);
++  EXPECT_EQ(observer.reordered, 1);
++  service->RemoveObserver(&observer);
++
++  // Upserting the only space's ID leaves one space.
++  TestingPrefServiceSimple solo_prefs;
++  RegisterSpacesProfilePrefs(solo_prefs.registry());
++  SpacesService solo(&solo_prefs);
++  solo.RestoreSpace(Space(solo.spaces()[0].id, "Only"), 0);
++  EXPECT_EQ(solo.spaces().size(), 1u);
++}
++
++TEST_F(SpacesServiceTest, RestoreSpaceKeepsEveryFieldAndPersists) {
++  auto service = MakeService();
++  const base::Uuid id = service->spaces()[0].id;
++  const base::Uuid b = service->CreateSpace("B");
++
++  Space restored(id, "Restored");
++  restored.icon = "🌊";
++  restored.theme.color1 = "#123456";
++  restored.theme.color2 = "#654321";
++  restored.theme.mode = SpaceTheme::Mode::kDark;
++  restored.theme.unknown_fields.Set("dark1", "#111111");
++  restored.unknown_fields.Set("future_field", 42);
++  restored.last_active = base::Time::FromSecondsSinceUnixEpoch(1'600'000'000);
++  service->RestoreSpace(std::move(restored), 1);
++
++  service.reset();
++  auto reloaded = MakeService();
++  const Space* space = reloaded->FindSpace(id);
++  ASSERT_TRUE(space);
++  EXPECT_EQ(space->name, "Restored");
++  EXPECT_EQ(space->icon, "🌊");
++  EXPECT_EQ(space->theme.color1, "#123456");
++  EXPECT_EQ(space->theme.color2, "#654321");
++  EXPECT_EQ(space->theme.mode, SpaceTheme::Mode::kDark);
++  EXPECT_EQ(*space->theme.unknown_fields.FindString("dark1"), "#111111");
++  EXPECT_EQ(space->unknown_fields.FindInt("future_field"), 42);
++  EXPECT_EQ(space->last_active,
++            base::Time::FromSecondsSinceUnixEpoch(1'600'000'000));
++  EXPECT_EQ(reloaded->GetIndex(id), 1u);
++
++  // A new ID persists too, at its restored spot.
++  Space added(base::Uuid::GenerateRandomV4(), "Added");
++  const base::Uuid added_id = added.id;
++  reloaded->RestoreSpace(std::move(added), 0);
++  reloaded.reset();
++  auto again = MakeService();
++  EXPECT_THAT(Ids(*again), ElementsAre(added_id, b, id));
++  EXPECT_EQ(again->FindSpace(added_id)->name, "Added");
++}
++
++TEST_F(SpacesServiceTest, RestoreSpaceSavesOnce) {
++  auto service = MakeService();
++  const base::Uuid a = service->spaces()[0].id;
++  service->CreateSpace("B");
++
++  int writes = 0;
++  PrefChangeRegistrar registrar;
++  registrar.Init(&prefs_);
++  registrar.Add(kSpaces,
++                base::BindLambdaForTesting([&writes] { ++writes; }));
++
++  Space imported(base::Uuid::GenerateRandomV4(), "Imported");
++  service->RestoreSpace(std::move(imported), 0);
++  EXPECT_EQ(writes, 1);
++
++  Space renamed(a, "New name");
++  service->RestoreSpace(std::move(renamed), 2);
++  EXPECT_EQ(writes, 2);
++}
++
+ }  // namespace
+ }  // namespace rac
+Index: src/chrome/browser/rac/spaces/spaces_store.cc
+===================================================================
+--- src.orig/chrome/browser/rac/spaces/spaces_store.cc
++++ src/chrome/browser/rac/spaces/spaces_store.cc
+@@ -12,6 +12,7 @@
+ #include "base/files/file_util.h"
+ #include "base/files/important_file_writer.h"
+ #include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
+ #include "base/json/values_util.h"
+@@ -19,6 +20,7 @@
+ #include "base/pickle.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "base/token.h"
+ 
+@@ -236,11 +238,34 @@ void SpacesStore::Load() {
+   DidLoad(base::OnceClosure(), ReadData(dir_));
+ }
+ 
+-void SpacesStore::LoadAsync(base::OnceClosure ready) {
++void SpacesStore::LoadAsync(base::OnceClosure ready,
++                            base::TaskPriority priority) {
+   CHECK(!loading_ && !write_pending_ && spaces_.empty());
+   loading_ = true;
+-  write_task_runner_->PostTaskAndReplyWithResult(
+-      FROM_HERE, base::BindOnce(&SpacesStore::ReadData, dir_),
++  if (priority == base::TaskPriority::BEST_EFFORT) {
++    write_task_runner_->PostTaskAndReplyWithResult(
++        FROM_HERE, base::BindOnce(&SpacesStore::ReadData, dir_),
++        base::BindOnce(&SpacesStore::DidLoad, weak_factory_.GetWeakPtr(),
++                       std::move(ready)));
++    return;
++  }
++  // The read starts from a later task on this sequence, not from here: it
++  // decodes stored tabs with the session navigation driver, which Chrome
++  // installs after the profile (and so this store) is created, and a read
++  // that decodes first leaves the browser with the wrong driver.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&SpacesStore::StartRead,
++                                weak_factory_.GetWeakPtr(), std::move(ready),
++                                priority));
++}
++
++void SpacesStore::StartRead(base::OnceClosure ready,
++                            base::TaskPriority priority) {
++  // Reading on a different sequence from the writer is safe: Put and Remove
++  // CHECK `!loading_`, so no write can be pending before the load finishes.
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), priority},
++      base::BindOnce(&SpacesStore::ReadData, dir_),
+       base::BindOnce(&SpacesStore::DidLoad, weak_factory_.GetWeakPtr(),
+                      std::move(ready)));
+ }
+@@ -335,6 +360,14 @@ void SpacesStore::SaveNow() {
+   write_pending_ = false;
+ }
+ 
++void SpacesStore::Flush(base::OnceClosure done) {
++  SaveNow();
++  // The no-op is sequenced after the write SaveNow just posted, and any
++  // write still running, so `done` runs only once the data is on disk.
++  write_task_runner_->PostTaskAndReply(FROM_HERE, base::DoNothing(),
++                                       std::move(done));
++}
++
+ base::DictValue SpacesStore::ToDict() const {
+   base::DictValue dict = unknown_fields_.Clone();
+   dict.Set(kVersionKey, version_);
+Index: src/chrome/browser/rac/spaces/spaces_store.h
+===================================================================
+--- src.orig/chrome/browser/rac/spaces/spaces_store.h
++++ src/chrome/browser/rac/spaces/spaces_store.h
+@@ -15,6 +15,7 @@
+ #include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "base/task/task_traits.h"
+ #include "base/time/time.h"
+ #include "base/timer/timer.h"
+ #include "base/uuid.h"
+@@ -81,8 +82,11 @@ class SpacesStore {
+   // Reads the file. Call once, early.
+   void Load();
+   // Reads and decodes on the storage sequence. Do not mutate the store until
+-  // `ready` runs. Destroying the store safely cancels the reply.
+-  void LoadAsync(base::OnceClosure ready);
++  // `ready` runs. Destroying the store safely cancels the reply. `priority`
++  // is the read's task priority; the default shares the write sequence's
++  // BEST_EFFORT priority.
++  void LoadAsync(base::OnceClosure ready,
++                 base::TaskPriority priority = base::TaskPriority::BEST_EFFORT);
+ 
+   // The stored space, or null. Doesn't remove it; call Remove once the tabs
+   // are live again.
+@@ -95,10 +99,16 @@ class SpacesStore {
+   bool HasPendingWrite() const;
+   // Posts the pending snapshot for writing without blocking the caller.
+   void SaveNow();
++  // Writes any pending data now like SaveNow, then runs `done` on the UI
++  // thread once that write — and every write posted before it — has
++  // finished on the write sequence. `done` always runs asynchronously,
++  // even when nothing was pending.
++  void Flush(base::OnceClosure done);
+ 
+  private:
+   struct LoadedData;
+   static LoadedData ReadData(const base::FilePath& dir);
++  void StartRead(base::OnceClosure ready, base::TaskPriority priority);
+   void DidLoad(base::OnceClosure ready, LoadedData data);
+   base::DictValue ToDict() const;
+ 
+Index: src/chrome/browser/rac/spaces/spaces_store_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/rac/spaces/spaces_store_unittest.cc
++++ src/chrome/browser/rac/spaces/spaces_store_unittest.cc
+@@ -218,6 +218,28 @@ TEST_F(SpacesStoreTest, AsyncLoadDoesNot
+   EXPECT_FALSE(store.HasPendingWrite());
+ }
+ 
++TEST_F(SpacesStoreTest, AsyncLoadAtHigherPriorityLoadsTheSameData) {
++  const auto id = base::Uuid::GenerateRandomV4();
++  {
++    SpacesStore initial(dir_.GetPath());
++    initial.Put(MakeSpace(id, "retained"));
++  }
++  task_environment_.RunUntilIdle();
++
++  SpacesStore store(dir_.GetPath());
++  base::test::TestFuture<void> ready;
++  {
++    base::ScopedDisallowBlocking disallow_blocking;
++    store.LoadAsync(ready.GetCallback(), base::TaskPriority::USER_VISIBLE);
++    EXPECT_FALSE(ready.IsReady());
++    task_environment_.RunUntilIdle();
++  }
++  ASSERT_TRUE(ready.IsReady());
++  ASSERT_TRUE(store.Find(id));
++  EXPECT_EQ(*store.Find(id)->unknown_fields.FindString("marker"), "retained");
++  EXPECT_FALSE(store.HasPendingWrite());
++}
++
+ TEST_F(SpacesStoreTest, AsyncLoadCanOutliveStoreWithoutCallingClient) {
+   base::test::TestFuture<void> ready;
+   {
+@@ -231,6 +253,36 @@ TEST_F(SpacesStoreTest, AsyncLoadCanOutl
+   EXPECT_FALSE(base::PathExists(dir_.GetPath().AppendASCII("rac spaces")));
+ }
+ 
++TEST_F(SpacesStoreTest, FlushRunsCallbackAfterTheWriteLands) {
++  SpacesStore store(dir_.GetPath());
++  const base::Uuid id = base::Uuid::GenerateRandomV4();
++  store.Put(MakeSpace(id, "flushed"));
++
++  base::test::TestFuture<void> flushed;
++  {
++    base::ScopedDisallowBlocking disallow_blocking;
++    store.Flush(flushed.GetCallback());
++    EXPECT_FALSE(store.HasPendingWrite());
++    // The callback waits for the background write, not for Put's timer.
++    EXPECT_FALSE(flushed.IsReady());
++    task_environment_.RunUntilIdle();
++  }
++  ASSERT_TRUE(flushed.IsReady());
++
++  SpacesStore reloaded(dir_.GetPath());
++  reloaded.Load();
++  ASSERT_TRUE(reloaded.Find(id));
++  EXPECT_EQ(*reloaded.Find(id)->unknown_fields.FindString("marker"),
++            "flushed");
++
++  // With nothing pending, the callback is still asynchronous.
++  base::test::TestFuture<void> again;
++  store.Flush(again.GetCallback());
++  EXPECT_FALSE(again.IsReady());
++  task_environment_.RunUntilIdle();
++  EXPECT_TRUE(again.IsReady());
++}
++
+ TEST_F(SpacesStoreTest, AsyncLoadThenSaveRetainsOtherSpaces) {
+   const auto first = base::Uuid::GenerateRandomV4();
+   const auto second = base::Uuid::GenerateRandomV4();
+Index: src/chrome/browser/ui/rac/sidebar/sidebar_items.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/sidebar/sidebar_items.cc
++++ src/chrome/browser/ui/rac/sidebar/sidebar_items.cc
+@@ -8,6 +8,7 @@
+ #include <set>
+ #include <utility>
+ 
++#include "base/check.h"
+ #include "base/no_destructor.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/uuid.h"
+@@ -26,10 +27,6 @@ namespace rac {
+ 
+ namespace {
+ 
+-// A dictionary of lists, each {"entries": [entry...]}. An entry is an item
+-// {"id", "url", "title", "name"} or a folder {"id", "title", "collapsed",
+-// "items"}.
+-constexpr char kListsPref[] = "rac.sidebar.lists";
+ // Set once Helium's pinned tabs have been turned into favorites.
+ constexpr char kMigratedPref[] = "rac.sidebar.migrated_pinned_tabs";
+ 
+@@ -158,6 +155,18 @@ const std::string& EntryId(const Sidebar
+ 
+ }  // namespace
+ 
++SidebarItems::ScopedBatch::ScopedBatch(SidebarItems* items) : items_(items) {
++  CHECK(items_);
++  ++items_->batch_depth_;
++}
++
++SidebarItems::ScopedBatch::~ScopedBatch() {
++  if (--items_->batch_depth_ == 0 && items_->batch_dirty_) {
++    items_->batch_dirty_ = false;
++    items_->SaveAndNotify();
++  }
++}
++
+ SidebarItem::SidebarItem() = default;
+ SidebarItem::SidebarItem(const SidebarItem&) = default;
+ SidebarItem& SidebarItem::operator=(const SidebarItem&) = default;
+@@ -520,6 +529,14 @@ void SidebarItems::SetListCollapsed(std:
+   SaveAndNotify();
+ }
+ 
++void SidebarItems::ReloadFromPrefs() {
++  lists_.clear();
++  LoadListsFromPrefs();
++  for (Observer& observer : observers_) {
++    observer.OnSidebarItemsChanged();
++  }
++}
++
+ void SidebarItems::AddObserver(Observer* observer) {
+   observers_.AddObserver(observer);
+ }
+@@ -655,12 +672,7 @@ void SidebarItems::MigrateHeliumPinnedTa
+ }
+ 
+ void SidebarItems::Load() {
+-  std::set<std::string> seen_ids;
+-  for (const auto [key, value] : profile_->GetPrefs()->GetDict(kListsPref)) {
+-    if (value.is_dict()) {
+-      lists_[key] = ListFromValue(value.GetDict(), seen_ids);
+-    }
+-  }
++  LoadListsFromPrefs();
+   // Earlier pinned-tab builds used one placeholder space. Adopt its list in
+   // the profile's first real space without changing item or folder IDs.
+   if (SpacesService* spaces = SpacesServiceFactory::GetForProfile(profile_)) {
+@@ -674,7 +686,20 @@ void SidebarItems::Load() {
+   }
+ }
+ 
++void SidebarItems::LoadListsFromPrefs() {
++  std::set<std::string> seen_ids;
++  for (const auto [key, value] : profile_->GetPrefs()->GetDict(kListsPref)) {
++    if (value.is_dict()) {
++      lists_[key] = ListFromValue(value.GetDict(), seen_ids);
++    }
++  }
++}
++
+ void SidebarItems::SaveAndNotify() {
++  if (batch_depth_ > 0) {
++    batch_dirty_ = true;
++    return;
++  }
+   base::DictValue lists;
+   for (const auto& [key, list] : lists_) {
+     if (!list.entries.empty() || list.collapsed) {
+Index: src/chrome/browser/ui/rac/sidebar/sidebar_items.h
+===================================================================
+--- src.orig/chrome/browser/ui/rac/sidebar/sidebar_items.h
++++ src/chrome/browser/ui/rac/sidebar/sidebar_items.h
+@@ -32,6 +32,11 @@ namespace rac {
+ 
+ class SidebarWindows;
+ 
++// The pref holding every list: a dictionary of serialized lists, each
++// {"entries": [entry...]}. An entry is an item {"id", "url", "title",
++// "name"} or a folder {"id", "title", "collapsed", "items"}.
++inline constexpr char kListsPref[] = "rac.sidebar.lists";
++
+ // A favorite or a pinned tab. Every window shows each item as a real tab;
+ // the item remembers the page it was pinned on, and the tab can browse away
+ // and reset back to it.
+@@ -102,6 +107,21 @@ class SidebarItems : public KeyedService
+     virtual void OnSidebarItemsChanged() = 0;
+   };
+ 
++  // While a ScopedBatch is alive, edits only mark the store dirty: one
++  // save and one notification for many edits. Batches may nest; the
++  // outermost batch's end saves and notifies once if anything changed.
++  // Create on the stack.
++  class ScopedBatch {
++   public:
++    explicit ScopedBatch(SidebarItems* items);
++    ScopedBatch(const ScopedBatch&) = delete;
++    ScopedBatch& operator=(const ScopedBatch&) = delete;
++    ~ScopedBatch();
++
++   private:
++    const raw_ptr<SidebarItems> items_;
++  };
++
+   static constexpr char kFavorites[] = "favorites";
+   static std::string PinnedListKey(const SpaceId& space);
+ 
+@@ -159,6 +179,11 @@ class SidebarItems : public KeyedService
+   void SetFolderCollapsed(std::string_view folder_id, bool collapsed);
+   void SetListCollapsed(std::string_view list_key, bool collapsed);
+ 
++  // Re-reads every list from the kListsPref pref, then notifies observers
++  // and windows, without writing the pref back. For a restore that set
++  // the pref behind this service's back.
++  void ReloadFromPrefs();
++
+   void AddObserver(Observer* observer);
+   void RemoveObserver(Observer* observer);
+ 
+@@ -189,11 +214,16 @@ class SidebarItems : public KeyedService
+                   SidebarItem item);
+   void MigrateHeliumPinnedTabs();
+   void Load();
++  // Reads kListsPref into `lists_`. Used by Load and ReloadFromPrefs.
++  void LoadListsFromPrefs();
+   void SaveAndNotify();
+ 
+   const raw_ptr<Profile> profile_;
+   std::map<std::string, SidebarList, std::less<>> lists_;
+   base::ObserverList<Observer> observers_;
++  // While positive, SaveAndNotify only sets `batch_dirty_`.
++  int batch_depth_ = 0;
++  bool batch_dirty_ = false;
+   std::unique_ptr<SidebarWindows> windows_;
+   base::ScopedObservation<SpacesService, SpacesService::Observer>
+       spaces_observation_{this};
+Index: src/chrome/browser/ui/rac/spaces/spaces_window_manager.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/spaces/spaces_window_manager.cc
++++ src/chrome/browser/ui/rac/spaces/spaces_window_manager.cc
+@@ -11,6 +11,7 @@
+ #include "base/check.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
++#include "base/logging.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "chrome/browser/lifetime/browser_shutdown.h"
+ #include "chrome/browser/performance_manager/policies/page_discarding_helper.h"
+@@ -98,6 +99,34 @@ bool IsUnusedInitialTab(tabs::TabInterfa
+          search::IsNTPOrRelatedURL(contents->GetVisibleURL(), profile);
+ }
+ 
++// StoredSpace holds a DictValue, so it has no copy constructor.
++StoredSpace CopyStoredSpace(const StoredSpace& source) {
++  StoredSpace copy;
++  copy.space = source.space;
++  copy.tabs = source.tabs;
++  copy.groups = source.groups;
++  copy.active_tab = source.active_tab;
++  copy.unknown_fields = source.unknown_fields.Clone();
++  return copy;
++}
++
++// Appends `stored`'s tabs and groups to `entry`, keeping `entry`'s active
++// tab and unknown fields. `entry->space` must already name the target space.
++void AppendStoredTabs(StoredSpace& entry, StoredSpace& stored) {
++  for (StoredGroup& group : stored.groups) {
++    const bool known =
++        std::ranges::any_of(entry.groups, [&](const StoredGroup& existing) {
++          return existing.id == group.id;
++        });
++    if (!known) {
++      entry.groups.push_back(std::move(group));
++    }
++  }
++  for (StoredTab& tab : stored.tabs) {
++    entry.tabs.push_back(std::move(tab));
++  }
++}
++
+ }  // namespace
+ 
+ SpacesWindowManager::SpacesWindowManager(Profile* profile,
+@@ -434,6 +463,53 @@ void SpacesWindowManager::MoveTabsToSpac
+   NotifyWindowSpaceChanged(browser);
+ }
+ 
++void SpacesWindowManager::MoveWindowTabs(const base::Uuid& from,
++                                         const base::Uuid& to) {
++  if (from == to || !spaces_->FindSpace(from) || !spaces_->FindSpace(to)) {
++    return;
++  }
++  // Retag every live tab of `from`, wherever it sits. TagTab also rewrites
++  // the session service's per-tab extra data, so a later session restore
++  // doesn't put them back in `from`. Groups and splits keep their members:
++  // a group belongs to one space, so all of `from`'s move together.
++  std::vector<WindowState*> affected;
++  for (auto* tab : GetSpaceTabs(from)) {
++    TagTab(tab, to);
++    WindowState* state = FindState(tab->GetBrowserWindowInterface());
++    if (state && !std::ranges::contains(affected, state)) {
++      affected.push_back(state);
++    }
++  }
++  // A window showing `from` now has no visible tabs of it; show `to` there.
++  // ShowSpace records the new window space in the session, and it reveals
++  // `to`'s tabs before the store merge below adds `from`'s stored ones.
++  for (const auto& [browser, state] : windows_) {
++    if (!state->closing && state->space == from) {
++      ShowSpace(const_cast<BrowserWindowInterface*>(browser), to);
++      // ShowSpace already refreshed and notified this window.
++      std::erase(affected, state.get());
++    }
++  }
++  // A space's tabs live either in a window or in the store; move the stored
++  // entry too. AddStoredTabs restores it into a window when `to` has live
++  // tabs, which the store merge would lose.
++  if (store_ready_) {
++    if (const StoredSpace* stored = store_.Find(from)) {
++      StoredSpace moved = CopyStoredSpace(*stored);
++      moved.space = to;
++      store_.Remove(from);
++      AddStoredTabs(std::move(moved));
++    }
++  }
++  hidden_since_.erase(from);
++  last_active_tabs_.erase(from);
++  for (WindowState* state : affected) {
++    RefreshVisibility(*state);
++    NotifyWindowSpaceChanged(state->browser);
++  }
++  UpdateUnloadTimer();
++}
++
+ void SpacesWindowManager::DeleteSpace(const base::Uuid& space) {
+   if (!store_ready_ || spaces_->spaces().size() <= 1 ||
+       !spaces_->FindSpace(space)) {
+@@ -562,6 +638,136 @@ size_t SpacesWindowManager::GetTabCount(
+   return 0;
+ }
+ 
++bool SpacesWindowManager::HasLiveTabs(const base::Uuid& space) const {
++  // GetSpaceTabs also finds hidden and unloaded tabs: a space has live tabs
++  // whenever any tab strip still holds one of them.
++  return !GetSpaceTabs(space).empty();
++}
++
++std::vector<StoredTabSummary> SpacesWindowManager::GetStoredTabs(
++    const base::Uuid& space) const {
++  std::vector<StoredTabSummary> summaries;
++  if (!store_ready_) {
++    return summaries;
++  }
++  const StoredSpace* stored = store_.Find(space);
++  if (!stored) {
++    return summaries;
++  }
++  summaries.reserve(stored->tabs.size());
++  for (const StoredTab& tab : stored->tabs) {
++    StoredTabSummary& summary = summaries.emplace_back();
++    if (!tab.navigations.empty()) {
++      const int selected =
++          std::clamp(tab.selected_navigation, 0,
++                     static_cast<int>(tab.navigations.size()) - 1);
++      const sessions::SerializedNavigationEntry& navigation =
++          tab.navigations[selected];
++      summary.url = navigation.virtual_url();
++      summary.title = navigation.title();
++      summary.favicon_url = navigation.favicon_url();
++    }
++    summary.pinned = !tab.sidebar_item_id.empty();
++    summary.last_active = tab.last_active;
++  }
++  return summaries;
++}
++
++void SpacesWindowManager::AddStoredTabs(StoredSpace stored) {
++  if (!store_ready_) {
++    DLOG(ERROR) << "AddStoredTabs before the store is ready; callers wait "
++                   "with RunWhenStoreReady.";
++    return;
++  }
++  if (!spaces_->FindSpace(stored.space)) {
++    return;
++  }
++  // A space with live tabs but no window showing it (hidden) still gets live
++  // tabs: a store entry beside live tabs is dropped when the space is shown
++  // again, so the tabs would be lost.
++  BrowserWindowInterface* holder = GetWindowHoldingSpace(stored.space);
++  if (!holder) {
++    const std::vector<tabs::TabInterface*> live = GetSpaceTabs(stored.space);
++    if (!live.empty()) {
++      holder = live.front()->GetBrowserWindowInterface();
++    }
++  }
++  if (holder) {
++    // RestoreStoredSpace inserts every tab unselected and defers loading
++    // until activation, so the window's active tab and its loaded pages are
++    // untouched. Its return value only matters to a caller that activates.
++    RestoreStoredSpace(holder, stored);
++    if (WindowState* state = FindState(holder)) {
++      RefreshVisibility(*state);
++    }
++    return;
++  }
++  // No window has the space's tabs: they stay stored. Appended after any
++  // existing entry's tabs, which keep the entry's active tab.
++  if (const StoredSpace* existing = store_.Find(stored.space)) {
++    StoredSpace entry = CopyStoredSpace(*existing);
++    AppendStoredTabs(entry, stored);
++    store_.Put(std::move(entry));
++  } else {
++    store_.Put(std::move(stored));
++  }
++}
++
++void SpacesWindowManager::RemoveStoredTabs(const base::Uuid& space) {
++  if (store_ready_) {
++    store_.Remove(space);
++  }
++}
++
++void SpacesWindowManager::RunWhenStoreReady(base::OnceClosure callback) {
++  if (store_ready_) {
++    std::move(callback).Run();
++    return;
++  }
++  store_ready_callbacks_.push_back(std::move(callback));
++}
++
++void SpacesWindowManager::FlushStore(base::OnceClosure callback) {
++  if (!store_ready_) {
++    RunWhenStoreReady(base::BindOnce(&SpacesWindowManager::FlushStore,
++                                     weak_ptr_factory_.GetWeakPtr(),
++                                     std::move(callback)));
++    return;
++  }
++  // A hidden space's tabs stay live in a window's tab strip, and the store
++  // only learns of them when they leave a window (HandleWindowClosing) or
++  // at Shutdown. Snapshot them now, replacing each space's entry like a
++  // window closing does: the live tabs are the current copy, and a stale or
++  // appended entry can't outlive them. Tabs of a space a window shows
++  // persist through the session instead, as at quit.
++  std::map<base::Uuid, std::vector<tabs::TabInterface*>> hidden;
++  for (const auto& [browser, state] : windows_) {
++    if (state->closing) {
++      continue;
++    }
++    for (auto* tab : *browser->GetTabStripModel()) {
++      if (tab->IsPinned() || tab == state->placeholder_tab) {
++        continue;
++      }
++      if (auto space = SpaceTabTag::Get(tab->GetContents())) {
++        hidden[*space].push_back(tab);
++      }
++    }
++  }
++  for (const auto& [space, tabs] : hidden) {
++    if (GetWindowHoldingSpace(space)) {
++      continue;
++    }
++    tabs::TabInterface* active = nullptr;
++    if (auto it = last_active_tabs_.find(space);
++        it != last_active_tabs_.end()) {
++      active = it->second.Get();
++    }
++    store_.Put(SnapshotSpaceTabs(space, tabs, active));
++  }
++  store_.Flush(std::move(callback));
++}
++
+ void SpacesWindowManager::AddObserver(Observer* observer) {
+   observers_.AddObserver(observer);
+ }
+@@ -740,6 +946,18 @@ void SpacesWindowManager::OnStoreReady()
+       ReconcileWindow(browser);
+     }
+   }
++  // Swapped out first: a callback may queue another or destroy this manager.
++  std::vector<base::OnceClosure> ready_callbacks;
++  ready_callbacks.swap(store_ready_callbacks_);
++  const base::WeakPtr<SpacesWindowManager> weak =
++      weak_ptr_factory_.GetWeakPtr();
++  for (auto& callback : ready_callbacks) {
++    std::move(callback).Run();
++    // A callback may have destroyed this manager; the rest are dropped with it.
++    if (!weak) {
++      return;
++    }
++  }
+ }
+ 
+ void SpacesWindowManager::ReconcileWindow(BrowserWindowInterface* browser) {
+Index: src/chrome/browser/ui/rac/spaces/spaces_window_manager.h
+===================================================================
+--- src.orig/chrome/browser/ui/rac/spaces/spaces_window_manager.h
++++ src/chrome/browser/ui/rac/spaces/spaces_window_manager.h
+@@ -8,6 +8,7 @@
+ #include <map>
+ #include <memory>
+ #include <optional>
++#include <string>
+ #include <vector>
+ 
+ #include "base/callback_list.h"
+@@ -16,6 +17,7 @@
+ #include "base/observer_list.h"
+ #include "base/observer_list_types.h"
+ #include "base/scoped_observation.h"
++#include "base/time/time.h"
+ #include "base/timer/timer.h"
+ #include "base/uuid.h"
+ #include "chrome/browser/rac/spaces/spaces_service.h"
+@@ -27,6 +29,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "components/keyed_service/core/keyed_service.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "url/gurl.h"
+ 
+ class BrowserWindowInterface;
+ class Profile;
+@@ -44,6 +47,15 @@ namespace rac {
+ // The session's window extra data key holding the space a window shows.
+ inline constexpr char kWindowSpaceExtraDataKey[] = "rac.space";
+ 
++// One stored tab of a space, summarized for lists and prompts.
++struct StoredTabSummary {
++  GURL url;
++  std::u16string title;
++  GURL favicon_url;
++  bool pinned = false;
++  base::Time last_active;
++};
++
+ // Decides which space each window shows. All live tabs stay owned by a normal
+ // TabStripModel, including tabs of spaces not currently shown.
+ //
+@@ -124,6 +136,12 @@ class SpacesWindowManager : public Keyed
+                        const std::vector<int>& indices,
+                        const base::Uuid& space);
+ 
++  // Moves every live tab of `from` to `to`, wherever it sits, and moves
++  // `from`'s stored tabs along. No tab is closed. A window showing `from`
++  // shows `to` afterwards. Does nothing when `from` and `to` are the same or
++  // either isn't a space.
++  void MoveWindowTabs(const base::Uuid& from, const base::Uuid& to);
++
+   // Closes the space's tabs, keeping them in History, and removes the space.
+   // Windows showing it switch to another space. Does nothing for the last
+   // space.
+@@ -131,6 +149,35 @@ class SpacesWindowManager : public Keyed
+ 
+   size_t GetTabCount(const base::Uuid& space) const;
+ 
++  // True while a window's tab strip holds a tab of `space`, including a
++  // hidden or unloaded one. Unlike GetWindowHoldingSpace, a space can have
++  // live tabs without a window showing it.
++  bool HasLiveTabs(const base::Uuid& space) const;
++
++  // The space's stored tabs, in stored order. Empty while the store loads
++  // or when the space has none.
++  std::vector<StoredTabSummary> GetStoredTabs(const base::Uuid& space) const;
++
++  // Adds `stored`'s tabs to `space`, which must exist. When a window holds
++  // the space they restore into it, deferred and unselected, so the active
++  // tab stays and nothing loads. Otherwise they join the space's stored
++  // tabs. Needs the store loaded; callers that can't wait use
++  // RunWhenStoreReady.
++  void AddStoredTabs(StoredSpace stored);
++
++  // Drops the space's stored tabs. Live tabs are untouched. Does nothing
++  // while the store loads.
++  void RemoveStoredTabs(const base::Uuid& space);
++
++  // Runs `callback` now when the store is loaded, or right after it loads.
++  // Callbacks still pending when the manager is destroyed are dropped.
++  void RunWhenStoreReady(base::OnceClosure callback);
++
++  // Snapshots hidden spaces' live tabs into the store, writes it, and runs
++  // `callback` once the write finished. The file then holds every hidden
++  // space's tabs.
++  void FlushStore(base::OnceClosure callback);
++
+   // Discards the tabs of a hidden space to free their memory. They reload
+   // when a window shows the space again. Tabs playing audio, showing
+   // picture-in-picture, or still loading stay live. Does nothing for a
+@@ -237,6 +284,7 @@ class SpacesWindowManager : public Keyed
+   // session persistence. Loaded off the UI thread before claiming a space.
+   SpacesStore store_;
+   bool store_ready_ = false;
++  std::vector<base::OnceClosure> store_ready_callbacks_;
+ 
+   std::map<const BrowserWindowInterface*, std::unique_ptr<WindowState>>
+       windows_;
