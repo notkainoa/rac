@@ -36,14 +36,17 @@ None of these need a Chromium build or `he`.
   link points to it, search engines skip it, and it shows sample data. Set
   it to `true` with the first release (see
   [Releases](releases.md#the-website)).
-- **The download page** detects Apple silicon or Intel, starts that
-  download once per visit, and lists every build below the install steps.
-  When the browser won't say which chip it's on (Safari often won't), the
-  page asks instead of guessing, so an Intel Mac never gets the wrong disk
-  image. It reads the latest GitHub release when the site builds
-  (`site/src/lib/release.ts`), so visitors never contact GitHub's API, only
-  the file they download. If the release is missing a disk image, or GitHub
-  doesn't answer, the build fails and the last good deployment stays live.
+- **The download page** is Apple silicon only. It shows one "Download for
+  Mac" button, labelled "Apple silicon (M1 or later), macOS 13 Ventura or
+  later". On a Mac it knows has Apple silicon, it starts the download once
+  per visit. On an Intel Mac it says rac needs Apple silicon and downloads
+  nothing. When the browser won't say which chip (Safari often won't), it
+  doesn't auto-download. Versions before 0.2.0 are labelled "Preview. Not
+  for daily use." It reads the latest GitHub release when the site builds
+  (`site/src/lib/release.ts`) and uses only the `_arm64-macos.dmg` asset,
+  so visitors never contact GitHub's API. If the release has no arm64 disk
+  image, or GitHub doesn't answer, the build fails and the last good
+  deployment stays live.
 - **The windows are working drawings of rac.** `site/src/components/rac/`
   rebuilds the sidebar, space editor, and assistant panel in HTML. Sizes were
   measured from the running browser. Colors and the eight space themes are
