@@ -210,7 +210,7 @@
 +#endif  // CHROME_BROWSER_UI_RAC_IMPORT_ARC_DEV_TRIGGER_H_
 --- /dev/null
 +++ b/chrome/browser/ui/rac/import/arc_importer.cc
-@@ -0,0 +1,1640 @@
+@@ -0,0 +1,1860 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -218,6 +218,7 @@
 +#include "chrome/browser/ui/rac/import/arc_importer.h"
 +
 +#include <algorithm>
++#include <map>
 +#include <memory>
 +#include <optional>
 +#include <string>
@@ -257,7 +258,7 @@
 +#include "chrome/browser/profiles/profile_observer.h"
 +#include "chrome/browser/rac/import/arc_import_mapping.h"
 +#include "chrome/browser/rac/import/arc_import_record.h"
-+#include "chrome/browser/rac/import/arc_source_root.h"
++#include "chrome/browser/rac/import/arc_reader.h"
 +#include "chrome/browser/rac/spaces/space.h"
 +#include "chrome/browser/rac/spaces/spaces_service.h"
 +#include "chrome/browser/rac/spaces/spaces_service_factory.h"
@@ -422,15 +423,44 @@
 +  return live;
 +}
 +
-+// The pinned list holding folder `id`, or empty.
-+std::string FindFolderListKey(const Services& s, std::string_view id) {
++// Every folder in a space's pinned list, by id, with the key of that list.
++// Built once per pass, so finding folders stays linear.
++using FolderLists = std::map<std::string, std::string, std::less<>>;
++FolderLists GatherFolderLists(const Services& s) {
++  FolderLists folders;
 +  for (const Space& space : s.spaces->spaces()) {
-+    std::string key = SidebarItems::PinnedListKey(space.id);
-+    if (s.items->GetList(key).FindFolder(id)) {
-+      return key;
++    const std::string key = SidebarItems::PinnedListKey(space.id);
++    for (const SidebarList::Entry& entry : s.items->GetList(key).entries) {
++      if (const auto* folder = std::get_if<SidebarFolder>(&entry)) {
++        folders.emplace(folder->id, key);
++      }
 +    }
 +  }
-+  return std::string();
++  return folders;
++}
++
++// An import cut short before it marked its run done is settled against
++// what the profile holds (ArcImportRecord::FinishInterrupted). A dropped
++// run's snapshot is unpinned, so its normal cap and expiry apply.
++ArcImportRecord::Interrupted SettleInterruptedRun(Profile* profile,
++                                                  const Services& s,
++                                                  ArcImportRecord& record) {
++  const ArcImportRecord::Run* interrupted = record.InterruptedRun();
++  if (!interrupted) {
++    return ArcImportRecord::Interrupted::kNone;
++  }
++  const std::string snapshot = interrupted->snapshot_id;
++  const ArcLiveSidebar live = GatherLive(profile, s);
++  const ArcImportRecord::Interrupted result =
++      record.FinishInterrupted(live.space_ids, live.sidebar_ids);
++  if (result == ArcImportRecord::Interrupted::kDropped && !snapshot.empty()) {
++    s.backups->UnpinSnapshot(snapshot);
++  }
++  return result;
++}
++
++std::string NewRacId() {
++  return base::Uuid::GenerateRandomV4().AsLowercaseString();
 +}
 +
 +StoredTab ToStoredTab(const ArcApplyTab& tab) {
@@ -457,12 +487,119 @@
 +  bool partial = false;
 +};
 +
++// The top-level entries of `list`, as PlanKeptPins() reads them.
++std::vector<ArcUndoPinEntry> PinEntries(const SidebarList& list) {
++  std::vector<ArcUndoPinEntry> entries;
++  for (const SidebarList::Entry& entry : list.entries) {
++    ArcUndoPinEntry pin;
++    if (const auto* folder = std::get_if<SidebarFolder>(&entry)) {
++      pin.id = folder->id;
++      pin.is_folder = true;
++      for (const SidebarItem& item : folder->items) {
++        pin.item_ids.push_back(item.id);
++      }
++    } else {
++      pin.id = std::get<SidebarItem>(entry).id;
++    }
++    entries.push_back(std::move(pin));
++  }
++  return entries;
++}
++
++// Moves `kept` from `source_key` to the end of the top level of
++// `target_key`. A folder of kept pins is made again there, under a new id.
++// Returns that id for each folder in `kept`, empty for a loose item or a
++// folder that wasn't moved.
++std::vector<std::string> MoveKeptPins(const Services& s,
++                                      const std::string& source_key,
++                                      const std::string& target_key,
++                                      const std::vector<ArcKeptPin>& kept) {
++  // One save and one notification; it ends before DeleteSpace closes tabs,
++  // so the kept pins' tabs have moved with them by then.
++  SidebarItems::ScopedBatch batch(s.items);
++  std::vector<std::string> copies(kept.size());
++  for (size_t i = 0; i < kept.size(); ++i) {
++    const ArcKeptPin& pin = kept[i];
++    if (pin.item_ids.empty()) {
++      continue;
++    }
++    if (pin.folder_id.empty()) {
++      s.items->MoveItem(
++          pin.item_ids.front(), target_key,
++          SidebarPosition{std::string(),
++                          s.items->GetList(target_key).entries.size()});
++      continue;
++    }
++    const SidebarFolder* folder =
++        s.items->GetList(source_key).FindFolder(pin.folder_id);
++    if (!folder) {
++      continue;
++    }
++    // AddFolder may grow the list and move its entries, so copy the
++    // folder's fields before calling it.
++    const std::u16string title = folder->title;
++    const bool collapsed = folder->collapsed;
++    copies[i] = s.items->AddFolder(
++        target_key, s.items->GetList(target_key).entries.size(), title);
++    s.items->SetFolderCollapsed(copies[i], collapsed);
++    s.items->MoveItems(pin.item_ids, target_key,
++                       SidebarPosition{copies[i], 0});
++  }
++  return copies;
++}
++
++// Undoes MoveKeptPins() for a space that stayed after all. Each kept pin
++// goes back to its index, in list order, which rebuilds the list as it was
++// (ArcKeptPin). A folder that moving its pins out emptied, and so removed,
++// is made again in its place under its own id, so the record's mapping of
++// it still holds; its copy is emptied by the moves, and so removed.
++void PutKeptPinsBack(const Services& s,
++                     const std::string& source_key,
++                     const std::string& target_key,
++                     const std::vector<ArcKeptPin>& kept,
++                     const std::vector<std::string>& copies) {
++  SidebarItems::ScopedBatch batch(s.items);
++  for (size_t i = 0; i < kept.size(); ++i) {
++    const ArcKeptPin& pin = kept[i];
++    if (pin.item_ids.empty()) {
++      continue;
++    }
++    if (pin.folder_id.empty()) {
++      s.items->MoveItem(pin.item_ids.front(), source_key,
++                        SidebarPosition{std::string(), pin.index});
++      continue;
++    }
++    if (copies[i].empty()) {
++      continue;
++    }
++    if (!s.items->GetList(source_key).FindFolder(pin.folder_id)) {
++      const SidebarFolder* copy =
++          s.items->GetList(target_key).FindFolder(copies[i]);
++      if (!copy) {
++        continue;
++      }
++      const std::u16string title = copy->title;
++      const bool collapsed = copy->collapsed;
++      s.items->AddFolderWithId(pin.folder_id, source_key, pin.index, title);
++      s.items->SetFolderCollapsed(pin.folder_id, collapsed);
++    }
++    for (size_t j = 0; j < pin.item_ids.size(); ++j) {
++      s.items->MoveItem(pin.item_ids[j], source_key,
++                        SidebarPosition{pin.folder_id, pin.item_indices[j]});
++    }
++  }
++}
++
 +// Takes out what `run` added to this profile, by id, wherever it is now.
 +// Pins the user added to an imported space after the import are first
-+// moved to a space that stays. Shared by Undo and by the rollback after a
-+// failed record write. `blank` is the space the run replaced, put back
-+// first so the profile always has a space and windows on an imported space
-+// fall back to it.
++// moved to a space that stays. Used by Undo. `blank` is the space the run
++// replaced, put back first so the profile always has a space and windows
++// on an imported space fall back to it.
++//
++// A page that asks before closing can keep its space: the user stayed on
++// it. That space then stays as it was. Its kept pins go back in their
++// places, and nothing in it is removed, so its mappings stay and Undo can
++// be tried again; the result is partial.
 +Removal RemoveRun(const Services& s,
 +                  const ArcImportRecord& record,
 +                  const ArcImportRecord::Run& run,
@@ -483,105 +620,78 @@
 +      s.spaces->spaces(), [&](const Space& space) {
 +        return std::ranges::contains(run_spaces, space.id.AsLowercaseString());
 +      });
++  std::optional<base::Uuid> created;
 +  if (only_run_spaces) {
-+    s.spaces->CreateSpace();
++    created = s.spaces->CreateSpace();
 +  }
 +
-+  // DeleteSpace deletes a space's whole pinned list, so move out first
-+  // what the run didn't make: pins the user added to an imported space
-+  // after the import. The favorites list is profile-wide and untouched by
-+  // DeleteSpace, so favorites need no move.
-+  {
-+    // Where the kept pins go: the restored blank space if the run replaced
-+    // one, else the first space the run didn't make.
-+    std::string target_key;
-+    if (blank_id && s.spaces->FindSpace(*blank_id)) {
-+      target_key = SidebarItems::PinnedListKey(*blank_id);
-+    } else {
-+      for (const Space& space : s.spaces->spaces()) {
-+        if (!std::ranges::contains(run_spaces,
-+                                 space.id.AsLowercaseString())) {
-+          target_key = SidebarItems::PinnedListKey(space.id);
-+          break;
-+        }
++  // DeleteSpace deletes a space's whole pinned list, so what the run didn't
++  // make is moved out first: pins the user added to an imported space after
++  // the import. They go to the restored blank space if the run replaced
++  // one, else to the first space the run didn't make. The favorites list
++  // is profile-wide and untouched by DeleteSpace, so favorites need no
++  // move.
++  std::string target_key;
++  if (blank_id && s.spaces->FindSpace(*blank_id)) {
++    target_key = SidebarItems::PinnedListKey(*blank_id);
++  } else {
++    for (const Space& space : s.spaces->spaces()) {
++      if (!std::ranges::contains(run_spaces, space.id.AsLowercaseString())) {
++        target_key = SidebarItems::PinnedListKey(space.id);
++        break;
 +      }
 +    }
-+    if (!target_key.empty()) {
-+      base::flat_set<std::string> run_ids;
-+      for (ItemKind kind :
-+           {ItemKind::kPinnedTab, ItemKind::kFolder, ItemKind::kFavorite}) {
-+        for (const std::string& id : record.ItemsOfRun(run.id, kind)) {
-+          run_ids.insert(id);
-+        }
-+      }
-+      // The batch isn't held across DeleteSpace, which closes tabs.
-+      SidebarItems::ScopedBatch batch(s.items);
-+      for (const std::string& id : run_spaces) {
-+        const base::Uuid uuid = base::Uuid::ParseLowercase(id);
-+        if (!uuid.is_valid() || !s.spaces->FindSpace(uuid)) {
-+          continue;
-+        }
-+        const std::string source_key = SidebarItems::PinnedListKey(uuid);
-+        std::vector<ArcUndoPinEntry> entries;
-+        for (const SidebarList::Entry& entry :
-+             s.items->GetList(source_key).entries) {
-+          ArcUndoPinEntry pin;
-+          if (const auto* folder = std::get_if<SidebarFolder>(&entry)) {
-+            pin.id = folder->id;
-+            pin.is_folder = true;
-+            for (const SidebarItem& item : folder->items) {
-+              pin.item_ids.push_back(item.id);
-+            }
-+          } else {
-+            pin.id = std::get<SidebarItem>(entry).id;
-+          }
-+          entries.push_back(std::move(pin));
-+        }
-+        // Each kept pin is appended at the end of the target's top level;
-+        // a folder of kept pins is made again there, under a new id.
-+        for (const ArcKeptPin& kept : PlanKeptPins(entries, run_ids)) {
-+          if (kept.item_ids.empty()) {
-+            continue;
-+          }
-+          if (kept.folder_id.empty()) {
-+            s.items->MoveItem(
-+                kept.item_ids.front(), target_key,
-+                SidebarPosition{std::string(),
-+                                s.items->GetList(target_key).entries.size()});
-+            continue;
-+          }
-+          const SidebarFolder* folder =
-+              s.items->GetList(source_key).FindFolder(kept.folder_id);
-+          if (!folder) {
-+            continue;
-+          }
-+          // AddFolder may grow the list and move its entries, so copy the
-+          // folder's fields before calling it.
-+          const std::u16string title = folder->title;
-+          const bool collapsed = folder->collapsed;
-+          const std::string new_id = s.items->AddFolder(
-+              target_key, s.items->GetList(target_key).entries.size(), title);
-+          s.items->SetFolderCollapsed(new_id, collapsed);
-+          s.items->MoveItems(kept.item_ids, target_key,
-+                             SidebarPosition{new_id, 0});
-+        }
-+      }
++  }
++  base::flat_set<std::string> run_ids;
++  for (ItemKind kind :
++       {ItemKind::kPinnedTab, ItemKind::kFolder, ItemKind::kFavorite}) {
++    for (const std::string& id : record.ItemsOfRun(run.id, kind)) {
++      run_ids.insert(id);
 +    }
 +  }
 +
 +  // Deleting a space closes its tabs into History, drops its stored tabs,
 +  // and deletes its pinned list. Its tabs' space tags and session data go
 +  // with the tabs, and windows showing it switch first, which rewrites the
-+  // window's session space. A page that asks before closing keeps its space.
++  // window's session space. A page that asks before closing keeps its
++  // space; DeleteSpace returns with the space still there.
++  std::vector<std::string> kept_spaces;
 +  for (const std::string& id : run_spaces) {
 +    const base::Uuid uuid = base::Uuid::ParseLowercase(id);
-+    if (uuid.is_valid() && s.spaces->FindSpace(uuid)) {
-+      s.windows->DeleteSpace(uuid);
-+    }
-+    if (uuid.is_valid() && s.spaces->FindSpace(uuid)) {
-+      result.partial = true;
-+    } else {
++    if (!uuid.is_valid() || !s.spaces->FindSpace(uuid)) {
 +      result.removed.insert(id);
++      continue;
++    }
++    const std::string source_key = SidebarItems::PinnedListKey(uuid);
++    std::vector<ArcKeptPin> kept;
++    std::vector<std::string> copies;
++    if (!target_key.empty()) {
++      kept = PlanKeptPins(PinEntries(s.items->GetList(source_key)), run_ids);
++      copies = MoveKeptPins(s, source_key, target_key, kept);
++    }
++    s.windows->DeleteSpace(uuid);
++    if (!s.spaces->FindSpace(uuid)) {
++      result.removed.insert(id);
++      continue;
++    }
++    PutKeptPinsBack(s, source_key, target_key, kept, copies);
++    kept_spaces.push_back(source_key);
++    result.partial = true;
++  }
++  // The new blank space isn't needed when an imported space stayed, unless
++  // it now holds pins moved out of one that went.
++  if (created && !kept_spaces.empty() &&
++      s.items->GetList(SidebarItems::PinnedListKey(*created))
++          .entries.empty()) {
++    s.windows->DeleteSpace(*created);
++  }
++
++  // Everything in a space that stayed is left as it is.
++  base::flat_set<std::string> in_kept_spaces;
++  for (const std::string& key : kept_spaces) {
++    for (const ArcUndoPinEntry& entry : PinEntries(s.items->GetList(key))) {
++      in_kept_spaces.insert(entry.id);
++      in_kept_spaces.insert(entry.item_ids.begin(), entry.item_ids.end());
 +    }
 +  }
 +
@@ -591,24 +701,31 @@
 +  // Pins the run added to spaces that stay, such as one an earlier import
 +  // made, or that the user moved out of an imported space; and favorites.
 +  // A tab that stops being an item closes if idle and stays if in use.
++  // RemoveItem does nothing for an item that's gone.
 +  for (ItemKind kind : {ItemKind::kPinnedTab, ItemKind::kFavorite}) {
 +    for (const std::string& id : record.ItemsOfRun(run.id, kind)) {
-+      if (s.items->FindItem(id)) {
-+        s.items->RemoveItem(id);
++      if (in_kept_spaces.contains(id)) {
++        continue;
 +      }
++      s.items->RemoveItem(id);
 +      result.removed.insert(id);
 +    }
 +  }
 +  // A folder the run made goes when it's empty. One the user has since put
 +  // their own pins in is theirs, and stays; its mapping stays too, so a
-+  // later import doesn't make it a second time.
++  // later import doesn't make it a second time. Gathered after the item
++  // removals, which remove a folder they empty.
++  const FolderLists folders = GatherFolderLists(s);
 +  for (const std::string& id : record.ItemsOfRun(run.id, ItemKind::kFolder)) {
-+    const std::string key = FindFolderListKey(s, id);
-+    if (key.empty()) {
++    if (in_kept_spaces.contains(id)) {
++      continue;
++    }
++    auto it = folders.find(id);
++    if (it == folders.end()) {
 +      result.removed.insert(id);
 +      continue;
 +    }
-+    if (s.items->GetList(key).FindFolder(id)->items.empty()) {
++    if (s.items->GetList(it->second).FindFolder(id)->items.empty()) {
 +      s.items->RemoveFolder(id);
 +      result.removed.insert(id);
 +    }
@@ -832,6 +949,12 @@
 +        break;
 +    }
 +
++    // An earlier import into this profile that was cut short is settled
++    // first, so nothing it wrote is added twice and Undo still finds it.
++    if (SettleInterruptedRun(profile_, services_, record_) !=
++        ArcImportRecord::Interrupted::kNone) {
++      record_dirty_ = true;
++    }
 +    plan_ = MapArcProfile(source_, record_, GatherLive(profile_, services_),
 +                          run_info_.options);
 +    result_.counts = plan_.counts;
@@ -843,7 +966,8 @@
 +  }
 +
 +  // Nothing is left to add: report it, write the record when it must name
-+  // this run so Undo finds the other profiles, and go on to history.
++  // this run so Undo finds the other profiles, or when it changed (an
++  // interrupted run was settled), and go on to history.
 +  void NothingNew() {
 +    SendSpacesProgress();
 +    result_.status = ArcProfileResult::Status::kNothingNew;
@@ -852,6 +976,16 @@
 +      WriteRecord(base::BindOnce(&ArcProfileImport::AfterRecordSaved,
 +                                 weak_factory_.GetWeakPtr(),
 +                                 /*wrote_sidebar=*/false));
++      return;
++    }
++    if (record_dirty_) {
++      WriteRecord(base::BindOnce(
++          [](base::WeakPtr<ArcProfileImport> self, bool) {
++            if (self) {
++              self->ImportHistory();
++            }
++          },
++          weak_factory_.GetWeakPtr()));
 +      return;
 +    }
 +    ImportHistory();
@@ -888,7 +1022,10 @@
 +    Apply();
 +  }
 +
-+  // Everything visible, in one task, so no window shows half an import.
++  // Plans the import and saves the record with the run marked in progress
++  // and every id it is about to write already mapped, before anything is
++  // written: an import cut short after this is settled at the next import
++  // or Undo instead of being added twice or left out of Undo.
 +  void Apply() {
 +    // The sidebar may have changed while the store flushed and the
 +    // snapshot was written, so plan against it now, not against what it
@@ -897,24 +1034,70 @@
 +                          run_info_.options);
 +    result_.counts = plan_.counts;
 +    if (plan_.IsEmpty()) {
-+      // The snapshot has nothing to roll back to; unpin it so its normal
-+      // cap and expiry apply.
-+      services_.backups->UnpinSnapshot(run_.snapshot_id);
-+      run_.snapshot_id.clear();
-+      run_.snapshot_time = base::Time();
-+      run_.undo_until = base::Time();
-+      result_.undo_until.reset();
-+      NothingNew();
++      NothingNewAfterSnapshot();
 +      return;
 +    }
++    base_record_ = record_;
 +    if (plan_.record_was_stale) {
 +      record_.ClearMappings();
 +    }
++    AssignRacIds(plan_, record_, run_.id, [] { return NewRacId(); });
++    run_.in_progress = true;
++    run_.replaced_blank_space = plan_.replace_blank_space;
++    FinalizeRecord(/*wrote_sidebar=*/true);
++    WriteRecord(base::BindOnce(&ArcProfileImport::OnInProgressSaved,
++                               weak_factory_.GetWeakPtr()));
++  }
++
++  // The snapshot has nothing to roll back to; unpin it so its normal cap
++  // and expiry apply.
++  void NothingNewAfterSnapshot() {
++    services_.backups->UnpinSnapshot(run_.snapshot_id);
++    run_.snapshot_id.clear();
++    run_.snapshot_time = base::Time();
++    run_.undo_until = base::Time();
++    result_.undo_until.reset();
++    NothingNew();
++  }
++
++  void OnInProgressSaved(bool saved) {
++    if (!saved) {
++      // Nothing is written without a saved record to settle it by.
++      services_.backups->UnpinSnapshot(run_.snapshot_id);
++      services_.backups->DeleteSnapshot(run_.snapshot_id);
++      result_.counts = ArcImportCounts();
++      result_.undo_until.reset();
++      Fail(ArcImportFailure::kRecordNotSaved);
++      return;
++    }
++    WriteSidebar();
++  }
++
++  // Everything visible, in one task, so no window shows half an import.
++  void WriteSidebar() {
++    // Planned again against the sidebar as it is now, with the ids the
++    // saved record holds. Whatever has none waits for a later import.
++    plan_ = MapArcProfile(source_, base_record_,
++                          GatherLive(profile_, services_), run_info_.options);
++    TakePlannedRacIds(plan_, record_, run_.id);
++    result_.counts = plan_.counts;
++    if (plan_.IsEmpty()) {
++      // The saved run is in progress with nothing written; write the record
++      // without it.
++      record_ = std::move(base_record_);
++      record_dirty_ = true;
++      run_.in_progress = false;
++      run_.replaced_blank_space.clear();
++      NothingNewAfterSnapshot();
++      return;
++    }
 +    std::optional<base::Uuid> first_new_space;
 +    {
-+      // Without the batch, every item saves the whole lists pref and wakes
-+      // every window's sync.
++      // Without the batches, every space saves the whole spaces pref and
++      // every item the whole lists pref, and wakes every window's sync.
++      SpacesService::ScopedSaveBatch save_batch(services_.spaces);
 +      SidebarItems::ScopedBatch batch(services_.items);
++      folder_lists_ = GatherFolderLists(services_);
 +      for (ArcApplySpace& space : plan_.spaces) {
 +        const base::Uuid id =
 +            space.is_new() ? CreateSpace(space)
@@ -929,10 +1112,12 @@
 +      }
 +      for (const ArcApplyTab& favorite : plan_.favorites) {
 +        AddTab(SidebarItems::kFavorites, SidebarPosition{}, favorite,
-+               ItemKind::kFavorite, /*at_end_of=*/SidebarItems::kFavorites);
++               /*at_end_of=*/SidebarItems::kFavorites);
 +      }
++      folder_lists_.clear();
 +    }
 +
++    run_.replaced_blank_space.clear();
 +    if (first_new_space && !plan_.replace_blank_space.empty()) {
 +      ReplaceBlankSpace(base::Uuid::ParseLowercase(plan_.replace_blank_space),
 +                        *first_new_space);
@@ -960,13 +1145,26 @@
 +    SendSpacesProgress();
 +    result_.status = ArcProfileResult::Status::kDone;
 +    FinalizeRecord(/*wrote_sidebar=*/true);
++    // Marks the run done, mapping only what was written: an item that
++    // couldn't be added isn't in the profile, so a later import brings it.
++    const ArcLiveSidebar live = GatherLive(profile_, services_);
++    if (record_.FinishInterrupted(live.space_ids, live.sidebar_ids) ==
++        ArcImportRecord::Interrupted::kDropped) {
++      // Nothing could be added at all.
++      services_.backups->UnpinSnapshot(run_.snapshot_id);
++      result_.status = ArcProfileResult::Status::kNothingNew;
++      result_.counts = ArcImportCounts();
++      result_.undo_until.reset();
++    }
 +    WriteRecord(base::BindOnce(&ArcProfileImport::AfterRecordSaved,
 +                               weak_factory_.GetWeakPtr(),
 +                               /*wrote_sidebar=*/true));
 +  }
 +
 +  base::Uuid CreateSpace(ArcApplySpace& apply) {
-+    Space space(base::Uuid::GenerateRandomV4(), std::move(apply.name));
++    // AssignRacIds() made the id, and the saved record maps it.
++    Space space(base::Uuid::ParseLowercase(apply.rac_id),
++                std::move(apply.name));
 +    space.icon = std::move(apply.icon);
 +    if (apply.theme) {
 +      space.theme = std::move(*apply.theme);
@@ -976,7 +1174,6 @@
 +    // notifies OnSpaceAdded.
 +    services_.spaces->RestoreSpace(std::move(space),
 +                                   services_.spaces->spaces().size());
-+    record_.MapSpace(apply.source_id, id.AsLowercaseString(), run_.id);
 +    return id;
 +  }
 +
@@ -985,23 +1182,24 @@
 +    const std::string key = SidebarItems::PinnedListKey(space);
 +    for (const ArcApplyEntry& entry : entries) {
 +      if (const auto* tab = std::get_if<ArcApplyTab>(&entry)) {
-+        AddTab(key, SidebarPosition{}, *tab, ItemKind::kPinnedTab, key);
++        AddTab(key, SidebarPosition{}, *tab, key);
 +        continue;
 +      }
 +      const ArcApplyFolder& folder = std::get<ArcApplyFolder>(entry);
 +      std::string folder_id = folder.existing_id;
 +      std::string folder_key = key;
 +      if (folder_id.empty()) {
-+        folder_id = services_.items->AddFolder(
-+            key, services_.items->GetList(key).entries.size(), folder.title);
-+        record_.MapItem(folder.source_id, folder_id, ItemKind::kFolder,
-+                        run_.id);
++        folder_id = folder.rac_id;
++        services_.items->AddFolderWithId(
++            folder_id, key, services_.items->GetList(key).entries.size(),
++            folder.title);
 +      } else {
 +        // The user may have moved it to another space since.
-+        folder_key = FindFolderListKey(services_, folder_id);
-+        if (folder_key.empty()) {
++        auto it = folder_lists_.find(folder_id);
++        if (it == folder_lists_.end()) {
 +          continue;
 +        }
++        folder_key = it->second;
 +      }
 +      for (const ArcApplyTab& tab : folder.tabs) {
 +        const SidebarFolder* live =
@@ -1010,30 +1208,28 @@
 +          break;
 +        }
 +        AddTab(folder_key, SidebarPosition{folder_id, live->items.size()}, tab,
-+               ItemKind::kPinnedTab, std::string());
++               std::string());
 +      }
 +    }
 +  }
 +
-+  // Adds at `position`, or at the end of the top level of `at_end_of`.
++  // Adds at `position`, or at the end of the top level of `at_end_of`,
++  // under the id AssignRacIds() made, which the saved record maps.
 +  void AddTab(std::string_view key,
 +              SidebarPosition position,
 +              const ArcApplyTab& tab,
-+              ItemKind kind,
 +              std::string_view at_end_of) {
 +    if (!at_end_of.empty()) {
 +      position = {std::string(),
 +                  services_.items->GetList(at_end_of).entries.size()};
 +    }
-+    const std::string id =
-+        services_.items->AddItem(key, position, tab.url, tab.page_title);
-+    if (id.empty()) {
++    if (!services_.items->AddItemWithId(tab.rac_id, key, position, tab.url,
++                                        tab.page_title)) {
 +      return;
 +    }
 +    if (!tab.name.empty()) {
-+      services_.items->SetItemName(id, tab.name);
++      services_.items->SetItemName(tab.rac_id, tab.name);
 +    }
-+    record_.MapItem(tab.source_id, id, kind, run_.id);
 +    if (!tab.favicon_path.empty()) {
 +      favicons_.push_back({tab.url, tab.favicon_path});
 +    }
@@ -1042,11 +1238,9 @@
 +  // The window showing the blank space shows Arc's first space instead, on
 +  // a fresh new-tab page, so no Arc page loads. Then the blank space goes.
 +  void ReplaceBlankSpace(const base::Uuid& blank, const base::Uuid& first) {
-+    const Space* space = services_.spaces->FindSpace(blank);
-+    if (!space) {
++    if (!services_.spaces->FindSpace(blank)) {
 +      return;
 +    }
-+    blank_copy_ = Space::FromDict(space->ToDict());
 +    if (BrowserWindowInterface* window =
 +            services_.windows->GetWindowHoldingSpace(blank)) {
 +      services_.windows->ShowSpace(window, first);
@@ -1098,17 +1292,9 @@
 +  }
 +
 +  void AfterRecordSaved(bool wrote_sidebar, bool saved) {
-+    if (!saved && wrote_sidebar) {
-+      // Without the record a rerun would add everything again, and Undo
-+      // couldn't find it. Take it all back now.
-+      RemoveRun(services_, record_, run_, std::move(blank_copy_));
-+      services_.backups->UnpinSnapshot(run_.snapshot_id);
-+      services_.backups->DeleteSnapshot(run_.snapshot_id);
-+      result_.counts = ArcImportCounts();
-+      result_.undo_until.reset();
-+      Fail(ArcImportFailure::kRecordNotSaved);
-+      return;
-+    }
++    // With the sidebar written, a record that couldn't be marked done is
++    // fine: the in-progress one saved before maps everything written, and
++    // the next import or Undo settles it. Nothing is taken back.
 +    if (!saved && !wrote_sidebar) {
 +      // The nothing-new run's record couldn't be saved, so the hand-offs
 +      // and other profiles' names it held are gone. Report it and carry on
@@ -1158,8 +1344,19 @@
 +            .Append(base::FilePath::FromUTF8Unsafe(source_.directory));
 +    file_runner_->PostTaskAndReplyWithResult(
 +        FROM_HERE,
-+        base::BindOnce(&base::PathExists,
-+                       source_path.Append(FILE_PATH_LITERAL("History"))),
++        base::BindOnce(
++            [](const base::FilePath& support_dir,
++               const base::FilePath& folder) {
++              // Helium's importer reads this folder. It and its History must
++              // be inside Arc's folder once symlinks are followed, as for
++              // every file the reader reads.
++              const base::FilePath history =
++                  folder.Append(FILE_PATH_LITERAL("History"));
++              return base::PathExists(history) &&
++                     ArcPathStaysInside(support_dir, folder) &&
++                     ArcPathStaysInside(support_dir, history);
++            },
++            run_info_.arc_support_dir, source_path),
 +        base::BindOnce(&ArcProfileImport::StartHistory,
 +                       weak_factory_.GetWeakPtr(), source_path));
 +  }
@@ -1262,12 +1459,19 @@
 +
 +  std::unique_ptr<DataBackups::Operation> operation_;
 +  ArcImportRecord record_;
++  // The record as read, before this run's mappings, for planning again
++  // once the in-progress record is saved.
++  ArcImportRecord base_record_;
++  // The record changed without a run of this import: write it even if
++  // nothing is new.
++  bool record_dirty_ = false;
 +  ArcImportRecord::Run run_;
 +  ArcApplyPlan plan_;
 +  ArcProfileResult result_;
++  // Folder ids to their list keys, while the sidebar is written.
++  FolderLists folder_lists_;
 +  std::vector<std::pair<base::Uuid, std::vector<ArcApplyTab>>> open_tabs_;
 +  std::vector<ArcFaviconWriter::Icon> favicons_;
-+  std::optional<Space> blank_copy_;
 +  std::unique_ptr<ArcFaviconWriter> favicon_writer_;
 +  raw_ptr<BraveExternalProcessImporterHost> history_host_ = nullptr;
 +  bool history_ok_ = false;
@@ -1304,10 +1508,10 @@
 +        done_(std::move(done)) {
 +    run_.id = base::Uuid::GenerateRandomV4().AsLowercaseString();
 +    // The plan carries the folder it was read from (ImportPlan::source_dir),
-+    // so history comes from the same copy, such as a dev fixture.
-+    run_.arc_support_dir = plan_.source_dir.empty()
-+                               ? GetArcSourcePaths().support_dir
-+                               : plan_.source_dir;
++    // so history comes from the same copy, such as a dev fixture. ReadArc()
++    // always sets it. Without it there's no history: finding Arc's folder
++    // again would touch the disk on the UI thread.
++    run_.arc_support_dir = plan_.source_dir;
 +    run_.options = std::move(options);
 +    run_.handoffs = plan_.handoffs;
 +    for (size_t i = 0; i < plan_.profiles.size(); ++i) {
@@ -1531,18 +1735,38 @@
 +    }
 +    record_ = std::move(read.record);
 +    const base::Time now = base::Time::Now();
-+    const ArcImportRecord::Run* run =
-+        run_id_.empty() ? record_.UndoableRun(now) : record_.FindRun(run_id_);
-+    if (!run) {
-+      Finish(record_.runs().empty() ? ArcUndoResult::kNothingToUndo
-+                                    : ArcUndoResult::kExpired);
++
++    // An import cut short is settled first (ArcImportRecord::
++    // FinishInterrupted). If none of it was in the profile, settling it is
++    // this profile's whole Undo; the other profiles it names still get
++    // theirs.
++    std::optional<ArcImportRecord::Run> interrupted;
++    if (const ArcImportRecord::Run* run = record_.InterruptedRun()) {
++      interrupted = *run;
++    }
++    if (SettleInterruptedRun(profile_, services_, record_) ==
++            ArcImportRecord::Interrupted::kDropped &&
++        (run_id_.empty() || run_id_ == interrupted->id)) {
++      run_ = std::move(*interrupted);
++      WriteRecord();
 +      return;
 +    }
-+    if (run->undone) {
++
++    // One run at a time, newest first, in each profile.
++    const ArcImportRecord::Run* newest = record_.NewestActiveRun();
++    const ArcImportRecord::Run* run =
++        run_id_.empty() ? newest : record_.FindRun(run_id_);
++    if (!run || run->undone) {
 +      Finish(ArcUndoResult::kNothingToUndo);
 +      return;
 +    }
-+    if (now >= run->undo_until) {
++    if (run != newest) {
++      // A newer import into this profile may have added to what this run
++      // made; it has to be undone here first.
++      Finish(ArcUndoResult::kPartlyUndone);
++      return;
++    }
++    if (run->undo_until.is_null() || now >= run->undo_until) {
 +      Finish(ArcUndoResult::kExpired);
 +      return;
 +    }
@@ -1590,8 +1814,12 @@
 +    const Removal removal =
 +        RemoveRun(services_, record_, run_, std::move(blank));
 +    partial_ = removal.partial;
-+    record_.ForgetRemoved(run_.id, removal.removed);
++    record_.ForgetRemoved(run_.id, removal.removed, base::Time::Now());
 +    operation_->MarkDataChanged();
++    WriteRecord();
++  }
++
++  void WriteRecord() {
 +    file_runner_->PostTaskAndReplyWithResult(
 +        FROM_HERE,
 +        base::BindOnce(
@@ -1605,8 +1833,9 @@
 +
 +  void OnRecordWritten(bool saved) {
 +    // The pre-import snapshot isn't deleted: Undo is done with it, so the
-+    // pin comes off and its normal cap and expiry apply.
-+    if (!run_.snapshot_id.empty()) {
++    // pin comes off and its normal cap and expiry apply. A space that
++    // stayed keeps the run undoable, and Undo may need the snapshot again.
++    if (!partial_ && !run_.snapshot_id.empty()) {
 +      services_.backups->UnpinSnapshot(run_.snapshot_id);
 +    }
 +    // The sidebar is already undone. A record that couldn't be saved still
@@ -1796,22 +2025,13 @@
 +      FROM_HERE,
 +      base::BindOnce(
 +          [](base::FilePath dir) {
-+            ArcImportState state;
 +            ArcImportRecord::ReadResult read = ArcImportRecord::Read(dir);
 +            if (read.status != ArcImportRecord::ReadStatus::kOk) {
-+              return state;
++              return ArcImportState();
 +            }
-+            if (!read.record.last_import.is_null()) {
-+              state.last_import = read.record.last_import;
-+            }
-+            if (const ArcImportRecord::Run* run =
-+                    read.record.UndoableRun(base::Time::Now())) {
-+              state.undo_until = run->undo_until;
-+              if (!run->snapshot_time.is_null()) {
-+                state.undo_snapshot_time = run->snapshot_time;
-+              }
-+            }
-+            return state;
++            // An interrupted run counts as the newest import: Undo settles
++            // it, then takes out what of it is in the profile.
++            return read.record.StateAt(base::Time::Now());
 +          },
 +          profile->GetPath()),
 +      std::move(done));
@@ -1853,7 +2073,7 @@
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/ui/rac/import/arc_importer.h
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,152 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1884,21 +2104,31 @@
 +// Puts an Arc ImportPlan into rac. In each target profile it:
 +//
 +// 1. Takes DataBackups' operation token, and holds it to the end.
-+// 2. Reads the import record and maps the Arc profile against it and the live
-+//    sidebar (MapArcProfile). If nothing is new, it stops there: no snapshot,
-+//    no write.
++// 2. Reads the import record, settles an earlier import that was cut short
++//    (below), and maps the Arc profile against the record and the live
++//    sidebar (MapArcProfile). If nothing is new, it stops there: no
++//    snapshot, no write.
 +// 3. Flushes the spaces store and takes a pinned "import-arc" snapshot. No
 +//    snapshot, no import.
-+// 4. Writes spaces, pinned tabs, folders, and favorites through
++// 4. Saves the record with the run marked in progress, the snapshot, and
++//    every rac id it is about to write already mapped (AssignRacIds). If
++//    that fails, nothing is written and it reports kRecordNotSaved.
++// 5. Writes spaces, pinned tabs, folders, and favorites through
 +//    SpacesService, SidebarItems, and SpacesWindowManager, in one UI task, so
 +//    no window shows half an import. Open tabs go into the spaces store,
 +//    unloaded, except in a space a window shows.
-+// 5. Saves the record. If that fails, takes the import back and reports
-+//    kFailed, so a rerun can't add everything twice.
-+// 6. Writes Arc's cached favicons to the favicon database, decoded in the
++// 6. Saves the record again with the run done.
++// 7. Writes Arc's cached favicons to the favicon database, decoded in the
 +//    data decoder's sandbox. Nothing is fetched.
-+// 7. Runs Helium's importer for history only, if asked and not done before.
-+// 8. Operation::MarkDataChanged(), and releases the token.
++// 8. Runs Helium's importer for history only, if asked and not done before.
++// 9. Operation::MarkDataChanged(), and releases the token.
++//
++// An import cut short between steps 4 and 6 (a crash, a power cut) leaves
++// a record whose run is in progress. The next import or Undo in that
++// profile settles it before anything else (ArcImportRecord::
++// FinishInterrupted): what of it reached disk is kept as imported and stays
++// undoable, the rest is forgotten. So nothing is added twice, and Undo
++// always finds what the import wrote.
 +//
 +// Nothing here makes a network request, installs an extension, or touches
 +// AI data. Profiles are imported one at a time.
@@ -1929,7 +2159,7 @@
 +  // finds every profile's part.
 +  std::string id;
 +  // Arc's support folder, for the history step: the folder the plan was
-+  // read from (ArcSourcePaths::support_dir).
++  // read from (ImportPlan::source_dir). Empty: no history.
 +  base::FilePath arc_support_dir;
 +  ArcImportOptions options;
 +  // Set only for the profile the import started from: hand-offs live in its
@@ -1949,7 +2179,9 @@
 +
 +// The import screens' entry point. `profile` receives the default Arc
 +// profile; the other checked ones go through ArcProfileMaker. `progress`
-+// runs on the UI thread, in bursts; `done` runs once.
++// runs on the UI thread, in bursts; `done` runs once. History comes from
++// `plan.source_dir`, which ReadArc() always sets; a plan without one
++// imports no history.
 +void StartArcImport(Profile* profile,
 +                    ImportPlan plan,
 +                    ArcImportOptions options,
@@ -1965,17 +2197,23 @@
 +                          ArcImportProgressCallback progress,
 +                          ArcProfileDoneCallback done);
 +
-+// When this profile last received an Arc import, and whether and until when
-+// it can be undone. Reads the import record on a background sequence.
++// When this profile last received an Arc import, and what Undo would do
++// there: undo its newest import until when, or nothing because it was
++// undone or has expired. Reads the import record on a background sequence.
 +void GetArcImportState(Profile* profile,
 +                       base::OnceCallback<void(ArcImportState)> done);
 +
-+// "Undo Arc import": removes what the newest import added, in every profile
-+// it touched, and puts back the blank space it replaced. It never deletes a
-+// profile and leaves history, favicons, and cookies in place. The spaces
-+// it removes close their tabs, which stay in History. Things the user made
-+// since the import are kept; pins they added to an imported space move to
-+// a space that stays.
++// "Undo Arc import": removes what this profile's newest import that isn't
++// undone yet added, and puts back the blank space it replaced; then the
++// same import's part in each profile it made, where that is still the
++// profile's newest. Each profile's imports are undone one at a time, newest
++// first, so a later import into another profile never makes an earlier one
++// un-undoable: Undo there takes out the later one, and then the earlier
++// one. It never deletes a profile and leaves history, favicons, and cookies
++// in place. The spaces it removes close their tabs, which stay in History.
++// Things the user made since the import are kept; pins they added to an
++// imported space move to a space that stays, or stay where they are if a
++// page keeps that space open (kPartlyUndone).
 +void UndoArcImport(Profile* profile,
 +                   base::OnceCallback<void(ArcUndoResult)> done);
 +

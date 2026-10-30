@@ -196,7 +196,7 @@ chrome/browser/rac/import/BUILD.gn.
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_reader.cc
-@@ -0,0 +1,1066 @@
+@@ -0,0 +1,1197 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -273,13 +273,40 @@ chrome/browser/rac/import/BUILD.gn.
 +constexpr int kJsonOptions =
 +    base::JSON_PARSE_RFC | base::JSON_REPLACE_INVALID_CHARACTERS;
 +
-+enum class FileResult { kOk, kMissing, kTooLarge, kUnreadable };
++// The folder being read, resolved once, so every path under it can be checked
++// against where it really is.
++class SourceFolder {
++ public:
++  explicit SourceFolder(const base::FilePath& root)
++      : real_(base::MakeAbsoluteFilePath(root)) {}
 +
-+FileResult ReadFile(const base::FilePath& path,
++  // Whether `path`, an existing file or folder, is inside the folder once
++  // symlinks are followed. False for anything that doesn't exist.
++  bool Contains(const base::FilePath& path) const {
++    if (real_.empty()) {
++      return false;
++    }
++    const base::FilePath real = base::MakeAbsoluteFilePath(path);
++    return !real.empty() && (real == real_ || real_.IsParent(real));
++  }
++
++ private:
++  const base::FilePath real_;
++};
++
++enum class FileResult { kOk, kMissing, kTooLarge, kUnreadable, kOutside };
++
++FileResult ReadFile(const SourceFolder& folder,
++                    const base::FilePath& path,
 +                    size_t max_bytes,
 +                    std::string* contents) {
 +  if (!base::PathExists(path)) {
 +    return FileResult::kMissing;
++  }
++  // A symlink, or a symlinked folder on the way, that leads out of the
++  // folder being read.
++  if (!folder.Contains(path)) {
++    return FileResult::kOutside;
 +  }
 +  if (base::DirectoryExists(path)) {
 +    return FileResult::kUnreadable;
@@ -302,12 +329,13 @@ chrome/browser/rac/import/BUILD.gn.
 +// Reads an optional JSON file into a dict. Returns nullopt and sets
 +// `*unusable` if the file exists but can't be used.
 +std::optional<base::DictValue> ReadOptionalJsonDict(
++    const SourceFolder& folder,
 +    const base::FilePath& path,
 +    size_t max_bytes,
 +    size_t max_depth,
 +    bool* unusable) {
 +  std::string contents;
-+  FileResult result = ReadFile(path, max_bytes, &contents);
++  FileResult result = ReadFile(folder, path, max_bytes, &contents);
 +  if (result == FileResult::kMissing) {
 +    return std::nullopt;
 +  }
@@ -383,13 +411,27 @@ chrome/browser/rac/import/BUILD.gn.
 +  bool is_default = false;
 +};
 +
++// Whether `{"default": <value>}` names the default profile: `true`, or `{}`,
++// Swift's own encoding of a case without a payload. Anything else, `false`
++// included, doesn't.
++bool IsDefaultMarker(const base::Value& value) {
++  if (value.is_bool()) {
++    return value.GetBool();
++  }
++  return value.is_dict() && value.GetDict().empty();
++}
++
 +// Arc names a profile with a value such as `{"default": true}` or
 +// `{"custom": {"_0": {"directoryBasename": "Profile 1"}}}`. A missing value
-+// means the default profile.
++// means the default profile. `{"default": false}` is not the default
++// profile and names no folder, so it becomes a profile of its own, keyed by
++// its raw value, with no folder: a new rac profile without names, history,
++// or extensions.
 +ProfileKey ToProfileKey(const base::Value* value) {
 +  ProfileKey result;
 +  const base::DictValue* dict = value ? value->GetIfDict() : nullptr;
-+  if (!value || (dict && dict->Find("default"))) {
++  const base::Value* is_default = dict ? dict->Find("default") : nullptr;
++  if (!value || (is_default && IsDefaultMarker(*is_default))) {
 +    result.key = kDefaultProfileKey;
 +    result.directory = kDefaultProfileDirectory;
 +    result.is_default = true;
@@ -617,10 +659,12 @@ chrome/browser/rac/import/BUILD.gn.
 + public:
 +  SidebarReader(const base::DictValue& container,
 +                const ArcSourcePaths& paths,
++                const SourceFolder& folder,
 +                const ArcReadLimits& limits,
 +                ImportPlan& plan)
 +      : container_(container),
 +        paths_(paths),
++        folder_(folder),
 +        limits_(limits),
 +        plan_(plan),
 +        report_(plan.report) {}
@@ -663,8 +707,12 @@ chrome/browser/rac/import/BUILD.gn.
 +  }
 +
 +  void ReadFaviconNames() {
-+    base::FileEnumerator files(paths_->support_dir.Append(kFaviconDir),
-+                               /*recursive=*/false,
++    const base::FilePath dir = paths_->support_dir.Append(kFaviconDir);
++    // A cache folder that is a symlink out of Arc's folder isn't listed.
++    if (!base::DirectoryExists(dir) || !folder_->Contains(dir)) {
++      return;
++    }
++    base::FileEnumerator files(dir, /*recursive=*/false,
 +                               base::FileEnumerator::FILES);
 +    for (base::FilePath file = files.Next(); !file.empty();
 +         file = files.Next()) {
@@ -715,11 +763,20 @@ chrome/browser/rac/import/BUILD.gn.
 +    }
 +    ForEachPair(*spaces, [&](const std::string& id,
 +                             const base::DictValue& space) {
++      // Past the cap, a space costs one count and nothing else, so a file
++      // with a huge number of them stays linear.
++      if (spaces_read_ >= limits_->max_spaces) {
++        ++report_->over_limit;
++        return;
++      }
 +      ImportProfile* profile = ProfileFor(space.Find("profile"));
 +      if (!profile) {
 +        ++report_->malformed_entries;
 +        return;
 +      }
++      ++spaces_read_;
++      section_items_ = 0;
++      section_limit_ = limits_->max_items_per_space;
 +      ImportSpace result;
 +      result.source_id = id;
 +      result.title = StringOrEmpty(space, "title");
@@ -824,7 +881,7 @@ chrome/browser/rac/import/BUILD.gn.
 +          continue;
 +        }
 +        if (ImportProfile* profile = ProfileFor(&(*top_apps)[i])) {
-+          ReadContainer(*id, Section::kFavorites, profile->favorites);
++          ReadFavoritesOf(*profile, *id);
 +        } else {
 +          ++report_->malformed_entries;
 +        }
@@ -851,12 +908,35 @@ chrome/browser/rac/import/BUILD.gn.
 +          "data.itemContainer.containerType.topApps");
 +      if (top_apps) {
 +        if (ImportProfile* profile = ProfileFor(top_apps->Find("_0"))) {
-+          ReadContainer(*id, Section::kFavorites, profile->favorites);
++          ReadFavoritesOf(*profile, *id);
 +        } else {
 +          ++report_->malformed_entries;
 +        }
 +      }
 +    }
++  }
++
++  // A profile may have several favorites containers; they share its cap.
++  void ReadFavoritesOf(ImportProfile& profile, std::string_view id) {
++    size_t& read = favorites_read_[profile.source_key];
++    section_items_ = read;
++    section_limit_ = limits_->max_favorites;
++    ReadContainer(id, Section::kFavorites, profile.favorites);
++    read = section_items_;
++  }
++
++  // Spends one item of the current section's budget and of the plan's, for
++  // an item about to go into the plan. False, and counted, when either is
++  // used up; the item is then left out with whatever it holds.
++  bool TakeItemBudget() {
++    if (section_items_ >= section_limit_ ||
++        total_items_ >= limits_->max_items) {
++      ++report_->over_limit;
++      return false;
++    }
++    ++section_items_;
++    ++total_items_;
++    return true;
 +  }
 +
 +  // Reads the children of container `id` into `out`.
@@ -947,12 +1027,19 @@ chrome/browser/rac/import/BUILD.gn.
 +      result.kind = ImportItem::Kind::kTab;
 +      result.url = *url;
 +      result.page_title = StringOrEmpty(*tab, "savedTitle");
++      if (!TakeItemBudget()) {
++        return std::nullopt;
++      }
 +      result.icon_emoji =
 +          ReadEmoji(tab->FindDictByDottedPath("customInfo.iconType"));
 +      std::string favicon = ArcFaviconFileName(id);
 +      if (favicon_names_.contains(favicon)) {
-+        result.favicon_path =
++        base::FilePath path =
 +            paths_->support_dir.Append(kFaviconDir).AppendASCII(favicon);
++        // The file itself may be a symlink out of Arc's folder.
++        if (folder_->Contains(path)) {
++          result.favicon_path = std::move(path);
++        }
 +      }
 +      CountTab(section);
 +      return result;
@@ -963,16 +1050,10 @@ chrome/browser/rac/import/BUILD.gn.
 +        ++report_->skipped_live_folders;
 +        return std::nullopt;
 +      }
-+      ++report_->folders;
-+      if (in_folder) {
-+        ++report_->nested_folders;
-+      }
 +    } else if (data->FindDict("splitView")) {
 +      result.group = ImportItem::Group::kSplitView;
-+      ++report_->split_views;
 +    } else if (data->FindDict("tabGroup")) {
 +      result.group = ImportItem::Group::kTabGroup;
-+      ++report_->tab_groups;
 +    } else if (data->Find("easel")) {
 +      ++report_->skipped_easels;
 +      return std::nullopt;
@@ -982,6 +1063,24 @@ chrome/browser/rac/import/BUILD.gn.
 +    } else {
 +      ++report_->skipped_unknown;
 +      return std::nullopt;
++    }
++    // Over the cap, the folder goes without its children being read.
++    if (!TakeItemBudget()) {
++      return std::nullopt;
++    }
++    switch (result.group) {
++      case ImportItem::Group::kNone:
++        ++report_->folders;
++        if (in_folder) {
++          ++report_->nested_folders;
++        }
++        break;
++      case ImportItem::Group::kSplitView:
++        ++report_->split_views;
++        break;
++      case ImportItem::Group::kTabGroup:
++        ++report_->tab_groups;
++        break;
 +    }
 +
 +    result.kind = ImportItem::Kind::kFolder;
@@ -1029,6 +1128,7 @@ chrome/browser/rac/import/BUILD.gn.
 +
 +  const raw_ref<const base::DictValue> container_;
 +  const raw_ref<const ArcSourcePaths> paths_;
++  const raw_ref<const SourceFolder> folder_;
 +  const raw_ref<const ArcReadLimits> limits_;
 +  const raw_ref<ImportPlan> plan_;
 +  const raw_ref<ImportReport> report_;
@@ -1043,14 +1143,24 @@ chrome/browser/rac/import/BUILD.gn.
 +  std::set<base::FilePath::StringType> favicon_names_;
 +  // Index into `plan_->profiles` by profile key.
 +  std::map<std::string, size_t> profile_index_;
++
++  // The caps (ArcReadLimits). Spaces read so far; items in the plan so far;
++  // items read into the current section (a space's lists, or a profile's
++  // favorites) and its cap; and favorites read so far per profile key.
++  size_t spaces_read_ = 0;
++  size_t total_items_ = 0;
++  size_t section_items_ = 0;
++  size_t section_limit_ = 0;
++  std::map<std::string, size_t> favorites_read_;
 +};
 +
 +void ReadProfileNames(const ArcSourcePaths& paths,
++                      const SourceFolder& folder,
 +                      const ArcReadLimits& limits,
 +                      ImportPlan& plan) {
 +  bool unusable = false;
 +  std::optional<base::DictValue> local_state = ReadOptionalJsonDict(
-+      paths.support_dir.Append(kUserDataDir).Append(kLocalStateFile),
++      folder, paths.support_dir.Append(kUserDataDir).Append(kLocalStateFile),
 +      limits.max_profile_file_bytes, limits.max_json_depth, &unusable);
 +  if (unusable) {
 +    plan.report.issues.push_back(ImportIssue::kProfileNamesUnreadable);
@@ -1074,6 +1184,7 @@ chrome/browser/rac/import/BUILD.gn.
 +}
 +
 +void ReadPinnedExtensions(const ArcSourcePaths& paths,
++                          const SourceFolder& folder,
 +                          const ArcReadLimits& limits,
 +                          ImportPlan& plan) {
 +  bool unusable = false;
@@ -1082,6 +1193,7 @@ chrome/browser/rac/import/BUILD.gn.
 +      continue;
 +    }
 +    std::optional<base::DictValue> preferences = ReadOptionalJsonDict(
++        folder,
 +        paths.support_dir.Append(kUserDataDir)
 +            .Append(base::FilePath::FromUTF8Unsafe(profile.directory))
 +            .Append(kPreferencesFile),
@@ -1109,11 +1221,12 @@ chrome/browser/rac/import/BUILD.gn.
 +}
 +
 +void ReadLinkRouting(const ArcSourcePaths& paths,
++                     const SourceFolder& folder,
 +                     const ArcReadLimits& limits,
 +                     ImportPlan& plan) {
 +  bool unusable = false;
 +  std::optional<base::DictValue> routing = ReadOptionalJsonDict(
-+      paths.support_dir.Append(kLinkRoutingFile),
++      folder, paths.support_dir.Append(kLinkRoutingFile),
 +      limits.max_settings_file_bytes, limits.max_json_depth, &unusable);
 +  if (routing) {
 +    const base::Value* rules = routing->Find("rules");
@@ -1134,8 +1247,17 @@ chrome/browser/rac/import/BUILD.gn.
 +}
 +
 +void ReadDefaults(const ArcSourcePaths& paths,
++                  const SourceFolder& folder,
 +                  const ArcReadLimits& limits,
 +                  ImportPlan& plan) {
++  // The current user's defaults file is outside Arc's folder by design. In a
++  // copy of Arc's files it is inside, and then must stay inside.
++  if (paths.support_dir.IsParent(paths.defaults_plist) &&
++      base::PathExists(paths.defaults_plist) &&
++      !folder.Contains(paths.defaults_plist)) {
++    plan.report.issues.push_back(ImportIssue::kSettingsUnreadable);
++    return;
++  }
 +  std::string threshold;
 +  switch (ReadArcAutoArchiveThreshold(paths.defaults_plist,
 +                                      limits.max_settings_file_bytes,
@@ -1190,10 +1312,13 @@ chrome/browser/rac/import/BUILD.gn.
 +  if (!paths.support_dir.IsAbsolute()) {
 +    return base::unexpected(ArcReadError::kNotFound);
 +  }
++  // Every file and folder read below must be inside this folder once
++  // symlinks are followed.
++  const SourceFolder folder(paths.support_dir);
 +  std::optional<base::Value> root;
 +  {
 +    std::string contents;
-+    switch (ReadFile(paths.support_dir.Append(kSidebarFile),
++    switch (ReadFile(folder, paths.support_dir.Append(kSidebarFile),
 +                     limits.max_sidebar_bytes, &contents)) {
 +      case FileResult::kOk:
 +        break;
@@ -1202,6 +1327,7 @@ chrome/browser/rac/import/BUILD.gn.
 +      case FileResult::kTooLarge:
 +        return base::unexpected(ArcReadError::kTooLarge);
 +      case FileResult::kUnreadable:
++      case FileResult::kOutside:
 +        return base::unexpected(ArcReadError::kUnreadable);
 +    }
 +    root = base::JSONReader::Read(contents, kJsonOptions,
@@ -1235,16 +1361,16 @@ chrome/browser/rac/import/BUILD.gn.
 +  ImportPlan plan;
 +  plan.source = ImportSource::kArc;
 +  plan.source_dir = paths.support_dir;
-+  SidebarReader(*data_container, paths, limits, plan).Read();
++  SidebarReader(*data_container, paths, folder, limits, plan).Read();
 +
-+  ReadProfileNames(paths, limits, plan);
-+  ReadPinnedExtensions(paths, limits, plan);
-+  ReadLinkRouting(paths, limits, plan);
++  ReadProfileNames(paths, folder, limits, plan);
++  ReadPinnedExtensions(paths, folder, limits, plan);
++  ReadLinkRouting(paths, folder, limits, plan);
 +  if (paths.defaults_plist.IsAbsolute()) {
-+    ReadDefaults(paths, limits, plan);
++    ReadDefaults(paths, folder, limits, plan);
 +  }
 +  const base::FilePath archive = paths.support_dir.Append(kArchiveFile);
-+  if (base::PathExists(archive)) {
++  if (base::PathExists(archive) && folder.Contains(archive)) {
 +    plan.handoffs.archive_path = archive;
 +  }
 +
@@ -1253,6 +1379,11 @@ chrome/browser/rac/import/BUILD.gn.
 +    plan.report.spaces += static_cast<int>(profile.spaces.size());
 +  }
 +  return plan;
++}
++
++bool ArcPathStaysInside(const base::FilePath& root,
++                        const base::FilePath& path) {
++  return SourceFolder(root).Contains(path);
 +}
 +
 +std::string ArcFaviconFileName(std::string_view item_id) {
@@ -1265,7 +1396,7 @@ chrome/browser/rac/import/BUILD.gn.
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_reader.h
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,113 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1316,8 +1447,10 @@ chrome/browser/rac/import/BUILD.gn.
 +  kUnexpectedShape,
 +};
 +
-+// Size and depth limits, so a damaged or hostile file can't exhaust memory
-+// or the stack. Tests lower them.
++// Size, depth, and count limits, so a damaged or hostile file can't exhaust
++// memory or the stack, or make the import's work on the UI thread grow out
++// of bounds. What a count limit leaves out is counted in
++// ImportReport::over_limit. Tests lower them.
 +struct ArcReadLimits {
 +  size_t max_sidebar_bytes = 64 * 1024 * 1024;
 +  // Arc's Chromium `Local State` and `Preferences`.
@@ -1332,6 +1465,16 @@ chrome/browser/rac/import/BUILD.gn.
 +  // A tab URL longer than this is dropped as invalid.
 +  size_t max_url_chars = url::kMaxURLChars;
 +  size_t max_favicon_files = 100'000;
++  // Spaces in the whole plan, across profiles. Later spaces are left out
++  // without being read, each counted once.
++  size_t max_spaces = 500;
++  // Tabs and folders (split views and tab groups included) in one space's
++  // pinned and open lists together, in one profile's favorites, and in the
++  // whole plan. A folder past a cap is left out with everything in it, and
++  // counted once.
++  size_t max_items_per_space = 2'000;
++  size_t max_favorites = 500;
++  size_t max_items = 20'000;
 +};
 +
 +// Whether `paths` has an Arc sidebar to import: one file-system check of
@@ -1344,9 +1487,21 @@ chrome/browser/rac/import/BUILD.gn.
 +// a plan. Reads only files under `paths`, and changes nothing. Blocks on file
 +// I/O, so call it on a sequence that may block. Never crashes on bad input:
 +// damaged parts are left out and counted in `ImportPlan::report`.
++//
++// Nothing outside `paths.support_dir` is read through it: a file or folder
++// in it that resolves outside it once symlinks are followed is refused (an
++// outside `StorableSidebar.json` is kUnreadable; any other file is reported
++// as unusable or left out). The current user's defaults file, which is
++// outside Arc's folder by design, is the one exception.
 +base::expected<ImportPlan, ArcReadError> ReadArc(
 +    const ArcSourcePaths& paths,
 +    const ArcReadLimits& limits = ArcReadLimits());
++
++// Whether `path` exists and, once symlinks are followed, is `root` or inside
++// it. Blocking. For later steps that read from Arc's folder, such as the
++// history import.
++bool ArcPathStaysInside(const base::FilePath& root,
++                        const base::FilePath& path);
 +
 +// The name of an item's file in `SidebarItemsFaviconCache/`: the lowercase
 +// hex MD5 of its id's UTF-8 bytes. Any id works, UUID or not.
@@ -1357,7 +1512,7 @@ chrome/browser/rac/import/BUILD.gn.
 +#endif  // CHROME_BROWSER_RAC_IMPORT_ARC_READER_H_
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_reader_unittest.cc
-@@ -0,0 +1,1619 @@
+@@ -0,0 +1,2135 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1380,6 +1535,7 @@ chrome/browser/rac/import/BUILD.gn.
 +#include "base/files/scoped_temp_dir.h"
 +#include "base/path_service.h"
 +#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
 +#include "base/time/time.h"
 +#include "base/types/expected.h"
 +#include "chrome/browser/rac/import/import_plan.h"
@@ -1459,6 +1615,7 @@ chrome/browser/rac/import/BUILD.gn.
 +  EXPECT_EQ(actual.malformed_entries, expected.malformed_entries)
 +      << "malformed_entries";
 +  EXPECT_EQ(actual.invalid_urls, expected.invalid_urls) << "invalid_urls";
++  EXPECT_EQ(actual.over_limit, expected.over_limit) << "over_limit";
 +  EXPECT_EQ(actual.damage_total(), expected.damage_total()) << "damage_total";
 +  EXPECT_EQ(actual.first_nested_folder_path, expected.first_nested_folder_path)
 +      << "first_nested_folder_path";
@@ -2718,6 +2875,80 @@ chrome/browser/rac/import/BUILD.gn.
 +  EXPECT_EQ(moved.profiles[0].spaces.size(), 1u);
 +}
 +
++// A sidebar with `spaces` spaces in the default profile, each with a pinned
++// container holding `tabs_per_space` tabs, and one favorites container with
++// `favorites` tabs. Ids: "space-<i>", "pin-<i>", "t-<i>-<j>", "fav-<k>".
++std::string GeneratedSidebarJson(int spaces,
++                                 int tabs_per_space,
++                                 int favorites) {
++  std::string json = R"json({"sidebar":{"containers":[{"spaces":[)json";
++  for (int i = 0; i < spaces; ++i) {
++    if (i != 0) {
++      json += ',';
++    }
++    base::StrAppend(&json,
++                    {R"json("space-)json", base::NumberToString(i),
++                     R"json(",{"title":"S)json", base::NumberToString(i),
++                     R"json(","profile":{"default":true},)json"
++                     R"json("containerIDs":["pinned","pin-)json",
++                     base::NumberToString(i), R"json("]})json"});
++  }
++  json += R"json(],"items":[)json";
++
++  // `items` is a flat key, value list; `item` adds the separator.
++  bool first_item = true;
++  auto item = [&](std::string_view entry) {
++    if (!first_item) {
++      json += ',';
++    }
++    first_item = false;
++    json += entry;
++  };
++  auto tab_json = [](std::string_view id, std::string_view url) {
++    return base::StrCat({"\"", id,
++                        R"json(",{"data":{"tab":{"savedURL":")json", url,
++                        R"json("}}})json"});
++  };
++  for (int i = 0; i < spaces; ++i) {
++    std::string pin =
++        base::StrCat({R"json("pin-)json", base::NumberToString(i),
++                      R"json(",{"childrenIds":[)json"});
++    for (int j = 0; j < tabs_per_space; ++j) {
++      if (j != 0) {
++        pin += ',';
++      }
++      base::StrAppend(&pin, {"\"t-", base::NumberToString(i), "-",
++                             base::NumberToString(j), "\""});
++    }
++    pin += "]}";
++    item(pin);
++    for (int j = 0; j < tabs_per_space; ++j) {
++      item(tab_json(
++          base::StrCat({"t-", base::NumberToString(i), "-",
++                        base::NumberToString(j)}),
++          base::StrCat({"https://example.com/", base::NumberToString(i),
++                        "/", base::NumberToString(j)})));
++    }
++  }
++
++  std::string top = R"json("top",{"childrenIds":[)json";
++  for (int k = 0; k < favorites; ++k) {
++    if (k != 0) {
++      top += ',';
++    }
++    base::StrAppend(&top, {"\"fav-", base::NumberToString(k), "\""});
++  }
++  top += "]}";
++  item(top);
++  for (int k = 0; k < favorites; ++k) {
++    item(tab_json(base::StrCat({"fav-", base::NumberToString(k)}),
++                  base::StrCat({"https://example.com/fav/",
++                                base::NumberToString(k)})));
++  }
++  json += R"json(],"topAppsContainerIDs":[{"default":true},"top"]}]}})json";
++  return json;
++}
++
 +class ArcReaderTempDirTest : public testing::Test {
 + protected:
 +  void SetUp() override { ASSERT_TRUE(temp_dir_.CreateUniqueTempDir()); }
@@ -2972,6 +3203,446 @@ chrome/browser/rac/import/BUILD.gn.
 +  expected.profiles = 1;
 +  expected.spaces = 1;
 +  expected.favorites = 2;
++  ExpectReport(result->report, expected);
++}
++
++TEST_F(ArcReaderTempDirTest, SidebarSymlinkedOutsideIsUnreadable) {
++  base::ScopedTempDir outside;
++  ASSERT_TRUE(outside.CreateUniqueTempDir());
++  const base::FilePath sidebar =
++      outside.GetPath().AppendASCII("StorableSidebar.json");
++  ASSERT_TRUE(base::WriteFile(sidebar, SidebarJson(kDefaultProfileJson)));
++  ASSERT_TRUE(
++      base::CreateSymbolicLink(sidebar, PathTo("StorableSidebar.json")));
++
++  base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths());
++  ASSERT_FALSE(result.has_value());
++  EXPECT_EQ(result.error(), ArcReadError::kUnreadable);
++}
++
++TEST_F(ArcReaderTempDirTest, SymlinkInsideTheFolderIsRead) {
++  WriteTo("real/StorableSidebar.json", SidebarJson(kDefaultProfileJson));
++  ASSERT_TRUE(
++      base::CreateSymbolicLink(PathTo("real/StorableSidebar.json"),
++                               PathTo("StorableSidebar.json")));
++
++  base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths());
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(result->profiles.size(), 1u);
++  ASSERT_EQ(result->profiles[0].spaces.size(), 1u);
++  ExpectSpace(result->profiles[0].spaces[0], "Home");
++}
++
++TEST_F(ArcReaderTempDirTest, SymlinkedSupportDirIsRead) {
++  base::ScopedTempDir outside;
++  ASSERT_TRUE(outside.CreateUniqueTempDir());
++  ASSERT_TRUE(base::WriteFile(
++      outside.GetPath().AppendASCII("StorableSidebar.json"),
++      SidebarJson(kDefaultProfileJson)));
++  ASSERT_TRUE(base::CreateSymbolicLink(outside.GetPath(), PathTo("link")));
++
++  base::expected<ImportPlan, ArcReadError> result =
++      ReadArc(ArcSourcePaths::ForSourceRoot(PathTo("link")));
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(result->profiles.size(), 1u);
++  EXPECT_EQ(result->source_dir, PathTo("link"));
++}
++
++TEST_F(ArcReaderTempDirTest, LocalStateSymlinkedOutsideIsAnIssue) {
++  base::ScopedTempDir outside;
++  ASSERT_TRUE(outside.CreateUniqueTempDir());
++  WriteTo("StorableSidebar.json", SidebarJson(kDefaultProfileJson));
++  ASSERT_TRUE(base::WriteFile(
++      outside.GetPath().AppendASCII("Local State"),
++      R"json({"profile":{"info_cache":{"Default":{"name":"Outside"}}}})json"));
++  ASSERT_TRUE(base::CreateDirectory(PathTo("User Data")));
++  ASSERT_TRUE(
++      base::CreateSymbolicLink(outside.GetPath().AppendASCII("Local State"),
++                               PathTo("User Data/Local State")));
++
++  base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths());
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(result->profiles.size(), 1u);
++  EXPECT_TRUE(result->profiles[0].display_name.empty());
++  EXPECT_TRUE(HasIssue(result->report.issues,
++                       ImportIssue::kProfileNamesUnreadable));
++}
++
++TEST_F(ArcReaderTempDirTest, UserDataFolderSymlinkedOutsideIsAnIssue) {
++  base::ScopedTempDir outside;
++  ASSERT_TRUE(outside.CreateUniqueTempDir());
++  WriteTo("StorableSidebar.json", SidebarJson(kDefaultProfileJson));
++  ASSERT_TRUE(base::WriteFile(
++      outside.GetPath().AppendASCII("Local State"),
++      R"json({"profile":{"info_cache":{"Default":{"name":"Outside"}}}})json"));
++  ASSERT_TRUE(base::CreateDirectory(outside.GetPath().AppendASCII("Default")));
++  ASSERT_TRUE(base::WriteFile(
++      outside.GetPath().AppendASCII("Default").AppendASCII("Preferences"),
++      R"json({"extensions":{"pinned_extensions":[)json"
++      R"json("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}})json"));
++  ASSERT_TRUE(
++      base::CreateSymbolicLink(outside.GetPath(), PathTo("User Data")));
++
++  base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths());
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(result->profiles.size(), 1u);
++  const ImportProfile& profile = result->profiles[0];
++  EXPECT_TRUE(profile.display_name.empty());
++  EXPECT_TRUE(profile.pinned_extension_ids.empty());
++  EXPECT_TRUE(HasIssue(result->report.issues,
++                       ImportIssue::kProfileNamesUnreadable));
++  EXPECT_TRUE(HasIssue(result->report.issues,
++                       ImportIssue::kExtensionsUnreadable));
++}
++
++TEST_F(ArcReaderTempDirTest, PreferencesSymlinkedOutsideIsAnIssue) {
++  base::ScopedTempDir outside;
++  ASSERT_TRUE(outside.CreateUniqueTempDir());
++  WriteTo("StorableSidebar.json", SidebarJson(kDefaultProfileJson));
++  ASSERT_TRUE(base::WriteFile(
++      outside.GetPath().AppendASCII("Preferences"),
++      R"json({"extensions":{"pinned_extensions":[)json"
++      R"json("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}})json"));
++  ASSERT_TRUE(base::CreateDirectory(PathTo("User Data/Default")));
++  ASSERT_TRUE(
++      base::CreateSymbolicLink(outside.GetPath().AppendASCII("Preferences"),
++                               PathTo("User Data/Default/Preferences")));
++
++  base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths());
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(result->profiles.size(), 1u);
++  EXPECT_TRUE(result->profiles[0].pinned_extension_ids.empty());
++  EXPECT_TRUE(HasIssue(result->report.issues,
++                       ImportIssue::kExtensionsUnreadable));
++}
++
++TEST_F(ArcReaderTempDirTest, RoutingAndDefaultsSymlinkedOutsideAreIssues) {
++  base::ScopedTempDir outside;
++  ASSERT_TRUE(outside.CreateUniqueTempDir());
++  WriteTo("StorableSidebar.json", SidebarJson(kDefaultProfileJson));
++  ASSERT_TRUE(base::WriteFile(
++      outside.GetPath().AppendASCII("StorableLinkRouting.json"),
++      R"json({"rules":[{"a":1}]})json"));
++  ASSERT_TRUE(base::WriteFile(
++      outside.GetPath().AppendASCII("company.thebrowser.Browser.plist"),
++      "x"));
++  ASSERT_TRUE(base::CreateSymbolicLink(
++      outside.GetPath().AppendASCII("StorableLinkRouting.json"),
++      PathTo("StorableLinkRouting.json")));
++  ASSERT_TRUE(base::CreateSymbolicLink(
++      outside.GetPath().AppendASCII("company.thebrowser.Browser.plist"),
++      PathTo("company.thebrowser.Browser.plist")));
++
++  base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths());
++  ASSERT_TRUE(result.has_value());
++  EXPECT_TRUE(result->handoffs.routing_rules_json.empty());
++  EXPECT_TRUE(HasIssue(result->report.issues,
++                       ImportIssue::kRoutingRulesUnreadable));
++  EXPECT_TRUE(
++      HasIssue(result->report.issues, ImportIssue::kSettingsUnreadable));
++}
++
++TEST_F(ArcReaderTempDirTest, ArchiveSymlinkedOutsideIsNotNamed) {
++  base::ScopedTempDir outside;
++  ASSERT_TRUE(outside.CreateUniqueTempDir());
++  WriteTo("StorableSidebar.json", SidebarJson(kDefaultProfileJson));
++  ASSERT_TRUE(base::WriteFile(
++      outside.GetPath().AppendASCII("StorableArchiveItems.json"), "{}"));
++  ASSERT_TRUE(base::CreateSymbolicLink(
++      outside.GetPath().AppendASCII("StorableArchiveItems.json"),
++      PathTo("StorableArchiveItems.json")));
++
++  base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths());
++  ASSERT_TRUE(result.has_value());
++  EXPECT_TRUE(result->handoffs.archive_path.empty());
++
++  ASSERT_TRUE(base::DeleteFile(PathTo("StorableArchiveItems.json")));
++  WriteTo("StorableArchiveItems.json", "{}");
++  result = ReadArc(Paths());
++  ASSERT_TRUE(result.has_value());
++  EXPECT_EQ(result->handoffs.archive_path,
++            PathTo("StorableArchiveItems.json"));
++}
++
++TEST_F(ArcReaderTempDirTest, FaviconsSymlinkedOutsideAreLeftOut) {
++  base::ScopedTempDir outside;
++  ASSERT_TRUE(outside.CreateUniqueTempDir());
++  WriteTo("StorableSidebar.json",
++          R"json({"sidebar":{"containers":[{"spaces":["space-1",)json"
++          R"json({"title":"Home","profile":{"default":true},)json"
++          R"json("containerIDs":["pinned","pin-1"]}],"items":[)json"
++          R"json("pin-1",{"childrenIds":["t1"]},)json"
++          R"json("t1",{"data":{"tab":{"savedURL":)json"
++          R"json("https://example.com/1"}}})json"
++          R"json(]}]}})json");
++  const std::string icon_name = ArcFaviconFileName("t1");
++  ASSERT_TRUE(base::WriteFile(outside.GetPath().AppendASCII("icon"), "x"));
++
++  // A cached file that resolves outside the folder is left out.
++  ASSERT_TRUE(base::CreateDirectory(PathTo(kFaviconDirName)));
++  const base::FilePath icon =
++      PathTo(kFaviconDirName).AppendASCII(icon_name);
++  ASSERT_TRUE(base::CreateSymbolicLink(
++      outside.GetPath().AppendASCII("icon"), icon));
++
++  base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths());
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(result->profiles.size(), 1u);
++  ASSERT_EQ(result->profiles[0].spaces.size(), 1u);
++  ASSERT_EQ(result->profiles[0].spaces[0].pinned.size(), 1u);
++  EXPECT_TRUE(result->profiles[0].spaces[0].pinned[0].favicon_path.empty());
++
++  // A real cached file is used.
++  ASSERT_TRUE(base::DeleteFile(icon));
++  ASSERT_TRUE(base::WriteFile(icon, "x"));
++  result = ReadArc(Paths());
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(result->profiles.size(), 1u);
++  ASSERT_EQ(result->profiles[0].spaces.size(), 1u);
++  ASSERT_EQ(result->profiles[0].spaces[0].pinned.size(), 1u);
++  EXPECT_FALSE(result->profiles[0].spaces[0].pinned[0].favicon_path.empty());
++
++  // A cache folder that resolves outside isn't listed at all.
++  ASSERT_TRUE(base::DeletePathRecursively(PathTo(kFaviconDirName)));
++  ASSERT_TRUE(base::CreateDirectory(outside.GetPath().AppendASCII("cache")));
++  ASSERT_TRUE(base::WriteFile(
++      outside.GetPath().AppendASCII("cache").AppendASCII(icon_name), "x"));
++  ASSERT_TRUE(
++      base::CreateSymbolicLink(outside.GetPath().AppendASCII("cache"),
++                               PathTo(kFaviconDirName)));
++
++  result = ReadArc(Paths());
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(result->profiles.size(), 1u);
++  ASSERT_EQ(result->profiles[0].spaces.size(), 1u);
++  ASSERT_EQ(result->profiles[0].spaces[0].pinned.size(), 1u);
++  EXPECT_TRUE(result->profiles[0].spaces[0].pinned[0].favicon_path.empty());
++}
++
++TEST_F(ArcReaderTempDirTest, ArcPathStaysInsideFollowsSymlinks) {
++  base::ScopedTempDir outside;
++  ASSERT_TRUE(outside.CreateUniqueTempDir());
++  WriteTo("a/file", "x");
++  ASSERT_TRUE(base::WriteFile(outside.GetPath().AppendASCII("file"), "x"));
++
++  const base::FilePath& root = temp_dir_.GetPath();
++  EXPECT_TRUE(ArcPathStaysInside(root, PathTo("a/file")));
++  EXPECT_TRUE(ArcPathStaysInside(root, root));
++  EXPECT_FALSE(ArcPathStaysInside(root, PathTo("missing")));
++
++  ASSERT_TRUE(
++      base::CreateSymbolicLink(outside.GetPath().AppendASCII("file"),
++                               PathTo("escape")));
++  EXPECT_FALSE(ArcPathStaysInside(root, PathTo("escape")));
++
++  ASSERT_TRUE(base::CreateSymbolicLink(PathTo("a/file"), PathTo("inner")));
++  EXPECT_TRUE(ArcPathStaysInside(root, PathTo("inner")));
++
++  // A ".." path out of the folder is refused too, when both temp dirs share
++  // a parent.
++  if (outside.GetPath().DirName() == root.DirName()) {
++    ASSERT_TRUE(base::WriteFile(outside.GetPath().AppendASCII("x"), "x"));
++    EXPECT_FALSE(ArcPathStaysInside(
++        root, root.Append(FILE_PATH_LITERAL(".."))
++                  .Append(outside.GetPath().BaseName())
++                  .Append(FILE_PATH_LITERAL("x"))));
++  }
++}
++
++TEST_F(ArcReaderTempDirTest, SpacesPastTheCapAreCountedNotRead) {
++  WriteTo("StorableSidebar.json", GeneratedSidebarJson(5, 1, 0));
++  ArcReadLimits limits;
++  limits.max_spaces = 3;
++  base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths(), limits);
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(result->profiles.size(), 1u);
++  const ImportProfile& profile = result->profiles[0];
++  ASSERT_EQ(profile.spaces.size(), 3u);
++  ExpectSpace(profile.spaces[0], "S0");
++  ExpectSpace(profile.spaces[1], "S1");
++  ExpectSpace(profile.spaces[2], "S2");
++
++  ImportReport expected;
++  expected.profiles = 1;
++  expected.spaces = 3;
++  expected.pinned_tabs = 3;
++  expected.over_limit = 2;
++  ExpectReport(result->report, expected);
++  EXPECT_EQ(result->report.damage_total(), 2);
++}
++
++TEST_F(ArcReaderTempDirTest, ItemsPerSpaceCap) {
++  WriteTo("StorableSidebar.json", GeneratedSidebarJson(2, 4, 0));
++  ArcReadLimits limits;
++  limits.max_items_per_space = 3;
++  base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths(), limits);
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(result->profiles.size(), 1u);
++  const ImportProfile& profile = result->profiles[0];
++  ASSERT_EQ(profile.spaces.size(), 2u);
++  for (size_t i = 0; i < 2u; ++i) {
++    SCOPED_TRACE(i);
++    ASSERT_EQ(profile.spaces[i].pinned.size(), 3u);
++    for (size_t j = 0; j < 3u; ++j) {
++      ExpectTab(profile.spaces[i].pinned[j],
++                base::StrCat({"https://example.com/",
++                              base::NumberToString(i), "/",
++                              base::NumberToString(j)}));
++    }
++  }
++
++  ImportReport expected;
++  expected.profiles = 1;
++  expected.spaces = 2;
++  expected.pinned_tabs = 6;
++  expected.over_limit = 2;
++  ExpectReport(result->report, expected);
++}
++
++TEST_F(ArcReaderTempDirTest, TotalItemsCap) {
++  WriteTo("StorableSidebar.json", GeneratedSidebarJson(3, 2, 2));
++  ArcReadLimits limits;
++  limits.max_items = 5;
++  base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths(), limits);
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(result->profiles.size(), 1u);
++  const ImportProfile& profile = result->profiles[0];
++  ASSERT_EQ(profile.spaces.size(), 3u);
++  ASSERT_EQ(profile.spaces[0].pinned.size(), 2u);
++  ASSERT_EQ(profile.spaces[1].pinned.size(), 2u);
++  ASSERT_EQ(profile.spaces[2].pinned.size(), 1u);
++  ExpectTab(profile.spaces[2].pinned[0], "https://example.com/2/0");
++  EXPECT_TRUE(profile.favorites.empty());
++
++  ImportReport expected;
++  expected.profiles = 1;
++  expected.spaces = 3;
++  expected.pinned_tabs = 5;
++  expected.over_limit = 3;
++  ExpectReport(result->report, expected);
++}
++
++TEST_F(ArcReaderTempDirTest, FavoritesCap) {
++  WriteTo("StorableSidebar.json", GeneratedSidebarJson(1, 1, 4));
++  ArcReadLimits limits;
++  limits.max_favorites = 2;
++  base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths(), limits);
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(result->profiles.size(), 1u);
++  const ImportProfile& profile = result->profiles[0];
++  ASSERT_EQ(profile.favorites.size(), 2u);
++  ExpectTab(profile.favorites[0], "https://example.com/fav/0");
++  ExpectTab(profile.favorites[1], "https://example.com/fav/1");
++
++  ImportReport expected;
++  expected.profiles = 1;
++  expected.spaces = 1;
++  expected.pinned_tabs = 1;
++  expected.favorites = 2;
++  expected.over_limit = 2;
++  ExpectReport(result->report, expected);
++}
++
++TEST_F(ArcReaderTempDirTest, FolderPastTheCapGoesWithItsChildren) {
++  WriteTo("StorableSidebar.json",
++          R"json({"sidebar":{"containers":[{"spaces":["space-1",)json"
++          R"json({"title":"Home","profile":{"default":true},)json"
++          R"json("containerIDs":["pinned","pin-1"]}],"items":[)json"
++          R"json("pin-1",{"childrenIds":["t1","f1"]},)json"
++          R"json("t1",{"data":{"tab":{"savedURL":)json"
++          R"json("https://example.com/1"}}},)json"
++          R"json("f1",{"childrenIds":["t2","t3"],"data":{"list":{}}},)json"
++          R"json("t2",{"data":{"tab":{"savedURL":)json"
++          R"json("https://example.com/2"}}},)json"
++          R"json("t3",{"data":{"tab":{"savedURL":)json"
++          R"json("https://example.com/3"}}})json"
++          R"json(]}]}})json");
++  ArcReadLimits limits;
++  limits.max_items_per_space = 1;
++  base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths(), limits);
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(result->profiles.size(), 1u);
++  ASSERT_EQ(result->profiles[0].spaces.size(), 1u);
++  const ImportSpace& space = result->profiles[0].spaces[0];
++  ASSERT_EQ(space.pinned.size(), 1u);
++  ExpectTab(space.pinned[0], "https://example.com/1");
++
++  ImportReport expected;
++  expected.profiles = 1;
++  expected.spaces = 1;
++  expected.pinned_tabs = 1;
++  expected.over_limit = 1;
++  ExpectReport(result->report, expected);
++  EXPECT_EQ(result->report.damage_total(), 1);
++}
++
++TEST_F(ArcReaderTempDirTest, ManySpacesStayFast) {
++  WriteTo("StorableSidebar.json", GeneratedSidebarJson(100000, 0, 0));
++  base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths());
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(result->profiles.size(), 1u);
++  EXPECT_EQ(result->profiles[0].spaces.size(), 500u);
++  EXPECT_EQ(result->report.over_limit, 99500);
++
++  ImportReport expected;
++  expected.profiles = 1;
++  expected.spaces = 500;
++  expected.over_limit = 99500;
++  ExpectReport(result->report, expected);
++}
++
++TEST_F(ArcReaderTempDirTest, DefaultFalseIsNotTheDefaultProfile) {
++  WriteTo("StorableSidebar.json",
++          SidebarJson(R"json({"default":false})json"));
++  base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths());
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(result->profiles.size(), 1u);
++  ExpectProfile(result->profiles[0], R"(raw:{"default":false})", "",
++                /*is_default=*/false, "");
++}
++
++TEST_F(ArcReaderTempDirTest, DefaultTrueAndEmptyDictAreTheDefaultProfile) {
++  for (const std::string& profile_json :
++       {std::string("{\"default\":true}"), std::string("{\"default\":{}}")}) {
++    SCOPED_TRACE(profile_json);
++    WriteTo("StorableSidebar.json", SidebarJson(profile_json));
++    base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths());
++    ASSERT_TRUE(result.has_value());
++    ASSERT_EQ(result->profiles.size(), 1u);
++    ExpectProfile(result->profiles[0], "default", "Default",
++                  /*is_default=*/true, "");
++  }
++}
++
++TEST_F(ArcReaderTempDirTest, DefaultTrueAndFalseAreTwoProfiles) {
++  WriteTo("StorableSidebar.json",
++          R"json({"sidebar":{"containers":[{"spaces":[)json"
++          R"json("space-1",{"title":"One","profile":{"default":false},)json"
++          R"json("containerIDs":[]},)json"
++          R"json("space-2",{"title":"Two","profile":{"default":true},)json"
++          R"json("containerIDs":[]}],"items":[]}]}})json");
++
++  base::expected<ImportPlan, ArcReadError> result = ReadArc(Paths());
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(result->profiles.size(), 2u);
++
++  // The default profile comes first even though its space came second.
++  const ImportProfile& first = result->profiles[0];
++  ExpectProfile(first, "default", "Default", /*is_default=*/true, "");
++  ASSERT_EQ(first.spaces.size(), 1u);
++  EXPECT_EQ(first.spaces[0].source_id, "space-2");
++  ExpectSpace(first.spaces[0], "Two");
++
++  const ImportProfile& second = result->profiles[1];
++  ExpectProfile(second, R"(raw:{"default":false})", "",
++                /*is_default=*/false, "");
++  ASSERT_EQ(second.spaces.size(), 1u);
++  EXPECT_EQ(second.spaces[0].source_id, "space-1");
++  ExpectSpace(second.spaces[0], "One");
++
++  ImportReport expected;
++  expected.profiles = 2;
++  expected.spaces = 2;
 +  ExpectReport(result->report, expected);
 +}
 +
@@ -3369,7 +4040,7 @@ chrome/browser/rac/import/BUILD.gn.
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/rac/import/import_plan.h
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,368 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -3700,11 +4371,15 @@ chrome/browser/rac/import/BUILD.gn.
 +  // reader's limit. The reader doesn't parse URLs; the applier drops ones
 +  // that don't parse and counts its own.
 +  int invalid_urls = 0;
++  // Spaces, tabs, and folders past the reader's count limits
++  // (ArcReadLimits). A space or folder left out counts once, without what's
++  // in it.
++  int over_limit = 0;
 +
 +  // All the damage above, for one "some items couldn't be read" line.
 +  int damage_total() const {
 +    return missing_items + repeated_items + too_deep + malformed_entries +
-+           invalid_urls;
++           invalid_urls + over_limit;
 +  }
 +
 +  std::vector<ImportIssue> issues;

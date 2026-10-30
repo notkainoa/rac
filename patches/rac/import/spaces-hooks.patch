@@ -50,11 +50,59 @@ Index: src/chrome/browser/rac/spaces/spaces_service.cc
  void SpacesService::MarkSpaceActive(const base::Uuid& id) {
    auto it = FindIterator(id);
    if (it == spaces_.end()) {
+@@ -232,7 +273,24 @@ void SpacesService::Load() {
+   }
+ }
+ 
++SpacesService::ScopedSaveBatch::ScopedSaveBatch(SpacesService* service)
++    : service_(service) {
++  CHECK(service_);
++  ++service_->save_batch_depth_;
++}
++
++SpacesService::ScopedSaveBatch::~ScopedSaveBatch() {
++  if (--service_->save_batch_depth_ == 0 && service_->save_pending_) {
++    service_->save_pending_ = false;
++    service_->Save();
++  }
++}
++
+ void SpacesService::Save() {
++  if (save_batch_depth_ > 0) {
++    save_pending_ = true;
++    return;
++  }
+   base::ListValue list;
+   for (const Space& space : spaces_) {
+     list.Append(space.ToDict());
 Index: src/chrome/browser/rac/spaces/spaces_service.h
 ===================================================================
 --- src.orig/chrome/browser/rac/spaces/spaces_service.h
 +++ src/chrome/browser/rac/spaces/spaces_service.h
-@@ -75,6 +75,15 @@ class SpacesService : public KeyedServic
+@@ -44,6 +44,22 @@ class SpacesService : public KeyedServic
+     virtual void OnSpacesReordered() {}
+   };
+ 
++  // While one is alive, changes skip the pref write; the outermost
++  // batch's end writes once if anything changed. Observers still hear of
++  // each change as it happens. For callers that change many spaces in one
++  // task, where a write per change would make the task quadratic. Create
++  // on the stack.
++  class ScopedSaveBatch {
++   public:
++    explicit ScopedSaveBatch(SpacesService* service);
++    ScopedSaveBatch(const ScopedSaveBatch&) = delete;
++    ScopedSaveBatch& operator=(const ScopedSaveBatch&) = delete;
++    ~ScopedSaveBatch();
++
++   private:
++    const raw_ptr<SpacesService> service_;
++  };
++
+   // The newest format this build writes. Builds only ever raise it.
+   static constexpr int kVersion = 1;
+ 
+@@ -75,6 +91,15 @@ class SpacesService : public KeyedServic
    // range.
    bool MoveSpace(const base::Uuid& id, size_t index);
  
@@ -70,6 +118,16 @@ Index: src/chrome/browser/rac/spaces/spaces_service.h
    // Records that a window just showed `id`.
    void MarkSpaceActive(const base::Uuid& id);
  
+@@ -109,6 +134,9 @@ class SpacesService : public KeyedServic
+   base::DictValue unknown_fields_;
+ 
+   base::ObserverList<Observer> observers_;
++  // While positive, Save() only sets `save_pending_`.
++  int save_batch_depth_ = 0;
++  bool save_pending_ = false;
+ };
+ 
+ }  // namespace rac
 Index: src/chrome/browser/rac/spaces/spaces_service_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/rac/spaces/spaces_service_unittest.cc
@@ -88,7 +146,7 @@ Index: src/chrome/browser/rac/spaces/spaces_service_unittest.cc
  #include "components/prefs/testing_pref_service.h"
  #include "testing/gmock/include/gmock/gmock.h"
  #include "testing/gtest/include/gtest/gtest.h"
-@@ -343,5 +345,137 @@ TEST_F(SpacesServiceTest, NothingUsableS
+@@ -343,5 +345,180 @@ TEST_F(SpacesServiceTest, NothingUsableS
    EXPECT_TRUE(service->spaces()[0].id.is_valid());
  }
  
@@ -222,6 +280,49 @@ Index: src/chrome/browser/rac/spaces/spaces_service_unittest.cc
 +  Space renamed(a, "New name");
 +  service->RestoreSpace(std::move(renamed), 2);
 +  EXPECT_EQ(writes, 2);
++}
++
++TEST_F(SpacesServiceTest, SaveBatchWritesOnceAtTheOutermostEnd) {
++  auto service = MakeService();
++  RecordingObserver observer;
++  service->AddObserver(&observer);
++
++  int writes = 0;
++  PrefChangeRegistrar registrar;
++  registrar.Init(&prefs_);
++  registrar.Add(kSpaces,
++                base::BindLambdaForTesting([&writes] { ++writes; }));
++
++  std::vector<base::Uuid> added;
++  {
++    SpacesService::ScopedSaveBatch batch(service.get());
++    for (int i = 0; i < 3; ++i) {
++      Space space(base::Uuid::GenerateRandomV4(), "Imported");
++      added.push_back(space.id);
++      service->RestoreSpace(std::move(space), service->spaces().size());
++    }
++    {
++      SpacesService::ScopedSaveBatch nested(service.get());
++      added.push_back(service->CreateSpace("Nested"));
++    }
++    // Observers hear of each change as it happens; the pref waits.
++    EXPECT_EQ(observer.added, added);
++    EXPECT_EQ(writes, 0);
++  }
++  EXPECT_EQ(writes, 1);
++  service->RemoveObserver(&observer);
++
++  // The single write holds every change.
++  service.reset();
++  auto reloaded = MakeService();
++  for (const base::Uuid& id : added) {
++    EXPECT_TRUE(reloaded->FindSpace(id));
++  }
++
++  // A batch with no change writes nothing.
++  writes = 0;
++  { SpacesService::ScopedSaveBatch batch(reloaded.get()); }
++  EXPECT_EQ(writes, 0);
 +}
 +
  }  // namespace
@@ -454,7 +555,67 @@ Index: src/chrome/browser/ui/rac/sidebar/sidebar_items.cc
  SidebarItem::SidebarItem() = default;
  SidebarItem::SidebarItem(const SidebarItem&) = default;
  SidebarItem& SidebarItem::operator=(const SidebarItem&) = default;
-@@ -520,6 +529,14 @@ void SidebarItems::SetListCollapsed(std:
+@@ -262,16 +271,28 @@ std::string SidebarItems::AddItem(std::s
+                                   const SidebarPosition& position,
+                                   const GURL& url,
+                                   const std::u16string& title) {
++  std::string id = NewId();
++  return AddItemWithId(id, list_key, position, url, title) ? id
++                                                           : std::string();
++}
++
++bool SidebarItems::AddItemWithId(std::string_view id,
++                                 std::string_view list_key,
++                                 const SidebarPosition& position,
++                                 const GURL& url,
++                                 const std::u16string& title) {
++  // Not checked in release builds: it walks every list, and an import adds
++  // thousands of items in one task.
++  DCHECK(!id.empty() && !LocateItem(id) && !FindMutableFolder(id));
+   SidebarItem item;
+-  item.id = NewId();
++  item.id = std::string(id);
+   item.url = url;
+   item.title = title;
+-  std::string id = item.id;
+   if (!InsertItem(list_key, position, std::move(item))) {
+-    return std::string();
++    return false;
+   }
+   SaveAndNotify();
+-  return id;
++  return true;
+ }
+ 
+ void SidebarItems::RemoveItem(std::string_view id) {
+@@ -467,15 +488,23 @@ void SidebarItems::SetItemName(std::stri
+ std::string SidebarItems::AddFolder(std::string_view list_key,
+                                     size_t index,
+                                     const std::u16string& title) {
++  std::string id = NewId();
++  AddFolderWithId(id, list_key, index, title);
++  return id;
++}
++
++void SidebarItems::AddFolderWithId(std::string_view id,
++                                   std::string_view list_key,
++                                   size_t index,
++                                   const std::u16string& title) {
++  DCHECK(!id.empty() && !LocateItem(id) && !FindMutableFolder(id));
+   SidebarFolder folder;
+-  folder.id = NewId();
++  folder.id = std::string(id);
+   folder.title = title;
+-  std::string id = folder.id;
+   SidebarList& list = lists_[std::string(list_key)];
+   index = std::min(index, list.entries.size());
+   list.entries.insert(list.entries.begin() + index, std::move(folder));
+   SaveAndNotify();
+-  return id;
+ }
+ 
+ void SidebarItems::RemoveFolder(std::string_view folder_id) {
+@@ -520,6 +549,14 @@ void SidebarItems::SetListCollapsed(std:
    SaveAndNotify();
  }
  
@@ -469,7 +630,7 @@ Index: src/chrome/browser/ui/rac/sidebar/sidebar_items.cc
  void SidebarItems::AddObserver(Observer* observer) {
    observers_.AddObserver(observer);
  }
-@@ -655,12 +672,7 @@ void SidebarItems::MigrateHeliumPinnedTa
+@@ -655,12 +692,7 @@ void SidebarItems::MigrateHeliumPinnedTa
  }
  
  void SidebarItems::Load() {
@@ -483,7 +644,7 @@ Index: src/chrome/browser/ui/rac/sidebar/sidebar_items.cc
    // Earlier pinned-tab builds used one placeholder space. Adopt its list in
    // the profile's first real space without changing item or folder IDs.
    if (SpacesService* spaces = SpacesServiceFactory::GetForProfile(profile_)) {
-@@ -674,7 +686,20 @@ void SidebarItems::Load() {
+@@ -674,7 +706,20 @@ void SidebarItems::Load() {
    }
  }
  
@@ -542,7 +703,33 @@ Index: src/chrome/browser/ui/rac/sidebar/sidebar_items.h
    static constexpr char kFavorites[] = "favorites";
    static std::string PinnedListKey(const SpaceId& space);
  
-@@ -159,6 +179,11 @@ class SidebarItems : public KeyedService
+@@ -127,6 +147,14 @@ class SidebarItems : public KeyedService
+                       const SidebarPosition& position,
+                       const GURL& url,
+                       const std::u16string& title);
++  // As AddItem, under an id the caller chose, so it can save the id before
++  // the item exists. `id` must be one nothing has used, such as a fresh
++  // UUID. Returns false if the item couldn't be added.
++  bool AddItemWithId(std::string_view id,
++                     std::string_view list_key,
++                     const SidebarPosition& position,
++                     const GURL& url,
++                     const std::u16string& title);
+   // Removes the item. A folder left empty is removed too.
+   void RemoveItem(std::string_view id);
+   void MoveItem(std::string_view id,
+@@ -153,12 +181,22 @@ class SidebarItems : public KeyedService
+   std::string AddFolder(std::string_view list_key,
+                         size_t index,
+                         const std::u16string& title);
++  // As AddFolder, under an id the caller chose, as for AddItemWithId.
++  void AddFolderWithId(std::string_view id,
++                       std::string_view list_key,
++                       size_t index,
++                       const std::u16string& title);
+   // Removes the folder and the items in it.
+   void RemoveFolder(std::string_view folder_id);
+   void SetFolderTitle(std::string_view folder_id, const std::u16string& title);
    void SetFolderCollapsed(std::string_view folder_id, bool collapsed);
    void SetListCollapsed(std::string_view list_key, bool collapsed);
  
@@ -554,7 +741,7 @@ Index: src/chrome/browser/ui/rac/sidebar/sidebar_items.h
    void AddObserver(Observer* observer);
    void RemoveObserver(Observer* observer);
  
-@@ -189,11 +214,16 @@ class SidebarItems : public KeyedService
+@@ -189,11 +227,16 @@ class SidebarItems : public KeyedService
                    SidebarItem item);
    void MigrateHeliumPinnedTabs();
    void Load();
