@@ -1,0 +1,294 @@
+Tells whether Arc is running, and watches for Arc to quit so the import can
+bring over sign-ins once Arc's cookie store is closed. macOS only; reads none
+of Arc's files.
+--- a/chrome/browser/rac/import/BUILD.gn
++++ b/chrome/browser/rac/import/BUILD.gn
+@@ -105,6 +105,22 @@
+   deps = [ "//sql:test_support" ]
+ }
+ 
++if (is_mac) {
++  # Whether Arc is running, and a watcher that fires when it quits. Built with
++  # ARC, which the observer token's lifetime relies on.
++  source_set("arc_app_state") {
++    sources = [
++      "arc_app_state_mac.h",
++      "arc_app_state_mac.mm",
++    ]
++    deps = [ "//base" ]
++    frameworks = [
++      "AppKit.framework",
++      "Foundation.framework",
++    ]
++  }
++}
++
+ # Build with `autoninja -C out/Default
+ # chrome/browser/rac/import:rac_import_unittests`. It's separate from
+ # Chromium's unit_tests, which takes hours to build.
+@@ -142,4 +158,9 @@
+     "//url",
+   ]
+   data = [ "//chrome/test/data/rac/import/" ]
++
++  if (is_mac) {
++    sources += [ "arc_app_state_mac_unittest.mm" ]
++    deps += [ ":arc_app_state" ]
++  }
+ }
+--- /dev/null
++++ b/chrome/browser/rac/import/arc_app_state_mac.h
+@@ -0,0 +1,77 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_IMPORT_ARC_APP_STATE_MAC_H_
++#define CHROME_BROWSER_RAC_IMPORT_ARC_APP_STATE_MAC_H_
++
++#include <memory>
++#include <string>
++#include <string_view>
++
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++#include "base/sequence_checker.h"
++
++// Whether Arc is running, and a way to wait until it isn't.
++//
++// Arc must be quit before rac brings over sign-ins (cookies): Arc keeps its
++// cookie store open while it runs, so a copy taken then can be torn or stale.
++// While IsArcRunning() is true, the import screen shows "Quit Arc to bring
++// over your sign-ins" and holds the sign-ins step. An ArcQuitWatcher tells
++// the screen when Arc has quit, so it can continue without the user pressing
++// anything and without polling.
++//
++// Both are for the UI thread. Neither reads any of Arc's files.
++
++namespace rac::import {
++
++// Arc's bundle identifier.
++inline constexpr char kArcBundleId[] = "company.thebrowser.Browser";
++
++// True if at least one Arc process is running that has not terminated.
++bool IsArcRunning();
++
++// Calls `on_quit` once, on the UI thread, when Arc is not running. If Arc is
++// already not running, `on_quit` still runs, from a posted task, never from
++// the constructor. Destroying the watcher first cancels the call.
++//
++// It listens for NSWorkspaceDidTerminateApplicationNotification, so it costs
++// nothing while Arc runs and does no work at any other time. It stops
++// listening as soon as it has called `on_quit`, and in its destructor.
++class ArcQuitWatcher {
++ public:
++  explicit ArcQuitWatcher(base::OnceClosure on_quit);
++  // Watches `bundle_id` instead of Arc. Tests use this with an application
++  // that can't exist.
++  ArcQuitWatcher(base::OnceClosure on_quit, std::string_view bundle_id);
++  ArcQuitWatcher(const ArcQuitWatcher&) = delete;
++  ArcQuitWatcher& operator=(const ArcQuitWatcher&) = delete;
++  ~ArcQuitWatcher();
++
++ private:
++  // Holds the Objective-C observer token, so this header stays C++.
++  struct Impl;
++
++  // A termination was reported, or the first check ran. Calls `on_quit_` if
++  // no process of the application is left.
++  void CheckAndFinish();
++  void StopObserving();
++
++  SEQUENCE_CHECKER(sequence_checker_);
++  const std::string bundle_id_;
++  base::OnceClosure on_quit_;
++  std::unique_ptr<Impl> impl_;
++  base::WeakPtrFactory<ArcQuitWatcher> weak_factory_{this};
++};
++
++namespace internal {
++
++// IsArcRunning() for any bundle identifier.
++bool IsArcRunning(std::string_view bundle_id);
++
++}  // namespace internal
++
++}  // namespace rac::import
++
++#endif  // CHROME_BROWSER_RAC_IMPORT_ARC_APP_STATE_MAC_H_
+--- /dev/null
++++ b/chrome/browser/rac/import/arc_app_state_mac.mm
+@@ -0,0 +1,110 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/arc_app_state_mac.h"
++
++#import <AppKit/AppKit.h>
++#import <Foundation/Foundation.h>
++
++#include <utility>
++
++#include "base/apple/foundation_util.h"
++#include "base/check.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/strings/sys_string_conversions.h"
++#include "base/task/single_thread_task_runner.h"
++
++namespace rac::import {
++
++struct ArcQuitWatcher::Impl {
++  // The token addObserverForName:... returned. Under ARC this is a strong
++  // reference; nil once the observer has been removed.
++  id<NSObject> token = nil;
++};
++
++namespace internal {
++
++bool IsArcRunning(std::string_view bundle_id) {
++  NSArray<NSRunningApplication*>* apps = [NSRunningApplication
++      runningApplicationsWithBundleIdentifier:base::SysUTF8ToNSString(
++                                                  bundle_id)];
++  for (NSRunningApplication* app in apps) {
++    // The list can still hold an app that has quit but isn't released yet.
++    if (!app.terminated) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace internal
++
++bool IsArcRunning() {
++  return internal::IsArcRunning(kArcBundleId);
++}
++
++ArcQuitWatcher::ArcQuitWatcher(base::OnceClosure on_quit)
++    : ArcQuitWatcher(std::move(on_quit), kArcBundleId) {}
++
++ArcQuitWatcher::ArcQuitWatcher(base::OnceClosure on_quit,
++                               std::string_view bundle_id)
++    : bundle_id_(bundle_id),
++      on_quit_(std::move(on_quit)),
++      impl_(std::make_unique<Impl>()) {
++  CHECK(on_quit_);
++  base::WeakPtr<ArcQuitWatcher> weak = weak_factory_.GetWeakPtr();
++  NSString* watched_id = base::SysUTF8ToNSString(bundle_id_);
++
++  // Observe first, then check, so an Arc that quits in between is still seen.
++  // NSWorkspace posts on the main thread; the main queue makes that explicit.
++  impl_->token = [NSWorkspace.sharedWorkspace.notificationCenter
++      addObserverForName:NSWorkspaceDidTerminateApplicationNotification
++                  object:nil
++                   queue:NSOperationQueue.mainQueue
++              usingBlock:^(NSNotification* notification) {
++                NSRunningApplication* app =
++                    base::apple::ObjCCast<NSRunningApplication>(
++                        notification.userInfo[NSWorkspaceApplicationKey]);
++                if (![app.bundleIdentifier isEqualToString:watched_id]) {
++                  return;
++                }
++                if (weak) {
++                  weak->CheckAndFinish();
++                }
++              }];
++
++  if (!internal::IsArcRunning(bundle_id_)) {
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(&ArcQuitWatcher::CheckAndFinish, std::move(weak)));
++  }
++}
++
++ArcQuitWatcher::~ArcQuitWatcher() {
++  StopObserving();
++}
++
++void ArcQuitWatcher::CheckAndFinish() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  // Already finished, or a second Arc process is still running.
++  if (!on_quit_ || internal::IsArcRunning(bundle_id_)) {
++    return;
++  }
++  // `on_quit_` may destroy this watcher, so nothing is touched after it.
++  base::OnceClosure on_quit = std::move(on_quit_);
++  StopObserving();
++  std::move(on_quit).Run();
++}
++
++void ArcQuitWatcher::StopObserving() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (impl_->token) {
++    [NSWorkspace.sharedWorkspace.notificationCenter
++        removeObserver:impl_->token];
++    impl_->token = nil;
++  }
++}
++
++}  // namespace rac::import
+--- /dev/null
++++ b/chrome/browser/rac/import/arc_app_state_mac_unittest.mm
+@@ -0,0 +1,60 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/arc_app_state_mac.h"
++
++#include <string_view>
++
++#include "base/run_loop.h"
++#include "base/test/bind.h"
++#include "base/test/task_environment.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::import {
++namespace {
++
++// No application has this bundle identifier. It's reverse-DNS, and `invalid`
++// is a top-level domain reserved so that it never names anything (RFC 2606).
++constexpr std::string_view kNoSuchBundleId = "invalid.rac.test.no-such-app";
++
++TEST(ArcAppStateMacTest, NoSuchBundleIdIsNotRunning) {
++  EXPECT_FALSE(internal::IsArcRunning(kNoSuchBundleId));
++}
++
++// Tests can't tell whether the machine running them has Arc open, so this
++// only checks that the real check agrees with the injected one for Arc.
++TEST(ArcAppStateMacTest, ArcCheckUsesArcsBundleId) {
++  EXPECT_EQ(IsArcRunning(), internal::IsArcRunning(kArcBundleId));
++}
++
++// With nothing to wait for, the callback runs once, later, not from the
++// constructor.
++TEST(ArcAppStateMacTest, WatcherCallsBackWhenAppIsNotRunning) {
++  base::test::SingleThreadTaskEnvironment task_environment;
++  base::RunLoop run_loop;
++  int calls = 0;
++  ArcQuitWatcher watcher(base::BindLambdaForTesting([&] {
++                           ++calls;
++                           run_loop.Quit();
++                         }),
++                         kNoSuchBundleId);
++  EXPECT_EQ(calls, 0);
++  run_loop.Run();
++  EXPECT_EQ(calls, 1);
++}
++
++// Destroying the watcher before its task runs cancels the callback.
++TEST(ArcAppStateMacTest, DestroyedWatcherNeverCallsBack) {
++  base::test::SingleThreadTaskEnvironment task_environment;
++  int calls = 0;
++  {
++    ArcQuitWatcher watcher(base::BindLambdaForTesting([&] { ++calls; }),
++                           kNoSuchBundleId);
++  }
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(calls, 0);
++}
++
++}  // namespace
++}  // namespace rac::import

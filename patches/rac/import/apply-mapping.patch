@@ -1,0 +1,4478 @@
+The pure half of the Arc import: maps an import plan onto spaces, pinned tabs,
+and favorites, and keeps the import record. No profile or browser state.
+--- a/chrome/browser/rac/import/BUILD.gn
++++ b/chrome/browser/rac/import/BUILD.gn
+@@ -46,23 +46,49 @@ source_set("arc_source") {
+   ]
+ }
+ 
++# Maps an import plan onto rac's spaces, pinned tabs, and favorites, and the
++# import record. Pure: no profile or browser state, so it tests without the
++# browser. The applier that writes the result is in
++# //chrome/browser/ui/rac/import (compiled in //chrome/browser/ui).
++source_set("apply") {
++  sources = [
++    "arc_import_mapping.cc",
++    "arc_import_mapping.h",
++    "arc_import_record.cc",
++    "arc_import_record.h",
++    "arc_import_types.cc",
++    "arc_import_types.h",
++  ]
++  public_deps = [
++    ":plan",
++    "//base",
++    "//chrome/browser/rac/spaces",
++    "//url",
++  ]
++}
++
+ # Build with `autoninja -C out/Default
+ # chrome/browser/rac/import:rac_import_unittests`. It's separate from
+ # Chromium's unit_tests, which takes hours to build.
+ test("rac_import_unittests") {
+   sources = [
++    "arc_import_mapping_unittest.cc",
++    "arc_import_record_unittest.cc",
+     "arc_reader_unittest.cc",
+     "arc_source_root_unittest.cc",
+   ]
+   deps = [
++    ":apply",
+     ":arc_reader",
+     ":arc_source",
+     "//base",
+     "//base/test:run_all_unittests",
+     "//base/test:test_support",
+     "//chrome/browser/rac/dev:buildflags",
++    "//chrome/browser/rac/spaces",
+     "//testing/gmock",
+     "//testing/gtest",
++    "//url",
+   ]
+   data = [ "//chrome/test/data/rac/import/" ]
+ }
+--- /dev/null
++++ b/chrome/browser/rac/import/arc_import_mapping.cc
+@@ -0,0 +1,690 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/arc_import_mapping.h"
++
++#include <algorithm>
++#include <cmath>
++#include <utility>
++
++#include "base/check_op.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/raw_ref.h"
++#include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/rac/import/arc_import_record.h"
++#include "url/url_constants.h"
++
++namespace rac {
++
++namespace {
++
++// ---------------------------------------------------------------------------
++// Colors.
++
++double SrgbToLinear(double encoded) {
++  // Extended sRGB: the curve is mirrored below zero and continues above one.
++  const double magnitude = std::abs(encoded);
++  const double linear = magnitude <= 0.04045
++                            ? magnitude / 12.92
++                            : std::pow((magnitude + 0.055) / 1.055, 2.4);
++  return std::copysign(linear, encoded);
++}
++
++double LinearToSrgb(double linear) {
++  const double magnitude = std::abs(linear);
++  const double encoded = magnitude <= 0.0031308
++                             ? magnitude * 12.92
++                             : 1.055 * std::pow(magnitude, 1 / 2.4) - 0.055;
++  return std::copysign(encoded, linear);
++}
++
++struct Rgb {
++  double r = 0;
++  double g = 0;
++  double b = 0;
++};
++
++struct Oklab {
++  double l = 0;
++  double a = 0;
++  double b = 0;
++};
++
++// Björn Ottosson's OKLab, from linear sRGB (public domain matrices).
++Oklab LinearSrgbToOklab(const Rgb& c) {
++  const double l = std::cbrt(0.4122214708 * c.r + 0.5363325363 * c.g +
++                             0.0514459929 * c.b);
++  const double m = std::cbrt(0.2119034982 * c.r + 0.6806995451 * c.g +
++                             0.1073969566 * c.b);
++  const double s = std::cbrt(0.0883024619 * c.r + 0.2817188376 * c.g +
++                             0.6299787005 * c.b);
++  return {0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
++          1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
++          0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s};
++}
++
++Rgb OklabToLinearSrgb(const Oklab& c) {
++  const double l_ = c.l + 0.3963377774 * c.a + 0.2158037573 * c.b;
++  const double m_ = c.l - 0.1055613458 * c.a - 0.0638541728 * c.b;
++  const double s_ = c.l - 0.0894841775 * c.a - 1.2914855480 * c.b;
++  const double l = l_ * l_ * l_;
++  const double m = m_ * m_ * m_;
++  const double s = s_ * s_ * s_;
++  return {4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
++          -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
++          -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s};
++}
++
++constexpr double kGamutEpsilon = 1e-6;
++
++bool InUnitRange(double value) {
++  return value >= -kGamutEpsilon && value <= 1 + kGamutEpsilon;
++}
++
++bool InGamut(const Rgb& linear) {
++  return InUnitRange(linear.r) && InUnitRange(linear.g) &&
++         InUnitRange(linear.b);
++}
++
++double Finite(double value) {
++  return std::isfinite(value) ? value : 0;
++}
++
++ImportColor FromLinear(const Rgb& linear, double alpha) {
++  return {std::clamp(LinearToSrgb(linear.r), 0.0, 1.0),
++          std::clamp(LinearToSrgb(linear.g), 0.0, 1.0),
++          std::clamp(LinearToSrgb(linear.b), 0.0, 1.0), alpha};
++}
++
++// Which of a variant's colors make its two stops.
++std::optional<std::pair<ImportColor, ImportColor>> VariantStops(
++    const ImportThemeVariant& variant) {
++  const std::optional<ImportColor>& first =
++      variant.color1 ? variant.color1 : variant.color2;
++  if (!first) {
++    return std::nullopt;
++  }
++  switch (variant.origin) {
++    case ImportThemeVariant::Origin::kUnknown:
++      return std::nullopt;
++    case ImportThemeVariant::Origin::kGradient:
++      return std::make_pair(
++          *first, variant.color1 && variant.color2 ? *variant.color2 : *first);
++    case ImportThemeVariant::Origin::kSingleColor:
++    case ImportThemeVariant::Origin::kPalette:
++      // One flat color: Arc's `shaded`, or the single color.
++      return std::make_pair(*first, *first);
++  }
++}
++
++bool IsUsable(const std::optional<ImportThemeVariant>& variant) {
++  return variant && VariantStops(*variant).has_value();
++}
++
++SpaceTheme::Mode ModeFor(const ImportThemeVariant& variant,
++                         const ImportColor& stop1,
++                         const ImportColor& stop2) {
++  switch (variant.content) {
++    case ImportThemeVariant::Content::kLight:
++      return SpaceTheme::Mode::kLight;
++    case ImportThemeVariant::Content::kDark:
++      return SpaceTheme::Mode::kDark;
++    case ImportThemeVariant::Content::kUnknown:
++      break;
++  }
++  const double luminance =
++      (RelativeLuminance(stop1) + RelativeLuminance(stop2)) / 2;
++  return luminance >= kLightLuminance ? SpaceTheme::Mode::kLight
++                                      : SpaceTheme::Mode::kDark;
++}
++
++// ---------------------------------------------------------------------------
++// Items.
++
++std::u16string ItemText(const std::string& text) {
++  return base::UTF8ToUTF16(base::CollapseWhitespaceASCII(
++      text, /*trim_sequences_with_line_breaks=*/false));
++}
++
++// Tabs in `items`, at any depth, that `record` doesn't map.
++size_t CountTabs(const std::vector<ImportItem>& items,
++                 const ArcImportRecord* record = nullptr) {
++  size_t count = 0;
++  for (const ImportItem& item : items) {
++    if (item.kind == ImportItem::Kind::kFolder) {
++      count += CountTabs(item.children, record);
++    } else if (!record || !record->FindItem(item.source_id)) {
++      ++count;
++    }
++  }
++  return count;
++}
++
++// Converts a tab, or counts why it's left out.
++std::optional<ArcApplyTab> ConvertTab(const ImportItem& item,
++                                      ArcImportCounts& counts) {
++  GURL url(item.url);
++  if (!url.is_valid()) {
++    ++counts.invalid_urls;
++    return std::nullopt;
++  }
++  if (!IsImportableUrl(url)) {
++    ++counts.unsupported_urls;
++    return std::nullopt;
++  }
++  ArcApplyTab tab;
++  tab.source_id = item.source_id;
++  tab.url = std::move(url);
++  tab.page_title = ItemText(item.page_title);
++  tab.name = ItemText(item.title);
++  tab.favicon_path = item.favicon_path;
++  tab.created = item.created;
++  return tab;
++}
++
++void CountGroup(const ImportItem& group, ArcImportCounts& counts) {
++  switch (group.group) {
++    case ImportItem::Group::kSplitView:
++      ++counts.split_views;
++      break;
++    case ImportItem::Group::kTabGroup:
++      ++counts.tab_groups;
++      break;
++    case ImportItem::Group::kNone:
++      break;
++  }
++}
++
++bool IsGroup(const ImportItem& item) {
++  return item.kind == ImportItem::Kind::kFolder &&
++         item.group != ImportItem::Group::kNone;
++}
++
++// Every tab in `items`, through folders, split views, and groups, for open
++// tabs and favorites. Groups are counted when one of their tabs is kept.
++void FlattenTabs(const std::vector<ImportItem>& items,
++                 const ArcImportRecord* record,
++                 ArcImportCounts& counts,
++                 std::vector<ArcApplyTab>& out) {
++  for (const ImportItem& item : items) {
++    if (item.kind == ImportItem::Kind::kFolder) {
++      const size_t before = out.size();
++      FlattenTabs(item.children, record, counts, out);
++      if (IsGroup(item) && out.size() > before) {
++        CountGroup(item, counts);
++      }
++      continue;
++    }
++    if (record && record->FindItem(item.source_id)) {
++      ++counts.already_imported;
++      continue;
++    }
++    if (std::optional<ArcApplyTab> tab = ConvertTab(item, counts)) {
++      out.push_back(std::move(*tab));
++    }
++  }
++}
++
++// Maps one space's pinned tree onto a one-level rac pinned list.
++class PinnedMapper {
++ public:
++  PinnedMapper(const ArcImportRecord* record,
++               const ArcLiveSidebar& live,
++               ArcImportCounts& counts,
++               std::vector<ArcApplyEntry>& out)
++      : record_(record), live_(live), counts_(counts), out_(out) {}
++
++  PinnedMapper(const PinnedMapper&) = delete;
++  PinnedMapper& operator=(const PinnedMapper&) = delete;
++
++  void MapTopLevel(const std::vector<ImportItem>& items) {
++    for (const ImportItem& item : items) {
++      if (item.kind == ImportItem::Kind::kTab) {
++        AddLooseTab(item);
++      } else if (IsGroup(item)) {
++        const int before = written_tabs_;
++        MapTopLevel(item.children);
++        if (written_tabs_ > before) {
++          CountGroup(item, *counts_);
++        }
++      } else {
++        MapFolder(item, {item.title});
++      }
++    }
++  }
++
++ private:
++  using Path = std::vector<std::string>;
++  using Nested = std::vector<std::pair<const ImportItem*, Path>>;
++
++  bool IsMapped(const ImportItem& item) const {
++    return record_ && record_->FindItem(item.source_id);
++  }
++
++  void AddLooseTab(const ImportItem& item) {
++    if (IsMapped(item)) {
++      ++counts_->already_imported;
++      return;
++    }
++    if (std::optional<ArcApplyTab> tab = ConvertTab(item, *counts_)) {
++      ++written_tabs_;
++      ++counts_->pinned_tabs;
++      out_->emplace_back(std::move(*tab));
++    }
++  }
++
++  // Emits `folder` as one rac folder, then its nested folders after it,
++  // depth first, each as its own rac folder named by its path.
++  void MapFolder(const ImportItem& folder, const Path& path) {
++    const ArcImportRecord::ItemMapping* mapping =
++        record_ ? record_->FindItem(folder.source_id) : nullptr;
++    ArcApplyFolder out;
++    out.source_id = folder.source_id;
++    out.title = base::UTF8ToUTF16(JoinFolderPath(path));
++    bool removed = false;
++    if (mapping) {
++      if (live_->sidebar_ids.contains(mapping->rac_id)) {
++        out.existing_id = mapping->rac_id;
++        ++counts_->already_imported;
++      } else {
++        removed = true;
++      }
++    }
++
++    Nested nested;
++    Collect(folder.children, path, removed, out, nested);
++
++    bool emit = false;
++    if (removed) {
++      emit = false;
++    } else if (!out.existing_id.empty()) {
++      emit = !out.tabs.empty();
++    } else {
++      // A new folder. One left with no tabs of its own is dropped, unless
++      // Arc's folder was empty to begin with: the user made it that way.
++      emit = !out.tabs.empty() || folder.children.empty();
++    }
++    if (emit) {
++      if (out.existing_id.empty()) {
++        ++counts_->folders;
++        if (path.size() > 1) {
++          ++counts_->nested_folders;
++          if (counts_->first_flattened_name.empty() &&
++              std::ranges::none_of(path, [](const std::string& title) {
++                return base::CollapseWhitespaceASCII(title, false).empty();
++              })) {
++            counts_->first_flattened_name = JoinFolderPath(path);
++          }
++        }
++      }
++      counts_->pinned_tabs += static_cast<int>(out.tabs.size());
++      out_->emplace_back(std::move(out));
++    }
++
++    for (const auto& [child, child_path] : nested) {
++      MapFolder(*child, child_path);
++    }
++  }
++
++  // The tabs directly in a folder, through split views and groups, go into
++  // `folder`; plain folders inside are queued in `nested`.
++  void Collect(const std::vector<ImportItem>& items,
++               const Path& path,
++               bool removed,
++               ArcApplyFolder& folder,
++               Nested& nested) {
++    for (const ImportItem& item : items) {
++      if (item.kind == ImportItem::Kind::kFolder) {
++        if (IsGroup(item)) {
++          const size_t before = folder.tabs.size();
++          Collect(item.children, path, removed, folder, nested);
++          if (folder.tabs.size() > before) {
++            CountGroup(item, *counts_);
++          }
++        } else {
++          Path child_path = path;
++          child_path.push_back(item.title);
++          nested.emplace_back(&item, std::move(child_path));
++        }
++        continue;
++      }
++      if (IsMapped(item)) {
++        ++counts_->already_imported;
++        continue;
++      }
++      if (removed) {
++        ++counts_->removed_since;
++        continue;
++      }
++      if (std::optional<ArcApplyTab> tab = ConvertTab(item, *counts_)) {
++        ++written_tabs_;
++        folder.tabs.push_back(std::move(*tab));
++      }
++    }
++  }
++
++  const raw_ptr<const ArcImportRecord> record_;
++  const raw_ref<const ArcLiveSidebar> live_;
++  const raw_ref<ArcImportCounts> counts_;
++  const raw_ref<std::vector<ArcApplyEntry>> out_;
++  int written_tabs_ = 0;
++};
++
++}  // namespace
++
++ArcApplyTab::ArcApplyTab() = default;
++ArcApplyTab::ArcApplyTab(const ArcApplyTab&) = default;
++ArcApplyTab::ArcApplyTab(ArcApplyTab&&) noexcept = default;
++ArcApplyTab& ArcApplyTab::operator=(const ArcApplyTab&) = default;
++ArcApplyTab& ArcApplyTab::operator=(ArcApplyTab&&) noexcept = default;
++ArcApplyTab::~ArcApplyTab() = default;
++
++ArcApplyFolder::ArcApplyFolder() = default;
++ArcApplyFolder::ArcApplyFolder(const ArcApplyFolder&) = default;
++ArcApplyFolder::ArcApplyFolder(ArcApplyFolder&&) noexcept = default;
++ArcApplyFolder& ArcApplyFolder::operator=(const ArcApplyFolder&) = default;
++ArcApplyFolder& ArcApplyFolder::operator=(ArcApplyFolder&&) noexcept = default;
++ArcApplyFolder::~ArcApplyFolder() = default;
++
++// SpaceTheme holds a base::DictValue, which can't be copied implicitly.
++ArcApplySpace::ArcApplySpace() = default;
++ArcApplySpace::ArcApplySpace(const ArcApplySpace& other)
++    : source_id(other.source_id),
++      existing_id(other.existing_id),
++      name(other.name),
++      icon(other.icon),
++      pinned(other.pinned),
++      open_tabs(other.open_tabs) {
++  if (other.theme) {
++    theme.emplace();
++    theme->color1 = other.theme->color1;
++    theme->color2 = other.theme->color2;
++    theme->mode = other.theme->mode;
++    theme->unknown_fields = other.theme->unknown_fields.Clone();
++  }
++}
++ArcApplySpace::ArcApplySpace(ArcApplySpace&&) noexcept = default;
++ArcApplySpace& ArcApplySpace::operator=(const ArcApplySpace& other) {
++  if (this != &other) {
++    *this = ArcApplySpace(other);
++  }
++  return *this;
++}
++ArcApplySpace& ArcApplySpace::operator=(ArcApplySpace&&) noexcept = default;
++ArcApplySpace::~ArcApplySpace() = default;
++
++ArcLiveSidebar::ArcLiveSidebar() = default;
++ArcLiveSidebar::ArcLiveSidebar(const ArcLiveSidebar&) = default;
++ArcLiveSidebar& ArcLiveSidebar::operator=(const ArcLiveSidebar&) = default;
++ArcLiveSidebar::~ArcLiveSidebar() = default;
++
++ArcApplyPlan::ArcApplyPlan() = default;
++ArcApplyPlan::ArcApplyPlan(const ArcApplyPlan&) = default;
++ArcApplyPlan::ArcApplyPlan(ArcApplyPlan&&) noexcept = default;
++ArcApplyPlan& ArcApplyPlan::operator=(const ArcApplyPlan&) = default;
++ArcApplyPlan& ArcApplyPlan::operator=(ArcApplyPlan&&) noexcept = default;
++ArcApplyPlan::~ArcApplyPlan() = default;
++
++ArcApplyPlan MapArcProfile(const ImportProfile& profile,
++                           const ArcImportRecord& record,
++                           const ArcLiveSidebar& live,
++                           const ArcImportOptions& options) {
++  ArcApplyPlan plan;
++  ArcImportCounts& counts = plan.counts;
++  plan.record_was_stale = record.IsStale(live.space_ids, live.sidebar_ids);
++  const ArcImportRecord* mapped = plan.record_was_stale ? nullptr : &record;
++
++  for (const ImportSpace& space : profile.spaces) {
++    ArcApplySpace out;
++    out.source_id = space.source_id;
++    const ArcImportRecord::SpaceMapping* mapping =
++        mapped ? mapped->FindSpace(space.source_id) : nullptr;
++
++    if (mapping && !live.space_ids.contains(mapping->rac_id)) {
++      // The user deleted the space an earlier import made. Respect that:
++      // what Arc has added to it since stays out.
++      counts.removed_since += static_cast<int>(CountTabs(space.pinned, mapped));
++      continue;
++    }
++
++    if (mapping) {
++      out.existing_id = mapping->rac_id;
++      ++counts.already_imported;
++      if (options.open_tabs) {
++        counts.open_tabs_not_reopened +=
++            static_cast<int>(CountTabs(space.open_tabs));
++      }
++    } else {
++      out.name = ImportedSpaceName(space);
++      out.icon = ImportedSpaceIcon(space);
++      out.theme = MaybeToSpaceTheme(space.theme);
++      ++counts.spaces;
++    }
++
++    PinnedMapper(mapped, live, counts, out.pinned).MapTopLevel(space.pinned);
++
++    if (out.is_new() && options.open_tabs) {
++      FlattenTabs(space.open_tabs, mapped, counts, out.open_tabs);
++      counts.open_tabs += static_cast<int>(out.open_tabs.size());
++    }
++
++    if (out.is_new() || !out.pinned.empty()) {
++      plan.spaces.push_back(std::move(out));
++    }
++  }
++
++  std::vector<ArcApplyTab> favorites;
++  FlattenTabs(profile.favorites, mapped, counts, favorites);
++  base::flat_set<std::string> seen = live.favorite_urls;
++  for (ArcApplyTab& favorite : favorites) {
++    if (!seen.insert(favorite.url.spec()).second) {
++      ++counts.favorites_already_there;
++      continue;
++    }
++    plan.favorites.push_back(std::move(favorite));
++  }
++  counts.favorites = static_cast<int>(plan.favorites.size());
++
++  if (counts.spaces > 0) {
++    plan.replace_blank_space = live.blank_space_id;
++  }
++  return plan;
++}
++
++std::optional<SpaceTheme> MaybeToSpaceTheme(const ImportTheme& theme) {
++  const ImportThemeVariant* primary = nullptr;
++  const ImportThemeVariant* dark = nullptr;
++  switch (theme.kind) {
++    case ImportTheme::Kind::kNone:
++      return std::nullopt;
++    case ImportTheme::Kind::kSingle:
++      if (IsUsable(theme.single)) {
++        primary = &*theme.single;
++      }
++      break;
++    case ImportTheme::Kind::kAppearanceBased:
++      if (IsUsable(theme.light) && IsUsable(theme.dark)) {
++        primary = &*theme.light;
++        dark = &*theme.dark;
++      } else if (IsUsable(theme.light)) {
++        primary = &*theme.light;
++      } else if (IsUsable(theme.dark)) {
++        primary = &*theme.dark;
++      }
++      break;
++  }
++  if (!primary) {
++    return std::nullopt;
++  }
++
++  auto [first, second] = *VariantStops(*primary);
++  first = GamutMapToSrgb(first);
++  second = GamutMapToSrgb(second);
++  SpaceTheme out;
++  out.color1 = ToSrgbHex(first);
++  out.color2 = ToSrgbHex(second);
++  if (dark) {
++    // Arc follows macOS between the two looks, and so does Auto.
++    out.mode = SpaceTheme::Mode::kAuto;
++    const auto [dark1, dark2] = *VariantStops(*dark);
++    out.unknown_fields.Set(kDarkStop1Key, ToSrgbHex(GamutMapToSrgb(dark1)));
++    out.unknown_fields.Set(kDarkStop2Key, ToSrgbHex(GamutMapToSrgb(dark2)));
++  } else {
++    out.mode = ModeFor(*primary, first, second);
++  }
++  return out;
++}
++
++SpaceTheme ToSpaceTheme(const ImportTheme& theme) {
++  std::optional<SpaceTheme> mapped = MaybeToSpaceTheme(theme);
++  return mapped ? std::move(*mapped) : SpaceTheme();
++}
++
++ImportColor GamutMapToSrgb(const ImportColor& color) {
++  const double alpha = std::clamp(Finite(color.alpha), 0.0, 1.0);
++  const Rgb encoded{Finite(color.red), Finite(color.green), Finite(color.blue)};
++  if (InUnitRange(encoded.r) && InUnitRange(encoded.g) &&
++      InUnitRange(encoded.b)) {
++    return {std::clamp(encoded.r, 0.0, 1.0), std::clamp(encoded.g, 0.0, 1.0),
++            std::clamp(encoded.b, 0.0, 1.0), alpha};
++  }
++  const Rgb linear{SrgbToLinear(encoded.r), SrgbToLinear(encoded.g),
++                   SrgbToLinear(encoded.b)};
++  const Oklab lab = LinearSrgbToOklab(linear);
++  if (!std::isfinite(lab.l) || lab.l <= 0) {
++    return {0, 0, 0, alpha};
++  }
++  if (lab.l >= 1) {
++    return {1, 1, 1, alpha};
++  }
++  const double chroma = std::hypot(lab.a, lab.b);
++  const double hue = std::atan2(lab.b, lab.a);
++  // Binary search for the largest chroma, at this lightness and hue, that's
++  // inside sRGB. Chroma zero is gray, which always is.
++  double low = 0;
++  double high = chroma;
++  for (int i = 0; i < 32; ++i) {
++    const double mid = (low + high) / 2;
++    if (InGamut(OklabToLinearSrgb(
++            {lab.l, mid * std::cos(hue), mid * std::sin(hue)}))) {
++      low = mid;
++    } else {
++      high = mid;
++    }
++  }
++  return FromLinear(
++      OklabToLinearSrgb({lab.l, low * std::cos(hue), low * std::sin(hue)}),
++      alpha);
++}
++
++std::string ToSrgbHex(const ImportColor& color) {
++  auto channel = [](double value) {
++    return static_cast<int>(
++        std::lround(std::clamp(Finite(value), 0.0, 1.0) * 255));
++  };
++  return base::StringPrintf("#%02X%02X%02X", channel(color.red),
++                            channel(color.green), channel(color.blue));
++}
++
++double RelativeLuminance(const ImportColor& color) {
++  auto linear = [](double value) {
++    return SrgbToLinear(std::clamp(Finite(value), 0.0, 1.0));
++  };
++  return 0.2126 * linear(color.red) + 0.7152 * linear(color.green) +
++         0.0722 * linear(color.blue);
++}
++
++std::string ImportedSpaceName(const ImportSpace& space) {
++  const std::string name = base::CollapseWhitespaceASCII(
++      space.title, /*trim_sequences_with_line_breaks=*/false);
++  return std::string(base::TruncateUTF8ToByteSize(name, kMaxSpaceNameBytes));
++}
++
++std::string ImportedSpaceIcon(const ImportSpace& space) {
++  const std::string_view icon =
++      base::TrimWhitespaceASCII(space.emoji, base::TRIM_ALL);
++  if (icon.empty() || icon.size() > 32 || !base::IsStringUTF8(icon)) {
++    return std::string();
++  }
++  return std::string(icon);
++}
++
++ArcProfileLabel ArcProfileLabelFor(const ImportPlan& plan, size_t index) {
++  CHECK_LT(index, plan.profiles.size());
++  const ImportProfile& profile = plan.profiles[index];
++  std::string name = base::CollapseWhitespaceASCII(
++      profile.display_name, /*trim_sequences_with_line_breaks=*/false);
++  // A name equal to the folder name is Chromium's, not the user's.
++  if (!name.empty() && name != profile.directory) {
++    return {.name = std::move(name)};
++  }
++  if (profile.is_default) {
++    return {.fallback = ArcProfileLabel::Fallback::kDefault};
++  }
++  int number = 1;
++  for (size_t i = 0; i <= index; ++i) {
++    if (!plan.profiles[i].is_default) {
++      ++number;
++    }
++  }
++  return {.fallback = ArcProfileLabel::Fallback::kNumbered, .number = number};
++}
++
++std::string JoinFolderPath(const std::vector<std::string>& titles) {
++  std::vector<std::string> parts;
++  for (const std::string& title : titles) {
++    std::string part = base::CollapseWhitespaceASCII(
++        title, /*trim_sequences_with_line_breaks=*/false);
++    if (!part.empty()) {
++      parts.push_back(std::move(part));
++    }
++  }
++  return base::JoinString(parts, kFolderPathSeparator);
++}
++
++bool IsImportableUrl(const GURL& url) {
++  return url.is_valid() && (url.SchemeIsHTTPOrHTTPS() || url.SchemeIsFile() ||
++                            url.IsAboutBlank());
++}
++
++ArcUndoPinEntry::ArcUndoPinEntry() = default;
++ArcUndoPinEntry::ArcUndoPinEntry(const ArcUndoPinEntry&) = default;
++ArcUndoPinEntry& ArcUndoPinEntry::operator=(const ArcUndoPinEntry&) = default;
++ArcUndoPinEntry::~ArcUndoPinEntry() = default;
++
++ArcKeptPin::ArcKeptPin() = default;
++ArcKeptPin::ArcKeptPin(const ArcKeptPin&) = default;
++ArcKeptPin& ArcKeptPin::operator=(const ArcKeptPin&) = default;
++ArcKeptPin::~ArcKeptPin() = default;
++
++std::vector<ArcKeptPin> PlanKeptPins(
++    const std::vector<ArcUndoPinEntry>& entries,
++    const base::flat_set<std::string>& run_ids) {
++  std::vector<ArcKeptPin> kept;
++  for (const ArcUndoPinEntry& entry : entries) {
++    ArcKeptPin pin;
++    if (!entry.is_folder) {
++      if (run_ids.contains(entry.id)) {
++        continue;
++      }
++      pin.item_ids.push_back(entry.id);
++    } else {
++      pin.folder_id = entry.id;
++      for (const std::string& item_id : entry.item_ids) {
++        if (!run_ids.contains(item_id)) {
++          pin.item_ids.push_back(item_id);
++        }
++      }
++      if (pin.item_ids.empty()) {
++        continue;
++      }
++    }
++    kept.push_back(std::move(pin));
++  }
++  return kept;
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/import/arc_import_mapping.h
+@@ -0,0 +1,288 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_IMPORT_ARC_IMPORT_MAPPING_H_
++#define CHROME_BROWSER_RAC_IMPORT_ARC_IMPORT_MAPPING_H_
++
++#include <cstddef>
++#include <optional>
++#include <string>
++#include <variant>
++#include <vector>
++
++#include "base/containers/flat_set.h"
++#include "base/files/file_path.h"
++#include "base/time/time.h"
++#include "chrome/browser/rac/import/arc_import_types.h"
++#include "chrome/browser/rac/import/import_plan.h"
++#include "chrome/browser/rac/spaces/space.h"
++#include "url/gurl.h"
++
++// Turns one Arc profile of an ImportPlan into what the applier writes: rac
++// spaces, pinned lists, favorites, and open tabs, minus what an earlier
++// import already brought. Pure: no profile, no services, no files, so every
++// rule is unit-tested. The applier gathers ArcLiveSidebar, calls
++// MapArcProfile(), and writes the result through SpacesService and
++// SidebarItems.
++//
++// The rules:
++//
++// - Each Arc space becomes its own rac space, keyed by its Arc id. Spaces are
++//   never matched by title, neither with each other nor with a rac space the
++//   user already has.
++// - Pinned lists keep their order. rac's folders are one level deep, so a
++//   folder inside a folder is lifted to the top, right after its parent, and
++//   named by its path, "Parent › Child". A parent left with no tabs of its
++//   own is dropped; an Arc folder that was empty to begin with is kept.
++// - Split views and tab groups are see-through: their tabs take their place
++//   in the list or folder around them.
++// - Open tabs (Today) are flattened to tabs. Only a space this import makes
++//   gets them.
++// - Favorites (Top Apps) are flattened to tabs, and a URL the profile
++//   already has as a favorite isn't added again.
++// - URLs are kept to an allowlist: http, https, file, and about:blank.
++//   Anything else, and anything GURL rejects, is left out and counted.
++// - A rerun skips everything the import record maps, wherever it is now.
++//   New Arc items in a mapped space are appended to it; new tabs in a mapped
++//   folder are appended to that folder. Items whose rac space or folder the
++//   user deleted aren't brought back.
++
++namespace rac {
++
++class ArcImportRecord;
++
++// A tab to write: a pinned tab, a favorite, or an open tab.
++struct ArcApplyTab {
++  ArcApplyTab();
++  ArcApplyTab(const ArcApplyTab&);
++  ArcApplyTab(ArcApplyTab&&) noexcept;
++  ArcApplyTab& operator=(const ArcApplyTab&);
++  ArcApplyTab& operator=(ArcApplyTab&&) noexcept;
++  ~ArcApplyTab();
++
++  // ImportItem::source_id.
++  std::string source_id;
++  GURL url;
++  // The page's own title (SidebarItem::title).
++  std::u16string page_title;
++  // The name the user gave it in Arc (SidebarItem::name). Empty: show the
++  // page title.
++  std::u16string name;
++  // Arc's cached favicon file. Empty if none. Not read yet.
++  base::FilePath favicon_path;
++  base::Time created;
++};
++
++// A rac folder to make, or one an earlier import made, with tabs to add.
++struct ArcApplyFolder {
++  ArcApplyFolder();
++  ArcApplyFolder(const ArcApplyFolder&);
++  ArcApplyFolder(ArcApplyFolder&&) noexcept;
++  ArcApplyFolder& operator=(const ArcApplyFolder&);
++  ArcApplyFolder& operator=(ArcApplyFolder&&) noexcept;
++  ~ArcApplyFolder();
++
++  // The Arc folder's id.
++  std::string source_id;
++  // Set when an earlier import made this folder and it's still there: the
++  // tabs are appended to it, and `title` is unused.
++  std::string existing_id;
++  // "Parent › Child" for a lifted folder.
++  std::u16string title;
++  std::vector<ArcApplyTab> tabs;
++};
++
++using ArcApplyEntry = std::variant<ArcApplyTab, ArcApplyFolder>;
++
++struct ArcApplySpace {
++  ArcApplySpace();
++  ArcApplySpace(const ArcApplySpace&);
++  ArcApplySpace(ArcApplySpace&&) noexcept;
++  ArcApplySpace& operator=(const ArcApplySpace&);
++  ArcApplySpace& operator=(ArcApplySpace&&) noexcept;
++  ~ArcApplySpace();
++
++  bool is_new() const { return existing_id.empty(); }
++
++  // ImportSpace::source_id.
++  std::string source_id;
++  // Set when an earlier import made this space and it's still there. Only
++  // `pinned` is then used, appended at the end of its pinned list.
++  std::string existing_id;
++  // New spaces only. `name` is empty when Arc had none; the sidebar then
++  // shows rac's own fallback, "Space <n>".
++  std::string name;
++  std::string icon;
++  // Nullopt: rac's default theme.
++  std::optional<SpaceTheme> theme;
++  // Top-level entries to add, in order.
++  std::vector<ArcApplyEntry> pinned;
++  // New spaces only, and only with ArcImportOptions::open_tabs.
++  std::vector<ArcApplyTab> open_tabs;
++};
++
++// What the profile holds when an import starts, gathered by the applier on
++// the UI thread.
++struct ArcLiveSidebar {
++  ArcLiveSidebar();
++  ArcLiveSidebar(const ArcLiveSidebar&);
++  ArcLiveSidebar& operator=(const ArcLiveSidebar&);
++  ~ArcLiveSidebar();
++
++  // Every space, as SpaceId::AsLowercaseString().
++  base::flat_set<std::string> space_ids;
++  // Every SidebarItem and SidebarFolder id, in every list.
++  base::flat_set<std::string> sidebar_ids;
++  // GURL::spec() of every favorite.
++  base::flat_set<std::string> favorite_urls;
++  // Set when the profile has a single space that is blank: no name, no
++  // icon, the default theme, nothing pinned, and no tabs but new-tab pages.
++  // That's what a new profile looks like. The import then replaces it, so
++  // Arc's first space comes first instead of after an empty one.
++  std::string blank_space_id;
++};
++
++struct ArcApplyPlan {
++  ArcApplyPlan();
++  ArcApplyPlan(const ArcApplyPlan&);
++  ArcApplyPlan(ArcApplyPlan&&) noexcept;
++  ArcApplyPlan& operator=(const ArcApplyPlan&);
++  ArcApplyPlan& operator=(ArcApplyPlan&&) noexcept;
++  ~ArcApplyPlan();
++
++  // True when applying writes nothing: the result is "nothing new", and no
++  // snapshot is taken.
++  bool IsEmpty() const { return !counts.AddsAnything(); }
++
++  // Arc's order. New spaces are appended after the profile's spaces; spaces
++  // with nothing to add are left out.
++  std::vector<ArcApplySpace> spaces;
++  // Appended after the profile's favorites.
++  std::vector<ArcApplyTab> favorites;
++  // ArcLiveSidebar::blank_space_id, when the plan makes at least one space.
++  std::string replace_blank_space;
++  // The record mapped things, none of which are in the profile any more,
++  // so it was ignored. The applier starts the record's mappings afresh.
++  bool record_was_stale = false;
++  // What applying this plan writes, and what it leaves out.
++  ArcImportCounts counts;
++};
++
++// The whole mapping for one Arc profile into one rac profile. `record` is
++// the target profile's import record, empty on a first import.
++ArcApplyPlan MapArcProfile(const ImportProfile& profile,
++                           const ArcImportRecord& record,
++                           const ArcLiveSidebar& live,
++                           const ArcImportOptions& options);
++
++// Themes.
++//
++// - A gradient: its first two base colors.
++// - One flat color, or a theme the reader picked from Arc's palette: that
++//   color for both stops.
++// - Separate light and dark looks: the light look's stops, mode Auto, and the
++//   dark look's stops under kDarkStop1Key/kDarkStop2Key in
++//   SpaceTheme::unknown_fields, which a Space keeps when it writes the
++//   theme back.
++// - With only one of the two looks, that one, as for a single look.
++// - Mode: from Arc's `contentOverBackgroundAppearance`; else from the stops'
++//   mean relative luminance, light at kLightLuminance or above.
++// - Colors outside sRGB are brought in by GamutMapToSrgb().
++// - No colors at all: nullopt, so rac's default theme stays.
++std::optional<SpaceTheme> MaybeToSpaceTheme(const ImportTheme& theme);
++// As above, with rac's default theme for nullopt. For the import preview,
++// so its tile is painted with exactly what the space gets.
++SpaceTheme ToSpaceTheme(const ImportTheme& theme);
++
++inline constexpr char kDarkStop1Key[] = "dark1";
++inline constexpr char kDarkStop2Key[] = "dark2";
++inline constexpr double kLightLuminance = 0.18;
++
++// Brings a color whose
++// channels may be outside 0..1 (Arc's `extendedSRGB`: sRGB primaries, the
++// sRGB curve extended past both ends) into sRGB by lowering its OKLCH chroma
++// while keeping lightness and hue. Lightness at or past either end gives
++// white or black. In-gamut colors come back unchanged. Alpha is kept.
++ImportColor GamutMapToSrgb(const ImportColor& color);
++// "#RRGGBB", uppercase like SpaceTheme's presets. Channels are clamped first;
++// map out-of-gamut colors with GamutMapToSrgb() before.
++std::string ToSrgbHex(const ImportColor& color);
++// WCAG relative luminance of an sRGB color, 0 to 1.
++double RelativeLuminance(const ImportColor& color);
++
++// Names.
++//
++// The name a rac space gets: Arc's title with its whitespace collapsed, at
++// most kMaxSpaceNameBytes. Empty when Arc had none; the sidebar then shows
++// rac's own "Space <n>" (IDS_RAC_SPACE_FALLBACK_NAME).
++std::string ImportedSpaceName(const ImportSpace& space);
++// The emoji, if it's one a Space can keep (valid UTF-8, at most 32
++// bytes, the limit Space::FromDict reads back). Else empty.
++std::string ImportedSpaceIcon(const ImportSpace& space);
++inline constexpr size_t kMaxSpaceNameBytes = 256;
++
++// How to label an Arc profile on the import screens and its new rac
++// profile: its own name; never its folder name ("Profile 1"). Without one,
++// the default profile is "Your Arc profile", and the others "Arc profile 2",
++// "Arc profile 3" in plan order. The UI turns `fallback` into text.
++struct ArcProfileLabel {
++  enum class Fallback { kNone, kDefault, kNumbered };
++
++  std::string name;
++  Fallback fallback = Fallback::kNone;
++  // kNumbered only. Starts at 2.
++  int number = 0;
++};
++ArcProfileLabel ArcProfileLabelFor(const ImportPlan& plan, size_t index);
++
++// " › " (U+203A), as the reader's ImportReport::first_nested_folder_path.
++inline constexpr char kFolderPathSeparator[] = " › ";
++// Joins folder titles from the top, skipping empty ones.
++std::string JoinFolderPath(const std::vector<std::string>& titles);
++
++// Whether rac imports a pin, favorite, or open tab with this URL: http,
++// https, file, and about:blank only. Everything else (chrome:, javascript:,
++// data:, blob:, Arc's own pages, extension pages, and so on) is left out
++// and counted as unsupported.
++bool IsImportableUrl(const GURL& url);
++
++// One top-level entry of a space's pinned list, as Undo sees it.
++struct ArcUndoPinEntry {
++  ArcUndoPinEntry();
++  ArcUndoPinEntry(const ArcUndoPinEntry&);
++  ArcUndoPinEntry& operator=(const ArcUndoPinEntry&);
++  ~ArcUndoPinEntry();
++  // The item's id, or the folder's id.
++  std::string id;
++  bool is_folder = false;
++  // For a folder: the ids of its items, in order. Empty for an item.
++  std::vector<std::string> item_ids;
++};
++
++// What Undo moves out of a space it is about to delete.
++struct ArcKeptPin {
++  ArcKeptPin();
++  ArcKeptPin(const ArcKeptPin&);
++  ArcKeptPin& operator=(const ArcKeptPin&);
++  ~ArcKeptPin();
++  // The id of the folder these items are in, or empty for a loose item.
++  std::string folder_id;
++  // A loose item: exactly its id. A folder: the ids of its items to keep.
++  std::vector<std::string> item_ids;
++};
++
++// `run_ids` is every rac id the import run mapped (spaces' items, folders,
++// favorites). Returns, in list order, the entries the run did not make:
++// - a loose item whose id is not in `run_ids`;
++// - for a folder, its items whose ids are not in `run_ids`, if there is at
++//   least one (the folder itself may or may not be the run's: either way the
++//   user's pins in it are kept). A folder whose items are all the run's is
++//   dropped.
++std::vector<ArcKeptPin> PlanKeptPins(
++    const std::vector<ArcUndoPinEntry>& entries,
++    const base::flat_set<std::string>& run_ids);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_IMPORT_ARC_IMPORT_MAPPING_H_
+--- /dev/null
++++ b/chrome/browser/rac/import/arc_import_mapping_unittest.cc
+@@ -0,0 +1,1389 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/arc_import_mapping.h"
++
++#include <cstddef>
++#include <limits>
++#include <optional>
++#include <string>
++#include <utility>
++#include <variant>
++#include <vector>
++
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/rac/import/arc_import_record.h"
++#include "chrome/browser/rac/import/import_plan.h"
++#include "testing/gmock/include/gmock/gmock.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace rac {
++namespace {
++
++using ::testing::ElementsAre;
++using ::testing::IsEmpty;
++
++// Builders. ImportItem and ImportSpace have user-declared constructors, so
++// they are built by assignment, not aggregate initialization. The space
++// builder isn't called Space(): that would clash with rac::Space.
++
++ImportItem Tab(const std::string& id,
++               const std::string& url,
++               const std::string& title = std::string()) {
++  ImportItem item;
++  item.kind = ImportItem::Kind::kTab;
++  item.source_id = id;
++  item.url = url;
++  item.title = title;
++  return item;
++}
++
++ImportItem Folder(const std::string& id,
++                  const std::string& title,
++                  std::vector<ImportItem> children,
++                  ImportItem::Group group = ImportItem::Group::kNone) {
++  ImportItem item;
++  item.kind = ImportItem::Kind::kFolder;
++  item.source_id = id;
++  item.title = title;
++  item.group = group;
++  item.children = std::move(children);
++  return item;
++}
++
++ImportItem SplitView(const std::string& id, std::vector<ImportItem> children) {
++  return Folder(id, std::string(), std::move(children),
++                ImportItem::Group::kSplitView);
++}
++
++ImportItem TabGroup(const std::string& id, std::vector<ImportItem> children) {
++  return Folder(id, std::string(), std::move(children),
++                ImportItem::Group::kTabGroup);
++}
++
++ImportSpace MakeSpace(const std::string& id,
++                      const std::string& title,
++                      std::vector<ImportItem> pinned,
++                      std::vector<ImportItem> open_tabs = {}) {
++  ImportSpace space;
++  space.source_id = id;
++  space.title = title;
++  space.pinned = std::move(pinned);
++  space.open_tabs = std::move(open_tabs);
++  return space;
++}
++
++ImportProfile ProfileOf(std::vector<ImportSpace> spaces) {
++  ImportProfile profile;
++  profile.source_key = "default";
++  profile.is_default = true;
++  profile.spaces = std::move(spaces);
++  return profile;
++}
++
++ImportProfile ProfileOf(ImportSpace space) {
++  std::vector<ImportSpace> spaces;
++  spaces.push_back(std::move(space));
++  return ProfileOf(std::move(spaces));
++}
++
++ImportColor C(double r, double g, double b, double a = 1) {
++  ImportColor color;
++  color.red = r;
++  color.green = g;
++  color.blue = b;
++  color.alpha = a;
++  return color;
++}
++
++ImportThemeVariant Variant(
++    ImportThemeVariant::Origin origin,
++    std::optional<ImportColor> color1,
++    std::optional<ImportColor> color2 = std::nullopt,
++    ImportThemeVariant::Content content =
++        ImportThemeVariant::Content::kUnknown) {
++  ImportThemeVariant variant;
++  variant.origin = origin;
++  variant.color1 = color1;
++  variant.color2 = color2;
++  variant.content = content;
++  return variant;
++}
++
++ImportTheme SingleTheme(const ImportThemeVariant& variant) {
++  ImportTheme theme;
++  theme.kind = ImportTheme::Kind::kSingle;
++  theme.single = variant;
++  return theme;
++}
++
++ImportTheme AppearanceTheme(std::optional<ImportThemeVariant> light,
++                            std::optional<ImportThemeVariant> dark) {
++  ImportTheme theme;
++  theme.kind = ImportTheme::Kind::kAppearanceBased;
++  theme.light = std::move(light);
++  theme.dark = std::move(dark);
++  return theme;
++}
++
++// A flat-color theme whose looks come from `content` only.
++ImportTheme FlatTheme(const ImportColor& color,
++                      ImportThemeVariant::Content content =
++                          ImportThemeVariant::Content::kUnknown) {
++  return SingleTheme(Variant(ImportThemeVariant::Origin::kSingleColor, color,
++                             std::nullopt, content));
++}
++
++bool IsHexColor(const std::string& text) {
++  if (text.size() != 7 || text[0] != '#') {
++    return false;
++  }
++  for (size_t i = 1; i < text.size(); ++i) {
++    const char c = text[i];
++    if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'))) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// "tab:<id>" or "folder:<title>[<tab ids>]", so a pinned list reads as one
++// vector of strings. The path separator is " \xE2\x80\xBA " (U+203A).
++std::string Describe(const ArcApplyEntry& entry) {
++  if (const ArcApplyTab* tab = std::get_if<ArcApplyTab>(&entry)) {
++    return "tab:" + tab->source_id;
++  }
++  const ArcApplyFolder& folder = std::get<ArcApplyFolder>(entry);
++  std::string out = "folder:" + base::UTF16ToUTF8(folder.title) + "[";
++  for (size_t i = 0; i < folder.tabs.size(); ++i) {
++    if (i > 0) {
++      out += ",";
++    }
++    out += folder.tabs[i].source_id;
++  }
++  return out + "]";
++}
++
++std::vector<std::string> DescribeAll(const std::vector<ArcApplyEntry>& list) {
++  std::vector<std::string> out;
++  for (const ArcApplyEntry& entry : list) {
++    out.push_back(Describe(entry));
++  }
++  return out;
++}
++
++std::vector<std::string> Ids(const std::vector<ArcApplyTab>& tabs) {
++  std::vector<std::string> out;
++  for (const ArcApplyTab& tab : tabs) {
++    out.push_back(tab.source_id);
++  }
++  return out;
++}
++
++// Maps against an empty record and an empty profile.
++ArcApplyPlan MapFresh(const ImportProfile& profile,
++                      const ArcImportOptions& options = ArcImportOptions()) {
++  return MapArcProfile(profile, ArcImportRecord(), ArcLiveSidebar(), options);
++}
++
++// The pinned list of the plan's only space.
++std::vector<std::string> OnlyPinned(const ArcApplyPlan& plan) {
++  EXPECT_EQ(plan.spaces.size(), 1u);
++  if (plan.spaces.empty()) {
++    return {};
++  }
++  return DescribeAll(plan.spaces[0].pinned);
++}
++
++// Simulates the applier: writes `plan` into the fake live sidebar and
++// records what it made, the way ArcImporter does. Open tabs aren't recorded.
++void FakeApply(const ArcApplyPlan& plan,
++               const std::string& run_id,
++               ArcImportRecord& record,
++               ArcLiveSidebar& live) {
++  int next = 0;
++  auto new_id = [&](const char* kind) {
++    return run_id + "-" + kind + "-" + std::to_string(++next);
++  };
++  auto add_tab = [&](const ArcApplyTab& tab, ArcImportRecord::ItemKind kind) {
++    const std::string id = new_id("item");
++    record.MapItem(tab.source_id, id, kind, run_id);
++    live.sidebar_ids.insert(id);
++    if (kind == ArcImportRecord::ItemKind::kFavorite) {
++      live.favorite_urls.insert(tab.url.spec());
++    }
++  };
++
++  for (const ArcApplySpace& space : plan.spaces) {
++    if (space.is_new()) {
++      const std::string id = new_id("space");
++      record.MapSpace(space.source_id, id, run_id);
++      live.space_ids.insert(id);
++    }
++    for (const ArcApplyEntry& entry : space.pinned) {
++      if (const ArcApplyTab* tab = std::get_if<ArcApplyTab>(&entry)) {
++        add_tab(*tab, ArcImportRecord::ItemKind::kPinnedTab);
++        continue;
++      }
++      const ArcApplyFolder& folder = std::get<ArcApplyFolder>(entry);
++      if (folder.existing_id.empty()) {
++        const std::string id = new_id("folder");
++        record.MapItem(folder.source_id, id, ArcImportRecord::ItemKind::kFolder,
++                       run_id);
++        live.sidebar_ids.insert(id);
++      }
++      for (const ArcApplyTab& tab : folder.tabs) {
++        add_tab(tab, ArcImportRecord::ItemKind::kPinnedTab);
++      }
++    }
++  }
++  for (const ArcApplyTab& favorite : plan.favorites) {
++    add_tab(favorite, ArcImportRecord::ItemKind::kFavorite);
++  }
++  if (!plan.replace_blank_space.empty()) {
++    live.blank_space_id.clear();
++  }
++}
++
++// The profile used by the rerun tests: two spaces with pins, a nested folder,
++// a split view, an empty folder, open tabs, and favorites.
++ImportProfile BigProfile() {
++  ImportProfile profile = ProfileOf(std::vector<ImportSpace>{
++      MakeSpace(
++          "S1", "One",
++          {Tab("t1", "https://t1.example/"),
++           Folder("P", "Parent",
++                  {Tab("p1", "https://p1.example/"),
++                   Folder("Q", "Child", {Tab("q1", "https://q1.example/")})}),
++           SplitView("sv", {Tab("s1", "https://s1.example/"),
++                            Tab("s2", "https://s2.example/")})},
++          {Tab("o1", "https://o1.example/"),
++           TabGroup("g", {Tab("o2", "https://o2.example/"),
++                          Tab("o3", "https://o3.example/")})}),
++      MakeSpace("S2", "Two",
++                {Tab("u1", "https://u1.example/"), Folder("E", "Empty", {})},
++                {Tab("v1", "https://v1.example/")})});
++  profile.favorites.push_back(Tab("fav1", "https://fav1.example/"));
++  profile.favorites.push_back(
++      Folder("favf", "Apps", {Tab("fav2", "https://fav2.example/")}));
++  return profile;
++}
++
++// ---------------------------------------------------------------------------
++// Flattening.
++
++TEST(ArcImportMappingTest, LooseTabsKeepOrder) {
++  ImportItem first = Tab("a", "https://a.example/", "Alpha");
++  first.page_title = "Page  A";
++  const ImportProfile profile = ProfileOf(MakeSpace(
++      "S", "Work",
++      {first, Tab("b", "https://b.example/"), Tab("c", "https://c.example/")}));
++
++  const ArcApplyPlan plan = MapFresh(profile);
++
++  EXPECT_THAT(OnlyPinned(plan), ElementsAre("tab:a", "tab:b", "tab:c"));
++  EXPECT_EQ(plan.counts.pinned_tabs, 3);
++  EXPECT_EQ(plan.counts.spaces, 1);
++  EXPECT_EQ(plan.counts.folders, 0);
++  const ArcApplyTab& tab = std::get<ArcApplyTab>(plan.spaces[0].pinned[0]);
++  EXPECT_EQ(tab.url.spec(), "https://a.example/");
++  EXPECT_EQ(tab.name, u"Alpha");
++  EXPECT_EQ(tab.page_title, u"Page A");
++  const ArcApplyTab& untitled = std::get<ArcApplyTab>(plan.spaces[0].pinned[1]);
++  EXPECT_TRUE(untitled.name.empty());
++}
++
++TEST(ArcImportMappingTest, NestedFoldersAreLiftedAndNamedByPath) {
++  const ImportProfile profile = ProfileOf(MakeSpace(
++      "S", "Work",
++      {Folder("A", "Parent",
++              {Tab("a1", "https://a1.example/"),
++               Folder("B", "Child",
++                      {Tab("b1", "https://b1.example/"),
++                       Folder("C", "Grand", {Tab("c1", "https://c1.example/")})}),
++               Tab("a2", "https://a2.example/")}),
++       Tab("z", "https://z.example/")}));
++
++  const ArcApplyPlan plan = MapFresh(profile);
++
++  EXPECT_THAT(OnlyPinned(plan),
++              ElementsAre("folder:Parent[a1,a2]",
++                          "folder:Parent \xE2\x80\xBA Child[b1]",
++                          "folder:Parent \xE2\x80\xBA Child \xE2\x80\xBA Grand[c1]",
++                          "tab:z"));
++  const std::vector<ArcApplyEntry>& pinned = plan.spaces[0].pinned;
++  ASSERT_TRUE(std::holds_alternative<ArcApplyFolder>(pinned[1]));
++  const ArcApplyFolder& child = std::get<ArcApplyFolder>(pinned[1]);
++  EXPECT_EQ(child.title, u"Parent › Child");
++  EXPECT_EQ(child.source_id, "B");
++  EXPECT_TRUE(child.existing_id.empty());
++  EXPECT_EQ(std::get<ArcApplyFolder>(pinned[2]).title,
++            u"Parent › Child › Grand");
++  EXPECT_EQ(std::get<ArcApplyFolder>(pinned[2]).source_id, "C");
++  EXPECT_TRUE(std::holds_alternative<ArcApplyTab>(pinned[3]));
++
++  EXPECT_EQ(plan.counts.folders, 3);
++  EXPECT_EQ(plan.counts.nested_folders, 2);
++  EXPECT_EQ(plan.counts.first_flattened_name, "Parent \xE2\x80\xBA Child");
++  EXPECT_EQ(plan.counts.pinned_tabs, 5);
++}
++
++TEST(ArcImportMappingTest, ParentWithOnlyFoldersIsDropped) {
++  const ImportProfile profile = ProfileOf(MakeSpace(
++      "S", "Work",
++      {Folder("P", "Parent",
++              {Folder("C", "Child", {Tab("c1", "https://c1.example/")})})}));
++
++  const ArcApplyPlan plan = MapFresh(profile);
++
++  EXPECT_THAT(OnlyPinned(plan),
++              ElementsAre("folder:Parent \xE2\x80\xBA Child[c1]"));
++  EXPECT_EQ(plan.counts.folders, 1);
++  EXPECT_EQ(plan.counts.nested_folders, 1);
++  EXPECT_EQ(plan.counts.pinned_tabs, 1);
++}
++
++TEST(ArcImportMappingTest, EmptyArcFolderIsKept) {
++  const ImportProfile profile = ProfileOf(MakeSpace(
++      "S", "Work",
++      {Folder("E", "Empty", {}), Tab("t", "https://t.example/")}));
++
++  const ArcApplyPlan plan = MapFresh(profile);
++
++  EXPECT_THAT(OnlyPinned(plan), ElementsAre("folder:Empty[]", "tab:t"));
++  EXPECT_EQ(plan.counts.folders, 1);
++  EXPECT_EQ(plan.counts.nested_folders, 0);
++  EXPECT_EQ(plan.counts.pinned_tabs, 1);
++}
++
++TEST(ArcImportMappingTest, FolderOfOnlyUnusableTabsIsDropped) {
++  const ImportProfile profile = ProfileOf(MakeSpace(
++      "S", "Work",
++      {Folder("F", "Broken", {Tab("bad", "not a url")}),
++       Tab("t", "https://t.example/")}));
++
++  const ArcApplyPlan plan = MapFresh(profile);
++
++  EXPECT_THAT(OnlyPinned(plan), ElementsAre("tab:t"));
++  EXPECT_EQ(plan.counts.folders, 0);
++  EXPECT_EQ(plan.counts.invalid_urls, 1);
++}
++
++TEST(ArcImportMappingTest, EmptyTitlesAreSkippedInPath) {
++  const ImportProfile profile = ProfileOf(MakeSpace(
++      "S", "Work",
++      {Folder("P", "",
++              {Folder("C", "Child", {Tab("c1", "https://c1.example/")})})}));
++
++  const ArcApplyPlan plan = MapFresh(profile);
++
++  ASSERT_EQ(plan.spaces.size(), 1u);
++  ASSERT_EQ(plan.spaces[0].pinned.size(), 1u);
++  EXPECT_EQ(std::get<ArcApplyFolder>(plan.spaces[0].pinned[0]).title,
++            u"Child");
++  EXPECT_EQ(plan.counts.folders, 1);
++  EXPECT_EQ(plan.counts.nested_folders, 1);
++  // Not every level has a title, so there is no example name.
++  EXPECT_TRUE(plan.counts.first_flattened_name.empty());
++}
++
++TEST(ArcImportMappingTest, SplitViewTabsTakeItsPlace) {
++  const ImportProfile profile = ProfileOf(MakeSpace(
++      "S", "Work",
++      {Tab("a", "https://a.example/"),
++       SplitView("sv", {Tab("b", "https://b.example/"),
++                        Tab("c", "https://c.example/")}),
++       Tab("d", "https://d.example/")}));
++
++  const ArcApplyPlan plan = MapFresh(profile);
++
++  EXPECT_THAT(OnlyPinned(plan),
++              ElementsAre("tab:a", "tab:b", "tab:c", "tab:d"));
++  EXPECT_EQ(plan.counts.split_views, 1);
++  EXPECT_EQ(plan.counts.tab_groups, 0);
++  EXPECT_EQ(plan.counts.pinned_tabs, 4);
++  EXPECT_EQ(plan.counts.folders, 0);
++}
++
++TEST(ArcImportMappingTest, TabGroupInsideFolderGoesIntoThatFolder) {
++  const ImportProfile profile = ProfileOf(MakeSpace(
++      "S", "Work",
++      {Folder("F", "Folder",
++              {Tab("x", "https://x.example/"),
++               TabGroup("g", {Tab("g1", "https://g1.example/"),
++                              Tab("g2", "https://g2.example/")}),
++               Tab("y", "https://y.example/")})}));
++
++  const ArcApplyPlan plan = MapFresh(profile);
++
++  EXPECT_THAT(OnlyPinned(plan), ElementsAre("folder:Folder[x,g1,g2,y]"));
++  EXPECT_EQ(plan.counts.tab_groups, 1);
++  EXPECT_EQ(plan.counts.split_views, 0);
++  EXPECT_EQ(plan.counts.folders, 1);
++  EXPECT_EQ(plan.counts.pinned_tabs, 4);
++}
++
++TEST(ArcImportMappingTest, GroupWithoutUsableTabsIsNotCounted) {
++  const ImportProfile profile = ProfileOf(MakeSpace(
++      "S", "Work",
++      {TabGroup("g1", {Tab("bad1", "not a url")}),
++       Folder("F", "Folder",
++              {Tab("ok", "https://ok.example/"),
++               SplitView("sv", {Tab("bad2", "http://")})})}));
++
++  const ArcApplyPlan plan = MapFresh(profile);
++
++  EXPECT_THAT(OnlyPinned(plan), ElementsAre("folder:Folder[ok]"));
++  EXPECT_EQ(plan.counts.tab_groups, 0);
++  EXPECT_EQ(plan.counts.split_views, 0);
++  EXPECT_EQ(plan.counts.invalid_urls, 2);
++}
++
++TEST(ArcImportMappingTest, FolderInsideTopLevelGroupBecomesTopLevelFolder) {
++  const ImportProfile profile = ProfileOf(MakeSpace(
++      "S", "Work",
++      {TabGroup("grp", {Tab("g1", "https://g1.example/"),
++                        Folder("X", "Plain", {Tab("x1", "https://x1.example/")}),
++                        Tab("g2", "https://g2.example/")})}));
++
++  const ArcApplyPlan plan = MapFresh(profile);
++
++  EXPECT_THAT(OnlyPinned(plan),
++              ElementsAre("tab:g1", "folder:Plain[x1]", "tab:g2"));
++  EXPECT_EQ(plan.counts.folders, 1);
++  EXPECT_EQ(plan.counts.nested_folders, 0);
++  EXPECT_TRUE(plan.counts.first_flattened_name.empty());
++  EXPECT_EQ(plan.counts.tab_groups, 1);
++  EXPECT_EQ(plan.counts.pinned_tabs, 3);
++}
++
++// ---------------------------------------------------------------------------
++// Open tabs and favorites.
++
++TEST(ArcImportMappingTest, OpenTabsFlattenThroughFoldersAndGroups) {
++  const ImportProfile profile = ProfileOf(MakeSpace(
++      "S", "Work", {},
++      {Tab("o1", "https://o1.example/"),
++       Folder("F", "Folder",
++              {Tab("o2", "https://o2.example/"),
++               TabGroup("g", {Tab("o3", "https://o3.example/"),
++                              Tab("o4", "https://o4.example/")})}),
++       Tab("o5", "https://o5.example/")}));
++
++  const ArcApplyPlan plan = MapFresh(profile);
++
++  ASSERT_EQ(plan.spaces.size(), 1u);
++  EXPECT_TRUE(plan.spaces[0].is_new());
++  EXPECT_THAT(Ids(plan.spaces[0].open_tabs),
++              ElementsAre("o1", "o2", "o3", "o4", "o5"));
++  EXPECT_THAT(plan.spaces[0].pinned, IsEmpty());
++  EXPECT_EQ(plan.counts.open_tabs, 5);
++  EXPECT_EQ(plan.counts.tab_groups, 1);
++  EXPECT_EQ(plan.counts.pinned_tabs, 0);
++  EXPECT_EQ(plan.counts.folders, 0);
++}
++
++TEST(ArcImportMappingTest, OpenTabsOffLeavesThemOut) {
++  const ImportProfile profile = ProfileOf(MakeSpace(
++      "S", "Work", {Tab("p", "https://p.example/")},
++      {Tab("o1", "https://o1.example/"), Tab("o2", "not a url")}));
++  ArcImportOptions options;
++  options.open_tabs = false;
++
++  const ArcApplyPlan plan = MapFresh(profile, options);
++
++  ASSERT_EQ(plan.spaces.size(), 1u);
++  EXPECT_THAT(plan.spaces[0].open_tabs, IsEmpty());
++  EXPECT_EQ(plan.counts.open_tabs, 0);
++  // Open tabs that were never looked at aren't counted as bad.
++  EXPECT_EQ(plan.counts.invalid_urls, 0);
++  EXPECT_THAT(OnlyPinned(plan), ElementsAre("tab:p"));
++}
++
++TEST(ArcImportMappingTest, FavoritesFlattenAndSkipRepeatedUrls) {
++  ImportProfile profile = ProfileOf(MakeSpace("S", "Work", {}));
++  profile.favorites.push_back(Tab("f1", "https://a.example/"));
++  profile.favorites.push_back(Folder(
++      "ff", "Apps",
++      {Tab("f2", "https://b.example/"), Tab("f3", "https://c.example/"),
++       Tab("f4", "https://a.example/")}));
++  ArcLiveSidebar live;
++  live.favorite_urls.insert(std::string("https://b.example/"));
++
++  const ArcApplyPlan plan =
++      MapArcProfile(profile, ArcImportRecord(), live, ArcImportOptions());
++
++  // f2 is a favorite already; f4 repeats f1's URL within Arc's Top Apps.
++  EXPECT_THAT(Ids(plan.favorites), ElementsAre("f1", "f3"));
++  EXPECT_EQ(plan.favorites[0].url.spec(), "https://a.example/");
++  EXPECT_EQ(plan.counts.favorites, 2);
++  EXPECT_EQ(plan.counts.favorites_already_there, 2);
++  EXPECT_EQ(plan.counts.folders, 0);
++}
++
++// ---------------------------------------------------------------------------
++// URLs.
++
++TEST(ArcImportMappingTest, UnusableUrlsAreLeftOutAndCounted) {
++  const ImportProfile profile = ProfileOf(MakeSpace(
++      "S", "Work",
++      {Tab("bad1", "not a url"), Tab("bad2", "http://"),
++       Tab("js", "javascript:alert(1)"), Tab("data", "data:text/html,x"),
++       Tab("blob", "blob:https://a.example/abc"),
++       Tab("ftp", "ftp://a.example/x"),
++       Tab("view", "view-source:https://a.example/"),
++       Tab("chrome", "chrome://settings/"),
++       Tab("ext", "chrome-extension://abc/x.html"),
++       Tab("about", "about:flags"), Tab("arc", "arc://boost"),
++       Tab("ok1", "https://a.example/"), Tab("ok2", "http://b.example/"),
++       Tab("ok3", "file:///tmp/x.html"), Tab("ok4", "about:blank")}));
++
++  const ArcApplyPlan plan = MapFresh(profile);
++
++  EXPECT_THAT(OnlyPinned(plan),
++              ElementsAre("tab:ok1", "tab:ok2", "tab:ok3", "tab:ok4"));
++  const std::vector<ArcApplyEntry>& pinned = plan.spaces[0].pinned;
++  EXPECT_EQ(std::get<ArcApplyTab>(pinned[0]).url.spec(), "https://a.example/");
++  EXPECT_EQ(std::get<ArcApplyTab>(pinned[1]).url.spec(), "http://b.example/");
++  EXPECT_EQ(std::get<ArcApplyTab>(pinned[2]).url.spec(), "file:///tmp/x.html");
++  EXPECT_EQ(std::get<ArcApplyTab>(pinned[3]).url.spec(), "about:blank");
++  EXPECT_EQ(plan.counts.invalid_urls, 2);
++  EXPECT_EQ(plan.counts.unsupported_urls, 9);
++  EXPECT_EQ(plan.counts.pinned_tabs, 4);
++}
++
++TEST(ArcImportMappingTest, IsImportableUrl) {
++  EXPECT_TRUE(IsImportableUrl(GURL("https://a.example/")));
++  EXPECT_TRUE(IsImportableUrl(GURL("http://a.example/")));
++  EXPECT_TRUE(IsImportableUrl(GURL("file:///tmp/x.html")));
++  EXPECT_TRUE(IsImportableUrl(GURL("about:blank")));
++
++  EXPECT_FALSE(IsImportableUrl(GURL()));
++  EXPECT_FALSE(IsImportableUrl(GURL("not a url")));
++  EXPECT_FALSE(IsImportableUrl(GURL("javascript:alert(1)")));
++  EXPECT_FALSE(IsImportableUrl(GURL("data:text/html,x")));
++  EXPECT_FALSE(IsImportableUrl(GURL("blob:https://a.example/abc")));
++  EXPECT_FALSE(IsImportableUrl(GURL("ftp://a.example/x")));
++  EXPECT_FALSE(IsImportableUrl(GURL("view-source:https://a.example/")));
++  EXPECT_FALSE(IsImportableUrl(GURL("chrome://settings/")));
++  EXPECT_FALSE(IsImportableUrl(GURL("chrome-extension://abc/x.html")));
++  EXPECT_FALSE(IsImportableUrl(GURL("about:flags")));
++  EXPECT_FALSE(IsImportableUrl(GURL("arc://boost")));
++}
++
++// ---------------------------------------------------------------------------
++// Themes.
++
++TEST(ArcImportMappingTest, NoThemeKeepsDefault) {
++  ImportTheme none;
++  EXPECT_FALSE(MaybeToSpaceTheme(none).has_value());
++
++  const SpaceTheme theme = ToSpaceTheme(none);
++  EXPECT_EQ(theme.color1, "#FFFFD7");
++  EXPECT_EQ(theme.color2, "#FFD9FB");
++  EXPECT_EQ(theme.mode, SpaceTheme::Mode::kAuto);
++  EXPECT_TRUE(theme.unknown_fields.empty());
++}
++
++TEST(ArcImportMappingTest, GradientUsesItsTwoColors) {
++  const ImportTheme theme = SingleTheme(Variant(
++      ImportThemeVariant::Origin::kGradient, C(1, 0.9, 0.8), C(0.9, 0.8, 1)));
++
++  const std::optional<SpaceTheme> mapped = MaybeToSpaceTheme(theme);
++
++  ASSERT_TRUE(mapped.has_value());
++  EXPECT_EQ(mapped->color1, "#FFE6CC");
++  EXPECT_EQ(mapped->color2, "#E6CCFF");
++  EXPECT_TRUE(mapped->unknown_fields.empty());
++  // Same through the preview's entry point.
++  const SpaceTheme preview = ToSpaceTheme(theme);
++  EXPECT_EQ(preview.color1, "#FFE6CC");
++  EXPECT_EQ(preview.color2, "#E6CCFF");
++}
++
++TEST(ArcImportMappingTest, GradientWithOneColorUsesItTwice) {
++  const std::optional<SpaceTheme> only_first =
++      MaybeToSpaceTheme(SingleTheme(Variant(
++          ImportThemeVariant::Origin::kGradient, C(1, 0.9, 0.8))));
++  ASSERT_TRUE(only_first.has_value());
++  EXPECT_EQ(only_first->color1, "#FFE6CC");
++  EXPECT_EQ(only_first->color2, "#FFE6CC");
++
++  const std::optional<SpaceTheme> only_second =
++      MaybeToSpaceTheme(SingleTheme(Variant(
++          ImportThemeVariant::Origin::kGradient, std::nullopt,
++          C(0.9, 0.8, 1))));
++  ASSERT_TRUE(only_second.has_value());
++  EXPECT_EQ(only_second->color1, "#E6CCFF");
++  EXPECT_EQ(only_second->color2, "#E6CCFF");
++}
++
++TEST(ArcImportMappingTest, SingleColorUsesItForBothStops) {
++  const std::optional<SpaceTheme> mapped =
++      MaybeToSpaceTheme(FlatTheme(C(0.2, 0.2, 0.4)));
++
++  ASSERT_TRUE(mapped.has_value());
++  EXPECT_EQ(mapped->color1, "#333366");
++  EXPECT_EQ(mapped->color2, "#333366");
++}
++
++TEST(ArcImportMappingTest, PaletteUsesFirstColorForBothStops) {
++  const std::optional<SpaceTheme> mapped =
++      MaybeToSpaceTheme(SingleTheme(Variant(
++          ImportThemeVariant::Origin::kPalette, C(1, 0.9, 0.8),
++          C(0.2, 0.2, 0.4))));
++
++  ASSERT_TRUE(mapped.has_value());
++  EXPECT_EQ(mapped->color1, "#FFE6CC");
++  EXPECT_EQ(mapped->color2, "#FFE6CC");
++}
++
++TEST(ArcImportMappingTest, UnknownOriginOrNoColorsKeepsDefault) {
++  // Colors, but a reader that didn't understand where they came from.
++  EXPECT_FALSE(MaybeToSpaceTheme(SingleTheme(Variant(
++                                     ImportThemeVariant::Origin::kUnknown,
++                                     C(1, 0, 0), C(0, 0, 1))))
++                   .has_value());
++  // A known origin without colors.
++  EXPECT_FALSE(MaybeToSpaceTheme(SingleTheme(Variant(
++                                     ImportThemeVariant::Origin::kGradient,
++                                     std::nullopt, std::nullopt)))
++                   .has_value());
++  // A single theme with no variant.
++  ImportTheme missing;
++  missing.kind = ImportTheme::Kind::kSingle;
++  EXPECT_FALSE(MaybeToSpaceTheme(missing).has_value());
++  // Appearance-based with neither look.
++  EXPECT_FALSE(MaybeToSpaceTheme(AppearanceTheme(std::nullopt, std::nullopt))
++                   .has_value());
++
++  const SpaceTheme fallback = ToSpaceTheme(SingleTheme(
++      Variant(ImportThemeVariant::Origin::kUnknown, C(1, 0, 0))));
++  EXPECT_EQ(fallback.color1, "#FFFFD7");
++  EXPECT_EQ(fallback.color2, "#FFD9FB");
++}
++
++TEST(ArcImportMappingTest, TwoLooksKeepLightStopsAndStoreDarkOnes) {
++  const ImportTheme theme = AppearanceTheme(
++      Variant(ImportThemeVariant::Origin::kGradient, C(1, 0.9, 0.8),
++              C(0.9, 0.8, 1), ImportThemeVariant::Content::kLight),
++      Variant(ImportThemeVariant::Origin::kGradient, C(0.2, 0.2, 0.4),
++              C(0.4, 0.2, 0.2), ImportThemeVariant::Content::kDark));
++
++  const std::optional<SpaceTheme> mapped = MaybeToSpaceTheme(theme);
++
++  ASSERT_TRUE(mapped.has_value());
++  EXPECT_EQ(mapped->color1, "#FFE6CC");
++  EXPECT_EQ(mapped->color2, "#E6CCFF");
++  EXPECT_EQ(mapped->mode, SpaceTheme::Mode::kAuto);
++  const std::string* dark1 = mapped->unknown_fields.FindString(kDarkStop1Key);
++  const std::string* dark2 = mapped->unknown_fields.FindString(kDarkStop2Key);
++  ASSERT_NE(dark1, nullptr);
++  ASSERT_NE(dark2, nullptr);
++  EXPECT_EQ(*dark1, "#333366");
++  EXPECT_EQ(*dark2, "#663333");
++  EXPECT_EQ(mapped->unknown_fields.size(), 2u);
++}
++
++TEST(ArcImportMappingTest, OnlyDarkLookIsUsedAsASingleLook) {
++  // Content says light even though the colors are dark: content wins.
++  const ImportTheme theme = AppearanceTheme(
++      std::nullopt,
++      Variant(ImportThemeVariant::Origin::kGradient, C(0.2, 0.2, 0.4),
++              C(0.4, 0.2, 0.2), ImportThemeVariant::Content::kLight));
++
++  const std::optional<SpaceTheme> mapped = MaybeToSpaceTheme(theme);
++
++  ASSERT_TRUE(mapped.has_value());
++  EXPECT_EQ(mapped->color1, "#333366");
++  EXPECT_EQ(mapped->color2, "#663333");
++  EXPECT_EQ(mapped->mode, SpaceTheme::Mode::kLight);
++  EXPECT_EQ(mapped->unknown_fields.FindString(kDarkStop1Key), nullptr);
++  EXPECT_EQ(mapped->unknown_fields.FindString(kDarkStop2Key), nullptr);
++
++  // A light look that has no colors leaves the same result.
++  const ImportTheme unusable_light = AppearanceTheme(
++      Variant(ImportThemeVariant::Origin::kUnknown, C(1, 1, 1)),
++      theme.dark);
++  const std::optional<SpaceTheme> from_dark =
++      MaybeToSpaceTheme(unusable_light);
++  ASSERT_TRUE(from_dark.has_value());
++  EXPECT_EQ(from_dark->color1, "#333366");
++  EXPECT_EQ(from_dark->unknown_fields.FindString(kDarkStop1Key), nullptr);
++}
++
++TEST(ArcImportMappingTest, OnlyLightLookHasNoDarkStops) {
++  const ImportTheme theme = AppearanceTheme(
++      Variant(ImportThemeVariant::Origin::kSingleColor, C(1, 0.9, 0.8),
++              std::nullopt, ImportThemeVariant::Content::kDark),
++      std::nullopt);
++
++  const std::optional<SpaceTheme> mapped = MaybeToSpaceTheme(theme);
++
++  ASSERT_TRUE(mapped.has_value());
++  EXPECT_EQ(mapped->color1, "#FFE6CC");
++  EXPECT_EQ(mapped->color2, "#FFE6CC");
++  EXPECT_EQ(mapped->mode, SpaceTheme::Mode::kDark);
++  EXPECT_TRUE(mapped->unknown_fields.empty());
++}
++
++TEST(ArcImportMappingTest, ContentDecidesModeRegardlessOfColors) {
++  const std::optional<SpaceTheme> dark_colors_light_content =
++      MaybeToSpaceTheme(FlatTheme(C(0.05, 0.05, 0.05),
++                                  ImportThemeVariant::Content::kLight));
++  ASSERT_TRUE(dark_colors_light_content.has_value());
++  EXPECT_EQ(dark_colors_light_content->mode, SpaceTheme::Mode::kLight);
++
++  const std::optional<SpaceTheme> light_colors_dark_content =
++      MaybeToSpaceTheme(FlatTheme(C(0.95, 0.95, 0.95),
++                                  ImportThemeVariant::Content::kDark));
++  ASSERT_TRUE(light_colors_dark_content.has_value());
++  EXPECT_EQ(light_colors_dark_content->mode, SpaceTheme::Mode::kDark);
++}
++
++TEST(ArcImportMappingTest, UnknownContentUsesLuminanceRule) {
++  // Relative luminance of gray 0.47 is about 0.187, of 0.46 about 0.179, and
++  // the cut is kLightLuminance (0.18).
++  EXPECT_NEAR(RelativeLuminance(C(0.47, 0.47, 0.47)), 0.187, 0.001);
++  EXPECT_NEAR(RelativeLuminance(C(0.46, 0.46, 0.46)), 0.179, 0.001);
++  EXPECT_DOUBLE_EQ(kLightLuminance, 0.18);
++
++  const std::optional<SpaceTheme> light =
++      MaybeToSpaceTheme(FlatTheme(C(0.47, 0.47, 0.47)));
++  ASSERT_TRUE(light.has_value());
++  EXPECT_EQ(light->mode, SpaceTheme::Mode::kLight);
++
++  const std::optional<SpaceTheme> dark =
++      MaybeToSpaceTheme(FlatTheme(C(0.46, 0.46, 0.46)));
++  ASSERT_TRUE(dark.has_value());
++  EXPECT_EQ(dark->mode, SpaceTheme::Mode::kDark);
++}
++
++TEST(ArcImportMappingTest, GamutMapLowersChromaInsteadOfClipping) {
++  const ImportColor mapped = GamutMapToSrgb(C(1.5, -0.5, 0.25));
++
++  EXPECT_GE(mapped.red, 0.0);
++  EXPECT_LE(mapped.red, 1.0);
++  EXPECT_GE(mapped.green, 0.0);
++  EXPECT_LE(mapped.green, 1.0);
++  EXPECT_GE(mapped.blue, 0.0);
++  EXPECT_LE(mapped.blue, 1.0);
++  EXPECT_DOUBLE_EQ(mapped.alpha, 1.0);
++  EXPECT_EQ(ToSrgbHex(mapped), "#FF989C");
++  // Naive clipping would give #FF0040.
++  EXPECT_NE(ToSrgbHex(mapped), "#FF0040");
++}
++
++TEST(ArcImportMappingTest, GamutMapEdgeCases) {
++  // In gamut: unchanged, alpha kept.
++  const ImportColor inside = C(0.2, 0.4, 0.6, 0.5);
++  EXPECT_EQ(GamutMapToSrgb(inside), inside);
++
++  // Lightness past either end: white or black.
++  EXPECT_EQ(GamutMapToSrgb(C(1.3, 1.3, 1.3)), C(1, 1, 1));
++  EXPECT_EQ(GamutMapToSrgb(C(-0.1, -0.1, -0.1)), C(0, 0, 0));
++  EXPECT_EQ(GamutMapToSrgb(C(-0.1, -0.1, -0.1, 0.25)), C(0, 0, 0, 0.25));
++
++  // A channel that isn't a number must not crash, and still gives a color.
++  const ImportColor nan_color =
++      GamutMapToSrgb(C(std::numeric_limits<double>::quiet_NaN(), 0.5, 0.5));
++  EXPECT_GE(nan_color.red, 0.0);
++  EXPECT_LE(nan_color.red, 1.0);
++  EXPECT_TRUE(IsHexColor(ToSrgbHex(nan_color)));
++  EXPECT_TRUE(IsHexColor(ToSrgbHex(
++      C(std::numeric_limits<double>::infinity(),
++        -std::numeric_limits<double>::infinity(),
++        std::numeric_limits<double>::quiet_NaN(),
++        std::numeric_limits<double>::quiet_NaN()))));
++}
++
++TEST(ArcImportMappingTest, HexRoundsClampsAndLuminanceEndsMeet) {
++  EXPECT_EQ(ToSrgbHex(C(0, 0, 0)), "#000000");
++  EXPECT_EQ(ToSrgbHex(C(1, 1, 1)), "#FFFFFF");
++  // 127.5 rounds up.
++  EXPECT_EQ(ToSrgbHex(C(0.5, 0.5, 0.5)), "#808080");
++  // Clamped first.
++  EXPECT_EQ(ToSrgbHex(C(1.2, -0.3, 0.2)), "#FF0033");
++  // Uppercase.
++  EXPECT_EQ(ToSrgbHex(C(10.0 / 255, 171.0 / 255, 255.0 / 255)), "#0AABFF");
++
++  EXPECT_NEAR(RelativeLuminance(C(1, 1, 1)), 1.0, 1e-9);
++  EXPECT_DOUBLE_EQ(RelativeLuminance(C(0, 0, 0)), 0.0);
++}
++
++TEST(ArcImportMappingTest, OutOfGamutThemeColorsAreMapped) {
++  const ImportColor wide1 = C(1.5, -0.5, 0.25);
++  const ImportColor wide2 = C(-0.2, 0.9, 1.3);
++  const std::optional<SpaceTheme> mapped = MaybeToSpaceTheme(SingleTheme(
++      Variant(ImportThemeVariant::Origin::kGradient, wide1, wide2)));
++
++  ASSERT_TRUE(mapped.has_value());
++  EXPECT_TRUE(IsHexColor(mapped->color1));
++  EXPECT_TRUE(IsHexColor(mapped->color2));
++  EXPECT_EQ(mapped->color1, "#FF989C");
++  EXPECT_EQ(mapped->color2, ToSrgbHex(GamutMapToSrgb(wide2)));
++  EXPECT_NE(mapped->color1, "#FF0040");
++
++  // The dark look goes through the same mapping.
++  const std::optional<SpaceTheme> two_looks = MaybeToSpaceTheme(AppearanceTheme(
++      Variant(ImportThemeVariant::Origin::kSingleColor, C(1, 1, 1)),
++      Variant(ImportThemeVariant::Origin::kSingleColor, wide1)));
++  ASSERT_TRUE(two_looks.has_value());
++  const std::string* dark1 = two_looks->unknown_fields.FindString(kDarkStop1Key);
++  ASSERT_NE(dark1, nullptr);
++  EXPECT_EQ(*dark1, "#FF989C");
++}
++
++// ---------------------------------------------------------------------------
++// Names.
++
++TEST(ArcImportMappingTest, SpaceNameCollapsesWhitespace) {
++  ImportSpace space;
++  EXPECT_EQ(ImportedSpaceName(space), "");
++
++  space.title = "  Work \n Stuff ";
++  EXPECT_EQ(ImportedSpaceName(space), "Work Stuff");
++
++  space.title = "Plain";
++  EXPECT_EQ(ImportedSpaceName(space), "Plain");
++}
++
++TEST(ArcImportMappingTest, SpaceNameIsTruncatedOnACharacterBoundary) {
++  ImportSpace space;
++  // U+3042, three bytes in UTF-8. 100 of them are 300 bytes.
++  std::string title;
++  for (int i = 0; i < 100; ++i) {
++    title += "\xE3\x81\x82";
++  }
++  space.title = title;
++
++  const std::string name = ImportedSpaceName(space);
++
++  EXPECT_LE(name.size(), kMaxSpaceNameBytes);
++  // 85 whole characters.
++  EXPECT_EQ(name.size(), 255u);
++  EXPECT_EQ(name, title.substr(0, 255));
++  EXPECT_TRUE(base::IsStringUTF8(name));
++}
++
++TEST(ArcImportMappingTest, SpaceIconKeepsEmojiAndDropsTheRest) {
++  ImportSpace space;
++  EXPECT_EQ(ImportedSpaceIcon(space), "");
++
++  // U+1F642.
++  space.emoji = "\xF0\x9F\x99\x82";
++  EXPECT_EQ(ImportedSpaceIcon(space), "\xF0\x9F\x99\x82");
++
++  // A ZWJ family sequence, 25 bytes.
++  const std::string family =
++      "\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D"
++      "\xF0\x9F\x91\xA7\xE2\x80\x8D\xF0\x9F\x91\xA6";
++  ASSERT_EQ(family.size(), 25u);
++  space.emoji = family;
++  EXPECT_EQ(ImportedSpaceIcon(space), family);
++
++  // The limit is 32 bytes.
++  space.emoji = std::string(32, 'a');
++  EXPECT_EQ(ImportedSpaceIcon(space), std::string(32, 'a'));
++  space.emoji = std::string(33, 'a');
++  EXPECT_EQ(ImportedSpaceIcon(space), "");
++  space.emoji = std::string(40, 'a');
++  EXPECT_EQ(ImportedSpaceIcon(space), "");
++
++  space.emoji = "\xFF";
++  EXPECT_EQ(ImportedSpaceIcon(space), "");
++}
++
++TEST(ArcImportMappingTest, ProfileLabelUsesItsOwnName) {
++  ImportPlan plan;
++  ImportProfile profile;
++  profile.is_default = true;
++  profile.display_name = "Work";
++  profile.directory = "Default";
++  plan.profiles.push_back(profile);
++
++  const ArcProfileLabel label = ArcProfileLabelFor(plan, 0);
++
++  EXPECT_EQ(label.name, "Work");
++  EXPECT_EQ(label.fallback, ArcProfileLabel::Fallback::kNone);
++}
++
++TEST(ArcImportMappingTest, ProfileLabelNeverShowsFolderName) {
++  ImportPlan plan;
++  ImportProfile profile;
++  profile.is_default = false;
++  profile.display_name = "Profile 1";
++  profile.directory = "Profile 1";
++  plan.profiles.push_back(profile);
++
++  const ArcProfileLabel label = ArcProfileLabelFor(plan, 0);
++
++  EXPECT_TRUE(label.name.empty());
++  EXPECT_EQ(label.fallback, ArcProfileLabel::Fallback::kNumbered);
++  EXPECT_EQ(label.number, 2);
++}
++
++TEST(ArcImportMappingTest, UnnamedDefaultProfileLabel) {
++  ImportPlan plan;
++  ImportProfile profile;
++  profile.is_default = true;
++  profile.directory = "Default";
++  plan.profiles.push_back(profile);
++
++  const ArcProfileLabel label = ArcProfileLabelFor(plan, 0);
++
++  EXPECT_TRUE(label.name.empty());
++  EXPECT_EQ(label.fallback, ArcProfileLabel::Fallback::kDefault);
++}
++
++TEST(ArcImportMappingTest, UnnamedOtherProfilesAreNumberedFromTwo) {
++  ImportProfile default_profile;
++  default_profile.is_default = true;
++  default_profile.directory = "Default";
++  ImportProfile other_a;
++  other_a.directory = "Profile 1";
++  ImportProfile other_b;
++  other_b.directory = "Profile 2";
++
++  ImportPlan with_default;
++  with_default.profiles = {default_profile, other_a, other_b};
++  EXPECT_EQ(ArcProfileLabelFor(with_default, 0).fallback,
++            ArcProfileLabel::Fallback::kDefault);
++  const ArcProfileLabel second = ArcProfileLabelFor(with_default, 1);
++  EXPECT_EQ(second.fallback, ArcProfileLabel::Fallback::kNumbered);
++  EXPECT_EQ(second.number, 2);
++  const ArcProfileLabel third = ArcProfileLabelFor(with_default, 2);
++  EXPECT_EQ(third.fallback, ArcProfileLabel::Fallback::kNumbered);
++  EXPECT_EQ(third.number, 3);
++
++  ImportPlan without_default;
++  without_default.profiles = {other_a, other_b};
++  const ArcProfileLabel first = ArcProfileLabelFor(without_default, 0);
++  EXPECT_EQ(first.fallback, ArcProfileLabel::Fallback::kNumbered);
++  EXPECT_EQ(first.number, 2);
++  const ArcProfileLabel next = ArcProfileLabelFor(without_default, 1);
++  EXPECT_EQ(next.fallback, ArcProfileLabel::Fallback::kNumbered);
++  EXPECT_EQ(next.number, 3);
++}
++
++TEST(ArcImportMappingTest, JoinFolderPathSkipsEmptyTitles) {
++  EXPECT_EQ(JoinFolderPath({"A", "", "B"}), "A \xE2\x80\xBA B");
++  EXPECT_EQ(JoinFolderPath({"A"}), "A");
++  EXPECT_EQ(JoinFolderPath({}), "");
++  EXPECT_EQ(JoinFolderPath({"", ""}), "");
++}
++
++TEST(ArcImportMappingTest, NewSpaceGetsNameIconAndTheme) {
++  ImportSpace space = MakeSpace("S", " Work  Stuff ", {});
++  space.emoji = "\xF0\x9F\x99\x82";
++  space.theme = FlatTheme(C(0.2, 0.2, 0.4));
++
++  const ArcApplyPlan plan = MapFresh(ProfileOf(space));
++
++  ASSERT_EQ(plan.spaces.size(), 1u);
++  const ArcApplySpace& out = plan.spaces[0];
++  EXPECT_TRUE(out.is_new());
++  EXPECT_EQ(out.source_id, "S");
++  EXPECT_EQ(out.name, "Work Stuff");
++  EXPECT_EQ(out.icon, "\xF0\x9F\x99\x82");
++  ASSERT_TRUE(out.theme.has_value());
++  EXPECT_EQ(out.theme->color1, "#333366");
++  EXPECT_EQ(plan.counts.spaces, 1);
++
++  // A copy of the plan keeps the theme, dark stops included.
++  ImportSpace two_looks = MakeSpace("T", "Two", {});
++  two_looks.theme = AppearanceTheme(
++      Variant(ImportThemeVariant::Origin::kSingleColor, C(1, 0.9, 0.8)),
++      Variant(ImportThemeVariant::Origin::kSingleColor, C(0.2, 0.2, 0.4)));
++  const ArcApplyPlan two = MapFresh(ProfileOf(two_looks));
++  const ArcApplyPlan copy = two;
++  ASSERT_EQ(copy.spaces.size(), 1u);
++  ASSERT_TRUE(copy.spaces[0].theme.has_value());
++  const std::string* dark1 =
++      copy.spaces[0].theme->unknown_fields.FindString(kDarkStop1Key);
++  ASSERT_NE(dark1, nullptr);
++  EXPECT_EQ(*dark1, "#333366");
++}
++
++// ---------------------------------------------------------------------------
++// Reruns and idempotence.
++
++TEST(ArcImportMappingTest, RerunAddsNothing) {
++  const ImportProfile profile = BigProfile();
++  ArcImportRecord record;
++  ArcLiveSidebar live;
++
++  const ArcApplyPlan first =
++      MapArcProfile(profile, record, live, ArcImportOptions());
++  ASSERT_FALSE(first.IsEmpty());
++  EXPECT_EQ(first.counts.spaces, 2);
++  // t1, p1, q1, s1, s2, u1.
++  EXPECT_EQ(first.counts.pinned_tabs, 6);
++  // Parent, Child, Empty.
++  EXPECT_EQ(first.counts.folders, 3);
++  EXPECT_EQ(first.counts.favorites, 2);
++  EXPECT_EQ(first.counts.open_tabs, 4);
++  FakeApply(first, "run-1", record, live);
++  ASSERT_TRUE(record.has_mappings());
++
++  const ArcApplyPlan second =
++      MapArcProfile(profile, record, live, ArcImportOptions());
++
++  EXPECT_TRUE(second.IsEmpty());
++  EXPECT_THAT(second.spaces, IsEmpty());
++  EXPECT_THAT(second.favorites, IsEmpty());
++  EXPECT_FALSE(second.record_was_stale);
++  EXPECT_EQ(second.counts.spaces, 0);
++  EXPECT_EQ(second.counts.pinned_tabs, 0);
++  EXPECT_EQ(second.counts.folders, 0);
++  EXPECT_EQ(second.counts.favorites, 0);
++  EXPECT_EQ(second.counts.open_tabs, 0);
++  EXPECT_GT(second.counts.already_imported, 0);
++  // o1, o2, o3, v1: a space this import made isn't given its tabs again.
++  EXPECT_EQ(second.counts.open_tabs_not_reopened, 4);
++  EXPECT_EQ(second.counts.removed_since, 0);
++}
++
++TEST(ArcImportMappingTest, RerunAppendsNewItemsToMappedSpaceAndFolder) {
++  ImportProfile first_read = ProfileOf(MakeSpace(
++      "S", "Work",
++      {Folder("F", "Folder", {Tab("f1", "https://f1.example/")}),
++       Tab("t1", "https://t1.example/")},
++      {Tab("o1", "https://o1.example/")}));
++  ArcImportRecord record;
++  ArcLiveSidebar live;
++  FakeApply(MapArcProfile(first_read, record, live, ArcImportOptions()),
++            "run-1", record, live);
++  const ArcImportRecord::ItemMapping* folder_mapping = record.FindItem("F");
++  ASSERT_NE(folder_mapping, nullptr);
++  const ArcImportRecord::SpaceMapping* space_mapping = record.FindSpace("S");
++  ASSERT_NE(space_mapping, nullptr);
++
++  const ImportProfile second_read = ProfileOf(MakeSpace(
++      "S", "Work",
++      {Folder("F", "Folder",
++              {Tab("f1", "https://f1.example/"),
++               Tab("f2", "https://f2.example/")}),
++       Tab("t1", "https://t1.example/"), Tab("t2", "https://t2.example/")},
++      {Tab("o1", "https://o1.example/"), Tab("o2", "https://o2.example/")}));
++
++  const ArcApplyPlan plan =
++      MapArcProfile(second_read, record, live, ArcImportOptions());
++
++  ASSERT_EQ(plan.spaces.size(), 1u);
++  const ArcApplySpace& space = plan.spaces[0];
++  EXPECT_FALSE(space.is_new());
++  EXPECT_EQ(space.existing_id, space_mapping->rac_id);
++  EXPECT_EQ(space.source_id, "S");
++  EXPECT_THAT(DescribeAll(space.pinned),
++              ElementsAre("folder:Folder[f2]", "tab:t2"));
++  const ArcApplyFolder& folder = std::get<ArcApplyFolder>(space.pinned[0]);
++  EXPECT_EQ(folder.existing_id, folder_mapping->rac_id);
++  EXPECT_EQ(folder.source_id, "F");
++  // A mapped space gets no open tabs.
++  EXPECT_THAT(space.open_tabs, IsEmpty());
++  EXPECT_EQ(plan.counts.spaces, 0);
++  EXPECT_EQ(plan.counts.folders, 0);
++  EXPECT_EQ(plan.counts.pinned_tabs, 2);
++  EXPECT_EQ(plan.counts.open_tabs, 0);
++  EXPECT_EQ(plan.counts.open_tabs_not_reopened, 2);
++  EXPECT_FALSE(plan.IsEmpty());
++}
++
++TEST(ArcImportMappingTest, DeletedSpaceIsNotBroughtBack) {
++  const ImportProfile first_read = ProfileOf(std::vector<ImportSpace>{
++      MakeSpace("S1", "One",
++                {Tab("a", "https://a.example/"), Tab("b", "https://b.example/")}),
++      MakeSpace("S2", "Two", {Tab("c", "https://c.example/")})});
++  ArcImportRecord record;
++  ArcLiveSidebar live;
++  FakeApply(MapArcProfile(first_read, record, live, ArcImportOptions()),
++            "run-1", record, live);
++  const ArcImportRecord::SpaceMapping* mapping = record.FindSpace("S1");
++  ASSERT_NE(mapping, nullptr);
++  live.space_ids.erase(mapping->rac_id);
++  ASSERT_FALSE(live.space_ids.empty());
++
++  const ImportProfile second_read = ProfileOf(std::vector<ImportSpace>{
++      MakeSpace("S1", "One",
++                {Tab("a", "https://a.example/"), Tab("b", "https://b.example/"),
++                 Tab("a2", "https://a2.example/")}),
++      MakeSpace("S2", "Two", {Tab("c", "https://c.example/")})});
++
++  const ArcApplyPlan plan =
++      MapArcProfile(second_read, record, live, ArcImportOptions());
++
++  EXPECT_FALSE(plan.record_was_stale);
++  EXPECT_THAT(plan.spaces, IsEmpty());
++  EXPECT_TRUE(plan.IsEmpty());
++  // Only what Arc added since: a2. The two it already imported are counted
++  // as already imported.
++  EXPECT_EQ(plan.counts.removed_since, 1);
++  EXPECT_EQ(plan.counts.spaces, 0);
++  EXPECT_EQ(plan.counts.pinned_tabs, 0);
++}
++
++TEST(ArcImportMappingTest, DeletedFolderIsNotBroughtBack) {
++  const ImportProfile first_read = ProfileOf(MakeSpace(
++      "S", "Work",
++      {Folder("F", "Deleted", {Tab("f1", "https://f1.example/")}),
++       Folder("G", "Kept", {Tab("g1", "https://g1.example/")}),
++       Tab("t1", "https://t1.example/")}));
++  ArcImportRecord record;
++  ArcLiveSidebar live;
++  FakeApply(MapArcProfile(first_read, record, live, ArcImportOptions()),
++            "run-1", record, live);
++  const ArcImportRecord::ItemMapping* deleted = record.FindItem("F");
++  const ArcImportRecord::ItemMapping* kept = record.FindItem("G");
++  ASSERT_NE(deleted, nullptr);
++  ASSERT_NE(kept, nullptr);
++  live.sidebar_ids.erase(deleted->rac_id);
++
++  const ImportProfile second_read = ProfileOf(MakeSpace(
++      "S", "Work",
++      {Folder("F", "Deleted",
++              {Tab("f1", "https://f1.example/"),
++               Tab("f2", "https://f2.example/")}),
++       Folder("G", "Kept",
++              {Tab("g1", "https://g1.example/"),
++               Tab("g2", "https://g2.example/")}),
++       Tab("t1", "https://t1.example/"), Tab("t2", "https://t2.example/")}));
++
++  const ArcApplyPlan plan =
++      MapArcProfile(second_read, record, live, ArcImportOptions());
++
++  EXPECT_FALSE(plan.record_was_stale);
++  EXPECT_THAT(OnlyPinned(plan), ElementsAre("folder:Kept[g2]", "tab:t2"));
++  const ArcApplyFolder& folder = std::get<ArcApplyFolder>(plan.spaces[0].pinned[0]);
++  EXPECT_EQ(folder.existing_id, kept->rac_id);
++  EXPECT_EQ(plan.counts.removed_since, 1);
++  EXPECT_EQ(plan.counts.pinned_tabs, 2);
++  EXPECT_EQ(plan.counts.folders, 0);
++}
++
++TEST(ArcImportMappingTest, StaleRecordImportsEverythingAgain) {
++  const ImportProfile profile = BigProfile();
++  ArcImportRecord record;
++  ArcLiveSidebar live;
++  const ArcApplyPlan first =
++      MapArcProfile(profile, record, live, ArcImportOptions());
++  FakeApply(first, "run-1", record, live);
++  ASSERT_TRUE(record.has_mappings());
++
++  // The profile lost all of it, say because Preferences was reset.
++  const ArcLiveSidebar empty_live;
++  const ArcApplyPlan again =
++      MapArcProfile(profile, record, empty_live, ArcImportOptions());
++
++  EXPECT_TRUE(again.record_was_stale);
++  EXPECT_FALSE(again.IsEmpty());
++  ASSERT_EQ(again.spaces.size(), 2u);
++  EXPECT_TRUE(again.spaces[0].is_new());
++  EXPECT_TRUE(again.spaces[1].is_new());
++  EXPECT_EQ(again.counts.spaces, first.counts.spaces);
++  EXPECT_EQ(again.counts.pinned_tabs, first.counts.pinned_tabs);
++  EXPECT_EQ(again.counts.folders, first.counts.folders);
++  EXPECT_EQ(again.counts.favorites, first.counts.favorites);
++  EXPECT_EQ(again.counts.open_tabs, first.counts.open_tabs);
++  EXPECT_EQ(again.counts.already_imported, 0);
++  EXPECT_EQ(again.counts.removed_since, 0);
++  EXPECT_EQ(DescribeAll(again.spaces[0].pinned),
++            DescribeAll(first.spaces[0].pinned));
++}
++
++TEST(ArcImportMappingTest, DuplicateTitleSpacesStaySeparate) {
++  const ImportProfile profile = ProfileOf(std::vector<ImportSpace>{
++      MakeSpace("S1", "Work", {Tab("a", "https://a.example/")}),
++      MakeSpace("S2", "Work", {Tab("b", "https://b.example/")})});
++
++  const ArcApplyPlan plan = MapFresh(profile);
++
++  ASSERT_EQ(plan.spaces.size(), 2u);
++  EXPECT_TRUE(plan.spaces[0].is_new());
++  EXPECT_TRUE(plan.spaces[1].is_new());
++  EXPECT_EQ(plan.spaces[0].source_id, "S1");
++  EXPECT_EQ(plan.spaces[1].source_id, "S2");
++  EXPECT_EQ(plan.spaces[0].name, "Work");
++  EXPECT_EQ(plan.spaces[1].name, "Work");
++  EXPECT_EQ(plan.counts.spaces, 2);
++
++  // A rac space that is already there, whatever it's called, is not one of
++  // these.
++  ArcLiveSidebar live;
++  live.space_ids.insert(std::string("some-rac-space"));
++  const ArcApplyPlan with_live =
++      MapArcProfile(profile, ArcImportRecord(), live, ArcImportOptions());
++  ASSERT_EQ(with_live.spaces.size(), 2u);
++  EXPECT_TRUE(with_live.spaces[0].is_new());
++  EXPECT_TRUE(with_live.spaces[1].is_new());
++  EXPECT_EQ(with_live.spaces[0].name, "Work");
++  EXPECT_EQ(with_live.spaces[1].name, "Work");
++  EXPECT_EQ(with_live.counts.spaces, 2);
++}
++
++TEST(ArcImportMappingTest, BlankSpaceIsReplacedOnlyWhenSpacesAreMade) {
++  const ImportProfile profile = BigProfile();
++  ArcImportRecord record;
++  ArcLiveSidebar live;
++  live.blank_space_id = "blank";
++
++  const ArcApplyPlan first =
++      MapArcProfile(profile, record, live, ArcImportOptions());
++  EXPECT_EQ(first.replace_blank_space, "blank");
++
++  FakeApply(first, "run-1", record, live);
++  EXPECT_TRUE(live.blank_space_id.empty());
++
++  // Even if a blank space is there again, a rerun with nothing new leaves
++  // it alone.
++  live.blank_space_id = "blank";
++  const ArcApplyPlan second =
++      MapArcProfile(profile, record, live, ArcImportOptions());
++  EXPECT_TRUE(second.IsEmpty());
++  EXPECT_TRUE(second.replace_blank_space.empty());
++}
++
++TEST(ArcImportMappingTest, ItemMovedToAnotherArcSpaceIsNotAddedAgain) {
++  const ImportProfile first_read = ProfileOf(std::vector<ImportSpace>{
++      MakeSpace("S1", "One",
++                {Tab("a", "https://a.example/"), Tab("b", "https://b.example/")}),
++      MakeSpace("S2", "Two", {Tab("c", "https://c.example/")})});
++  ArcImportRecord record;
++  ArcLiveSidebar live;
++  FakeApply(MapArcProfile(first_read, record, live, ArcImportOptions()),
++            "run-1", record, live);
++
++  // In Arc, `a` moved from S1 to S2.
++  const ImportProfile second_read = ProfileOf(std::vector<ImportSpace>{
++      MakeSpace("S1", "One", {Tab("b", "https://b.example/")}),
++      MakeSpace("S2", "Two",
++                {Tab("c", "https://c.example/"), Tab("a", "https://a.example/")})});
++
++  const ArcApplyPlan plan =
++      MapArcProfile(second_read, record, live, ArcImportOptions());
++
++  EXPECT_TRUE(plan.IsEmpty());
++  EXPECT_THAT(plan.spaces, IsEmpty());
++  EXPECT_EQ(plan.counts.pinned_tabs, 0);
++  // Two mapped spaces and three mapped tabs.
++  EXPECT_EQ(plan.counts.already_imported, 5);
++  EXPECT_EQ(plan.counts.removed_since, 0);
++}
++
++// ---------------------------------------------------------------------------
++// Undo.
++
++ArcUndoPinEntry UndoItem(const std::string& id) {
++  ArcUndoPinEntry entry;
++  entry.id = id;
++  return entry;
++}
++
++ArcUndoPinEntry UndoFolder(const std::string& id,
++                           std::vector<std::string> item_ids) {
++  ArcUndoPinEntry entry;
++  entry.id = id;
++  entry.is_folder = true;
++  entry.item_ids = std::move(item_ids);
++  return entry;
++}
++
++// "item:<id>" or "folder:<id>[<item ids>]", like Describe() for the apply
++// plan.
++std::string DescribeKept(const ArcKeptPin& pin) {
++  if (pin.folder_id.empty()) {
++    return "item:" + pin.item_ids[0];
++  }
++  return "folder:" + pin.folder_id + "[" +
++         base::JoinString(pin.item_ids, ",") + "]";
++}
++
++std::vector<std::string> DescribeAllKept(const std::vector<ArcKeptPin>& pins) {
++  std::vector<std::string> out;
++  for (const ArcKeptPin& pin : pins) {
++    out.push_back(DescribeKept(pin));
++  }
++  return out;
++}
++
++TEST(ArcImportMappingTest, KeptPinsEmptyInput) {
++  EXPECT_THAT(PlanKeptPins({}, {"r1"}), IsEmpty());
++  EXPECT_THAT(PlanKeptPins({}, {}), IsEmpty());
++}
++
++TEST(ArcImportMappingTest, KeptPinsAllRunItemsKeepsNothing) {
++  const std::vector<ArcUndoPinEntry> entries = {
++      UndoItem("r1"), UndoFolder("rf", {"r2", "r3"}), UndoItem("r4")};
++
++  EXPECT_THAT(PlanKeptPins(entries, {"r1", "r2", "r3", "r4", "rf"}),
++              IsEmpty());
++}
++
++TEST(ArcImportMappingTest, KeptPinsUserItemBetweenRunItemsIsKept) {
++  const std::vector<ArcUndoPinEntry> entries = {
++      UndoItem("r1"), UndoItem("user"), UndoItem("r2")};
++
++  const std::vector<ArcKeptPin> kept = PlanKeptPins(entries, {"r1", "r2"});
++
++  ASSERT_EQ(kept.size(), 1u);
++  EXPECT_TRUE(kept[0].folder_id.empty());
++  EXPECT_THAT(kept[0].item_ids, ElementsAre("user"));
++}
++
++TEST(ArcImportMappingTest, KeptPinsKeepListOrder) {
++  const std::vector<ArcUndoPinEntry> entries = {
++      UndoItem("u1"),
++      UndoFolder("fa", {"ua1", "r1"}),
++      UndoItem("r2"),
++      UndoFolder("fb", {"r3", "ub1", "ub2"}),
++      UndoItem("u2")};
++
++  EXPECT_THAT(DescribeAllKept(PlanKeptPins(entries, {"r1", "r2", "r3"})),
++              ElementsAre("item:u1", "folder:fa[ua1]", "folder:fb[ub1,ub2]",
++                          "item:u2"));
++}
++
++TEST(ArcImportMappingTest, KeptPinsFolderOfOnlyRunItemsIsDropped) {
++  const std::vector<ArcUndoPinEntry> entries = {
++      UndoItem("u1"), UndoFolder("user-folder", {"r1", "r2"}),
++      UndoItem("u2")};
++
++  EXPECT_THAT(DescribeAllKept(PlanKeptPins(entries, {"r1", "r2"})),
++              ElementsAre("item:u1", "item:u2"));
++}
++
++TEST(ArcImportMappingTest, KeptPinsRunFolderKeepsUserItemsOnly) {
++  const std::vector<ArcUndoPinEntry> entries = {
++      UndoFolder("run-folder", {"r1", "user", "r2"})};
++
++  const std::vector<ArcKeptPin> kept =
++      PlanKeptPins(entries, {"run-folder", "r1", "r2"});
++
++  ASSERT_EQ(kept.size(), 1u);
++  EXPECT_EQ(kept[0].folder_id, "run-folder");
++  EXPECT_THAT(kept[0].item_ids, ElementsAre("user"));
++}
++
++TEST(ArcImportMappingTest, KeptPinsUserFolderKeepsNonRunItemsOnly) {
++  const std::vector<ArcUndoPinEntry> entries = {
++      UndoFolder("user-folder", {"u1", "r1", "u2", "r2"})};
++
++  const std::vector<ArcKeptPin> kept = PlanKeptPins(entries, {"r1", "r2"});
++
++  ASSERT_EQ(kept.size(), 1u);
++  EXPECT_EQ(kept[0].folder_id, "user-folder");
++  EXPECT_THAT(kept[0].item_ids, ElementsAre("u1", "u2"));
++}
++
++TEST(ArcImportMappingTest, KeptPinsUserFolderOfOnlyRunItemsIsDropped) {
++  const std::vector<ArcUndoPinEntry> entries = {
++      UndoFolder("user-folder", {"r1", "r2"})};
++
++  EXPECT_THAT(PlanKeptPins(entries, {"r1", "r2"}), IsEmpty());
++}
++
++}  // namespace
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/import/arc_import_record.cc
+@@ -0,0 +1,539 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/arc_import_record.h"
++
++#include <algorithm>
++#include <cstddef>
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/files/important_file_writer.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/json/values_util.h"
++#include "base/strings/string_util.h"
++
++namespace rac {
++
++namespace {
++
++constexpr char kVersionKey[] = "version";
++constexpr char kMinReaderVersionKey[] = "min_reader_version";
++constexpr char kSourceKey[] = "source";
++constexpr char kSourceArc[] = "arc";
++constexpr char kArcProfileKey[] = "arc_profile";
++constexpr char kFirstImportKey[] = "first_import";
++constexpr char kLastImportKey[] = "last_import";
++constexpr char kHistoryImportedKey[] = "history_imported";
++constexpr char kSpacesKey[] = "spaces";
++constexpr char kItemsKey[] = "items";
++constexpr char kRunsKey[] = "runs";
++constexpr char kHandoffsKey[] = "handoffs";
++constexpr char kPinnedExtensionsKey[] = "pinned_extensions";
++
++constexpr char kRacKey[] = "rac";
++constexpr char kRunKey[] = "run";
++constexpr char kKindKey[] = "kind";
++constexpr char kKindPinned[] = "pinned";
++constexpr char kKindFolder[] = "folder";
++constexpr char kKindFavorite[] = "favorite";
++
++constexpr char kRunIdKey[] = "id";
++constexpr char kRunTimeKey[] = "time";
++constexpr char kRunSnapshotKey[] = "snapshot";
++constexpr char kRunSnapshotTimeKey[] = "snapshot_time";
++constexpr char kRunUndoUntilKey[] = "undo_until";
++constexpr char kRunReplacedBlankKey[] = "replaced_blank_space";
++constexpr char kRunProfilesKey[] = "profiles";
++constexpr char kRunUndoneKey[] = "undone";
++
++constexpr char kRoutingRulesKey[] = "routing_rules";
++constexpr char kRoutingDefaultKey[] = "routing_default";
++constexpr char kAutoArchiveKey[] = "auto_archive";
++constexpr char kAutoArchiveAfterKey[] = "auto_archive_after";
++constexpr char kArchivePathKey[] = "archive_path";
++
++// Every key this build reads at the top level. Anything else is kept.
++constexpr const char* kKnownKeys[] = {
++    kVersionKey,       kMinReaderVersionKey, kSourceKey,   kArcProfileKey,
++    kFirstImportKey,   kLastImportKey,       kHistoryImportedKey,
++    kSpacesKey,        kItemsKey,            kRunsKey,     kHandoffsKey,
++    kPinnedExtensionsKey};
++
++const char* KindToString(ArcImportRecord::ItemKind kind) {
++  switch (kind) {
++    case ArcImportRecord::ItemKind::kPinnedTab:
++      return kKindPinned;
++    case ArcImportRecord::ItemKind::kFolder:
++      return kKindFolder;
++    case ArcImportRecord::ItemKind::kFavorite:
++      return kKindFavorite;
++  }
++}
++
++std::optional<ArcImportRecord::ItemKind> KindFromString(
++    const std::string& kind) {
++  if (kind == kKindPinned) {
++    return ArcImportRecord::ItemKind::kPinnedTab;
++  }
++  if (kind == kKindFolder) {
++    return ArcImportRecord::ItemKind::kFolder;
++  }
++  if (kind == kKindFavorite) {
++    return ArcImportRecord::ItemKind::kFavorite;
++  }
++  return std::nullopt;
++}
++
++void SetTime(base::DictValue& dict, const char* key, base::Time time) {
++  if (!time.is_null()) {
++    dict.Set(key, base::TimeToValue(time));
++  }
++}
++
++base::Time GetTime(const base::DictValue& dict, const char* key) {
++  return base::ValueToTime(dict.Find(key)).value_or(base::Time());
++}
++
++std::string GetString(const base::DictValue& dict, const char* key) {
++  const std::string* value = dict.FindString(key);
++  return value ? *value : std::string();
++}
++
++base::ListValue StringsToList(const std::vector<std::string>& strings) {
++  base::ListValue list;
++  for (const std::string& value : strings) {
++    list.Append(value);
++  }
++  return list;
++}
++
++std::vector<std::string> ListToStrings(const base::ListValue* list) {
++  std::vector<std::string> strings;
++  if (!list) {
++    return strings;
++  }
++  for (const base::Value& value : *list) {
++    if (value.is_string()) {
++      strings.push_back(value.GetString());
++    }
++  }
++  return strings;
++}
++
++base::DictValue RunToDict(const ArcImportRecord::Run& run) {
++  base::DictValue dict;
++  dict.Set(kRunIdKey, run.id);
++  SetTime(dict, kRunTimeKey, run.time);
++  if (!run.snapshot_id.empty()) {
++    dict.Set(kRunSnapshotKey, run.snapshot_id);
++  }
++  SetTime(dict, kRunSnapshotTimeKey, run.snapshot_time);
++  SetTime(dict, kRunUndoUntilKey, run.undo_until);
++  if (!run.replaced_blank_space.empty()) {
++    dict.Set(kRunReplacedBlankKey, run.replaced_blank_space);
++  }
++  if (!run.other_profiles.empty()) {
++    dict.Set(kRunProfilesKey, StringsToList(run.other_profiles));
++  }
++  dict.Set(kRunUndoneKey, run.undone);
++  return dict;
++}
++
++std::optional<ArcImportRecord::Run> RunFromDict(const base::DictValue& dict) {
++  ArcImportRecord::Run run;
++  run.id = GetString(dict, kRunIdKey);
++  if (run.id.empty()) {
++    return std::nullopt;
++  }
++  run.time = GetTime(dict, kRunTimeKey);
++  run.snapshot_id = GetString(dict, kRunSnapshotKey);
++  run.snapshot_time = GetTime(dict, kRunSnapshotTimeKey);
++  run.undo_until = GetTime(dict, kRunUndoUntilKey);
++  run.replaced_blank_space = GetString(dict, kRunReplacedBlankKey);
++  run.other_profiles = ListToStrings(dict.FindList(kRunProfilesKey));
++  // A profile name must be one folder name. Anything else is dropped so
++  // Undo can never be pointed outside the user data folder.
++  std::erase_if(run.other_profiles, [](const std::string& name) {
++    return name.empty() || name == "." || name == ".." ||
++           name.find('/') != std::string::npos ||
++           name.find('\\') != std::string::npos;
++  });
++  run.undone = dict.FindBool(kRunUndoneKey).value_or(false);
++  return run;
++}
++
++base::DictValue HandoffsToDict(const ImportHandoffs& handoffs) {
++  base::DictValue dict;
++  if (!handoffs.routing_rules_json.empty()) {
++    dict.Set(kRoutingRulesKey, StringsToList(handoffs.routing_rules_json));
++  }
++  if (!handoffs.routing_default_json.empty()) {
++    dict.Set(kRoutingDefaultKey, handoffs.routing_default_json);
++  }
++  if (!handoffs.auto_archive_raw.empty()) {
++    dict.Set(kAutoArchiveKey, handoffs.auto_archive_raw);
++  }
++  if (handoffs.auto_archive_after) {
++    dict.Set(kAutoArchiveAfterKey,
++             base::TimeDeltaToValue(*handoffs.auto_archive_after));
++  }
++  if (!handoffs.archive_path.empty()) {
++    dict.Set(kArchivePathKey, base::FilePathToValue(handoffs.archive_path));
++  }
++  return dict;
++}
++
++ImportHandoffs HandoffsFromDict(const base::DictValue* dict) {
++  ImportHandoffs handoffs;
++  if (!dict) {
++    return handoffs;
++  }
++  handoffs.routing_rules_json = ListToStrings(dict->FindList(kRoutingRulesKey));
++  handoffs.routing_default_json = GetString(*dict, kRoutingDefaultKey);
++  handoffs.auto_archive_raw = GetString(*dict, kAutoArchiveKey);
++  handoffs.auto_archive_after =
++      base::ValueToTimeDelta(dict->Find(kAutoArchiveAfterKey));
++  if (std::optional<base::FilePath> path =
++          base::ValueToFilePath(dict->Find(kArchivePathKey))) {
++    handoffs.archive_path = std::move(*path);
++  }
++  return handoffs;
++}
++
++}  // namespace
++
++ArcImportRecord::Run::Run() = default;
++ArcImportRecord::Run::Run(const Run&) = default;
++ArcImportRecord::Run& ArcImportRecord::Run::operator=(const Run&) = default;
++ArcImportRecord::Run::~Run() = default;
++bool ArcImportRecord::Run::operator==(const Run&) const = default;
++
++ArcImportRecord::ArcImportRecord() = default;
++ArcImportRecord::ArcImportRecord(const ArcImportRecord& other)
++    : arc_profile_key(other.arc_profile_key),
++      first_import(other.first_import),
++      last_import(other.last_import),
++      history_imported(other.history_imported),
++      handoffs(other.handoffs),
++      pinned_extension_ids(other.pinned_extension_ids),
++      spaces_(other.spaces_),
++      items_(other.items_),
++      runs_(other.runs_),
++      unknown_fields_(other.unknown_fields_.Clone()) {}
++ArcImportRecord::ArcImportRecord(ArcImportRecord&&) noexcept = default;
++ArcImportRecord& ArcImportRecord::operator=(const ArcImportRecord& other) {
++  if (this != &other) {
++    *this = ArcImportRecord(other);
++  }
++  return *this;
++}
++ArcImportRecord& ArcImportRecord::operator=(ArcImportRecord&&) noexcept =
++    default;
++ArcImportRecord::~ArcImportRecord() = default;
++
++// static
++base::FilePath ArcImportRecord::DirFor(const base::FilePath& profile_dir) {
++  return profile_dir.AppendASCII(kDirName);
++}
++
++// static
++base::FilePath ArcImportRecord::PathFor(const base::FilePath& profile_dir) {
++  return DirFor(profile_dir).AppendASCII(kFileName);
++}
++
++// static
++ArcImportRecord::ReadResult ArcImportRecord::Read(
++    const base::FilePath& profile_dir) {
++  const base::FilePath path = PathFor(profile_dir);
++  if (!base::PathExists(path)) {
++    return {};
++  }
++  std::string json;
++  if (!base::ReadFileToStringWithMaxSize(path, &json, kMaxFileSize)) {
++    return {.status = ReadStatus::kUnreadable};
++  }
++  return Parse(json);
++}
++
++bool ArcImportRecord::Write(const base::FilePath& profile_dir) const {
++  const std::string json = Serialize();
++  if (json.empty()) {
++    return false;
++  }
++  const base::FilePath dir = DirFor(profile_dir);
++  if (!base::CreateDirectory(dir) ||
++      !base::SetPosixFilePermissions(dir, 0700)) {
++    return false;
++  }
++  return base::ImportantFileWriter::WriteFileAtomically(PathFor(profile_dir),
++                                                        json);
++}
++
++// static
++bool ArcImportRecord::MoveAside(const base::FilePath& profile_dir) {
++  const base::FilePath dir = DirFor(profile_dir);
++  return base::ReplaceFile(dir.AppendASCII(kFileName),
++                           dir.AppendASCII(kBadFileName), nullptr);
++}
++
++// static
++ArcImportRecord::ReadResult ArcImportRecord::Parse(std::string_view json) {
++  std::optional<base::DictValue> dict =
++      base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC);
++  if (!dict) {
++    return {.status = ReadStatus::kCorrupt};
++  }
++  const std::optional<int> version = dict->FindInt(kVersionKey);
++  if (!version || *version < 1) {
++    return {.status = ReadStatus::kCorrupt};
++  }
++  const int min_reader = dict->FindInt(kMinReaderVersionKey).value_or(*version);
++  if (min_reader > kVersion) {
++    return {.status = ReadStatus::kTooNew};
++  }
++  if (const std::string* source = dict->FindString(kSourceKey);
++      source && *source != kSourceArc) {
++    return {.status = ReadStatus::kCorrupt};
++  }
++
++  ReadResult result;
++  result.status = ReadStatus::kOk;
++  ArcImportRecord& record = result.record;
++  record.arc_profile_key = GetString(*dict, kArcProfileKey);
++  record.first_import = GetTime(*dict, kFirstImportKey);
++  record.last_import = GetTime(*dict, kLastImportKey);
++  record.history_imported = GetTime(*dict, kHistoryImportedKey);
++
++  // Entries that don't parse are dropped one by one, so a damaged entry
++  // costs only itself.
++  if (const base::DictValue* spaces = dict->FindDict(kSpacesKey)) {
++    for (const auto [arc_id, value] : *spaces) {
++      const base::DictValue* entry = value.GetIfDict();
++      if (!entry || arc_id.empty()) {
++        continue;
++      }
++      std::string rac_id = GetString(*entry, kRacKey);
++      if (rac_id.empty()) {
++        continue;
++      }
++      record.spaces_[arc_id] = {std::move(rac_id), GetString(*entry, kRunKey)};
++    }
++  }
++  if (const base::DictValue* items = dict->FindDict(kItemsKey)) {
++    for (const auto [arc_id, value] : *items) {
++      const base::DictValue* entry = value.GetIfDict();
++      if (!entry || arc_id.empty()) {
++        continue;
++      }
++      std::string rac_id = GetString(*entry, kRacKey);
++      const std::optional<ItemKind> kind =
++          KindFromString(GetString(*entry, kKindKey));
++      if (rac_id.empty() || !kind) {
++        continue;
++      }
++      record.items_[arc_id] = {std::move(rac_id), GetString(*entry, kRunKey),
++                               *kind};
++    }
++  }
++  if (const base::ListValue* runs = dict->FindList(kRunsKey)) {
++    for (const base::Value& value : *runs) {
++      if (const base::DictValue* run_dict = value.GetIfDict()) {
++        if (std::optional<Run> run = RunFromDict(*run_dict)) {
++          record.runs_.push_back(std::move(*run));
++        }
++      }
++    }
++  }
++  record.handoffs = HandoffsFromDict(dict->FindDict(kHandoffsKey));
++  record.pinned_extension_ids =
++      ListToStrings(dict->FindList(kPinnedExtensionsKey));
++
++  record.unknown_fields_ = std::move(*dict);
++  for (const char* key : kKnownKeys) {
++    record.unknown_fields_.Remove(key);
++  }
++  return result;
++}
++
++std::string ArcImportRecord::Serialize() const {
++  base::DictValue dict = unknown_fields_.Clone();
++  dict.Set(kVersionKey, kVersion);
++  dict.Set(kMinReaderVersionKey, kMinReaderVersion);
++  dict.Set(kSourceKey, kSourceArc);
++  dict.Set(kArcProfileKey, arc_profile_key);
++  SetTime(dict, kFirstImportKey, first_import);
++  SetTime(dict, kLastImportKey, last_import);
++  SetTime(dict, kHistoryImportedKey, history_imported);
++
++  base::DictValue spaces;
++  for (const auto& [arc_id, mapping] : spaces_) {
++    base::DictValue entry;
++    entry.Set(kRacKey, mapping.rac_id);
++    entry.Set(kRunKey, mapping.run_id);
++    // Arc ids are opaque and may hold dots; Set() never splits a key.
++    spaces.Set(arc_id, std::move(entry));
++  }
++  dict.Set(kSpacesKey, std::move(spaces));
++
++  base::DictValue items;
++  for (const auto& [arc_id, mapping] : items_) {
++    base::DictValue entry;
++    entry.Set(kRacKey, mapping.rac_id);
++    entry.Set(kRunKey, mapping.run_id);
++    entry.Set(kKindKey, KindToString(mapping.kind));
++    items.Set(arc_id, std::move(entry));
++  }
++  dict.Set(kItemsKey, std::move(items));
++
++  base::ListValue runs;
++  for (const Run& run : runs_) {
++    runs.Append(RunToDict(run));
++  }
++  dict.Set(kRunsKey, std::move(runs));
++
++  base::DictValue handoffs_dict = HandoffsToDict(handoffs);
++  if (!handoffs_dict.empty()) {
++    dict.Set(kHandoffsKey, std::move(handoffs_dict));
++  }
++  if (!pinned_extension_ids.empty()) {
++    dict.Set(kPinnedExtensionsKey, StringsToList(pinned_extension_ids));
++  }
++
++  // Fails only on binary values or too deep a nesting, which this record
++  // never holds. Write() refuses to write an empty result anyway.
++  return base::WriteJsonWithOptions(dict,
++                                    base::JSONWriter::OPTIONS_PRETTY_PRINT)
++      .value_or(std::string());
++}
++
++const ArcImportRecord::SpaceMapping* ArcImportRecord::FindSpace(
++    std::string_view arc_id) const {
++  auto it = spaces_.find(arc_id);
++  return it == spaces_.end() ? nullptr : &it->second;
++}
++
++const ArcImportRecord::ItemMapping* ArcImportRecord::FindItem(
++    std::string_view arc_id) const {
++  auto it = items_.find(arc_id);
++  return it == items_.end() ? nullptr : &it->second;
++}
++
++void ArcImportRecord::MapSpace(std::string arc_id,
++                               std::string rac_id,
++                               std::string run_id) {
++  spaces_[std::move(arc_id)] = {std::move(rac_id), std::move(run_id)};
++}
++
++void ArcImportRecord::MapItem(std::string arc_id,
++                              std::string rac_id,
++                              ItemKind kind,
++                              std::string run_id) {
++  items_[std::move(arc_id)] = {std::move(rac_id), std::move(run_id), kind};
++}
++
++void ArcImportRecord::ClearMappings() {
++  spaces_.clear();
++  items_.clear();
++}
++
++bool ArcImportRecord::IsStale(
++    const base::flat_set<std::string>& live_space_ids,
++    const base::flat_set<std::string>& live_sidebar_ids) const {
++  if (!has_mappings()) {
++    return false;
++  }
++  for (const auto& [arc_id, mapping] : spaces_) {
++    if (live_space_ids.contains(mapping.rac_id)) {
++      return false;
++    }
++  }
++  for (const auto& [arc_id, mapping] : items_) {
++    if (live_sidebar_ids.contains(mapping.rac_id)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++void ArcImportRecord::AddRun(Run run) {
++  runs_.push_back(std::move(run));
++  if (runs_.size() > kMaxRuns) {
++    runs_.erase(runs_.begin(),
++                runs_.begin() + static_cast<std::ptrdiff_t>(runs_.size() -
++                                                            kMaxRuns));
++  }
++}
++
++const ArcImportRecord::Run* ArcImportRecord::FindRun(
++    std::string_view run_id) const {
++  auto it = std::ranges::find(runs_, run_id, &Run::id);
++  return it == runs_.end() ? nullptr : &*it;
++}
++
++const ArcImportRecord::Run* ArcImportRecord::UndoableRun(
++    base::Time now) const {
++  if (runs_.empty()) {
++    return nullptr;
++  }
++  const Run& newest = runs_.back();
++  if (newest.undone || newest.undo_until.is_null() ||
++      now >= newest.undo_until) {
++    return nullptr;
++  }
++  return &newest;
++}
++
++std::vector<std::string> ArcImportRecord::SpacesOfRun(
++    std::string_view run_id) const {
++  std::vector<std::string> ids;
++  for (const auto& [arc_id, mapping] : spaces_) {
++    if (mapping.run_id == run_id) {
++      ids.push_back(mapping.rac_id);
++    }
++  }
++  return ids;
++}
++
++std::vector<std::string> ArcImportRecord::ItemsOfRun(std::string_view run_id,
++                                                     ItemKind kind) const {
++  std::vector<std::string> ids;
++  for (const auto& [arc_id, mapping] : items_) {
++    if (mapping.run_id == run_id && mapping.kind == kind) {
++      ids.push_back(mapping.rac_id);
++    }
++  }
++  return ids;
++}
++
++void ArcImportRecord::ForgetRemoved(
++    std::string_view run_id,
++    const base::flat_set<std::string>& removed) {
++  bool left = false;
++  auto forget = [&](auto& map) {
++    for (auto it = map.begin(); it != map.end();) {
++      if (it->second.run_id != run_id) {
++        ++it;
++      } else if (removed.contains(it->second.rac_id)) {
++        it = map.erase(it);
++      } else {
++        left = true;
++        ++it;
++      }
++    }
++  };
++  forget(spaces_);
++  forget(items_);
++  if (left) {
++    return;
++  }
++  for (Run& run : runs_) {
++    if (run.id == run_id) {
++      run.undone = true;
++    }
++  }
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/import/arc_import_record.h
+@@ -0,0 +1,224 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_IMPORT_ARC_IMPORT_RECORD_H_
++#define CHROME_BROWSER_RAC_IMPORT_ARC_IMPORT_RECORD_H_
++
++#include <map>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/flat_set.h"
++#include "base/files/file_path.h"
++#include "base/time/time.h"
++#include "base/values.h"
++#include "chrome/browser/rac/import/import_plan.h"
++
++namespace rac {
++
++// What an Arc import put into one rac profile, so a rerun adds only what's
++// new and Undo removes only what the import added. Saved as
++// `<profile>/rac imports/arc.json`, 0600 in a 0700 folder, outside
++// `Preferences`, so a `Preferences` reset doesn't make the next import add
++// everything twice.
++//
++// It holds ids, times, counts, and the hand-offs later features pick up.
++// No URLs or titles of tabs: those are in the sidebar itself, and in the
++// pre-import snapshot for its 7 days.
++//
++//   { "version": 1, "min_reader_version": 1, "source": "arc",
++//     "arc_profile": "default",
++//     "first_import": <time>, "last_import": <time>,
++//     "history_imported": <time>,
++//     "spaces": { "<arc space id>": { "rac": "<uuid>", "run": "<run id>" } },
++//     "items":  { "<arc item id>":  { "rac": "<sidebar id>", "run": "<run id>",
++//                                     "kind": "pinned" | "folder" | "favorite" } },
++//     "runs": [ { "id": "<uuid>", "time": <time>, "snapshot": "<backup id>",
++//                 "snapshot_time": <time>, "undo_until": <time>,
++//                 "replaced_blank_space": "<uuid>",
++//                 "profiles": ["Profile 2"], "undone": false } ],
++//     "handoffs": { "routing_rules": ["<json>"], "routing_default": "<json>",
++//                   "auto_archive": "sevenDays", "auto_archive_after": <delta>,
++//                   "archive_path": "<path>" },
++//     "pinned_extensions": ["<extension id>"] }
++//
++// Times use base::TimeToValue. Top-level keys this build doesn't know are
++// kept and written back; unknown keys inside an entry are not. Pure: reading and writing are blocking file calls, made on a
++// MayBlock sequence by the applier.
++class ArcImportRecord {
++ public:
++  // The newest format this build writes, and the oldest build that can read
++  // it. Builds only ever raise them. A record whose `min_reader_version` is
++  // above kVersion isn't read, and the import refuses to run rather than
++  // overwrite it.
++  static constexpr int kVersion = 1;
++  static constexpr int kMinReaderVersion = 1;
++
++  static constexpr char kDirName[] = "rac imports";
++  static constexpr char kFileName[] = "arc.json";
++  // Where a record that couldn't be parsed is moved before a fresh one is
++  // written. One copy is kept.
++  static constexpr char kBadFileName[] = "arc.json.bad";
++  // Files over this size are not read; Read() reports them as kUnreadable.
++  static constexpr size_t kMaxFileSize = 16 * 1024 * 1024;
++  // Older runs are dropped from `runs`. Their mappings stay.
++  static constexpr size_t kMaxRuns = 20;
++
++  enum class ItemKind { kPinnedTab, kFolder, kFavorite };
++
++  struct SpaceMapping {
++    // SpaceId::AsLowercaseString().
++    std::string rac_id;
++    std::string run_id;
++
++    bool operator==(const SpaceMapping&) const = default;
++  };
++
++  struct ItemMapping {
++    // A SidebarItem or SidebarFolder id.
++    std::string rac_id;
++    std::string run_id;
++    ItemKind kind = ItemKind::kPinnedTab;
++
++    bool operator==(const ItemMapping&) const = default;
++  };
++
++  // One import into this profile.
++  struct Run {
++    Run();
++    Run(const Run&);
++    Run& operator=(const Run&);
++    ~Run();
++
++    // Shared by every profile the same import touched.
++    std::string id;
++    base::Time time;
++    // The pinned pre-import DataBackups snapshot.
++    std::string snapshot_id;
++    // When the snapshot was taken.
++    base::Time snapshot_time;
++    // DataBackups::kSnapshotLifetime after the snapshot.
++    base::Time undo_until;
++    // The blank space the import replaced, if it did. Undo puts it back.
++    std::string replaced_blank_space;
++    // Other rac profiles the same import touched, as profile folder base
++    // names. Only in the record of the profile the import started from.
++    std::vector<std::string> other_profiles;
++    bool undone = false;
++
++    bool operator==(const Run&) const;
++  };
++
++  enum class ReadStatus {
++    // No record: this profile never received an Arc import.
++    kMissing,
++    kOk,
++    // Not a record this build understands. The applier moves it aside.
++    kCorrupt,
++    // The file exists but couldn't be read, or is over kMaxFileSize. Not
++    // known to be damaged, so it is left alone and the import refuses to
++    // run.
++    kUnreadable,
++    // Written by a newer rac. Leave it alone.
++    kTooNew,
++  };
++
++  struct ReadResult;
++
++  ArcImportRecord();
++  ArcImportRecord(const ArcImportRecord&);
++  ArcImportRecord(ArcImportRecord&&) noexcept;
++  ArcImportRecord& operator=(const ArcImportRecord&);
++  ArcImportRecord& operator=(ArcImportRecord&&) noexcept;
++  ~ArcImportRecord();
++
++  static base::FilePath DirFor(const base::FilePath& profile_dir);
++  static base::FilePath PathFor(const base::FilePath& profile_dir);
++
++  // Blocking. Never creates anything.
++  static ReadResult Read(const base::FilePath& profile_dir);
++  // Blocking. Creates the folder 0700 if needed, re-asserts 0700, and
++  // replaces the file atomically with ImportantFileWriter, whose temp file is
++  // 0600 from creation. Returns false if any step failed; the old file is
++  // then still in place.
++  bool Write(const base::FilePath& profile_dir) const;
++  // Blocking. Renames an unreadable record to kBadFileName, replacing an
++  // older one.
++  static bool MoveAside(const base::FilePath& profile_dir);
++
++  static ReadResult Parse(std::string_view json);
++  std::string Serialize() const;
++
++  // Lookups by Arc id. Null if not mapped.
++  const SpaceMapping* FindSpace(std::string_view arc_id) const;
++  const ItemMapping* FindItem(std::string_view arc_id) const;
++
++  void MapSpace(std::string arc_id, std::string rac_id, std::string run_id);
++  void MapItem(std::string arc_id,
++               std::string rac_id,
++               ItemKind kind,
++               std::string run_id);
++  bool has_mappings() const { return !spaces_.empty() || !items_.empty(); }
++  void ClearMappings();
++
++  // True when the record maps something but none of it is in the profile
++  // any more: `Preferences` was reset and not restored, or the user removed
++  // everything the import brought. A rerun then imports as if for the first
++  // time, instead of skipping everything.
++  bool IsStale(const base::flat_set<std::string>& live_space_ids,
++               const base::flat_set<std::string>& live_sidebar_ids) const;
++
++  // Runs, oldest first.
++  const std::vector<Run>& runs() const { return runs_; }
++  // Appends `run`, dropping the oldest beyond kMaxRuns.
++  void AddRun(Run run);
++  const Run* FindRun(std::string_view run_id) const;
++  // The newest run, if it isn't undone and `now` is before its undo_until.
++  // Only the newest run can be undone: an older one's additions may have
++  // been extended by the newer one.
++  const Run* UndoableRun(base::Time now) const;
++
++  // rac ids a run added, in mapping order.
++  std::vector<std::string> SpacesOfRun(std::string_view run_id) const;
++  std::vector<std::string> ItemsOfRun(std::string_view run_id,
++                                      ItemKind kind) const;
++  // Forgets the mappings of `run_id` whose rac id is in `removed`, so a later
++  // import brings those back. Marks the run undone when none of its mappings
++  // are left, including a run that never had any (one that only names the
++  // other profiles an import touched).
++  void ForgetRemoved(std::string_view run_id,
++                     const base::flat_set<std::string>& removed);
++
++  // Which Arc profile went into this rac profile (ImportProfile::source_key).
++  std::string arc_profile_key;
++  base::Time first_import;
++  base::Time last_import;
++  // When Helium's importer last brought this profile's history. Null if it
++  // never did. History isn't imported twice: it would duplicate visits.
++  base::Time history_imported;
++  // Hand-offs for later features (link routing, tab archive), kept, not
++  // applied. Only in the record of the profile the import started from.
++  ImportHandoffs handoffs;
++  // ImportProfile::pinned_extension_ids, kept, never installed.
++  std::vector<std::string> pinned_extension_ids;
++
++ private:
++  std::map<std::string, SpaceMapping, std::less<>> spaces_;
++  std::map<std::string, ItemMapping, std::less<>> items_;
++  std::vector<Run> runs_;
++  // Top-level keys this build doesn't read.
++  base::DictValue unknown_fields_;
++};
++
++struct ArcImportRecord::ReadResult {
++  ReadStatus status = ReadStatus::kMissing;
++  // Empty unless kOk.
++  ArcImportRecord record;
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_IMPORT_ARC_IMPORT_RECORD_H_
+--- /dev/null
++++ b/chrome/browser/rac/import/arc_import_record_unittest.cc
+@@ -0,0 +1,975 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/arc_import_record.h"
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/containers/flat_set.h"
++#include "base/files/file_enumerator.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/json/json_reader.h"
++#include "base/time/time.h"
++#include "base/values.h"
++#include "testing/gmock/include/gmock/gmock.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++using ::testing::ElementsAre;
++using ::testing::IsEmpty;
++
++using ItemKind = ArcImportRecord::ItemKind;
++using ReadStatus = ArcImportRecord::ReadStatus;
++using ImportRun = ArcImportRecord::Run;
++
++// A fixed time, `seconds` after the Unix epoch.
++base::Time At(double seconds) {
++  return base::Time::FromSecondsSinceUnixEpoch(seconds);
++}
++
++// A run with every field set. `undone` is false.
++ImportRun MakeRun(const std::string& id, double base_seconds) {
++  ImportRun run;
++  run.id = id;
++  run.time = At(base_seconds);
++  run.snapshot_id = "snapshot-" + id;
++  run.snapshot_time = At(base_seconds + 1);
++  run.undo_until = At(base_seconds + 7 * 24 * 3600);
++  run.replaced_blank_space = "blank-space-" + id;
++  run.other_profiles = {"Profile 2", "Profile 3"};
++  run.undone = false;
++  return run;
++}
++
++// A record with every field filled in. See ExpectFullRecord().
++ArcImportRecord MakeFullRecord() {
++  ArcImportRecord record;
++  record.arc_profile_key = "custom:Profile 1";
++  record.first_import = At(1760000000);
++  record.last_import = At(1760100000);
++  record.history_imported = At(1760050000);
++
++  record.MapSpace("arc-space-1", "11111111-1111-4111-8111-111111111111",
++                  "run-1");
++  record.MapSpace("arc-space-2", "22222222-2222-4222-8222-222222222222",
++                  "run-2");
++  record.MapItem("arc-pin-1", "rac-pin-1", ItemKind::kPinnedTab, "run-1");
++  record.MapItem("arc-folder-1", "rac-folder-1", ItemKind::kFolder, "run-1");
++  record.MapItem("arc-fav-1", "rac-fav-1", ItemKind::kFavorite, "run-2");
++
++  record.AddRun(MakeRun("run-1", 1760000000));
++  ImportRun second = MakeRun("run-2", 1760100000);
++  second.undone = true;
++  second.other_profiles = {"Profile 2"};
++  record.AddRun(std::move(second));
++
++  record.handoffs.routing_rules_json = {R"({"match":"a.test","to":"space-1"})",
++                                        R"({"match":"b.test","to":"space-2"})"};
++  record.handoffs.routing_default_json = R"({"to":"space-1"})";
++  record.handoffs.auto_archive_raw = "sevenDays";
++  record.handoffs.auto_archive_after = base::Days(7);
++  record.handoffs.archive_path =
++      base::FilePath("/tmp/arc-test/StorableArchiveItems.json");
++
++  record.pinned_extension_ids = {"aaaabbbbccccddddeeeeffffgggghhhh",
++                                 "ppppoooonnnnmmmmllllkkkkjjjjiiii"};
++  return record;
++}
++
++// Checks `record` against MakeFullRecord().
++void ExpectFullRecord(const ArcImportRecord& record) {
++  EXPECT_EQ(record.arc_profile_key, "custom:Profile 1");
++  EXPECT_EQ(record.first_import, At(1760000000));
++  EXPECT_EQ(record.last_import, At(1760100000));
++  EXPECT_EQ(record.history_imported, At(1760050000));
++
++  const ArcImportRecord::SpaceMapping* space1 = record.FindSpace("arc-space-1");
++  ASSERT_TRUE(space1);
++  EXPECT_EQ(space1->rac_id, "11111111-1111-4111-8111-111111111111");
++  EXPECT_EQ(space1->run_id, "run-1");
++  const ArcImportRecord::SpaceMapping* space2 = record.FindSpace("arc-space-2");
++  ASSERT_TRUE(space2);
++  EXPECT_EQ(space2->rac_id, "22222222-2222-4222-8222-222222222222");
++  EXPECT_EQ(space2->run_id, "run-2");
++  EXPECT_FALSE(record.FindSpace("arc-space-3"));
++
++  const ArcImportRecord::ItemMapping* pin = record.FindItem("arc-pin-1");
++  ASSERT_TRUE(pin);
++  EXPECT_EQ(pin->rac_id, "rac-pin-1");
++  EXPECT_EQ(pin->run_id, "run-1");
++  EXPECT_EQ(pin->kind, ItemKind::kPinnedTab);
++  const ArcImportRecord::ItemMapping* folder = record.FindItem("arc-folder-1");
++  ASSERT_TRUE(folder);
++  EXPECT_EQ(folder->rac_id, "rac-folder-1");
++  EXPECT_EQ(folder->run_id, "run-1");
++  EXPECT_EQ(folder->kind, ItemKind::kFolder);
++  const ArcImportRecord::ItemMapping* favorite = record.FindItem("arc-fav-1");
++  ASSERT_TRUE(favorite);
++  EXPECT_EQ(favorite->rac_id, "rac-fav-1");
++  EXPECT_EQ(favorite->run_id, "run-2");
++  EXPECT_EQ(favorite->kind, ItemKind::kFavorite);
++  EXPECT_TRUE(record.has_mappings());
++
++  ASSERT_EQ(record.runs().size(), 2u);
++  EXPECT_EQ(record.runs()[0].id, "run-1");
++  EXPECT_EQ(record.runs()[1].id, "run-2");
++  const ImportRun* run1 = record.FindRun("run-1");
++  ASSERT_TRUE(run1);
++  EXPECT_EQ(*run1, MakeRun("run-1", 1760000000));
++  const ImportRun* run2 = record.FindRun("run-2");
++  ASSERT_TRUE(run2);
++  ImportRun expected_second = MakeRun("run-2", 1760100000);
++  expected_second.undone = true;
++  expected_second.other_profiles = {"Profile 2"};
++  EXPECT_EQ(*run2, expected_second);
++  EXPECT_FALSE(record.FindRun("run-3"));
++
++  EXPECT_THAT(record.handoffs.routing_rules_json,
++              ElementsAre(R"({"match":"a.test","to":"space-1"})",
++                          R"({"match":"b.test","to":"space-2"})"));
++  EXPECT_EQ(record.handoffs.routing_default_json, R"({"to":"space-1"})");
++  EXPECT_EQ(record.handoffs.auto_archive_raw, "sevenDays");
++  ASSERT_TRUE(record.handoffs.auto_archive_after.has_value());
++  EXPECT_EQ(*record.handoffs.auto_archive_after, base::Days(7));
++  EXPECT_EQ(record.handoffs.archive_path,
++            base::FilePath("/tmp/arc-test/StorableArchiveItems.json"));
++
++  EXPECT_THAT(record.pinned_extension_ids,
++              ElementsAre("aaaabbbbccccddddeeeeffffgggghhhh",
++                          "ppppoooonnnnmmmmllllkkkkjjjjiiii"));
++}
++
++// Parses `json` and expects kOk.
++ArcImportRecord ParseOk(std::string_view json) {
++  ArcImportRecord::ReadResult result = ArcImportRecord::Parse(json);
++  EXPECT_EQ(result.status, ReadStatus::kOk);
++  return std::move(result.record);
++}
++
++// Serializes `record` and reads the text back as a dict.
++base::DictValue SerializedDict(const ArcImportRecord& record) {
++  std::optional<base::DictValue> dict =
++      base::JSONReader::ReadDict(record.Serialize(), base::JSON_PARSE_RFC);
++  EXPECT_TRUE(dict.has_value());
++  return dict ? std::move(*dict) : base::DictValue();
++}
++
++bool WriteText(const base::FilePath& path, std::string_view text) {
++  return base::WriteFile(path, text);
++}
++
++// The permission bits of `path`, or -1.
++int ModeOf(const base::FilePath& path) {
++  int mode = 0;
++  if (!base::GetPosixFilePermissions(path, &mode)) {
++    return -1;
++  }
++  return mode & 0777;
++}
++
++// Base names of everything directly inside `dir`, files and folders.
++std::vector<std::string> NamesIn(const base::FilePath& dir) {
++  std::vector<std::string> names;
++  base::FileEnumerator enumerator(
++      dir, /*recursive=*/false,
++      base::FileEnumerator::FILES | base::FileEnumerator::DIRECTORIES);
++  for (base::FilePath path = enumerator.Next(); !path.empty();
++       path = enumerator.Next()) {
++    names.push_back(path.BaseName().value());
++  }
++  return names;
++}
++
++TEST(ArcImportRecordTest, RoundTripsEveryField) {
++  const ArcImportRecord record = MakeFullRecord();
++  ExpectFullRecord(record);
++
++  ArcImportRecord::ReadResult result =
++      ArcImportRecord::Parse(record.Serialize());
++  ASSERT_EQ(result.status, ReadStatus::kOk);
++  ExpectFullRecord(result.record);
++  EXPECT_EQ(result.record.Serialize(), record.Serialize());
++}
++
++TEST(ArcImportRecordTest, EmptyRecordRoundTrips) {
++  const ArcImportRecord record;
++  ArcImportRecord parsed = ParseOk(record.Serialize());
++  EXPECT_TRUE(parsed.arc_profile_key.empty());
++  EXPECT_TRUE(parsed.first_import.is_null());
++  EXPECT_TRUE(parsed.last_import.is_null());
++  EXPECT_TRUE(parsed.history_imported.is_null());
++  EXPECT_FALSE(parsed.has_mappings());
++  EXPECT_THAT(parsed.runs(), IsEmpty());
++  EXPECT_THAT(parsed.handoffs.routing_rules_json, IsEmpty());
++  EXPECT_TRUE(parsed.handoffs.routing_default_json.empty());
++  EXPECT_TRUE(parsed.handoffs.auto_archive_raw.empty());
++  EXPECT_FALSE(parsed.handoffs.auto_archive_after.has_value());
++  EXPECT_TRUE(parsed.handoffs.archive_path.empty());
++  EXPECT_THAT(parsed.pinned_extension_ids, IsEmpty());
++}
++
++TEST(ArcImportRecordTest, WritesVersionFields) {
++  const ArcImportRecord record = MakeFullRecord();
++  std::optional<base::DictValue> dict =
++      base::JSONReader::ReadDict(record.Serialize(), base::JSON_PARSE_RFC);
++  ASSERT_TRUE(dict.has_value());
++  EXPECT_EQ(dict->FindInt("version"), std::optional<int>(1));
++  EXPECT_EQ(dict->FindInt("min_reader_version"), std::optional<int>(1));
++  ASSERT_TRUE(dict->FindString("source"));
++  EXPECT_EQ(*dict->FindString("source"), "arc");
++  EXPECT_EQ(ArcImportRecord::kVersion, 1);
++  EXPECT_EQ(ArcImportRecord::kMinReaderVersion, 1);
++}
++
++TEST(ArcImportRecordTest, MissingVersionIsCorrupt) {
++  EXPECT_EQ(ArcImportRecord::Parse(R"({"source":"arc"})").status,
++            ReadStatus::kCorrupt);
++  EXPECT_EQ(ArcImportRecord::Parse("{}").status, ReadStatus::kCorrupt);
++}
++
++TEST(ArcImportRecordTest, VersionZeroIsCorrupt) {
++  EXPECT_EQ(
++      ArcImportRecord::Parse(R"({"version":0,"min_reader_version":0})").status,
++      ReadStatus::kCorrupt);
++  EXPECT_EQ(ArcImportRecord::Parse(R"({"version":-1})").status,
++            ReadStatus::kCorrupt);
++}
++
++TEST(ArcImportRecordTest, VersionOfWrongTypeIsCorrupt) {
++  EXPECT_EQ(ArcImportRecord::Parse(R"({"version":"1"})").status,
++            ReadStatus::kCorrupt);
++}
++
++TEST(ArcImportRecordTest, TooNewMinReaderVersion) {
++  EXPECT_EQ(
++      ArcImportRecord::Parse(R"({"version":3,"min_reader_version":2})").status,
++      ReadStatus::kTooNew);
++}
++
++TEST(ArcImportRecordTest, NewerVersionWithoutMinReaderVersionIsTooNew) {
++  // `min_reader_version` defaults to `version`.
++  EXPECT_EQ(ArcImportRecord::Parse(R"({"version":2})").status,
++            ReadStatus::kTooNew);
++}
++
++TEST(ArcImportRecordTest, VersionOneWithoutMinReaderVersionIsOk) {
++  EXPECT_EQ(ArcImportRecord::Parse(R"({"version":1})").status,
++            ReadStatus::kOk);
++}
++
++TEST(ArcImportRecordTest, NewerVersionStillReadable) {
++  constexpr char kJson[] = R"({
++    "version": 2,
++    "min_reader_version": 1,
++    "source": "arc",
++    "arc_profile": "default",
++    "future_key": {"nested": [1, 2, {"x": "y"}], "flag": true},
++    "spaces": {"s1": {"rac": "rac-s1", "run": "run-1"}},
++    "items": {"i1": {"rac": "rac-i1", "run": "run-1", "kind": "folder"}}
++  })";
++  ArcImportRecord record = ParseOk(kJson);
++  EXPECT_EQ(record.arc_profile_key, "default");
++  ASSERT_TRUE(record.FindSpace("s1"));
++  EXPECT_EQ(record.FindSpace("s1")->rac_id, "rac-s1");
++  ASSERT_TRUE(record.FindItem("i1"));
++  EXPECT_EQ(record.FindItem("i1")->kind, ItemKind::kFolder);
++
++  std::optional<base::DictValue> original =
++      base::JSONReader::ReadDict(kJson, base::JSON_PARSE_RFC);
++  ASSERT_TRUE(original.has_value());
++  const base::Value* expected_future = original->Find("future_key");
++  ASSERT_TRUE(expected_future);
++
++  base::DictValue written = SerializedDict(record);
++  const base::Value* future = written.Find("future_key");
++  ASSERT_TRUE(future);
++  EXPECT_EQ(*future, *expected_future);
++  // The version is rewritten to what this build writes.
++  EXPECT_EQ(written.FindInt("version"), std::optional<int>(1));
++  EXPECT_EQ(written.FindInt("min_reader_version"), std::optional<int>(1));
++}
++
++TEST(ArcImportRecordTest, NotJsonIsCorrupt) {
++  EXPECT_EQ(ArcImportRecord::Parse("not json").status, ReadStatus::kCorrupt);
++  EXPECT_EQ(ArcImportRecord::Parse("").status, ReadStatus::kCorrupt);
++  EXPECT_EQ(ArcImportRecord::Parse("{").status, ReadStatus::kCorrupt);
++}
++
++TEST(ArcImportRecordTest, JsonListIsCorrupt) {
++  EXPECT_EQ(ArcImportRecord::Parse(R"([{"version":1}])").status,
++            ReadStatus::kCorrupt);
++  EXPECT_EQ(ArcImportRecord::Parse("[]").status, ReadStatus::kCorrupt);
++}
++
++TEST(ArcImportRecordTest, OtherSourceIsCorrupt) {
++  EXPECT_EQ(
++      ArcImportRecord::Parse(R"({"version":1,"source":"zen"})").status,
++      ReadStatus::kCorrupt);
++}
++
++TEST(ArcImportRecordTest, MissingSourceIsAccepted) {
++  // The code reads a record without a `source` key as an Arc record, and
++  // writes `source` back.
++  ArcImportRecord record =
++      ParseOk(R"({"version":1,"arc_profile":"default"})");
++  EXPECT_EQ(record.arc_profile_key, "default");
++  base::DictValue written = SerializedDict(record);
++  ASSERT_TRUE(written.FindString("source"));
++  EXPECT_EQ(*written.FindString("source"), "arc");
++}
++
++TEST(ArcImportRecordTest, DropsBadEntriesOneByOne) {
++  constexpr char kJson[] = R"({
++    "version": 1,
++    "spaces": {
++      "good-space-1": {"rac": "rac-1", "run": "run-1"},
++      "no-rac": {"run": "run-1"},
++      "empty-rac": {"rac": "", "run": "run-1"},
++      "not-a-dict": "rac-x",
++      "": {"rac": "rac-empty-key", "run": "run-1"},
++      "good-space-2": {"rac": "rac-2", "run": "run-1"}
++    },
++    "items": {
++      "good-pin": {"rac": "rac-pin", "run": "run-1", "kind": "pinned"},
++      "unknown-kind": {"rac": "rac-x", "run": "run-1", "kind": "mystery"},
++      "no-kind": {"rac": "rac-y", "run": "run-1"},
++      "no-rac": {"run": "run-1", "kind": "pinned"},
++      "not-a-dict": 5,
++      "good-folder": {"rac": "rac-folder", "run": "run-1", "kind": "folder"},
++      "good-fav": {"rac": "rac-fav", "run": "run-1", "kind": "favorite"}
++    },
++    "runs": [
++      {"id": "run-1", "undone": false},
++      {"time": "123"},
++      "not a dict",
++      {"id": ""},
++      {"id": "run-2"}
++    ]
++  })";
++  ArcImportRecord record = ParseOk(kJson);
++
++  ASSERT_TRUE(record.FindSpace("good-space-1"));
++  EXPECT_EQ(record.FindSpace("good-space-1")->rac_id, "rac-1");
++  ASSERT_TRUE(record.FindSpace("good-space-2"));
++  EXPECT_EQ(record.FindSpace("good-space-2")->rac_id, "rac-2");
++  EXPECT_FALSE(record.FindSpace("no-rac"));
++  EXPECT_FALSE(record.FindSpace("empty-rac"));
++  EXPECT_FALSE(record.FindSpace("not-a-dict"));
++  EXPECT_FALSE(record.FindSpace(""));
++
++  ASSERT_TRUE(record.FindItem("good-pin"));
++  EXPECT_EQ(record.FindItem("good-pin")->kind, ItemKind::kPinnedTab);
++  ASSERT_TRUE(record.FindItem("good-folder"));
++  EXPECT_EQ(record.FindItem("good-folder")->kind, ItemKind::kFolder);
++  ASSERT_TRUE(record.FindItem("good-fav"));
++  EXPECT_EQ(record.FindItem("good-fav")->kind, ItemKind::kFavorite);
++  EXPECT_FALSE(record.FindItem("unknown-kind"));
++  EXPECT_FALSE(record.FindItem("no-kind"));
++  EXPECT_FALSE(record.FindItem("no-rac"));
++  EXPECT_FALSE(record.FindItem("not-a-dict"));
++
++  ASSERT_EQ(record.runs().size(), 2u);
++  EXPECT_EQ(record.runs()[0].id, "run-1");
++  EXPECT_EQ(record.runs()[1].id, "run-2");
++}
++
++TEST(ArcImportRecordTest, OpaqueArcIdsRoundTrip) {
++  const std::vector<std::string> ids = {
++      "a.b.c", "https://x.example/p?q=1", "with spaces",
++      "4F3C2A10-5B6D-4E7F-8A9B-0C1D2E3F4A5B"};
++  ArcImportRecord record;
++  for (const std::string& id : ids) {
++    record.MapSpace(id, "rac-space-for-" + id, "run-1");
++    record.MapItem(id, "rac-item-for-" + id, ItemKind::kFolder, "run-1");
++  }
++
++  base::DictValue written = SerializedDict(record);
++  const base::DictValue* spaces = written.FindDict("spaces");
++  ASSERT_TRUE(spaces);
++  // Dots must not split the key into nested dicts.
++  ASSERT_TRUE(spaces->FindDict("a.b.c"));
++  EXPECT_FALSE(spaces->Find("a"));
++  EXPECT_EQ(spaces->size(), ids.size());
++  const base::DictValue* items = written.FindDict("items");
++  ASSERT_TRUE(items);
++  ASSERT_TRUE(items->FindDict("a.b.c"));
++  EXPECT_FALSE(items->Find("a"));
++  EXPECT_EQ(items->size(), ids.size());
++
++  ArcImportRecord parsed = ParseOk(record.Serialize());
++  for (const std::string& id : ids) {
++    ASSERT_TRUE(parsed.FindSpace(id)) << id;
++    EXPECT_EQ(parsed.FindSpace(id)->rac_id, "rac-space-for-" + id);
++    ASSERT_TRUE(parsed.FindItem(id)) << id;
++    EXPECT_EQ(parsed.FindItem(id)->rac_id, "rac-item-for-" + id);
++    EXPECT_EQ(parsed.FindItem(id)->kind, ItemKind::kFolder);
++  }
++  EXPECT_FALSE(parsed.FindSpace("a"));
++  EXPECT_FALSE(parsed.FindSpace("a.b"));
++}
++
++TEST(ArcImportRecordTest, RunProfilesMustBeFolderNames) {
++  ImportRun run = MakeRun("run-1", 1760000000);
++  run.other_profiles = {"Profile 2", "../evil", "a/b", "",
++                        ".",         "..",      "x\\y"};
++  ArcImportRecord record;
++  record.AddRun(std::move(run));
++
++  ArcImportRecord parsed = ParseOk(record.Serialize());
++  const ImportRun* parsed_run = parsed.FindRun("run-1");
++  ASSERT_TRUE(parsed_run);
++  EXPECT_THAT(parsed_run->other_profiles, ElementsAre("Profile 2"));
++}
++
++TEST(ArcImportRecordTest, WriteCreatesPrivateFiles) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath profile = temp.GetPath();
++  const base::FilePath dir = ArcImportRecord::DirFor(profile);
++  const base::FilePath file = ArcImportRecord::PathFor(profile);
++  EXPECT_EQ(dir.BaseName().value(), "rac imports");
++  EXPECT_EQ(file.BaseName().value(), "arc.json");
++  EXPECT_EQ(file.DirName(), dir);
++  EXPECT_EQ(dir.DirName(), profile);
++
++  const ArcImportRecord record = MakeFullRecord();
++  ASSERT_TRUE(record.Write(profile));
++
++  EXPECT_TRUE(base::DirectoryExists(dir));
++  EXPECT_EQ(ModeOf(dir), 0700);
++  EXPECT_TRUE(base::PathExists(file));
++  EXPECT_EQ(ModeOf(file), 0600);
++
++  ArcImportRecord::ReadResult result = ArcImportRecord::Read(profile);
++  ASSERT_EQ(result.status, ReadStatus::kOk);
++  ExpectFullRecord(result.record);
++}
++
++TEST(ArcImportRecordTest, WriteTightensExistingDir) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath profile = temp.GetPath();
++  const base::FilePath dir = ArcImportRecord::DirFor(profile);
++  ASSERT_TRUE(base::CreateDirectory(dir));
++  ASSERT_TRUE(base::SetPosixFilePermissions(dir, 0755));
++  ASSERT_EQ(ModeOf(dir), 0755);
++  // An older, looser file is replaced by a 0600 one.
++  const base::FilePath file = ArcImportRecord::PathFor(profile);
++  ASSERT_TRUE(WriteText(file, "{}"));
++  ASSERT_TRUE(base::SetPosixFilePermissions(file, 0644));
++
++  ASSERT_TRUE(MakeFullRecord().Write(profile));
++
++  EXPECT_EQ(ModeOf(dir), 0700);
++  EXPECT_EQ(ModeOf(file), 0600);
++  EXPECT_EQ(ArcImportRecord::Read(profile).status, ReadStatus::kOk);
++}
++
++TEST(ArcImportRecordTest, ReadMissingIsMissing) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath profile = temp.GetPath();
++
++  ArcImportRecord::ReadResult result = ArcImportRecord::Read(profile);
++  EXPECT_EQ(result.status, ReadStatus::kMissing);
++  EXPECT_FALSE(result.record.has_mappings());
++  EXPECT_FALSE(base::PathExists(ArcImportRecord::DirFor(profile)));
++  EXPECT_THAT(NamesIn(profile), IsEmpty());
++
++  // The folder exists but the file doesn't.
++  ASSERT_TRUE(base::CreateDirectory(ArcImportRecord::DirFor(profile)));
++  EXPECT_EQ(ArcImportRecord::Read(profile).status, ReadStatus::kMissing);
++}
++
++TEST(ArcImportRecordTest, ReadCorruptFileIsCorrupt) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath profile = temp.GetPath();
++  ASSERT_TRUE(base::CreateDirectory(ArcImportRecord::DirFor(profile)));
++  ASSERT_TRUE(WriteText(ArcImportRecord::PathFor(profile), "{"));
++
++  EXPECT_EQ(ArcImportRecord::Read(profile).status, ReadStatus::kCorrupt);
++}
++
++TEST(ArcImportRecordTest, ReadDirectoryIsUnreadableAndLeftAlone) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath profile = temp.GetPath();
++  const base::FilePath dir = ArcImportRecord::DirFor(profile);
++  const base::FilePath file = ArcImportRecord::PathFor(profile);
++  ASSERT_TRUE(base::CreateDirectory(dir));
++  // A directory where the record file should be: the path exists, but it
++  // cannot be read as a file.
++  ASSERT_TRUE(base::CreateDirectory(file));
++
++  EXPECT_EQ(ArcImportRecord::Read(profile).status, ReadStatus::kUnreadable);
++
++  // Not known to be damaged: it is left alone, not moved aside.
++  EXPECT_TRUE(base::DirectoryExists(file));
++  EXPECT_THAT(NamesIn(dir), ElementsAre("arc.json"));
++}
++
++TEST(ArcImportRecordTest, ReadTooNewFileIsTooNew) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath profile = temp.GetPath();
++  ASSERT_TRUE(base::CreateDirectory(ArcImportRecord::DirFor(profile)));
++  ASSERT_TRUE(WriteText(ArcImportRecord::PathFor(profile),
++                        R"({"version":5,"min_reader_version":4})"));
++
++  EXPECT_EQ(ArcImportRecord::Read(profile).status, ReadStatus::kTooNew);
++}
++
++TEST(ArcImportRecordTest, MoveAsideRenames) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath profile = temp.GetPath();
++  const base::FilePath dir = ArcImportRecord::DirFor(profile);
++  const base::FilePath file = ArcImportRecord::PathFor(profile);
++  const base::FilePath bad = dir.AppendASCII("arc.json.bad");
++  ASSERT_TRUE(base::CreateDirectory(dir));
++
++  ASSERT_TRUE(WriteText(file, "junk one"));
++  EXPECT_TRUE(ArcImportRecord::MoveAside(profile));
++  EXPECT_FALSE(base::PathExists(file));
++  std::string content;
++  ASSERT_TRUE(base::ReadFileToString(bad, &content));
++  EXPECT_EQ(content, "junk one");
++  EXPECT_EQ(ArcImportRecord::Read(profile).status, ReadStatus::kMissing);
++
++  // A second move replaces the older .bad copy.
++  ASSERT_TRUE(WriteText(file, "junk two"));
++  EXPECT_TRUE(ArcImportRecord::MoveAside(profile));
++  EXPECT_FALSE(base::PathExists(file));
++  ASSERT_TRUE(base::ReadFileToString(bad, &content));
++  EXPECT_EQ(content, "junk two");
++  EXPECT_THAT(NamesIn(dir), ElementsAre("arc.json.bad"));
++}
++
++TEST(ArcImportRecordTest, MoveAsideWithoutFileFails) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath profile = temp.GetPath();
++  ASSERT_TRUE(base::CreateDirectory(ArcImportRecord::DirFor(profile)));
++
++  EXPECT_FALSE(ArcImportRecord::MoveAside(profile));
++  EXPECT_THAT(NamesIn(ArcImportRecord::DirFor(profile)), IsEmpty());
++}
++
++TEST(ArcImportRecordTest, WriteReplacesAtomically) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath profile = temp.GetPath();
++
++  ArcImportRecord a;
++  a.arc_profile_key = "profile-a";
++  a.MapSpace("space-a", "rac-a", "run-a");
++  ASSERT_TRUE(a.Write(profile));
++
++  ArcImportRecord b;
++  b.arc_profile_key = "profile-b";
++  b.MapSpace("space-b", "rac-b", "run-b");
++  ASSERT_TRUE(b.Write(profile));
++
++  ArcImportRecord::ReadResult result = ArcImportRecord::Read(profile);
++  ASSERT_EQ(result.status, ReadStatus::kOk);
++  EXPECT_EQ(result.record.arc_profile_key, "profile-b");
++  EXPECT_FALSE(result.record.FindSpace("space-a"));
++  ASSERT_TRUE(result.record.FindSpace("space-b"));
++  EXPECT_EQ(result.record.FindSpace("space-b")->rac_id, "rac-b");
++
++  EXPECT_THAT(NamesIn(ArcImportRecord::DirFor(profile)),
++              ElementsAre("arc.json"));
++  EXPECT_THAT(NamesIn(profile), ElementsAre("rac imports"));
++  EXPECT_EQ(ModeOf(ArcImportRecord::PathFor(profile)), 0600);
++}
++
++TEST(ArcImportRecordTest, IsStale) {
++  const base::flat_set<std::string> none{};
++
++  // No mappings: nothing to be stale.
++  ArcImportRecord empty;
++  EXPECT_FALSE(empty.IsStale(none, none));
++  EXPECT_FALSE(empty.IsStale({"x"}, {"y"}));
++
++  // One mapped space, live.
++  ArcImportRecord with_space;
++  with_space.MapSpace("s1", "rac-space", "run-1");
++  EXPECT_FALSE(with_space.IsStale({"rac-space"}, none));
++  EXPECT_TRUE(with_space.IsStale(none, none));
++  EXPECT_TRUE(with_space.IsStale({"other-space"}, none));
++  // Space ids and sidebar ids are separate sets.
++  EXPECT_TRUE(with_space.IsStale(none, {"rac-space"}));
++
++  // One mapped item, live.
++  ArcImportRecord with_item;
++  with_item.MapItem("i1", "rac-item", ItemKind::kPinnedTab, "run-1");
++  EXPECT_FALSE(with_item.IsStale(none, {"rac-item"}));
++  EXPECT_TRUE(with_item.IsStale(none, none));
++  EXPECT_TRUE(with_item.IsStale({"rac-item"}, none));
++
++  // Several mappings: one live one is enough.
++  ArcImportRecord mixed;
++  mixed.MapSpace("s1", "rac-space-1", "run-1");
++  mixed.MapSpace("s2", "rac-space-2", "run-1");
++  mixed.MapItem("i1", "rac-item-1", ItemKind::kFolder, "run-1");
++  mixed.MapItem("i2", "rac-item-2", ItemKind::kFavorite, "run-1");
++  EXPECT_TRUE(mixed.IsStale(none, none));
++  EXPECT_FALSE(mixed.IsStale({"rac-space-2"}, none));
++  EXPECT_FALSE(mixed.IsStale(none, {"rac-item-2"}));
++  EXPECT_TRUE(mixed.IsStale({"rac-item-1"}, {"rac-space-1"}));
++}
++
++TEST(ArcImportRecordTest, ClearMappings) {
++  ArcImportRecord record = MakeFullRecord();
++  ASSERT_TRUE(record.has_mappings());
++
++  record.ClearMappings();
++
++  EXPECT_FALSE(record.has_mappings());
++  EXPECT_FALSE(record.FindSpace("arc-space-1"));
++  EXPECT_FALSE(record.FindItem("arc-pin-1"));
++  EXPECT_THAT(record.SpacesOfRun("run-1"), IsEmpty());
++  // Runs and hand-offs stay.
++  EXPECT_EQ(record.runs().size(), 2u);
++  EXPECT_TRUE(record.FindRun("run-1"));
++  EXPECT_EQ(record.handoffs.auto_archive_raw, "sevenDays");
++  EXPECT_EQ(record.pinned_extension_ids.size(), 2u);
++
++  ArcImportRecord parsed = ParseOk(record.Serialize());
++  EXPECT_FALSE(parsed.has_mappings());
++  EXPECT_EQ(parsed.runs().size(), 2u);
++}
++
++TEST(ArcImportRecordTest, HasMappingsCountsSpacesAndItems) {
++  ArcImportRecord record;
++  EXPECT_FALSE(record.has_mappings());
++  record.MapSpace("s", "r", "run");
++  EXPECT_TRUE(record.has_mappings());
++
++  ArcImportRecord items_only;
++  items_only.MapItem("i", "r", ItemKind::kFavorite, "run");
++  EXPECT_TRUE(items_only.has_mappings());
++}
++
++TEST(ArcImportRecordTest, AddRunCapsAtMaxRuns) {
++  ArcImportRecord record;
++  record.MapItem("arc-item", "rac-item", ItemKind::kPinnedTab, "run-0");
++  const size_t total = ArcImportRecord::kMaxRuns + 3;
++  for (size_t i = 0; i < total; ++i) {
++    record.AddRun(MakeRun("run-" + std::to_string(i),
++                          1760000000 + static_cast<double>(i) * 1000));
++  }
++
++  ASSERT_EQ(record.runs().size(), ArcImportRecord::kMaxRuns);
++  EXPECT_EQ(record.runs().front().id, "run-3");
++  EXPECT_EQ(record.runs().back().id, "run-" + std::to_string(total - 1));
++  EXPECT_FALSE(record.FindRun("run-0"));
++  EXPECT_FALSE(record.FindRun("run-2"));
++  EXPECT_TRUE(record.FindRun("run-3"));
++  // Dropped runs keep their mappings.
++  EXPECT_TRUE(record.FindItem("arc-item"));
++}
++
++TEST(ArcImportRecordTest, AddRunKeepsOrderUnderTheCap) {
++  ArcImportRecord record;
++  record.AddRun(MakeRun("first", 1760000000));
++  record.AddRun(MakeRun("second", 1760001000));
++  ASSERT_EQ(record.runs().size(), 2u);
++  EXPECT_EQ(record.runs()[0].id, "first");
++  EXPECT_EQ(record.runs()[1].id, "second");
++}
++
++TEST(ArcImportRecordTest, UndoableRunIsNewestOnly) {
++  ImportRun older = MakeRun("older", 1000);
++  older.undo_until = At(2000);
++  ImportRun newer = MakeRun("newer", 2000);
++  newer.undo_until = At(3000);
++
++  // Both in their deadline: the newest is returned.
++  {
++    ArcImportRecord record;
++    record.AddRun(older);
++    record.AddRun(newer);
++    const ImportRun* undoable = record.UndoableRun(At(1500));
++    ASSERT_TRUE(undoable);
++    EXPECT_EQ(undoable->id, "newer");
++  }
++
++  // Just before the deadline still counts.
++  {
++    ArcImportRecord record;
++    record.AddRun(older);
++    record.AddRun(newer);
++    const ImportRun* undoable = record.UndoableRun(At(2999));
++    ASSERT_TRUE(undoable);
++    EXPECT_EQ(undoable->id, "newer");
++  }
++
++  // The newest is undone: no run, although the older one is in its deadline.
++  {
++    ImportRun undone = newer;
++    undone.undone = true;
++    ArcImportRecord record;
++    record.AddRun(older);
++    record.AddRun(undone);
++    EXPECT_FALSE(record.UndoableRun(At(1500)));
++  }
++
++  // The newest is past its deadline. now == undo_until counts as past.
++  {
++    ArcImportRecord record;
++    record.AddRun(older);
++    record.AddRun(newer);
++    EXPECT_FALSE(record.UndoableRun(At(3000)));
++    EXPECT_FALSE(record.UndoableRun(At(3001)));
++  }
++
++  // The newest has no deadline.
++  {
++    ImportRun no_deadline = newer;
++    no_deadline.undo_until = base::Time();
++    ArcImportRecord record;
++    record.AddRun(older);
++    record.AddRun(no_deadline);
++    EXPECT_FALSE(record.UndoableRun(At(1500)));
++  }
++
++  // A single run in its deadline.
++  {
++    ArcImportRecord record;
++    record.AddRun(newer);
++    ASSERT_TRUE(record.UndoableRun(At(2500)));
++    EXPECT_EQ(record.UndoableRun(At(2500))->id, "newer");
++  }
++
++  // No runs.
++  {
++    ArcImportRecord record;
++    EXPECT_FALSE(record.UndoableRun(At(1500)));
++  }
++}
++
++TEST(ArcImportRecordTest, SpacesOfRunAndItemsOfRunFilterByRunAndKind) {
++  ArcImportRecord record;
++  record.MapSpace("s1", "rac-s1", "run-1");
++  record.MapSpace("s2", "rac-s2", "run-2");
++  record.MapSpace("s3", "rac-s3", "run-1");
++  record.MapItem("i1", "rac-pin-1", ItemKind::kPinnedTab, "run-1");
++  record.MapItem("i2", "rac-pin-2", ItemKind::kPinnedTab, "run-2");
++  record.MapItem("i3", "rac-folder-1", ItemKind::kFolder, "run-1");
++  record.MapItem("i4", "rac-fav-1", ItemKind::kFavorite, "run-1");
++  record.MapItem("i5", "rac-pin-3", ItemKind::kPinnedTab, "run-1");
++
++  // In mapping order, which is Arc id order.
++  EXPECT_THAT(record.SpacesOfRun("run-1"), ElementsAre("rac-s1", "rac-s3"));
++  EXPECT_THAT(record.SpacesOfRun("run-2"), ElementsAre("rac-s2"));
++  EXPECT_THAT(record.SpacesOfRun("run-3"), IsEmpty());
++
++  EXPECT_THAT(record.ItemsOfRun("run-1", ItemKind::kPinnedTab),
++              ElementsAre("rac-pin-1", "rac-pin-3"));
++  EXPECT_THAT(record.ItemsOfRun("run-1", ItemKind::kFolder),
++              ElementsAre("rac-folder-1"));
++  EXPECT_THAT(record.ItemsOfRun("run-1", ItemKind::kFavorite),
++              ElementsAre("rac-fav-1"));
++  EXPECT_THAT(record.ItemsOfRun("run-2", ItemKind::kPinnedTab),
++              ElementsAre("rac-pin-2"));
++  EXPECT_THAT(record.ItemsOfRun("run-2", ItemKind::kFolder), IsEmpty());
++  EXPECT_THAT(record.ItemsOfRun("run-3", ItemKind::kPinnedTab), IsEmpty());
++}
++
++// Two runs: "run-R" with 2 spaces and 2 items, and "run-O" with 1 of each.
++ArcImportRecord MakeTwoRunRecord() {
++  ArcImportRecord record;
++  record.AddRun(MakeRun("run-R", 1000));
++  record.AddRun(MakeRun("run-O", 2000));
++  record.MapSpace("s1", "sp1", "run-R");
++  record.MapSpace("s2", "sp2", "run-R");
++  record.MapItem("i1", "pin1", ItemKind::kPinnedTab, "run-R");
++  record.MapItem("i2", "folder2", ItemKind::kFolder, "run-R");
++  record.MapSpace("s3", "sp3", "run-O");
++  record.MapItem("i3", "pin3", ItemKind::kPinnedTab, "run-O");
++  return record;
++}
++
++TEST(ArcImportRecordTest, ForgetRemovedPartial) {
++  ArcImportRecord record = MakeTwoRunRecord();
++
++  // sp3 and pin3 are in `removed` but belong to the other run.
++  record.ForgetRemoved("run-R", {"sp1", "pin1", "sp3", "pin3"});
++
++  EXPECT_FALSE(record.FindSpace("s1"));
++  EXPECT_FALSE(record.FindItem("i1"));
++  ASSERT_TRUE(record.FindSpace("s2"));
++  EXPECT_EQ(record.FindSpace("s2")->rac_id, "sp2");
++  ASSERT_TRUE(record.FindItem("i2"));
++  EXPECT_EQ(record.FindItem("i2")->rac_id, "folder2");
++  EXPECT_THAT(record.SpacesOfRun("run-R"), ElementsAre("sp2"));
++  EXPECT_THAT(record.ItemsOfRun("run-R", ItemKind::kPinnedTab), IsEmpty());
++  EXPECT_THAT(record.ItemsOfRun("run-R", ItemKind::kFolder),
++              ElementsAre("folder2"));
++
++  // The other run's mappings are untouched.
++  ASSERT_TRUE(record.FindSpace("s3"));
++  EXPECT_EQ(record.FindSpace("s3")->rac_id, "sp3");
++  ASSERT_TRUE(record.FindItem("i3"));
++  EXPECT_EQ(record.FindItem("i3")->rac_id, "pin3");
++
++  ASSERT_TRUE(record.FindRun("run-R"));
++  EXPECT_FALSE(record.FindRun("run-R")->undone);
++  ASSERT_TRUE(record.FindRun("run-O"));
++  EXPECT_FALSE(record.FindRun("run-O")->undone);
++}
++
++TEST(ArcImportRecordTest, ForgetRemovedAll) {
++  ArcImportRecord record = MakeTwoRunRecord();
++
++  record.ForgetRemoved("run-R", {"sp1", "sp2", "pin1", "folder2"});
++
++  EXPECT_FALSE(record.FindSpace("s1"));
++  EXPECT_FALSE(record.FindSpace("s2"));
++  EXPECT_FALSE(record.FindItem("i1"));
++  EXPECT_FALSE(record.FindItem("i2"));
++  ASSERT_TRUE(record.FindRun("run-R"));
++  EXPECT_TRUE(record.FindRun("run-R")->undone);
++
++  // The other run is untouched.
++  EXPECT_TRUE(record.FindSpace("s3"));
++  EXPECT_TRUE(record.FindItem("i3"));
++  ASSERT_TRUE(record.FindRun("run-O"));
++  EXPECT_FALSE(record.FindRun("run-O")->undone);
++  // Undone is saved.
++  ArcImportRecord parsed = ParseOk(record.Serialize());
++  ASSERT_TRUE(parsed.FindRun("run-R"));
++  EXPECT_TRUE(parsed.FindRun("run-R")->undone);
++}
++
++TEST(ArcImportRecordTest, ForgetRemovedOfOtherRunsIdsKeepsRunLive) {
++  ArcImportRecord record = MakeTwoRunRecord();
++
++  // Nothing of run-R is in `removed`, so run-R keeps all of its mappings.
++  record.ForgetRemoved("run-R", {"sp3", "pin3"});
++
++  EXPECT_EQ(record.SpacesOfRun("run-R").size(), 2u);
++  EXPECT_EQ(record.ItemsOfRun("run-R", ItemKind::kPinnedTab).size(), 1u);
++  EXPECT_EQ(record.ItemsOfRun("run-R", ItemKind::kFolder).size(), 1u);
++  EXPECT_FALSE(record.FindRun("run-R")->undone);
++  EXPECT_TRUE(record.FindSpace("s3"));
++  EXPECT_TRUE(record.FindItem("i3"));
++}
++
++TEST(ArcImportRecordTest, CopyKeepsUnknownFields) {
++  constexpr char kJson[] = R"({
++    "version": 1,
++    "arc_profile": "default",
++    "future_key": {"keep": ["me", 1]},
++    "another_future_key": "text",
++    "spaces": {"s1": {"rac": "rac-s1", "run": "run-1"}}
++  })";
++  ArcImportRecord original = ParseOk(kJson);
++
++  std::optional<base::DictValue> source =
++      base::JSONReader::ReadDict(kJson, base::JSON_PARSE_RFC);
++  ASSERT_TRUE(source.has_value());
++  const base::Value* expected_future = source->Find("future_key");
++  ASSERT_TRUE(expected_future);
++
++  auto expect_keeps_unknown = [&](const ArcImportRecord& record) {
++    base::DictValue written = SerializedDict(record);
++    const base::Value* future = written.Find("future_key");
++    ASSERT_TRUE(future);
++    EXPECT_EQ(*future, *expected_future);
++    ASSERT_TRUE(written.FindString("another_future_key"));
++    EXPECT_EQ(*written.FindString("another_future_key"), "text");
++  };
++
++  expect_keeps_unknown(original);
++
++  ArcImportRecord copy_constructed(original);
++  expect_keeps_unknown(copy_constructed);
++  ASSERT_TRUE(copy_constructed.FindSpace("s1"));
++
++  // Copy-assign over a record with its own, different unknown field.
++  ArcImportRecord assigned = ParseOk(R"({"version":1,"old_key":true})");
++  assigned = original;
++  expect_keeps_unknown(assigned);
++  EXPECT_FALSE(SerializedDict(assigned).Find("old_key"));
++  ASSERT_TRUE(assigned.FindSpace("s1"));
++
++  // The original is unchanged by the copies.
++  expect_keeps_unknown(original);
++
++  ArcImportRecord moved(std::move(copy_constructed));
++  expect_keeps_unknown(moved);
++}
++
++TEST(ArcImportRecordTest, MapItemOverwrites) {
++  ArcImportRecord record;
++  record.MapItem("arc-item", "rac-1", ItemKind::kPinnedTab, "run-1");
++  record.MapItem("arc-item", "rac-2", ItemKind::kFolder, "run-2");
++
++  const ArcImportRecord::ItemMapping* mapping = record.FindItem("arc-item");
++  ASSERT_TRUE(mapping);
++  EXPECT_EQ(mapping->rac_id, "rac-2");
++  EXPECT_EQ(mapping->kind, ItemKind::kFolder);
++  EXPECT_EQ(mapping->run_id, "run-2");
++  EXPECT_THAT(record.ItemsOfRun("run-1", ItemKind::kPinnedTab), IsEmpty());
++  EXPECT_THAT(record.ItemsOfRun("run-2", ItemKind::kFolder),
++              ElementsAre("rac-2"));
++
++  ArcImportRecord parsed = ParseOk(record.Serialize());
++  ASSERT_TRUE(parsed.FindItem("arc-item"));
++  EXPECT_EQ(parsed.FindItem("arc-item")->rac_id, "rac-2");
++  EXPECT_EQ(parsed.FindItem("arc-item")->kind, ItemKind::kFolder);
++}
++
++TEST(ArcImportRecordTest, MapSpaceOverwrites) {
++  ArcImportRecord record;
++  record.MapSpace("arc-space", "rac-1", "run-1");
++  record.MapSpace("arc-space", "rac-2", "run-2");
++
++  const ArcImportRecord::SpaceMapping* mapping = record.FindSpace("arc-space");
++  ASSERT_TRUE(mapping);
++  EXPECT_EQ(mapping->rac_id, "rac-2");
++  EXPECT_EQ(mapping->run_id, "run-2");
++  EXPECT_THAT(record.SpacesOfRun("run-1"), IsEmpty());
++  EXPECT_THAT(record.SpacesOfRun("run-2"), ElementsAre("rac-2"));
++}
++
++TEST(ArcImportRecordTest, LargeFileIsUnreadable) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath profile = temp.GetPath();
++  ASSERT_TRUE(base::CreateDirectory(ArcImportRecord::DirFor(profile)));
++
++  // One byte over the limit, so the file is never parsed.
++  const std::string text(ArcImportRecord::kMaxFileSize + 1, ' ');
++  ASSERT_TRUE(WriteText(ArcImportRecord::PathFor(profile), text));
++
++  EXPECT_EQ(ArcImportRecord::Read(profile).status, ReadStatus::kUnreadable);
++}
++
++TEST(ArcImportRecordTest, FileAtMaxSizeIsRead) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath profile = temp.GetPath();
++  ASSERT_TRUE(base::CreateDirectory(ArcImportRecord::DirFor(profile)));
++
++  std::string text = R"({"version":1})";
++  text.resize(ArcImportRecord::kMaxFileSize, ' ');
++  ASSERT_TRUE(WriteText(ArcImportRecord::PathFor(profile), text));
++
++  EXPECT_EQ(ArcImportRecord::Read(profile).status, ReadStatus::kOk);
++}
++
++}  // namespace
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/import/arc_import_types.cc
+@@ -0,0 +1,53 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/arc_import_types.h"
++
++namespace rac {
++
++ArcImportOptions::ArcImportOptions() = default;
++ArcImportOptions::ArcImportOptions(const ArcImportOptions&) = default;
++ArcImportOptions& ArcImportOptions::operator=(const ArcImportOptions&) =
++    default;
++ArcImportOptions::~ArcImportOptions() = default;
++
++ArcImportProgress::ArcImportProgress() = default;
++ArcImportProgress::ArcImportProgress(const ArcImportProgress&) = default;
++ArcImportProgress& ArcImportProgress::operator=(const ArcImportProgress&) =
++    default;
++ArcImportProgress::~ArcImportProgress() = default;
++
++ArcImportCounts& ArcImportCounts::operator+=(const ArcImportCounts& other) {
++  spaces += other.spaces;
++  pinned_tabs += other.pinned_tabs;
++  folders += other.folders;
++  favorites += other.favorites;
++  open_tabs += other.open_tabs;
++  nested_folders += other.nested_folders;
++  if (first_flattened_name.empty()) {
++    first_flattened_name = other.first_flattened_name;
++  }
++  split_views += other.split_views;
++  tab_groups += other.tab_groups;
++  invalid_urls += other.invalid_urls;
++  unsupported_urls += other.unsupported_urls;
++  favorites_already_there += other.favorites_already_there;
++  already_imported += other.already_imported;
++  removed_since += other.removed_since;
++  open_tabs_not_reopened += other.open_tabs_not_reopened;
++  return *this;
++}
++
++ArcProfileResult::ArcProfileResult() = default;
++ArcProfileResult::ArcProfileResult(const ArcProfileResult&) = default;
++ArcProfileResult& ArcProfileResult::operator=(const ArcProfileResult&) =
++    default;
++ArcProfileResult::~ArcProfileResult() = default;
++
++ArcImportResult::ArcImportResult() = default;
++ArcImportResult::ArcImportResult(const ArcImportResult&) = default;
++ArcImportResult& ArcImportResult::operator=(const ArcImportResult&) = default;
++ArcImportResult::~ArcImportResult() = default;
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/import/arc_import_types.h
+@@ -0,0 +1,242 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_IMPORT_ARC_IMPORT_TYPES_H_
++#define CHROME_BROWSER_RAC_IMPORT_ARC_IMPORT_TYPES_H_
++
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/containers/flat_set.h"
++#include "base/files/file_path.h"
++#include "base/time/time.h"
++
++// What the import screens send to the Arc applier and get back from it. Plain
++// structs: no profile, no browser state. The applier lives under
++// chrome/browser/ui/rac/import/.
++
++namespace rac {
++
++// The choices on the Arc step.
++struct ArcImportOptions {
++  ArcImportOptions();
++  ArcImportOptions(const ArcImportOptions&);
++  ArcImportOptions& operator=(const ArcImportOptions&);
++  ~ArcImportOptions();
++
++  // ImportProfile::source_key of each profile left unchecked. A checked
++  // default profile goes into the profile that started the import; other
++  // checked ones go into new rac profiles, made by the sign-ins step.
++  base::flat_set<std::string> skipped_profile_keys;
++  // Arc's Today tabs, created unloaded, for spaces this import creates.
++  bool open_tabs = true;
++  // Arc's browsing history, through Helium's importer, history only.
++  bool history = true;
++  // Ignored until the sign-ins step is built.
++  bool sign_ins = false;
++};
++
++// Sent while an import runs. A fast import sends these in a burst; the page
++// decides what to show.
++struct ArcImportProgress {
++  enum class Step {
++    // DataBackups::CreateSnapshot, before anything is written.
++    kSnapshot,
++    // One event per Arc space, written or already there.
++    kSpaces,
++    // Helium's importer, run separately.
++    kHistory,
++    // During the sign-ins step, one event per profile.
++    kSignIns,
++    // macOS is showing its Keychain prompt.
++    kWaitingForMac,
++  };
++
++  ArcImportProgress();
++  ArcImportProgress(const ArcImportProgress&);
++  ArcImportProgress& operator=(const ArcImportProgress&);
++  ~ArcImportProgress();
++
++  Step step = Step::kSnapshot;
++  // kSpaces: Arc spaces handled so far and in all, across checked profiles.
++  int done = 0;
++  int total = 0;
++  // kSpaces: ImportSpace::source_id just handled.
++  std::string space_id;
++  // kSpaces: the name the sidebar shows for it, with rac's fallback for an
++  // unnamed space. UTF-8.
++  std::string space_title;
++};
++
++// What an import wrote, or would write, into one profile. Every count is of
++// what was actually written, so a rerun counts only what's new.
++struct ArcImportCounts {
++  // Came over.
++  int spaces = 0;
++  int pinned_tabs = 0;
++  // rac folders made, including lifted ones.
++  int folders = 0;
++  int favorites = 0;
++  int open_tabs = 0;
++
++  // Changed on the way.
++  // Arc folders inside folders, lifted to the top as "Parent › Child".
++  int nested_folders = 0;
++  // The first lifted folder's name whose path has a title at every level,
++  // for the result screen. Empty if none.
++  std::string first_flattened_name;
++  // Split views and tab groups whose tabs came over as separate tabs.
++  int split_views = 0;
++  int tab_groups = 0;
++
++  // Left out by the applier. The reader's own skips are in ImportReport.
++  // URLs GURL rejects. Belongs on the "couldn't be read" line.
++  int invalid_urls = 0;
++  // Valid URLs rac won't open from the sidebar: javascript:, data:, Arc's
++  // own pages, extension pages, and so on.
++  int unsupported_urls = 0;
++  // Favorites already in the profile, by URL. Not added a second time.
++  int favorites_already_there = 0;
++  // Already imported by an earlier run (the import record maps them).
++  int already_imported = 0;
++  // In a space or folder an earlier import made and the user deleted since.
++  // Not brought back.
++  int removed_since = 0;
++  // Open tabs of spaces an earlier run made. Only a new space gets its open
++  // tabs, so a rerun never adds tabs to a space the user has been using.
++  int open_tabs_not_reopened = 0;
++
++  // Whether applying writes anything at all.
++  bool AddsAnything() const {
++    return spaces || pinned_tabs || folders || favorites || open_tabs;
++  }
++  ArcImportCounts& operator+=(const ArcImportCounts& other);
++};
++
++// Why an import into a profile changed nothing.
++enum class ArcImportFailure {
++  kNone,
++  // Another import, Undo, or restore is running.
++  kBusy,
++  // The pre-import snapshot couldn't be written.
++  kSnapshotFailed,
++  // The import record was written by a newer rac. Importing again could
++  // lose what it records.
++  kRecordTooNew,
++  // The import record exists but couldn't be read, so it was left alone
++  // and the import refused to run.
++  kRecordUnreadable,
++  // The import record couldn't be saved, so the import was taken back.
++  kRecordNotSaved,
++  // Imports and Undo go into regular profiles only.
++  kOffTheRecord,
++  // The profile went away while importing.
++  kProfileGone,
++};
++
++// One Arc profile's part of an import.
++struct ArcProfileResult {
++  enum class Status {
++    kDone,
++    kNothingNew,
++    // Unchecked on the Arc step.
++    kSkipped,
++    // Not the default profile, and no sign-ins step to make its rac profile
++    // yet.
++    kNeedsProfile,
++    kFailed,
++  };
++  enum class History {
++    kNotRequested,
++    kImported,
++    // An earlier run of this import already brought it.
++    kAlreadyImported,
++    // Arc has no history file for this profile, or no profile folder.
++    kNotAvailable,
++    kFailed,
++  };
++
++  ArcProfileResult();
++  ArcProfileResult(const ArcProfileResult&);
++  ArcProfileResult& operator=(const ArcProfileResult&);
++  ~ArcProfileResult();
++
++  std::string source_key;
++  Status status = Status::kSkipped;
++  // kFailed only.
++  ArcImportFailure failure = ArcImportFailure::kNone;
++  // The rac profile it went into. Empty when nothing went anywhere.
++  base::FilePath profile_path;
++  // True if the sign-ins step made that profile for this import.
++  bool new_profile = false;
++  ArcImportCounts counts;
++  History history = History::kNotRequested;
++  // Arc's pinned extensions. Kept in the import record, never installed.
++  int pinned_extensions = 0;
++  // Until when this profile's part can be undone. Unset if nothing was
++  // written.
++  std::optional<base::Time> undo_until;
++};
++
++// Sent once, when everything has ended.
++struct ArcImportResult {
++  enum class Status {
++    kDone,
++    // Every checked profile was already imported, Arc has nothing new, and
++    // no history came over either.
++    kNothingNew,
++    // Nothing was changed anywhere: either nothing was written, or what was
++    // written was taken back.
++    kFailed,
++  };
++  using Failure = ArcImportFailure;
++
++  ArcImportResult();
++  ArcImportResult(const ArcImportResult&);
++  ArcImportResult& operator=(const ArcImportResult&);
++  ~ArcImportResult();
++
++  Status status = Status::kFailed;
++  Failure failure = ArcImportFailure::kNone;
++  // All profiles together.
++  ArcImportCounts counts;
++  std::vector<ArcProfileResult> profiles;
++  // Routing rules or the auto-archive setting were kept for later.
++  bool handoffs_saved = false;
++  int pinned_extensions = 0;
++  // Until when "Undo Arc import" works: the latest of the profiles'. Unset
++  // when nothing was written.
++  std::optional<base::Time> undo_until;
++};
++
++// For onboarding and Settings.
++struct ArcImportState {
++  // Null if this profile never received an Arc import.
++  std::optional<base::Time> last_import;
++  // Set while the newest import can still be undone.
++  std::optional<base::Time> undo_until;
++  // When the pre-import snapshot was taken, for "Your sidebar goes back to
++  // how it was on <date>".
++  std::optional<base::Time> undo_snapshot_time;
++};
++
++enum class ArcUndoResult {
++  kUndone,
++  // A page asked before closing and the user stayed, so its space stayed.
++  // Everything else was undone. Undo can be tried again.
++  kPartlyUndone,
++  // Another import, Undo, or restore is running. Nothing changed.
++  kBusy,
++  // The 7 days are over. Nothing changed.
++  kExpired,
++  // No import to undo. Nothing changed.
++  kNothingToUndo,
++  // The import record couldn't be read or saved. Nothing changed.
++  kFailed,
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_IMPORT_ARC_IMPORT_TYPES_H_

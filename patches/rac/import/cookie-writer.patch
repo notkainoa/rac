@@ -1,0 +1,2864 @@
+--- a/chrome/browser/rac/import/BUILD.gn
++++ b/chrome/browser/rac/import/BUILD.gn
+@@ -105,6 +105,44 @@ source_set("cookie_fixture_db") {
+   deps = [ "//sql:test_support" ]
+ }
+ 
++# Writes prepared cookies through network::mojom::CookieManager. No profile or
++# content dependency, so its tests don't need a browser.
++source_set("cookie_writer") {
++  sources = [
++    "cookie_writer.cc",
++    "cookie_writer.h",
++  ]
++  public_deps = [
++    "//base",
++    "//net",
++    "//url",
++  ]
++  deps = [
++    "//mojo/public/cpp/bindings",
++    "//services/network/public/mojom",
++  ]
++}
++
++# Picks the profile's cookie store, refuses incognito, guest and system
++# profiles, and applies the profile's cookie settings.
++source_set("cookie_writer_profile") {
++  sources = [
++    "cookie_writer_profile.cc",
++    "cookie_writer_profile.h",
++  ]
++  public_deps = [ ":cookie_writer" ]
++  deps = [
++    "//chrome/browser/content_settings:content_settings_factory",
++    "//chrome/browser/profiles:profile",
++    "//components/content_settings/core/browser:cookie_settings",
++    "//components/content_settings/core/common",
++    "//content/public/browser",
++    "//net",
++    "//services/network/public/mojom",
++    "//url",
++  ]
++}
++
+ if (is_mac) {
+   # Whether Arc is running, and a watcher that fires when it quits. Built with
+   # ARC, which the observer token's lifetime relies on.
+@@ -132,6 +170,7 @@ test("rac_import_unittests") {
+     "arc_source_root_unittest.cc",
+     "cookie_db_rows_unittest.cc",
+     "cookie_test_vectors.inc",
++    "cookie_writer_unittest.cc",
+     "imported_cookie_crypto_unittest.cc",
+   ]
+   deps = [
+@@ -141,12 +180,22 @@ test("rac_import_unittests") {
+     ":cookie_crypto",
+     ":cookie_db",
+     ":cookie_fixture_db",
++    ":cookie_writer",
+     "//base",
+-    "//base/test:run_all_unittests",
+     "//base/test:test_support",
+     "//chrome/browser/rac/dev:buildflags",
+     "//chrome/browser/rac/spaces",
+     "//crypto",
++
++    # cookie_writer_unittest.cc talks to a real network::CookieManager over a
++    # mojo pipe, so the runner has to initialize mojo.
++    "//mojo/core/test:run_all_unittests",
++    "//mojo/public/cpp/bindings",
++    "//net",
++    "//net:test_support",
++    "//services/network:network_service",
++    "//services/network:test_support",
++    "//services/network/public/mojom",
+     "//sql",
+     "//sql:test_support",
+     "//testing/gmock",
+@@ -164,3 +213,39 @@ test("rac_import_unittests") {
+     deps += [ ":arc_app_state" ]
+   }
+ }
++
++# The profile getter's and settings filter's tests need TestingProfile, so they
++# link most of //chrome and use Chrome's unit test launcher, like
++# //chrome/browser/rac/pip:rac_pip_tests. Kept apart so rac_import_unittests
++# stays small.
++source_set("cookie_writer_profile_unittests") {
++  testonly = true
++  sources = [ "cookie_writer_profile_unittest.cc" ]
++  deps = [
++    ":cookie_writer_profile",
++    "//base",
++    "//base/test:test_support",
++    "//chrome/browser/content_settings:content_settings_factory",
++    "//chrome/browser/profiles:profile",
++    "//chrome/test:test_support",
++    "//components/content_settings/core/browser:cookie_settings",
++    "//components/content_settings/core/common",
++    "//components/prefs",
++    "//content/public/browser",
++    "//content/test:test_support",
++    "//net",
++    "//services/network/public/mojom",
++    "//testing/gtest",
++    "//url",
++  ]
++}
++
++# Build with `autoninja -C out/Default
++# chrome/browser/rac/import:rac_import_profile_unittests`.
++test("rac_import_profile_unittests") {
++  deps = [
++    ":cookie_writer_profile_unittests",
++    "//chrome/test:test_support_unit",
++  ]
++  data_deps = [ "//chrome:packed_resources" ]
++}
+--- /dev/null
++++ b/chrome/browser/rac/import/DEPS
+@@ -0,0 +1,13 @@
++specific_include_rules = {
++  # The test drives a real in-process CookieManager, which isn't public API,
++  # and fakes built on network::TestCookieManager.
++  "cookie_writer_unittest\.cc": [
++    "+services/network/cookie_manager.h",
++    "+services/network/session_cleanup_cookie_store.h",
++    "+services/network/test/test_cookie_manager.h",
++  ],
++  "cookie_writer_profile_unittest\.cc": [
++    "+chrome/test/base/testing_profile.h",
++    "+content/public/test/browser_task_environment.h",
++  ],
++}
+--- /dev/null
++++ b/chrome/browser/rac/import/cookie_writer.cc
+@@ -0,0 +1,642 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/cookie_writer.h"
++
++#include <algorithm>
++#include <map>
++#include <memory>
++#include <numeric>
++#include <optional>
++#include <set>
++#include <string_view>
++#include <utility>
++
++#include "base/check.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "mojo/public/cpp/bindings/callback_helpers.h"
++#include "net/base/schemeful_site.h"
++#include "net/cookies/cookie_access_result.h"
++#include "net/cookies/cookie_inclusion_status.h"
++#include "net/cookies/cookie_options.h"
++#include "net/cookies/cookie_partition_key.h"
++#include "net/cookies/unique_cookie_key.h"
++#include "services/network/public/mojom/cookie_manager.mojom.h"
++
++namespace rac::import {
++
++namespace {
++
++using ExclusionReason = net::CookieInclusionStatus::ExclusionReason;
++
++constexpr int kMaxPort = 65535;
++
++// A browser-initiated import is trusted: it may write HttpOnly cookies and
++// every SameSite mode. Same options as ProfileAuthData and FloatingSsoService.
++net::CookieOptions ImportCookieOptions() {
++  net::CookieOptions options;
++  options.set_include_httponly();
++  options.set_same_site_cookie_context(
++      net::CookieOptions::SameSiteCookieContext::MakeInclusive());
++  options.set_do_not_update_access_time();
++  return options;
++}
++
++// The CookieManager mojom traits hit NOTREACHED() on an enum value they don't
++// know, which would crash the browser while sending the cookie. The source DB
++// can hold such values (SameSite 3 was the retired "Extended" mode), so map
++// anything unknown to the default. SQLitePersistentCookieStore does the same
++// for SameSite and the source scheme when it loads a row.
++net::CookieSameSite KnownSameSite(net::CookieSameSite value) {
++  switch (value) {
++    case net::CookieSameSite::UNSPECIFIED:
++    case net::CookieSameSite::NO_RESTRICTION:
++    case net::CookieSameSite::LAX_MODE:
++    case net::CookieSameSite::STRICT_MODE:
++      return value;
++  }
++  return net::CookieSameSite::UNSPECIFIED;
++}
++
++net::CookiePriority KnownPriority(net::CookiePriority value) {
++  switch (value) {
++    case net::COOKIE_PRIORITY_LOW:
++    case net::COOKIE_PRIORITY_MEDIUM:
++    case net::COOKIE_PRIORITY_HIGH:
++      return value;
++  }
++  return net::COOKIE_PRIORITY_DEFAULT;
++}
++
++// Never sent to the store as is (CreateSanitizedCookie derives the cookie's
++// source scheme from the URL), but SourceUrlFor() reads it.
++net::CookieSourceScheme KnownSourceScheme(net::CookieSourceScheme value) {
++  switch (value) {
++    case net::CookieSourceScheme::kUnset:
++    case net::CookieSourceScheme::kNonSecure:
++    case net::CookieSourceScheme::kSecure:
++      return value;
++  }
++  return net::CookieSourceScheme::kUnset;
++}
++
++// Maps CreateSanitizedCookie's exclusion reasons to one report bucket. The
++// order matters: a `__Host-` cookie with a Domain is a prefix failure first.
++CookieRejectReason ReasonForSanitizeFailure(
++    const net::CookieInclusionStatus& status) {
++  if (status.HasExclusionReason(ExclusionReason::EXCLUDE_INVALID_PREFIX)) {
++    return CookieRejectReason::kInvalidPrefix;
++  }
++  if (status.HasExclusionReason(ExclusionReason::EXCLUDE_INVALID_PARTITIONED)) {
++    return CookieRejectReason::kPartitionedInsecure;
++  }
++  if (status.HasExclusionReason(ExclusionReason::EXCLUDE_INVALID_DOMAIN) ||
++      status.HasExclusionReason(ExclusionReason::EXCLUDE_DOMAIN_NON_ASCII)) {
++    return CookieRejectReason::kInvalidDomain;
++  }
++  if (status.HasExclusionReason(ExclusionReason::EXCLUDE_INVALID_PATH)) {
++    return CookieRejectReason::kInvalidPath;
++  }
++  if (status.HasExclusionReason(
++          ExclusionReason::EXCLUDE_DISALLOWED_CHARACTER) ||
++      status.HasExclusionReason(
++          ExclusionReason::EXCLUDE_NAME_VALUE_PAIR_EXCEEDS_MAX_SIZE) ||
++      status.HasExclusionReason(
++          ExclusionReason::EXCLUDE_ATTRIBUTE_VALUE_EXCEEDS_MAX_SIZE) ||
++      status.HasExclusionReason(
++          ExclusionReason::EXCLUDE_AMBIGUOUS_SERIALIZATION) ||
++      status.HasExclusionReason(ExclusionReason::EXCLUDE_NO_COOKIE_CONTENT)) {
++    return CookieRejectReason::kInvalidNameOrValue;
++  }
++  return CookieRejectReason::kNonCanonical;
++}
++
++CookieRejectReason ReasonForStoreFailure(
++    const net::CookieInclusionStatus& status) {
++  if (status.HasExclusionReason(
++          ExclusionReason::EXCLUDE_SAMESITE_NONE_INSECURE)) {
++    return CookieRejectReason::kSameSiteNoneInsecure;
++  }
++  if (status.HasExclusionReason(ExclusionReason::EXCLUDE_OVERWRITE_SECURE) ||
++      status.HasExclusionReason(
++          ExclusionReason::EXCLUDE_OVERWRITE_HTTP_ONLY)) {
++    return CookieRejectReason::kWouldOverwriteProtected;
++  }
++  return CookieRejectReason::kStoreRefused;
++}
++
++}  // namespace
++
++ImportedCookie::ImportedCookie() = default;
++ImportedCookie::ImportedCookie(const ImportedCookie&) = default;
++ImportedCookie::ImportedCookie(ImportedCookie&&) = default;
++ImportedCookie& ImportedCookie::operator=(const ImportedCookie&) = default;
++ImportedCookie& ImportedCookie::operator=(ImportedCookie&&) = default;
++ImportedCookie::~ImportedCookie() = default;
++
++size_t CookieWriteReport::rejected_total() const {
++  return std::accumulate(rejected.begin(), rejected.end(), size_t{0});
++}
++
++namespace internal {
++
++PrepareResult::PrepareResult() = default;
++PrepareResult::PrepareResult(PrepareResult&&) = default;
++PrepareResult& PrepareResult::operator=(PrepareResult&&) = default;
++PrepareResult::~PrepareResult() = default;
++
++// Keeps the source scheme and port. The host check means a malformed
++// `host_key` such as "a.test@b.test" can't plant a cookie on another site.
++std::optional<GURL> SourceUrlFor(const ImportedCookie& in) {
++  std::string_view host = in.host_key;
++  if (host.starts_with('.')) {
++    host.remove_prefix(1);
++  }
++  if (host.empty()) {
++    return std::nullopt;
++  }
++
++  const bool https =
++      in.secure || in.source_scheme == net::CookieSourceScheme::kSecure;
++  const int default_port = https ? 443 : 80;
++  std::string port;
++  if (in.source_port > 0 && in.source_port <= kMaxPort &&
++      in.source_port != default_port) {
++    port = base::StrCat({":", base::NumberToString(in.source_port)});
++  }
++
++  GURL url(base::StrCat({https ? "https" : "http", "://", host, port, "/"}));
++  if (!url.is_valid() || !url.has_host() || url.has_username() ||
++      url.has_password() ||
++      !base::EqualsCaseInsensitiveASCII(url.host(), host)) {
++    return std::nullopt;
++  }
++  return url;
++}
++
++PrepareResult PrepareCookies(std::vector<ImportedCookie> cookies,
++                             base::Time now) {
++  PrepareResult result;
++  result.ready.reserve(cookies.size());
++  CookieWriteReport& report = result.report;
++
++  for (ImportedCookie& in : cookies) {
++    ++report.total;
++
++    in.same_site = KnownSameSite(in.same_site);
++    in.priority = KnownPriority(in.priority);
++    in.source_scheme = KnownSourceScheme(in.source_scheme);
++
++    if (!in.expiry.is_null() && in.expiry <= now) {
++      ++report.skipped_expired;
++      continue;
++    }
++
++    std::optional<net::CookiePartitionKey> partition_key;
++    if (!in.partition_key.empty()) {
++      // Strict parsing: the string must be exactly a serialized schemeful
++      // site, as Chromium writes it to `top_frame_site_key`.
++      auto parsed = net::CookiePartitionKey::FromStorage(
++          in.partition_key, in.has_cross_site_ancestor);
++      if (!parsed.has_value() || !parsed->has_value()) {
++        report.AddRejected(CookieRejectReason::kInvalidPartitionKey);
++        continue;
++      }
++      partition_key = std::move(*parsed);
++    }
++
++    std::optional<GURL> source_url = SourceUrlFor(in);
++    if (!source_url) {
++      report.AddRejected(CookieRejectReason::kInvalidDomain);
++      continue;
++    }
++
++    // Keep the source's times but never in the future, and never with a last
++    // access before creation. CreateSanitizedCookie refuses a non-null last
++    // access with a null creation, so creation is always filled in.
++    const base::Time creation =
++        (in.creation.is_null() || in.creation > now) ? now : in.creation;
++    const base::Time last_access =
++        in.last_access.is_null()
++            ? creation
++            : std::clamp(in.last_access, creation, now);
++
++    // A host-only cookie has no Domain attribute; a domain cookie's
++    // `host_key` is its Domain attribute.
++    const std::string domain_attribute =
++        in.host_key.starts_with('.') ? in.host_key : std::string();
++
++    net::CookieInclusionStatus status;
++    std::unique_ptr<net::CanonicalCookie> cookie =
++        net::CanonicalCookie::CreateSanitizedCookie(
++            *source_url, in.name, in.value, domain_attribute, in.path,
++            creation, in.expiry, last_access, in.secure, in.http_only,
++            in.same_site, in.priority, std::move(partition_key), &status);
++    if (!cookie) {
++      report.AddRejected(ReasonForSanitizeFailure(status));
++      continue;
++    }
++    // CreateSanitizedCookie only DCHECKs this.
++    if (!cookie->IsCanonical()) {
++      report.AddRejected(CookieRejectReason::kNonCanonical);
++      continue;
++    }
++    // CreateSanitizedCookie quietly turns a domain cookie on a public suffix
++    // (".test", ".co.uk") or an IP address into a host-only cookie. Only
++    // import cookies whose domain survives the conversion unchanged.
++    if (cookie->Domain() != base::ToLowerASCII(in.host_key)) {
++      report.AddRejected(CookieRejectReason::kInvalidDomain);
++      continue;
++    }
++    // A key without a cross-site ancestor means the top-level site set the
++    // cookie for itself, so the cookie's own site has to be that site.
++    // Otherwise the store accepts a cookie that no request can ever read.
++    if (cookie->IsPartitioned() && !cookie->PartitionKey()->IsThirdParty() &&
++        net::SchemefulSite(*source_url) != cookie->PartitionKey()->site()) {
++      report.AddRejected(CookieRejectReason::kInvalidPartitionKey);
++      continue;
++    }
++    // CreateSanitizedCookie caps expiry at creation + 400 days, which can put
++    // an old cookie in the past. The store would accept it and drop it
++    // silently, so count it here instead.
++    if (cookie->IsExpired(now)) {
++      ++report.skipped_expired;
++      continue;
++    }
++
++    result.ready.push_back(
++        {std::move(*cookie), std::move(source_url).value()});
++  }
++
++  std::ranges::stable_sort(result.ready, {}, [](const PreparedCookie& p) {
++    return p.cookie.CreationDate();
++  });
++
++  // Rows that differ only in source scheme or port are one cookie to the
++  // store, which would keep whichever came last and still count both as set.
++  // Keep the newest; on a tie, the one listed later. Cookies already in rac
++  // are compared later, in SkipCookiesNotNewerThan().
++  std::set<net::UniqueCookieKey> seen;
++  std::vector<PreparedCookie> kept;
++  kept.reserve(result.ready.size());
++  for (auto it = result.ready.rbegin(); it != result.ready.rend(); ++it) {
++    if (!seen.insert(it->cookie.LegacyUniqueKey()).second) {
++      ++report.skipped_duplicate;
++      continue;
++    }
++    kept.push_back(std::move(*it));
++  }
++  // Back to oldest first, so the order is the same on every run.
++  std::ranges::reverse(kept);
++  result.ready = std::move(kept);
++  return result;
++}
++
++PrepareResult SkipCookiesNotNewerThan(
++    PrepareResult prepared,
++    std::vector<net::CanonicalCookie> existing) {
++  // The same key the dedupe above uses. With scheme- and port-bound cookies
++  // off (the default in 156) it's also the key the store replaces by; with
++  // them on it's coarser, which only ever keeps more of rac's cookies.
++  std::map<net::UniqueCookieKey, base::Time> newest_in_rac;
++  for (const net::CanonicalCookie& cookie : existing) {
++    auto [it, inserted] =
++        newest_in_rac.try_emplace(cookie.LegacyUniqueKey(),
++                                  cookie.CreationDate());
++    if (!inserted) {
++      it->second = std::max(it->second, cookie.CreationDate());
++    }
++  }
++  // rac's cookie values aren't needed past this point.
++  existing.clear();
++  existing.shrink_to_fit();
++
++  std::vector<PreparedCookie> kept;
++  kept.reserve(prepared.ready.size());
++  for (PreparedCookie& candidate : prepared.ready) {
++    auto it = newest_in_rac.find(candidate.cookie.LegacyUniqueKey());
++    // A tie keeps rac's: it's the cookie the user's sites see today.
++    if (it != newest_in_rac.end() &&
++        it->second >= candidate.cookie.CreationDate()) {
++      ++prepared.report.skipped_newer_in_rac;
++      continue;
++    }
++    kept.push_back(std::move(candidate));
++  }
++  prepared.ready = std::move(kept);
++  return prepared;
++}
++
++}  // namespace internal
++
++// static
++std::unique_ptr<CookieWriter> CookieWriter::CreateForTesting(
++    network::mojom::CookieManager* cookie_manager,
++    CookieSettingsFilter settings_filter) {
++  CHECK(cookie_manager);
++  if (!settings_filter) {
++    settings_filter = base::BindRepeating(
++        [](const net::CanonicalCookie&, const GURL&) {
++          return CookieSettingsDecision::kAllow;
++        });
++  }
++  return std::make_unique<CookieWriter>(
++      base::BindRepeating(
++          [](network::mojom::CookieManager* manager) { return manager; },
++          base::Unretained(cookie_manager)),
++      std::move(settings_filter));
++}
++
++CookieWriter::CookieWriter(CookieManagerGetter get_cookie_manager,
++                           CookieSettingsFilter settings_filter)
++    : get_cookie_manager_(std::move(get_cookie_manager)),
++      settings_filter_(std::move(settings_filter)) {
++  CHECK(get_cookie_manager_);
++  CHECK(settings_filter_);
++}
++
++CookieWriter::~CookieWriter() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++}
++
++void CookieWriter::Write(std::vector<ImportedCookie> cookies,
++                         DoneCallback done) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  // `done_` is empty again once it has run, so it can't guard this.
++  CHECK(!started_);
++  started_ = true;
++  CHECK(done);
++  done_ = std::move(done);
++
++  // Parsing and canonicalizing a few thousand cookies takes long enough to
++  // drop frames, so keep it off the UI thread.
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE,
++      {base::TaskPriority::USER_VISIBLE,
++       base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
++      base::BindOnce(&internal::PrepareCookies, std::move(cookies),
++                     base::Time::Now()),
++      base::BindOnce(&CookieWriter::OnPrepared,
++                     weak_factory_.GetWeakPtr()));
++}
++
++void CookieWriter::OnPrepared(internal::PrepareResult result) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  report_ = result.report;
++  pending_ = std::move(result.ready);
++  next_ = 0;
++  if (pending_.empty()) {
++    Finish();
++    return;
++  }
++  ReadExistingCookies();
++}
++
++void CookieWriter::ReadExistingCookies() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  network::mojom::CookieManager* cookie_manager = get_cookie_manager_.Run();
++  if (!cookie_manager) {
++    FailUnsentCookies();
++    return;
++  }
++  // One read of every cookie in the profile, partitioned ones included. The
++  // store holds at most a few thousand, so this is one round trip; a
++  // GetCookieList() per host would be hundreds, and it matches by URL rather
++  // than by exact name, domain, path and partition key.
++  cookie_manager->GetAllCookies(mojo::WrapCallbackWithDropHandler(
++      base::BindOnce(&CookieWriter::OnExistingCookies,
++                     weak_factory_.GetWeakPtr()),
++      base::BindOnce(&CookieWriter::OnExistingCookiesDropped,
++                     weak_factory_.GetWeakPtr())));
++}
++
++void CookieWriter::OnExistingCookies(
++    const std::vector<net::CanonicalCookie>& existing) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  internal::PrepareResult prepared;
++  prepared.ready = std::move(pending_);
++  prepared.report = report_;
++  pending_.clear();
++  // Building the key map and checking a few thousand cookies against it is
++  // kept off the UI thread too. `existing` is copied into the task.
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE,
++      {base::TaskPriority::USER_VISIBLE,
++       base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
++      base::BindOnce(&internal::SkipCookiesNotNewerThan, std::move(prepared),
++                     existing),
++      base::BindOnce(&CookieWriter::OnComparedWithExisting,
++                     weak_factory_.GetWeakPtr()));
++}
++
++void CookieWriter::OnExistingCookiesDropped() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  // The pipe closed or the network service restarted. This can run while the
++  // remote is being destroyed, so only post. Without the read the writer
++  // can't tell which imports are older than rac's, so a second loss fails
++  // the import rather than overwrite blindly.
++  if (read_retried_) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&CookieWriter::FailUnsentCookies,
++                                  weak_factory_.GetWeakPtr()));
++    return;
++  }
++  read_retried_ = true;
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&CookieWriter::ReadExistingCookies,
++                                weak_factory_.GetWeakPtr()));
++}
++
++void CookieWriter::OnComparedWithExisting(internal::PrepareResult result) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  report_ = result.report;
++  pending_ = std::move(result.ready);
++  next_ = 0;
++  ContinueOrFinish();
++}
++
++void CookieWriter::FailUnsentCookies() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  DCHECK_EQ(in_flight_, 0u);
++  for (size_t i = 0; i < retry_.size(); ++i) {
++    report_.AddRejected(CookieRejectReason::kStoreRefused);
++  }
++  retry_.clear();
++  for (; next_ < pending_.size(); ++next_) {
++    report_.AddRejected(CookieRejectReason::kStoreRefused);
++  }
++  Finish();
++}
++
++void CookieWriter::PostContinueOrFinish() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  // Post rather than recurse, so the UI thread gets a turn between batches
++  // and a synchronous fake or a dying pipe can't re-enter SendNextBatch().
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&CookieWriter::ContinueOrFinish,
++                                weak_factory_.GetWeakPtr()));
++}
++
++void CookieWriter::ContinueOrFinish() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!retry_.empty() || next_ < pending_.size()) {
++    SendNextBatch();
++  } else {
++    Finish();
++  }
++}
++
++void CookieWriter::SendNextBatch() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  DCHECK_EQ(in_flight_, 0u);
++  DCHECK(dropped_.empty());
++
++  network::mojom::CookieManager* cookie_manager = get_cookie_manager_.Run();
++  if (!cookie_manager) {
++    FailUnsentCookies();
++    return;
++  }
++
++  // A batch is either a one-time resend of calls the last batch lost to a
++  // dropped connection, or the next new cookies that rac's cookie settings
++  // allow. Resent cookies were already checked.
++  std::vector<size_t> batch;
++  retrying_ = !retry_.empty();
++  if (retrying_) {
++    batch.swap(retry_);
++  } else {
++    // Settings are read now, not at the start, so a change the user makes
++    // mid-import applies to every batch not yet sent. At most kBatchSize
++    // cookies are checked per task.
++    const size_t end = std::min(next_ + kBatchSize, pending_.size());
++    batch.reserve(end - next_);
++    for (; next_ < end; ++next_) {
++      const internal::PreparedCookie& prepared = pending_[next_];
++      switch (settings_filter_.Run(prepared.cookie, prepared.source_url)) {
++        case CookieSettingsDecision::kAllow:
++          batch.push_back(next_);
++          break;
++        case CookieSettingsDecision::kBlock:
++          ++report_.skipped_blocked_by_settings;
++          break;
++        case CookieSettingsDecision::kClearOnExit:
++          ++report_.skipped_clear_on_exit;
++          break;
++      }
++    }
++    if (batch.empty()) {
++      // Every cookie in this stretch was skipped. Move on in a new task, as
++      // after a batch.
++      PostContinueOrFinish();
++      return;
++    }
++  }
++
++  const net::CookieOptions options = ImportCookieOptions();
++  // Set before sending: a fake manager may answer, or a dead pipe may drop the
++  // callback, synchronously.
++  in_flight_ = batch.size();
++  for (size_t index : batch) {
++    const internal::PreparedCookie& prepared = pending_[index];
++    // A lost connection destroys the callback without running it, which
++    // calls OnCookieDropped() instead. That can happen synchronously while
++    // the pipe is torn down, so neither path may finish the import directly.
++    cookie_manager->SetCanonicalCookie(
++        prepared.cookie, prepared.source_url, options,
++        mojo::WrapCallbackWithDropHandler(
++            base::BindOnce(&CookieWriter::OnCookieSet,
++                           weak_factory_.GetWeakPtr()),
++            base::BindOnce(&CookieWriter::OnCookieDropped,
++                           weak_factory_.GetWeakPtr(), index)));
++  }
++}
++
++void CookieWriter::OnCookieSet(net::CookieAccessResult result) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (result.status.IsInclude()) {
++    ++report_.set;
++  } else {
++    report_.AddRejected(ReasonForStoreFailure(result.status));
++  }
++  OnBatchItemDone();
++}
++
++void CookieWriter::OnCookieDropped(size_t index) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  // The network service restarted or the pipe closed. Resend once, on
++  // whatever manager the getter returns next; a second loss is final.
++  if (retrying_) {
++    report_.AddRejected(CookieRejectReason::kStoreRefused);
++  } else {
++    dropped_.push_back(index);
++  }
++  OnBatchItemDone();
++}
++
++void CookieWriter::OnBatchItemDone() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  DCHECK_GT(in_flight_, 0u);
++  if (--in_flight_ != 0) {
++    return;
++  }
++  retry_ = std::move(dropped_);
++  dropped_.clear();
++  PostContinueOrFinish();
++}
++
++void CookieWriter::Finish() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  // Drop the cookie values as soon as they're no longer needed.
++  pending_.clear();
++  pending_.shrink_to_fit();
++
++  DCHECK_EQ(report_.total, report_.set + report_.skipped_total() +
++                               report_.rejected_total());
++  // Counts only. Never log names, values or hosts.
++  VLOG(1) << "rac import: cookies total=" << report_.total
++          << " set=" << report_.set
++          << " skipped_expired=" << report_.skipped_expired
++          << " skipped_duplicate=" << report_.skipped_duplicate
++          << " skipped_newer_in_rac=" << report_.skipped_newer_in_rac
++          << " skipped_blocked_by_settings="
++          << report_.skipped_blocked_by_settings
++          << " skipped_clear_on_exit=" << report_.skipped_clear_on_exit
++          << " rejected=" << report_.rejected_total();
++
++  network::mojom::CookieManager* cookie_manager =
++      report_.set > 0 ? get_cookie_manager_.Run() : nullptr;
++  if (!cookie_manager) {
++    OnFlushed();
++    return;
++  }
++  // Commit to disk now instead of within the store's usual 30 seconds, so a
++  // crash right after import doesn't lose it. If the pipe drops first, the
++  // callback runs anyway, possibly while the remote is being destroyed.
++  cookie_manager->FlushCookieStore(mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++      base::BindOnce(&CookieWriter::OnFlushed, weak_factory_.GetWeakPtr())));
++}
++
++void CookieWriter::OnFlushed() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  // Always a fresh task: this can run from inside a remote's destructor during
++  // profile teardown or a network service restart, and `done` must not.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(&CookieWriter::RunDone, weak_factory_.GetWeakPtr()));
++}
++
++void CookieWriter::RunDone() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  // Copy first: `done_` may delete this writer, and `report_` with it.
++  const CookieWriteReport report = report_;
++  std::move(done_).Run(report);
++}
++
++}  // namespace rac::import
+--- /dev/null
++++ b/chrome/browser/rac/import/cookie_writer.h
+@@ -0,0 +1,275 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_IMPORT_COOKIE_WRITER_H_
++#define CHROME_BROWSER_RAC_IMPORT_COOKIE_WRITER_H_
++
++#include <array>
++#include <cstddef>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++#include "base/sequence_checker.h"
++#include "base/time/time.h"
++#include "net/cookies/canonical_cookie.h"
++#include "net/cookies/cookie_constants.h"
++#include "url/gurl.h"
++
++namespace net {
++struct CookieAccessResult;
++}  // namespace net
++
++namespace network::mojom {
++class CookieManager;
++}  // namespace network::mojom
++
++namespace rac::import {
++
++// One cookie as the source reader hands it over. Field meanings match
++// Chromium's `cookies` table; the reader has already decrypted the value and
++// converted times from Windows-epoch microseconds to base::Time.
++struct ImportedCookie {
++  ImportedCookie();
++  ImportedCookie(const ImportedCookie&);
++  ImportedCookie(ImportedCookie&&);
++  ImportedCookie& operator=(const ImportedCookie&);
++  ImportedCookie& operator=(ImportedCookie&&);
++  ~ImportedCookie();
++
++  std::string name;
++  std::string value;
++  // `host_key`: "example.com" for a host-only cookie, ".example.com" for a
++  // domain cookie, "192.0.2.1" or "[2001:db8::1]" for an IP host.
++  std::string host_key;
++  std::string path;
++  base::Time creation;
++  // Null means a session cookie.
++  base::Time expiry;
++  base::Time last_access;
++  bool secure = false;
++  bool http_only = false;
++  // The three enums below may hold any value the source DB had, including
++  // ones this Chromium doesn't know. The writer maps unknown values to
++  // UNSPECIFIED, MEDIUM and kUnset.
++  net::CookieSameSite same_site = net::CookieSameSite::UNSPECIFIED;
++  net::CookiePriority priority = net::COOKIE_PRIORITY_DEFAULT;
++  net::CookieSourceScheme source_scheme = net::CookieSourceScheme::kUnset;
++  // -1 (url::PORT_UNSPECIFIED) when unknown.
++  int source_port = -1;
++  // `top_frame_site_key`, such as "https://example.com". Empty means the
++  // cookie is unpartitioned.
++  std::string partition_key;
++  // `has_cross_site_ancestor`. Only read when `partition_key` is set.
++  bool has_cross_site_ancestor = true;
++};
++
++// Why a cookie was not written. Reported as counts only.
++enum class CookieRejectReason {
++  // `partition_key` is set but is not a serialized schemeful site, or it has
++  // no cross-site ancestor and names a different site than the cookie's host.
++  kInvalidPartitionKey = 0,
++  // Breaks a `__Host-`, `__Secure-`, `__Http-` or `__Host-Http-` rule.
++  kInvalidPrefix,
++  // Partitioned without Secure.
++  kPartitionedInsecure,
++  // `host_key` is empty, a public suffix, malformed, or names another host.
++  kInvalidDomain,
++  kInvalidPath,
++  // Disallowed characters, over the size limits, or an ambiguous
++  // empty-name cookie.
++  kInvalidNameOrValue,
++  // Built, but CanonicalCookie::IsCanonical() still failed.
++  kNonCanonical,
++  // The store refused SameSite=None without Secure.
++  kSameSiteNoneInsecure,
++  // The store refused to replace an existing Secure or HttpOnly cookie.
++  kWouldOverwriteProtected,
++  // Any other store refusal, a missing cookie manager, or a call dropped
++  // twice by a lost network service connection. Losing the read of rac's
++  // existing cookies twice fails every cookie this way.
++  kStoreRefused,
++  kMaxValue = kStoreRefused,
++};
++
++struct CookieWriteReport {
++  size_t total = 0;
++  // Accepted by the cookie store. The store can still evict some later if the
++  // profile goes over its per-domain or global cookie limits.
++  size_t set = 0;
++  // Expired on arrival, or expired once capped to 400 days after creation.
++  size_t skipped_expired = 0;
++  // Another row had the same name, domain, path and partition key and a
++  // newer (or equal, later-listed) creation time.
++  size_t skipped_duplicate = 0;
++  // rac already had a cookie with the same name, domain, path and partition
++  // key, created at the same time or later. rac's is kept.
++  size_t skipped_newer_in_rac = 0;
++  // rac's cookie settings block the cookie's site, or block all cookies by
++  // default.
++  size_t skipped_blocked_by_settings = 0;
++  // rac's cookie settings clear the cookie's site, or every site, on exit.
++  size_t skipped_clear_on_exit = 0;
++  std::array<size_t, static_cast<size_t>(CookieRejectReason::kMaxValue) + 1>
++      rejected = {};
++
++  size_t rejected_count(CookieRejectReason reason) const {
++    return rejected[static_cast<size_t>(reason)];
++  }
++  size_t rejected_total() const;
++  size_t skipped_total() const {
++    return skipped_expired + skipped_duplicate + skipped_newer_in_rac +
++           skipped_blocked_by_settings + skipped_clear_on_exit;
++  }
++  void AddRejected(CookieRejectReason reason) {
++    ++rejected[static_cast<size_t>(reason)];
++  }
++};
++
++// What the target profile's cookie settings say about one imported cookie.
++enum class CookieSettingsDecision {
++  kAllow,
++  // Counted as `skipped_blocked_by_settings`.
++  kBlock,
++  // Counted as `skipped_clear_on_exit`.
++  kClearOnExit,
++};
++
++// Asks the target profile's cookie settings about `cookie`, which the writer
++// would set from `source_url`. Runs on the UI thread, in the task that sends
++// the cookie's batch, so it sees the settings as they are then. Must not
++// re-enter the writer. CookieSettingsFilterForImport() builds the real one.
++using CookieSettingsFilter =
++    base::RepeatingCallback<CookieSettingsDecision(
++        const net::CanonicalCookie& cookie,
++        const GURL& source_url)>;
++
++namespace internal {
++
++struct PreparedCookie {
++  net::CanonicalCookie cookie;
++  GURL source_url;
++};
++
++struct PrepareResult {
++  PrepareResult();
++  PrepareResult(PrepareResult&&);
++  PrepareResult& operator=(PrepareResult&&);
++  ~PrepareResult();
++
++  // Oldest first, with no two sharing a name, domain, path and partition key.
++  std::vector<PreparedCookie> ready;
++  // PrepareCookies() fills in `total`, `skipped_expired`, `skipped_duplicate`
++  // and the pre-store rejections; SkipCookiesNotNewerThan() adds
++  // `skipped_newer_in_rac`.
++  CookieWriteReport report;
++};
++
++// Validates and converts `cookies`. Pure and thread-safe; runs on the thread
++// pool. Exposed for tests.
++PrepareResult PrepareCookies(std::vector<ImportedCookie> cookies,
++                             base::Time now);
++
++// Drops every cookie in `prepared.ready` that matches a cookie in `existing`
++// by LegacyUniqueKey() (name, domain, path, partition key) when that existing
++// cookie was created at the same time or later, and counts it as
++// `skipped_newer_in_rac`. Keeps the order of the rest. Pure and thread-safe;
++// runs on the thread pool. Exposed for tests.
++PrepareResult SkipCookiesNotNewerThan(
++    PrepareResult prepared,
++    std::vector<net::CanonicalCookie> existing);
++
++// Rebuilds the URL `cookie` could have come from. Returns nullopt unless the
++// URL's host is exactly the cookie's host. Exposed for tests, since later
++// checks in PrepareCookies() reject the same inputs.
++std::optional<GURL> SourceUrlFor(const ImportedCookie& cookie);
++
++}  // namespace internal
++
++// Writes imported cookies into one profile's cookie store through the public
++// CookieManager mojo interface. Lives on the UI thread. Deleting the writer
++// cancels the import; `done` then never runs.
++//
++// In order: validate (thread pool), read rac's cookies once with
++// GetAllCookies() and drop imports that aren't newer (thread pool), then send
++// in batches, asking `settings_filter` about each cookie just before its batch
++// goes out.
++class CookieWriter {
++ public:
++  // Called before every batch, so a network service restart is picked up.
++  // May return null, which fails the rest of the import.
++  using CookieManagerGetter =
++      base::RepeatingCallback<network::mojom::CookieManager*()>;
++  using DoneCallback = base::OnceCallback<void(const CookieWriteReport&)>;
++
++  // How many SetCanonicalCookie calls are in flight at once. The writer waits
++  // for a whole batch to be acknowledged before sending the next.
++  static constexpr size_t kBatchSize = 250;
++
++  // Always writes to `cookie_manager`, which must outlive the writer. A null
++  // `settings_filter` allows every cookie. Real callers use
++  // CreateCookieWriterForImport(), which passes the profile's getter and
++  // filter.
++  static std::unique_ptr<CookieWriter> CreateForTesting(
++      network::mojom::CookieManager* cookie_manager,
++      CookieSettingsFilter settings_filter = CookieSettingsFilter());
++
++  // Both must be non-null.
++  CookieWriter(CookieManagerGetter get_cookie_manager,
++               CookieSettingsFilter settings_filter);
++  CookieWriter(const CookieWriter&) = delete;
++  CookieWriter& operator=(const CookieWriter&) = delete;
++  ~CookieWriter();
++
++  // Call once. `done` always runs in its own task, never from inside Write()
++  // or from a mojo pipe being torn down, and may delete the writer.
++  void Write(std::vector<ImportedCookie> cookies, DoneCallback done);
++
++ private:
++  void OnPrepared(internal::PrepareResult result);
++  void ReadExistingCookies();
++  void OnExistingCookies(const std::vector<net::CanonicalCookie>& existing);
++  void OnExistingCookiesDropped();
++  void OnComparedWithExisting(internal::PrepareResult result);
++  void FailUnsentCookies();
++  void PostContinueOrFinish();
++  void ContinueOrFinish();
++  void SendNextBatch();
++  void OnCookieSet(net::CookieAccessResult result);
++  void OnCookieDropped(size_t index);
++  void OnBatchItemDone();
++  void Finish();
++  void OnFlushed();
++  void RunDone();
++
++  CookieManagerGetter get_cookie_manager_;
++  CookieSettingsFilter settings_filter_;
++  bool started_ = false;
++  // Whether the read of rac's existing cookies was already lost once.
++  bool read_retried_ = false;
++  std::vector<internal::PreparedCookie> pending_;
++  // The next index in `pending_` that has never been checked against the
++  // settings filter or sent.
++  size_t next_ = 0;
++  size_t in_flight_ = 0;
++  // Whether the batch in flight is a resend of dropped calls.
++  bool retrying_ = false;
++  // Indexes in `pending_` whose calls the current batch lost to a dropped
++  // connection.
++  std::vector<size_t> dropped_;
++  // Indexes to resend, once, before any new cookies.
++  std::vector<size_t> retry_;
++  CookieWriteReport report_;
++  DoneCallback done_;
++
++  SEQUENCE_CHECKER(sequence_checker_);
++  base::WeakPtrFactory<CookieWriter> weak_factory_{this};
++};
++
++}  // namespace rac::import
++
++#endif  // CHROME_BROWSER_RAC_IMPORT_COOKIE_WRITER_H_
+--- /dev/null
++++ b/chrome/browser/rac/import/cookie_writer_profile.cc
+@@ -0,0 +1,137 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/cookie_writer_profile.h"
++
++#include <memory>
++#include <optional>
++#include <utility>
++
++#include "base/check.h"
++#include "base/functional/bind.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "chrome/browser/content_settings/cookie_settings_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/content_settings/core/browser/cookie_settings.h"
++#include "components/content_settings/core/common/content_settings.h"
++#include "components/content_settings/core/common/cookie_settings_base.h"
++#include "content/public/browser/storage_partition.h"
++#include "net/base/schemeful_site.h"
++#include "net/cookies/canonical_cookie.h"
++#include "net/cookies/cookie_partition_key.h"
++#include "net/cookies/cookie_setting_override.h"
++#include "net/cookies/site_for_cookies.h"
++#include "services/network/public/mojom/cookie_manager.mojom.h"
++#include "url/gurl.h"
++#include "url/origin.h"
++
++namespace rac::import {
++
++namespace {
++
++// Null for a destroyed, incognito, guest or system profile. Other storage
++// partitions (isolated apps, <webview>) are never written.
++network::mojom::CookieManager* GetCookieManagerForImport(
++    base::WeakPtr<Profile> weak_profile) {
++  Profile* profile = weak_profile.get();
++  if (!profile || !profile->IsRegularProfile()) {
++    return nullptr;
++  }
++  return profile->GetDefaultStoragePartition()
++      ->GetCookieManagerForBrowserProcess();
++}
++
++struct ImportCookieSettings {
++  base::WeakPtr<Profile> profile;
++  scoped_refptr<content_settings::CookieSettings> cookie_settings;
++  // ShouldDeleteCookieOnExit() wants the rule list built once, not per
++  // cookie.
++  ContentSettingsForOneType rules;
++};
++
++// Whether the profile would let the cookie's own site store it.
++bool IsAllowedForImport(const content_settings::CookieSettings& settings,
++                        const net::CanonicalCookie& cookie,
++                        const GURL& source_url) {
++  const std::optional<net::CookiePartitionKey>& partition_key =
++      cookie.PartitionKey();
++  // The partition key argument below only matters for nonce keys, which
++  // CookiePartitionKey::FromStorage() never returns, so it's left out.
++  if (partition_key && partition_key->IsThirdParty()) {
++    // Set by the cookie's site while embedded under the partition's site,
++    // and only ever readable there. Ask in that context. Third-party
++    // blocking alone leaves partitioned cookies allowed; a Block that
++    // applies to the site there doesn't. Same rule as the network service's
++    // CookieSettings::IsCookieAllowed().
++    content_settings::CookieSettingsBase::CookieSettingWithMetadata setting;
++    const bool full_access = settings.IsFullCookieAccessAllowed(
++        source_url, net::SiteForCookies(),
++        url::Origin::Create(partition_key->site().GetURL()),
++        net::CookieSettingOverrides(), /*cookie_partition_key=*/std::nullopt,
++        &setting);
++    return full_access || setting.allow_partitioned_cookies();
++  }
++  // Unpartitioned, or partitioned by its own site: first-party. The original
++  // context is unknown, and the user's site exceptions and default are what
++  // decide whether the site may keep cookies at all; a stored cookie is
++  // readable by its own site whatever the third-party setting is.
++  const url::Origin origin = url::Origin::Create(source_url);
++  return settings.IsFullCookieAccessAllowed(
++      source_url, net::SiteForCookies::FromOrigin(origin), origin,
++      net::CookieSettingOverrides(), /*cookie_partition_key=*/std::nullopt);
++}
++
++CookieSettingsDecision CheckImportCookieSettings(
++    const ImportCookieSettings* settings,
++    const net::CanonicalCookie& cookie,
++    const GURL& source_url) {
++  if (!settings->profile) {
++    return CookieSettingsDecision::kBlock;
++  }
++  const content_settings::CookieSettings& cookie_settings =
++      *settings->cookie_settings;
++  if (!IsAllowedForImport(cookie_settings, cookie, source_url)) {
++    return CookieSettingsDecision::kBlock;
++  }
++  // The predicate the network service deletes session-only cookies with at
++  // exit (CookieSettings::CreateDeleteCookieOnExitPredicate()), so a cookie
++  // is skipped exactly when rac would delete it. IsCookieSessionOnly() only
++  // looks at the site's own rule, and would skip a domain cookie that an
++  // Allow exception for a subdomain keeps.
++  if (cookie_settings.ShouldDeleteCookieOnExit(settings->rules, cookie.Domain(),
++                                               cookie.SourceScheme())) {
++    return CookieSettingsDecision::kClearOnExit;
++  }
++  return CookieSettingsDecision::kAllow;
++}
++
++}  // namespace
++
++std::unique_ptr<CookieWriter> CreateCookieWriterForImport(Profile* profile) {
++  return std::make_unique<CookieWriter>(CookieManagerGetterForImport(profile),
++                                        CookieSettingsFilterForImport(profile));
++}
++
++CookieWriter::CookieManagerGetter CookieManagerGetterForImport(
++    Profile* profile) {
++  CHECK(profile);
++  // A weak pointer, so a profile closed mid-import makes the getter return
++  // null and the writer fails the remaining cookies instead of crashing.
++  return base::BindRepeating(&GetCookieManagerForImport,
++                             profile->GetWeakPtr());
++}
++
++CookieSettingsFilter CookieSettingsFilterForImport(Profile* profile) {
++  CHECK(profile);
++  auto settings = std::make_unique<ImportCookieSettings>();
++  settings->profile = profile->GetWeakPtr();
++  settings->cookie_settings = CookieSettingsFactory::GetForProfile(profile);
++  CHECK(settings->cookie_settings);
++  settings->rules = settings->cookie_settings->GetCookieSettings();
++  return base::BindRepeating(&CheckImportCookieSettings,
++                             base::Owned(std::move(settings)));
++}
++
++}  // namespace rac::import
+--- /dev/null
++++ b/chrome/browser/rac/import/cookie_writer_profile.h
+@@ -0,0 +1,52 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_IMPORT_COOKIE_WRITER_PROFILE_H_
++#define CHROME_BROWSER_RAC_IMPORT_COOKIE_WRITER_PROFILE_H_
++
++#include <memory>
++
++#include "chrome/browser/rac/import/cookie_writer.h"
++
++class Profile;
++
++namespace rac::import {
++
++// The way in for production code: a writer for `profile`, with the getter and
++// settings filter below. `profile` must not be null. Create it right before
++// Write(); the filter's clear-on-exit rules are read when it's created.
++std::unique_ptr<CookieWriter> CreateCookieWriterForImport(Profile* profile);
++
++// A getter for CookieWriter that returns the cookie manager of `profile`'s
++// default storage partition, re-read before each batch so a restarted
++// network service is picked up. `profile` must not be null.
++//
++// The getter returns null, which fails the import, when `profile` is
++// incognito, guest or a system profile, so an import can never land in one,
++// and once `profile` is destroyed. It never falls back to the original
++// profile.
++CookieWriter::CookieManagerGetter CookieManagerGetterForImport(
++    Profile* profile);
++
++// A settings filter that applies `profile`'s cookie settings, through
++// Chromium's own content_settings::CookieSettings:
++//
++// - kBlock when `profile` would not let the cookie's site store cookies:
++//   a Block exception for the site, or Block as the default. Each cookie is
++//   asked as first-party to its own site, so blocking third-party cookies
++//   doesn't skip it. A partitioned cookie with a cross-site ancestor is
++//   asked in its partition instead (the cookie's site embedded under the
++//   partition's top-level site), with the network service's rule for
++//   partitioned cookies.
++// - kClearOnExit when `profile` would delete the cookie at exit, by the
++//   same rule the network service deletes with.
++// - kAllow otherwise.
++//
++// Returns kBlock once `profile` is destroyed; the writer never gets that far,
++// since its getter returns null first. `profile` must not be null.
++CookieSettingsFilter CookieSettingsFilterForImport(Profile* profile);
++
++}  // namespace rac::import
++
++#endif  // CHROME_BROWSER_RAC_IMPORT_COOKIE_WRITER_PROFILE_H_
+--- /dev/null
++++ b/chrome/browser/rac/import/cookie_writer_profile_unittest.cc
+@@ -0,0 +1,271 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/cookie_writer_profile.h"
++
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/check_op.h"
++#include "base/test/gtest_util.h"
++#include "base/test/test_future.h"
++#include "base/time/time.h"
++#include "chrome/browser/content_settings/cookie_settings_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/test/base/testing_profile.h"
++#include "components/content_settings/core/browser/cookie_settings.h"
++#include "components/content_settings/core/common/content_settings.h"
++#include "components/content_settings/core/common/pref_names.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/storage_partition.h"
++#include "content/public/test/browser_task_environment.h"
++#include "net/cookies/canonical_cookie.h"
++#include "services/network/public/mojom/cookie_manager.mojom.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace rac::import {
++namespace {
++
++// Synthetic test data only. Secure, so it's set from an https URL.
++ImportedCookie MakeCookie(std::string name = "profile_test",
++                          std::string host_key = "example.test") {
++  const base::Time now = base::Time::Now();
++  ImportedCookie cookie;
++  cookie.name = std::move(name);
++  cookie.value = "synthetic-value";
++  cookie.host_key = std::move(host_key);
++  cookie.path = "/";
++  cookie.creation = now - base::Days(1);
++  cookie.expiry = now + base::Days(30);
++  cookie.secure = true;
++  return cookie;
++}
++
++// A partitioned cookie set by `host_key` while embedded under `top_site`.
++ImportedCookie MakeEmbeddedCookie(std::string host_key, std::string top_site) {
++  ImportedCookie cookie = MakeCookie("embedded", std::move(host_key));
++  cookie.partition_key = std::move(top_site);
++  cookie.has_cross_site_ancestor = true;
++  return cookie;
++}
++
++CookieWriteReport WriteAll(Profile* profile,
++                           std::vector<ImportedCookie> cookies) {
++  std::unique_ptr<CookieWriter> writer = CreateCookieWriterForImport(profile);
++  base::test::TestFuture<const CookieWriteReport&> done;
++  writer->Write(std::move(cookies), done.GetCallback());
++  return done.Get();
++}
++
++CookieWriteReport WriteOne(Profile* profile) {
++  return WriteAll(profile, {MakeCookie()});
++}
++
++std::vector<net::CanonicalCookie> AllCookies(Profile* profile) {
++  base::test::TestFuture<const std::vector<net::CanonicalCookie>&> cookies;
++  profile->GetDefaultStoragePartition()
++      ->GetCookieManagerForBrowserProcess()
++      ->GetAllCookies(cookies.GetCallback());
++  return cookies.Get();
++}
++
++class CookieWriterProfileTest : public testing::Test {
++ protected:
++  content::BrowserTaskEnvironment task_environment_;
++};
++
++TEST_F(CookieWriterProfileTest, WritesIntoRegularProfile) {
++  TestingProfile profile;
++  network::mojom::CookieManager* manager =
++      profile.GetDefaultStoragePartition()->GetCookieManagerForBrowserProcess();
++  EXPECT_EQ(CookieManagerGetterForImport(&profile).Run(), manager);
++
++  EXPECT_EQ(WriteOne(&profile).set, 1u);
++  const std::vector<net::CanonicalCookie> cookies = AllCookies(&profile);
++  ASSERT_EQ(cookies.size(), 1u);
++  EXPECT_EQ(cookies[0].Name(), "profile_test");
++}
++
++TEST_F(CookieWriterProfileTest, RefusesIncognitoProfile) {
++  TestingProfile profile;
++  Profile* incognito =
++      profile.GetPrimaryOTRProfile(/*create_if_needed=*/true);
++  EXPECT_EQ(CookieManagerGetterForImport(incognito).Run(), nullptr);
++
++  const CookieWriteReport report = WriteOne(incognito);
++  EXPECT_EQ(report.set, 0u);
++  EXPECT_EQ(report.rejected_count(CookieRejectReason::kStoreRefused), 1u);
++}
++
++TEST_F(CookieWriterProfileTest, RefusesGuestProfile) {
++  TestingProfile::Builder builder;
++  builder.SetGuestSession();
++  std::unique_ptr<TestingProfile> guest = builder.Build();
++  EXPECT_EQ(CookieManagerGetterForImport(guest.get()).Run(), nullptr);
++  EXPECT_EQ(CookieManagerGetterForImport(
++                guest->GetPrimaryOTRProfile(/*create_if_needed=*/true))
++                .Run(),
++            nullptr);
++
++  const CookieWriteReport report = WriteOne(guest.get());
++  EXPECT_EQ(report.set, 0u);
++  EXPECT_EQ(report.rejected_count(CookieRejectReason::kStoreRefused), 1u);
++}
++
++TEST_F(CookieWriterProfileTest, GetterReturnsNullOnceProfileIsDestroyed) {
++  auto profile = std::make_unique<TestingProfile>();
++  CookieWriter::CookieManagerGetter getter =
++      CookieManagerGetterForImport(profile.get());
++  EXPECT_TRUE(getter.Run());
++  profile.reset();
++  EXPECT_EQ(getter.Run(), nullptr);
++}
++
++TEST_F(CookieWriterProfileTest, NullProfileCrashes) {
++  EXPECT_CHECK_DEATH(CookieManagerGetterForImport(nullptr));
++  EXPECT_CHECK_DEATH(CookieSettingsFilterForImport(nullptr));
++  EXPECT_CHECK_DEATH(CreateCookieWriterForImport(nullptr));
++}
++
++TEST_F(CookieWriterProfileTest, SkipsCookiesTheProfileBlocks) {
++  // End to end with the profile's real CookieSettings.
++  TestingProfile profile;
++  CookieSettingsFactory::GetForProfile(&profile)->SetCookieSetting(
++      GURL("https://blocked.test"), CONTENT_SETTING_BLOCK);
++
++  const CookieWriteReport report =
++      WriteAll(&profile, {MakeCookie("blocked", "blocked.test"),
++                          MakeCookie("allowed", "allowed.test")});
++  EXPECT_EQ(report.total, 2u);
++  EXPECT_EQ(report.set, 1u);
++  EXPECT_EQ(report.skipped_blocked_by_settings, 1u);
++  const std::vector<net::CanonicalCookie> cookies = AllCookies(&profile);
++  ASSERT_EQ(cookies.size(), 1u);
++  EXPECT_EQ(cookies[0].Name(), "allowed");
++}
++
++// --- CookieSettingsFilterForImport() on its own, with a TestingProfile's real
++// CookieSettings.
++
++class CookieSettingsFilterTest : public CookieWriterProfileTest {
++ protected:
++  // Converts `cookie` the way the writer does, then asks a filter built now,
++  // so it sees every rule set so far.
++  CookieSettingsDecision Check(ImportedCookie cookie) {
++    internal::PrepareResult prepared =
++        internal::PrepareCookies({std::move(cookie)}, base::Time::Now());
++    CHECK_EQ(prepared.ready.size(), 1u);
++    return CookieSettingsFilterForImport(&profile_).Run(
++        prepared.ready[0].cookie, prepared.ready[0].source_url);
++  }
++
++  content_settings::CookieSettings& settings() {
++    return *CookieSettingsFactory::GetForProfile(&profile_);
++  }
++
++  TestingProfile profile_;
++};
++
++TEST_F(CookieSettingsFilterTest, AllowsWithDefaultSettings) {
++  EXPECT_EQ(Check(MakeCookie("a", "allowed.test")),
++            CookieSettingsDecision::kAllow);
++  EXPECT_EQ(Check(MakeCookie("b", ".allowed.test")),
++            CookieSettingsDecision::kAllow);
++  EXPECT_EQ(Check(MakeEmbeddedCookie("embed.test", "https://top.test")),
++            CookieSettingsDecision::kAllow);
++}
++
++TEST_F(CookieSettingsFilterTest, BlocksSiteBlockedInSettings) {
++  settings().SetCookieSetting(GURL("https://blocked.test"),
++                              CONTENT_SETTING_BLOCK);
++  EXPECT_EQ(Check(MakeCookie("a", "blocked.test")),
++            CookieSettingsDecision::kBlock);
++  EXPECT_EQ(Check(MakeCookie("b", ".blocked.test")),
++            CookieSettingsDecision::kBlock);
++  // A block on a site covers its partitioned cookies everywhere.
++  EXPECT_EQ(Check(MakeEmbeddedCookie("blocked.test", "https://top.test")),
++            CookieSettingsDecision::kBlock);
++  // Other sites are untouched.
++  EXPECT_EQ(Check(MakeCookie("c", "allowed.test")),
++            CookieSettingsDecision::kAllow);
++}
++
++TEST_F(CookieSettingsFilterTest, ClearOnExitSite) {
++  settings().SetCookieSetting(GURL("https://session.test"),
++                              CONTENT_SETTING_SESSION_ONLY);
++  EXPECT_EQ(Check(MakeCookie("a", "session.test")),
++            CookieSettingsDecision::kClearOnExit);
++  EXPECT_EQ(Check(MakeCookie("b", ".session.test")),
++            CookieSettingsDecision::kClearOnExit);
++  EXPECT_EQ(Check(MakeCookie("c", "allowed.test")),
++            CookieSettingsDecision::kAllow);
++}
++
++TEST_F(CookieSettingsFilterTest, DefaultBlockBlocksAllButExceptions) {
++  settings().SetDefaultCookieSetting(CONTENT_SETTING_BLOCK);
++  settings().SetCookieSetting(GURL("https://allowed.test"),
++                              CONTENT_SETTING_ALLOW);
++  EXPECT_EQ(Check(MakeCookie("a", "any.test")),
++            CookieSettingsDecision::kBlock);
++  EXPECT_EQ(Check(MakeEmbeddedCookie("embed.test", "https://top.test")),
++            CookieSettingsDecision::kBlock);
++  EXPECT_EQ(Check(MakeCookie("b", "allowed.test")),
++            CookieSettingsDecision::kAllow);
++}
++
++TEST_F(CookieSettingsFilterTest, DefaultClearOnExitClearsAllButExceptions) {
++  settings().SetDefaultCookieSetting(CONTENT_SETTING_SESSION_ONLY);
++  settings().SetCookieSetting(GURL("https://allowed.test"),
++                              CONTENT_SETTING_ALLOW);
++  EXPECT_EQ(Check(MakeCookie("a", "any.test")),
++            CookieSettingsDecision::kClearOnExit);
++  EXPECT_EQ(Check(MakeCookie("b", "allowed.test")),
++            CookieSettingsDecision::kAllow);
++}
++
++TEST_F(CookieSettingsFilterTest, ThirdPartyBlockingSkipsNothing) {
++  profile_.GetPrefs()->SetInteger(
++      prefs::kCookieControlsMode,
++      static_cast<int>(content_settings::CookieControlsMode::kBlockThirdParty));
++  ASSERT_TRUE(settings().ShouldBlockThirdPartyCookies());
++  // First-party to its own site.
++  EXPECT_EQ(Check(MakeCookie("a", "embed.test")),
++            CookieSettingsDecision::kAllow);
++  // Asked in its partition, where third-party blocking still allows
++  // partitioned cookies.
++  EXPECT_EQ(Check(MakeEmbeddedCookie("embed.test", "https://top.test")),
++            CookieSettingsDecision::kAllow);
++}
++
++TEST_F(CookieSettingsFilterTest, PartitionedCookieIsAskedInItsPartition) {
++  // Blocks cookies of every site embedded under top.test.
++  settings().SetThirdPartyCookieSetting(GURL("https://top.test"),
++                                        CONTENT_SETTING_BLOCK);
++  EXPECT_EQ(Check(MakeEmbeddedCookie("embed.test", "https://top.test")),
++            CookieSettingsDecision::kBlock);
++  EXPECT_EQ(Check(MakeEmbeddedCookie("embed.test", "https://other.test")),
++            CookieSettingsDecision::kAllow);
++  EXPECT_EQ(Check(MakeCookie("a", "embed.test")),
++            CookieSettingsDecision::kAllow);
++}
++
++TEST_F(CookieSettingsFilterTest, BlocksOnceProfileIsDestroyed) {
++  auto profile = std::make_unique<TestingProfile>();
++  CookieSettingsFilter filter = CookieSettingsFilterForImport(profile.get());
++  internal::PrepareResult prepared =
++      internal::PrepareCookies({MakeCookie()}, base::Time::Now());
++  ASSERT_EQ(prepared.ready.size(), 1u);
++  const internal::PreparedCookie& cookie = prepared.ready[0];
++  EXPECT_EQ(filter.Run(cookie.cookie, cookie.source_url),
++            CookieSettingsDecision::kAllow);
++  profile.reset();
++  EXPECT_EQ(filter.Run(cookie.cookie, cookie.source_url),
++            CookieSettingsDecision::kBlock);
++}
++
++}  // namespace
++}  // namespace rac::import
+--- /dev/null
++++ b/chrome/browser/rac/import/cookie_writer_unittest.cc
+@@ -0,0 +1,1334 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/cookie_writer.h"
++
++#include <memory>
++#include <optional>
++#include <set>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/check_op.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/run_loop.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/test/bind.h"
++#include "base/test/gtest_util.h"
++#include "base/test/run_until.h"
++#include "base/test/task_environment.h"
++#include "base/test/test_future.h"
++#include "base/time/time.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "net/cookies/canonical_cookie.h"
++#include "net/cookies/cookie_access_result.h"
++#include "net/cookies/cookie_constants.h"
++#include "net/cookies/cookie_monster.h"
++#include "net/cookies/cookie_options.h"
++#include "net/cookies/cookie_partition_key.h"
++#include "net/url_request/url_request_context.h"
++#include "net/url_request/url_request_context_builder.h"
++#include "net/url_request/url_request_test_util.h"
++#include "services/network/cookie_manager.h"
++#include "services/network/public/mojom/cookie_manager.mojom.h"
++#include "services/network/session_cleanup_cookie_store.h"
++#include "services/network/test/test_cookie_manager.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace rac::import {
++namespace {
++
++// Synthetic test data only. Hosts use the reserved .test TLD and
++// documentation IP ranges.
++ImportedCookie MakeCookie(std::string name,
++                          std::string host_key,
++                          bool secure = true) {
++  const base::Time now = base::Time::Now();
++  ImportedCookie cookie;
++  cookie.name = std::move(name);
++  cookie.value = "synthetic-value";
++  cookie.host_key = std::move(host_key);
++  cookie.path = "/";
++  cookie.creation = now - base::Days(10);
++  cookie.last_access = now - base::Days(1);
++  cookie.expiry = now + base::Days(30);
++  cookie.secure = secure;
++  cookie.source_scheme = secure ? net::CookieSourceScheme::kSecure
++                                : net::CookieSourceScheme::kNonSecure;
++  cookie.source_port = secure ? 443 : 80;
++  return cookie;
++}
++
++// `count` cookies, each on its own registrable domain, since the store keeps
++// at most 180 per eTLD+1.
++std::vector<ImportedCookie> ManyCookies(size_t count) {
++  std::vector<ImportedCookie> cookies;
++  for (size_t i = 0; i < count; ++i) {
++    cookies.push_back(
++        MakeCookie("n", "site" + base::NumberToString(i) + ".test"));
++  }
++  return cookies;
++}
++
++// Allows every cookie, as a profile with default settings would.
++CookieSettingsFilter AllowAll() {
++  return base::BindRepeating([](const net::CanonicalCookie&, const GURL&) {
++    return CookieSettingsDecision::kAllow;
++  });
++}
++
++// A stand-in for a profile's cookie settings: `decision` for every cookie
++// whose domain is in `hosts`, kAllow for the rest. With no hosts, `decision`
++// applies to every cookie, like a default setting.
++CookieSettingsFilter FakeSettings(CookieSettingsDecision decision,
++                                  std::set<std::string> hosts = {}) {
++  return base::BindRepeating(
++      [](CookieSettingsDecision decision, const std::set<std::string>& hosts,
++         const net::CanonicalCookie& cookie, const GURL&) {
++        return hosts.empty() || hosts.contains(cookie.Domain())
++                   ? decision
++                   : CookieSettingsDecision::kAllow;
++      },
++      decision, std::move(hosts));
++}
++
++// An in-process CookieManager with no mojo pipe. In kHold mode it keeps every
++// callback until the test answers or drops it; dropping one is what a lost
++// connection does. Records every SetCanonicalCookie and FlushCookieStore call.
++// GetAllCookies() answers at once with `existing()`, or drops the call while
++// `drop_reads()` is above zero.
++class FakeCookieManager : public network::TestCookieManager {
++ public:
++  enum class Mode {
++    // Keep callbacks until the test calls AcceptHeldSets(), AnswerFlush() or
++    // DropHeldCalls().
++    kHold,
++    // Answer every call at once, with success.
++    kAccept,
++    // Destroy every callback unrun, as a dead pipe does.
++    kDrop,
++  };
++
++  explicit FakeCookieManager(Mode mode) : mode_(mode) {}
++  ~FakeCookieManager() override = default;
++
++  void SetCanonicalCookie(const net::CanonicalCookie& cookie,
++                          const GURL& source_url,
++                          const net::CookieOptions& cookie_options,
++                          SetCanonicalCookieCallback callback) override {
++    ++set_calls_;
++    switch (mode_) {
++      case Mode::kHold:
++        held_sets_.push_back(std::move(callback));
++        return;
++      case Mode::kAccept:
++        std::move(callback).Run(net::CookieAccessResult());
++        return;
++      case Mode::kDrop:
++        return;
++    }
++  }
++
++  void GetAllCookies(GetAllCookiesCallback callback) override {
++    ++read_calls_;
++    if (drop_reads_ > 0) {
++      --drop_reads_;
++      return;
++    }
++    std::move(callback).Run(existing_);
++  }
++
++  void FlushCookieStore(FlushCookieStoreCallback callback) override {
++    ++flush_calls_;
++    sets_before_flush_ = set_calls_;
++    switch (mode_) {
++      case Mode::kHold:
++        held_flush_ = std::move(callback);
++        return;
++      case Mode::kAccept:
++        std::move(callback).Run();
++        return;
++      case Mode::kDrop:
++        return;
++    }
++  }
++
++  void AcceptHeldSets() {
++    std::vector<SetCanonicalCookieCallback> callbacks;
++    callbacks.swap(held_sets_);
++    for (SetCanonicalCookieCallback& callback : callbacks) {
++      std::move(callback).Run(net::CookieAccessResult());
++    }
++  }
++
++  // Destroys every held callback without running it.
++  void DropHeldCalls() {
++    std::vector<SetCanonicalCookieCallback> callbacks;
++    callbacks.swap(held_sets_);
++    callbacks.clear();
++    held_flush_.Reset();
++  }
++
++  void AnswerFlush() { std::move(held_flush_).Run(); }
++
++  std::vector<net::CanonicalCookie>& existing() { return existing_; }
++  void set_drop_reads(size_t count) { drop_reads_ = count; }
++  size_t read_calls() const { return read_calls_; }
++  size_t held_sets() const { return held_sets_.size(); }
++  bool has_held_flush() const { return !held_flush_.is_null(); }
++  size_t set_calls() const { return set_calls_; }
++  size_t flush_calls() const { return flush_calls_; }
++  size_t sets_before_flush() const { return sets_before_flush_; }
++
++ private:
++  const Mode mode_;
++  std::vector<SetCanonicalCookieCallback> held_sets_;
++  FlushCookieStoreCallback held_flush_;
++  std::vector<net::CanonicalCookie> existing_;
++  size_t drop_reads_ = 0;
++  size_t read_calls_ = 0;
++  size_t set_calls_ = 0;
++  size_t flush_calls_ = 0;
++  size_t sets_before_flush_ = 0;
++};
++
++// A real network::CookieManager over an in-memory net::CookieMonster, reached
++// through a mojo pipe as in the browser. Tests that need to hold, drop or
++// count calls use FakeCookieManager instead.
++class CookieWriterTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    auto context_builder = net::CreateTestURLRequestContextBuilder();
++    context_builder->SetCookieStore(std::make_unique<net::CookieMonster>(
++        /*store=*/nullptr, /*net_log=*/nullptr));
++    url_request_context_ = context_builder->Build();
++    cookie_manager_ = std::make_unique<network::CookieManager>(
++        url_request_context_.get(),
++        /*session_cleanup_cookie_store=*/nullptr, /*params=*/nullptr);
++    cookie_manager_->AddReceiver(remote_.BindNewPipeAndPassReceiver());
++  }
++
++  CookieWriteReport Write(std::vector<ImportedCookie> cookies,
++                          CookieSettingsFilter filter = AllowAll()) {
++    return WriteWith(remote_.get(), std::move(cookies), std::move(filter));
++  }
++
++  static CookieWriteReport WriteWith(
++      network::mojom::CookieManager* manager,
++      std::vector<ImportedCookie> cookies,
++      CookieSettingsFilter filter = AllowAll()) {
++    std::unique_ptr<CookieWriter> writer =
++        CookieWriter::CreateForTesting(manager, std::move(filter));
++    base::test::TestFuture<const CookieWriteReport&> done;
++    writer->Write(std::move(cookies), done.GetCallback());
++    return done.Get();
++  }
++
++  // Puts `cookie` in the store directly, as if rac had set it before the
++  // import. Converted the same way the writer converts.
++  void SeedCookie(ImportedCookie cookie) {
++    internal::PrepareResult prepared =
++        internal::PrepareCookies({std::move(cookie)}, base::Time::Now());
++    ASSERT_EQ(prepared.ready.size(), 1u);
++    net::CookieOptions options;
++    options.set_include_httponly();
++    options.set_same_site_cookie_context(
++        net::CookieOptions::SameSiteCookieContext::MakeInclusive());
++    base::test::TestFuture<net::CookieAccessResult> result;
++    remote_->SetCanonicalCookie(prepared.ready[0].cookie,
++                                prepared.ready[0].source_url, options,
++                                result.GetCallback());
++    ASSERT_TRUE(result.Get().status.IsInclude());
++  }
++
++  std::vector<net::CanonicalCookie> AllCookies() {
++    base::test::TestFuture<const std::vector<net::CanonicalCookie>&> cookies;
++    remote_->GetAllCookies(cookies.GetCallback());
++    return cookies.Get();
++  }
++
++  std::optional<net::CanonicalCookie> FindCookie(std::string_view name) {
++    for (const net::CanonicalCookie& cookie : AllCookies()) {
++      if (cookie.Name() == name) {
++        return cookie;
++      }
++    }
++    return std::nullopt;
++  }
++
++  // Writes one cookie and checks that it's the only outcome in the report.
++  void ExpectSet(ImportedCookie cookie) {
++    const CookieWriteReport report = Write({std::move(cookie)});
++    EXPECT_EQ(report.total, 1u);
++    EXPECT_EQ(report.set, 1u);
++    EXPECT_EQ(report.rejected_total(), 0u);
++  }
++  void ExpectRejected(ImportedCookie cookie, CookieRejectReason reason) {
++    const std::string name = cookie.name;
++    const CookieWriteReport report = Write({std::move(cookie)});
++    EXPECT_EQ(report.total, 1u);
++    EXPECT_EQ(report.set, 0u);
++    EXPECT_EQ(report.rejected_count(reason), 1u);
++    EXPECT_EQ(report.rejected_total(), 1u);
++    EXPECT_FALSE(FindCookie(name));
++  }
++
++  base::test::TaskEnvironment task_environment_;
++  std::unique_ptr<net::URLRequestContext> url_request_context_;
++  std::unique_ptr<network::CookieManager> cookie_manager_;
++  mojo::Remote<network::mojom::CookieManager> remote_;
++};
++
++TEST_F(CookieWriterTest, WritesNormalCookieWithItsAttributes) {
++  ImportedCookie in = MakeCookie("plain", ".example.test");
++  in.path = "/account";
++  in.priority = net::COOKIE_PRIORITY_HIGH;
++  in.same_site = net::CookieSameSite::LAX_MODE;
++  const base::Time creation = in.creation;
++  const base::Time expiry = in.expiry;
++  const base::Time last_access = in.last_access;
++  ExpectSet(in);
++
++  std::optional<net::CanonicalCookie> out = FindCookie("plain");
++  ASSERT_TRUE(out);
++  EXPECT_EQ(out->Value(), "synthetic-value");
++  EXPECT_EQ(out->Domain(), ".example.test");
++  EXPECT_TRUE(out->IsDomainCookie());
++  EXPECT_EQ(out->Path(), "/account");
++  EXPECT_EQ(out->CreationDate(), creation);
++  EXPECT_EQ(out->ExpiryDate(), expiry);
++  EXPECT_EQ(out->LastAccessDate(), last_access);
++  EXPECT_TRUE(out->SecureAttribute());
++  EXPECT_FALSE(out->IsHttpOnly());
++  EXPECT_EQ(out->SameSite(), net::CookieSameSite::LAX_MODE);
++  EXPECT_EQ(out->Priority(), net::COOKIE_PRIORITY_HIGH);
++  EXPECT_EQ(out->SourceScheme(), net::CookieSourceScheme::kSecure);
++  EXPECT_EQ(out->SourcePort(), 443);
++  EXPECT_FALSE(out->IsPartitioned());
++}
++
++TEST_F(CookieWriterTest, HostOnlyCookieStaysHostOnly) {
++  ExpectSet(MakeCookie("host_only", "www.example.test"));
++  std::optional<net::CanonicalCookie> out = FindCookie("host_only");
++  ASSERT_TRUE(out);
++  EXPECT_EQ(out->Domain(), "www.example.test");
++  EXPECT_TRUE(out->IsHostCookie());
++}
++
++TEST_F(CookieWriterTest, SkipsExpiredCookie) {
++  ImportedCookie in = MakeCookie("expired", "example.test");
++  in.expiry = base::Time::Now() - base::Minutes(1);
++  const CookieWriteReport report = Write({in});
++  EXPECT_EQ(report.skipped_expired, 1u);
++  EXPECT_EQ(report.set, 0u);
++  EXPECT_TRUE(AllCookies().empty());
++}
++
++TEST_F(CookieWriterTest, SkipsCookieThatExpiresOnceCappedTo400Days) {
++  // Created 500 days ago with expiry next month: the 400-day cap puts its
++  // expiry 100 days in the past. Only the writer's own expiry check catches
++  // this; the store would accept the cookie and drop it.
++  ImportedCookie in = MakeCookie("too_old", "example.test");
++  in.creation = base::Time::Now() - base::Days(500);
++  in.last_access = base::Time::Now() - base::Days(2);
++  const CookieWriteReport report = Write({in});
++  EXPECT_EQ(report.skipped_expired, 1u);
++  EXPECT_EQ(report.set, 0u);
++  EXPECT_TRUE(AllCookies().empty());
++}
++
++TEST_F(CookieWriterTest, KeepsSessionCookie) {
++  ImportedCookie in = MakeCookie("session", "example.test");
++  in.expiry = base::Time();
++  ExpectSet(in);
++  std::optional<net::CanonicalCookie> out = FindCookie("session");
++  ASSERT_TRUE(out);
++  EXPECT_FALSE(out->IsPersistent());
++}
++
++// --- Out-of-range enums. Each would hit NOTREACHED() in the mojom traits if
++// it reached the pipe, so these go through the real mojo remote.
++
++TEST_F(CookieWriterTest, MapsUnknownSameSiteToUnspecified) {
++  // 3 is the retired SameSite=Extended, still possible in an old DB.
++  for (int raw : {3, 4, -2, 100}) {
++    SCOPED_TRACE(raw);
++    const std::string name = "ss_" + base::NumberToString(raw + 10);
++    ImportedCookie in = MakeCookie(name, "example.test");
++    in.same_site = static_cast<net::CookieSameSite>(raw);
++    ExpectSet(in);
++    std::optional<net::CanonicalCookie> out = FindCookie(name);
++    ASSERT_TRUE(out);
++    EXPECT_EQ(out->SameSite(), net::CookieSameSite::UNSPECIFIED);
++  }
++}
++
++TEST_F(CookieWriterTest, MapsUnknownPriorityToMedium) {
++  // CookiePriority is an unscoped enum without a fixed type, so 3 is the only
++  // out-of-range value a cast can produce without undefined behavior.
++  ImportedCookie in = MakeCookie("priority", "example.test");
++  in.priority = static_cast<net::CookiePriority>(3);
++  ExpectSet(in);
++  std::optional<net::CanonicalCookie> out = FindCookie("priority");
++  ASSERT_TRUE(out);
++  EXPECT_EQ(out->Priority(), net::COOKIE_PRIORITY_MEDIUM);
++}
++
++TEST_F(CookieWriterTest, IgnoresUnknownSourceScheme) {
++  ImportedCookie insecure =
++      MakeCookie("scheme_insecure", "example.test", /*secure=*/false);
++  insecure.source_scheme = static_cast<net::CookieSourceScheme>(7);
++  insecure.source_port = 8080;
++  ExpectSet(insecure);
++  std::optional<net::CanonicalCookie> out = FindCookie("scheme_insecure");
++  ASSERT_TRUE(out);
++  EXPECT_EQ(out->SourceScheme(), net::CookieSourceScheme::kNonSecure);
++  EXPECT_EQ(out->SourcePort(), 8080);
++
++  ImportedCookie secure = MakeCookie("scheme_secure", "example.test");
++  secure.source_scheme = static_cast<net::CookieSourceScheme>(-1);
++  ExpectSet(secure);
++  out = FindCookie("scheme_secure");
++  ASSERT_TRUE(out);
++  EXPECT_EQ(out->SourceScheme(), net::CookieSourceScheme::kSecure);
++}
++
++// --- Name prefixes. Chromium's own rules, reached through
++// CreateSanitizedCookie.
++
++TEST_F(CookieWriterTest, HostPrefix) {
++  ExpectSet(MakeCookie("__Host-ok", "example.test"));
++  std::optional<net::CanonicalCookie> out = FindCookie("__Host-ok");
++  ASSERT_TRUE(out);
++  EXPECT_TRUE(out->IsHostCookie());
++
++  // A domain cookie can't carry __Host-.
++  ExpectRejected(MakeCookie("__Host-domain", ".example.test"),
++                 CookieRejectReason::kInvalidPrefix);
++
++  ImportedCookie wrong_path = MakeCookie("__Host-path", "example.test");
++  wrong_path.path = "/sub";
++  ExpectRejected(wrong_path, CookieRejectReason::kInvalidPrefix);
++
++  ExpectRejected(MakeCookie("__Host-insecure", "example.test",
++                            /*secure=*/false),
++                 CookieRejectReason::kInvalidPrefix);
++}
++
++TEST_F(CookieWriterTest, SecurePrefix) {
++  ExpectSet(MakeCookie("__Secure-ok", ".example.test"));
++  ExpectRejected(MakeCookie("__Secure-insecure", ".example.test",
++                            /*secure=*/false),
++                 CookieRejectReason::kInvalidPrefix);
++}
++
++TEST_F(CookieWriterTest, HttpPrefix) {
++  ImportedCookie ok = MakeCookie("__Http-ok", ".example.test");
++  ok.http_only = true;
++  ExpectSet(ok);
++
++  ExpectRejected(MakeCookie("__Http-not-httponly", ".example.test"),
++                 CookieRejectReason::kInvalidPrefix);
++
++  ImportedCookie insecure =
++      MakeCookie("__Http-insecure", ".example.test", /*secure=*/false);
++  insecure.http_only = true;
++  ExpectRejected(insecure, CookieRejectReason::kInvalidPrefix);
++}
++
++TEST_F(CookieWriterTest, HostHttpPrefix) {
++  ImportedCookie ok = MakeCookie("__Host-Http-ok", "example.test");
++  ok.http_only = true;
++  ExpectSet(ok);
++  std::optional<net::CanonicalCookie> out = FindCookie("__Host-Http-ok");
++  ASSERT_TRUE(out);
++  EXPECT_TRUE(out->IsHostCookie());
++  EXPECT_TRUE(out->IsHttpOnly());
++
++  ExpectRejected(MakeCookie("__Host-Http-not-httponly", "example.test"),
++                 CookieRejectReason::kInvalidPrefix);
++
++  ImportedCookie domain = MakeCookie("__Host-Http-domain", ".example.test");
++  domain.http_only = true;
++  ExpectRejected(domain, CookieRejectReason::kInvalidPrefix);
++
++  ImportedCookie wrong_path = MakeCookie("__Host-Http-path", "example.test");
++  wrong_path.http_only = true;
++  wrong_path.path = "/sub";
++  ExpectRejected(wrong_path, CookieRejectReason::kInvalidPrefix);
++}
++
++TEST_F(CookieWriterTest, PrefixesMatchInAnyCase) {
++  ExpectSet(MakeCookie("__host-ok", "example.test"));
++  ExpectRejected(MakeCookie("__host-domain", ".example.test"),
++                 CookieRejectReason::kInvalidPrefix);
++  ExpectRejected(MakeCookie("__SECURE-insecure", ".example.test",
++                            /*secure=*/false),
++                 CookieRejectReason::kInvalidPrefix);
++  ExpectRejected(MakeCookie("__http-not-httponly", ".example.test"),
++                 CookieRejectReason::kInvalidPrefix);
++}
++
++TEST_F(CookieWriterTest, WritesHttpOnlyCookie) {
++  ImportedCookie in = MakeCookie("http_only", "example.test");
++  in.http_only = true;
++  ExpectSet(in);
++  std::optional<net::CanonicalCookie> out = FindCookie("http_only");
++  ASSERT_TRUE(out);
++  EXPECT_TRUE(out->IsHttpOnly());
++}
++
++TEST_F(CookieWriterTest, WritesEverySameSiteValue) {
++  const std::pair<const char*, net::CookieSameSite> kCases[] = {
++      {"ss_unspecified", net::CookieSameSite::UNSPECIFIED},
++      {"ss_none", net::CookieSameSite::NO_RESTRICTION},
++      {"ss_lax", net::CookieSameSite::LAX_MODE},
++      {"ss_strict", net::CookieSameSite::STRICT_MODE},
++  };
++  for (const auto& [name, same_site] : kCases) {
++    SCOPED_TRACE(name);
++    ImportedCookie in = MakeCookie(name, "example.test");
++    in.same_site = same_site;
++    ExpectSet(in);
++    std::optional<net::CanonicalCookie> out = FindCookie(name);
++    ASSERT_TRUE(out);
++    EXPECT_EQ(out->SameSite(), same_site);
++  }
++}
++
++TEST_F(CookieWriterTest, StoreRejectsInsecureSameSiteNone) {
++  ImportedCookie in = MakeCookie("ss_none_insecure", "example.test",
++                                 /*secure=*/false);
++  in.same_site = net::CookieSameSite::NO_RESTRICTION;
++  ExpectRejected(in, CookieRejectReason::kSameSiteNoneInsecure);
++}
++
++// --- Partitioned cookies.
++
++TEST_F(CookieWriterTest, PartitionedCookie) {
++  ImportedCookie valid = MakeCookie("chips_ok", "embed.test");
++  valid.partition_key = "https://top.test";
++  valid.has_cross_site_ancestor = true;
++  ExpectSet(valid);
++  std::optional<net::CanonicalCookie> out = FindCookie("chips_ok");
++  ASSERT_TRUE(out);
++  ASSERT_TRUE(out->IsPartitioned());
++  EXPECT_EQ(out->PartitionKey()->site().Serialize(), "https://top.test");
++  EXPECT_TRUE(out->PartitionKey()->IsThirdParty());
++
++  ImportedCookie garbage = MakeCookie("chips_garbage", "embed.test");
++  garbage.partition_key = "not a site";
++  ExpectRejected(garbage, CookieRejectReason::kInvalidPartitionKey);
++
++  // Parses loosely, but isn't the exact serialized form Chromium stores. Only
++  // the strict FromStorage() parse catches this.
++  ImportedCookie with_path = MakeCookie("chips_path", "embed.test");
++  with_path.partition_key = "https://top.test/path";
++  ExpectRejected(with_path, CookieRejectReason::kInvalidPartitionKey);
++
++  ImportedCookie insecure = MakeCookie("chips_insecure", "embed.test",
++                                       /*secure=*/false);
++  insecure.partition_key = "https://top.test";
++  ExpectRejected(insecure, CookieRejectReason::kPartitionedInsecure);
++}
++
++TEST_F(CookieWriterTest, WritesFirstPartyPartitionedCookie) {
++  // No cross-site ancestor: the top-level site set it for itself. A
++  // subdomain of that site still counts as the same site.
++  const std::pair<const char*, const char*> kCases[] = {
++      {"chips_1p_host", "top.test"},
++      {"chips_1p_subdomain", "www.top.test"},
++      {"chips_1p_domain", ".top.test"},
++  };
++  for (const auto& [name, host_key] : kCases) {
++    SCOPED_TRACE(name);
++    ImportedCookie in = MakeCookie(name, host_key);
++    in.partition_key = "https://top.test";
++    in.has_cross_site_ancestor = false;
++    ExpectSet(in);
++    std::optional<net::CanonicalCookie> out = FindCookie(name);
++    ASSERT_TRUE(out);
++    ASSERT_TRUE(out->IsPartitioned());
++    EXPECT_FALSE(out->PartitionKey()->IsThirdParty());
++    EXPECT_EQ(out->Domain(), host_key);
++  }
++}
++
++TEST_F(CookieWriterTest, RejectsFirstPartyPartitionKeyForAnotherSite) {
++  // The store would accept these, but no request could ever read them: a
++  // first-party key only matches requests to its own site. Only the writer's
++  // partition-site check catches this.
++  for (const char* host_key : {"embed.test", ".embed.test"}) {
++    SCOPED_TRACE(host_key);
++    ImportedCookie in = MakeCookie("chips_unreadable", host_key);
++    in.partition_key = "https://other.test";
++    in.has_cross_site_ancestor = false;
++    ExpectRejected(in, CookieRejectReason::kInvalidPartitionKey);
++  }
++}
++
++// --- Hosts.
++
++TEST_F(CookieWriterTest, WritesCookieForIpAddressHost) {
++  ImportedCookie in = MakeCookie("ip", "192.0.2.10", /*secure=*/false);
++  in.source_port = 8080;
++  ExpectSet(in);
++  std::optional<net::CanonicalCookie> out = FindCookie("ip");
++  ASSERT_TRUE(out);
++  EXPECT_EQ(out->Domain(), "192.0.2.10");
++  EXPECT_TRUE(out->IsHostCookie());
++  EXPECT_EQ(out->SourcePort(), 8080);
++  EXPECT_EQ(out->SourceScheme(), net::CookieSourceScheme::kNonSecure);
++}
++
++TEST_F(CookieWriterTest, Ipv6HostKey) {
++  ExpectSet(MakeCookie("ipv6", "[2001:db8::1]"));
++  std::optional<net::CanonicalCookie> out = FindCookie("ipv6");
++  ASSERT_TRUE(out);
++  EXPECT_EQ(out->Domain(), "[2001:db8::1]");
++  EXPECT_TRUE(out->IsHostCookie());
++
++  // Uppercase hex is the same address.
++  ExpectSet(MakeCookie("ipv6_upper", "[2001:DB8::2]"));
++  out = FindCookie("ipv6_upper");
++  ASSERT_TRUE(out);
++  EXPECT_EQ(out->Domain(), "[2001:db8::2]");
++
++  // Chromium always stores the compressed form, so anything else is not a
++  // `host_key` it wrote.
++  ExpectRejected(MakeCookie("ipv6_long", "[2001:db8:0:0:0:0:0:3]"),
++                 CookieRejectReason::kInvalidDomain);
++  ExpectRejected(MakeCookie("ipv6_bare", "2001:db8::4"),
++                 CookieRejectReason::kInvalidDomain);
++}
++
++TEST_F(CookieWriterTest, AcceptsUppercaseHostKey) {
++  ExpectSet(MakeCookie("upper_host", "WWW.Example.TEST"));
++  std::optional<net::CanonicalCookie> out = FindCookie("upper_host");
++  ASSERT_TRUE(out);
++  EXPECT_EQ(out->Domain(), "www.example.test");
++
++  ExpectSet(MakeCookie("upper_domain", ".Example.TEST"));
++  out = FindCookie("upper_domain");
++  ASSERT_TRUE(out);
++  EXPECT_EQ(out->Domain(), ".example.test");
++}
++
++TEST_F(CookieWriterTest, TrailingDotHostKey) {
++  // Chromium keeps a fully qualified host's trailing dot, so it's a distinct
++  // host and imports as is.
++  ExpectSet(MakeCookie("fqdn", "example.test."));
++  std::optional<net::CanonicalCookie> out = FindCookie("fqdn");
++  ASSERT_TRUE(out);
++  EXPECT_EQ(out->Domain(), "example.test.");
++
++  ExpectRejected(MakeCookie("double_dot", "example.test.."),
++                 CookieRejectReason::kInvalidDomain);
++}
++
++TEST_F(CookieWriterTest, IdnHostKey) {
++  // Chromium stores the punycode form.
++  ExpectSet(MakeCookie("idn", "xn--bcher-kva.test"));
++  std::optional<net::CanonicalCookie> out = FindCookie("idn");
++  ASSERT_TRUE(out);
++  EXPECT_EQ(out->Domain(), "xn--bcher-kva.test");
++
++  // The Unicode form ("bücher.test") parses to the punycode host, which isn't
++  // the `host_key`.
++  ExpectRejected(MakeCookie("idn_unicode", "b\xC3\xBC"
++                                           "cher.test"),
++                 CookieRejectReason::kInvalidDomain);
++}
++
++TEST_F(CookieWriterTest, RejectsDomainCookieOnPublicSuffix) {
++  // CreateSanitizedCookie would quietly make these host-only cookies for the
++  // suffix itself. Only the writer's domain-unchanged check catches it.
++  ExpectRejected(MakeCookie("suffix", ".test"),
++                 CookieRejectReason::kInvalidDomain);
++  ExpectRejected(MakeCookie("suffix_uk", ".co.uk"),
++                 CookieRejectReason::kInvalidDomain);
++}
++
++TEST_F(CookieWriterTest, RejectsDomainCookieOnIpAddress) {
++  // Same as above: CreateSanitizedCookie turns it into a host-only cookie.
++  ExpectRejected(MakeCookie("ip_domain", ".192.0.2.10", /*secure=*/false),
++                 CookieRejectReason::kInvalidDomain);
++}
++
++TEST_F(CookieWriterTest, RejectsHostKeyThatNamesAnotherHost) {
++  // End to end: none of these reaches the store. More than one check rejects
++  // each of them, so this doesn't show which; SourceUrlForRequiresExactHost
++  // covers the URL host check on its own.
++  ExpectRejected(MakeCookie("smuggled", "a.test@victim.test"),
++                 CookieRejectReason::kInvalidDomain);
++  ExpectRejected(MakeCookie("smuggled_domain", ".a.test@victim.test"),
++                 CookieRejectReason::kInvalidDomain);
++  ExpectRejected(MakeCookie("with_path", "a.test/x"),
++                 CookieRejectReason::kInvalidDomain);
++  EXPECT_TRUE(AllCookies().empty());
++}
++
++// --- SourceUrlFor() on its own. For a host-only cookie, the later check that
++// the stored domain equals `host_key` rejects the same inputs, so only a
++// direct call shows this check works by itself.
++
++TEST(CookieWriterSourceUrlTest, SourceUrlForRequiresExactHost) {
++  for (const char* host_key :
++       {"a.test@victim.test", ".a.test@victim.test", "user:pw@victim.test",
++        "a.test/x", "a.test:8443", "a.test?x", "a.test#x", "", ".",
++        "b\xC3\xBC"
++        "cher.test",
++        "ex%61mple.test", "[2001:db8:0:0:0:0:0:1]", "2001:db8::1"}) {
++    SCOPED_TRACE(host_key);
++    EXPECT_FALSE(internal::SourceUrlFor(MakeCookie("c", host_key)));
++  }
++}
++
++TEST(CookieWriterSourceUrlTest, SourceUrlForKeepsSchemeAndPort) {
++  ImportedCookie secure = MakeCookie("c", ".example.test");
++  EXPECT_EQ(internal::SourceUrlFor(secure), GURL("https://example.test/"));
++
++  ImportedCookie insecure = MakeCookie("c", "example.test", /*secure=*/false);
++  insecure.source_port = 8080;
++  EXPECT_EQ(internal::SourceUrlFor(insecure),
++            GURL("http://example.test:8080/"));
++
++  // Not Secure, but set over https.
++  ImportedCookie from_https =
++      MakeCookie("c", "example.test", /*secure=*/false);
++  from_https.source_scheme = net::CookieSourceScheme::kSecure;
++  from_https.source_port = 443;
++  EXPECT_EQ(internal::SourceUrlFor(from_https), GURL("https://example.test/"));
++
++  for (int port : {-1, 0, 65536}) {
++    SCOPED_TRACE(port);
++    ImportedCookie no_port = MakeCookie("c", "example.test");
++    no_port.source_port = port;
++    EXPECT_EQ(internal::SourceUrlFor(no_port), GURL("https://example.test/"));
++  }
++
++  EXPECT_EQ(internal::SourceUrlFor(MakeCookie("c", "Example.TEST")),
++            GURL("https://example.test/"));
++  EXPECT_EQ(internal::SourceUrlFor(MakeCookie("c", "[2001:db8::1]")),
++            GURL("https://[2001:db8::1]/"));
++}
++
++// --- Duplicates.
++
++TEST(CookieWriterPrepareTest, KeepsNewestOfRowsThatDifferOnlyInSource) {
++  const base::Time now = base::Time::Now();
++  ImportedCookie newer = MakeCookie("dup", "example.test");
++  newer.value = "newer";
++  newer.creation = now - base::Days(2);
++  newer.source_port = 8443;
++
++  ImportedCookie older = MakeCookie("dup", "example.test");
++  older.value = "older";
++  older.creation = now - base::Days(5);
++
++  ImportedCookie oldest = MakeCookie("dup", "EXAMPLE.test");
++  oldest.value = "oldest";
++  oldest.creation = now - base::Days(8);
++  oldest.source_scheme = net::CookieSourceScheme::kUnset;
++  oldest.source_port = -1;
++
++  internal::PrepareResult result =
++      internal::PrepareCookies({older, newer, oldest}, now);
++  EXPECT_EQ(result.report.total, 3u);
++  EXPECT_EQ(result.report.skipped_duplicate, 2u);
++  ASSERT_EQ(result.ready.size(), 1u);
++  EXPECT_EQ(result.ready[0].cookie.Value(), "newer");
++  EXPECT_EQ(result.ready[0].source_url, GURL("https://example.test:8443/"));
++}
++
++TEST(CookieWriterPrepareTest, OnEqualCreationTimeTheLaterRowWins) {
++  const base::Time now = base::Time::Now();
++  ImportedCookie first = MakeCookie("dup", "example.test");
++  first.value = "first";
++  ImportedCookie second = first;
++  second.value = "second";
++  second.source_port = 8443;
++
++  internal::PrepareResult result =
++      internal::PrepareCookies({first, second}, now);
++  EXPECT_EQ(result.report.skipped_duplicate, 1u);
++  ASSERT_EQ(result.ready.size(), 1u);
++  EXPECT_EQ(result.ready[0].cookie.Value(), "second");
++}
++
++TEST(CookieWriterPrepareTest, KeepsRowsTheStoreKeepsApart) {
++  const base::Time now = base::Time::Now();
++  ImportedCookie base_cookie = MakeCookie("c", "example.test");
++  ImportedCookie other_name = MakeCookie("C", "example.test");
++  ImportedCookie other_path = MakeCookie("c", "example.test");
++  other_path.path = "/a";
++  ImportedCookie domain_cookie = MakeCookie("c", ".example.test");
++  ImportedCookie partitioned = MakeCookie("c", "example.test");
++  partitioned.partition_key = "https://top.test";
++  ImportedCookie other_partition = MakeCookie("c", "example.test");
++  other_partition.partition_key = "https://other.test";
++
++  internal::PrepareResult result = internal::PrepareCookies(
++      {base_cookie, other_name, other_path, domain_cookie, partitioned,
++       other_partition},
++      now);
++  EXPECT_EQ(result.report.skipped_duplicate, 0u);
++  EXPECT_EQ(result.ready.size(), 6u);
++}
++
++TEST_F(CookieWriterTest, ReportsDuplicatesAndStoresTheNewest) {
++  ImportedCookie older = MakeCookie("dup", "example.test");
++  older.value = "older";
++  older.creation = base::Time::Now() - base::Days(5);
++  ImportedCookie newer = MakeCookie("dup", "example.test");
++  newer.value = "newer";
++  newer.creation = base::Time::Now() - base::Days(2);
++  newer.source_port = 8443;
++
++  const CookieWriteReport report = Write({newer, older});
++  EXPECT_EQ(report.total, 2u);
++  EXPECT_EQ(report.set, 1u);
++  EXPECT_EQ(report.skipped_duplicate, 1u);
++  ASSERT_EQ(AllCookies().size(), 1u);
++  EXPECT_EQ(FindCookie("dup")->Value(), "newer");
++}
++
++TEST_F(CookieWriterTest, ReportCountsEveryOutcome) {
++  // rac already has a newer "j".
++  ImportedCookie in_rac = MakeCookie("j", "example.test");
++  in_rac.creation = base::Time::Now() - base::Days(1);
++  SeedCookie(in_rac);
++
++  std::vector<ImportedCookie> cookies;
++  cookies.push_back(MakeCookie("a", "example.test"));
++  cookies.push_back(MakeCookie("b", ".example.test"));
++  ImportedCookie expired = MakeCookie("c", "example.test");
++  expired.expiry = base::Time::Now() - base::Days(1);
++  cookies.push_back(expired);
++  cookies.push_back(MakeCookie("__Host-d", ".example.test"));
++  cookies.push_back(MakeCookie("__Secure-e", "example.test", /*secure=*/false));
++  ImportedCookie bad_key = MakeCookie("f", "example.test");
++  bad_key.partition_key = "::";
++  cookies.push_back(bad_key);
++  cookies.push_back(MakeCookie("g", ".test"));  // Public suffix.
++  ImportedCookie bad_value = MakeCookie("h", "example.test");
++  bad_value.value = "semi;colon";
++  cookies.push_back(bad_value);
++  ImportedCookie none_insecure =
++      MakeCookie("i", "example.test", /*secure=*/false);
++  none_insecure.same_site = net::CookieSameSite::NO_RESTRICTION;
++  cookies.push_back(none_insecure);
++  ImportedCookie duplicate = MakeCookie("a", "example.test");
++  duplicate.creation = base::Time::Now() - base::Days(20);
++  cookies.push_back(duplicate);
++  cookies.push_back(MakeCookie("j", "example.test"));  // Older than rac's.
++  cookies.push_back(MakeCookie("k", "blocked.test"));
++  cookies.push_back(MakeCookie("l", "session.test"));
++
++  const CookieWriteReport report = Write(
++      std::move(cookies),
++      base::BindRepeating([](const net::CanonicalCookie& cookie, const GURL&) {
++        if (cookie.Domain() == "blocked.test") {
++          return CookieSettingsDecision::kBlock;
++        }
++        if (cookie.Domain() == "session.test") {
++          return CookieSettingsDecision::kClearOnExit;
++        }
++        return CookieSettingsDecision::kAllow;
++      }));
++  EXPECT_EQ(report.total, 13u);
++  EXPECT_EQ(report.set, 2u);
++  EXPECT_EQ(report.skipped_expired, 1u);
++  EXPECT_EQ(report.skipped_duplicate, 1u);
++  EXPECT_EQ(report.skipped_newer_in_rac, 1u);
++  EXPECT_EQ(report.skipped_blocked_by_settings, 1u);
++  EXPECT_EQ(report.skipped_clear_on_exit, 1u);
++  EXPECT_EQ(report.skipped_total(), 5u);
++  EXPECT_EQ(report.rejected_count(CookieRejectReason::kInvalidPrefix), 2u);
++  EXPECT_EQ(report.rejected_count(CookieRejectReason::kInvalidPartitionKey),
++            1u);
++  EXPECT_EQ(report.rejected_count(CookieRejectReason::kInvalidDomain), 1u);
++  EXPECT_EQ(report.rejected_count(CookieRejectReason::kInvalidNameOrValue),
++            1u);
++  EXPECT_EQ(report.rejected_count(CookieRejectReason::kSameSiteNoneInsecure),
++            1u);
++  EXPECT_EQ(report.rejected_total(), 6u);
++  EXPECT_EQ(report.total,
++            report.set + report.skipped_expired + report.skipped_duplicate +
++                report.skipped_newer_in_rac +
++                report.skipped_blocked_by_settings +
++                report.skipped_clear_on_exit + report.rejected_total());
++  // "a", "b" and rac's own "j".
++  EXPECT_EQ(AllCookies().size(), 3u);
++}
++
++// --- Cookies already in rac. The newer one is kept; a tie keeps rac's.
++
++TEST_F(CookieWriterTest, KeepsNewerCookieAlreadyInRac) {
++  ImportedCookie in_rac = MakeCookie("session", ".example.test");
++  in_rac.value = "rac";
++  in_rac.creation = base::Time::Now() - base::Days(1);
++  SeedCookie(in_rac);
++
++  ImportedCookie imported = MakeCookie("session", ".example.test");
++  imported.value = "arc";
++  imported.creation = base::Time::Now() - base::Days(5);
++  const CookieWriteReport report = Write({imported});
++  EXPECT_EQ(report.total, 1u);
++  EXPECT_EQ(report.set, 0u);
++  EXPECT_EQ(report.skipped_newer_in_rac, 1u);
++  ASSERT_EQ(AllCookies().size(), 1u);
++  EXPECT_EQ(FindCookie("session")->Value(), "rac");
++}
++
++TEST_F(CookieWriterTest, ReplacesOlderCookieAlreadyInRac) {
++  ImportedCookie in_rac = MakeCookie("session", ".example.test");
++  in_rac.value = "rac";
++  in_rac.creation = base::Time::Now() - base::Days(5);
++  SeedCookie(in_rac);
++
++  ImportedCookie imported = MakeCookie("session", ".example.test");
++  // A different value, or the store keeps the old creation time.
++  imported.value = "arc";
++  imported.creation = base::Time::Now() - base::Days(1);
++  imported.last_access = imported.creation;
++  const base::Time creation = imported.creation;
++  const CookieWriteReport report = Write({imported});
++  EXPECT_EQ(report.set, 1u);
++  EXPECT_EQ(report.skipped_newer_in_rac, 0u);
++  ASSERT_EQ(AllCookies().size(), 1u);
++  std::optional<net::CanonicalCookie> out = FindCookie("session");
++  ASSERT_TRUE(out);
++  EXPECT_EQ(out->Value(), "arc");
++  EXPECT_EQ(out->CreationDate(), creation);
++}
++
++TEST_F(CookieWriterTest, EqualCreationTimeKeepsRacsCookie) {
++  ImportedCookie in_rac = MakeCookie("session", "example.test");
++  in_rac.value = "rac";
++  SeedCookie(in_rac);
++
++  ImportedCookie imported = in_rac;
++  imported.value = "arc";
++  const CookieWriteReport report = Write({imported});
++  EXPECT_EQ(report.set, 0u);
++  EXPECT_EQ(report.skipped_newer_in_rac, 1u);
++  EXPECT_EQ(FindCookie("session")->Value(), "rac");
++}
++
++TEST_F(CookieWriterTest, NewerInRacOnlyMatchesTheSameCookie) {
++  // A newer rac cookie with the same name but another path, domain or
++  // partition is a different cookie, and doesn't stop the import.
++  ImportedCookie in_rac = MakeCookie("c", "example.test");
++  in_rac.path = "/rac";
++  in_rac.creation = base::Time::Now() - base::Days(1);
++  SeedCookie(in_rac);
++  ImportedCookie in_rac_partitioned = MakeCookie("c", "example.test");
++  in_rac_partitioned.partition_key = "https://top.test";
++  in_rac_partitioned.creation = base::Time::Now() - base::Days(1);
++  SeedCookie(in_rac_partitioned);
++
++  ImportedCookie other_path = MakeCookie("c", "example.test");
++  ImportedCookie other_domain = MakeCookie("c", ".example.test");
++  ImportedCookie other_partition = MakeCookie("c", "example.test");
++  other_partition.partition_key = "https://other.test";
++  ImportedCookie same_partition = in_rac_partitioned;
++  same_partition.creation = base::Time::Now() - base::Days(5);
++  const CookieWriteReport report =
++      Write({other_path, other_domain, other_partition, same_partition});
++  EXPECT_EQ(report.set, 3u);
++  EXPECT_EQ(report.skipped_newer_in_rac, 1u);
++  EXPECT_EQ(AllCookies().size(), 5u);
++}
++
++TEST(CookieWriterPrepareTest, SkipCookiesNotNewerThanMatchesByLegacyKey) {
++  const base::Time now = base::Time::Now();
++  ImportedCookie older = MakeCookie("older", "example.test");
++  older.creation = now - base::Days(5);
++  ImportedCookie tie = MakeCookie("tie", "example.test");
++  tie.creation = now - base::Days(3);
++  ImportedCookie newer = MakeCookie("newer", "example.test");
++  newer.creation = now - base::Days(1);
++  ImportedCookie unrelated = MakeCookie("unrelated", "example.test");
++
++  // rac's copies were set over http on another port. The store treats them
++  // as the same cookies, so the comparison does too.
++  auto rac_copy = [&](const std::string& name, base::Time creation) {
++    ImportedCookie in_rac = MakeCookie(name, "example.test", /*secure=*/false);
++    in_rac.source_port = 8080;
++    in_rac.creation = creation;
++    in_rac.last_access = creation;
++    internal::PrepareResult result = internal::PrepareCookies({in_rac}, now);
++    CHECK_EQ(result.ready.size(), 1u);
++    return result.ready[0].cookie;
++  };
++  std::vector<net::CanonicalCookie> existing = {
++      rac_copy("older", now - base::Days(3)),
++      rac_copy("tie", now - base::Days(3)),
++      rac_copy("newer", now - base::Days(3)),
++  };
++
++  internal::PrepareResult result = internal::SkipCookiesNotNewerThan(
++      internal::PrepareCookies({older, tie, newer, unrelated}, now),
++      std::move(existing));
++  EXPECT_EQ(result.report.total, 4u);
++  EXPECT_EQ(result.report.skipped_newer_in_rac, 2u);
++  ASSERT_EQ(result.ready.size(), 2u);
++  // Still oldest first.
++  EXPECT_EQ(result.ready[0].cookie.Name(), "unrelated");
++  EXPECT_EQ(result.ready[1].cookie.Name(), "newer");
++}
++
++TEST_F(CookieWriterTest, RetriesLostReadOfExistingCookiesOnce) {
++  FakeCookieManager manager(FakeCookieManager::Mode::kAccept);
++  manager.set_drop_reads(1);
++  const CookieWriteReport report =
++      WriteWith(&manager, {MakeCookie("a", "example.test")});
++  EXPECT_EQ(report.set, 1u);
++  EXPECT_EQ(manager.read_calls(), 2u);
++}
++
++TEST_F(CookieWriterTest, FailsImportWhenReadOfExistingCookiesIsLostTwice) {
++  // Without the read, the writer can't tell which imports are older than
++  // rac's, so it sends nothing rather than overwrite blindly.
++  FakeCookieManager manager(FakeCookieManager::Mode::kAccept);
++  manager.set_drop_reads(2);
++  const CookieWriteReport report = WriteWith(
++      &manager,
++      {MakeCookie("a", "example.test"), MakeCookie("b", "example.test")});
++  EXPECT_EQ(report.set, 0u);
++  EXPECT_EQ(report.rejected_count(CookieRejectReason::kStoreRefused), 2u);
++  EXPECT_EQ(manager.read_calls(), 2u);
++  EXPECT_EQ(manager.set_calls(), 0u);
++  EXPECT_EQ(manager.flush_calls(), 0u);
++}
++
++TEST_F(CookieWriterTest, SkipsReadWhenNothingIsLeftToWrite) {
++  FakeCookieManager manager(FakeCookieManager::Mode::kAccept);
++  ImportedCookie expired = MakeCookie("expired", "example.test");
++  expired.expiry = base::Time::Now() - base::Days(1);
++  WriteWith(&manager, {expired});
++  EXPECT_EQ(manager.read_calls(), 0u);
++}
++
++// --- rac's cookie settings, through a fake filter. The real filter is
++// tested against a TestingProfile in cookie_writer_profile_unittest.cc.
++
++TEST_F(CookieWriterTest, SkipsHostBlockedBySettings) {
++  const CookieWriteReport report = Write(
++      {MakeCookie("blocked", "blocked.test"),
++       MakeCookie("allowed", "allowed.test")},
++      FakeSettings(CookieSettingsDecision::kBlock, {"blocked.test"}));
++  EXPECT_EQ(report.total, 2u);
++  EXPECT_EQ(report.set, 1u);
++  EXPECT_EQ(report.skipped_blocked_by_settings, 1u);
++  EXPECT_FALSE(FindCookie("blocked"));
++  EXPECT_TRUE(FindCookie("allowed"));
++}
++
++TEST_F(CookieWriterTest, SkipsHostClearedOnExit) {
++  const CookieWriteReport report = Write(
++      {MakeCookie("cleared", "session.test"),
++       MakeCookie("allowed", "allowed.test")},
++      FakeSettings(CookieSettingsDecision::kClearOnExit, {"session.test"}));
++  EXPECT_EQ(report.set, 1u);
++  EXPECT_EQ(report.skipped_clear_on_exit, 1u);
++  EXPECT_EQ(report.skipped_blocked_by_settings, 0u);
++  EXPECT_FALSE(FindCookie("cleared"));
++  EXPECT_TRUE(FindCookie("allowed"));
++}
++
++TEST_F(CookieWriterTest, DefaultBlockSkipsEverything) {
++  // More than one batch, so whole stretches with nothing to send still move
++  // on to the next.
++  FakeCookieManager manager(FakeCookieManager::Mode::kAccept);
++  const size_t kCount = CookieWriter::kBatchSize * 2 + 7;
++  const CookieWriteReport report =
++      WriteWith(&manager, ManyCookies(kCount),
++                FakeSettings(CookieSettingsDecision::kBlock));
++  EXPECT_EQ(report.total, kCount);
++  EXPECT_EQ(report.set, 0u);
++  EXPECT_EQ(report.skipped_blocked_by_settings, kCount);
++  EXPECT_EQ(manager.set_calls(), 0u);
++  // Nothing was set, so there's nothing to flush.
++  EXPECT_EQ(manager.flush_calls(), 0u);
++}
++
++TEST_F(CookieWriterTest, AllowedHostIsWrittenUnchanged) {
++  // A filter that allows the cookie changes nothing about how it's written.
++  ImportedCookie in = MakeCookie("allowed", ".allowed.test");
++  in.http_only = true;
++  in.same_site = net::CookieSameSite::STRICT_MODE;
++  const base::Time creation = in.creation;
++  const CookieWriteReport report = Write(
++      {in}, FakeSettings(CookieSettingsDecision::kBlock, {"blocked.test"}));
++  EXPECT_EQ(report.set, 1u);
++  EXPECT_EQ(report.skipped_blocked_by_settings, 0u);
++  std::optional<net::CanonicalCookie> out = FindCookie("allowed");
++  ASSERT_TRUE(out);
++  EXPECT_EQ(out->Domain(), ".allowed.test");
++  EXPECT_TRUE(out->IsHttpOnly());
++  EXPECT_EQ(out->SameSite(), net::CookieSameSite::STRICT_MODE);
++  EXPECT_EQ(out->CreationDate(), creation);
++}
++
++TEST_F(CookieWriterTest, FilterSeesEachCookieOnceWithItsSourceUrl) {
++  // Also across a resend: a cookie already checked isn't asked about again.
++  FakeCookieManager old_manager(FakeCookieManager::Mode::kHold);
++  FakeCookieManager new_manager(FakeCookieManager::Mode::kAccept);
++  network::mojom::CookieManager* current = &old_manager;
++  std::vector<GURL> asked;
++  CookieWriter writer(
++      base::BindLambdaForTesting(
++          [&]() -> network::mojom::CookieManager* { return current; }),
++      base::BindLambdaForTesting(
++          [&](const net::CanonicalCookie&, const GURL& source_url) {
++            asked.push_back(source_url);
++            return CookieSettingsDecision::kAllow;
++          }));
++
++  ImportedCookie insecure = MakeCookie("a", "a.test", /*secure=*/false);
++  insecure.source_port = 8080;
++  base::test::TestFuture<const CookieWriteReport&> done;
++  writer.Write({insecure}, done.GetCallback());
++  ASSERT_TRUE(
++      base::test::RunUntil([&] { return old_manager.held_sets() == 1; }));
++  current = &new_manager;
++  old_manager.DropHeldCalls();
++
++  EXPECT_EQ(done.Get().set, 1u);
++  ASSERT_EQ(asked.size(), 1u);
++  EXPECT_EQ(asked[0], GURL("http://a.test:8080/"));
++}
++
++// --- Batching, connection loss, flush and lifetime.
++
++TEST_F(CookieWriterTest, WritesAcrossSeveralBatches) {
++  const size_t kCount = CookieWriter::kBatchSize * 2 + 7;
++  const CookieWriteReport report = Write(ManyCookies(kCount));
++  EXPECT_EQ(report.total, kCount);
++  EXPECT_EQ(report.set, kCount);
++  EXPECT_EQ(AllCookies().size(), kCount);
++}
++
++TEST_F(CookieWriterTest, EmptyInputFinishes) {
++  const CookieWriteReport report = Write({});
++  EXPECT_EQ(report.total, 0u);
++  EXPECT_EQ(report.set, 0u);
++}
++
++TEST_F(CookieWriterTest, FailsRemainingCookiesWhenNoCookieManager) {
++  CookieWriter writer(
++      base::BindRepeating(
++          []() -> network::mojom::CookieManager* { return nullptr; }),
++      AllowAll());
++  base::test::TestFuture<const CookieWriteReport&> done;
++  writer.Write(
++      {MakeCookie("a", "example.test"), MakeCookie("b", "example.test")},
++      done.GetCallback());
++  EXPECT_EQ(done.Get().set, 0u);
++  EXPECT_EQ(done.Get().rejected_count(CookieRejectReason::kStoreRefused), 2u);
++}
++
++TEST_F(CookieWriterTest, RetriesDroppedBatchOnceOnNewManager) {
++  // A network service restart with a whole batch in flight: the old remote
++  // drops every pending callback and the getter returns a new manager.
++  FakeCookieManager old_manager(FakeCookieManager::Mode::kHold);
++  FakeCookieManager new_manager(FakeCookieManager::Mode::kAccept);
++  network::mojom::CookieManager* current = &old_manager;
++  CookieWriter writer(
++      base::BindLambdaForTesting(
++          [&]() -> network::mojom::CookieManager* { return current; }),
++      AllowAll());
++
++  const size_t kCount = CookieWriter::kBatchSize + 10;
++  base::test::TestFuture<const CookieWriteReport&> done;
++  writer.Write(ManyCookies(kCount), done.GetCallback());
++  ASSERT_TRUE(base::test::RunUntil([&] {
++    return old_manager.held_sets() == CookieWriter::kBatchSize;
++  }));
++
++  current = &new_manager;
++  old_manager.DropHeldCalls();
++  EXPECT_FALSE(done.IsReady());
++
++  const CookieWriteReport& report = done.Get();
++  EXPECT_EQ(report.total, kCount);
++  EXPECT_EQ(report.set, kCount);
++  EXPECT_EQ(report.rejected_total(), 0u);
++  EXPECT_EQ(old_manager.set_calls(), CookieWriter::kBatchSize);
++  // The dropped batch again, then the 10 never sent.
++  EXPECT_EQ(new_manager.set_calls(), kCount);
++  EXPECT_EQ(old_manager.flush_calls(), 0u);
++  EXPECT_EQ(new_manager.flush_calls(), 1u);
++}
++
++TEST_F(CookieWriterTest, FailsCookiesDroppedTwice) {
++  // A manager whose pipe stays dead: every call is retried once, then fails.
++  FakeCookieManager dead(FakeCookieManager::Mode::kDrop);
++  const size_t kCount = CookieWriter::kBatchSize + 10;
++  const CookieWriteReport report = WriteWith(&dead, ManyCookies(kCount));
++  EXPECT_EQ(report.set, 0u);
++  EXPECT_EQ(report.rejected_count(CookieRejectReason::kStoreRefused), kCount);
++  EXPECT_EQ(dead.set_calls(), kCount * 2);
++  // Nothing was set, so there's nothing to flush.
++  EXPECT_EQ(dead.flush_calls(), 0u);
++}
++
++TEST_F(CookieWriterTest, FailsRemainingCookiesWhenManagerGoesAway) {
++  // The profile closes mid-import: the in-flight batch still lands, and the
++  // getter returns null for the rest.
++  FakeCookieManager manager(FakeCookieManager::Mode::kHold);
++  network::mojom::CookieManager* current = &manager;
++  CookieWriter writer(
++      base::BindLambdaForTesting(
++          [&]() -> network::mojom::CookieManager* { return current; }),
++      AllowAll());
++
++  const size_t kCount = CookieWriter::kBatchSize + 10;
++  base::test::TestFuture<const CookieWriteReport&> done;
++  writer.Write(ManyCookies(kCount), done.GetCallback());
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return manager.held_sets() == CookieWriter::kBatchSize; }));
++
++  current = nullptr;
++  manager.AcceptHeldSets();
++
++  const CookieWriteReport& report = done.Get();
++  EXPECT_EQ(report.set, CookieWriter::kBatchSize);
++  EXPECT_EQ(report.rejected_count(CookieRejectReason::kStoreRefused), 10u);
++  EXPECT_EQ(manager.flush_calls(), 0u);
++}
++
++TEST_F(CookieWriterTest, FlushesOnceAfterEveryCookieIsAcknowledged) {
++  FakeCookieManager manager(FakeCookieManager::Mode::kHold);
++  std::unique_ptr<CookieWriter> writer =
++      CookieWriter::CreateForTesting(&manager);
++  base::test::TestFuture<const CookieWriteReport&> done;
++  writer->Write({MakeCookie("a", "example.test"),
++                 MakeCookie("b", "example.test"),
++                 MakeCookie("c", "example.test")},
++                done.GetCallback());
++  ASSERT_TRUE(base::test::RunUntil([&] { return manager.held_sets() == 3; }));
++  EXPECT_EQ(manager.flush_calls(), 0u);
++
++  manager.AcceptHeldSets();
++  ASSERT_TRUE(base::test::RunUntil([&] { return manager.has_held_flush(); }));
++  EXPECT_EQ(manager.flush_calls(), 1u);
++  EXPECT_EQ(manager.sets_before_flush(), 3u);
++
++  // `done` waits for the flush.
++  task_environment_.RunUntilIdle();
++  EXPECT_FALSE(done.IsReady());
++  manager.AnswerFlush();
++  EXPECT_EQ(done.Get().set, 3u);
++  EXPECT_EQ(manager.flush_calls(), 1u);
++}
++
++TEST_F(CookieWriterTest, SkipsFlushWhenNothingWasSet) {
++  FakeCookieManager manager(FakeCookieManager::Mode::kAccept);
++  ImportedCookie expired = MakeCookie("expired", "example.test");
++  expired.expiry = base::Time::Now() - base::Days(1);
++  const CookieWriteReport report = WriteWith(&manager, {expired});
++  EXPECT_EQ(report.skipped_expired, 1u);
++  EXPECT_EQ(manager.set_calls(), 0u);
++  EXPECT_EQ(manager.flush_calls(), 0u);
++}
++
++TEST_F(CookieWriterTest, DoneIsPostedWhenFlushIsDropped) {
++  // Profile teardown destroys the remote with the flush pending, which runs
++  // the flush callback from inside the remote's destructor. `done` must not
++  // run there.
++  FakeCookieManager manager(FakeCookieManager::Mode::kHold);
++  std::unique_ptr<CookieWriter> writer =
++      CookieWriter::CreateForTesting(&manager);
++  base::test::TestFuture<const CookieWriteReport&> done;
++  writer->Write({MakeCookie("a", "example.test")}, done.GetCallback());
++  ASSERT_TRUE(base::test::RunUntil([&] { return manager.held_sets() == 1; }));
++  manager.AcceptHeldSets();
++  ASSERT_TRUE(base::test::RunUntil([&] { return manager.has_held_flush(); }));
++
++  manager.DropHeldCalls();
++  EXPECT_FALSE(done.IsReady());
++  EXPECT_EQ(done.Get().set, 1u);
++}
++
++TEST_F(CookieWriterTest, DeletingWriterBeforePrepareCancels) {
++  FakeCookieManager manager(FakeCookieManager::Mode::kAccept);
++  std::unique_ptr<CookieWriter> writer =
++      CookieWriter::CreateForTesting(&manager);
++  bool done_ran = false;
++  writer->Write(
++      {MakeCookie("a", "example.test")},
++      base::BindLambdaForTesting(
++          [&](const CookieWriteReport&) { done_ran = true; }));
++  writer.reset();
++  task_environment_.RunUntilIdle();
++  EXPECT_FALSE(done_ran);
++  EXPECT_EQ(manager.set_calls(), 0u);
++}
++
++TEST_F(CookieWriterTest, DeletingWriterMidBatchCancels) {
++  // Late replies and dropped calls both arrive after the writer is gone.
++  for (const bool drop : {false, true}) {
++    SCOPED_TRACE(drop);
++    FakeCookieManager manager(FakeCookieManager::Mode::kHold);
++    std::unique_ptr<CookieWriter> writer =
++        CookieWriter::CreateForTesting(&manager);
++    bool done_ran = false;
++    writer->Write(ManyCookies(CookieWriter::kBatchSize + 10),
++                  base::BindLambdaForTesting(
++                      [&](const CookieWriteReport&) { done_ran = true; }));
++    ASSERT_TRUE(base::test::RunUntil(
++        [&] { return manager.held_sets() == CookieWriter::kBatchSize; }));
++
++    writer.reset();
++    if (drop) {
++      manager.DropHeldCalls();
++    } else {
++      manager.AcceptHeldSets();
++    }
++    task_environment_.RunUntilIdle();
++    EXPECT_FALSE(done_ran);
++    EXPECT_EQ(manager.set_calls(), CookieWriter::kBatchSize);
++    EXPECT_EQ(manager.flush_calls(), 0u);
++  }
++}
++
++TEST_F(CookieWriterTest, WriterCanBeDeletedFromDone) {
++  FakeCookieManager manager(FakeCookieManager::Mode::kAccept);
++  std::unique_ptr<CookieWriter> writer =
++      CookieWriter::CreateForTesting(&manager);
++  base::RunLoop run_loop;
++  size_t set = 0;
++  writer->Write(
++      {MakeCookie("a", "example.test")},
++      base::BindLambdaForTesting([&](const CookieWriteReport& report) {
++        writer.reset();
++        // Still valid: the writer passes its own copy.
++        set = report.set;
++        run_loop.Quit();
++      }));
++  run_loop.Run();
++  EXPECT_FALSE(writer);
++  EXPECT_EQ(set, 1u);
++}
++
++TEST_F(CookieWriterTest, WriteTwiceCrashes) {
++  FakeCookieManager manager(FakeCookieManager::Mode::kAccept);
++  std::unique_ptr<CookieWriter> writer =
++      CookieWriter::CreateForTesting(&manager);
++  base::test::TestFuture<const CookieWriteReport&> done;
++  writer->Write({}, done.GetCallback());
++  ASSERT_TRUE(done.Wait());
++  // `done_` is empty again here, so only `started_` catches this.
++  EXPECT_CHECK_DEATH(writer->Write({}, base::DoNothing()));
++}
++
++}  // namespace
++}  // namespace rac::import
