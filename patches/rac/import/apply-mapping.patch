@@ -2,7 +2,7 @@ The pure half of the Arc import: maps an import plan onto spaces, pinned tabs,
 and favorites, and keeps the import record. No profile or browser state.
 --- a/chrome/browser/rac/import/BUILD.gn
 +++ b/chrome/browser/rac/import/BUILD.gn
-@@ -46,23 +46,49 @@ source_set("arc_source") {
+@@ -46,23 +46,50 @@ source_set("arc_source") {
    ]
  }
  
@@ -34,6 +34,7 @@ and favorites, and keeps the import record. No profile or browser state.
    sources = [
 +    "arc_import_mapping_unittest.cc",
 +    "arc_import_record_unittest.cc",
++    "arc_import_rerun_unittest.cc",
      "arc_reader_unittest.cc",
      "arc_source_root_unittest.cc",
    ]
@@ -5595,3 +5596,320 @@ and favorites, and keeps the import record. No profile or browser state.
 +}  // namespace rac
 +
 +#endif  // CHROME_BROWSER_RAC_IMPORT_ARC_IMPORT_TYPES_H_
+--- /dev/null
++++ b/chrome/browser/rac/import/arc_import_rerun_unittest.cc
+@@ -0,0 +1,314 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Reruns and retries across the import record and the mapping: how an
++// interrupted run meets an edited Arc file, and how Undo is retried after
++// a partial Undo or a blocked profile.
++
++#include <string>
++#include <utility>
++#include <variant>
++#include <vector>
++
++#include "base/containers/flat_set.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/time/time.h"
++#include "chrome/browser/rac/import/arc_import_mapping.h"
++#include "chrome/browser/rac/import/arc_import_record.h"
++#include "chrome/browser/rac/import/arc_import_types.h"
++#include "chrome/browser/rac/import/import_plan.h"
++#include "testing/gmock/include/gmock/gmock.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++using ::testing::ElementsAre;
++using ::testing::IsEmpty;
++using ::testing::UnorderedElementsAre;
++
++using ItemKind = ArcImportRecord::ItemKind;
++using Interrupted = ArcImportRecord::Interrupted;
++
++base::Time At(double seconds) {
++  return base::Time::FromSecondsSinceUnixEpoch(seconds);
++}
++
++ImportItem MakeTab(std::string id, std::string url) {
++  ImportItem item;
++  item.kind = ImportItem::Kind::kTab;
++  item.source_id = std::move(id);
++  item.url = std::move(url);
++  return item;
++}
++
++ImportItem MakeFolder(std::string id,
++                  std::string title,
++                  std::vector<ImportItem> children) {
++  ImportItem item;
++  item.kind = ImportItem::Kind::kFolder;
++  item.source_id = std::move(id);
++  item.title = std::move(title);
++  item.children = std::move(children);
++  return item;
++}
++
++ImportSpace MakeSpace(std::string id, std::vector<ImportItem> pinned) {
++  ImportSpace space;
++  space.source_id = std::move(id);
++  space.title = "Work";
++  space.pinned = std::move(pinned);
++  return space;
++}
++
++ArcImportRecord::Run MakeRun(const std::string& id, double seconds) {
++  ArcImportRecord::Run run;
++  run.id = id;
++  run.time = At(seconds);
++  run.snapshot_id = "snapshot-" + id;
++  run.snapshot_time = At(seconds);
++  run.undo_until = At(seconds + 7 * 24 * 3600);
++  return run;
++}
++
++
++const ArcApplyTab& TabAt(const ArcApplySpace& space, size_t index) {
++  return std::get<ArcApplyTab>(space.pinned.at(index));
++}
++
++const ArcApplyFolder& FolderAt(const ArcApplySpace& space, size_t index) {
++  return std::get<ArcApplyFolder>(space.pinned.at(index));
++}
++
++// Everything AssignRacIds() gave out, as if the applier wrote it.
++void AddWritten(const ArcApplyPlan& plan, ArcLiveSidebar& live) {
++  for (const ArcApplySpace& space : plan.spaces) {
++    if (space.is_new()) {
++      live.space_ids.insert(space.rac_id);
++    }
++    for (const ArcApplyEntry& entry : space.pinned) {
++      if (const auto* tab = std::get_if<ArcApplyTab>(&entry)) {
++        live.sidebar_ids.insert(tab->rac_id);
++        continue;
++      }
++      const ArcApplyFolder& folder = std::get<ArcApplyFolder>(entry);
++      if (folder.existing_id.empty()) {
++        live.sidebar_ids.insert(folder.rac_id);
++      }
++      for (const ArcApplyTab& tab : folder.tabs) {
++        live.sidebar_ids.insert(tab.rac_id);
++      }
++    }
++  }
++  for (const ArcApplyTab& favorite : plan.favorites) {
++    live.sidebar_ids.insert(favorite.rac_id);
++    live.favorite_urls.insert(favorite.url.spec());
++  }
++}
++
++// ---------------------------------------------------------------------------
++// An interrupted run, and Arc's file edited before the relaunch.
++
++// The import was cut short with part of it on disk, and Arc has changed
++// since: a pin renamed, one added, a tab added to a folder. The next import
++// settles the old run first (FinishInterrupted), then brings what didn't
++// land and what's new, each once, and leaves what landed alone.
++TEST(ArcImportRerunTest, InterruptedRunThenAnEditedArcFile) {
++  ArcImportRecord record;
++  ArcImportRecord::Run cut = MakeRun("cut", 1000);
++  cut.in_progress = true;
++  record.AddRun(cut);
++  record.MapSpace("arc-space", "space-1", "cut");
++  record.MapItem("a1", "rac-a1", ItemKind::kPinnedTab, "cut");
++  record.MapItem("a2", "rac-a2", ItemKind::kPinnedTab, "cut");
++  record.MapItem("folder", "rac-folder", ItemKind::kFolder, "cut");
++  record.MapItem("a3", "rac-a3", ItemKind::kPinnedTab, "cut");
++
++  // What reached disk: the space, a1, and the folder; not a2 or a3.
++  ArcLiveSidebar live;
++  live.space_ids = {"space-1"};
++  live.sidebar_ids = {"rac-a1", "rac-folder"};
++
++  ASSERT_EQ(record.FinishInterrupted(live.space_ids, live.sidebar_ids),
++            Interrupted::kFinished);
++  EXPECT_FALSE(record.FindItem("a2"));
++  EXPECT_FALSE(record.FindItem("a3"));
++  EXPECT_TRUE(record.UndoableRun(At(2000)));
++
++  // Arc's file at relaunch.
++  ImportItem renamed = MakeTab("a1", "https://one.test/");
++  renamed.title = "Renamed in Arc";
++  ImportProfile profile;
++  profile.spaces.push_back(MakeSpace(
++      "arc-space",
++      {std::move(renamed), MakeTab("a2", "https://two.test/"),
++       MakeFolder("folder", "Docs",
++                  {MakeTab("a3", "https://three.test/"),
++                   MakeTab("a5", "https://five.test/")}),
++       MakeTab("a4", "https://four.test/")}));
++
++  ArcApplyPlan plan = MapArcProfile(profile, record, live, {});
++  ASSERT_EQ(plan.spaces.size(), 1u);
++  const ArcApplySpace& space = plan.spaces[0];
++  EXPECT_EQ(space.existing_id, "space-1");
++  ASSERT_EQ(space.pinned.size(), 3u);
++  EXPECT_EQ(TabAt(space, 0).source_id, "a2");
++  EXPECT_EQ(FolderAt(space, 1).existing_id, "rac-folder");
++  ASSERT_EQ(FolderAt(space, 1).tabs.size(), 2u);
++  EXPECT_EQ(FolderAt(space, 1).tabs[0].source_id, "a3");
++  EXPECT_EQ(FolderAt(space, 1).tabs[1].source_id, "a5");
++  EXPECT_EQ(TabAt(space, 2).source_id, "a4");
++  EXPECT_EQ(plan.counts.spaces, 0);
++  EXPECT_EQ(plan.counts.folders, 0);
++  EXPECT_EQ(plan.counts.pinned_tabs, 4);
++  // The space, a1 (renamed in Arc, kept as the user has it), the folder.
++  EXPECT_EQ(plan.counts.already_imported, 3);
++
++  // The new run, saved in progress, then written in full.
++  ArcImportRecord::Run next = MakeRun("next", 3000);
++  next.in_progress = true;
++  record.AddRun(next);
++  int next_id = 0;
++  AssignRacIds(plan, record, "next",
++               [&] { return "new-" + base::NumberToString(++next_id); });
++  AddWritten(plan, live);
++  EXPECT_EQ(record.FinishInterrupted(live.space_ids, live.sidebar_ids),
++            Interrupted::kFinished);
++  EXPECT_THAT(record.ItemsOfRun("next", ItemKind::kPinnedTab),
++              UnorderedElementsAre("new-1", "new-2", "new-3",
++                                              "new-4"));
++  EXPECT_EQ(record.FindItem("a1")->rac_id, "rac-a1");
++  EXPECT_EQ(record.FindItem("a1")->run_id, "cut");
++
++  // Imported once: a third look finds nothing new.
++  EXPECT_TRUE(MapArcProfile(profile, record, live, {}).IsEmpty());
++}
++
++// ---------------------------------------------------------------------------
++// Retrying Undo.
++
++// The first Undo puts the blank space back and deletes one of two spaces;
++// a page keeps the other. The retry doesn't put the blank space back again
++// (RestoreSpace upserts, and would overwrite what the user did with it
++// since), still sends kept pins there, and ends the run.
++TEST(ArcImportRerunTest, RetryAfterAPartialUndoKeepsTheRestoredBlankSpace) {
++  ArcImportRecord record;
++  ArcImportRecord::Run run = MakeRun("run", 1000);
++  run.replaced_blank_space = "blank";
++  record.AddRun(run);
++  record.MapSpace("arc-1", "space-1", "run");
++  record.MapSpace("arc-2", "space-2", "run");
++  record.MapItem("p1", "pin-1", ItemKind::kPinnedTab, "run");
++  record.MapItem("p2", "pin-2", ItemKind::kPinnedTab, "run");
++
++  const std::vector<std::string> run_spaces = record.SpacesOfRun("run");
++  ArcUndoSpaces first =
++      PlanUndoSpaces({"space-1", "space-2"}, run_spaces, "blank");
++  EXPECT_TRUE(first.restore_blank);
++  EXPECT_FALSE(first.create_space);
++  EXPECT_EQ(first.target_space, "blank");
++
++  // space-2 stayed, with its pin.
++  record.ForgetRemoved("run", {"space-1", "pin-1"}, At(2000));
++  ASSERT_TRUE(record.UndoableRun(At(2000)));
++  EXPECT_EQ(record.UndoableRun(At(2000))->id, "run");
++  EXPECT_EQ(record.FindRun("run")->replaced_blank_space, "blank");
++  EXPECT_EQ(record.StateAt(At(2000)).status,
++            ArcImportState::Status::kUndoable);
++
++  ArcUndoSpaces retry =
++      PlanUndoSpaces({"blank", "space-2"}, record.SpacesOfRun("run"), "blank");
++  EXPECT_FALSE(retry.restore_blank);
++  EXPECT_FALSE(retry.create_space);
++  EXPECT_EQ(retry.target_space, "blank");
++
++  record.ForgetRemoved("run", {"space-2", "pin-2"}, At(3000));
++  EXPECT_TRUE(record.FindRun("run")->undone);
++  EXPECT_EQ(record.StateAt(At(3000)).status, ArcImportState::Status::kUndone);
++}
++
++// Without a blank space, and with every space the run's, Undo makes a new
++// one first. On the retry that space is the user's like any other: kept
++// pins go there, and no second one is made. If the first try deleted it
++// again (nothing moved into it), the retry makes one again.
++TEST(ArcImportRerunTest, RetryAfterAPartialUndoWithAMadeSpace) {
++  const std::vector<std::string> run_spaces = {"space-1", "space-2"};
++  ArcUndoSpaces first = PlanUndoSpaces(run_spaces, run_spaces, std::string());
++  EXPECT_FALSE(first.restore_blank);
++  EXPECT_TRUE(first.create_space);
++  EXPECT_TRUE(first.target_space.empty());
++
++  ArcUndoSpaces kept_made =
++      PlanUndoSpaces({"made", "space-2"}, {"space-2"}, std::string());
++  EXPECT_FALSE(kept_made.create_space);
++  EXPECT_EQ(kept_made.target_space, "made");
++
++  ArcUndoSpaces made_deleted =
++      PlanUndoSpaces({"space-2"}, {"space-2"}, std::string());
++  EXPECT_TRUE(made_deleted.create_space);
++  EXPECT_TRUE(made_deleted.target_space.empty());
++}
++
++TEST(ArcImportRerunTest, UndoSpacesPickTheFirstSpaceTheRunDidNotMake) {
++  ArcUndoSpaces plan = PlanUndoSpaces({"space-1", "mine-1", "mine-2"},
++                                      {"space-1"}, std::string());
++  EXPECT_FALSE(plan.restore_blank);
++  EXPECT_FALSE(plan.create_space);
++  EXPECT_EQ(plan.target_space, "mine-1");
++}
++
++// One import wrote into the starting profile and into "Profile 2". Profile
++// 2 has had a newer import since, so Undo there is blocked: the newer one
++// may have extended what the shared one made. Undoing the newest there
++// first lets a retry there take out the shared import's part.
++TEST(ArcImportRerunTest, CrossProfileCascadeBlockedThenRetried) {
++  const base::Time now = At(5000);
++
++  ArcImportRecord origin;
++  ArcImportRecord::Run shared = MakeRun("shared", 1000);
++  shared.other_profiles = {"Profile 2"};
++  origin.AddRun(shared);
++  origin.MapSpace("arc-a", "origin-space", "shared");
++
++  ArcImportRecord other;
++  other.AddRun(MakeRun("shared", 1000));
++  other.MapSpace("arc-b", "other-space", "shared");
++  other.AddRun(MakeRun("later", 2000));
++  other.MapItem("arc-pin", "later-pin", ItemKind::kPinnedTab, "later");
++
++  // The starting profile's Undo, which names Profile 2.
++  const ArcImportRecord::Run* undoing = origin.UndoableRun(now);
++  ASSERT_TRUE(undoing);
++  EXPECT_EQ(undoing->id, "shared");
++  EXPECT_THAT(undoing->other_profiles, ElementsAre("Profile 2"));
++  origin.ForgetRemoved("shared", {"origin-space"}, now);
++  EXPECT_TRUE(origin.FindRun("shared")->undone);
++
++  // In Profile 2 (ArcProfileUndo with the shared run's id): not its newest
++  // active run, so blocked, and nothing changes.
++  const ArcImportRecord::Run* asked = other.FindRun("shared");
++  ASSERT_TRUE(asked);
++  ASSERT_TRUE(other.NewestActiveRun());
++  EXPECT_NE(asked, other.NewestActiveRun());
++  EXPECT_EQ(other.NewestActiveRun()->id, "later");
++  EXPECT_THAT(other.SpacesOfRun("shared"), ElementsAre("other-space"));
++
++  // The user undoes the newest import there.
++  ASSERT_TRUE(other.UndoableRun(now));
++  EXPECT_EQ(other.UndoableRun(now)->id, "later");
++  other.ForgetRemoved("later", {"later-pin"}, now);
++  EXPECT_TRUE(other.FindRun("later")->undone);
++
++  // The retry there: the shared run is the newest now, and goes.
++  ASSERT_TRUE(other.UndoableRun(now));
++  EXPECT_EQ(other.UndoableRun(now)->id, "shared");
++  EXPECT_EQ(other.FindRun("shared"), other.NewestActiveRun());
++  other.ForgetRemoved("shared", {"other-space"}, now);
++  EXPECT_TRUE(other.FindRun("shared")->undone);
++  EXPECT_THAT(other.SpacesOfRun("shared"), IsEmpty());
++  EXPECT_EQ(other.StateAt(now).status, ArcImportState::Status::kUndone);
++}
++
++}  // namespace
++}  // namespace rac
