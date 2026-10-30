@@ -8,6 +8,10 @@ _tag="$1"
 _rac_version=$(python3 "$_root_dir/devutils/rac/rac_version.py" --print)
 _base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${_tag}/"
 
+# Tracing stays off while the signing key is checked and cleaned, so the key
+# never reaches the log even if GitHub's masking misses it.
+{ set +x; } 2>/dev/null
+
 # A release without feeds strands every installed copy until the next good
 # release, so refuse to publish one.
 if [ -z "${PROD_MACOS_SPARKLE_ED_PUB_KEY:-}" ] || [ -z "${RAC_SPARKLE_ED_PRIVATE_KEY:-}" ]; then
@@ -18,6 +22,7 @@ fi
 PROD_MACOS_SPARKLE_ED_PUB_KEY=$(printf '%s' "$PROD_MACOS_SPARKLE_ED_PUB_KEY" | tr -d '[:space:]')
 export RAC_SPARKLE_ED_PRIVATE_KEY
 RAC_SPARKLE_ED_PRIVATE_KEY=$(printf '%s' "$RAC_SPARKLE_ED_PRIVATE_KEY" | tr -d '[:space:]')
+set -x
 
 # RAC_ARCHES lists the architectures this run built. A feed is written only for
 # those, so an arm64-only release has no appcast-x86_64.xml.
