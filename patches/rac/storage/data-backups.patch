@@ -4,7 +4,7 @@ Index: src/chrome/browser/prefs/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/prefs/BUILD.gn
 +++ src/chrome/browser/prefs/BUILD.gn
-@@ -106,6 +106,7 @@
+@@ -106,6 +106,7 @@ source_set("impl") {
      "//chrome/browser/push_messaging:service_impl_public",
      "//chrome/browser/rac/pip",
      "//chrome/browser/rac/spaces",
@@ -82,7 +82,7 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/storage/data_backups.cc
-@@ -0,0 +1,1304 @@
+@@ -0,0 +1,1451 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -90,6 +90,7 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 +#include "chrome/browser/rac/storage/data_backups.h"
 +
 +#include <algorithm>
++#include <cstdint>
 +#include <utility>
 +#include <vector>
 +
@@ -216,8 +217,8 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 +constexpr char kEntriesKey[] = "entries";
 +constexpr char kFolderItemsKey[] = "items";
 +
-+// Far bigger than any backup this build writes. Larger files are skipped.
-+constexpr size_t kMaxFileSize = 64 * 1024 * 1024;
++// Files over DataBackups::kMaxBackupBytes are never read, so none is written.
++constexpr size_t kMaxFileSize = DataBackups::kMaxBackupBytes;
 +
 +// How long a failed write or delete waits before it's tried again.
 +constexpr base::TimeDelta kRetryDelay = base::Hours(1);
@@ -254,6 +255,13 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 +      !millisecond) {
 +    return std::nullopt;
 +  }
++  // FromUTCExploded may normalize an out-of-range field (month 13 becomes
++  // January of the next year), so a malformed name could pass for a real
++  // time. Only a time that explodes back to the same fields is accepted.
++  if (*month < 1 || *month > 12 || *day < 1 || *day > 31 || *hour > 23 ||
++      *minute > 59 || *second > 59) {
++    return std::nullopt;
++  }
 +  base::Time::Exploded exploded = {};
 +  exploded.year = *year;
 +  exploded.month = *month;
@@ -264,6 +272,16 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 +  exploded.millisecond = *millisecond;
 +  base::Time time;
 +  if (!base::Time::FromUTCExploded(exploded, &time)) {
++    return std::nullopt;
++  }
++  base::Time::Exploded round_trip;
++  time.UTCExplode(&round_trip);
++  if (round_trip.year != exploded.year || round_trip.month != exploded.month ||
++      round_trip.day_of_month != exploded.day_of_month ||
++      round_trip.hour != exploded.hour ||
++      round_trip.minute != exploded.minute ||
++      round_trip.second != exploded.second ||
++      round_trip.millisecond != exploded.millisecond) {
 +    return std::nullopt;
 +  }
 +  return time;
@@ -366,9 +384,13 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 +
 +// The folder is the user's only, and so is every file in it. Backups hold
 +// the same data as `Preferences`, but nobody else needs to read them.
++//
++// Fails, and leaves nothing on disk, if the serialized file is over
++// `max_bytes` (and never writes more than ReadJsonDict would read).
 +bool WriteBackupFile(const base::FilePath& dir,
 +                     std::string_view id,
-+                     const base::DictValue& file) {
++                     const base::DictValue& file,
++                     size_t max_bytes = kMaxFileSize) {
 +  if (!base::CreateDirectory(dir)) {
 +    LOG(ERROR) << "rac: couldn't create the backups folder";
 +    return false;
@@ -376,6 +398,11 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 +  std::string json;
 +  if (!base::JSONWriter::Write(file, &json)) {
 +    LOG(ERROR) << "rac: couldn't serialize a backup";
++    return false;
++  }
++  if (json.size() > std::min(max_bytes, kMaxFileSize)) {
++    LOG(ERROR) << "rac: a backup is too big to keep (" << json.size()
++               << " bytes), so none was written";
 +    return false;
 +  }
 +#if BUILDFLAG(IS_POSIX)
@@ -414,6 +441,7 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 +  Kind kind;
 +  base::Time created;
 +  base::Time modified;
++  int64_t size = 0;
 +};
 +
 +// Oldest first. Names and the directory's stat data only; no file is opened.
@@ -426,8 +454,9 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 +       path = files.Next()) {
 +    std::string id = path.BaseName().RemoveFinalExtension().MaybeAsASCII();
 +    if (std::optional<ParsedId> parsed = ParseBackupId(id)) {
++      const base::FileEnumerator::FileInfo info = files.GetInfo();
 +      backups.push_back({path, std::move(id), parsed->kind, parsed->created,
-+                         files.GetInfo().GetLastModifiedTime()});
++                         info.GetLastModifiedTime(), info.GetSize()});
 +    }
 +  }
 +  std::ranges::sort(backups, {}, &BackupFile::created);
@@ -541,12 +570,13 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 +// The newest pre-reset copy or snapshot with data in it, other than
 +// `skip_id`. Daily backups aren't considered: after a reset, every daily is
 +// either a pre-reset copy already or holds what was made since.
-+std::optional<DataBackups::Contents> NewestWithData(const base::FilePath& dir,
-+                                                    base::Time now,
-+                                                    std::string_view skip_id) {
++std::optional<DataBackups::Contents> NewestWithData(
++    const base::FilePath& dir,
++    base::Time now,
++    const base::flat_set<std::string>& skip_ids) {
 +  std::vector<BackupFile> backups = ListBackups(dir);
 +  for (const BackupFile& backup : base::Reversed(backups)) {
-+    if (backup.kind == Kind::kDaily || backup.id == skip_id) {
++    if (backup.kind == Kind::kDaily || skip_ids.contains(backup.id)) {
 +      continue;
 +    }
 +    std::optional<DataBackups::Contents> contents =
@@ -614,20 +644,39 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 +  }
 +}
 +
++// How many bytes the folder has room for, once expired and surplus files are
++// gone. A snapshot is never allowed to take the folder past `max_total`.
++size_t RoomLeft(const base::FilePath& dir,
++                base::Time now,
++                const base::flat_set<std::string>& pinned,
++                size_t max_total) {
++  FileWork pruned;
++  Prune(dir, now, pinned, pruned);
++  size_t used = 0;
++  for (const BackupFile& backup : ListBackups(dir)) {
++    used += static_cast<size_t>(std::max<int64_t>(backup.size, 0));
++  }
++  return used < max_total ? max_total - used : 0;
++}
++
 +FileWork WriteSnapshot(const base::FilePath& profile_dir,
 +                       const base::FilePath& dir,
 +                       std::string id,
 +                       base::DictValue file,
 +                       base::Time now,
-+                       base::flat_set<std::string> pinned) {
++                       base::flat_set<std::string> pinned,
++                       size_t max_total) {
 +  if (std::optional<base::DictValue> store = ReadSpacesStore(profile_dir)) {
 +    file.Set(kSpacesStoreKey, std::move(*store));
 +  }
 +  FileWork work;
-+  if (WriteBackupFile(dir, id, file)) {
++  // Make room first. `pinned` includes the new snapshot, so the cap never
++  // takes it. A snapshot that doesn't fit is not written; the caller sees no
++  // id, and an import doesn't start.
++  const size_t room = RoomLeft(dir, now, pinned, max_total);
++  if (WriteBackupFile(dir, id, file, room)) {
 +    work.snapshot_written = std::move(id);
 +  }
-+  // `pinned` includes the new snapshot, so the cap never takes it.
 +  Prune(dir, now, pinned, work);
 +  return work;
 +}
@@ -653,6 +702,76 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 +  FileWork work;
 +  Prune(dir, now, pinned, work);
 +  return work;
++}
++
++// Whether `backup` (a pre-reset copy or snapshot) will still be on disk when
++// an offer made at `now` lapses.
++bool LastsThroughOffer(const base::FilePath& dir,
++                       const std::string& id,
++                       base::Time now) {
++  std::optional<ParsedId> parsed = ParseBackupId(id);
++  base::File::Info info;
++  const base::FilePath path = FileForId(dir, id);
++  if (!parsed || !base::GetFileInfo(path, &info)) {
++    return false;
++  }
++  std::optional<base::Time> expiry =
++      ExpiryOf({path, id, parsed->kind, parsed->created, info.last_modified},
++               now);
++  return expiry && *expiry >= now + DataBackups::kRestoreOfferLifetime;
++}
++
++// What SecureForOffer found.
++enum class Secured {
++  kYes,
++  // This backup can't be offered, but another may be.
++  kNo,
++  // The disk refused a write or a file time; trying again later may work.
++  kRetryLater,
++};
++
++// Makes the backup an offer will point at last at least as long as the offer,
++// and updates `best` to the file that does. A pre-reset copy's lifetime
++// starts at its file time, so a copy kept by an earlier reset is restarted
++// now. A snapshot expires in at most kSnapshotLifetime, so the offer gets a
++// pre-reset copy of its prefs; its open tabs aren't copied, so they still go
++// on time. `best` is left alone unless the answer is kYes.
++Secured SecureForOffer(const base::FilePath& dir,
++                       DataBackups::Contents& best,
++                       base::Time now) {
++  static_assert(DataBackups::kPreResetLifetime >
++                DataBackups::kRestoreOfferLifetime);
++  std::string id = best.id;
++  if (best.kind == Kind::kSnapshot) {
++    id = PreResetId(best.created);
++    if (!base::PathExists(FileForId(dir, id))) {
++      base::DictValue copy =
++          MakeFile(kKindPreReset, best.reason, best.created);
++      copy.Set(kPrefsKey, best.prefs.Clone());
++      // A new file's time is now, which starts its lifetime.
++      if (!WriteBackupFile(dir, id, copy)) {
++        return Secured::kRetryLater;
++      }
++      best.id = id;
++      best.kind = Kind::kPreReset;
++      return Secured::kYes;
++    }
++    // A copy from an earlier reset is already there. Offer that one, and
++    // only if it has the data; never overwrite a pre-reset copy. If it can't
++    // serve, another backup may, and a file that stays unusable must not
++    // hold up the check at every launch.
++    std::optional<DataBackups::Contents> existing =
++        ReadBackupFile(dir, id, now);
++    if (!existing || !HasData(*existing)) {
++      return Secured::kNo;
++    }
++    best = std::move(*existing);
++  }
++  if (base::TouchFile(FileForId(dir, best.id), now, now) ||
++      LastsThroughOffer(dir, best.id, now)) {
++    return Secured::kYes;
++  }
++  return Secured::kRetryLater;
 +}
 +
 +// Runs once per `Preferences`, when kInitializedPref is unset. Backup files
@@ -685,22 +804,28 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 +      result.rotated = false;
 +    }
 +  }
-+  std::optional<DataBackups::Contents> best =
-+      NewestWithData(dir, now, /*skip_id=*/std::string_view());
++  // The offer outlives a snapshot (7 days) and might outlive an older
++  // pre-reset copy, so the backup it points at is secured first. A backup
++  // that can't be secured is never offered. If the disk refused the work,
++  // there is no offer and the check runs again at the next launch (`rotated`
++  // is false, like a failed rotation); if one backup is just unusable, the
++  // next newest is tried.
++  base::flat_set<std::string> skip_ids;
++  std::optional<DataBackups::Contents> best;
++  while ((best = NewestWithData(dir, now, skip_ids))) {
++    const Secured secured = SecureForOffer(dir, *best, now);
++    if (secured == Secured::kYes) {
++      break;
++    }
++    LOG(ERROR) << "rac: couldn't keep a backup for a restore offer";
++    if (secured == Secured::kRetryLater) {
++      result.rotated = false;
++      return result;
++    }
++    skip_ids.insert(best->id);
++  }
 +  if (!best) {
 +    return result;
-+  }
-+  if (best->kind == Kind::kSnapshot) {
-+    // A snapshot expires in at most kSnapshotLifetime, which can be before
-+    // the offer lapses. The offer gets a pre-reset copy of its prefs. Its open
-+    // tabs aren't copied, so they still go on time.
-+    const std::string id = PreResetId(best->created);
-+    base::DictValue copy = MakeFile(kKindPreReset, best->reason, best->created);
-+    copy.Set(kPrefsKey, best->prefs.Clone());
-+    if (!base::PathExists(FileForId(dir, id)) &&
-+        WriteBackupFile(dir, id, copy)) {
-+      best->id = id;
-+    }
 +  }
 +  // Only the offer's small summaries are made here, not a copy of the prefs.
 +  std::vector<DataBackups::SpaceSummary> spaces =
@@ -722,7 +847,7 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 +    return offered;
 +  }
 +  LOG(ERROR) << "rac: the offered backup is gone; using the next newest";
-+  return NewestWithData(dir, now, id);
++  return NewestWithData(dir, now, {id});
 +}
 +
 +// Calls `visit` with each list in rac.sidebar.lists, its key, and its
@@ -1019,6 +1144,24 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 +}
 +
 +// static
++bool DataBackups::HasDefaultTheme(const base::DictValue& space) {
++  const base::DictValue* theme = space.FindDict(kSpaceThemeKey);
++  if (!theme) {
++    return true;
++  }
++  // A stored theme that can't be read comes from a newer build, so it isn't
++  // the default.
++  const std::optional<SpaceTheme> stored = SpaceTheme::FromDict(*theme);
++  if (!stored) {
++    return false;
++  }
++  const SpaceTheme default_theme;
++  return stored->color1 == default_theme.color1 &&
++         stored->color2 == default_theme.color2 &&
++         stored->mode == default_theme.mode;
++}
++
++// static
 +bool DataBackups::IsEmpty(const base::Value* spaces,
 +                          const base::Value* sidebar_lists) {
 +  // An empty folder is something the user made too.
@@ -1049,7 +1192,11 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 +  }
 +  const std::string* name = only_space->FindString(kSpaceNameKey);
 +  const std::string* icon = only_space->FindString(kSpaceIconKey);
-+  return (!name || name->empty()) && (!icon || icon->empty());
++  if ((name && !name->empty()) || (icon && !icon->empty())) {
++    return false;
++  }
++  // A theme the user picked is something they made too.
++  return HasDefaultTheme(*only_space);
 +}
 +
 +void DataBackups::CreateSnapshot(std::string_view reason,
@@ -1077,7 +1224,7 @@ Index: src/chrome/browser/rac/storage/data_backups.cc
 +  pinned.insert(id);
 +  PostFileTask(base::BindOnce(&WriteSnapshot, profile_dir_, dir_,
 +                              std::move(id), std::move(file), now,
-+                              std::move(pinned)),
++                              std::move(pinned), max_total_bytes_),
 +               base::BindOnce(&DataBackups::DidCreateSnapshot,
 +                              weak_factory_.GetWeakPtr(), std::move(done)));
 +}
@@ -1391,7 +1538,7 @@ Index: src/chrome/browser/rac/storage/data_backups.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/storage/data_backups.h
-@@ -0,0 +1,417 @@
+@@ -0,0 +1,436 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1482,7 +1629,8 @@ Index: src/chrome/browser/rac/storage/data_backups.h
 +  // No daily backup is kept past this, however few are left.
 +  static constexpr base::TimeDelta kDailyLifetime = base::Days(30);
 +  // How long an unanswered restore offer stays. The backup it points at is a
-+  // pre-reset copy, which outlives it.
++  // pre-reset copy whose lifetime is restarted when the offer is made, so it
++  // outlives the offer.
 +  static constexpr base::TimeDelta kRestoreOfferLifetime = base::Days(7);
 +  // An even earlier run that only prunes, so an expired file is gone seconds
 +  // after launch instead of minutes.
@@ -1495,6 +1643,14 @@ Index: src/chrome/browser/rac/storage/data_backups.h
 +  static constexpr base::TimeDelta kDailyAfterChangeDelay = base::Minutes(1);
 +  // Unpinned snapshots beyond this are deleted early, oldest first.
 +  static constexpr size_t kMaxSnapshots = 8;
++  // The biggest backup file this build writes. It's also the biggest file it
++  // reads, so a backup is never written that Undo or a restore can't read.
++  static constexpr size_t kMaxBackupBytes = 64 * 1024 * 1024;
++  // The most all backup files may take together. A new snapshot that would
++  // take the folder over this, after expired and surplus files are pruned, is
++  // refused. A daily backup and a pre-reset copy are never refused for it:
++  // they are prefs only, and the service itself keeps their number small.
++  static constexpr size_t kMaxTotalBytes = 256 * 1024 * 1024;
 +  // A backup dated more than this in the future means the clock moved back.
 +  // Its lifetime then starts now, so it still ends, and Undo isn't wiped.
 +  static constexpr base::TimeDelta kClockSkewAllowance = base::Days(1);
@@ -1652,9 +1808,11 @@ Index: src/chrome/browser/rac/storage/data_backups.h
 +    virtual void OnRestoreOfferChanged() = 0;
 +  };
 +
-+  // Runs with the new snapshot's id, or nullopt if it couldn't be written.
-+  // An import must not start without one. Not run if the service is
-+  // destroyed first, which happens only when the profile goes away.
++  // Runs with the new snapshot's id, or nullopt if it couldn't be written:
++  // the file would be over kMaxBackupBytes, it would take the folder over
++  // kMaxTotalBytes, or the disk refused it. Nothing is left on disk then. An
++  // import must not start without an id. Not run if the service is destroyed
++  // first, which happens only when the profile goes away.
 +  using SnapshotCallback =
 +      base::OnceCallback<void(std::optional<std::string> id)>;
 +  using ReadCallback = base::OnceCallback<void(std::optional<Contents>)>;
@@ -1672,10 +1830,15 @@ Index: src/chrome/browser/rac/storage/data_backups.h
 +
 +  // True if `spaces` and `sidebar_lists` (stored values of kSpacesPref and
 +  // kSidebarListsPref, null if unset) hold nothing a user made: at most one
-+  // space with no name and no icon, and no favorites or pinned tabs. That's
-+  // what a new profile, or one whose `Preferences` was reset, looks like.
++  // space with no name, no icon, and the default theme, and no favorites or
++  // pinned tabs. That's what a new profile, or one whose `Preferences` was
++  // reset, looks like.
 +  static bool IsEmpty(const base::Value* spaces,
 +                      const base::Value* sidebar_lists);
++  // True if the stored space `space` has no theme, or the default one
++  // (SpaceTheme's), so the user never picked one. A theme this build can't
++  // read isn't the default.
++  static bool HasDefaultTheme(const base::DictValue& space);
 +  static Counts Count(const base::Value* spaces,
 +                      const base::Value* sidebar_lists);
 +  // Summaries of the first kMaxOfferSpaces spaces in `spaces` (a stored value
@@ -1730,6 +1893,8 @@ Index: src/chrome/browser/rac/storage/data_backups.h
 +  void AddObserver(Observer* observer);
 +  void RemoveObserver(Observer* observer);
 +
++  // Lowers kMaxTotalBytes for this service, so a test needn't write 256 MiB.
++  void SetMaxTotalBytesForTesting(size_t bytes) { max_total_bytes_ = bytes; }
 +  // Runs the scheduled work now instead of waiting for its timer.
 +  void RunScheduledWorkForTesting();
 +  // Runs `done` after every file task posted so far has finished and its
@@ -1783,6 +1948,7 @@ Index: src/chrome/browser/rac/storage/data_backups.h
 +  const raw_ptr<const base::Clock> clock_;
 +  const scoped_refptr<base::SequencedTaskRunner> task_runner_;
 +
++  size_t max_total_bytes_ = kMaxTotalBytes;
 +  std::optional<RestoreOffer> restore_offer_;
 +  bool operation_running_ = false;
 +  // Keeps snapshot ids unique when two are taken in the same millisecond.
@@ -1914,7 +2080,7 @@ Index: src/chrome/browser/rac/storage/data_backups_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/storage/data_backups_unittest.cc
-@@ -0,0 +1,1533 @@
+@@ -0,0 +1,1806 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1922,6 +2088,7 @@ Index: src/chrome/browser/rac/storage/data_backups_unittest.cc
 +#include "chrome/browser/rac/storage/data_backups.h"
 +
 +#include <algorithm>
++#include <cstdint>
 +#include <memory>
 +#include <optional>
 +#include <string>
@@ -1929,6 +2096,7 @@ Index: src/chrome/browser/rac/storage/data_backups_unittest.cc
 +#include <utility>
 +#include <vector>
 +
++#include "base/files/file.h"
 +#include "base/files/file_enumerator.h"
 +#include "base/files/file_path.h"
 +#include "base/files/file_util.h"
@@ -2274,6 +2442,69 @@ Index: src/chrome/browser/rac/storage/data_backups_unittest.cc
 +  }
 +}
 +
++// A theme the user picked counts as data by itself, even on a single
++// unnamed space. Only the exact default theme, or no theme, stays empty.
++TEST_F(DataBackupsTest, ThemeOnlyChangeOfSingleSpaceCountsAsData) {
++  const base::DictValue no_lists = MakeEmptyLists();
++  auto with_theme = [](std::string_view color1, std::string_view color2,
++                       std::string_view mode) {
++    base::DictValue spaces = MakeSpaces({""});
++    spaces.FindList("spaces")->front().GetDict().Set(
++        "theme", base::DictValue()
++                     .Set("color1", color1)
++                     .Set("color2", color2)
++                     .Set("mode", mode));
++    return spaces;
++  };
++
++  EXPECT_FALSE(
++      IsEmptyFor(with_theme("#D87249", "#FFD1B1", "auto"), no_lists));
++  EXPECT_FALSE(
++      IsEmptyFor(with_theme("#FFFFD7", "#FFD9FB", "dark"), no_lists));
++  EXPECT_TRUE(
++      IsEmptyFor(with_theme("#FFFFD7", "#FFD9FB", "auto"), no_lists));
++  EXPECT_TRUE(IsEmptyFor(MakeSpaces({""}), no_lists));
++
++  // A theme that can't be read comes from a newer build; it counts as data.
++  base::DictValue broken = MakeSpaces({""});
++  broken.FindList("spaces")->front().GetDict().Set(
++      "theme", base::DictValue().Set("color1", "nonsense"));
++  EXPECT_FALSE(IsEmptyFor(broken, no_lists));
++}
++
++// A single unnamed space whose only difference is a picked theme is enough
++// user data to get a daily backup.
++TEST_F(DataBackupsTest, ThemeOnlyChangeGetsADailyBackup) {
++  base::DictValue spaces = MakeSpaces({""});
++  spaces.FindList("spaces")->front().GetDict().Set(
++      "theme", base::DictValue()
++                   .Set("color1", "#D87249")
++                   .Set("color2", "#FFD1B1")
++                   .Set("mode", "auto"));
++  SetSpaces(spaces);
++
++  std::unique_ptr<DataBackups> backups = Make();
++  FastForward(DataBackups::kStartupDelay);
++  EXPECT_EQ(Ids("daily-").size(), 1u);
++}
++
++// A single unnamed space with exactly the default theme stays empty: no
++// daily backup is written and the service waits for real data instead.
++TEST_F(DataBackupsTest, DefaultThemeSingleSpaceGetsNoDailyBackup) {
++  base::DictValue spaces = MakeSpaces({""});
++  spaces.FindList("spaces")->front().GetDict().Set(
++      "theme", base::DictValue()
++                   .Set("color1", "#FFFFD7")
++                   .Set("color2", "#FFD9FB")
++                   .Set("mode", "auto"));
++  SetSpaces(spaces);
++
++  std::unique_ptr<DataBackups> backups = Make();
++  FastForward(DataBackups::kStartupDelay);
++  EXPECT_TRUE(Ids("daily-").empty());
++  EXPECT_FALSE(backups->HasScheduledWorkForTesting());
++}
++
 +// Items in a folder are counted, the folder itself isn't, and favorites and
 +// pinned tabs are counted apart.
 +TEST_F(DataBackupsTest, CountsItemsInFolders) {
@@ -2425,6 +2656,48 @@ Index: src/chrome/browser/rac/storage/data_backups_unittest.cc
 +    SCOPED_TRACE(id);
 +    EXPECT_FALSE(ReadContents(*backups, id));
 +  }
++}
++
++// A backup id's time must be a real UTC time, field by field; an id whose
++// fields only normalize to a valid date reads nothing.
++TEST_F(DataBackupsTest, ReadBackupRejectsOutOfRangeTimes) {
++  std::unique_ptr<DataBackups> backups = Make();
++  task_environment_.RunUntilIdle();
++
++  auto write_file = [this](std::string_view id) {
++    const base::DictValue file =
++        base::DictValue()
++            .Set("version", DataBackups::kVersion)
++            .Set("min_reader_version", DataBackups::kMinReaderVersion)
++            .Set("kind", "daily")
++            .Set("created", base::TimeToValue(clock()->Now()))
++            .Set("prefs", base::DictValue());
++    std::optional<std::string> json = base::WriteJson(file);
++    EXPECT_TRUE(json);
++    base::ScopedAllowBlockingForTesting allow_blocking;
++    EXPECT_TRUE(base::CreateDirectory(BackupsDir()));
++    EXPECT_TRUE(base::WriteFile(BackupFile(id), json.value_or("")));
++  };
++  for (const char* id : {"daily-20261301T000000000Z",
++                         "daily-20261032T000000000Z",
++                         "daily-20260230T000000000Z",
++                         "daily-20261010T240000000Z",
++                         "daily-20261010T006000000Z",
++                         "daily-20261010T000060000Z",
++                         "snapshot-20261301T000000000Z-import-arc"}) {
++    SCOPED_TRACE(id);
++    write_file(id);
++    EXPECT_FALSE(ReadContents(*backups, id));
++  }
++
++  // The same content under a valid id reads fine.
++  write_file("daily-20261010T000000000Z");
++  EXPECT_TRUE(ReadContents(*backups, "daily-20261010T000000000Z"));
++
++  // A file whose name doesn't parse isn't a backup: the prune neither reads
++  // nor deletes it.
++  FastForward(DataBackups::kStartupPruneDelay + base::Seconds(1));
++  EXPECT_TRUE(FileExists(BackupFile("daily-20261301T000000000Z")));
 +}
 +
 +#if BUILDFLAG(IS_POSIX)
@@ -2664,6 +2937,58 @@ Index: src/chrome/browser/rac/storage/data_backups_unittest.cc
 +  Flush(*backups);
 +  EXPECT_TRUE(FileExists(BackupFile(daily)));
 +  EXPECT_TRUE(ReadContents(*backups, daily));
++}
++
++// A snapshot over kMaxBackupBytes is never reported as written: Undo could
++// not read it back, so the caller gets no id and nothing is left on disk.
++TEST_F(DataBackupsTest, SnapshotOverMaxBackupBytesIsNotWritten) {
++  base::DictValue spaces = MakeSpaces({"Work"});
++  spaces.Set("pad",
++             std::string(DataBackups::kMaxBackupBytes + 1024, 'x'));
++  SetSpaces(spaces);
++
++  std::unique_ptr<DataBackups> backups = Make();
++  EXPECT_FALSE(TakeSnapshot(*backups, kImportReason));
++  EXPECT_TRUE(Ids("").empty());
++
++  SetSpaces(MakeSpaces({"Work"}));
++  std::optional<std::string> id = TakeSnapshot(*backups, kImportReason);
++  ASSERT_TRUE(id);
++  EXPECT_TRUE(ReadContents(*backups, *id));
++}
++
++// A snapshot that would take the folder over kMaxTotalBytes is refused, on
++// top of the kMaxSnapshots count cap; deleting one frees room again. A daily
++// backup is never refused by the total cap.
++TEST_F(DataBackupsTest, SnapshotsStayUnderTheTotalByteCap) {
++  SetUserData();
++  std::unique_ptr<DataBackups> backups = Make();
++  task_environment_.RunUntilIdle();
++
++  std::optional<std::string> first = TakeSnapshot(*backups, kImportReason);
++  ASSERT_TRUE(first);
++  std::optional<int64_t> size;
++  {
++    base::ScopedAllowBlockingForTesting allow_blocking;
++    size = base::GetFileSize(BackupFile(*first));
++  }
++  ASSERT_TRUE(size);
++  backups->SetMaxTotalBytesForTesting(static_cast<size_t>(*size) * 5 / 2);
++
++  std::optional<std::string> second = TakeSnapshot(*backups, kImportReason);
++  ASSERT_TRUE(second);
++  EXPECT_FALSE(TakeSnapshot(*backups, kImportReason));
++  EXPECT_EQ(Ids("snapshot-"), (std::vector<std::string>{*first, *second}));
++  EXPECT_TRUE(ReadContents(*backups, *first));
++  EXPECT_TRUE(ReadContents(*backups, *second));
++
++  backups->DeleteSnapshot(*first);
++  Flush(*backups);
++  EXPECT_TRUE(TakeSnapshot(*backups, kImportReason));
++
++  // The folder is at the cap again, but the daily backup is written anyway.
++  FastForward(DataBackups::kStartupDelay);
++  EXPECT_EQ(Ids("daily-").size(), 1u);
 +}
 +
 +// The daily backup waits kStartupDelay, so it never competes with startup.
@@ -2954,6 +3279,48 @@ Index: src/chrome/browser/rac/storage/data_backups_unittest.cc
 +  EXPECT_FALSE(FileExists(BackupFile(kept)));
 +}
 +
++// A reset found again refreshes the kept pre-reset copy's file time, so the
++// new offer never points at a backup that expires before the offer lapses.
++TEST_F(DataBackupsTest, SecondResetRefreshesANearExpiryPreResetCopy) {
++  // The mock clock starts near the epoch; move it ahead so a file time
++  // kPreResetLifetime back is still a real time.
++  task_environment_.AdvanceClock(RealisticTime() - clock()->Now());
++  std::unique_ptr<DataBackups> backups;
++  WriteDailyThenReset(backups);
++  ASSERT_TRUE(backups->restore_offer());
++  const std::string kept = backups->restore_offer()->backup_id;
++
++  // Nearly expired: one day of its kPreResetLifetime left.
++  SetFileTime(BackupFile(kept),
++              clock()->Now() - DataBackups::kPreResetLifetime +
++                  base::Days(1));
++
++  backups->ResolveRestoreOffer();
++  ResetPreferences();
++  backups = Make();
++  task_environment_.RunUntilIdle();
++
++  ASSERT_TRUE(backups->restore_offer());
++  const DataBackups::RestoreOffer& offer = *backups->restore_offer();
++  EXPECT_EQ(offer.backup_id, kept);
++
++  base::File::Info info;
++  {
++    base::ScopedAllowBlockingForTesting allow_blocking;
++    ASSERT_TRUE(base::GetFileInfo(BackupFile(kept), &info));
++  }
++  EXPECT_LE(info.last_modified, clock()->Now());
++  EXPECT_GE(info.last_modified, clock()->Now() - base::Minutes(1));
++  EXPECT_LE(offer.detected + DataBackups::kRestoreOfferLifetime,
++            info.last_modified + DataBackups::kPreResetLifetime);
++
++  FastForward(DataBackups::kRestoreOfferLifetime - base::Hours(1));
++  ASSERT_TRUE(backups->restore_offer());
++  std::optional<DataBackups::Contents> offered = ReadOffered(*backups);
++  ASSERT_TRUE(offered);
++  EXPECT_EQ(offered->counts, kUserDataCounts);
++}
++
 +// With no backup files, an empty sidebar is a new profile, not a reset, so
 +// nothing is offered.
 +TEST_F(DataBackupsTest, NoOfferForNewProfile) {
@@ -3004,6 +3371,78 @@ Index: src/chrome/browser/rac/storage/data_backups_unittest.cc
 +  EXPECT_EQ(offered->id, offered_id);
 +  EXPECT_EQ(offered->counts, kUserDataCounts);
 +  EXPECT_FALSE(offered->spaces_store);
++}
++
++// When the pre-reset copy of an offered snapshot can't be used, no offer
++// points at the snapshot id, which expires before the offer would. The
++// check is still done, so one bad file doesn't stop the daily backups at
++// every launch.
++TEST_F(DataBackupsTest, NoOfferWhenTheSnapshotCopyCannotBeMade) {
++  SetUserData();
++  base::Time created;
++  std::string snapshot;
++  {
++    std::unique_ptr<DataBackups> backups = Make();
++    std::optional<std::string> id = TakeSnapshot(*backups, kImportReason);
++    ASSERT_TRUE(id);
++    snapshot = *id;
++    std::optional<DataBackups::Contents> contents =
++        ReadContents(*backups, *id);
++    ASSERT_TRUE(contents);
++    created = contents->created;
++  }
++
++  // A directory sits where the pre-reset copy of the snapshot would go.
++  {
++    base::ScopedAllowBlockingForTesting allow_blocking;
++    ASSERT_TRUE(base::CreateDirectory(
++        BackupFile(base::StrCat({"prereset-", IdTime(created)}))));
++  }
++  ResetPreferences();
++
++  std::unique_ptr<DataBackups> backups = Make();
++  task_environment_.RunUntilIdle();
++  EXPECT_FALSE(backups->restore_offer());
++  EXPECT_TRUE(prefs_.GetBoolean(DataBackups::kInitializedPref));
++  EXPECT_TRUE(FileExists(BackupFile(snapshot)));
++}
++
++// A prereset copy that can't serve an offer is skipped, and the next newest
++// backup with data is offered instead of nothing.
++TEST_F(DataBackupsTest, UnusableCopyFallsBackToTheNextBackup) {
++  SetUserData();
++  std::string older;
++  base::Time created;
++  {
++    std::unique_ptr<DataBackups> backups = Make();
++    std::optional<std::string> id = TakeSnapshot(*backups, kImportReason);
++    ASSERT_TRUE(id);
++    older = *id;
++    // A second snapshot, which is the newest and the one whose copy is bad.
++    task_environment_.FastForwardBy(base::Seconds(5));
++    std::optional<std::string> newest = TakeSnapshot(*backups, "import-arc");
++    ASSERT_TRUE(newest);
++    std::optional<DataBackups::Contents> contents =
++        ReadContents(*backups, *newest);
++    ASSERT_TRUE(contents);
++    created = contents->created;
++  }
++  {
++    base::ScopedAllowBlockingForTesting allow_blocking;
++    ASSERT_TRUE(base::CreateDirectory(
++        BackupFile(base::StrCat({"prereset-", IdTime(created)}))));
++  }
++  ResetPreferences();
++
++  std::unique_ptr<DataBackups> backups = Make();
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(backups->restore_offer());
++  // The offer points at a pre-reset copy of the older snapshot, never at a
++  // snapshot.
++  EXPECT_NE(backups->restore_offer()->backup_id, older);
++  EXPECT_TRUE(
++      base::StartsWith(backups->restore_offer()->backup_id, "prereset-"));
++  EXPECT_TRUE(ReadOffered(*backups));
 +}
 +
 +// If the offered backup can't be read, the next newest one with data is
@@ -3452,13 +3891,14 @@ Index: src/chrome/browser/rac/storage/restore_plan.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/storage/restore_plan.cc
-@@ -0,0 +1,271 @@
+@@ -0,0 +1,361 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#include "chrome/browser/rac/storage/restore_plan.h"
 +
++#include <algorithm>
 +#include <string_view>
 +
 +#include "base/strings/strcat.h"
@@ -3476,6 +3916,9 @@ Index: src/chrome/browser/rac/storage/restore_plan.cc
 +constexpr char kPinnedListPrefix[] = "pinned.";
 +constexpr char kEntriesKey[] = "entries";
 +constexpr char kEntryIdKey[] = "id";
++constexpr char kEntryUrlKey[] = "url";
++// A folder's items.
++constexpr char kEntryItemsKey[] = "items";
 +// `rac spaces`: {"version": N, "spaces": {<space id>: StoredSpace}}.
 +constexpr char kStoreSpacesKey[] = "spaces";
 +
@@ -3503,11 +3946,100 @@ Index: src/chrome/browser/rac/storage/restore_plan.cc
 +      id ? EntriesOf(live_lists, base::StrCat({kPinnedListPrefix, *id}))
 +         : nullptr;
 +  return (!name || name->empty()) && (!icon || icon->empty()) &&
-+         (!pinned || pinned->empty());
++         (!pinned || pinned->empty()) && DataBackups::HasDefaultTheme(space);
++}
++
++const std::string* IdOf(const base::Value& entry) {
++  return entry.is_dict() ? entry.GetDict().FindString(kEntryIdKey) : nullptr;
++}
++
++const std::string* UrlOf(const base::Value& entry) {
++  return entry.is_dict() ? entry.GetDict().FindString(kEntryUrlKey) : nullptr;
++}
++
++const base::ListValue* ItemsOf(const base::Value& entry) {
++  return entry.is_dict() ? entry.GetDict().FindList(kEntryItemsKey) : nullptr;
++}
++
++// Every id in `entries`, including the items inside folders.
++void CollectIds(const base::ListValue& entries,
++                base::flat_set<std::string>& ids) {
++  for (const base::Value& entry : entries) {
++    if (const std::string* id = IdOf(entry)) {
++      ids.insert(*id);
++    }
++    if (const base::ListValue* items = ItemsOf(entry)) {
++      CollectIds(*items, ids);
++    }
++  }
++}
++
++// `first`'s entries, then those of `second` that `first` doesn't have, deduped
++// by id (anywhere in the list) and by URL (at this level). A folder both
++// lists have is merged, not skipped, so an item pinned inside it on either
++// side survives: the result has the folder's fields from `first`, and its
++// items merged the same way, live items first. `first_is_live` says which
++// of the two is the live one.
++base::ListValue MergeEntries(const base::ListValue& first,
++                             const base::ListValue& second,
++                             bool first_is_live) {
++  base::ListValue merged = first.Clone();
++  base::flat_set<std::string> ids;
++  base::flat_set<std::string> urls;
++  CollectIds(merged, ids);
++  for (const base::Value& entry : merged) {
++    if (const std::string* url = UrlOf(entry)) {
++      urls.insert(*url);
++    }
++  }
++  for (const base::Value& entry : second) {
++    const std::string* id = IdOf(entry);
++    const std::string* url = UrlOf(entry);
++    if (id && ids.contains(*id)) {
++      // The same folder on both sides: merge what's inside.
++      const base::ListValue* second_items = ItemsOf(entry);
++      if (!second_items) {
++        continue;
++      }
++      for (base::Value& target : merged) {
++        const std::string* target_id = IdOf(target);
++        base::ListValue* first_items =
++            target.is_dict() ? target.GetDict().FindList(kEntryItemsKey)
++                             : nullptr;
++        if (first_items && target_id && *target_id == *id) {
++          const base::ListValue& live_items =
++              first_is_live ? *first_items : *second_items;
++          const base::ListValue& backup_items =
++              first_is_live ? *second_items : *first_items;
++          // Live order first, then the backup's items that are missing.
++          base::ListValue folder_items =
++              MergeEntries(live_items, backup_items, /*first_is_live=*/true);
++          target.GetDict().Set(kEntryItemsKey, std::move(folder_items));
++          break;
++        }
++      }
++      continue;
++    }
++    if (url && urls.contains(*url)) {
++      continue;
++    }
++    merged.Append(entry.Clone());
++    if (id) {
++      ids.insert(*id);
++    }
++    if (url) {
++      urls.insert(*url);
++    }
++    if (const base::ListValue* items = ItemsOf(entry)) {
++      CollectIds(*items, ids);
++    }
++  }
++  return merged;
 +}
 +
 +// Backup lists first; then, per list, live entries the backup doesn't have.
-+// `drop_list` is the placeholder's (empty) pinned list.
++// A folder on both sides keeps the live items in their order, then the
++// backup's. `drop_list` is the placeholder's (empty) pinned list.
 +std::optional<base::Value> MergeLists(const base::DictValue* backup,
 +                                      const base::DictValue* live,
 +                                      std::string_view drop_list) {
@@ -3528,27 +4060,14 @@ Index: src/chrome/browser/rac/storage/restore_plan.cc
 +        merged.Set(key, live_dict->Clone());
 +        continue;
 +      }
-+      base::ListValue* entries = target->FindList(kEntriesKey);
++      const base::ListValue* entries = target->FindList(kEntriesKey);
 +      if (!entries) {
 +        // Keep the backup's other fields for this list.
 +        target->Set(kEntriesKey, live_entries->Clone());
 +        continue;
 +      }
-+      base::flat_set<std::string> ids;
-+      for (const base::Value& entry : *entries) {
-+        if (const std::string* id =
-+                entry.is_dict() ? entry.GetDict().FindString(kEntryIdKey)
-+                                : nullptr) {
-+          ids.insert(*id);
-+        }
-+      }
-+      for (const base::Value& entry : *live_entries) {
-+        const std::string* id =
-+            entry.is_dict() ? entry.GetDict().FindString(kEntryIdKey) : nullptr;
-+        if (!id || !ids.contains(*id)) {
-+          entries->Append(entry.Clone());
-+        }
-+      }
++      target->Set(kEntriesKey, MergeEntries(*entries, *live_entries,
++                                            /*first_is_live=*/false));
 +    }
 +  }
 +  return base::Value(std::move(merged));
@@ -3639,7 +4158,16 @@ Index: src/chrome/browser/rac/storage/restore_plan.cc
 +  }
 +
 +  // 2. Live spaces the backup doesn't have.
-+  if (const base::ListValue* spaces = SpacesIn(live.prefs)) {
++  const base::ListValue* live_spaces = SpacesIn(live.prefs);
++  // The reset placeholder is only told apart from a space the user made
++  // after the reset when it's the only space there is: a blank space made
++  // later looks just like it, and its tabs would move.
++  const bool only_one_live_space =
++      live_spaces &&
++      std::ranges::count_if(*live_spaces, [](const base::Value& space) {
++        return StoredSpaceId(space) != nullptr;
++      }) == 1;
++  if (const base::ListValue* spaces = live_spaces) {
 +    for (const base::Value& space : *spaces) {
 +      const std::string* id = StoredSpaceId(space);
 +      if (!id || backup_ids.contains(*id)) {
@@ -3648,11 +4176,12 @@ Index: src/chrome/browser/rac/storage/restore_plan.cc
 +      if (mode == RestoreMode::kExact) {
 +        plan.delete_spaces.push_back(*id);
 +      } else if (!plan.move_tabs_from && !plan.spaces.empty() &&
++                 only_one_live_space &&
 +                 IsBlankSpace(space.GetDict(), live_lists) &&
 +                 !live.spaces_with_stored_tabs.contains(*id)) {
-+        // The space a reset leaves. Whatever is open in it moves, so a merge
-+        // closes nothing. A space with stored tabs isn't blank: only open
-+        // tabs move, and deleting it would drop those.
++        // The space a reset leaves, and the only one live. Whatever is open
++        // in it moves, so a merge closes nothing. A space with stored tabs
++        // isn't blank: only open tabs move, and deleting it would drop those.
 +        plan.move_tabs_from = *id;
 +        plan.move_tabs_to = *plan.spaces.front().FindString(kSpaceIdKey);
 +        plan.delete_spaces.push_back(*id);
@@ -3728,7 +4257,7 @@ Index: src/chrome/browser/rac/storage/restore_plan.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/storage/restore_plan.h
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,93 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -3790,8 +4319,9 @@ Index: src/chrome/browser/rac/storage/restore_plan.h
 +  std::vector<base::DictValue> spaces;
 +  // kMerge only: the empty space a reset left. Its window tabs move into
 +  // `move_tabs_to`, the first restored space, and then it's deleted, so the
-+  // result is exactly the backup plus what was made since. Not set when it
-+  // can't be told apart from a space the user made.
++  // result is exactly the backup plus what was made since. Set only when that
++  // space is the only live space. A blank space made after the reset looks
++  // the same, so with more than one live space none is touched.
 +  std::optional<std::string> move_tabs_from;
 +  std::string move_tabs_to;
 +  // Deleted with SpacesWindowManager::DeleteSpace, after the move.
@@ -3825,7 +4355,7 @@ Index: src/chrome/browser/rac/storage/restore_plan_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/storage/restore_plan_unittest.cc
-@@ -0,0 +1,458 @@
+@@ -0,0 +1,669 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -3876,7 +4406,7 @@ Index: src/chrome/browser/rac/storage/restore_plan_unittest.cc
 +  for (const std::string& id : ids) {
 +    entries.Append(base::DictValue()
 +                       .Set("id", id)
-+                       .Set("url", "https://a.test/")
++                       .Set("url", "https://a.test/" + id)
 +                       .Set("title", title));
 +  }
 +  return base::DictValue().Set("entries", std::move(entries));
@@ -3931,6 +4461,31 @@ Index: src/chrome/browser/rac/storage/restore_plan_unittest.cc
 +  if (entries) {
 +    for (const base::Value& entry : *entries) {
 +      ids.push_back(*entry.GetDict().FindString("id"));
++    }
++  }
++  return ids;
++}
++
++// The item ids inside folder `folder_id` in list `key`; empty if it has none.
++Ids FolderItemIds(const std::optional<base::Value>& lists,
++                  const std::string& key,
++                  const std::string& folder_id) {
++  Ids ids;
++  const base::DictValue* list =
++      lists && lists->is_dict() ? lists->GetDict().FindDict(key) : nullptr;
++  const base::ListValue* entries = list ? list->FindList("entries") : nullptr;
++  if (entries) {
++    for (const base::Value& entry : *entries) {
++      const std::string* id = entry.GetDict().FindString("id");
++      if (id && *id == folder_id) {
++        if (const base::ListValue* items =
++                entry.GetDict().FindList("items")) {
++          for (const base::Value& item : *items) {
++            ids.push_back(*item.GetDict().FindString("id"));
++          }
++        }
++        break;
++      }
 +    }
 +  }
 +  return ids;
@@ -4067,8 +4622,9 @@ Index: src/chrome/browser/rac/storage/restore_plan_unittest.cc
 +  EXPECT_EQ(IdsOf(plan.spaces), Ids({"s1", "s2"}));
 +}
 +
-+// A merge keeps spaces made since the reset. Only the blank one is the
-+// placeholder, and only when there is a restored space to move its tabs to.
++// A merge keeps spaces made since the reset. The blank placeholder is only
++// told apart from them when it's the only live space, and only when there is
++// a restored space to move its tabs to.
 +TEST(RestorePlanTest, MergeKeepsSpacesMadeSinceReset) {
 +  DataBackups::Contents backup =
 +      MakeBackup(MakePrefs({{"s1", "Work"}, {"s2", "Play"}}));
@@ -4079,9 +4635,11 @@ Index: src/chrome/browser/rac/storage/restore_plan_unittest.cc
 +          .Set(DataBackups::kSidebarListsPref,
 +               base::DictValue().Set("pinned.s9", MakeEntries({"p9"}))));
 +
++  // With another space live, the blank one could be the user's: nothing is
++  // moved or deleted.
 +  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
-+  EXPECT_EQ(plan.delete_spaces, Ids({"reset"}));
-+  EXPECT_EQ(*plan.move_tabs_from, "reset");
++  EXPECT_TRUE(plan.delete_spaces.empty());
++  EXPECT_FALSE(plan.move_tabs_from.has_value());
 +
 +  // An unnamed space with a pinned tab isn't blank, even listed first.
 +  live = MakeLive(
@@ -4091,8 +4649,8 @@ Index: src/chrome/browser/rac/storage/restore_plan_unittest.cc
 +          .Set(DataBackups::kSidebarListsPref,
 +               base::DictValue().Set("pinned.s9", MakeEntries({"p9"}))));
 +  plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
-+  EXPECT_EQ(plan.delete_spaces, Ids({"reset"}));
-+  EXPECT_EQ(*plan.move_tabs_from, "reset");
++  EXPECT_TRUE(plan.delete_spaces.empty());
++  EXPECT_FALSE(plan.move_tabs_from.has_value());
 +
 +  // With no spaces in the backup, there's nowhere to move tabs, so the blank
 +  // space is kept.
@@ -4100,6 +4658,59 @@ Index: src/chrome/browser/rac/storage/restore_plan_unittest.cc
 +  live = MakeLive(base::DictValue().Set(
 +      DataBackups::kSpacesPref, MakeSpacesPref({{"reset", ""}})));
 +  plan = MakeRestorePlan(no_spaces, live, RestoreMode::kMerge);
++  EXPECT_FALSE(plan.move_tabs_from.has_value());
++  EXPECT_TRUE(plan.delete_spaces.empty());
++}
++
++// A blank space made after the reset looks just like the placeholder, so
++// with more than one live space none is moved or deleted. Only a lone blank
++// space is taken to be the placeholder.
++TEST(RestorePlanTest, MergeKeepsBlankSpaceMadeAfterReset) {
++  DataBackups::Contents backup =
++      MakeBackup(MakePrefs({{"s1", "Work"}, {"s2", "Play"}}));
++  LiveSidebar live = MakeLive(base::DictValue().Set(
++      DataBackups::kSpacesPref,
++      MakeSpacesPref({{"reset", ""}, {"made", ""}})));
++
++  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  EXPECT_FALSE(plan.move_tabs_from.has_value());
++  EXPECT_TRUE(plan.delete_spaces.empty());
++  EXPECT_EQ(IdsOf(plan.spaces), Ids({"s1", "s2"}));
++
++  // The only live space and blank: it's the placeholder.
++  live = MakeLive(base::DictValue().Set(
++      DataBackups::kSpacesPref, MakeSpacesPref({{"reset", ""}})));
++  plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  ASSERT_TRUE(plan.move_tabs_from.has_value());
++  EXPECT_EQ(*plan.move_tabs_from, "reset");
++  EXPECT_EQ(plan.move_tabs_to, "s1");
++  EXPECT_EQ(plan.delete_spaces, Ids({"reset"}));
++
++  // One blank space plus one the backup has is still two live spaces.
++  live = MakeLive(base::DictValue().Set(
++      DataBackups::kSpacesPref,
++      MakeSpacesPref({{"made", ""}, {"s1", "Work"}})));
++  plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  EXPECT_FALSE(plan.move_tabs_from.has_value());
++  EXPECT_TRUE(plan.delete_spaces.empty());
++}
++
++// A lone unnamed space whose theme the user changed isn't blank, so a merge
++// doesn't delete it (and its theme) after moving the tabs.
++TEST(RestorePlanTest, MergeKeepsThemedPlaceholder) {
++  DataBackups::Contents backup =
++      MakeBackup(MakePrefs({{"s1", "Work"}, {"s2", "Play"}}));
++  base::DictValue spaces = MakeSpacesPref({{"reset", ""}});
++  spaces.FindList("spaces")->front().GetDict().Set(
++      "theme", base::DictValue()
++                   .Set("color1", "#D87249")
++                   .Set("color2", "#FFD1B1")
++                   .Set("mode", "auto"));
++  LiveSidebar live =
++      MakeLive(base::DictValue().Set(DataBackups::kSpacesPref,
++                                     std::move(spaces)));
++
++  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
 +  EXPECT_FALSE(plan.move_tabs_from.has_value());
 +  EXPECT_TRUE(plan.delete_spaces.empty());
 +}
@@ -4130,7 +4741,7 @@ Index: src/chrome/browser/rac/storage/restore_plan_unittest.cc
 +  LiveSidebar live = MakeLive(
 +      base::DictValue()
 +          .Set(DataBackups::kSpacesPref,
-+               MakeSpacesPref({{"reset", ""}, {"s9", "New"}}))
++               MakeSpacesPref({{"reset", ""}}))
 +          .Set(DataBackups::kSidebarListsPref,
 +               base::DictValue()
 +                   .Set("favorites", MakeEntries({"f1", "f2"}, "Live"))
@@ -4149,6 +4760,136 @@ Index: src/chrome/browser/rac/storage/restore_plan_unittest.cc
 +                                       ->FindList("entries"))[0]
 +                                     .GetDict();
 +  EXPECT_EQ(*first.FindString("title"), "Backup");
++}
++
++// A folder both sides have is merged, not taken from the backup alone: its
++// items are the live ones in their order, then the backup's it lacks,
++// deduped by id. The folder itself keeps the backup's fields.
++TEST(RestorePlanTest, MergeKeepsItemsInAFolderOnBothSides) {
++  DataBackups::Contents backup = MakeBackup(MakePrefs({{"s1", "Work"}}));
++  backup.prefs.Set(
++      DataBackups::kSidebarListsPref,
++      base::DictValue().Set(
++          "pinned.s1", base::test::ParseJsonDict(R"({"entries":[
++              {"id":"a","url":"https://a.test/a","title":"A"},
++              {"id":"F","title":"Backup title","collapsed":false,
++               "items":[
++                 {"id":"b1","url":"https://a.test/b1","title":"B1"},
++                 {"id":"b2","url":"https://a.test/b2","title":"B2"}]}]})")));
++  LiveSidebar live = MakeLive(
++      base::DictValue()
++          .Set(DataBackups::kSpacesPref, MakeSpacesPref({{"reset", ""}}))
++          .Set(DataBackups::kSidebarListsPref,
++               base::DictValue().Set(
++                   "pinned.s1",
++                   base::test::ParseJsonDict(R"({"entries":[
++                       {"id":"x","url":"https://a.test/x","title":"X"},
++                       {"id":"F","title":"Live title",
++                        "items":[
++                          {"id":"l1","url":"https://a.test/l1","title":"L1"},
++                          {"id":"b2","url":"https://a.test/b2","title":"B2"},
++                          {"id":"l2","url":"https://a.test/l2",
++                           "title":"L2"}]}]})"))));
++
++  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  ASSERT_TRUE(plan.sidebar_lists.has_value());
++  EXPECT_EQ(EntryIds(plan.sidebar_lists, "pinned.s1"), Ids({"a", "F", "x"}));
++  EXPECT_EQ(FolderItemIds(plan.sidebar_lists, "pinned.s1", "F"),
++            Ids({"l1", "b2", "l2", "b1"}));
++  const base::DictValue& folder =
++      (*plan.sidebar_lists->GetDict()
++            .FindDict("pinned.s1")
++            ->FindList("entries"))[1]
++          .GetDict();
++  EXPECT_EQ(*folder.FindString("title"), "Backup title");
++}
++
++// Live items in a shared folder win their slots and the backup's fill in
++// after. An empty live "items" loses none of the backup's, and a folder
++// only the live side has is appended whole.
++TEST(RestorePlanTest, MergeFolderOnlyLiveHasItsItemsKept) {
++  DataBackups::Contents backup = MakeBackup(MakePrefs({{"s1", "Work"}}));
++  backup.prefs.Set(
++      DataBackups::kSidebarListsPref,
++      base::DictValue().Set(
++          "pinned.s1", base::test::ParseJsonDict(R"({"entries":[
++              {"id":"F","title":"Folder",
++               "items":[{"id":"b1","url":"https://a.test/b1"}]}]})")));
++  LiveSidebar live = MakeLive(
++      base::DictValue()
++          .Set(DataBackups::kSpacesPref, MakeSpacesPref({{"reset", ""}}))
++          .Set(DataBackups::kSidebarListsPref,
++               base::DictValue().Set(
++                   "pinned.s1",
++                   base::test::ParseJsonDict(R"({"entries":[
++                       {"id":"F","title":"Folder",
++                        "items":[
++                          {"id":"l1","url":"https://a.test/l1"},
++                          {"id":"l2","url":"https://a.test/l2"}]}]})"))));
++
++  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  EXPECT_EQ(FolderItemIds(plan.sidebar_lists, "pinned.s1", "F"),
++            Ids({"l1", "l2", "b1"}));
++
++  backup.prefs.Set(
++      DataBackups::kSidebarListsPref,
++      base::DictValue().Set(
++          "pinned.s1", base::test::ParseJsonDict(R"({"entries":[
++              {"id":"F","title":"Folder",
++               "items":[
++                 {"id":"b1","url":"https://a.test/b1"},
++                 {"id":"b2","url":"https://a.test/b2"}]}]})")));
++  live = MakeLive(
++      base::DictValue()
++          .Set(DataBackups::kSpacesPref, MakeSpacesPref({{"reset", ""}}))
++          .Set(DataBackups::kSidebarListsPref,
++               base::DictValue().Set(
++                   "pinned.s1",
++                   base::test::ParseJsonDict(R"({"entries":[
++                       {"id":"F","title":"Folder","items":[]},
++                       {"id":"G","title":"Live only",
++                        "items":[{"id":"g1",
++                                  "url":"https://a.test/g1"}]}]})"))));
++  plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  EXPECT_EQ(EntryIds(plan.sidebar_lists, "pinned.s1"), Ids({"F", "G"}));
++  EXPECT_EQ(FolderItemIds(plan.sidebar_lists, "pinned.s1", "F"),
++            Ids({"b1", "b2"}));
++  EXPECT_EQ(FolderItemIds(plan.sidebar_lists, "pinned.s1", "G"),
++            Ids({"g1"}));
++}
++
++// Entries dedupe by url too, not just by id: a live top-level entry whose
++// url the backup already has is skipped, and the same holds for a backup
++// item inside a shared folder.
++TEST(RestorePlanTest, MergeDedupsByUrlToo) {
++  DataBackups::Contents backup = MakeBackup(MakePrefs({{"s1", "Work"}}));
++  backup.prefs.Set(
++      DataBackups::kSidebarListsPref,
++      base::DictValue()
++          .Set("favorites", base::test::ParseJsonDict(R"({"entries":[
++                  {"id":"f1","url":"https://same.test/"}]})"))
++          .Set("pinned.s1", base::test::ParseJsonDict(R"({"entries":[
++                  {"id":"F","title":"Folder",
++                   "items":[{"id":"b1","url":"https://same.test/"}]}]})")));
++  LiveSidebar live = MakeLive(
++      base::DictValue()
++          .Set(DataBackups::kSpacesPref, MakeSpacesPref({{"reset", ""}}))
++          .Set(DataBackups::kSidebarListsPref,
++               base::DictValue()
++                   .Set("favorites",
++                        base::test::ParseJsonDict(R"({"entries":[
++                            {"id":"f9","url":"https://same.test/"},
++                            {"id":"f2","url":"https://other.test/"}]})"))
++                   .Set("pinned.s1",
++                        base::test::ParseJsonDict(R"({"entries":[
++                            {"id":"F","title":"Folder",
++                             "items":[{"id":"l1",
++                                       "url":"https://same.test/"}]}]})"))));
++
++  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  EXPECT_EQ(EntryIds(plan.sidebar_lists, "favorites"), Ids({"f1", "f2"}));
++  EXPECT_EQ(FolderItemIds(plan.sidebar_lists, "pinned.s1", "F"),
++            Ids({"l1"}));
 +}
 +
 +// An exact restore makes the lists the backup's, and clears them when the
