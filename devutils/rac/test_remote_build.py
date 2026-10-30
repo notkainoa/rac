@@ -137,6 +137,11 @@ echo "worktree.sh $*" >> "$RAC_FAKE_LOG"
 if [ "$1" = setup ] && [ ! -f patches/series.merged ]; then
   devutils/update_patches.sh merge
 fi
+# verify-series tests: setup fails, or clones a (here empty) tree.
+if [ "$1" = setup ]; then
+  [ -z "${FAKE_SETUP_EXIT:-}" ] || exit "$FAKE_SETUP_EXIT"
+  [ -z "${FAKE_SETUP_TREE:-}" ] || mkdir -p build/src
+fi
 # Like the real sync, record the applied stack (which needs quilt's .pc).
 if [ "$1" = sync ] && [ -f build/src/.pc/applied-patches ]; then
   cp build/src/.pc/applied-patches build/src/.pc/.rac_applied
@@ -265,6 +270,43 @@ case "$*" in
     cp "$QUILT_PATCHES/$QUILT_SERIES" .pc/applied-patches ;;
   *next*) echo rac/x/broken.patch ;;
 esac
+'''
+# quilt for verify-series: pop forgets the applied stack; push prints
+# quilt's and patch's lines for every patch in the series (no -q), with
+# an offset hunk in QUILT_OFFSET_PATCH and a fuzzed one in
+# QUILT_FUZZ_PATCH, stops at the second patch on QUILT_EXIT, and leaves
+# the last patch out on QUILT_SHORT.
+STUB_VERIFY_QUILT = '''\
+echo "quilt $* QUILT_PATCHES=$QUILT_PATCHES QUILT_SERIES=$QUILT_SERIES pwd=$(pwd -P)" >> "$RAC_FAKE_LOG"
+[ "${1:-}" != --quiltrc ] || shift 2
+case "$1" in
+  pop) rm -f .pc/applied-patches; exit 0 ;;
+  push) ;;
+  *) exit 0 ;;
+esac
+mkdir -p .pc
+: > .pc/applied-patches
+patches=$(awk '!/^[[:space:]]*(#|$)/ { print $1 }' "$QUILT_PATCHES/$QUILT_SERIES")
+[ -z "${QUILT_SHORT:-}" ] || patches=$(printf '%s\\n' "$patches" | sed '$d')
+n=0
+for p in $patches; do
+  n=$((n + 1))
+  echo "Applying patch $p"
+  if [ -n "${QUILT_EXIT:-}" ] && [ "$n" = 2 ]; then
+    echo "patching file chrome/two.cc"
+    echo "Hunk #1 FAILED at 7."
+    echo "Patch $p does not apply (enforce with -f)"
+    exit "$QUILT_EXIT"
+  fi
+  echo "patching file chrome/file$n.cc"
+  case "$p" in
+    "${QUILT_OFFSET_PATCH:-}") echo "Hunk #1 succeeded at 12 (offset 2 lines)." ;;
+    "${QUILT_FUZZ_PATCH:-}") echo "Hunk #2 succeeded at 40 with fuzz 1." ;;
+  esac
+  echo "$p" >> .pc/applied-patches
+  echo
+done
+echo "Now at patch $p"
 '''
 # Fixture python scripts append their argv to the test's call log.
 STUB_LOG_PY = '''\
@@ -2311,6 +2353,170 @@ class StatusTest(RemoteBuildTest):
         self.assertIn('load average', result.stdout)
         self.assertIn('free disk under', result.stdout)
         self.assertIn('queue status here', result.stdout)
+
+
+@unittest.skipUnless(sys.platform == 'darwin',
+                    'remote-build.sh drives macOS hosts')
+class VerifySeriesTest(RemoteBuildTest):
+    """verify-series: the Pro fetches a GitHub branch into the base, makes a
+    throwaway clone, and reapplies the whole stack with --fuzz 0. The
+    base's origin is a local fixture standing in for GitHub."""
+
+    def setUp(self):
+        super().setUp()
+        self.remote_root = self.seed_remote()
+        self.base = self.remote_root / 'base'
+        self.origin = self.folder / 'base-origin'
+        # The branch under test, on "GitHub": two patches in its series.
+        git(self.origin, 'checkout', '-q', '-b', 'feat/x')
+        write(self.origin / 'patches/series', 'a.patch\n# a note\n\nrac/x/b.patch\n')
+        write(self.origin / 'patches/rac/x/b.patch', 'b\n')
+        git(self.origin, 'add', '-A')
+        git(self.origin, 'commit', '-qm', 'add b')
+        git(self.origin, 'checkout', '-q', 'main')
+        self.clone = self.remote_root / 'wt/verify-feat-x'
+        tool(self.remote / 'bin' / 'quilt', STUB_VERIFY_QUILT)
+
+    def verify(self, *args, **env):
+        env.setdefault('FAKE_SETUP_TREE', '1')
+        return self.run_rb('verify-series', *args, **env)
+
+    def assert_cleaned_up(self):
+        self.assertFalse(self.clone.exists())
+        listing = git(self.base, 'worktree', 'list', '--porcelain').stdout
+        self.assertNotIn('verify-feat-x', listing)
+        self.assertIn('worktree.sh cleanup', self.calls())
+
+    def test_refuses_bad_branch_names(self):
+        for bad in ('a/../b', 'a..b', '/abs', 'x/', 'a b', 'a;b', '$(id)',
+                    'a\nb', '~x', 'a:b'):
+            result = self.run_rb('verify-series', bad, success=False)
+            self.assertEqual(result.returncode, 2, bad)
+            self.assertIn('branch name', result.stderr)
+        # A leading - is an option, and a dash-led name after -- is refused.
+        result = self.run_rb('verify-series', '-x', success=False)
+        self.assertIn('usage', result.stderr)
+        result = self.run_rb('verify-series', '--', '-x', success=False)
+        self.assertEqual(result.returncode, 2)
+        self.run_rb('verify-series', success=False)
+        self.run_rb('verify-series', 'a', 'b', success=False)
+        # Refused on the Air before any ssh.
+        self.assertEqual(self.calls(), '')
+
+    def test_remote_script_has_every_step(self):
+        result = self.run_rb('--dry-run', 'verify-series', 'feat/x', success=True)
+        script = result.stderr
+        for step in ('fetch -q --no-recurse-submodules origin',
+                     '+refs/heads/$branch:refs/remotes/origin/$branch',
+                     'worktree add -q --detach "$clone"',
+                     'submodule update --init',
+                     'devutils/rac/worktree.sh setup "$base"',
+                     'build-queue.sh',
+                     'nice -n 10 taskpolicy -c utility',
+                     'python3 devutils/rac/dev_names.py unsub',
+                     'QUILT_SERIES=series.merged',
+                     'pop -a -q',
+                     'push -a --fuzz 0',
+                     'offset .* line|with fuzz',
+                     'trap finish EXIT',
+                     'devutils/rac/worktree.sh cleanup',
+                     'worktree remove --force "$clone"'):
+            self.assertIn(step, script)
+        self.assertEqual(self.calls(), '')
+        self.assertFalse(self.clone.exists())
+
+    def test_a_clean_stack_passes_and_cleans_up(self):
+        result = self.verify('feat/x', success=True)
+        self.assertIn('feat/x applies cleanly: 2 of 2 patches', result.stdout)
+        calls = self.calls()
+        # In order: the queue, setup, names reverted, a full pop, then the
+        # push with fuzz 0 against the clone's merged series, then cleanup.
+        order = [calls.index(step) for step in (
+            'queue bash -c', 'worktree.sh setup', 'dev_names.py unsub',
+            'quilt --quiltrc - pop -a -q', 'quilt --quiltrc - push -a --fuzz 0',
+            'worktree.sh cleanup')]
+        self.assertEqual(order, sorted(order))
+        self.assertIn(f'QUILT_PATCHES={self.clone}/patches QUILT_SERIES=series.merged '
+                      f'pwd={self.clone}/build/src', calls)
+        self.assertIn('nice -n 10 taskpolicy -c utility', calls)
+        self.assert_cleaned_up()
+        log = self.remote_root / 'logs/verify-feat-x.log'
+        self.assertIn('Applying patch rac/x/b.patch', log.read_text())
+        # No branch in the base moved: the clone is detached.
+        self.assertNotIn('feat/x', git(self.base, 'branch', '--list').stdout)
+
+    def test_an_offset_hunk_fails_and_names_the_patch(self):
+        result = self.verify('feat/x', success=False,
+                             QUILT_OFFSET_PATCH='rac/x/b.patch')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('rac/x/b.patch | chrome/file2.cc | Hunk #1 succeeded at 12 '
+                      '(offset 2 lines).', result.stderr)
+        self.assertNotIn('a.patch |', result.stderr)
+        self.assertNotIn('applies cleanly', result.stdout)
+        self.assert_cleaned_up()
+
+    def test_a_fuzzed_hunk_fails(self):
+        result = self.verify('feat/x', success=False, QUILT_FUZZ_PATCH='a.patch')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('a.patch | chrome/file1.cc | Hunk #2 succeeded at 40 with fuzz 1.',
+                      result.stderr)
+        self.assert_cleaned_up()
+
+    def test_a_patch_that_does_not_apply_fails_with_the_log(self):
+        result = self.verify('feat/x', success=False, QUILT_EXIT='1')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('quilt push -a --fuzz 0 failed (exit 1)', result.stderr)
+        self.assertIn('Patch rac/x/b.patch does not apply', result.stderr)
+        self.assertIn('applied 1 of the 2 patches', result.stderr)
+        self.assert_cleaned_up()
+
+    def test_a_short_push_fails(self):
+        result = self.verify('feat/x', success=False, QUILT_SHORT='1')
+        self.assertIn('applied 1 of the 2 patches', result.stderr)
+        self.assert_cleaned_up()
+
+    def test_a_failed_setup_still_cleans_up(self):
+        result = self.verify('feat/x', success=False, FAKE_SETUP_EXIT='3')
+        self.assertIn('making the clone or popping its stack failed', result.stderr)
+        self.assertNotIn('quilt', self.calls())
+        self.assert_cleaned_up()
+
+    def test_a_missing_branch_fails(self):
+        result = self.verify('feat/nope', success=False)
+        self.assertIn("couldn't fetch branch 'feat/nope'", result.stderr)
+        self.assertFalse((self.remote_root / 'wt/verify-feat-nope').exists())
+
+    def test_keep_leaves_the_clone_and_the_next_run_replaces_it(self):
+        result = self.verify('--keep', 'feat/x', success=True)
+        self.assertIn('kept the verify clone', result.stderr)
+        self.assertTrue((self.clone / 'build/src/.pc/applied-patches').exists())
+        self.assertNotIn('worktree.sh cleanup', self.calls())
+        result = self.verify('feat/x', success=True)
+        self.assertIn('removing the previous verify clone', result.stderr)
+        self.assert_cleaned_up()
+
+    def test_refuses_a_folder_that_is_not_a_verify_clone(self):
+        write(self.clone / 'mine.txt', 'keep me\n')
+        result = self.verify('feat/x', success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('not a verify-series clone', result.stderr)
+        self.assertEqual((self.clone / 'mine.txt').read_text(), 'keep me\n')
+        # A push clone (a worktree without the marker) is refused too.
+        shutil.rmtree(self.clone)
+        git(self.base, 'worktree', 'add', '-q', '--detach', str(self.clone))
+        result = self.verify('feat/x', success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertTrue(self.clone.is_dir())
+
+    def test_refuses_while_the_base_builds(self):
+        slot = self.remote_root / 'build-queue/build-1'
+        slot.mkdir(parents=True)
+        (slot / 'holder.json').write_text(json.dumps(
+            {'pid': os.getpid(), 'worktree': str(self.base)}))
+        result = self.verify('feat/x', success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("base's build is queued or running", result.stderr)
+        self.assertFalse(self.clone.exists())
 
 
 @unittest.skipUnless(sys.platform == 'darwin',

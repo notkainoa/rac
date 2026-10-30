@@ -154,6 +154,16 @@ invalidates every tree built there (new compiler flags and SDK path), so
 keep Xcode pinned on build machines; `build`, `run` and `push` refuse when
 the Pro's Xcode differs from the one its base recorded.
 
+After pushing a patch change to GitHub and before asking for a merge, run
+`devutils/rac/remote-build.sh verify-series <your branch>`. It reproduces
+the macOS CI sanity job's check, which the fast Linux checks can't: the
+Pro fetches the branch, makes a throwaway clone `wt/verify-<branch>` from
+the base's tree, and, holding one build slot, pops the whole stack and
+pushes it again with `--fuzz 0`. It fails on a patch that doesn't apply
+and names every hunk that applied with an offset or fuzz, either of which
+turns main red. The push log stays in `logs/verify-<branch>.log`, and the
+clone is removed afterwards unless `--keep` is given. It never builds.
+
 ### What a remote run may do
 
 A remote run launches the clone's built binary directly — never
