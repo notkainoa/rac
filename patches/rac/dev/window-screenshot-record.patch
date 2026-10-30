@@ -1,0 +1,397 @@
+--- a/chrome/browser/ui/views/rac/BUILD.gn
++++ b/chrome/browser/ui/views/rac/BUILD.gn
+@@ -43,7 +43,11 @@ source_set("look") {
+   # Developer tools behind the screenshot harness. Official builds leave
+   # them out (see //chrome/browser/rac/dev).
+   if (rac_dev_switches) {
+-    sources += [ "dev/frame_log.cc" ]
++    sources += [
++      "dev/frame_log.cc",
++      "dev/window_record.cc",
++      "dev/window_record.h",
++    ]
+   }
+ }
+ 
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/dev/window_record.cc
+@@ -0,0 +1,300 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/dev/window_record.h"
++
++#include <algorithm>
++#include <memory>
++#include <optional>
++#include <utility>
++
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/stringprintf.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "base/time/time.h"
++#include "base/timer/timer.h"
++#include "components/viz/common/frame_sinks/copy_output_request.h"
++#include "components/viz/common/frame_sinks/copy_output_result.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "ui/compositor/compositor.h"
++#include "ui/compositor/compositor_observer.h"
++#include "ui/compositor/layer.h"
++#include "ui/gfx/codec/png_codec.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/widget/widget_observer.h"
++
++namespace rac::dev {
++namespace {
++
++// Bytes of frames copied but not yet written. Past this, frames are skipped
++// and counted, so a slow disk can't eat the machine's memory.
++constexpr int64_t kMaxPendingBytes = 512 * 1024 * 1024;
++constexpr int kScaleDenominator = 1000;
++
++constexpr base::TaskTraits kWriteTraits = {
++    base::MayBlock(), base::TaskPriority::USER_BLOCKING,
++    base::TaskShutdownBehavior::BLOCK_SHUTDOWN};
++
++int64_t Micros(base::TimeTicks ticks) {
++  return ticks.since_origin().InMicroseconds();
++}
++
++bool EncodeAndWrite(const SkBitmap& bitmap,
++                    const base::FilePath& path,
++                    bool fast) {
++  std::optional<std::vector<uint8_t>> png =
++      fast ? gfx::PNGCodec::FastEncodeBGRASkBitmap(
++                 bitmap, /*discard_transparency=*/false)
++           : gfx::PNGCodec::EncodeBGRASkBitmap(bitmap,
++                                               /*discard_transparency=*/false);
++  if (!png) {
++    LOG(ERROR) << "rac window screenshot: PNG encode failed";
++    return false;
++  }
++  if (!base::WriteFile(path, *png)) {
++    LOG(ERROR) << "rac window screenshot write failed: " << path;
++    return false;
++  }
++  return true;
++}
++
++// Records one window's frames for a fixed time, then writes a last "done"
++// line once every copied frame is on disk. Deletes itself then, or at once
++// if the window goes away.
++class Recorder : public ui::CompositorObserver, public views::WidgetObserver {
++ public:
++  Recorder(views::Widget* widget,
++           base::FilePath dir,
++           base::TimeDelta duration,
++           int scale)
++      : widget_(widget),
++        dir_(std::move(dir)),
++        scale_(scale),
++        log_(base::ThreadPool::CreateSequencedTaskRunner(kWriteTraits)) {
++    log_->PostTask(FROM_HERE, base::BindOnce(
++                                  [](const base::FilePath& dir) {
++                                    base::CreateDirectory(dir);
++                                    base::WriteFile(
++                                        dir.AppendASCII("frames.jsonl"), "");
++                                  },
++                                  dir_));
++    widget_observation_.Observe(widget);
++    compositor_observation_.Observe(widget->GetCompositor());
++    // Its own deadline, since commits stop when the window can't draw.
++    deadline_.Start(FROM_HERE, duration,
++                    base::BindOnce(&Recorder::Finish, base::Unretained(this)));
++    LOG(ERROR) << "rac window record started -> " << dir_;
++    RequestFrame();
++  }
++
++  // ui::CompositorObserver:
++  void OnCompositingDidCommit(ui::Compositor* compositor) override {
++    // Ask for a copy of the next frame. Posted, since a copy request
++    // commits again.
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(&Recorder::RequestFrame, weak_factory_.GetWeakPtr()));
++  }
++
++  void OnCompositingShuttingDown(ui::Compositor* compositor) override {
++    Abandon();
++  }
++
++  // views::WidgetObserver:
++  void OnWidgetDestroying(views::Widget* widget) override { Abandon(); }
++
++ private:
++  void RequestFrame() {
++    if (finished_) {
++      return;
++    }
++    const base::TimeTicks now = base::TimeTicks::Now();
++    if (now == last_request_) {
++      return;
++    }
++    ui::Compositor* compositor = widget_->GetCompositor();
++    ui::Layer* layer = compositor ? compositor->root_layer() : nullptr;
++    if (!layer) {
++      Abandon();
++      return;
++    }
++    const gfx::Size size = layer->size();
++    const int64_t bytes = int64_t{4} * size.width() * size.height() * scale_ /
++                          kScaleDenominator * scale_ / kScaleDenominator;
++    if (pending_ > 0 && pending_bytes_ + bytes > kMaxPendingBytes) {
++      ++skipped_;
++      compositor->ScheduleDraw();
++      return;
++    }
++    last_request_ = now;
++    auto request = std::make_unique<viz::CopyOutputRequest>(
++        viz::CopyOutputRequest::ResultFormat::RGBA,
++        viz::CopyOutputRequest::ResultDestination::kSystemMemory,
++        base::BindOnce(&Recorder::OnFrame, weak_factory_.GetWeakPtr(),
++                       requested_++, now, bytes));
++    request->set_area(gfx::Rect(size));
++    if (scale_ != kScaleDenominator) {
++      request->SetUniformScaleRatio(kScaleDenominator, scale_);
++    }
++    ++pending_;
++    pending_bytes_ += bytes;
++    layer->RequestCopyOfOutput(std::move(request));
++    compositor->ScheduleDraw();
++  }
++
++  void OnFrame(int index,
++               base::TimeTicks requested,
++               int64_t bytes,
++               std::unique_ptr<viz::CopyOutputResult> result) {
++    const base::TimeTicks now = base::TimeTicks::Now();
++    if (!result || result->IsEmpty()) {
++      ++skipped_;
++      OnWritten(bytes, std::string());
++      return;
++    }
++    SkBitmap bitmap = result->ScopedAccessSkBitmap().GetOutScopedBitmap();
++    std::string line = base::StringPrintf(
++        "{\"i\":%d,\"req_us\":%lld,\"res_us\":%lld,\"w\":%d,\"h\":%d,"
++        "\"skipped\":%d}\n",
++        index, static_cast<long long>(Micros(requested)),
++        static_cast<long long>(Micros(now)), bitmap.width(), bitmap.height(),
++        skipped_);
++    // Frames encode in parallel; each line is logged once its PNG exists.
++    base::ThreadPool::PostTaskAndReply(
++        FROM_HERE, kWriteTraits,
++        base::BindOnce(
++            [](SkBitmap bitmap, base::FilePath path) {
++              EncodeAndWrite(bitmap, path, /*fast=*/true);
++            },
++            std::move(bitmap),
++            dir_.AppendASCII(base::StringPrintf("f%04d.png", index))),
++        base::BindOnce(&Recorder::OnWritten, weak_factory_.GetWeakPtr(), bytes,
++                       std::move(line)));
++  }
++
++  void OnWritten(int64_t bytes, std::string line) {
++    --pending_;
++    pending_bytes_ -= bytes;
++    if (!line.empty()) {
++      log_->PostTask(FROM_HERE,
++                     base::BindOnce(
++                         [](base::FilePath path, std::string line) {
++                           base::AppendToFile(path, line);
++                         },
++                         dir_.AppendASCII("frames.jsonl"), std::move(line)));
++    }
++    if (finished_ && pending_ == 0) {
++      Done();
++    }
++  }
++
++  // Stops asking for frames; the ones in flight still land.
++  void Finish() {
++    if (finished_) {
++      return;
++    }
++    finished_ = true;
++    deadline_.Stop();
++    compositor_observation_.Reset();
++    if (pending_ == 0) {
++      Done();
++    }
++  }
++
++  // The window is going away: frames in flight won't come.
++  void Abandon() {
++    Finish();
++    widget_ = nullptr;
++    if (!done_) {
++      skipped_ += pending_;
++      Done();
++    }
++  }
++
++  void Done() {
++    if (done_) {
++      return;
++    }
++    done_ = true;
++    widget_observation_.Reset();
++    weak_factory_.InvalidateWeakPtrs();
++    log_->PostTask(
++        FROM_HERE,
++        base::BindOnce([](base::FilePath path,
++                          std::string line) { base::AppendToFile(path, line); },
++                       dir_.AppendASCII("frames.jsonl"),
++                       base::StringPrintf(
++                           "{\"done\":true,\"requested\":%d,\"skipped\":%d}\n",
++                           requested_, skipped_)));
++    LOG(ERROR) << "rac window record done: " << requested_ << " frames, "
++               << skipped_ << " skipped";
++    base::SequencedTaskRunner::GetCurrentDefault()->DeleteSoon(FROM_HERE, this);
++  }
++
++  raw_ptr<views::Widget> widget_;
++  const base::FilePath dir_;
++  const int scale_;
++  const scoped_refptr<base::SequencedTaskRunner> log_;
++  base::OneShotTimer deadline_;
++  base::TimeTicks last_request_;
++  int requested_ = 0;
++  int pending_ = 0;
++  int64_t pending_bytes_ = 0;
++  int skipped_ = 0;
++  bool finished_ = false;
++  bool done_ = false;
++  base::ScopedObservation<views::Widget, views::WidgetObserver>
++      widget_observation_{this};
++  base::ScopedObservation<ui::Compositor, ui::CompositorObserver>
++      compositor_observation_{this};
++  base::WeakPtrFactory<Recorder> weak_factory_{this};
++};
++
++}  // namespace
++
++void EncodeAndWritePng(SkBitmap bitmap, base::FilePath path, bool fast) {
++  base::ThreadPool::PostTask(
++      FROM_HERE, kWriteTraits,
++      base::BindOnce(
++          [](SkBitmap bitmap, base::FilePath path, bool fast) {
++            if (EncodeAndWrite(bitmap, path, fast)) {
++              LOG(ERROR) << "rac window screenshot wrote " << path;
++            }
++          },
++          std::move(bitmap), std::move(path), fast));
++}
++
++bool HandleRecordRequest(views::Widget* widget,
++                         const std::vector<std::string>& words) {
++  int ms = 0;
++  if (words.empty() || words[0] != "record" ||
++      (words.size() != 3 && words.size() != 4) ||
++      !base::StringToInt(words[2], &ms) || ms <= 0) {
++    return false;
++  }
++  double scale = 1.0;
++  if (words.size() == 4 &&
++      (!base::StringToDouble(words[3], &scale) || scale <= 0 || scale > 1)) {
++    LOG(ERROR) << "rac window record: SCALE must be in (0, 1]";
++    return true;
++  }
++  if (!widget || widget->IsClosed() || !widget->GetCompositor()) {
++    return true;
++  }
++  new Recorder(widget, base::FilePath(words[1]), base::Milliseconds(ms),
++               std::max(1, static_cast<int>(scale * kScaleDenominator + 0.5)));
++  return true;
++}
++
++}  // namespace rac::dev
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/dev/window_record.h
+@@ -0,0 +1,38 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_DEV_WINDOW_RECORD_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_DEV_WINDOW_RECORD_H_
++
++#include <string>
++#include <vector>
++
++class SkBitmap;
++
++namespace base {
++class FilePath;
++}
++
++namespace views {
++class Widget;
++}
++
++namespace rac::dev {
++
++// Encodes `bitmap` as a PNG and writes it to `path`, both off the UI thread,
++// so a capture never stalls the frames it is measuring. `fast` trades file
++// size for encode time.
++void EncodeAndWritePng(SkBitmap bitmap, base::FilePath path, bool fast);
++
++// Handles `record DIR MS [SCALE]`: copies every frame `widget` draws for MS
++// milliseconds to DIR/fNNNN.png, scaled by SCALE (default 1), and writes one
++// JSON line per frame to DIR/frames.jsonl, then a "done" line. Recording
++// keeps the compositor drawing, so time idle frames with the frame log
++// instead. Returns false if `words` isn't a record request.
++bool HandleRecordRequest(views::Widget* widget,
++                         const std::vector<std::string>& words);
++
++}  // namespace rac::dev
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_DEV_WINDOW_RECORD_H_
+--- a/chrome/browser/ui/views/rac/window_screenshot.mm
++++ b/chrome/browser/ui/views/rac/window_screenshot.mm
+@@ -34,6 +34,7 @@
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/rac/dev/frame_log.h"
++#include "chrome/browser/ui/views/rac/dev/window_record.h"
+ #include "components/viz/common/frame_sinks/copy_output_request.h"
+ #include "components/viz/common/frame_sinks/copy_output_result.h"
+ #include "skia/ext/skia_utils_mac.h"
+@@ -208,15 +209,7 @@ std::vector<base::WeakPtr<views::Widget>
+ void WriteBitmap(const SkBitmap& bitmap, const base::FilePath& path) {
+   LOG(ERROR) << "rac window screenshot: compositor bitmap " << bitmap.width()
+              << "x" << bitmap.height();
+-  std::optional<std::vector<uint8_t>> png =
+-      gfx::PNGCodec::EncodeBGRASkBitmap(bitmap, /*discard_transparency=*/false);
+-  if (!png) {
+-    LOG(ERROR) << "rac window screenshot: PNG encode failed";
+-    return;
+-  }
+-  base::ThreadPool::PostTask(
+-      FROM_HERE, {base::MayBlock()},
+-      base::BindOnce(&WriteBytes, path, std::move(*png)));
++  dev::EncodeAndWritePng(bitmap, path, /*fast=*/false);
+ }
+ 
+ // Paints each popup over the window's bitmap where it sits on screen, then
+@@ -484,6 +477,10 @@ void SendSwipe(base::WeakPtr<views::Widg
+ bool HandleInput(views::Widget* widget,
+                  const std::vector<std::string>& words,
+                  const std::string& line) {
++  //   record DIR MS [SCALE]  copies every frame for MS ms to DIR
++  if (dev::HandleRecordRequest(widget, words)) {
++    return true;
++  }
+   const std::string& verb = words[0];
+   int x = 0;
+   int y = 0;
