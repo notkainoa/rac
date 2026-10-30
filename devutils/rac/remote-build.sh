@@ -35,6 +35,12 @@ refuse() { echo "rac remote: refusing: $*" >&2; exit 2; }
 log() { echo "rac remote: $*" >&2; }
 
 host=${RAC_REMOTE_HOST:-kainoas-macbook-pro}
+# A host starting with - or holding spaces would reach ssh as options.
+case "$host" in
+  -* | '' | *[!A-Za-z0-9._@-]*)
+    echo "rac remote: RAC_REMOTE_HOST must be a plain host name, not '$host'" >&2
+    exit 2 ;;
+esac
 # The remote root, relative to the remote home so a different $HOME (such
 # as a test's) moves the whole thing.
 rdir=rac-remote
@@ -144,8 +150,8 @@ toolchain_record() {
 
 # Refuses when the Pro's Xcode build or SDK drifted from the record the
 # tree was built with: a build under another toolchain recompiles all of
-# Chromium. $1 is a clone or base dir; a missing or build-less record
-# passes (a base that never finished its cold build records nothing).
+# Chromium. $1 is a clone or base dir; a missing record passes (a base
+# whose bootstrap never started records nothing), a partial one refuses.
 # The record is the xcodebuild -version output plus SDK, DEVELOPER_DIR=,
 # and commit lines -- the shape a by-hand bootstrap writes -- and the
 # older xcode_build/sdk key lines still parse too.
@@ -156,7 +162,11 @@ check_toolchain_record() {
   was_build=$(awk '/^xcode_build / { print $2; exit }
                   /^Build version / { print $3; exit }' "$record")
   was_sdk=$(awk 'tolower($1) == "sdk" { print $2; exit }' "$record")
-  [ -n "$was_build" ] || return 0
+  if [ -z "$was_build" ] || [ -z "$was_sdk" ]; then
+    echo "rac remote: refusing: $record has no Xcode build or SDK line;" >&2
+    echo "  can't tell which toolchain built this tree" >&2
+    return 2
+  fi
   xcode=$(xcode_dir) || return 1
   rver=$(DEVELOPER_DIR=$xcode xcodebuild -version)
   rbuild=${rver##*Build version }
@@ -1078,6 +1088,12 @@ if [ -n "$shot" ]; then
   # to stay inside the clone.
   [ ! -L "$clone/build/shots" ] || {
     echo "rac remote: refusing: $clone/build/shots is a symlink" >&2
+    exit 2
+  }
+  # Check before creating anything: a symlinked build/ (or any folder on
+  # the way) would otherwise let mkdir make folders outside the clone.
+  inside_clone "$clone" "$shot" || {
+    echo "rac remote: refusing: $shot leaves the clone through a symlink" >&2
     exit 2
   }
   mkdir -p "$(dirname "$shot")"

@@ -1259,6 +1259,20 @@ class BuildTest(RemoteBuildTest):
         self.assertIn('17A100', result.stderr)
 
 
+    def test_a_partial_toolchain_record_refuses(self):
+        # An SDK line without a build line can't prove the toolchain.
+        record = self.remote_root / 'base/.rac-toolchain'
+        write(record, 'SDK 26.0\ncommit 433a847\n')
+        result = self.run_rb('build', self.wt, success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('no Xcode build or SDK line', result.stderr)
+
+    def test_host_that_looks_like_an_ssh_option_is_refused(self):
+        for bad in ('-oProxyCommand=evil', 'host name', 'h;x'):
+            result = self.run_rb('status', success=False, RAC_REMOTE_HOST=bad)
+            self.assertEqual(result.returncode, 2, bad)
+            self.assertIn('plain host name', result.stderr)
+
 @unittest.skipUnless(sys.platform == 'darwin',
                     'remote-build.sh drives macOS hosts')
 class RunTest(RemoteBuildTest):
@@ -1354,6 +1368,17 @@ class RunTest(RemoteBuildTest):
         self.assertEqual(result.returncode, 2)
         self.assertIn('symlink', result.stderr)
         self.assertFalse((outside / 'x.png').exists())
+
+    def test_run_refuses_a_symlinked_build_dir_before_creating_anything(self):
+        # build -> outside: the refusal has to come before mkdir, or mkdir
+        # makes build/shots outside the clone first.
+        outside = self.folder / 'outside'
+        outside.mkdir()
+        (self.clone / 'build').symlink_to(outside)
+        result = self.run_rb('run', self.wt, '--timeout', '5', '--',
+                             '--rac-window-screenshot=x.png', success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse((outside / 'shots').exists())
 
     def test_run_refuses_a_symlink_under_shots(self):
         # A symlinked dir inside build/shots escapes the same way.
