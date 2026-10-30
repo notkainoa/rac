@@ -141,9 +141,11 @@ def sub(tree):
 def build_marker(tree):
     """When each build output folder last saved its state. A build between
     unsub and sub records different content under the mtimes unsub saved, so
-    putting them back could hide a real change from the next build."""
+    putting them back could hide a real change from the next build. gn reads
+    .grd files too, so a gn gen in between counts as well."""
     return {str(state.relative_to(tree)): state.stat().st_mtime_ns
-            for pattern in ('out/*/.siso_fs_state', 'out/*/.ninja_log')
+            for pattern in ('out/*/.siso_fs_state', 'out/*/.ninja_log',
+                            'out/*/build.ninja', 'out/*/build.ninja.stamp')
             for state in sorted(tree.glob(pattern))}
 
 
