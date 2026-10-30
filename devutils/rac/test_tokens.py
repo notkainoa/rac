@@ -263,5 +263,18 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(self.run_tokens('--patches', root).returncode, 1)
 
 
+class RepositoryTest(unittest.TestCase):
+
+    def test_rac_patches_match_the_header(self):
+        patches = Path(__file__).resolve().parents[2] / 'patches'
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), '--check', '--patches',
+             str(patches)],
+            capture_output=True,
+            text=True,
+            check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()

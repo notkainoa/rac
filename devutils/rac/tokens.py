@@ -9,8 +9,9 @@ rac_tokens.h is the only source: it's what the compiler sees, so the native
 values can't drift from it, and the CSS is the one derived file. Springs
 become CSS linear() curves sampled from the same spring math as rac::Spring.
 
-By default both files are read from the build tree. Without a build tree,
---check reads them out of the rac patches that create them.
+By default both files are read from the build tree. Without one, use
+`--check --patches patches`: it reads both files from the rac patch that
+creates them, so a later patch that edits either file isn't seen.
 
 usage: tokens.py [--check] [-t <build/src> | --patches <dir>]
                  [--header <file>] [--css <file>]
