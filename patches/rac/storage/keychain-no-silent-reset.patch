@@ -1,0 +1,1476 @@
+Index: src/chrome/app/rac_strings.grdp
+===================================================================
+--- src.orig/chrome/app/rac_strings.grdp
++++ src/chrome/app/rac_strings.grdp
+@@ -306,4 +306,27 @@
+   <message name="IDS_RAC_SITE_CONTROLS_ALL_SITE_SETTINGS" desc="Menu item in site controls that opens the settings page for every site.">
+     All site settings
+   </message>
++  <if expr="is_macosx">
++    <message name="IDS_RAC_KEYCHAIN_KEY_MISSING_TITLE" desc="Title of the dialog shown at startup when rac's encryption key, which this install had before, isn't in the macOS Keychain. rac can't open until the user quits or makes a new key.">
++      rac can’t find its encryption key in your Keychain
++    </message>
++    <message name="IDS_RAC_KEYCHAIN_KEY_MISSING_MESSAGE" desc="Body of the dialog shown at startup when rac's encryption key isn't in the macOS Keychain. Explains when to just reopen rac, and what a new key costs.">
++      If you just logged in, quit and open rac again. If the key was deleted, or this Mac was set up without your old Keychain, rac can make a new one. Saved passwords, sign-ins (cookies), and AI provider keys from before can’t be read with a new key.
++    </message>
++    <message name="IDS_RAC_KEYCHAIN_KEY_MISSING_QUIT" desc="Default button of the missing encryption key dialog. Quits rac and changes nothing.">
++      Quit
++    </message>
++    <message name="IDS_RAC_KEYCHAIN_KEY_MISSING_NEW_KEY" desc="Button of the missing encryption key dialog. Opens a confirmation before rac makes a new key.">
++      Make a New Key…
++    </message>
++    <message name="IDS_RAC_KEYCHAIN_NEW_KEY_CONFIRM_TITLE" desc="Title of the confirmation shown after the user chose Make a New Key in the missing encryption key dialog.">
++      Make a new key?
++    </message>
++    <message name="IDS_RAC_KEYCHAIN_NEW_KEY_CONFIRM_MESSAGE" desc="Body of the confirmation shown after the user chose Make a New Key in the missing encryption key dialog. rac quits, and makes the key when it's opened again.">
++      This can’t be undone. rac will quit. Open it again to start with the new key.
++    </message>
++    <message name="IDS_RAC_KEYCHAIN_NEW_KEY_CONFIRM" desc="Button of the confirmation that makes rac's new encryption key. The data encrypted with the old key can't be read afterward.">
++      Make New Key
++    </message>
++  </if>
+ </grit-part>
+Index: src/chrome/browser/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/BUILD.gn
++++ src/chrome/browser/BUILD.gn
+@@ -1588,6 +1588,8 @@ source_set("core") {
+       "//components/handoff",
+       "//components/metal_util",
+       "//components/os_crypt/browser:keychain_key_provider",
++      "//chrome/browser/rac/storage:keychain",
++      "//chrome/browser/ui/rac/storage:keychain_key_dialog",
+       "//components/policy/core/common:common_constants",
+       "//components/remote_cocoa/app_shim",
+       "//components/remote_cocoa/app_shim:features",
+Index: src/chrome/browser/browser_process_impl.cc
+===================================================================
+--- src.orig/chrome/browser/browser_process_impl.cc
++++ src/chrome/browser/browser_process_impl.cc
+@@ -287,6 +287,8 @@ void OnLocalStatePrefsLoaded();
+ #include <stdlib.h>
+ 
+ #include "base/process/process.h"
++#include "chrome/browser/rac/storage/keychain_key_guard_mac.h"
++#include "chrome/browser/ui/rac/storage/keychain_key_dialog.h"
+ #include "chrome/browser/ui/simple_message_box.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/os_crypt/async/browser/keychain_key_provider.h"
+@@ -1681,7 +1683,10 @@ void BrowserProcessImpl::PreMainMessageL
+     providers.emplace_back(
+         /*precedence=*/10u,
+         std::make_unique<os_crypt_async::KeychainKeyProvider>(
+-            base::BindOnce(&ShowKeychainStartupError)));
++            rac::KeychainKeyGuard::Install(
++                local_state(), base::BindOnce(&ShowKeychainStartupError),
++                base::BindOnce(&rac::ShowMissingKeychainKeyDialog,
++                               base::Unretained(local_state())))));
+   }
+ #endif  // BUILDFLAG(IS_MAC)
+ 
+Index: src/chrome/browser/prefs/browser_prefs.cc
+===================================================================
+--- src.orig/chrome/browser/prefs/browser_prefs.cc
++++ src/chrome/browser/prefs/browser_prefs.cc
+@@ -80,6 +80,7 @@
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/rac/pip/auto_pip_prefs.h"
+ #include "chrome/browser/rac/spaces/spaces_prefs.h"
++#include "chrome/browser/rac/storage/keychain_key_prefs.h"
+ #include "chrome/browser/rac/updates/rac_updates.h"
+ #include "chrome/browser/rlz/chrome_rlz_tracker_delegate.h"
+ #include "chrome/browser/search/background/ntp_custom_background_service.h"
+@@ -1591,6 +1592,7 @@ void RegisterLocalState(PrefRegistrySimp
+ #if BUILDFLAG(IS_ANDROID)
+   PushMessagingServiceImpl::RegisterPrefs(registry);
+ #endif
++  rac::RegisterKeychainKeyPrefs(registry);
+   rac::RegisterUpdatePrefs(registry);
+   RegisterScreenshotPrefs(registry);
+   search_engines::SearchEngineChoiceService::RegisterLocalStatePrefs(registry);
+Index: src/chrome/browser/rac/storage/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/storage/BUILD.gn
++++ src/chrome/browser/rac/storage/BUILD.gn
+@@ -4,12 +4,15 @@
+ 
+ import("//testing/test.gni")
+ 
+-# Backups of the profile's sidebar data. Depends only on base and prefs, so
+-# it can be tested without a browser.
++# Backups of the profile's sidebar data, and the Local State prefs that guard
++# the Keychain key. Depends only on base and prefs, so it can be tested without
++# a browser.
+ source_set("storage") {
+   sources = [
+     "data_backups.cc",
+     "data_backups.h",
++    "keychain_key_prefs.cc",
++    "keychain_key_prefs.h",
+     "restore_plan.cc",
+     "restore_plan.h",
+   ]
+@@ -57,3 +60,59 @@ test("rac_storage_unittests") {
+     "//testing/gtest",
+   ]
+ }
++
++if (is_mac) {
++  # Keeps os_crypt from replacing a Keychain key it couldn't find (see
++  # keychain_key_guard_mac.h). Installed by //chrome/browser:core.
++  source_set("keychain") {
++    sources = [
++      "guarded_keychain_mac.h",
++      "keychain_key_guard_mac.h",
++      "keychain_key_guard_mac.mm",
++    ]
++    public_deps = [
++      "//base",
++      "//crypto",
++    ]
++    deps = [
++      ":storage",
++      "//components/os_crypt/common:keychain_password_mac",
++      "//components/os_crypt/common:switches",
++      "//components/prefs",
++    ]
++    frameworks = [
++      "Foundation.framework",
++      "Security.framework",
++    ]
++  }
++
++  # Build with `autoninja -C out/Default
++  # chrome/browser/rac/storage:rac_keychain_unittests`. Every test uses a fake
++  # keychain; none touches the real one.
++  test("rac_keychain_unittests") {
++    sources = [
++      "keychain_key_guard_mac_unittest.mm",
++      "keychain_key_prefs_unittest.cc",
++    ]
++    deps = [
++      ":keychain",
++      ":storage",
++      "//base",
++      "//base/test:run_all_unittests",
++      "//base/test:test_support",
++      "//components/os_crypt/async/browser",
++      "//components/os_crypt/async/browser:keychain_key_provider",
++      "//components/os_crypt/async/common",
++      "//components/os_crypt/common:keychain_password_mac",
++      "//components/os_crypt/common:switches",
++      "//components/prefs",
++      "//components/prefs:test_support",
++      "//crypto",
++      "//testing/gtest",
++    ]
++    frameworks = [
++      "Foundation.framework",
++      "Security.framework",
++    ]
++  }
++}
+Index: src/chrome/browser/rac/storage/keychain_key_guard_mac.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/storage/keychain_key_guard_mac.h
+@@ -0,0 +1,68 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_STORAGE_KEYCHAIN_KEY_GUARD_MAC_H_
++#define CHROME_BROWSER_RAC_STORAGE_KEYCHAIN_KEY_GUARD_MAC_H_
++
++#include "base/functional/callback.h"
++
++class PrefService;
++
++namespace crypto::apple {
++class KeychainV2;
++}
++
++// Chromium makes a new storage key as soon as the Keychain says "not found",
++// and KeychainV2::AddGenericPassword() is an upsert. If the lookup only
++// failed for a moment, as it can while the login keychain is coming up, the
++// new key makes every cookie, saved password, and AI provider key unreadable,
++// and the upsert can overwrite the real item that appeared in the meantime.
++//
++// rac installs GuardedKeychainV2 (guarded_keychain_mac.h) as
++// KeychainV2::GetInstance(), which is what KeychainKeyProvider uses outside
++// tests, so nothing in //crypto or //components changes:
++// - When a key is expected (see IsKeychainKeyExpected()), "not found" adds
++//   nothing and stays an error. Helium's fail-closed provider retries, then
++//   gives up, and rac's missing-key dialog offers a confirmed new key.
++// - When no key is expected, the key is added with SecItemAdd only. If an
++//   item appeared, that fails with errSecDuplicateItem, and the provider's
++//   retry reads the existing item. Nothing is ever updated or overwritten.
++// Calls for any other Keychain item pass through unchanged.
++//
++// This header is plain C++, so browser_process_impl.cc can include it.
++namespace rac {
++
++class GuardedKeychainV2;
++
++class KeychainKeyGuard {
++ public:
++  // Call on the UI thread while building Helium's KeychainKeyProvider, before
++  // it asks for the key. Installs the guard, and returns the closure the
++  // provider runs when it gives up: `on_key_missing` if the key was expected
++  // and not found, otherwise Helium's `on_failure`. With --use-mock-keychain,
++  // installs nothing and returns `on_failure`.
++  static base::OnceClosure Install(PrefService* local_state,
++                                   base::OnceClosure on_failure,
++                                   base::OnceClosure on_key_missing);
++
++  // As Install(), but guards `inner` instead of the real Keychain.
++  static base::OnceClosure InstallOverForTesting(
++      crypto::apple::KeychainV2& inner,
++      PrefService* local_state,
++      base::OnceClosure on_failure,
++      base::OnceClosure on_key_missing);
++
++  static GuardedKeychainV2* GetForTesting();
++  static void UninstallForTesting();
++
++ private:
++  static base::OnceClosure InstallOver(crypto::apple::KeychainV2* inner,
++                                       PrefService* local_state,
++                                       base::OnceClosure on_failure,
++                                       base::OnceClosure on_key_missing);
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_STORAGE_KEYCHAIN_KEY_GUARD_MAC_H_
+Index: src/chrome/browser/rac/storage/keychain_key_guard_mac.mm
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/storage/keychain_key_guard_mac.mm
+@@ -0,0 +1,198 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/storage/keychain_key_guard_mac.h"
++
++#import <Foundation/Foundation.h>
++#import <Security/Security.h>
++
++#include <utility>
++
++#include "base/apple/bridging.h"
++#include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/strings/sys_string_conversions.h"
++#include "base/task/bind_post_task.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/rac/storage/guarded_keychain_mac.h"
++#include "chrome/browser/rac/storage/keychain_key_prefs.h"
++#include "components/os_crypt/common/keychain_password_mac.h"
++#include "components/os_crypt/common/os_crypt_switches.h"
++#include "components/prefs/pref_service.h"
++#include "crypto/apple/keychain_util.h"
++
++using base::apple::CFToNSPtrCast;
++using base::apple::NSToCFPtrCast;
++
++namespace rac {
++
++namespace {
++
++// Lives until the process exits once installed, because KeychainV2 callers
++// keep the reference GetInstance() gave them.
++GuardedKeychainV2* g_guard = nullptr;
++
++void RunOnFailure(base::OnceClosure on_failure,
++                  base::OnceClosure on_key_missing) {
++  if (g_guard && g_guard->key_missing()) {
++    std::move(on_key_missing).Run();
++    return;
++  }
++  std::move(on_failure).Run();
++}
++
++}  // namespace
++
++GuardedKeychainV2::GuardedKeychainV2(crypto::apple::KeychainV2& inner,
++                                     bool key_expected,
++                                     base::OnceClosure on_key_seen)
++    : inner_(inner),
++      key_expected_(key_expected),
++      on_key_seen_(std::move(on_key_seen)) {}
++
++GuardedKeychainV2::~GuardedKeychainV2() = default;
++
++base::expected<std::vector<uint8_t>, OSStatus>
++GuardedKeychainV2::FindGenericPassword(std::string_view service_name,
++                                       std::string_view account_name) {
++  auto result = inner_->FindGenericPassword(service_name, account_name);
++  if (!IsStorageKey(service_name, account_name)) {
++    return result;
++  }
++  // Only the latest lookup counts: AddGenericPassword() sets it again if this
++  // one said "not found".
++  key_missing_.store(false);
++  if (result.has_value()) {
++    ReportKeySeen();
++  }
++  return result;
++}
++
++OSStatus GuardedKeychainV2::AddGenericPassword(
++    std::string_view service_name,
++    std::string_view account_name,
++    base::span<const uint8_t> password) {
++  if (!IsStorageKey(service_name, account_name)) {
++    return inner_->AddGenericPassword(service_name, account_name, password);
++  }
++
++  // KeychainPassword only adds after its lookup said "not found". When this
++  // install had a key, that's a key that is missing or not visible yet, never
++  // one to replace.
++  if (key_expected_) {
++    LOG(ERROR) << "The Keychain has no storage key, but this install had one. "
++                  "Not making a new one.";
++    key_missing_.store(true);
++    return errSecItemNotFound;
++  }
++
++  // Add only. Unlike KeychainV2::AddGenericPassword(), there's no lookup
++  // first: it would ask for the item's data, which can show a second prompt,
++  // and if it found an item, the upsert would overwrite it. SecItemAdd fails
++  // with errSecDuplicateItem instead, and the provider's retry reads that
++  // item. These are the attributes upstream uses for a new item.
++  NSData* value = [NSData dataWithBytes:password.data() length:password.size()];
++  NSDictionary* attributes = @{
++    CFToNSPtrCast(kSecClass) : CFToNSPtrCast(kSecClassGenericPassword),
++    CFToNSPtrCast(kSecAttrService) : base::SysUTF8ToNSString(service_name),
++    CFToNSPtrCast(kSecAttrAccount) : base::SysUTF8ToNSString(account_name),
++    CFToNSPtrCast(kSecValueData) : value,
++    CFToNSPtrCast(kSecAttrAccessible) :
++        CFToNSPtrCast(crypto::apple::GetKeychainAccessibilityAttribute()),
++  };
++  OSStatus status = inner_->ItemAdd(NSToCFPtrCast(attributes),
++                                    /*result=*/nullptr);
++  if (status == noErr) {
++    ReportKeySeen();
++  }
++  return status;
++}
++
++bool GuardedKeychainV2::key_missing() const {
++  return key_missing_.load();
++}
++
++void GuardedKeychainV2::SetAsInstance() {
++  SetInstanceOverride(this);
++}
++
++void GuardedKeychainV2::ClearAsInstance() {
++  ClearInstanceOverride();
++}
++
++// static
++bool GuardedKeychainV2::IsStorageKey(std::string_view service_name,
++                                     std::string_view account_name) {
++  return service_name == KeychainPassword::GetServiceName() &&
++         account_name == KeychainPassword::GetAccountName();
++}
++
++void GuardedKeychainV2::ReportKeySeen() {
++  if (!key_seen_reported_.exchange(true) && on_key_seen_) {
++    std::move(on_key_seen_).Run();
++  }
++}
++
++// static
++base::OnceClosure KeychainKeyGuard::Install(PrefService* local_state,
++                                            base::OnceClosure on_failure,
++                                            base::OnceClosure on_key_missing) {
++  return InstallOver(/*inner=*/nullptr, local_state, std::move(on_failure),
++                     std::move(on_key_missing));
++}
++
++// static
++base::OnceClosure KeychainKeyGuard::InstallOverForTesting(
++    crypto::apple::KeychainV2& inner,
++    PrefService* local_state,
++    base::OnceClosure on_failure,
++    base::OnceClosure on_key_missing) {
++  return InstallOver(&inner, local_state, std::move(on_failure),
++                     std::move(on_key_missing));
++}
++
++// static
++base::OnceClosure KeychainKeyGuard::InstallOver(
++    crypto::apple::KeychainV2* inner,
++    PrefService* local_state,
++    base::OnceClosure on_failure,
++    base::OnceClosure on_key_missing) {
++  // Dev builds and browser tests use a fake keychain, so there's nothing to
++  // guard, and the real Keychain is never touched.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          os_crypt::switches::kUseMockKeychain)) {
++    return on_failure;
++  }
++  CHECK(!g_guard);
++  // Take the real instance before the guard replaces it.
++  if (!inner) {
++    inner = &crypto::apple::KeychainV2::GetInstance();
++  }
++  g_guard = new GuardedKeychainV2(
++      *inner, IsKeychainKeyExpected(*local_state),
++      base::BindPostTask(base::SequencedTaskRunner::GetCurrentDefault(),
++                         base::BindOnce(&RecordKeychainKeySeen,
++                                        base::Unretained(local_state))));
++  g_guard->SetAsInstance();
++  return base::BindOnce(&RunOnFailure, std::move(on_failure),
++                        std::move(on_key_missing));
++}
++
++// static
++GuardedKeychainV2* KeychainKeyGuard::GetForTesting() {
++  return g_guard;
++}
++
++// static
++void KeychainKeyGuard::UninstallForTesting() {
++  if (!g_guard) {
++    return;
++  }
++  g_guard->ClearAsInstance();
++  delete g_guard;
++  g_guard = nullptr;
++}
++
++}  // namespace rac
+Index: src/chrome/browser/rac/storage/keychain_key_guard_mac_unittest.mm
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/storage/keychain_key_guard_mac_unittest.mm
+@@ -0,0 +1,468 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/storage/keychain_key_guard_mac.h"
++
++#import <Foundation/Foundation.h>
++#import <Security/Security.h>
++
++#include <deque>
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/apple/bridging.h"
++#include "base/apple/foundation_util.h"
++#include "base/command_line.h"
++#include "base/containers/span.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/strings/sys_string_conversions.h"
++#include "base/test/scoped_command_line.h"
++#include "base/test/task_environment.h"
++#include "base/time/time.h"
++#include "base/values.h"
++#include "chrome/browser/rac/storage/guarded_keychain_mac.h"
++#include "chrome/browser/rac/storage/keychain_key_prefs.h"
++#include "components/os_crypt/async/browser/keychain_key_provider.h"
++#include "components/os_crypt/async/browser/os_crypt_async.h"
++#include "components/os_crypt/async/common/encryptor.h"
++#include "components/os_crypt/common/keychain_password_mac.h"
++#include "components/os_crypt/common/os_crypt_switches.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/testing_pref_service.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++using base::apple::CFToNSPtrCast;
++
++namespace rac {
++namespace {
++
++// A keychain with at most one item, the storage key. Nothing here reaches
++// the real Keychain: every KeychainV2 call that KeychainPassword, the guard,
++// or upstream's AddGenericPassword() can make is answered here.
++class ScriptedKeychain : public crypto::apple::KeychainV2 {
++ public:
++  ScriptedKeychain() = default;
++  ~ScriptedKeychain() override = default;
++
++  // The item exists, with this password.
++  void Store(std::string password) { item_ = std::move(password); }
++  // The next FindGenericPassword() calls return these, before the item
++  // answers. noErr is not allowed here; use Store().
++  void ScriptFind(std::vector<OSStatus> results) {
++    script_.assign(results.begin(), results.end());
++  }
++  // The item appears just before the next ItemAdd(), as if another process or
++  // a slow login made it visible after the lookup.
++  void AppearBeforeAdd(std::string password) {
++    appear_before_add_ = std::move(password);
++  }
++
++  const std::optional<std::string>& item() const { return item_; }
++  int find_calls() const { return find_calls_; }
++  int add_calls() const { return add_calls_; }
++  int update_calls() const { return update_calls_; }
++  int copy_matching_calls() const { return copy_matching_calls_; }
++  NSDictionary* last_add() const { return last_add_; }
++
++  // crypto::apple::KeychainV2:
++  base::expected<std::vector<uint8_t>, OSStatus> FindGenericPassword(
++      std::string_view service_name,
++      std::string_view account_name) override {
++    ++find_calls_;
++    if (!script_.empty()) {
++      OSStatus status = script_.front();
++      script_.pop_front();
++      return base::unexpected(status);
++    }
++    if (!item_) {
++      return base::unexpected(errSecItemNotFound);
++    }
++    auto bytes = base::as_byte_span(*item_);
++    return std::vector<uint8_t>(bytes.begin(), bytes.end());
++  }
++
++  OSStatus ItemAdd(CFDictionaryRef attributes, CFTypeRef* result) override {
++    ++add_calls_;
++    if (appear_before_add_) {
++      item_ = std::move(appear_before_add_);
++      appear_before_add_.reset();
++    }
++    if (item_) {
++      return errSecDuplicateItem;
++    }
++    last_add_ = [base::apple::CFToNSPtrCast(attributes) copy];
++    item_ = PasswordFrom(attributes);
++    return noErr;
++  }
++
++  OSStatus ItemCopyMatching(CFDictionaryRef query, CFTypeRef* result) override {
++    ++copy_matching_calls_;
++    return item_ ? OSStatus{noErr} : OSStatus{errSecItemNotFound};
++  }
++
++  OSStatus ItemUpdate(CFDictionaryRef query,
++                      CFDictionaryRef keychain_data) override {
++    ++update_calls_;
++    item_ = PasswordFrom(keychain_data);
++    return noErr;
++  }
++
++  OSStatus ItemDelete(CFDictionaryRef query) override {
++    ADD_FAILURE() << "Nothing should delete the item.";
++    return errSecUnimplemented;
++  }
++
++ private:
++  static std::string PasswordFrom(CFDictionaryRef dict) {
++    NSData* data = base::apple::ObjCCast<NSData>(
++        base::apple::CFToNSPtrCast(dict)[CFToNSPtrCast(kSecValueData)]);
++    return std::string(static_cast<const char*>(data.bytes), data.length);
++  }
++
++  std::optional<std::string> item_;
++  std::deque<OSStatus> script_;
++  std::optional<std::string> appear_before_add_;
++  NSDictionary* __strong last_add_ = nil;
++  int find_calls_ = 0;
++  int add_calls_ = 0;
++  int update_calls_ = 0;
++  int copy_matching_calls_ = 0;
++};
++
++class KeychainKeyGuardTest : public ::testing::Test {
++ protected:
++  KeychainKeyGuardTest() {
++    RegisterKeychainKeyPrefs(local_state_.registry());
++    local_state_.registry()->RegisterDictionaryPref(kKeychainProfilesPref);
++  }
++
++  void SetUp() override {
++    ASSERT_FALSE(base::CommandLine::ForCurrentProcess()->HasSwitch(
++        os_crypt::switches::kUseMockKeychain));
++    ASSERT_FALSE(KeychainKeyGuard::GetForTesting());
++  }
++
++  void TearDown() override { KeychainKeyGuard::UninstallForTesting(); }
++
++  // Installs the guard over `keychain` the way BrowserProcessImpl does, with
++  // counters for Helium's dialog and rac's.
++  base::OnceClosure Install(ScriptedKeychain& keychain) {
++    return KeychainKeyGuard::InstallOverForTesting(
++        keychain, &local_state_,
++        base::BindOnce([](int* count) { ++*count; }, &helium_dialogs_),
++        base::BindOnce([](int* count) { ++*count; }, &rac_dialogs_));
++  }
++
++  // Builds Helium's fail-closed provider inside OSCryptAsync, as
++  // BrowserProcessImpl does, and lets every retry run. Returns the encryptor,
++  // or null if the provider never delivered a key.
++  scoped_refptr<os_crypt_async::Encryptor> RunProvider(
++      base::OnceClosure on_failure) {
++    // Without the guard, the provider would use the real Keychain.
++    CHECK(KeychainKeyGuard::GetForTesting());
++    std::vector<std::pair<os_crypt_async::OSCryptAsync::Precedence,
++                          std::unique_ptr<os_crypt_async::KeyProvider>>>
++        providers;
++    providers.emplace_back(
++        10u, std::make_unique<os_crypt_async::KeychainKeyProvider>(
++                 std::move(on_failure)));
++    os_crypt_async::OSCryptAsync os_crypt(std::move(providers));
++    scoped_refptr<os_crypt_async::Encryptor> encryptor;
++    os_crypt.GetInstance(base::BindOnce(
++        [](scoped_refptr<os_crypt_async::Encryptor>* out,
++           scoped_refptr<os_crypt_async::Encryptor> encryptor) {
++          *out = std::move(encryptor);
++        },
++        &encryptor));
++    // Helium retries 3 times, 1 s apart.
++    task_environment_.FastForwardBy(base::Seconds(10));
++    return encryptor;
++  }
++
++  // What the encryptor for `password` makes of a fixed string. The Keychain
++  // key's encryption (AES-128-CBC, fixed IV) is deterministic, so equal output
++  // means an equal key.
++  // Uses its own Local State, so the test's isn't marked as having a key.
++  std::string EncryptWithKeyFrom(const std::string& password) {
++    TestingPrefServiceSimple local_state;
++    RegisterKeychainKeyPrefs(local_state.registry());
++    ScriptedKeychain keychain;
++    keychain.Store(password);
++    base::OnceClosure on_failure = KeychainKeyGuard::InstallOverForTesting(
++        keychain, &local_state, base::DoNothing(), base::DoNothing());
++    scoped_refptr<os_crypt_async::Encryptor> encryptor =
++        RunProvider(std::move(on_failure));
++    KeychainKeyGuard::UninstallForTesting();
++    return Encrypt(encryptor);
++  }
++
++  static std::string Encrypt(
++      const scoped_refptr<os_crypt_async::Encryptor>& encryptor) {
++    std::string ciphertext;
++    CHECK(encryptor);
++    CHECK(encryptor->EncryptString("probe", &ciphertext));
++    return ciphertext;
++  }
++
++  base::test::TaskEnvironment task_environment_{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME};
++  TestingPrefServiceSimple local_state_;
++  int helium_dialogs_ = 0;
++  int rac_dialogs_ = 0;
++};
++
++// The plan's test. A slow login: the first lookup says "not found", and the
++// real item is there by the retry. Upstream adds a second key on the first
++// attempt and uses it.
++TEST_F(KeychainKeyGuardTest, NotFoundThenFoundWritesNoSecondKey) {
++  const std::string expected = EncryptWithKeyFrom("existing");
++  ASSERT_NE(expected, EncryptWithKeyFrom("other"));
++
++  local_state_.SetBoolean(kKeychainKeySeen, true);
++  ScriptedKeychain keychain;
++  keychain.Store("existing");
++  keychain.ScriptFind({errSecItemNotFound});
++  scoped_refptr<os_crypt_async::Encryptor> encryptor =
++      RunProvider(Install(keychain));
++
++  ASSERT_TRUE(encryptor);
++  EXPECT_EQ(Encrypt(encryptor), expected);
++  EXPECT_EQ(keychain.find_calls(), 2);
++  EXPECT_EQ(keychain.add_calls(), 0);
++  EXPECT_EQ(keychain.update_calls(), 0);
++  EXPECT_EQ(keychain.copy_matching_calls(), 0);
++  EXPECT_EQ(keychain.item(), "existing");
++  EXPECT_EQ(helium_dialogs_, 0);
++  EXPECT_EQ(rac_dialogs_, 0);
++}
++
++TEST_F(KeychainKeyGuardTest, ExpectedKeyMissingFailsClosed) {
++  local_state_.SetBoolean(kKeychainKeySeen, true);
++  ScriptedKeychain keychain;
++  scoped_refptr<os_crypt_async::Encryptor> encryptor =
++      RunProvider(Install(keychain));
++
++  // The key callback never ran, so nothing loads without the key.
++  EXPECT_FALSE(encryptor);
++  // The first try and 3 retries, none of which added anything.
++  EXPECT_EQ(keychain.find_calls(), 4);
++  EXPECT_EQ(keychain.add_calls(), 0);
++  EXPECT_EQ(keychain.update_calls(), 0);
++  EXPECT_FALSE(keychain.item());
++  EXPECT_TRUE(KeychainKeyGuard::GetForTesting()->key_missing());
++  // rac's dialog, which can make a new key, instead of Helium's.
++  EXPECT_EQ(rac_dialogs_, 1);
++  EXPECT_EQ(helium_dialogs_, 0);
++}
++
++TEST_F(KeychainKeyGuardTest, ExpectedKeyNotFoundAddsNothing) {
++  ScriptedKeychain keychain;
++  GuardedKeychainV2 guard(keychain, /*key_expected=*/true, base::DoNothing());
++  KeychainPassword password(guard);
++
++  auto result = password.GetPasswordWithError();
++  ASSERT_FALSE(result.has_value());
++  EXPECT_EQ(result.error(), errSecItemNotFound);
++  EXPECT_TRUE(guard.key_missing());
++  EXPECT_EQ(keychain.add_calls(), 0);
++  EXPECT_EQ(keychain.update_calls(), 0);
++  EXPECT_FALSE(keychain.item());
++}
++
++TEST_F(KeychainKeyGuardTest, AddNeverOverwritesAnExistingItem) {
++  // Upstream's upsert, on the same fake, would overwrite the item. This shows
++  // the fake can tell.
++  {
++    ScriptedKeychain keychain;
++    keychain.Store("existing");
++    const std::string fresh = "fresh";
++    EXPECT_EQ(keychain.AddGenericPassword("rac Storage Key", "rac",
++                                          base::as_byte_span(fresh)),
++              noErr);
++    EXPECT_EQ(keychain.update_calls(), 1);
++    EXPECT_EQ(keychain.item(), "fresh");
++  }
++
++  // Directly: the add fails as a duplicate and the item is untouched.
++  {
++    ScriptedKeychain keychain;
++    keychain.AppearBeforeAdd("existing");
++    GuardedKeychainV2 guard(keychain, /*key_expected=*/false,
++                            base::DoNothing());
++    auto result = KeychainPassword(guard).GetPasswordWithError();
++    ASSERT_FALSE(result.has_value());
++    EXPECT_EQ(result.error(), errSecDuplicateItem);
++    EXPECT_FALSE(guard.key_missing());
++    EXPECT_EQ(keychain.update_calls(), 0);
++    EXPECT_EQ(keychain.copy_matching_calls(), 0);
++    EXPECT_EQ(keychain.item(), "existing");
++  }
++
++  // Through the provider: its retry reads the item that won.
++  const std::string expected = EncryptWithKeyFrom("existing");
++  ScriptedKeychain keychain;
++  keychain.AppearBeforeAdd("existing");
++  scoped_refptr<os_crypt_async::Encryptor> encryptor =
++      RunProvider(Install(keychain));
++  ASSERT_TRUE(encryptor);
++  EXPECT_EQ(Encrypt(encryptor), expected);
++  EXPECT_EQ(keychain.add_calls(), 1);
++  EXPECT_EQ(keychain.update_calls(), 0);
++  EXPECT_EQ(keychain.item(), "existing");
++  EXPECT_EQ(helium_dialogs_, 0);
++  EXPECT_EQ(rac_dialogs_, 0);
++}
++
++TEST_F(KeychainKeyGuardTest, UnexpectedMissingKeyIsAddedOnce) {
++  ScriptedKeychain keychain;
++  int key_seen = 0;
++  GuardedKeychainV2 guard(
++      keychain, /*key_expected=*/false,
++      base::BindOnce([](int* count) { ++*count; }, &key_seen));
++  KeychainPassword password(guard);
++
++  auto made = password.GetPasswordWithError();
++  ASSERT_TRUE(made.has_value());
++  ASSERT_FALSE(made->empty());
++  EXPECT_EQ(keychain.add_calls(), 1);
++  // No lookup that asks for the item's data, so no second prompt.
++  EXPECT_EQ(keychain.copy_matching_calls(), 0);
++  EXPECT_EQ(keychain.update_calls(), 0);
++  EXPECT_EQ(key_seen, 1);
++
++  NSDictionary* add = keychain.last_add();
++  ASSERT_TRUE(add);
++  EXPECT_EQ(add.count, 5u);
++  EXPECT_TRUE([add[CFToNSPtrCast(kSecClass)]
++      isEqual:CFToNSPtrCast(kSecClassGenericPassword)]);
++  EXPECT_TRUE([add[CFToNSPtrCast(kSecAttrService)] isEqual:@"rac Storage Key"]);
++  EXPECT_TRUE([add[CFToNSPtrCast(kSecAttrAccount)] isEqual:@"rac"]);
++  EXPECT_TRUE([add[CFToNSPtrCast(kSecAttrAccessible)]
++      isEqual:CFToNSPtrCast(kSecAttrAccessibleWhenUnlocked)]);
++  EXPECT_EQ(keychain.item(), *made);
++
++  // The next read finds it and adds nothing.
++  auto read = password.GetPasswordWithError();
++  ASSERT_TRUE(read.has_value());
++  EXPECT_EQ(*read, *made);
++  EXPECT_EQ(keychain.add_calls(), 1);
++  EXPECT_EQ(key_seen, 1);
++}
++
++TEST_F(KeychainKeyGuardTest, ErrorIsNotTreatedAsMissing) {
++  // Directly: an error is passed on, and nothing is added.
++  {
++    ScriptedKeychain keychain;
++    keychain.ScriptFind({errSecInteractionNotAllowed});
++    GuardedKeychainV2 guard(keychain, /*key_expected=*/false,
++                            base::DoNothing());
++    auto result = KeychainPassword(guard).GetPasswordWithError();
++    ASSERT_FALSE(result.has_value());
++    EXPECT_EQ(result.error(), errSecInteractionNotAllowed);
++    EXPECT_FALSE(guard.key_missing());
++    EXPECT_EQ(keychain.add_calls(), 0);
++  }
++
++  // Through the provider, with a key expected: Helium's dialog, not rac's,
++  // so nobody is offered a new key because the Keychain was locked. Only
++  // the last attempt counts.
++  local_state_.SetBoolean(kKeychainKeySeen, true);
++  ScriptedKeychain keychain;
++  keychain.ScriptFind({errSecItemNotFound, errSecItemNotFound,
++                       errSecItemNotFound, errSecInteractionNotAllowed});
++  scoped_refptr<os_crypt_async::Encryptor> encryptor =
++      RunProvider(Install(keychain));
++  EXPECT_FALSE(encryptor);
++  EXPECT_EQ(keychain.find_calls(), 4);
++  EXPECT_EQ(keychain.add_calls(), 0);
++  EXPECT_FALSE(KeychainKeyGuard::GetForTesting()->key_missing());
++  EXPECT_EQ(helium_dialogs_, 1);
++  EXPECT_EQ(rac_dialogs_, 0);
++}
++
++TEST_F(KeychainKeyGuardTest, ExpectationComesFromLocalState) {
++  // Whether the guard lets KeychainPassword add a key to an empty keychain.
++  auto adds_key = [&]() {
++    ScriptedKeychain keychain;
++    base::OnceClosure on_failure = Install(keychain);
++    bool added = KeychainPassword(*KeychainKeyGuard::GetForTesting())
++                     .GetPasswordWithError()
++                     .has_value();
++    KeychainKeyGuard::UninstallForTesting();
++    task_environment_.RunUntilIdle();
++    local_state_.ClearPref(kKeychainKeySeen);
++    return added;
++  };
++
++  // A fresh Local State: a first launch, so a key may be made.
++  EXPECT_TRUE(adds_key());
++
++  // The marker.
++  local_state_.SetBoolean(kKeychainKeySeen, true);
++  EXPECT_FALSE(adds_key());
++
++  // No marker, but a profile: an install from before the marker.
++  local_state_.SetDict(
++      kKeychainProfilesPref,
++      base::DictValue().Set("Default", base::DictValue().Set("name", "Me")));
++  EXPECT_FALSE(adds_key());
++
++  // The user confirmed a new key, which overrides both.
++  local_state_.SetBoolean(kKeychainKeySeen, true);
++  local_state_.SetBoolean(kKeychainAllowNewKey, true);
++  EXPECT_TRUE(adds_key());
++  local_state_.ClearPref(kKeychainProfilesPref);
++
++  // With --use-mock-keychain, as in dev builds and browser tests, nothing is
++  // installed, and Helium's failure closure comes back as it was.
++  base::test::ScopedCommandLine command_line;
++  command_line.GetProcessCommandLine()->AppendSwitch(
++      os_crypt::switches::kUseMockKeychain);
++  base::OnceClosure on_failure = KeychainKeyGuard::Install(
++      &local_state_,
++      base::BindOnce([](int* count) { ++*count; }, &helium_dialogs_),
++      base::BindOnce([](int* count) { ++*count; }, &rac_dialogs_));
++  EXPECT_FALSE(KeychainKeyGuard::GetForTesting());
++  std::move(on_failure).Run();
++  EXPECT_EQ(helium_dialogs_, 1);
++  EXPECT_EQ(rac_dialogs_, 0);
++}
++
++TEST_F(KeychainKeyGuardTest, KeySeenIsRecordedOnce) {
++  // As after a confirmed new key: allow_new_key set, no marker yet.
++  local_state_.SetBoolean(kKeychainAllowNewKey, true);
++  ScriptedKeychain keychain;
++  keychain.Store("existing");
++  base::OnceClosure on_failure = Install(keychain);
++
++  int changes = 0;
++  PrefChangeRegistrar registrar;
++  registrar.Init(&local_state_);
++  auto count = base::BindRepeating([](int* count) { ++*count; }, &changes);
++  registrar.Add(kKeychainKeySeen, count);
++  registrar.Add(kKeychainAllowNewKey, count);
++
++  KeychainPassword password(*KeychainKeyGuard::GetForTesting());
++  ASSERT_TRUE(password.GetPasswordWithError().has_value());
++  // Recorded on the UI thread, not on the Keychain worker.
++  EXPECT_EQ(changes, 0);
++  task_environment_.RunUntilIdle();
++  EXPECT_TRUE(local_state_.GetBoolean(kKeychainKeySeen));
++  EXPECT_FALSE(local_state_.HasPrefPath(kKeychainAllowNewKey));
++  EXPECT_EQ(changes, 2);
++
++  // Later reads, and recording it again, write nothing.
++  ASSERT_TRUE(password.GetPasswordWithError().has_value());
++  task_environment_.RunUntilIdle();
++  RecordKeychainKeySeen(&local_state_);
++  EXPECT_EQ(changes, 2);
++}
++
++}  // namespace
++}  // namespace rac
+Index: src/chrome/browser/rac/storage/keychain_key_prefs.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/storage/keychain_key_prefs.cc
+@@ -0,0 +1,91 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/storage/keychain_key_prefs.h"
++
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/values.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
++
++namespace rac {
++
++namespace {
++
++void OnKeyMissingAnswered(PrefService* local_state,
++                          AskNewKeyStep ask,
++                          base::OnceClosure quit,
++                          bool make_new_key);
++
++void OnConfirmAnswered(PrefService* local_state,
++                       base::OnceClosure quit,
++                       bool make_new_key) {
++  if (!make_new_key) {
++    std::move(quit).Run();
++    return;
++  }
++  local_state->SetBoolean(kKeychainAllowNewKey, true);
++  // Quit only once the pref is on disk, or the next launch would still treat
++  // the key as expected and show this dialog again.
++  local_state->CommitPendingWrite(std::move(quit));
++}
++
++void OnKeyMissingAnswered(PrefService* local_state,
++                          AskNewKeyStep ask,
++                          base::OnceClosure quit,
++                          bool make_new_key) {
++  if (!make_new_key) {
++    std::move(quit).Run();
++    return;
++  }
++  ask.Run(NewKeyStep::kConfirm,
++          base::BindOnce(&OnConfirmAnswered, base::Unretained(local_state),
++                         std::move(quit)));
++}
++
++}  // namespace
++
++void RegisterKeychainKeyPrefs(PrefRegistrySimple* registry) {
++  registry->RegisterBooleanPref(kKeychainKeySeen, false);
++  registry->RegisterBooleanPref(kKeychainAllowNewKey, false);
++}
++
++bool IsKeychainKeyExpected(const PrefService& local_state) {
++  if (local_state.GetBoolean(kKeychainAllowNewKey)) {
++    return false;
++  }
++  if (local_state.GetBoolean(kKeychainKeySeen)) {
++    return true;
++  }
++  const PrefService::Preference* profiles =
++      local_state.FindPreference(kKeychainProfilesPref);
++  if (!profiles) {
++    return false;
++  }
++  const base::DictValue* dict = profiles->GetValue()->GetIfDict();
++  return dict && !dict->empty();
++}
++
++void RecordKeychainKeySeen(PrefService* local_state) {
++  if (!local_state->GetBoolean(kKeychainKeySeen)) {
++    local_state->SetBoolean(kKeychainKeySeen, true);
++  }
++  if (local_state->HasPrefPath(kKeychainAllowNewKey)) {
++    local_state->ClearPref(kKeychainAllowNewKey);
++  }
++}
++
++void RunNewKeychainKeyFlow(PrefService* local_state,
++                           AskNewKeyStep ask,
++                           base::OnceClosure quit) {
++  AskNewKeyStep ask_copy = ask;
++  ask_copy.Run(
++      NewKeyStep::kKeyMissing,
++      base::BindOnce(&OnKeyMissingAnswered, base::Unretained(local_state),
++                     std::move(ask), std::move(quit)));
++}
++
++}  // namespace rac
+Index: src/chrome/browser/rac/storage/keychain_key_prefs.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/storage/keychain_key_prefs.h
+@@ -0,0 +1,68 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_STORAGE_KEYCHAIN_KEY_PREFS_H_
++#define CHROME_BROWSER_RAC_STORAGE_KEYCHAIN_KEY_PREFS_H_
++
++#include "base/functional/callback.h"
++
++class PrefRegistrySimple;
++class PrefService;
++
++// What Local State says about the Keychain item that holds the key for
++// cookies, saved passwords, and other os_crypt data. The guard that uses it is
++// in keychain_key_guard_mac.h. These are plain prefs, so they're registered on
++// every platform.
++namespace rac {
++
++// Local State: set the first time this install reads or makes its key. Once
++// it's set, "not found" means the key is missing, not that it was never made.
++inline constexpr char kKeychainKeySeen[] = "rac.keychain.key_seen";
++
++// Local State: set only when the user confirms "Make a New Key" in the
++// missing-key dialog. It lets the next launch make a key, and is cleared as
++// soon as a key is read or made.
++inline constexpr char kKeychainAllowNewKey[] = "rac.keychain.allow_new_key";
++
++// prefs::kProfileAttributes. Spelled out so this stays free of //chrome deps;
++// keychain_key_dialog.cc static_asserts that it still matches.
++inline constexpr char kKeychainProfilesPref[] = "profile.info_cache";
++
++void RegisterKeychainKeyPrefs(PrefRegistrySimple* registry);
++
++// Whether this install has had a key before, so a missing one must not be
++// replaced silently. True if the key was seen, or, for installs from before
++// that pref, if Local State lists any profile. Every install that ran has
++// made a key, because the Keychain key provider runs at every startup. False
++// once the user confirmed making a new key.
++bool IsKeychainKeyExpected(const PrefService& local_state);
++
++// Records that a key was read or made. Writes nothing if that's already
++// recorded, so a healthy launch doesn't touch Local State.
++void RecordKeychainKeySeen(PrefService* local_state);
++
++// The steps of the missing-key dialog.
++enum class NewKeyStep {
++  // "rac can't find its encryption key." Quit (default) or Make a New Key…
++  kKeyMissing,
++  // "Make a new key? This can't be undone." Cancel (default) or Make New Key.
++  kConfirm,
++};
++
++// Shows one step and replies true only for "Make a New Key…" or
++// "Make New Key". Anything else, including closing it, replies false.
++using AskNewKeyStep =
++    base::RepeatingCallback<void(NewKeyStep, base::OnceCallback<void(bool)>)>;
++
++// Runs the missing-key dialog: asks `kKeyMissing`, then `kConfirm`. Only when
++// both say yes, it sets kKeychainAllowNewKey and waits until Local State is
++// written. Then, whatever the answers, it runs `quit`. The next launch makes
++// the key.
++void RunNewKeychainKeyFlow(PrefService* local_state,
++                           AskNewKeyStep ask,
++                           base::OnceClosure quit);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_STORAGE_KEYCHAIN_KEY_PREFS_H_
+Index: src/chrome/browser/rac/storage/keychain_key_prefs_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/storage/keychain_key_prefs_unittest.cc
+@@ -0,0 +1,121 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/storage/keychain_key_prefs.h"
++
++#include <optional>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback.h"
++#include "base/test/task_environment.h"
++#include "base/values.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/testing_pref_service.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++// Answers each step of the missing-key dialog from a script, as a user would.
++class FakeAsker {
++ public:
++  explicit FakeAsker(std::vector<bool> answers)
++      : answers_(std::move(answers)) {}
++
++  AskNewKeyStep Callback() {
++    return base::BindRepeating(&FakeAsker::Ask, base::Unretained(this));
++  }
++
++  const std::vector<NewKeyStep>& asked() const { return asked_; }
++
++ private:
++  void Ask(NewKeyStep step, base::OnceCallback<void(bool)> reply) {
++    asked_.push_back(step);
++    ASSERT_LT(asked_.size() - 1, answers_.size());
++    std::move(reply).Run(answers_[asked_.size() - 1]);
++  }
++
++  std::vector<bool> answers_;
++  std::vector<NewKeyStep> asked_;
++};
++
++class KeychainKeyPrefsTest : public ::testing::Test {
++ protected:
++  KeychainKeyPrefsTest() {
++    RegisterKeychainKeyPrefs(local_state_.registry());
++    local_state_.registry()->RegisterDictionaryPref(kKeychainProfilesPref);
++  }
++
++  // Runs the flow with `answers` and reports whether Local State was
++  // committed by the time rac quit, or nullopt if it never quit.
++  std::optional<bool> RunFlow(FakeAsker& asker) {
++    std::optional<bool> committed_at_quit;
++    RunNewKeychainKeyFlow(
++        &local_state_, asker.Callback(),
++        base::BindOnce(
++            [](std::optional<bool>* out, TestingPrefStore* store) {
++              *out = store->committed();
++            },
++            &committed_at_quit,
++            base::Unretained(local_state_.user_prefs_store().get())));
++    task_environment_.RunUntilIdle();
++    return committed_at_quit;
++  }
++
++  base::test::TaskEnvironment task_environment_;
++  TestingPrefServiceSimple local_state_;
++};
++
++TEST_F(KeychainKeyPrefsTest, NewKeyNeedsTwoConfirmations) {
++  // Quit at the first step: no second step, nothing written.
++  {
++    FakeAsker asker({false});
++    EXPECT_TRUE(RunFlow(asker).has_value());
++    EXPECT_EQ(asker.asked(), std::vector<NewKeyStep>{NewKeyStep::kKeyMissing});
++    EXPECT_FALSE(local_state_.HasPrefPath(kKeychainAllowNewKey));
++  }
++  // Make a New Key…, then Cancel: still nothing written, and rac quits.
++  {
++    FakeAsker asker({true, false});
++    EXPECT_TRUE(RunFlow(asker).has_value());
++    EXPECT_EQ(asker.asked(), (std::vector<NewKeyStep>{NewKeyStep::kKeyMissing,
++                                                      NewKeyStep::kConfirm}));
++    EXPECT_FALSE(local_state_.HasPrefPath(kKeychainAllowNewKey));
++  }
++  // Both confirmed: allow_new_key is set and committed before rac quits.
++  // (Setting the pref marks the store uncommitted, so `true` here means a
++  // commit came after it.)
++  {
++    FakeAsker asker({true, true});
++    EXPECT_EQ(RunFlow(asker), true);
++    EXPECT_EQ(asker.asked().size(), 2u);
++    EXPECT_TRUE(local_state_.GetBoolean(kKeychainAllowNewKey));
++  }
++}
++
++TEST_F(KeychainKeyPrefsTest, AllowNewKeyOverridesEveryReasonToExpectAKey) {
++  EXPECT_FALSE(IsKeychainKeyExpected(local_state_));
++  local_state_.SetBoolean(kKeychainKeySeen, true);
++  EXPECT_TRUE(IsKeychainKeyExpected(local_state_));
++  local_state_.SetBoolean(kKeychainAllowNewKey, true);
++  EXPECT_FALSE(IsKeychainKeyExpected(local_state_));
++
++  // A key read or made clears it, so the next missing key fails closed again.
++  RecordKeychainKeySeen(&local_state_);
++  EXPECT_FALSE(local_state_.HasPrefPath(kKeychainAllowNewKey));
++  EXPECT_TRUE(IsKeychainKeyExpected(local_state_));
++}
++
++TEST_F(KeychainKeyPrefsTest, ProfilesWithoutTheMarkerMeanAKeyExisted) {
++  base::DictValue profiles;
++  profiles.Set("Default", base::DictValue().Set("name", "Personal"));
++  local_state_.SetDict(kKeychainProfilesPref, std::move(profiles));
++  EXPECT_FALSE(local_state_.GetBoolean(kKeychainKeySeen));
++  EXPECT_TRUE(IsKeychainKeyExpected(local_state_));
++}
++
++}  // namespace
++}  // namespace rac
+Index: src/chrome/browser/ui/rac/storage/BUILD.gn
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/storage/BUILD.gn
+@@ -0,0 +1,23 @@
++# Copyright 2026 The rac Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++# The missing Keychain key dialog. Shown before any browser window exists, so
++# it needs only Views, not //chrome/browser/ui. Used by //chrome/browser:core.
++source_set("keychain_key_dialog") {
++  sources = [
++    "keychain_key_dialog.cc",
++    "keychain_key_dialog.h",
++  ]
++  deps = [
++    "//base",
++    "//chrome/app:generated_resources",
++    "//chrome/browser/rac/storage",
++    "//chrome/common:constants",
++    "//components/prefs",
++    "//components/strings",
++    "//ui/base",
++    "//ui/gfx",
++    "//ui/views",
++  ]
++}
+Index: src/chrome/browser/ui/rac/storage/keychain_key_dialog.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/storage/keychain_key_dialog.cc
+@@ -0,0 +1,126 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/storage/keychain_key_dialog.h"
++
++#include <stdlib.h>
++
++#include <memory>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback.h"
++#include "base/location.h"
++#include "base/memory/ref_counted.h"
++#include "base/no_destructor.h"
++#include "base/process/process.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/rac/storage/keychain_key_prefs.h"
++#include "chrome/common/pref_names.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/strings/grit/components_strings.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/mojom/dialog_button.mojom.h"
++#include "ui/base/mojom/ui_base_types.mojom-shared.h"
++#include "ui/base/ui_base_types.h"
++#include "ui/gfx/native_ui_types.h"
++#include "ui/views/controls/message_box_view.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/window/dialog_delegate.h"
++
++static_assert(std::string_view(rac::kKeychainProfilesPref) ==
++              prefs::kProfileAttributes);
++
++namespace rac {
++
++namespace {
++
++// One answer per dialog: accept, cancel, Escape, and closing the window can't
++// all reply.
++class Reply : public base::RefCounted<Reply> {
++ public:
++  explicit Reply(base::OnceCallback<void(bool)> callback)
++      : callback_(std::move(callback)) {}
++
++  void Run(bool make_new_key) {
++    if (!callback_) {
++      return;
++    }
++    // Let the widget finish closing before the next step opens.
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback_), make_new_key));
++  }
++
++ private:
++  friend class base::RefCounted<Reply>;
++  ~Reply() = default;
++
++  base::OnceCallback<void(bool)> callback_;
++};
++
++// The dialogs' delegates. The widgets don't own them, and rac quits after the
++// last one, so they're kept until then.
++std::vector<std::unique_ptr<views::DialogDelegate>>& Delegates() {
++  static base::NoDestructor<std::vector<std::unique_ptr<views::DialogDelegate>>>
++      delegates;
++  return *delegates;
++}
++
++void AskStep(NewKeyStep step, base::OnceCallback<void(bool)> callback) {
++  const bool confirm = step == NewKeyStep::kConfirm;
++  auto reply = base::MakeRefCounted<Reply>(std::move(callback));
++
++  auto dialog = std::make_unique<views::DialogDelegate>();
++  dialog->SetModalType(ui::mojom::ModalType::kNone);
++  dialog->SetShowCloseButton(false);
++  dialog->SetTitle(confirm ? IDS_RAC_KEYCHAIN_NEW_KEY_CONFIRM_TITLE
++                           : IDS_RAC_KEYCHAIN_KEY_MISSING_TITLE);
++  dialog->SetButtons(static_cast<int>(ui::mojom::DialogButton::kOk) |
++                     static_cast<int>(ui::mojom::DialogButton::kCancel));
++  // OK makes the key. Cancel (Quit at the first step) is the default, so
++  // Return never makes one.
++  dialog->SetButtonLabel(ui::mojom::DialogButton::kOk,
++                         l10n_util::GetStringUTF16(
++                             confirm ? IDS_RAC_KEYCHAIN_NEW_KEY_CONFIRM
++                                     : IDS_RAC_KEYCHAIN_KEY_MISSING_NEW_KEY));
++  dialog->SetButtonLabel(
++      ui::mojom::DialogButton::kCancel,
++      l10n_util::GetStringUTF16(confirm ? IDS_CANCEL
++                                        : IDS_RAC_KEYCHAIN_KEY_MISSING_QUIT));
++  dialog->SetDefaultButton(static_cast<int>(ui::mojom::DialogButton::kCancel));
++  dialog->SetAcceptCallback(base::BindOnce(&Reply::Run, reply, true));
++  dialog->SetCancelCallback(base::BindOnce(&Reply::Run, reply, false));
++  dialog->SetCloseCallback(base::BindOnce(&Reply::Run, reply, false));
++  dialog->SetContentsView(std::make_unique<views::MessageBoxView>(
++      l10n_util::GetStringUTF16(confirm
++                                    ? IDS_RAC_KEYCHAIN_NEW_KEY_CONFIRM_MESSAGE
++                                    : IDS_RAC_KEYCHAIN_KEY_MISSING_MESSAGE)));
++
++  // No browser window exists yet, so there's no parent. Float it above other
++  // windows, like Chromium's parentless message boxes.
++  views::Widget* widget = views::DialogDelegate::CreateDialogWidget(
++      dialog.get(), gfx::NativeWindow(), gfx::NativeView());
++  Delegates().push_back(std::move(dialog));
++  widget->SetZOrderLevel(ui::ZOrderLevel::kFloatingWindow);
++  widget->Show();
++}
++
++void Quit() {
++  // Profile initialization is still waiting for the key. Exit without
++  // flushing partially initialized preferences, as Helium's Keychain error
++  // does. Local State was already written if the user asked for a new key.
++  base::Process::TerminateCurrentProcessImmediately(EXIT_FAILURE);
++}
++
++}  // namespace
++
++void ShowMissingKeychainKeyDialog(PrefService* local_state) {
++  RunNewKeychainKeyFlow(local_state, base::BindRepeating(&AskStep),
++                        base::BindOnce(&Quit));
++}
++
++}  // namespace rac
+Index: src/chrome/browser/ui/rac/storage/keychain_key_dialog.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/storage/keychain_key_dialog.h
+@@ -0,0 +1,22 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_STORAGE_KEYCHAIN_KEY_DIALOG_H_
++#define CHROME_BROWSER_UI_RAC_STORAGE_KEYCHAIN_KEY_DIALOG_H_
++
++class PrefService;
++
++namespace rac {
++
++// Shown when the Keychain key provider gave up and this install's key was
++// expected but not found (see keychain_key_guard_mac.h). Profile loading is
++// still waiting for the key, so the dialog has no parent window. Asks whether
++// to make a new key, confirms, and quits rac either way; rac::
++// RunNewKeychainKeyFlow() has the steps. Quits without flushing profile prefs,
++// like Helium's Keychain error.
++void ShowMissingKeychainKeyDialog(PrefService* local_state);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_RAC_STORAGE_KEYCHAIN_KEY_DIALOG_H_
+Index: src/chrome/browser/rac/storage/guarded_keychain_mac.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/storage/guarded_keychain_mac.h
+@@ -0,0 +1,69 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_STORAGE_GUARDED_KEYCHAIN_MAC_H_
++#define CHROME_BROWSER_RAC_STORAGE_GUARDED_KEYCHAIN_MAC_H_
++
++#include <stdint.h>
++
++#include <atomic>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/functional/callback.h"
++#include "base/memory/raw_ref.h"
++#include "base/types/expected.h"
++#include "crypto/apple/keychain_v2.h"
++
++// The keychain that keychain_key_guard_mac.h installs. A separate header
++// because keychain_v2.h imports Objective-C headers, and the code that
++// installs the guard is C++.
++namespace rac {
++
++class GuardedKeychainV2 : public crypto::apple::KeychainV2 {
++ public:
++  // `inner` answers FindGenericPassword() and ItemAdd(). Every other call is
++  // KeychainV2's own, the real Security call. `on_key_seen` runs once, on the
++  // thread that read or made the key, so bind it to a task runner.
++  GuardedKeychainV2(crypto::apple::KeychainV2& inner,
++                    bool key_expected,
++                    base::OnceClosure on_key_seen);
++  GuardedKeychainV2(const GuardedKeychainV2&) = delete;
++  GuardedKeychainV2& operator=(const GuardedKeychainV2&) = delete;
++  ~GuardedKeychainV2() override;
++
++  // crypto::apple::KeychainV2:
++  base::expected<std::vector<uint8_t>, OSStatus> FindGenericPassword(
++      std::string_view service_name,
++      std::string_view account_name) override;
++  OSStatus AddGenericPassword(std::string_view service_name,
++                              std::string_view account_name,
++                              base::span<const uint8_t> password) override;
++
++  // Whether the last lookup of the storage key said "not found" while a key
++  // was expected. Set on a worker thread, read on the UI thread.
++  bool key_missing() const;
++
++  // Makes this what KeychainV2::GetInstance() returns, until
++  // ClearAsInstance().
++  void SetAsInstance();
++  void ClearAsInstance();
++
++ private:
++  static bool IsStorageKey(std::string_view service_name,
++                           std::string_view account_name);
++  void ReportKeySeen();
++
++  const raw_ref<crypto::apple::KeychainV2> inner_;
++  const bool key_expected_;
++  std::atomic<bool> key_missing_{false};
++  std::atomic<bool> key_seen_reported_{false};
++  // Moved out only by the call that flips `key_seen_reported_`.
++  base::OnceClosure on_key_seen_;
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_STORAGE_GUARDED_KEYCHAIN_MAC_H_
