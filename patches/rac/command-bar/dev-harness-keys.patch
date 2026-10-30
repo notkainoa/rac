@@ -1,0 +1,280 @@
+--- a/chrome/browser/ui/views/rac/window_screenshot.mm
++++ b/chrome/browser/ui/views/rac/window_screenshot.mm
+@@ -64,6 +64,10 @@
+ #include "ui/views/widget/widget.h"
+ #include "ui/views/widget/widget_observer.h"
+ 
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++#include "chrome/browser/ui/views/rac/dev/native_keys.h"
++#endif
++
+ namespace rac {
+ 
+ // Developer builds only. Official builds keep the two hooks as no-ops, so
+@@ -687,6 +691,74 @@ bool HandleInput(views::Widget* widget,
+     }
+     return true;
+   }
++  //   nspress NAME [MODS]  presses and releases a native key in the focused
++  //                        window (a popup if one is on top): a-z, 0-9,
++  //                        return, escape, tab, space, backspace, arrows,
++  //                        home, end, pageup, pagedown
++  //   nstype TEXT          types TEXT there as native key presses, on a US
++  //                        keyboard; with a character it has no key for, it
++  //                        logs an error and types nothing
++  if ((verb == "nspress" && (words.size() == 2 || words.size() == 3)) ||
++      (verb == "nstype" && words.size() >= 2)) {
++    views::Widget* target = FocusedWidget(widget);
++    NSEventModifierFlags flags = 0;
++    std::vector<dev::NativeKey> keys;
++    if (verb == "nspress") {
++      std::optional<dev::NativeKey> key = dev::NativeKeyNamed(words[1]);
++      if (!key) {
++        LOG(ERROR) << "rac window screenshot: nspress has no key named "
++                   << words[1];
++        return true;
++      }
++      keys.push_back(std::move(*key));
++      flags = NativeModifiers(words.size() == 3 ? words[2] : "");
++    } else {
++      std::string unsupported;
++      std::optional<std::vector<dev::NativeKey>> typed = dev::NativeKeysForText(
++          base::TrimWhitespaceASCII(std::string_view(line).substr(verb.size()),
++                                    base::TRIM_ALL),
++          &unsupported);
++      if (!typed) {
++        LOG(ERROR) << "rac window screenshot: nstype has no key for \""
++                   << unsupported << "\" (US keyboard only); typed nothing";
++        return true;
++      }
++      keys = std::move(*typed);
++    }
++    for (const dev::NativeKey& key : keys) {
++      NSString* characters = base::SysUTF16ToNSString(key.characters);
++      const NSEventModifierFlags key_flags =
++          flags | (key.shift ? NSEventModifierFlagShift : 0);
++      PostNativeKey(target, NSEventTypeKeyDown, key.key_code, characters,
++                    key_flags);
++      PostNativeKey(target, NSEventTypeKeyUp, key.key_code, characters,
++                    key_flags);
++    }
++    return true;
++  }
++  //   after MS REQUEST     runs REQUEST (a verb, or a PNG path) MS later,
++  //                        for sampling motion one frame per run
++  if (verb == "after" && words.size() >= 3 && base::StringToInt(words[1], &x)) {
++    const std::string rest(base::TrimWhitespaceASCII(
++        std::string_view(line).substr(line.find(words[1]) + words[1].size()),
++        base::TRIM_ALL));
++    base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::WeakPtr<views::Widget> widget, std::string rest) {
++              if (!widget || widget->IsClosed()) {
++                return;
++              }
++              std::vector<std::string> parts = base::SplitString(
++                  rest, " ", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++              if (!HandleInput(widget.get(), parts, rest)) {
++                Capture(widget, base::FilePath(rest));
++              }
++            },
++            widget->GetWeakPtr(), rest),
++        base::Milliseconds(x));
++    return true;
++  }
+   if (verb == "nsflags" && words.size() == 2) {
+     const NSEventModifierFlags flags = NativeModifiers(words[1]);
+     // 59 is the left Control key, the usual one to hold for Ctrl+Tab.
+--- a/chrome/browser/ui/views/rac/BUILD.gn
++++ b/chrome/browser/ui/views/rac/BUILD.gn
+@@ -51,6 +51,8 @@ source_set("look") {
+       "dev/forced_appearance.h",
+       "dev/forced_appearance.mm",
+       "dev/frame_log.cc",
++      "dev/native_keys.h",
++      "dev/native_keys.mm",
+       "dev/window_record.cc",
+       "dev/window_record.h",
+       "dev/window_select.h",
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/dev/native_keys.h
+@@ -0,0 +1,43 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_DEV_NATIVE_KEYS_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_DEV_NATIVE_KEYS_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "chrome/browser/rac/dev/buildflags.h"
++
++static_assert(BUILDFLAG(RAC_DEV_SWITCHES),
++              "The screenshot harness's keys are for dev builds only.");
++
++namespace rac::dev {
++
++// One key of a US keyboard, for the screenshot harness's nspress and nstype
++// verbs, which post it as a native key event.
++struct NativeKey {
++  // A macOS virtual key code (kVK_* in Carbon's Events.h).
++  unsigned short key_code = 0;
++  // What the key types, with Shift applied.
++  std::u16string characters;
++  bool shift = false;
++};
++
++// The key named `name`: a-z, 0-9, return, escape, tab, space, backspace, up,
++// down, left, right, home, end, pageup, or pagedown. nullopt for any other.
++std::optional<NativeKey> NativeKeyNamed(std::string_view name);
++
++// The keys that type `text` (UTF-8) on a US keyboard: letters, digits, space,
++// and the punctuation printed on the keys. nullopt if a character has no key
++// there, such as "é" or an emoji; `unsupported` then holds the first one.
++std::optional<std::vector<NativeKey>> NativeKeysForText(
++    std::string_view text,
++    std::string* unsupported);
++
++}  // namespace rac::dev
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_DEV_NATIVE_KEYS_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/dev/native_keys.mm
+@@ -0,0 +1,132 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/dev/native_keys.h"
++
++#import <AppKit/AppKit.h>
++
++#include <iterator>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/strings/string_util.h"
++
++namespace rac::dev {
++
++namespace {
++
++// kVK_ANSI_A.. in Carbon's Events.h, in a-z order.
++constexpr unsigned short kLetters[] = {0,  11, 8,  2,  14, 3,  5,  4,  34,
++                                       38, 40, 37, 46, 45, 31, 35, 12, 15,
++                                       1,  17, 32, 9,  13, 7,  16, 6};
++// kVK_ANSI_0..9.
++constexpr unsigned short kDigits[] = {29, 18, 19, 20, 21, 23, 22, 26, 28, 25};
++
++// The punctuation keys, each with what it types without and with Shift.
++struct PunctuationKey {
++  unsigned short key_code;
++  char plain;
++  char shifted;
++};
++constexpr PunctuationKey kPunctuation[] = {
++    {50, '`', '~'}, {27, '-', '_'},  {24, '=', '+'}, {33, '[', '{'},
++    {30, ']', '}'}, {42, '\\', '|'}, {41, ';', ':'}, {39, '\'', '"'},
++    {43, ',', '<'}, {47, '.', '>'},  {44, '/', '?'},
++};
++// What the digit keys type with Shift, from 0 to 9.
++constexpr char kShiftedDigits[] = ")!@#$%^&*(";
++
++NativeKey Key(unsigned short key_code, char16_t c, bool shift = false) {
++  return NativeKey{key_code, std::u16string(1, c), shift};
++}
++
++std::optional<NativeKey> KeyForCharacter(char c) {
++  if (base::IsAsciiLower(c)) {
++    return Key(kLetters[c - 'a'], c);
++  }
++  if (base::IsAsciiUpper(c)) {
++    return Key(kLetters[c - 'A'], c, /*shift=*/true);
++  }
++  if (base::IsAsciiDigit(c)) {
++    return Key(kDigits[c - '0'], c);
++  }
++  if (c == ' ') {
++    return Key(49, c);
++  }
++  for (size_t i = 0; i < std::size(kShiftedDigits) - 1; ++i) {
++    if (c == kShiftedDigits[i]) {
++      return Key(kDigits[i], c, /*shift=*/true);
++    }
++  }
++  for (const PunctuationKey& key : kPunctuation) {
++    if (c == key.plain) {
++      return Key(key.key_code, c);
++    }
++    if (c == key.shifted) {
++      return Key(key.key_code, c, /*shift=*/true);
++    }
++  }
++  return std::nullopt;
++}
++
++}  // namespace
++
++std::optional<NativeKey> NativeKeyNamed(std::string_view name) {
++  if (name.size() == 1 &&
++      (base::IsAsciiLower(name[0]) || base::IsAsciiDigit(name[0]))) {
++    return KeyForCharacter(name[0]);
++  }
++  struct Named {
++    std::string_view name;
++    unsigned short key_code;
++    char16_t characters;
++  };
++  static constexpr Named kNamed[] = {
++      {"return", 36, u'\r'},
++      {"escape", 53, 0x1b},
++      {"tab", 48, u'\t'},
++      {"space", 49, u' '},
++      {"backspace", 51, 0x7f},
++      {"up", 126, NSUpArrowFunctionKey},
++      {"down", 125, NSDownArrowFunctionKey},
++      {"left", 123, NSLeftArrowFunctionKey},
++      {"right", 124, NSRightArrowFunctionKey},
++      {"home", 115, NSHomeFunctionKey},
++      {"end", 119, NSEndFunctionKey},
++      {"pageup", 116, NSPageUpFunctionKey},
++      {"pagedown", 121, NSPageDownFunctionKey},
++  };
++  for (const Named& key : kNamed) {
++    if (name == key.name) {
++      return Key(key.key_code, key.characters);
++    }
++  }
++  return std::nullopt;
++}
++
++std::optional<std::vector<NativeKey>> NativeKeysForText(
++    std::string_view text,
++    std::string* unsupported) {
++  std::vector<NativeKey> keys;
++  for (size_t i = 0; i < text.size(); ++i) {
++    std::optional<NativeKey> key = KeyForCharacter(text[i]);
++    if (!key) {
++      // Report the whole character, not one byte of it.
++      size_t end = i + 1;
++      while (end < text.size() &&
++             (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) {
++        ++end;
++      }
++      *unsupported = std::string(text.substr(i, end - i));
++      return std::nullopt;
++    }
++    keys.push_back(std::move(*key));
++  }
++  return keys;
++}
++
++}  // namespace rac::dev

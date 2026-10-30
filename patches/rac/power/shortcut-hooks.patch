@@ -1,0 +1,208 @@
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn
++++ src/chrome/browser/ui/BUILD.gn
+@@ -2396,6 +2396,7 @@ static_library("ui") {
+       "//chrome/browser/lifetime:termination_notification",
+       "//chrome/browser/password_manager/actor_login:factories",
+       "//chrome/browser/rac/actions:core",
++      "//chrome/browser/rac/power/shortcuts",
+       "//chrome/browser/record_replay",
+       "//chrome/browser/record_replay:impl",
+       "//chrome/browser/speech",
+Index: src/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
++++ src/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
+@@ -13,6 +13,7 @@
+ #include "base/strings/string_number_conversions.h"
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/rac/power/shortcuts/table_shortcuts.h"
+ #include "chrome/browser/ui/helium/helium_layout_state_controller.h"
+ #include "chrome/common/pref_names.h"
+ #include "chrome/grit/generated_resources.h"
+@@ -325,6 +326,18 @@ std::optional<BrowserShortcutCommandLabe
+       return Label(IDS_VIEW_SOURCE);
+   }
+ 
++  // rac: rows of the action table name themselves. A rac id with no row (a
++  // row removed or renumbered after the user saved a rebind), or an AI-only
++  // row while AI is off (or with no `prefs`), has no label.
++  if (std::optional<rac::power::TableLabel> label =
++          rac::power::TableLabelFor(command_id, prefs)) {
++    return label->replacement ? Label(label->message_id, *label->replacement)
++                              : Label(label->message_id);
++  }
++  if (rac::power::IsStaleTableCommand(command_id, prefs)) {
++    return std::nullopt;
++  }
++
+   DCHECK(false) << "Missing browser shortcut label for command id "
+                 << command_id;
+   return std::nullopt;
+Index: src/chrome/browser/ui/browser_shortcuts/browser_shortcut_service.cc
+===================================================================
+--- src.orig/chrome/browser/ui/browser_shortcuts/browser_shortcut_service.cc
++++ src/chrome/browser/ui/browser_shortcuts/browser_shortcut_service.cc
+@@ -18,6 +18,7 @@
+ #include "base/values.h"
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/rac/power/shortcuts/table_shortcuts.h"
+ #include "chrome/browser/ui/accelerator_table.h"
+ #include "chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.h"
+ #include "chrome/browser/ui/browser_shortcuts/browser_shortcut_prefs.h"
+@@ -118,6 +119,8 @@ BrowserShortcutService::BrowserShortcutS
+   pref_change_registrar_.Add(::prefs::kHeliumLayout, on_label_pref_changed);
+   pref_change_registrar_.Add(::prefs::kVerticalCollapseShortcut,
+                              on_label_pref_changed);
++  rac::power::ObserveTableShortcutPrefs(pref_change_registrar_,
++                                        on_label_pref_changed);
+ 
+   LoadFromPrefs();
+   RebuildCommandCache();
+@@ -499,6 +502,15 @@ BrowserShortcutService::BuildCurrentDefa
+           .FindDict(CommandIdToPrefKey(IDC_TOGGLE_VERTICAL_TABS_COLLAPSE))) {
+     defaults.try_emplace(IDC_TOGGLE_VERTICAL_TABS_COLLAPSE);
+   }
++  // rac: the action table's default shortcuts.
++  rac::power::ApplyTableShortcuts(
++      prefs_, defaults, seen_accelerators,
++      [&](int command_id) {
++        return GetBrowserShortcutCommandLabel(command_id, prefs_).has_value();
++      },
++      [](const ui::Accelerator& accelerator) {
++        return !AcceleratorToString(accelerator).empty();
++      });
+   return defaults;
+ }
+ 
+Index: src/chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac.mm
+===================================================================
+--- src.orig/chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac.mm
++++ src/chrome/browser/ui/browser_shortcuts/browser_shortcut_platform_mac.mm
+@@ -13,6 +13,7 @@
+ #include "base/no_destructor.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/global_keyboard_shortcuts_mac.h"
++#include "chrome/browser/rac/power/shortcuts/table_shortcuts.h"
+ #include "chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.h"
+ #include "chrome/browser/ui/cocoa/accelerators_cocoa.h"
+ #include "ui/base/accelerators/platform_accelerator_cocoa.h"
+@@ -139,7 +140,10 @@ void AppendMenuItems(
+       live_menu_command_ids->insert(command_id);
+     }
+     std::optional<ui::Accelerator> accelerator = AcceleratorFromMenuItem(item);
+-    if (command_id != NO_COMMAND) {
++    // rac: a table command's menu key comes from the service; read back here
++    // it would turn into a locked default.
++    if (command_id != NO_COMMAND &&
++        !rac::power::IsTableShortcutCommand(command_id)) {
+       const bool user_modifiable =
+           IsMenuCommandHeliumModifiable(command_id, accelerator);
+       const ui::Accelerator* default_accelerator =
+@@ -179,6 +183,14 @@ bool ShouldManageMenuItem(NSMenuItem* it
+     return true;
+   }
+ 
++  // rac: the action table's commands have no Chromium default key, so
++  // IsMenuCommandHeliumModifiable() would skip them and the menu would never
++  // show their shortcut. AI-only rows are managed too, so their key clears
++  // while AI is off (this code has no PrefService to ask).
++  if (rac::power::IsTableShortcutCommand(command_id)) {
++    return true;
++  }
++
+   return IsMenuCommandHeliumModifiable(command_id, AcceleratorFromMenuItem(item));
+ }
+ 
+Index: src/chrome/browser/rac/power/shortcuts/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/power/shortcuts/BUILD.gn
++++ src/chrome/browser/rac/power/shortcuts/BUILD.gn
+@@ -31,6 +31,7 @@ source_set("shortcuts") {
+ # separate from Chromium's unit_tests, which takes hours to build.
+ test("rac_power_shortcuts_unittests") {
+   sources = [
++    "table_rows_unittest.cc",
+     "table_shortcuts_prefs_unittest.cc",
+     "table_shortcuts_unittest.cc",
+   ]
+Index: src/chrome/browser/rac/power/shortcuts/table_rows_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/power/shortcuts/table_rows_unittest.cc
+@@ -0,0 +1,72 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include <string_view>
++
++#include "chrome/browser/rac/actions/rac_actions.h"
++#include "chrome/browser/rac/power/shortcuts/table_shortcuts.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/events/event_constants.h"
++#include "ui/events/keycodes/keyboard_codes.h"
++
++namespace rac::power {
++namespace {
++
++using action_table::Action;
++using action_table::Surface;
++
++// The modifiers Helium's shortcut page can store
++// (kStoredModifierMask in browser_shortcut_serialization.cc).
++constexpr int kStoredModifiers = ui::EF_SHIFT_DOWN | ui::EF_CONTROL_DOWN |
++                                 ui::EF_ALT_DOWN | ui::EF_COMMAND_DOWN;
++
++// These run on the real table, so a new row can't reach the browser with a
++// default Helium would refuse. The service's own checks (a label and a
++// serialized form) need the browser, so they run in the service; here is
++// what the table can promise by itself.
++
++// A shortcut row without a command id is allowed (the service ignores it);
++// one with an id must have a label for every command it covers.
++TEST(TableRowsTest, EveryShortcutCommandHasALabel) {
++  for (const Action& row : action_table::All()) {
++    if (!row.surfaces.Has(Surface::kShortcut) || row.command_id == 0) {
++      continue;
++    }
++    SCOPED_TRACE(std::string(row.id));
++    const int last = row.command_id_last ? row.command_id_last : row.command_id;
++    for (int command_id = row.command_id; command_id <= last; ++command_id) {
++      // With AI on, so ai_only rows are checked too. The placeholder check
++      // needs the browser's strings, so it is the runtime guard's job.
++      auto label = TableLabelFor(action_table::All(), command_id,
++                                 /*ai_on=*/true, [](int) { return true; });
++      ASSERT_TRUE(label) << "no label for command " << command_id;
++      EXPECT_NE(0, label->message_id);
++    }
++  }
++}
++
++TEST(TableRowsTest, EveryDefaultShortcutCanBeStored) {
++  const auto all_on = [](std::string_view) { return true; };
++  for (const TableShortcut& shortcut :
++       EnabledTableShortcuts(action_table::All(), all_on, /*ai_on=*/true)) {
++    SCOPED_TRACE(shortcut.command_id);
++    EXPECT_NE(ui::VKEY_UNKNOWN, shortcut.accelerator.key_code());
++    EXPECT_EQ(0, shortcut.accelerator.modifiers() & ~kStoredModifiers);
++  }
++}
++
++TEST(TableRowsTest, EveryDefaultShortcutHasAModifier) {
++  const auto all_on = [](std::string_view) { return true; };
++  for (const TableShortcut& shortcut :
++       EnabledTableShortcuts(action_table::All(), all_on, /*ai_on=*/true)) {
++    SCOPED_TRACE(shortcut.command_id);
++    EXPECT_NE(0,
++              shortcut.accelerator.modifiers() &
++                  (ui::EF_CONTROL_DOWN | ui::EF_ALT_DOWN | ui::EF_COMMAND_DOWN))
++        << "a bare or Shift-only key would fire while typing";
++  }
++}
++
++}  // namespace
++}  // namespace rac::power

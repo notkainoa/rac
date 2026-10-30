@@ -134,7 +134,7 @@ Nothing here blocks a release. Build these after it, in any order.
 
 | Feature | Covers |
 | --- | --- |
-| Command bar | A quick launcher for tabs, history, and actions, available in place of the new tab page, with AI in it |
+| Command bar | A quick launcher for tabs, history, and actions, opened with ⌘T and ⌘L, with AI in it |
 | Boosts | Custom CSS and JavaScript for each site, with an editor |
 | Arc import | Bring Arc's spaces, pinned tabs, and favorites into rac's |
 | Dia import | Bring a Dia setup into rac. What it can cover needs research first |

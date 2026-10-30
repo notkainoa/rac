@@ -1,0 +1,1759 @@
+--- /dev/null
++++ b/chrome/browser/rac/actions/BUILD.gn
+@@ -0,0 +1,40 @@
++# Copyright 2026 The rac Authors
++# Use of this source code is governed by a GPL-3.0 license.
++
++import("//testing/test.gni")
++
++# rac's single action table. Static data and a few pure functions: it depends
++# on base and the keyboard-code enum, nothing from the browser, so the agent
++# core and the tests link it without a browser.
++#
++# Build and test:
++#   autoninja -C out/Default chrome/browser/rac/actions:rac_actions_unittests
++source_set("core") {
++  sources = [
++    "rac_action_handler_ids.cc",
++    "rac_action_handler_ids.h",
++    "rac_action_ids.h",
++    "rac_actions.cc",
++    "rac_actions.h",
++    "rac_actions_agent.cc",
++    "rac_actions_groups.h",
++  ]
++
++  public_deps = [
++    "//base",
++    "//ui/events:event_constants",
++    "//ui/events:events_base",
++  ]
++}
++
++test("rac_actions_unittests") {
++  sources = [ "rac_actions_unittest.cc" ]
++  data = [ "testdata/tools_list_legacy.json" ]
++  deps = [
++    ":core",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//testing/gtest",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/rac/actions/rac_action_ids.h
+@@ -0,0 +1,28 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_ACTIONS_RAC_ACTION_IDS_H_
++#define CHROME_BROWSER_RAC_ACTIONS_RAC_ACTION_IDS_H_
++
++// Command ids for the table's own rows. Stable forever: users' shortcut
++// rebinds are saved under them (kCustomAccelerators), so never renumber or
++// reuse one. rac_actions_unittest pins them to a committed list. They sit in
++// IDC_RAC_ACTION_FIRST..LAST, which the command controller hands to the table.
++//
++// The range lives here, not in chrome_command_ids.h: nearly every file in
++// Chrome includes that header, so one line there rebuilds the whole tree.
++// 40800..40999 was free in Chromium 156 and in every Helium and rac patch;
++// check it again at each sync.
++#define IDC_RAC_ACTION_FIRST 40800
++#define IDC_RAC_ACTION_LAST 40999
++
++#define IDC_RAC_OPEN_COMMAND_BAR 40800
++#define IDC_RAC_OPEN_COMMAND_BAR_WITH_URL 40801
++#define IDC_RAC_CLEAR_TABS 40802
++#define IDC_RAC_OPEN_LITTLE_WINDOW 40803
++#define IDC_RAC_COPY_AS_MARKDOWN 40804
++
++static_assert(IDC_RAC_OPEN_COMMAND_BAR >= IDC_RAC_ACTION_FIRST &&
++              IDC_RAC_COPY_AS_MARKDOWN <= IDC_RAC_ACTION_LAST);
++
++#endif  // CHROME_BROWSER_RAC_ACTIONS_RAC_ACTION_IDS_H_
+--- /dev/null
++++ b/chrome/browser/rac/actions/rac_actions.cc
+@@ -0,0 +1,141 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/actions/rac_actions.h"
++
++#include <utility>
++
++#include "base/check.h"
++#include "base/json/json_reader.h"
++#include "base/no_destructor.h"
++#include "chrome/browser/rac/actions/rac_actions_groups.h"
++
++namespace rac::action_table {
++namespace {
++
++// The one central list of groups. Row order in All() follows it.
++using GroupFn = base::span<const Action> (*)();
++constexpr GroupFn kGroups[] = {
++    &AgentActions,
++};
++
++bool IsUiSurface(Surface surface) {
++  return surface != Surface::kBuiltInAgent && surface != Surface::kOutsideAgent;
++}
++
++bool MeetsNeeds(const Action& action, const ActionContext& context) {
++  const Availability& need = action.availability;
++  return (!need.Has(Need::kTab) || context.has_tab) &&
++         (!need.Has(Need::kWebPage) || context.has_web_page) &&
++         (!need.Has(Need::kNotIncognito) || !context.incognito) &&
++         (!need.Has(Need::kSpaces) || context.has_spaces);
++}
++
++}  // namespace
++
++bool IsAvailable(const Action& action, const ActionContext& context) {
++  return (!action.ai_only || context.ai_enabled) && MeetsNeeds(action, context);
++}
++
++base::span<const Action> All() {
++  static const base::NoDestructor<std::vector<Action>> kAll([] {
++    std::vector<Action> all;
++    for (GroupFn group : kGroups) {
++      base::span<const Action> rows = group();
++      all.insert(all.end(), rows.begin(), rows.end());
++    }
++    return all;
++  }());
++  return *kAll;
++}
++
++const Action* Find(std::string_view id) {
++  for (const Action& action : All()) {
++    if (action.id == id) {
++      return &action;
++    }
++  }
++  return nullptr;
++}
++
++const Action* FindByCommand(int command_id) {
++  if (command_id == 0) {
++    return nullptr;
++  }
++  for (const Action& action : All()) {
++    const int last =
++        action.command_id_last ? action.command_id_last : action.command_id;
++    if (action.command_id && command_id >= action.command_id &&
++        command_id <= last) {
++      return &action;
++    }
++  }
++  return nullptr;
++}
++
++std::vector<const Action*> ForSurface(Surface surface,
++                                      const ActionContext& context) {
++  return ForSurface(All(), surface, context);
++}
++
++std::vector<const Action*> ForSurface(base::span<const Action> rows,
++                                      Surface surface,
++                                      const ActionContext& context) {
++  std::vector<const Action*> result;
++  for (const Action& action : rows) {
++    if (!action.surfaces.Has(surface)) {
++      continue;
++    }
++    if (action.ai_only && !context.ai_enabled) {
++      continue;
++    }
++    if (IsUiSurface(surface) && !MeetsNeeds(action, context)) {
++      continue;
++    }
++    result.push_back(&action);
++  }
++  return result;
++}
++
++std::optional<std::string_view> FirstShortcutCollision(
++    base::span<const Action> rows) {
++  for (size_t i = 0; i < rows.size(); ++i) {
++    if (rows[i].default_shortcut.empty() ||
++        !rows[i].surfaces.Has(Surface::kShortcut)) {
++      continue;
++    }
++    for (size_t j = i + 1; j < rows.size(); ++j) {
++      if (rows[j].surfaces.Has(Surface::kShortcut) &&
++          rows[j].default_shortcut.SameKeys(rows[i].default_shortcut)) {
++        return rows[j].id;
++      }
++    }
++  }
++  return std::nullopt;
++}
++
++base::DictValue ArgsSchema(const Action& action) {
++  std::optional<base::DictValue> schema =
++      base::JSONReader::ReadDict(action.args_json, base::JSON_PARSE_RFC);
++  CHECK(schema.has_value()) << "bad args_json for " << action.id;
++  return std::move(*schema);
++}
++
++base::DictValue WireAnnotations(const Action& action) {
++  CHECK(action.hints.has_value()) << "unclassified action " << action.id;
++  const McpHints& hints = *action.hints;
++  base::DictValue annotations;
++  if (action.wire == WireHints::kReadOnlyOnly) {
++    if (hints.read_only) {
++      annotations.Set("readOnlyHint", true);
++    }
++    return annotations;
++  }
++  annotations.Set("readOnlyHint", hints.read_only);
++  annotations.Set("destructiveHint", hints.destructive);
++  annotations.Set("idempotentHint", hints.idempotent);
++  annotations.Set("openWorldHint", hints.open_world);
++  return annotations;
++}
++
++}  // namespace rac::action_table
+--- /dev/null
++++ b/chrome/browser/rac/actions/rac_actions.h
+@@ -0,0 +1,211 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_ACTIONS_RAC_ACTIONS_H_
++#define CHROME_BROWSER_RAC_ACTIONS_RAC_ACTIONS_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/enum_set.h"
++#include "base/containers/span.h"
++#include "base/memory/raw_ptr.h"
++#include "base/values.h"
++#include "ui/events/keycodes/keyboard_codes.h"
++
++class BrowserWindowInterface;
++namespace gfx {
++struct VectorIcon;
++}
++
++// rac's single action table: one static list of everything rac can do. See
++// docs/internals/action-table.md for the rules about who may edit which field.
++// Compiled-in data with no service and no startup cost: the table is built on
++// first use.
++namespace rac::action_table {
++
++enum class Surface {
++  kSidebar,
++  kCommandBar,
++  kCommandBarSuggested,  // Shown in the command bar's empty state.
++  kMenu,
++  kShortcut,
++  kBuiltInAgent,
++  kOutsideAgent,
++  kMaxValue = kOutsideAgent,
++};
++using Surfaces = base::EnumSet<Surface, Surface::kSidebar, Surface::kMaxValue>;
++
++// What an action needs before it can run (plan 07's "availability").
++enum class Need {
++  kTab,
++  kWebPage,  // The active tab shows an http(s) page.
++  kNotIncognito,
++  kSpaces,  // A normal profile window, where spaces exist.
++  kMaxValue = kSpaces,
++};
++using Availability = base::EnumSet<Need, Need::kTab, Need::kMaxValue>;
++
++// The same three values the guard has always used (tool_registry.h aliases
++// this as rac::agent::RiskClass).
++enum class RiskClass {
++  kNone,           // Read tools.
++  kLow,            // Click/type/scroll inside allowed origins.
++  kConsequential,  // Submit/buy/delete/password/cross-origin/etc.
++};
++
++// How an outside client is treated (plan 05's non-page table). The guard
++// applies each client's own level on top of this later.
++enum class OutsideClass {
++  kNotOffered,  // Never reaches an outside client's tools/list.
++  kRead,
++  kFreeInOwnTabs,
++  kAlwaysAsks,
++};
++
++// The four MCP annotation hints, always stored in full.
++struct McpHints {
++  bool read_only;
++  bool destructive;
++  bool idempotent;
++  bool open_world;
++};
++
++// What tools/list sends. kReadOnlyOnly is today's wire format: only
++// {"readOnlyHint":true}, and only on read tools. kFull sends all four.
++enum class WireHints { kReadOnlyOnly, kFull };
++
++// Which Mac menu a kMenu row lands in. The menu builder places rows after
++// `menu_after` (an IDC_ command id in that menu), or at the menu's end.
++enum class Menu { kNone, kFile, kEdit, kView, kSpaces, kTab, kWindow };
++
++// Who runs a row. The table is data only: it holds no function pointers, so
++// it depends on nothing from the browser.
++enum class Dispatch {
++  // A browser-side handler, looked up by `id` in
++  // chrome/browser/ui/rac/rac_action_handlers.cc (the //chrome/browser/ui
++  // target). The ids with handlers are listed in rac_action_handler_ids.cc;
++  // a coverage test fails on a kBrowser row missing from it.
++  kBrowser,
++  // Chromium runs `command_id` itself (IDC_NEW_WINDOW, IDC_COPY_URL). The row
++  // only adds surfaces, a label, and keywords. The table's dispatch hook
++  // never routes these ids, so a handler can't call itself in a loop.
++  kCommand,
++  kAgentController,  // AgentController::HandleToolCall does the work.
++};
++
++// What a surface passes to the table. Plain values, so the table stays cheap
++// to build and easy to test.
++struct ActionContext {
++  raw_ptr<BrowserWindowInterface> browser = nullptr;
++  // The window's active space, as SpacesService names it. Empty when the
++  // window has none (incognito, a PWA window).
++  std::string active_space_id;
++  bool ai_enabled = false;
++  bool has_tab = false;
++  bool has_web_page = false;
++  bool incognito = false;
++  bool has_spaces = false;  // A normal profile window.
++};
++
++// Maps 1:1 onto AcceleratorMapping.
++struct ShortcutSpec {
++  ui::KeyboardCode key = ui::VKEY_UNKNOWN;
++  int modifiers = 0;  // ui::EF_*_DOWN flags.
++  // The IDC_ id whose default this shortcut takes over, or 0. The collision
++  // test allows a clash only with this command.
++  int replaces_command_id = 0;
++
++  constexpr bool empty() const { return key == ui::VKEY_UNKNOWN; }
++  // Same keys pressed; ignores `replaces_command_id`.
++  constexpr bool SameKeys(const ShortcutSpec& other) const {
++    return key == other.key && modifiers == other.modifiers;
++  }
++};
++
++// Fields are listed in the order a row sets them (C++ designated initializers
++// must follow it). A field with no value yet means "off" or "unclassified".
++struct Action {
++  // Stable forever, never reused. Also the MCP tool name.
++  std::string_view id;
++  // The IDC_ id menus, accelerators, and the shortcut page use. Stable
++  // forever: users' rebinds are saved under it (kCustomAccelerators). Either
++  // an existing Chromium/rac id (IDC_COPY_URL, IDC_RAC_SHOW_SPACE_0) or one
++  // from rac_action_ids.h inside IDC_RAC_ACTION_FIRST..LAST, which the
++  // command controller dispatches to the table. 0 = no command.
++  int command_id = 0;
++  // For a row that is a numbered set (Show Space 1-9): the last id. The label
++  // takes the ordinal (command_id - first + 1) as $1. 0 = a single command.
++  int command_id_last = 0;
++  int label_id = 0;     // IDS_ string for the command bar and sidebar.
++  int keywords_id = 0;  // UI. IDS_ string of search aliases. 0 = none.
++  const gfx::VectorIcon* icon = nullptr;  // UI. nullptr = none.
++  // UI. The argument that receives the command bar's typed text ("prompt"
++  // for `ask`). "" = none.
++  std::string_view query_arg;
++  int menu_label_id = 0;  // Plan 07. 0 = same as label_id.
++  // English text for tools/list. Not localized.
++  std::string_view description;
++  // JSON Schema for the arguments, written out in full (including the empty
++  // object schema for an action with no arguments).
++  std::string_view args_json;
++  ShortcutSpec default_shortcut;  // Plan 07.
++  // UI. A boolean pref that turns the shortcut and menu item on (D13's
++  // "Cmd+T opens the command bar"). While it is false the row has no default
++  // shortcut and no menu item, and a replaced command keeps its key. Power's
++  // shortcut hook and Core's menu hook both read it. "" = always on.
++  std::string_view shortcut_pref;
++  Availability availability;  // Plan 07.
++  Surfaces surfaces;
++  Menu menu = Menu::kNone;  // UI. Only read for rows with kMenu.
++  int menu_after = 0;       // UI. An IDC_ id in `menu`; 0 = the menu's end.
++  bool ai_only = false;     // Cannot work without the assistant.
++  // Unset until someone classifies the row. A test fails on an unset row.
++  std::optional<RiskClass> risk;
++  std::optional<OutsideClass> outside;
++  std::optional<McpHints> hints;
++  WireHints wire = WireHints::kFull;
++  Dispatch dispatch = Dispatch::kBrowser;
++};
++
++// Whether a surface may show and run `action` now: false for an ai_only row
++// with AI off, or when the context lacks something the row needs. For the
++// sidebar and menus, which show or disable a single row.
++bool IsAvailable(const Action& action, const ActionContext& context);
++
++// Every row, in a stable order: the order of the group list in rac_actions.cc,
++// then the order inside each group's file.
++base::span<const Action> All();
++const Action* Find(std::string_view id);
++// The row whose command id range holds `command_id`, or null.
++const Action* FindByCommand(int command_id);
++
++// The only way UI code walks the table. Drops ai_only rows when AI is off and
++// rows whose availability the context doesn't meet, so no caller checks the AI
++// switch itself. Availability applies to the UI surfaces only: an agent that
++// asks for something with no tab to act on gets an error from the handler.
++std::vector<const Action*> ForSurface(Surface surface,
++                                      const ActionContext& context);
++// Same filter over any list of rows (tests use it with made-up rows).
++std::vector<const Action*> ForSurface(base::span<const Action> rows,
++                                      Surface surface,
++                                      const ActionContext& context);
++
++// The id of the first row whose default shortcut another row also uses, or
++// nullopt. Rows that don't have the kShortcut surface are ignored.
++std::optional<std::string_view> FirstShortcutCollision(
++    base::span<const Action> rows);
++
++// The row's argument schema, parsed from `args_json`. CHECKs on bad JSON; a
++// unit test parses every row.
++base::DictValue ArgsSchema(const Action& action);
++
++// The `annotations` object tools/list sends for this row. Empty when the row
++// sends none (today: every action tool).
++base::DictValue WireAnnotations(const Action& action);
++
++}  // namespace rac::action_table
++
++#endif  // CHROME_BROWSER_RAC_ACTIONS_RAC_ACTIONS_H_
+--- /dev/null
++++ b/chrome/browser/rac/actions/rac_actions_agent.cc
+@@ -0,0 +1,263 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/actions/rac_actions_groups.h"
++
++namespace rac::action_table {
++namespace {
++
++// Today's 15 agent tools. Names, descriptions, and argument schemas are the
++// ones tool_registry.cc has always sent, character for character: the golden
++// test in rac_actions_unittest.cc fails on any difference. Row order is the
++// order tools/list has always used.
++//
++// "hints" is what each tool really is (plan 05 confirms). The wire sends only
++// readOnlyHint on read tools (kReadOnlyOnly), as before.
++constexpr Action kAgentActions[] = {
++    {
++        .id = "snapshot",
++        .description =
++            "Capture a Playwright-style accessibility snapshot of the "
++            "current page with stable element refs (e12). Viewport-only by "
++            "default.",
++        .args_json =
++            R"json({"additionalProperties":false,"properties":{"full":{"description":"Include offscreen actionable nodes","type":"boolean"},"tab_id":{"description":"Tab alias; defaults to the tab the agent last used or was given","type":"string"}},"required":[],"type":"object"})json",
++        .surfaces = {Surface::kBuiltInAgent, Surface::kOutsideAgent},
++        .risk = RiskClass::kNone,
++        .outside = OutsideClass::kRead,
++        .hints = McpHints{.read_only = true,
++                          .destructive = false,
++                          .idempotent = true,
++                          .open_world = false},
++        .wire = WireHints::kReadOnlyOnly,
++        .dispatch = Dispatch::kAgentController,
++    },
++    {
++        .id = "get_page_text",
++        .description =
++            "Read compact structured page text for chat-style context "
++            "(headings, lists, links). Prefer snapshot for acting.",
++        .args_json =
++            R"json({"additionalProperties":false,"properties":{"tab_id":{"description":"Tab alias","type":"string"}},"required":[],"type":"object"})json",
++        .surfaces = {Surface::kBuiltInAgent, Surface::kOutsideAgent},
++        .risk = RiskClass::kNone,
++        .outside = OutsideClass::kRead,
++        .hints = McpHints{.read_only = true,
++                          .destructive = false,
++                          .idempotent = true,
++                          .open_world = false},
++        .wire = WireHints::kReadOnlyOnly,
++        .dispatch = Dispatch::kAgentController,
++    },
++    {
++        .id = "list_tabs",
++        .description =
++            "List tabs in the current window/space the agent may use.",
++        .args_json =
++            R"json({"additionalProperties":false,"properties":{},"required":[],"type":"object"})json",
++        .surfaces = {Surface::kBuiltInAgent, Surface::kOutsideAgent},
++        .risk = RiskClass::kNone,
++        .outside = OutsideClass::kRead,
++        .hints = McpHints{.read_only = true,
++                          .destructive = false,
++                          .idempotent = true,
++                          .open_world = false},
++        .wire = WireHints::kReadOnlyOnly,
++        .dispatch = Dispatch::kAgentController,
++    },
++    {
++        .id = "find_in_page",
++        .description =
++            "Find text matches in the current page (count + snippets).",
++        .args_json =
++            R"json({"additionalProperties":false,"properties":{"query":{"description":"Text to find","type":"string"},"tab_id":{"description":"Tab alias","type":"string"}},"required":["query"],"type":"object"})json",
++        .surfaces = {Surface::kBuiltInAgent, Surface::kOutsideAgent},
++        .risk = RiskClass::kNone,
++        .outside = OutsideClass::kRead,
++        .hints = McpHints{.read_only = true,
++                          .destructive = false,
++                          .idempotent = true,
++                          .open_world = false},
++        .wire = WireHints::kReadOnlyOnly,
++        .dispatch = Dispatch::kAgentController,
++    },
++    {
++        .id = "click",
++        .description = "Click an element by snapshot ref.",
++        .args_json =
++            R"json({"additionalProperties":false,"properties":{"ref":{"description":"Element ref from snapshot, e.g. e12","type":"string"},"tab_id":{"description":"Tab alias","type":"string"}},"required":["ref"],"type":"object"})json",
++        .surfaces = {Surface::kBuiltInAgent, Surface::kOutsideAgent},
++        .risk = RiskClass::kLow,
++        .outside = OutsideClass::kFreeInOwnTabs,
++        .hints = McpHints{.read_only = false,
++                          .destructive = true,
++                          .idempotent = false,
++                          .open_world = true},
++        .wire = WireHints::kReadOnlyOnly,
++        .dispatch = Dispatch::kAgentController,
++    },
++    {
++        .id = "type",
++        .description =
++            "Type text into an element by ref. Password/payment fields are "
++            "consequential.",
++        .args_json =
++            R"json({"additionalProperties":false,"properties":{"press_enter":{"description":"Press Enter after typing","type":"boolean"},"ref":{"description":"Element ref","type":"string"},"tab_id":{"description":"Tab alias","type":"string"},"text":{"description":"Text to type","type":"string"}},"required":["ref","text"],"type":"object"})json",
++        .surfaces = {Surface::kBuiltInAgent, Surface::kOutsideAgent},
++        .risk = RiskClass::kLow,
++        .outside = OutsideClass::kFreeInOwnTabs,
++        .hints = McpHints{.read_only = false,
++                          .destructive = true,
++                          .idempotent = false,
++                          .open_world = true},
++        .wire = WireHints::kReadOnlyOnly,
++        .dispatch = Dispatch::kAgentController,
++    },
++    {
++        .id = "select_option",
++        .description = "Select an option in a combobox by option value.",
++        .args_json =
++            R"json({"additionalProperties":false,"properties":{"ref":{"description":"Element ref","type":"string"},"tab_id":{"description":"Tab alias","type":"string"},"value":{"description":"Option value attribute","type":"string"}},"required":["ref","value"],"type":"object"})json",
++        .surfaces = {Surface::kBuiltInAgent, Surface::kOutsideAgent},
++        .risk = RiskClass::kLow,
++        .outside = OutsideClass::kFreeInOwnTabs,
++        .hints = McpHints{.read_only = false,
++                          .destructive = true,
++                          .idempotent = true,
++                          .open_world = true},
++        .wire = WireHints::kReadOnlyOnly,
++        .dispatch = Dispatch::kAgentController,
++    },
++    {
++        .id = "press_key",
++        .description = "Press Enter on an element ref. May submit a form.",
++        .args_json =
++            R"json({"additionalProperties":false,"properties":{"key":{"description":"Enter only","enum":["Enter"],"type":"string"},"ref":{"description":"Element ref to press Enter on","type":"string"},"tab_id":{"description":"Tab alias","type":"string"}},"required":["key","ref"],"type":"object"})json",
++        .surfaces = {Surface::kBuiltInAgent, Surface::kOutsideAgent},
++        .risk = RiskClass::kLow,
++        .outside = OutsideClass::kFreeInOwnTabs,
++        .hints = McpHints{.read_only = false,
++                          .destructive = true,
++                          .idempotent = false,
++                          .open_world = true},
++        .wire = WireHints::kReadOnlyOnly,
++        .dispatch = Dispatch::kAgentController,
++    },
++    {
++        .id = "scroll",
++        .description = "Scroll the page or a scrollable element by dx/dy DIPs.",
++        .args_json =
++            R"json({"additionalProperties":false,"properties":{"dx":{"description":"Horizontal delta in DIPs","type":"number"},"dy":{"description":"Vertical delta in DIPs","type":"number"},"ref":{"description":"Optional scroll container ref","type":"string"},"tab_id":{"description":"Tab alias","type":"string"}},"required":[],"type":"object"})json",
++        .surfaces = {Surface::kBuiltInAgent, Surface::kOutsideAgent},
++        .risk = RiskClass::kLow,
++        .outside = OutsideClass::kFreeInOwnTabs,
++        .hints = McpHints{.read_only = false,
++                          .destructive = false,
++                          .idempotent = false,
++                          .open_world = false},
++        .wire = WireHints::kReadOnlyOnly,
++        .dispatch = Dispatch::kAgentController,
++    },
++    {
++        .id = "navigate",
++        .description =
++            "Navigate the current tab to an http(s) URL. Never chrome://, "
++            "file, or downloads.",
++        .args_json =
++            R"json({"additionalProperties":false,"properties":{"tab_id":{"description":"Tab alias","type":"string"},"url":{"description":"http(s) URL","type":"string"}},"required":["url"],"type":"object"})json",
++        .surfaces = {Surface::kBuiltInAgent, Surface::kOutsideAgent},
++        .risk = RiskClass::kConsequential,
++        .outside = OutsideClass::kFreeInOwnTabs,
++        .hints = McpHints{.read_only = false,
++                          .destructive = false,
++                          .idempotent = true,
++                          .open_world = true},
++        .wire = WireHints::kReadOnlyOnly,
++        .dispatch = Dispatch::kAgentController,
++    },
++    {
++        .id = "go_back",
++        .description = "Go back in the current tab's history.",
++        .args_json =
++            R"json({"additionalProperties":false,"properties":{"tab_id":{"description":"Tab alias","type":"string"}},"required":[],"type":"object"})json",
++        .surfaces = {Surface::kBuiltInAgent, Surface::kOutsideAgent},
++        .risk = RiskClass::kLow,
++        .outside = OutsideClass::kFreeInOwnTabs,
++        .hints = McpHints{.read_only = false,
++                          .destructive = false,
++                          .idempotent = false,
++                          .open_world = true},
++        .wire = WireHints::kReadOnlyOnly,
++        .dispatch = Dispatch::kAgentController,
++    },
++    {
++        .id = "open_tab",
++        .description = "Open a new tab to an http(s) URL in the current space.",
++        .args_json =
++            R"json({"additionalProperties":false,"properties":{"url":{"description":"http(s) URL","type":"string"}},"required":["url"],"type":"object"})json",
++        .surfaces = {Surface::kBuiltInAgent, Surface::kOutsideAgent},
++        .risk = RiskClass::kLow,
++        .outside = OutsideClass::kFreeInOwnTabs,
++        .hints = McpHints{.read_only = false,
++                          .destructive = false,
++                          .idempotent = false,
++                          .open_world = true},
++        .wire = WireHints::kReadOnlyOnly,
++        .dispatch = Dispatch::kAgentController,
++    },
++    {
++        .id = "switch_tab",
++        .description = "Activate a tab by alias from list_tabs.",
++        .args_json =
++            R"json({"additionalProperties":false,"properties":{"tab_id":{"description":"Tab alias","type":"string"}},"required":["tab_id"],"type":"object"})json",
++        .surfaces = {Surface::kBuiltInAgent, Surface::kOutsideAgent},
++        .risk = RiskClass::kLow,
++        .outside = OutsideClass::kFreeInOwnTabs,
++        .hints = McpHints{.read_only = false,
++                          .destructive = false,
++                          .idempotent = true,
++                          .open_world = false},
++        .wire = WireHints::kReadOnlyOnly,
++        .dispatch = Dispatch::kAgentController,
++    },
++    {
++        .id = "close_tab",
++        .description = "Close a tab the agent opened. Closing a user tab is "
++                       "consequential.",
++        .args_json =
++            R"json({"additionalProperties":false,"properties":{"tab_id":{"description":"Tab alias","type":"string"}},"required":["tab_id"],"type":"object"})json",
++        .surfaces = {Surface::kBuiltInAgent, Surface::kOutsideAgent},
++        .risk = RiskClass::kLow,
++        .outside = OutsideClass::kFreeInOwnTabs,
++        .hints = McpHints{.read_only = false,
++                          .destructive = true,
++                          .idempotent = true,
++                          .open_world = false},
++        .wire = WireHints::kReadOnlyOnly,
++        .dispatch = Dispatch::kAgentController,
++    },
++    {
++        .id = "wait_for_settle",
++        .description = "Wait until the page is settled after prior actions.",
++        .args_json =
++            R"json({"additionalProperties":false,"properties":{"tab_id":{"description":"Tab alias","type":"string"},"timeout_ms":{"description":"Max wait in milliseconds, up to 10000 (default 4000)","type":"number"}},"required":[],"type":"object"})json",
++        .surfaces = {Surface::kBuiltInAgent, Surface::kOutsideAgent},
++        .risk = RiskClass::kLow,
++        .outside = OutsideClass::kFreeInOwnTabs,
++        .hints = McpHints{.read_only = false,
++                          .destructive = false,
++                          .idempotent = true,
++                          .open_world = false},
++        .wire = WireHints::kReadOnlyOnly,
++        .dispatch = Dispatch::kAgentController,
++    },
++
++};
++
++}  // namespace
++
++base::span<const Action> AgentActions() {
++  return kAgentActions;
++}
++
++}  // namespace rac::action_table
+--- /dev/null
++++ b/chrome/browser/rac/actions/rac_actions_groups.h
+@@ -0,0 +1,20 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_ACTIONS_RAC_ACTIONS_GROUPS_H_
++#define CHROME_BROWSER_RAC_ACTIONS_RAC_ACTIONS_GROUPS_H_
++
++#include "base/containers/span.h"
++#include "chrome/browser/rac/actions/rac_actions.h"
++
++// One function per group of rows, each defined in rac_actions_<group>.cc.
++// A new group adds its file, one line here, and one line in the group list in
++// rac_actions.cc. Nobody else's rows are touched.
++namespace rac::action_table {
++
++// Today's page tools, handled by AgentController (plan 05 owns these rows).
++base::span<const Action> AgentActions();
++
++}  // namespace rac::action_table
++
++#endif  // CHROME_BROWSER_RAC_ACTIONS_RAC_ACTIONS_GROUPS_H_
+--- /dev/null
++++ b/chrome/browser/rac/actions/rac_actions_unittest.cc
+@@ -0,0 +1,233 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/actions/rac_actions.h"
++
++#include <set>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/base_paths.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/path_service.h"
++#include "base/values.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/events/event_constants.h"
++#include "ui/events/keycodes/keyboard_codes.h"
++
++namespace rac::action_table {
++namespace {
++
++// Ids that exist today. Ids are never removed or reused, so this list only
++// grows. Adding a row means adding its id here too.
++constexpr std::string_view kCommittedIds[] = {
++    "snapshot",   "get_page_text", "list_tabs",       "find_in_page",
++    "click",      "type",          "select_option",   "press_key",
++    "scroll",     "navigate",      "go_back",         "open_tab",
++    "switch_tab", "close_tab",     "wait_for_settle",
++};
++
++// Plan 05's "Never" class. None of these may have an outside surface.
++constexpr std::string_view kNeverForOutsideClients[] = {
++    "change_setting",    "set_site_rule", "set_agent_level",
++    "install_extension", "clear_history", "clear_browsing_data",
++    "delete_space",
++};
++
++constexpr Surface kUiSurfaces[] = {Surface::kSidebar, Surface::kCommandBar,
++                                   Surface::kMenu, Surface::kShortcut};
++
++constexpr Action MadeUp(std::string_view id,
++                        Surfaces surfaces,
++                        bool ai_only = false,
++                        ShortcutSpec shortcut = {}) {
++  return {.id = id,
++          .default_shortcut = shortcut,
++          .surfaces = surfaces,
++          .ai_only = ai_only};
++}
++
++TEST(RacActionsTest, EveryRowIsClassified) {
++  for (const Action& action : All()) {
++    SCOPED_TRACE(std::string(action.id));
++    EXPECT_FALSE(action.id.empty());
++    EXPECT_TRUE(action.risk.has_value());
++    EXPECT_TRUE(action.outside.has_value());
++    ASSERT_TRUE(action.hints.has_value());
++    // A read-only action can't be destructive.
++    EXPECT_FALSE(action.hints->read_only && action.hints->destructive);
++    const bool agent_row = action.surfaces.Has(Surface::kBuiltInAgent) ||
++                           action.surfaces.Has(Surface::kOutsideAgent);
++    if (agent_row) {
++      EXPECT_FALSE(action.description.empty());
++      EXPECT_EQ(*ArgsSchema(action).FindString("type"), "object");
++    }
++    // Chromium runs a kCommand row's id, so it must have one. Handler
++    // coverage for kBrowser rows is tested next to the handlers, in the
++    // //chrome/browser/ui target.
++    if (action.dispatch == Dispatch::kCommand) {
++      EXPECT_NE(action.command_id, 0) << "a command row needs its IDC_ id";
++    }
++    // An outside client sees a row exactly when it was classified for them.
++    EXPECT_EQ(action.surfaces.Has(Surface::kOutsideAgent),
++              action.outside != OutsideClass::kNotOffered);
++  }
++}
++
++TEST(RacActionsTest, IdsAreUniqueAndNeverRemoved) {
++  std::set<std::string_view> seen;
++  for (const Action& action : All()) {
++    EXPECT_TRUE(seen.insert(action.id).second) << "duplicate id " << action.id;
++  }
++  for (std::string_view id : kCommittedIds) {
++    EXPECT_TRUE(Find(id)) << "id was removed: " << id;
++  }
++  EXPECT_EQ(Find("no_such_action"), nullptr);
++}
++
++// The wire bytes of tools/list for the 15 current tools must never change. The
++// golden file is made by testdata/gen_tools_list_golden.py from the original
++// tool_registry.cc. This test assembles the reply the way McpToolSpecToDict
++// does; tools_list_golden_unittest.cc in the agent directory runs the same
++// file through the real MCP handler.
++TEST(RacActionsTest, ToolsListMatchesGoldenBytes) {
++  base::ListValue tools;
++  for (const Action& action : All()) {
++    if (action.dispatch != Dispatch::kAgentController) {
++      continue;
++    }
++    base::DictValue tool;
++    tool.Set("name", std::string(action.id));
++    tool.Set("description", std::string(action.description));
++    tool.Set("inputSchema", ArgsSchema(action));
++    base::DictValue annotations = WireAnnotations(action);
++    if (!annotations.empty()) {
++      tool.Set("annotations", std::move(annotations));
++    }
++    tools.Append(std::move(tool));
++  }
++  base::DictValue reply;
++  reply.Set("jsonrpc", "2.0");
++  reply.Set("id", 1);
++  reply.Set("result", base::DictValue().Set("tools", std::move(tools)));
++  std::string actual;
++  ASSERT_TRUE(base::JSONWriter::Write(reply, &actual));
++
++  base::FilePath golden_path;
++  ASSERT_TRUE(
++      base::PathService::Get(base::DIR_SRC_TEST_DATA_ROOT, &golden_path));
++  golden_path = golden_path.AppendASCII(
++      "chrome/browser/rac/actions/testdata/tools_list_legacy.json");
++  std::string golden;
++  ASSERT_TRUE(base::ReadFileToString(golden_path, &golden)) << golden_path;
++  EXPECT_EQ(actual, golden);
++}
++
++TEST(RacActionsTest, WireAnnotationsFollowTheWireMode) {
++  const Action read = {.id = "r",
++                       .hints = McpHints{.read_only = true,
++                                         .destructive = false,
++                                         .idempotent = true,
++                                         .open_world = false},
++                       .wire = WireHints::kReadOnlyOnly};
++  const Action act = {.id = "a",
++                      .hints = McpHints{.read_only = false,
++                                        .destructive = true,
++                                        .idempotent = false,
++                                        .open_world = true},
++                      .wire = WireHints::kReadOnlyOnly};
++  const Action full = {.id = "f",
++                       .hints = McpHints{.read_only = false,
++                                         .destructive = true,
++                                         .idempotent = true,
++                                         .open_world = false},
++                       .wire = WireHints::kFull};
++
++  std::string json;
++  ASSERT_TRUE(base::JSONWriter::Write(WireAnnotations(read), &json));
++  EXPECT_EQ(json, R"({"readOnlyHint":true})");
++  EXPECT_TRUE(WireAnnotations(act).empty());
++  ASSERT_TRUE(base::JSONWriter::Write(WireAnnotations(full), &json));
++  EXPECT_EQ(json, R"({"destructiveHint":true,"idempotentHint":true,)"
++                  R"("openWorldHint":false,"readOnlyHint":false})");
++}
++
++TEST(RacActionsTest, AiOnlyRowsNeverShowWithAiOff) {
++  const Action rows[] = {
++      MadeUp("plain", {Surface::kCommandBar, Surface::kOutsideAgent}),
++      MadeUp(
++          "ask",
++          {Surface::kCommandBar, Surface::kSidebar, Surface::kMenu,
++           Surface::kShortcut, Surface::kBuiltInAgent, Surface::kOutsideAgent},
++          /*ai_only=*/true),
++  };
++  ActionContext ai_off;
++  ai_off.ai_enabled = false;
++  for (Surface surface :
++       {Surface::kSidebar, Surface::kCommandBar, Surface::kMenu,
++        Surface::kShortcut, Surface::kBuiltInAgent, Surface::kOutsideAgent}) {
++    for (const Action* action : ForSurface(rows, surface, ai_off)) {
++      EXPECT_NE(action->id, "ask");
++    }
++  }
++  ActionContext ai_on;
++  ai_on.ai_enabled = true;
++  EXPECT_EQ(ForSurface(rows, Surface::kCommandBar, ai_on).size(), 2u);
++  EXPECT_EQ(ForSurface(rows, Surface::kCommandBar, ai_off).size(), 1u);
++
++  // The real table too: whatever rows exist, none survives with AI off.
++  for (Surface surface : kUiSurfaces) {
++    for (const Action* action : ForSurface(surface, ai_off)) {
++      EXPECT_FALSE(action->ai_only) << action->id;
++    }
++  }
++}
++
++TEST(RacActionsTest, AvailabilityFiltersUiSurfacesOnly) {
++  Action needs_tab =
++      MadeUp("needs_tab", {Surface::kCommandBar, Surface::kBuiltInAgent});
++  needs_tab.availability = {Need::kTab, Need::kNotIncognito};
++  const Action rows[] = {needs_tab};
++  ActionContext context;
++  EXPECT_TRUE(ForSurface(rows, Surface::kCommandBar, context).empty());
++  EXPECT_EQ(ForSurface(rows, Surface::kBuiltInAgent, context).size(), 1u);
++  context.has_tab = true;
++  EXPECT_EQ(ForSurface(rows, Surface::kCommandBar, context).size(), 1u);
++  context.incognito = true;
++  EXPECT_TRUE(ForSurface(rows, Surface::kCommandBar, context).empty());
++}
++
++TEST(RacActionsTest, NeverActionsHaveNoOutsideSurface) {
++  for (std::string_view id : kNeverForOutsideClients) {
++    const Action* action = Find(id);
++    EXPECT_TRUE(!action || !action->surfaces.Has(Surface::kOutsideAgent)) << id;
++  }
++}
++
++TEST(RacActionsTest, ShortcutsDoNotCollide) {
++  EXPECT_EQ(FirstShortcutCollision(All()), std::nullopt);
++
++  const ShortcutSpec cmd_k = {ui::VKEY_K, ui::EF_COMMAND_DOWN};
++  const Action colliding[] = {
++      MadeUp("a", {Surface::kShortcut}, false, cmd_k),
++      MadeUp("b", {Surface::kShortcut}, false, cmd_k),
++  };
++  EXPECT_EQ(FirstShortcutCollision(colliding), "b");
++
++  const Action no_shortcut_surface[] = {
++      MadeUp("a", {Surface::kShortcut}, false, cmd_k),
++      MadeUp("b", {Surface::kCommandBar}, false, cmd_k),
++      MadeUp("c", {Surface::kShortcut}, false,
++             {ui::VKEY_K, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN}),
++  };
++  EXPECT_EQ(FirstShortcutCollision(no_shortcut_surface), std::nullopt);
++  // Collisions with Chromium's and Helium's own shortcut tables are checked
++  // when the first shortcut row lands (needs the accelerator list).
++}
++
++}  // namespace
++}  // namespace rac::action_table
+--- /dev/null
++++ b/chrome/browser/rac/actions/testdata/check_rows_against_golden.py
+@@ -0,0 +1,30 @@
++#!/usr/bin/env python3
++"""Second, independent check: reads rac_actions_agent.cc as text, rebuilds the
++tools/list reply from the string literals in the rows (concatenating adjacent
++literals the way the C++ compiler does), and compares it to the golden file.
++Also checks the row order and the kReadOnlyOnly rule. Stdlib only.
++
++    check_rows_against_golden.py rac_actions_agent.cc tools_list_legacy.json
++"""
++import json, re, sys
++src, golden = open(sys.argv[1]).read(), open(sys.argv[2]).read()
++sys.path.insert(0, __file__.rsplit("/", 1)[0])
++import importlib.util
++spec = importlib.util.spec_from_file_location("g", __file__.rsplit("/", 1)[0] + "/gen_tools_list_golden.py")
++g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
++
++STR = g.STR
++tools = []
++for row in re.split(r'\n    \{\n        \.id = ', src)[1:]:
++    name = g.unquote_all(re.match(STR, row).group(0))
++    desc = g.unquote_all(re.search(rf'\.description =({g.STRS}),\n', row).group(1))
++    schema = json.loads(re.search(r'R"json\((.*)\)json"', row).group(1))
++    read_only = re.search(r'\.read_only = (true|false)', row).group(1) == "true"
++    assert "WireHints::kReadOnlyOnly" in row and "Dispatch::kAgentController" in row, name
++    e = {"name": name, "description": desc, "inputSchema": schema}
++    if read_only:
++        e["annotations"] = {"readOnlyHint": True}
++    tools.append(e)
++line = g.dump({"id": 1, "jsonrpc": "2.0", "result": {"tools": tools}})
++print(len(tools), "rows;", "MATCH" if line == golden else "MISMATCH")
++sys.exit(0 if line == golden else 1)
+--- /dev/null
++++ b/chrome/browser/rac/actions/testdata/gen_tools_list_golden.py
+@@ -0,0 +1,183 @@
++#!/usr/bin/env python3
++"""Rebuilds today's MCP `tools/list` reply from tool_registry.cc, byte for byte.
++
++Run against the ORIGINAL tool_registry.cc (before the table change):
++
++    gen_tools_list_golden.py <tool_registry.cc> [--out tools_list_legacy.json]
++    gen_tools_list_golden.py <tool_registry.cc> --rows     # C++ row literals
++
++It parses the C++ (the StringProp/BoolProp/NumberProp/ObjectSchema helpers and
++the ToolDefinition blocks) instead of re-typing the data, so the golden file
++cannot drift from the source by a typo. It then writes JSON the way the C++
++does:
++
++* base::DictValue is a sorted flat_map, so every object has sorted keys.
++* base::JSONWriter prints no spaces, escapes `<` as \\u003C, U+2028/2029 as
++  \\u2028/\\u2029, other control characters (< 0x20) as \\uXXXX (uppercase),
++  and leaves every other character as is.
++* McpToolSpecToDict (mcp_protocol.cc) emits name, description, inputSchema and,
++  for read tools only, annotations {"readOnlyHint": true}.
++* The reply is MakeMcpResult(id 1, {"tools": [...]}), so the line is
++  {"id":1,"jsonrpc":"2.0","result":{"tools":[...]}} with no trailing newline.
++
++Stdlib only.
++"""
++import json
++import re
++import sys
++
++STR = r'"(?:[^"\\]|\\.)*"'
++STRS = rf'(?:\s*{STR})+'
++
++TYPES = {"StringProp": "string", "BoolProp": "boolean", "NumberProp": "number"}
++
++
++def unquote_all(text):
++    """Concatenates adjacent C++ string literals."""
++    out = []
++    for lit in re.findall(STR, text):
++        body = lit[1:-1]
++        body = re.sub(r'\\(.)', lambda m: {'n': '\n', 't': '\t'}.get(m.group(1), m.group(1)), body)
++        out.append(body)
++    return "".join(out)
++
++
++def parse_tools(src):
++    tools = []
++    for block in re.split(r'\n  \{\n    ToolDefinition t;', src)[1:]:
++        block = block.split("tools.push_back")[0]
++        name = unquote_all(re.search(rf't\.name = ({STR});', block).group(1))
++        desc = unquote_all(re.search(rf't\.description =({STRS});', block).group(1))
++        kind = re.search(r't\.kind = ToolKind::k(\w+);', block).group(1)
++        risk = re.search(r't\.default_risk = RiskClass::k(\w+);', block)
++        params = re.search(r't\.parameters =\s*ObjectSchema\((.*)\);\s*$', block, re.S).group(1)
++        # params = <props expr>, {<required>}
++        req_m = re.search(r',\s*\{([^{}]*)\}\s*\)?\s*$', params + ")", re.S)
++        required = re.findall(STR, req_m.group(1))
++        required = [unquote_all(r) for r in required]
++        props_expr = params[:req_m.start()] if req_m else params
++        props = {}
++        for m in re.finditer(
++                rf'\.Set\(\s*({STR}),\s*(StringProp|BoolProp|NumberProp)\(({STRS})\s*\)'
++                rf'(?:\s*\.Set\("enum",\s*base::ListValue\(\)\.Append\(({STR})\)\))?', props_expr):
++            key = unquote_all(m.group(1))
++            prop = {"type": TYPES[m.group(2)], "description": unquote_all(m.group(3))}
++            if m.group(4):
++                prop["enum"] = [unquote_all(m.group(4))]
++            props[key] = prop
++        n_sets = len(re.findall(r'\.Set\(\s*"', props_expr)) - len(re.findall(r'\.Set\("enum"', props_expr))
++        assert n_sets == len(props), (name, n_sets, len(props))
++        tools.append({
++            "name": name, "description": desc, "kind": kind,
++            "risk": risk.group(1) if risk else "None",
++            "schema": {"type": "object", "properties": props, "required": required,
++                       "additionalProperties": False},
++        })
++    return tools
++
++
++def esc(s):
++    out = ['"']
++    for ch in s:
++        o = ord(ch)
++        if ch == '\b': out.append('\\b')
++        elif ch == '\f': out.append('\\f')
++        elif ch == '\n': out.append('\\n')
++        elif ch == '\r': out.append('\\r')
++        elif ch == '\t': out.append('\\t')
++        elif ch == '\\': out.append('\\\\')
++        elif ch == '"': out.append('\\"')
++        elif ch == '<': out.append('\\u003C')
++        elif o in (0x2028, 0x2029): out.append('\\u%04X' % o)
++        elif o < 32: out.append('\\u%04X' % o)
++        else: out.append(ch)
++    out.append('"')
++    return "".join(out)
++
++
++def dump(v):
++    """base::JSONWriter's output for a DictValue/ListValue tree."""
++    if isinstance(v, dict):
++        return "{" + ",".join(esc(k) + ":" + dump(v[k]) for k in sorted(v)) + "}"
++    if isinstance(v, list):
++        return "[" + ",".join(dump(x) for x in v) + "]"
++    if v is True: return "true"
++    if v is False: return "false"
++    if isinstance(v, int): return str(v)
++    if isinstance(v, str): return esc(v)
++    raise TypeError(v)
++
++
++def tools_list_line(tools):
++    entries = []
++    for t in tools:
++        e = {"name": t["name"], "description": t["description"], "inputSchema": t["schema"]}
++        if t["kind"] == "Read":
++            e["annotations"] = {"readOnlyHint": True}
++        entries.append(e)
++    return dump({"id": 1, "jsonrpc": "2.0", "result": {"tools": entries}})
++
++
++# What each legacy tool really is: (read_only, destructive, idempotent, open_world).
++# See docs/internals/action-table.md. Not on the wire for the 15 (kReadOnlyOnly).
++HINTS = {
++    "snapshot": "TFTF", "get_page_text": "TFTF", "list_tabs": "TFTF", "find_in_page": "TFTF",
++    "click": "FTFT", "type": "FTFT", "press_key": "FTFT", "select_option": "FTTT",
++    "scroll": "FFFF", "wait_for_settle": "FFTF", "navigate": "FFTT",
++    "go_back": "FFFT", "open_tab": "FFFT", "switch_tab": "FFTF", "close_tab": "FTTF",
++}
++
++
++def cxx_literal(s, indent):
++    """A C++ raw-string-free literal, split in <= ~72-column pieces."""
++    pieces, cur = [], ""
++    for word in re.findall(r'\S+\s*', s):
++        if len(cur) + len(word) > 64 and cur:
++            pieces.append(cur); cur = ""
++        cur += word
++    if cur: pieces.append(cur)
++    q = lambda p: '"' + p.replace('\\', '\\\\').replace('"', '\\"') + '"'
++    return ("\n" + " " * indent).join(q(p) for p in pieces)
++
++
++def rows(tools):
++    out = []
++    for t in tools:
++        h = HINTS[t["name"]]
++        assert (h[0] == "T") == (t["kind"] == "Read"), t["name"]
++        schema = dump(t["schema"])
++        out.append(f'''    {{
++        .id = "{t["name"]}",
++        .description =
++            {cxx_literal(t["description"], 12)},
++        .args_json =
++            R"json({schema})json",
++        .surfaces = {{Surface::kBuiltInAgent, Surface::kOutsideAgent}},
++        .risk = RiskClass::k{t["risk"]},
++        .outside = OutsideClass::k{"Read" if t["kind"] == "Read" else "FreeInOwnTabs"},
++        .hints = McpHints{{.read_only = {h[0] == "T"}, .destructive = {h[1] == "T"},
++                          .idempotent = {h[2] == "T"}, .open_world = {h[3] == "T"}}},
++        .wire = WireHints::kReadOnlyOnly,
++        .dispatch = Dispatch::kAgentController,
++    }},'''.replace("True", "true").replace("False", "false"))
++    return "\n".join(out)
++
++
++def main():
++    path = sys.argv[1]
++    tools = parse_tools(open(path).read())
++    assert len(tools) == 15, len(tools)
++    if "--rows" in sys.argv:
++        print(rows(tools))
++        return
++    out = sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv else None
++    line = tools_list_line(tools)
++    if out:
++        with open(out, "w", newline="") as f:
++            f.write(line)
++    else:
++        print(line)
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null
++++ b/chrome/browser/rac/actions/testdata/tools_list_legacy.json
+@@ -0,0 +1 @@
++{"id":1,"jsonrpc":"2.0","result":{"tools":[{"annotations":{"readOnlyHint":true},"description":"Capture a Playwright-style accessibility snapshot of the current page with stable element refs (e12). Viewport-only by default.","inputSchema":{"additionalProperties":false,"properties":{"full":{"description":"Include offscreen actionable nodes","type":"boolean"},"tab_id":{"description":"Tab alias; defaults to the tab the agent last used or was given","type":"string"}},"required":[],"type":"object"},"name":"snapshot"},{"annotations":{"readOnlyHint":true},"description":"Read compact structured page text for chat-style context (headings, lists, links). Prefer snapshot for acting.","inputSchema":{"additionalProperties":false,"properties":{"tab_id":{"description":"Tab alias","type":"string"}},"required":[],"type":"object"},"name":"get_page_text"},{"annotations":{"readOnlyHint":true},"description":"List tabs in the current window/space the agent may use.","inputSchema":{"additionalProperties":false,"properties":{},"required":[],"type":"object"},"name":"list_tabs"},{"annotations":{"readOnlyHint":true},"description":"Find text matches in the current page (count + snippets).","inputSchema":{"additionalProperties":false,"properties":{"query":{"description":"Text to find","type":"string"},"tab_id":{"description":"Tab alias","type":"string"}},"required":["query"],"type":"object"},"name":"find_in_page"},{"description":"Click an element by snapshot ref.","inputSchema":{"additionalProperties":false,"properties":{"ref":{"description":"Element ref from snapshot, e.g. e12","type":"string"},"tab_id":{"description":"Tab alias","type":"string"}},"required":["ref"],"type":"object"},"name":"click"},{"description":"Type text into an element by ref. Password/payment fields are consequential.","inputSchema":{"additionalProperties":false,"properties":{"press_enter":{"description":"Press Enter after typing","type":"boolean"},"ref":{"description":"Element ref","type":"string"},"tab_id":{"description":"Tab alias","type":"string"},"text":{"description":"Text to type","type":"string"}},"required":["ref","text"],"type":"object"},"name":"type"},{"description":"Select an option in a combobox by option value.","inputSchema":{"additionalProperties":false,"properties":{"ref":{"description":"Element ref","type":"string"},"tab_id":{"description":"Tab alias","type":"string"},"value":{"description":"Option value attribute","type":"string"}},"required":["ref","value"],"type":"object"},"name":"select_option"},{"description":"Press Enter on an element ref. May submit a form.","inputSchema":{"additionalProperties":false,"properties":{"key":{"description":"Enter only","enum":["Enter"],"type":"string"},"ref":{"description":"Element ref to press Enter on","type":"string"},"tab_id":{"description":"Tab alias","type":"string"}},"required":["key","ref"],"type":"object"},"name":"press_key"},{"description":"Scroll the page or a scrollable element by dx/dy DIPs.","inputSchema":{"additionalProperties":false,"properties":{"dx":{"description":"Horizontal delta in DIPs","type":"number"},"dy":{"description":"Vertical delta in DIPs","type":"number"},"ref":{"description":"Optional scroll container ref","type":"string"},"tab_id":{"description":"Tab alias","type":"string"}},"required":[],"type":"object"},"name":"scroll"},{"description":"Navigate the current tab to an http(s) URL. Never chrome://, file, or downloads.","inputSchema":{"additionalProperties":false,"properties":{"tab_id":{"description":"Tab alias","type":"string"},"url":{"description":"http(s) URL","type":"string"}},"required":["url"],"type":"object"},"name":"navigate"},{"description":"Go back in the current tab's history.","inputSchema":{"additionalProperties":false,"properties":{"tab_id":{"description":"Tab alias","type":"string"}},"required":[],"type":"object"},"name":"go_back"},{"description":"Open a new tab to an http(s) URL in the current space.","inputSchema":{"additionalProperties":false,"properties":{"url":{"description":"http(s) URL","type":"string"}},"required":["url"],"type":"object"},"name":"open_tab"},{"description":"Activate a tab by alias from list_tabs.","inputSchema":{"additionalProperties":false,"properties":{"tab_id":{"description":"Tab alias","type":"string"}},"required":["tab_id"],"type":"object"},"name":"switch_tab"},{"description":"Close a tab the agent opened. Closing a user tab is consequential.","inputSchema":{"additionalProperties":false,"properties":{"tab_id":{"description":"Tab alias","type":"string"}},"required":["tab_id"],"type":"object"},"name":"close_tab"},{"description":"Wait until the page is settled after prior actions.","inputSchema":{"additionalProperties":false,"properties":{"tab_id":{"description":"Tab alias","type":"string"},"timeout_ms":{"description":"Max wait in milliseconds, up to 10000 (default 4000)","type":"number"}},"required":[],"type":"object"},"name":"wait_for_settle"}]}}
+\ No newline at end of file
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -2314,6 +2314,8 @@ static_library("ui") {
+       "browser.h",
+       "browser_tabstrip.cc",
+       "browser_tabstrip.h",
++      "rac/rac_action_handlers.cc",
++      "rac/rac_action_handlers.h",
+       "rac/sidebar/pinned_tabs_space.cc",
+       "rac/sidebar/pinned_tabs_space.h",
+       "rac/sidebar/sidebar_actions.cc",
+@@ -2393,6 +2395,7 @@ static_library("ui") {
+       "//chrome/browser/indigo",
+       "//chrome/browser/lifetime:termination_notification",
+       "//chrome/browser/password_manager/actor_login:factories",
++      "//chrome/browser/rac/actions:core",
+       "//chrome/browser/record_replay",
+       "//chrome/browser/record_replay:impl",
+       "//chrome/browser/speech",
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -78,6 +78,7 @@
+ #include "chrome/browser/ui/passwords/ui_utils.h"
+ #include "chrome/browser/ui/profiles/profile_picker.h"
+ #include "chrome/browser/ui/profiles/profile_view_utils.h"
++#include "chrome/browser/ui/rac/rac_action_handlers.h"
+ #include "chrome/browser/ui/rac/sidebar/sidebar_actions.h"
+ #include "chrome/browser/ui/views/rac/ai/assistant_actions.h"
+ #include "chrome/browser/ui/rac/sidebar/sidebar_window_sync.h"
+@@ -663,10 +664,17 @@ void BrowserCommandController::ShowCusto
+ // BrowserCommandController, CommandUpdater implementation:
+ 
+ bool BrowserCommandController::SupportsCommand(int id) const {
++  // rac: commands in the action-table range are the table's.
++  if (rac::action_table::BrowserActionForCommand(id)) {
++    return true;
++  }
+   return command_updater_->SupportsCommand(id);
+ }
+ 
+ bool BrowserCommandController::IsCommandEnabled(int id) const {
++  if (rac::action_table::BrowserActionForCommand(id)) {
++    return rac::action_table::IsBrowserCommandEnabled(browser_, id);
++  }
+   return command_updater_->IsCommandEnabled(id);
+ }
+ 
+@@ -675,6 +683,11 @@ bool BrowserCommandController::ExecuteCo
+     WindowOpenDisposition disposition,
+     std::optional<actions::ActionInvocationContext> context,
+     base::TimeTicks time_stamp) {
++  // rac: commands in the action-table range run through the table's kBrowser
++  // handler, not the command updater.
++  if (rac::action_table::ExecuteBrowserCommand(browser_, id)) {
++    return true;
++  }
+   if (!SupportsCommand(id) || !IsCommandEnabled(id)) {
+     return false;
+   }
+--- a/chrome/browser/ui/cocoa/BUILD.gn
++++ b/chrome/browser/ui/cocoa/BUILD.gn
+@@ -174,6 +174,7 @@ source_set("cocoa") {
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/browser_window:create_browser_window",
+     "//chrome/browser/ui/javascript_dialogs",
++    "//chrome/browser/ui/rac:action_menu_items",
+     "//chrome/browser/ui/tab_contents",
+     "//chrome/browser/ui/tabs:tab_strip_model_observer",
+     "//chrome/browser/ui/tabs/saved_tab_groups",
+--- a/chrome/browser/ui/cocoa/main_menu_builder.mm
++++ b/chrome/browser/ui/cocoa/main_menu_builder.mm
+@@ -16,6 +16,7 @@
+ #include "chrome/browser/feedback/report_unsafe_site_dialog.h"
+ #include "chrome/browser/ui/cocoa/accelerators_cocoa.h"
+ #include "chrome/browser/ui/cocoa/history_menu_bridge.h"
++#include "chrome/browser/ui/rac/rac_action_menu_items.h"
+ #include "chrome/browser/ui/toolbar/app_menu_model.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/common/chrome_features.h"
+@@ -660,6 +661,10 @@ NSMenu* BuildMainMenu(NSApplication* nsa
+     }
+   }
+ 
++  if (!is_pwa) {
++    rac::action_table::InsertActionMenuItems(main_menu);
++  }
++
+   nsapp.mainMenu = main_menu;
+ 
+   return main_menu;
+--- /dev/null
++++ b/chrome/browser/ui/rac/rac_action_handlers.cc
+@@ -0,0 +1,165 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/ui/rac/rac_action_handlers.h"
++
++#include <algorithm>
++#include <array>
++#include <map>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/check.h"
++#include "base/no_destructor.h"
++#include "base/uuid.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/actions/rac_action_handler_ids.h"
++#include "chrome/browser/rac/actions/rac_action_ids.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/web_contents.h"
++#include "url/gurl.h"
++
++namespace rac::action_table {
++namespace {
++
++// Row id -> browser-side handler, for Dispatch::kBrowser rows. Every kBrowser
++// row in the table needs an entry here, and its id in
++// HandledActionIds() (chrome/browser/rac/actions/rac_action_handler_ids.cc),
++// which the browser-free coverage test checks against the table. Entries look
++// like
++//
++//     {"open_command_bar", &OpenCommandBar},
++//
++// with the function defined above in this anonymous namespace. A handler that
++// does nothing without a browser checks `context.browser` first.
++constexpr std::array<std::pair<std::string_view, BrowserActionHandler>, 0>
++    kBrowserHandlers{};
++
++// Whether kBrowserHandlers and HandledActionIds() name the same set of rows.
++// The coverage test checks the id list against the table; this checks the
++// other half, so neither file can drift without a failure.
++bool HandlerMapMatchesIdList() {
++  std::vector<std::string_view> mapped;
++  mapped.reserve(kBrowserHandlers.size());
++  for (const auto& [row_id, handler] : kBrowserHandlers) {
++    mapped.push_back(row_id);
++  }
++  std::vector<std::string_view> listed(HandledActionIds().begin(),
++                                       HandledActionIds().end());
++  std::ranges::sort(mapped);
++  std::ranges::sort(listed);
++  return mapped == listed;
++}
++
++// Overrides that tests install with SetBrowserActionHandlerForTesting. Map,
++// not part of kBrowserHandlers, so a test can register a row id that isn't in
++// the table at all.
++std::map<std::string, BrowserActionHandler, std::less<>>& TestHandlers() {
++  static base::NoDestructor<
++      std::map<std::string, BrowserActionHandler, std::less<>>>
++      handlers;
++  return *handlers;
++}
++
++}  // namespace
++
++BrowserActionHandler FindBrowserActionHandler(std::string_view id) {
++  // Once per process, on first use.
++  static const bool kCheckedMap = [] {
++    CHECK(HandlerMapMatchesIdList())
++        << "kBrowserHandlers (rac_action_handlers.cc) and HandledActionIds() "
++           "(rac_action_handler_ids.cc) name different rows";
++    return true;
++  }();
++  if (auto it = TestHandlers().find(id); it != TestHandlers().end()) {
++    return it->second;
++  }
++  for (const auto& [row_id, handler] : kBrowserHandlers) {
++    if (row_id == id) {
++      return handler;
++    }
++  }
++  return nullptr;
++}
++
++void RunBrowserAction(const Action& action,
++                      const ActionContext& context,
++                      const base::DictValue& args) {
++  CHECK_EQ(action.dispatch, Dispatch::kBrowser) << action.id;
++  BrowserActionHandler handler = FindBrowserActionHandler(action.id);
++  CHECK(handler) << "kBrowser action has no handler: " << action.id;
++  handler(context, args);
++}
++
++ActionContext ContextForWindow(BrowserWindowInterface* browser) {
++  ActionContext context;
++  context.browser = browser;
++  if (!browser) {
++    return context;
++  }
++
++  Profile* profile = browser->GetProfile();
++  context.incognito = profile->IsIncognitoProfile();
++  context.ai_enabled = rac::ai::IsAiEnabled(profile->GetPrefs());
++
++  TabStripModel* tabs = browser->GetTabStripModel();
++  context.has_tab = tabs && tabs->active_index() != TabStripModel::kNoTab;
++  if (context.has_tab) {
++    if (content::WebContents* contents = tabs->GetActiveWebContents()) {
++      context.has_web_page =
++          contents->GetLastCommittedURL().SchemeIsHTTPOrHTTPS();
++    }
++  }
++
++  // The manager exists for normal windows of the profile, where spaces do.
++  if (SpacesWindowManager* manager = SpacesWindowManager::From(browser)) {
++    context.has_spaces = true;
++    if (std::optional<SpaceId> space = manager->GetActiveSpaceId(browser)) {
++      context.active_space_id = space->AsLowercaseString();
++    }
++  }
++  return context;
++}
++
++const Action* BrowserActionForCommand(int id) {
++  if (id < IDC_RAC_ACTION_FIRST || id > IDC_RAC_ACTION_LAST) {
++    return nullptr;
++  }
++  const Action* action = FindByCommand(id);
++  return action && action->dispatch == Dispatch::kBrowser ? action : nullptr;
++}
++
++bool IsBrowserCommandEnabled(BrowserWindowInterface* browser, int id) {
++  const Action* action = BrowserActionForCommand(id);
++  return action && IsAvailable(*action, ContextForWindow(browser));
++}
++
++bool ExecuteBrowserCommand(BrowserWindowInterface* browser, int id) {
++  const Action* action = BrowserActionForCommand(id);
++  if (!action) {
++    return false;
++  }
++  const ActionContext context = ContextForWindow(browser);
++  if (!IsAvailable(*action, context)) {
++    return false;
++  }
++  RunBrowserAction(*action, context, base::DictValue());
++  return true;
++}
++
++void SetBrowserActionHandlerForTesting(std::string_view id,
++                                       BrowserActionHandler handler) {
++  if (handler) {
++    TestHandlers()[std::string(id)] = handler;
++  } else {
++    TestHandlers().erase(std::string(id));
++  }
++}
++
++}  // namespace rac::action_table
+--- /dev/null
++++ b/chrome/browser/ui/rac/rac_action_handlers.h
+@@ -0,0 +1,64 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_UI_RAC_RAC_ACTION_HANDLERS_H_
++#define CHROME_BROWSER_UI_RAC_RAC_ACTION_HANDLERS_H_
++
++#include <string_view>
++
++#include "base/values.h"
++#include "chrome/browser/rac/actions/rac_actions.h"
++
++class BrowserWindowInterface;
++
++// The browser-side half of the action table. The table itself
++// (chrome/browser/rac/actions/) is data only: a Dispatch::kBrowser row names
++// a function here, looked up by the row's `id`. New rows add one entry to the
++// map in rac_action_handlers.cc, the handler function next to it, and the
++// row's id to HandledActionIds() in
++// chrome/browser/rac/actions/rac_action_handler_ids.cc, which the coverage
++// test checks against the table.
++namespace rac::action_table {
++
++using BrowserActionHandler = void (*)(const ActionContext&,
++                                      const base::DictValue&);
++
++// The handler `id` names, or null when no row claims it. The map is CHECKed
++// against HandledActionIds() on first call, and the coverage test checks
++// every kBrowser row against that list.
++BrowserActionHandler FindBrowserActionHandler(std::string_view id);
++
++// Runs the row's browser-side handler with `args` (empty for menu and key
++// invocation). CHECKs that `action` is a kBrowser row with a handler: a row
++// without one is a table bug the coverage unittest catches first.
++void RunBrowserAction(const Action& action,
++                      const ActionContext& context,
++                      const base::DictValue& args);
++
++// The window's current state, for IsAvailable() and handlers.
++ActionContext ContextForWindow(BrowserWindowInterface* browser);
++
++// Command routing for BrowserCommandController. The controller defers to
++// these for every id so the table alone decides which ids it owns.
++//
++// The kBrowser row that owns command `id`, or null when `id` is outside the
++// IDC_RAC_ACTION_FIRST..LAST range or its row is dispatched another way
++// (kCommand rows keep running through Chromium's own command path).
++const Action* BrowserActionForCommand(int id);
++
++// Whether `id`'s row is available in `browser`'s window right now.
++bool IsBrowserCommandEnabled(BrowserWindowInterface* browser, int id);
++
++// Runs `id`'s kBrowser handler through RunBrowserAction and returns true.
++// False when `id` isn't a table command or its row isn't available now, so
++// the caller can fall back to the command updater's own answer.
++bool ExecuteBrowserCommand(BrowserWindowInterface* browser, int id);
++
++// Registers `handler` for `id` ahead of the static map, for tests. Passing
++// null removes it again.
++void SetBrowserActionHandlerForTesting(std::string_view id,
++                                       BrowserActionHandler handler);
++
++}  // namespace rac::action_table
++
++#endif  // CHROME_BROWSER_UI_RAC_RAC_ACTION_HANDLERS_H_
+--- a/chrome/browser/ui/rac/BUILD.gn
++++ b/chrome/browser/ui/rac/BUILD.gn
+@@ -2,6 +2,8 @@
+ # You can use, redistribute, and/or modify this source code under
+ # the terms of the GPL-3.0 license that can be found in the LICENSE file.
+ 
++import("//testing/test.gni")
++
+ assert(!is_android)
+ 
+ source_set("sidebar_address_bar_prefs") {
+@@ -26,3 +28,34 @@ source_set("sidebar_address_bar_prefs")
+   ]
+   public_deps = [ "//components/prefs" ]
+ }
++
++# Menu placement for action-table rows with Surface::kMenu. ObjC++ (NSMenu),
++# used by //chrome/browser/ui/cocoa's main_menu_builder.mm.
++source_set("action_menu_items") {
++  sources = [
++    "rac_action_menu_items.h",
++    "rac_action_menu_items.mm",
++  ]
++  deps = [
++    "//chrome/app:command_ids",
++    "//chrome/browser/rac/actions:core",
++    "//ui/base",
++  ]
++}
++
++# Coverage test for the action table's kBrowser handlers: every kBrowser row
++# must appear in the handler id list, and every listed id must be a kBrowser
++# row. The list is browser-free (rac_action_handler_ids.cc in
++# //chrome/browser/rac/actions:core), so this test links with base only — a
++# standalone test can't dep on //chrome/browser/ui. Build alone:
++#   autoninja -C out/Default chrome/browser/ui/rac:rac_action_handler_ids_unittests
++test("rac_action_handler_ids_unittests") {
++  sources = [ "rac_action_handler_ids_unittest.cc" ]
++  deps = [
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//chrome/browser/rac/actions:core",
++    "//testing/gtest",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/rac/rac_action_menu_items.h
+@@ -0,0 +1,20 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_UI_RAC_RAC_ACTION_MENU_ITEMS_H_
++#define CHROME_BROWSER_UI_RAC_RAC_ACTION_MENU_ITEMS_H_
++
++@class NSMenu;
++
++namespace rac::action_table {
++
++// Inserts each action-table row with Surface::kMenu into its `menu`, after
++// `menu_after` (or at the menu's end). Called once from BuildMainMenu after
++// the standard menus are built. Items get a commandDispatch: action and no
++// key equivalent: BrowserShortcutService owns menu key equivalents at
++// runtime.
++void InsertActionMenuItems(NSMenu* main_menu);
++
++}  // namespace rac::action_table
++
++#endif  // CHROME_BROWSER_UI_RAC_RAC_ACTION_MENU_ITEMS_H_
+--- /dev/null
++++ b/chrome/browser/ui/rac/rac_action_menu_items.mm
+@@ -0,0 +1,81 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#import "chrome/browser/ui/rac/rac_action_menu_items.h"
++
++#import <Cocoa/Cocoa.h>
++
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/rac/actions/rac_actions.h"
++#include "ui/base/l10n/l10n_util.h"
++#import "ui/base/l10n/l10n_util_mac.h"
++
++namespace rac::action_table {
++namespace {
++
++// The menu a kMenu row lands in. The Spaces menu has no tag; find it by an
++// item it always contains.
++NSMenu* MenuForActionMenu(NSMenu* main_menu, Menu menu) {
++  int tag;
++  switch (menu) {
++    case Menu::kFile:
++      tag = IDC_FILE_MENU;
++      break;
++    case Menu::kEdit:
++      tag = IDC_EDIT_MENU;
++      break;
++    case Menu::kView:
++      tag = IDC_VIEW_MENU;
++      break;
++    case Menu::kTab:
++      tag = IDC_TAB_MENU;
++      break;
++    case Menu::kWindow:
++      tag = IDC_WINDOW_MENU;
++      break;
++    case Menu::kSpaces:
++      for (NSMenuItem* item in main_menu.itemArray) {
++        if ([item.submenu itemWithTag:IDC_RAC_NEW_SPACE]) {
++          return item.submenu;
++        }
++      }
++      return nil;
++    case Menu::kNone:
++      return nil;
++  }
++  return [main_menu itemWithTag:tag].submenu;
++}
++
++}  // namespace
++
++void InsertActionMenuItems(NSMenu* main_menu) {
++  for (const Action& action : All()) {
++    if (!action.surfaces.Has(Surface::kMenu) || !action.command_id) {
++      continue;
++    }
++    // TODO(core-table): the menu is built before any profile loads, so a
++    // row gated by a pref can't be placed yet. Place or hide these rows
++    // once the last-used profile loads.
++    if (!action.shortcut_pref.empty()) {
++      continue;
++    }
++    const int label_id =
++        action.menu_label_id ? action.menu_label_id : action.label_id;
++    NSMenu* menu = MenuForActionMenu(main_menu, action.menu);
++    if (!label_id || !menu) {
++      continue;
++    }
++    NSMenuItem* item = [[NSMenuItem alloc]
++        initWithTitle:l10n_util::GetNSStringWithFixup(label_id)
++               action:@selector(commandDispatch:)
++        keyEquivalent:@""];
++    item.tag = action.command_id;
++    const NSInteger after = action.menu_after
++                                ? [menu indexOfItemWithTag:action.menu_after]
++                                : NSNotFound;
++    [menu insertItem:item
++             atIndex:(after != NSNotFound) ? after + 1 : menu.numberOfItems];
++  }
++}
++
++}  // namespace rac::action_table
+--- /dev/null
++++ b/chrome/browser/rac/actions/rac_action_handler_ids.cc
+@@ -0,0 +1,22 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/actions/rac_action_handler_ids.h"
++
++#include <array>
++
++namespace rac::action_table {
++
++base::span<const std::string_view> HandledActionIds() {
++  // One entry per Dispatch::kBrowser row that has a handler in
++  // chrome/browser/ui/rac/rac_action_handlers.cc. With entries this reads
++  //
++  //     std::array{"open_command_bar"}
++  //
++  // Empty today (the table has no kBrowser rows yet), but the coverage test
++  // iterates the table either way.
++  static constexpr std::array<std::string_view, 0> kIds{};
++  return kIds;
++}
++
++}  // namespace rac::action_table
+--- /dev/null
++++ b/chrome/browser/rac/actions/rac_action_handler_ids.h
+@@ -0,0 +1,22 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_ACTIONS_RAC_ACTION_HANDLER_IDS_H_
++#define CHROME_BROWSER_RAC_ACTIONS_RAC_ACTION_HANDLER_IDS_H_
++
++#include <string_view>
++
++#include "base/containers/span.h"
++
++namespace rac::action_table {
++
++// The ids of the Dispatch::kBrowser rows that have a handler in
++// chrome/browser/ui/rac/rac_action_handlers.cc. The list is browser-free
++// (base only) so the coverage test links without //chrome/browser/ui.
++// rac_action_handlers.cc CHECKs its handler map against this list on first
++// use, so the two files can't drift.
++base::span<const std::string_view> HandledActionIds();
++
++}  // namespace rac::action_table
++
++#endif  // CHROME_BROWSER_RAC_ACTIONS_RAC_ACTION_HANDLER_IDS_H_
+--- /dev/null
++++ b/chrome/browser/ui/rac/rac_action_handler_ids_unittest.cc
+@@ -0,0 +1,47 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/actions/rac_action_handler_ids.h"
++
++#include <algorithm>
++#include <string_view>
++#include <vector>
++
++#include "chrome/browser/rac/actions/rac_actions.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::action_table {
++namespace {
++
++// The coverage guarantee, testable without the browser: every kBrowser row
++// names a handler id, and rac_action_handlers.cc CHECKs on first use that its
++// handler map names exactly these ids. The handlers themselves need the
++// browser (BrowserWindowInterface, profiles, tab strips) and stay in
++// //chrome/browser/ui, untested here.
++TEST(RacActionHandlerIdsTest, EveryBrowserRowHasAHandler) {
++  for (const Action& action : All()) {
++    if (action.dispatch == Dispatch::kBrowser) {
++      EXPECT_TRUE(std::ranges::contains(HandledActionIds(), action.id))
++          << "kBrowser row without a handler: " << action.id;
++    }
++  }
++}
++
++TEST(RacActionHandlerIdsTest, EveryHandledIdIsABrowserRow) {
++  for (std::string_view id : HandledActionIds()) {
++    const Action* action = Find(id);
++    ASSERT_TRUE(action) << "handled id with no table row: " << id;
++    EXPECT_EQ(action->dispatch, Dispatch::kBrowser)
++        << "handled id is not a kBrowser row: " << id;
++  }
++}
++
++TEST(RacActionHandlerIdsTest, NoDuplicateIds) {
++  std::vector<std::string_view> ids(HandledActionIds().begin(),
++                                    HandledActionIds().end());
++  std::ranges::sort(ids);
++  EXPECT_EQ(std::ranges::adjacent_find(ids), ids.end());
++}
++
++}  // namespace
++}  // namespace rac::action_table
