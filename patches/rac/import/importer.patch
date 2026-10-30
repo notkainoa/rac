@@ -210,7 +210,7 @@
 +#endif  // CHROME_BROWSER_UI_RAC_IMPORT_ARC_DEV_TRIGGER_H_
 --- /dev/null
 +++ b/chrome/browser/ui/rac/import/arc_importer.cc
-@@ -0,0 +1,1860 @@
+@@ -0,0 +1,1909 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -253,6 +253,8 @@
 +#include "chrome/browser/importer/profile_writer.h"
 +#include "chrome/browser/profiles/keep_alive/profile_keep_alive_types.h"
 +#include "chrome/browser/profiles/keep_alive/scoped_profile_keep_alive.h"
++#include "chrome/browser/profiles/profile_attributes_entry.h"
++#include "chrome/browser/profiles/profile_attributes_storage.h"
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/profiles/profile_manager.h"
 +#include "chrome/browser/profiles/profile_observer.h"
@@ -485,7 +487,19 @@
 +struct Removal {
 +  base::flat_set<std::string> removed;
 +  bool partial = false;
++  // The spaces that stayed, in sidebar order, as the sidebar names them.
++  std::vector<std::u16string> kept_space_names;
 +};
++
++// The profile's name in the profile list, or nothing if the list doesn't
++// have it.
++std::u16string ProfileDisplayName(Profile* profile) {
++  const ProfileAttributesEntry* entry =
++      g_browser_process->profile_manager()
++          ->GetProfileAttributesStorage()
++          .GetProfileAttributesWithPath(profile->GetPath());
++  return entry ? entry->GetName() : std::u16string();
++}
 +
 +// The top-level entries of `list`, as PlanKeptPins() reads them.
 +std::vector<ArcUndoPinEntry> PinEntries(const SidebarList& list) {
@@ -684,6 +698,21 @@
 +      s.items->GetList(SidebarItems::PinnedListKey(*created))
 +          .entries.empty()) {
 +    s.windows->DeleteSpace(*created);
++  }
++
++  // Name the spaces that stayed the way the sidebar does: the space's name,
++  // or rac's "Space <position>" (1-based, switcher order) if it has none.
++  const std::vector<Space>& all_spaces = s.spaces->spaces();
++  for (size_t i = 0; i < all_spaces.size(); ++i) {
++    if (!std::ranges::contains(
++            kept_spaces, SidebarItems::PinnedListKey(all_spaces[i].id))) {
++      continue;
++    }
++    result.kept_space_names.push_back(
++        all_spaces[i].name.empty()
++            ? l10n_util::GetStringFUTF16(IDS_RAC_SPACE_FALLBACK_NAME,
++                                         base::NumberToString16(i + 1))
++            : base::UTF8ToUTF16(all_spaces[i].name));
 +  }
 +
 +  // Everything in a space that stayed is left as it is.
@@ -1680,7 +1709,7 @@
 +// Undo in one profile. `run_id` empty: this profile's newest undoable run.
 +class ArcProfileUndo : public ProfileObserver {
 + public:
-+  using Done = base::OnceCallback<void(ArcUndoResult,
++  using Done = base::OnceCallback<void(ArcUndoOutcome,
 +                                       const ArcImportRecord::Run* run)>;
 +
 +  static void Start(Profile* profile, std::string run_id, Done done) {
@@ -1763,6 +1792,7 @@
 +    if (run != newest) {
 +      // A newer import into this profile may have added to what this run
 +      // made; it has to be undone here first.
++      outcome_.blocked_profiles.push_back(ProfileDisplayName(profile_));
 +      Finish(ArcUndoResult::kPartlyUndone);
 +      return;
 +    }
@@ -1814,6 +1844,7 @@
 +    const Removal removal =
 +        RemoveRun(services_, record_, run_, std::move(blank));
 +    partial_ = removal.partial;
++    outcome_.kept_spaces = removal.kept_space_names;
 +    record_.ForgetRemoved(run_.id, removal.removed, base::Time::Now());
 +    operation_->MarkDataChanged();
 +    WriteRecord();
@@ -1853,7 +1884,14 @@
 +
 +  void Finish(ArcUndoResult result) {
 +    operation_.reset();
-+    std::move(done_).Run(result, run_.id.empty() ? nullptr : &run_);
++    outcome_.result = result;
++    // The lists say what stayed, and only a partly undone import has any.
++    if (result != ArcUndoResult::kPartlyUndone) {
++      outcome_.kept_spaces.clear();
++      outcome_.blocked_profiles.clear();
++    }
++    std::move(done_).Run(std::move(outcome_),
++                         run_.id.empty() ? nullptr : &run_);
 +    delete this;
 +  }
 +
@@ -1866,6 +1904,7 @@
 +  ArcImportRecord record_;
 +  ArcImportRecord::Run run_;
 +  bool partial_ = false;
++  ArcUndoOutcome outcome_;
 +  base::ScopedObservation<Profile, ProfileObserver> profile_observation_{this};
 +  base::WeakPtrFactory<ArcProfileUndo> weak_factory_{this};
 +};
@@ -1875,7 +1914,7 @@
 +class ArcUndoCoordinator {
 + public:
 +  static void Start(Profile* profile,
-+                    base::OnceCallback<void(ArcUndoResult)> done) {
++                    base::OnceCallback<void(ArcUndoOutcome)> done) {
 +    auto* self = new ArcUndoCoordinator(profile->GetPath(), std::move(done));
 +    ArcProfileUndo::Start(
 +        profile, std::string(),
@@ -1885,13 +1924,13 @@
 +
 + private:
 +  ArcUndoCoordinator(base::FilePath origin_path,
-+                     base::OnceCallback<void(ArcUndoResult)> done)
++                     base::OnceCallback<void(ArcUndoOutcome)> done)
 +      : user_data_dir_(origin_path.DirName()), done_(std::move(done)) {}
 +
-+  void OnOriginDone(ArcUndoResult result, const ArcImportRecord::Run* run) {
-+    result_ = result;
-+    if (!run || (result != ArcUndoResult::kUndone &&
-+                 result != ArcUndoResult::kPartlyUndone)) {
++  void OnOriginDone(ArcUndoOutcome outcome, const ArcImportRecord::Run* run) {
++    outcome_ = std::move(outcome);
++    if (!run || (outcome_.result != ArcUndoResult::kUndone &&
++                 outcome_.result != ArcUndoResult::kPartlyUndone)) {
 +      Finish();
 +      return;
 +    }
@@ -1940,12 +1979,20 @@
 +    ArcProfileUndo::Start(
 +        profile, run_id_,
 +        base::BindOnce(
-+            [](ArcUndoCoordinator* self, ArcUndoResult result,
++            [](ArcUndoCoordinator* self, ArcUndoOutcome outcome,
 +               const ArcImportRecord::Run*) {
-+              if (result == ArcUndoResult::kPartlyUndone ||
-+                  result == ArcUndoResult::kFailed ||
-+                  result == ArcUndoResult::kBusy) {
-+                self->result_ = ArcUndoResult::kPartlyUndone;
++              if (outcome.result == ArcUndoResult::kPartlyUndone ||
++                  outcome.result == ArcUndoResult::kFailed ||
++                  outcome.result == ArcUndoResult::kBusy) {
++                self->outcome_.result = ArcUndoResult::kPartlyUndone;
++                // After the starting profile's, in the order the profiles
++                // were undone.
++                for (std::u16string& name : outcome.kept_spaces) {
++                  self->outcome_.kept_spaces.push_back(std::move(name));
++                }
++                for (std::u16string& name : outcome.blocked_profiles) {
++                  self->outcome_.blocked_profiles.push_back(std::move(name));
++                }
 +              }
 +              self->keep_alive_.reset();
 +              self->Next();
@@ -1955,13 +2002,13 @@
 +
 +  void Finish() {
 +    keep_alive_.reset();
-+    std::move(done_).Run(result_);
++    std::move(done_).Run(std::move(outcome_));
 +    delete this;
 +  }
 +
 +  const base::FilePath user_data_dir_;
-+  base::OnceCallback<void(ArcUndoResult)> done_;
-+  ArcUndoResult result_ = ArcUndoResult::kFailed;
++  base::OnceCallback<void(ArcUndoOutcome)> done_;
++  ArcUndoOutcome outcome_;
 +  std::string run_id_;
 +  std::vector<std::string> others_;
 +  // Keeps the profile being undone alive until its Undo finishes.
@@ -2038,11 +2085,13 @@
 +}
 +
 +void UndoArcImport(Profile* profile,
-+                   base::OnceCallback<void(ArcUndoResult)> done) {
++                   base::OnceCallback<void(ArcUndoOutcome)> done) {
 +  CHECK(profile);
 +  if (profile->IsOffTheRecord()) {
++    ArcUndoOutcome outcome;
++    outcome.result = ArcUndoResult::kFailed;
 +    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
-+        FROM_HERE, base::BindOnce(std::move(done), ArcUndoResult::kFailed));
++        FROM_HERE, base::BindOnce(std::move(done), std::move(outcome)));
 +    return;
 +  }
 +  ArcUndoCoordinator::Start(profile, std::move(done));
@@ -2073,7 +2122,7 @@
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/ui/rac/import/arc_importer.h
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,154 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -2213,9 +2262,11 @@
 +// in place. The spaces it removes close their tabs, which stay in History.
 +// Things the user made since the import are kept; pins they added to an
 +// imported space move to a space that stays, or stay where they are if a
-+// page keeps that space open (kPartlyUndone).
++// page keeps that space open (kPartlyUndone). `done` also says which spaces
++// stayed and which profiles still have a newer import to undo
++// (ArcUndoOutcome).
 +void UndoArcImport(Profile* profile,
-+                   base::OnceCallback<void(ArcUndoResult)> done);
++                   base::OnceCallback<void(ArcUndoOutcome)> done);
 +
 +// What the sidebar calls an imported space: its name, or rac's own
 +// "Space <position>" (1-based, switcher order) if Arc had none.
