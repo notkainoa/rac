@@ -1476,6 +1476,28 @@ class RunTest(RemoteBuildTest):
         written = (self.clone / 'build/req/req.txt').read_text()
         self.assertNotIn('pages', written)
 
+    def test_run_import_arc_now_needs_a_source_root(self):
+        # Without --rac-import-source-root the dev import reads the Pro's
+        # real Arc, and an Arc fixture file is not a source root.
+        write(self.clone / 'devutils/fixtures/arc/StorableSidebar.json', '{}\n')
+        (self.clone / 'build/arc-root').mkdir(parents=True)
+        for extra in ([], ['--rac-arc-import-fixture=devutils/fixtures/arc/StorableSidebar.json']):
+            result = self.run_rb('run', self.wt, '--', '--no-first-run',
+                                 '--rac-import-arc-now', *extra, success=False)
+            self.assertEqual(result.returncode, 2, extra)
+            self.assertIn('real Arc', result.stderr, extra)
+        for bad in ('--rac-import-arc-now=1', '--rac-import-arc-now=',
+                    '-rac-import-arc-now', '--RAC-IMPORT-ARC-NOW'):
+            result = self.run_rb('run', self.wt, '--',
+                                 '--rac-import-source-root=build/arc-root', bad,
+                                 success=False)
+            self.assertEqual(result.returncode, 2, bad)
+        self.assertEqual(self.calls(), '')
+        self.run_rb('run', self.wt, '--timeout', '3', '--', '--no-first-run',
+                    '--rac-import-source-root=build/arc-root',
+                    '--rac-import-arc-now', success=True)
+        self.assertIn('--rac-import-arc-now', self.calls())
+
     def test_run_refuses_a_malformed_allowed_hosts_list(self):
         req = self.folder / 'req.txt'
         write(req, 'key tab\n')

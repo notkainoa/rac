@@ -19,8 +19,10 @@
 #                                     F is a screenshot-requests line on the
 #                                     Air, checked by remote_requests.py. After
 #                                     --, args are a fixed allowlist:
-#                                     --no-first-run and
-#                                     --rac-launch-in-background,
+#                                     --no-first-run,
+#                                     --rac-launch-in-background and
+#                                     --rac-import-arc-now (only with
+#                                     --rac-import-source-root=),
 #                                     --rac-window-screenshot=<path> (a shot
 #                                     under the clone's build/shots) and
 #                                     --rac-window-screenshot-delay=<1-4
@@ -1024,7 +1026,8 @@ check_run_arg() {
       refuse "run args may not touch a real profile folder ($arg)" ;;
   esac
   case "$arg" in
-    --no-first-run | --rac-launch-in-background) return 0 ;;
+    --no-first-run | --rac-launch-in-background | --rac-import-arc-now)
+      return 0 ;;
     --rac-window-screenshot=?* | --rac-arc-import-fixture=?* | \
       --rac-import-source-root=?*)
       value=${arg#*=} ;;
@@ -1066,7 +1069,7 @@ check_run_arg() {
 
 cmd_run() {
   local name=$1 timeout=90 requests='' outputs='' fresh=0 checked
-  local req_pages='' import_input=0 setup_page=0
+  local req_pages='' import_input=0 setup_page=0 source_root=0 arc_now=0
   shift
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1100,7 +1103,9 @@ cmd_run() {
   for arg in "$@"; do
     check_run_arg "$arg"
     case "$arg" in
-      --rac-arc-import-fixture=* | --rac-import-source-root=*) import_input=1 ;;
+      --rac-arc-import-fixture=*) import_input=1 ;;
+      --rac-import-source-root=*) import_input=1; source_root=1 ;;
+      --rac-import-arc-now) arc_now=1 ;;
     esac
     lower=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
     case "$lower" in
@@ -1119,6 +1124,11 @@ cmd_run() {
   # the same run it would read the maintainer's real Arc data.
   if [ "$setup_page" = 1 ] && [ "$import_input" = 0 ]; then
     refuse "opening chrome://setup needs --rac-arc-import-fixture= or --rac-import-source-root= in the same run, so the import screen reads a fixture, not the Pro's real Arc data"
+  fi
+  # --rac-import-arc-now imports at startup from --rac-import-source-root,
+  # and from the maintainer's real Arc when that switch is missing.
+  if [ "$arc_now" = 1 ] && [ "$source_root" = 0 ]; then
+    refuse "--rac-import-arc-now needs --rac-import-source-root= in the same run, or it imports the Pro's real Arc data"
   fi
   remote "$name" "$timeout" "$queue_wait" "$requests" "$outputs" "$fresh" "$@" <<'EOS'
 set -e
