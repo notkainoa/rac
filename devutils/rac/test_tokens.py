@@ -112,6 +112,8 @@ class ParseTest(unittest.TestCase):
             'constexpr int kRadius4 = 4;',
             'inline constexpr int kRadius4 = 4;\ninline constexpr int kRadius4 = 4;',
             'inline constexpr int kRadius4 = 4',
+            'inline constexpr base::TimeDelta kLoopStep = base::Hertz(0);',
+            '// rac-css: --rac-radius-pill = 9999px\ninline constexpr int kRadius4 = 4;',
         ]
         for body in bad:
             with self.subTest(body=body), self.assertRaises(tokens.TokenError):
@@ -174,7 +176,8 @@ class SpringTest(unittest.TestCase):
                                    places=6)
 
     def test_settle_matches_plan_two(self):
-        # Plan 02: within 1% at 264 ms (page) and 192 ms (reveal), to the ms.
+        # Plan 02: within 1% at 264.1 ms (page) and 192.8 ms (reveal); this
+        # rounds up to the next whole ms.
         self.assertEqual(tokens.spring_settle_ms(0.25, 1.0, 0.01), 265)
         self.assertEqual(tokens.spring_settle_ms(0.185, 0.77, 0.01), 193)
 
@@ -261,6 +264,14 @@ class CommandTest(unittest.TestCase):
         root = str(self.folder / 'patches')
         self.assertEqual(self.run_tokens('--check', '--patches', root).returncode, 0)
         self.assertEqual(self.run_tokens('--patches', root).returncode, 1)
+
+        # A later patch that edits the header can't be checked from patches.
+        (patches / 'zz-edit.patch').write_text(
+            f'--- a/{tokens.HEADER.as_posix()}\n+++ b/{tokens.HEADER.as_posix()}\n'
+            '@@ -1,1 +1,1 @@\n-x\n+y\n')
+        result = self.run_tokens('--check', '--patches', root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('zz-edit.patch edits', result.stderr)
 
 
 class RepositoryTest(unittest.TestCase):
