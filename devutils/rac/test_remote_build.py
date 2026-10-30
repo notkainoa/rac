@@ -539,7 +539,7 @@ class BuildTest(RemoteBuildTest):
         self.assertIn('nice -n 10', calls)
         self.assertIn('taskpolicy -c utility', calls)
         self.assertIn('queue bash -c', calls)
-        self.assertIn('autoninja -C out/Default chrome chromedriver -local_jobs=14',
+        self.assertIn('autoninja -C out/Default chrome chromedriver -local_jobs=14 -k 0',
                       result.stdout)
 
     def test_build_with_targets(self):

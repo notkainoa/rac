@@ -132,7 +132,8 @@ left free, `run -- --rac-window-screenshot=x.png` to launch it in the
 background with its own profile (the shot lands in the clone's
 `build/shots/`), and `pull` files back. `run` refuses arguments with
 absolute paths, `..`, or a profile folder, and stops only processes from
-the clone's own app.
+the clone's own app. Nobody builds rac natively on the Pro: every build
+there goes through `remote-build.sh`.
 
 ## Updating the base
 

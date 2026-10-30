@@ -414,7 +414,7 @@ exec nice -n 10 taskpolicy -c utility devutils/rac/build-queue.sh \
   bash -c 'cd "$1" && shift && exec "$@"' rac-build "$src" \
   env "SISO_PATH=$src/third_party/siso/cipd/siso" "DEVELOPER_DIR=$xcode" \
   python3 third_party/depot_tools/autoninja.py -C out/Default \
-  "${targets[@]}" "-local_jobs=$jobs"
+  "${targets[@]}" "-local_jobs=$jobs" -k 0
 EOS
 }
 
