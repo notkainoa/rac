@@ -54,7 +54,7 @@ and favorites, and keeps the import record. No profile or browser state.
  }
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_import_mapping.cc
-@@ -0,0 +1,798 @@
+@@ -0,0 +1,829 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -852,10 +852,41 @@ and favorites, and keeps the import record. No profile or browser state.
 +  return kept;
 +}
 +
++ArcUndoSpaces::ArcUndoSpaces() = default;
++ArcUndoSpaces::ArcUndoSpaces(const ArcUndoSpaces&) = default;
++ArcUndoSpaces& ArcUndoSpaces::operator=(const ArcUndoSpaces&) = default;
++ArcUndoSpaces::~ArcUndoSpaces() = default;
++
++ArcUndoSpaces PlanUndoSpaces(const std::vector<std::string>& profile_spaces,
++                             const std::vector<std::string>& run_spaces,
++                             const std::string& blank_space) {
++  ArcUndoSpaces plan;
++  std::vector<std::string> spaces = profile_spaces;
++  if (!blank_space.empty() && !std::ranges::contains(spaces, blank_space)) {
++    plan.restore_blank = true;
++    spaces.insert(spaces.begin(), blank_space);
++  }
++  plan.create_space =
++      std::ranges::all_of(spaces, [&](const std::string& space) {
++        return std::ranges::contains(run_spaces, space);
++      });
++  if (!blank_space.empty()) {
++    plan.target_space = blank_space;
++    return plan;
++  }
++  for (const std::string& space : spaces) {
++    if (!std::ranges::contains(run_spaces, space)) {
++      plan.target_space = space;
++      break;
++    }
++  }
++  return plan;
++}
++
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_import_mapping.h
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,354 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -906,7 +937,8 @@ and favorites, and keeps the import record. No profile or browser state.
 +// - A rerun skips everything the import record maps, wherever it is now.
 +//   New Arc items in a mapped space are appended to it; new tabs in a mapped
 +//   folder are appended to that folder. Items whose rac space or folder the
-+//   user deleted aren't brought back.
++//   user deleted aren't brought back, and neither are pins or favorites the
++//   user deleted: a rerun adds only what's new in Arc.
 +
 +namespace rac {
 +
@@ -1177,6 +1209,34 @@ and favorites, and keeps the import record. No profile or browser state.
 +std::vector<ArcKeptPin> PlanKeptPins(
 +    const std::vector<ArcUndoPinEntry>& entries,
 +    const base::flat_set<std::string>& run_ids);
++
++// Which spaces Undo works with before it deletes a run's spaces.
++struct ArcUndoSpaces {
++  ArcUndoSpaces();
++  ArcUndoSpaces(const ArcUndoSpaces&);
++  ArcUndoSpaces& operator=(const ArcUndoSpaces&);
++  ~ArcUndoSpaces();
++
++  // Put back the blank space the run replaced, at the front. Not when it's
++  // already there: on a retry after a partial Undo the first try put it
++  // back, and it stays as the user has had it since, rather than being
++  // overwritten by the snapshot's copy.
++  bool restore_blank = false;
++  // Make a new space first: every space left is the run's, and deleting
++  // them all would leave none.
++  bool create_space = false;
++  // Where the user's own pins in a run space go: the blank space if the run
++  // replaced one, else the first space the run didn't make. Empty with
++  // `create_space`: the new space.
++  std::string target_space;
++};
++
++// `profile_spaces` are the profile's spaces in switcher order and
++// `run_spaces` the run's, as lowercase ids; `blank_space` is the run's
++// replaced blank space, or empty.
++ArcUndoSpaces PlanUndoSpaces(const std::vector<std::string>& profile_spaces,
++                             const std::vector<std::string>& run_spaces,
++                             const std::string& blank_space);
 +
 +}  // namespace rac
 +
@@ -2904,7 +2964,7 @@ and favorites, and keeps the import record. No profile or browser state.
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_import_record.cc
-@@ -0,0 +1,623 @@
+@@ -0,0 +1,645 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -3354,6 +3414,28 @@ and favorites, and keeps the import record. No profile or browser state.
 +  items_.clear();
 +}
 +
++bool ArcImportRecord::UnmapItem(std::string_view arc_id,
++                                std::string_view run_id) {
++  auto it = items_.find(arc_id);
++  if (it == items_.end() || it->second.run_id != run_id) {
++    return false;
++  }
++  items_.erase(it);
++  return true;
++}
++
++bool ArcImportRecord::RemapItem(std::string_view run_id,
++                                std::string_view old_rac_id,
++                                std::string new_rac_id) {
++  for (auto& [arc_id, mapping] : items_) {
++    if (mapping.run_id == run_id && mapping.rac_id == old_rac_id) {
++      mapping.rac_id = std::move(new_rac_id);
++      return true;
++    }
++  }
++  return false;
++}
++
 +bool ArcImportRecord::IsStale(
 +    const base::flat_set<std::string>& live_space_ids,
 +    const base::flat_set<std::string>& live_sidebar_ids) const {
@@ -3530,7 +3612,7 @@ and favorites, and keeps the import record. No profile or browser state.
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_import_record.h
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,276 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -3581,8 +3663,9 @@ and favorites, and keeps the import record. No profile or browser state.
 +//     "pinned_extensions": ["<extension id>"] }
 +//
 +// Times use base::TimeToValue. Top-level keys this build doesn't know are
-+// kept and written back; unknown keys inside an entry are not. Pure: reading and writing are blocking file calls, made on a
-+// MayBlock sequence by the applier.
++// kept and written back; unknown keys inside an entry are not. Pure: reading
++// and writing are blocking file calls, made on a MayBlock sequence by the
++// applier.
 +class ArcImportRecord {
 + public:
 +  // The newest format this build writes, and the oldest build that can read
@@ -3705,6 +3788,18 @@ and favorites, and keeps the import record. No profile or browser state.
 +               std::string run_id);
 +  bool has_mappings() const { return !spaces_.empty() || !items_.empty(); }
 +  void ClearMappings();
++  // Forgets `arc_id`'s mapping if `run_id` made it. For an item the run
++  // mapped but couldn't add, such as one whose id the sidebar already has:
++  // that id is live, so FinishInterrupted() would keep it. Returns whether
++  // a mapping was forgotten.
++  bool UnmapItem(std::string_view arc_id, std::string_view run_id);
++  // Points `run_id`'s item mapped to `old_rac_id` at `new_rac_id` instead.
++  // For a folder of the run that Undo made again under a new id, holding
++  // the user's own pins, so a later Undo of the run still finds it. Returns
++  // whether a mapping changed.
++  bool RemapItem(std::string_view run_id,
++                 std::string_view old_rac_id,
++                 std::string new_rac_id);
 +
 +  // True when the record maps something but none of it is in the profile
 +  // any more: `Preferences` was reset and not restored, or the user removed
@@ -3796,7 +3891,7 @@ and favorites, and keeps the import record. No profile or browser state.
 +#endif  // CHROME_BROWSER_RAC_IMPORT_ARC_IMPORT_RECORD_H_
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_import_record_unittest.cc
-@@ -0,0 +1,1293 @@
+@@ -0,0 +1,1356 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -5086,6 +5181,69 @@ and favorites, and keeps the import record. No profile or browser state.
 +  ASSERT_TRUE(WriteText(ArcImportRecord::PathFor(profile), text));
 +
 +  EXPECT_EQ(ArcImportRecord::Read(profile).status, ReadStatus::kOk);
++}
++
++// An item the run couldn't add because its id was taken: that id is live,
++// so FinishInterrupted() would keep the mapping, and Undo would remove the
++// other item. UnmapItem() forgets it, and only for the run that made it.
++TEST(ArcImportRecordTest, UnmapItemForgetsOnlyThatRunsMapping) {
++  ArcImportRecord record;
++  ImportRun run = MakeRun("now", 2000);
++  run.in_progress = true;
++  record.AddRun(run);
++  record.MapItem("taken", "someone-elses-id", ItemKind::kPinnedTab, "now");
++  record.MapItem("added", "pin-1", ItemKind::kPinnedTab, "now");
++  record.MapItem("older", "pin-0", ItemKind::kPinnedTab, "before");
++
++  EXPECT_FALSE(record.UnmapItem("older", "now"));
++  EXPECT_FALSE(record.UnmapItem("missing", "now"));
++  EXPECT_TRUE(record.UnmapItem("taken", "now"));
++  EXPECT_FALSE(record.FindItem("taken"));
++  EXPECT_TRUE(record.FindItem("older"));
++
++  EXPECT_EQ(record.FinishInterrupted({}, {"someone-elses-id", "pin-1"}),
++            ArcImportRecord::Interrupted::kFinished);
++  EXPECT_THAT(record.ItemsOfRun("now", ItemKind::kPinnedTab),
++              ElementsAre("pin-1"));
++}
++
++// Undo deleted a space the run made, and moved a folder of the run that
++// held the user's own pins out of it under a new id. The record follows the
++// folder, so the run's Undo still finds it, and once the user empties it a
++// later Undo takes it out and ends the run.
++TEST(ArcImportRecordTest, RemapItemFollowsAFolderUndoMoved) {
++  ArcImportRecord record;
++  record.AddRun(MakeRun("run", 1000));
++  record.MapSpace("arc-space", "space-1", "run");
++  record.MapItem("arc-folder", "folder-1", ItemKind::kFolder, "run");
++  record.MapItem("arc-pin", "pin-1", ItemKind::kPinnedTab, "run");
++  // Another run with the same rac id isn't touched.
++  record.MapItem("other-folder", "folder-1", ItemKind::kFolder, "other");
++
++  EXPECT_FALSE(record.RemapItem("run", "no-such-id", "x"));
++  EXPECT_TRUE(record.RemapItem("run", "folder-1", "folder-copy"));
++  ASSERT_TRUE(record.FindItem("arc-folder"));
++  EXPECT_EQ(record.FindItem("arc-folder")->rac_id, "folder-copy");
++  EXPECT_EQ(record.FindItem("arc-folder")->kind, ItemKind::kFolder);
++  EXPECT_EQ(record.FindItem("other-folder")->rac_id, "folder-1");
++
++  // The first Undo: the space and the run's pin went; the old folder id
++  // reads as removed, and the copy stays, holding the user's pins.
++  record.ForgetRemoved("run", {"space-1", "pin-1", "folder-1"}, At(2000));
++  EXPECT_THAT(record.ItemsOfRun("run", ItemKind::kFolder),
++              ElementsAre("folder-copy"));
++  EXPECT_FALSE(record.FindRun("run")->undone);
++  ASSERT_TRUE(record.UndoableRun(At(2000)));
++
++  // Saved and read back, the new id holds.
++  ArcImportRecord parsed = ParseOk(record.Serialize());
++  ASSERT_TRUE(parsed.FindItem("arc-folder"));
++  EXPECT_EQ(parsed.FindItem("arc-folder")->rac_id, "folder-copy");
++
++  // A later Undo, once the copy is empty and removed.
++  parsed.ForgetRemoved("run", {"folder-copy"}, At(3000));
++  EXPECT_TRUE(parsed.FindRun("run")->undone);
++  EXPECT_FALSE(parsed.FindItem("arc-folder"));
 +}
 +
 +}  // namespace
