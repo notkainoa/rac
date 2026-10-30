@@ -18,10 +18,16 @@ usage: worktree_state.py <tree> <patches dir> <command>
   matches           exit 0 if the applied stack equals the series
   check <keep>      exit 1 if popping the patches above the first <keep>
                     would throw away edits that aren't saved in a patch
+  snapshot <keep>   record a hash and the mtime of every file the patches
+                    above the first <keep> touched, so restore can give the
+                    mtime back when a push writes the same bytes
+  restore           set the recorded mtime on each file whose content is
+                    unchanged, then delete the record
 """
 
 from pathlib import Path
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -29,6 +35,7 @@ import tempfile
 
 RECORD = '.rac_applied'
 SAVED = '.rac_patch_bytes'
+MTIMES = '.rac_mtimes.json'
 QUILT_PATCH_OPTS = '--unified --reject-format=unified'
 # How many committed versions of a patch check() tries before refusing.
 GIT_VERSIONS = 20
@@ -258,6 +265,115 @@ def check(tree, patches, keep):
             '  To throw the edits away instead, run: devutils/rac/worktree.sh sync --discard')
 
 
+def build_marker(tree):
+    """The mtimes a build updates, per output dir. If one changed between
+    snapshot and restore, a build ran in between: its outputs were made from
+    other content, so giving sources their old mtimes back would let siso
+    take stale outputs as up to date. gn gen alone counts too: build.ninja
+    made from a popped BUILD.gn would look newer than the restored file."""
+    marker = {}
+    for name in ('.siso_fs_state', '.ninja_log', 'build.ninja', 'build.ninja.stamp'):
+        for path in sorted((tree / 'out').glob(f'*/{name}')):
+            if path.is_file():
+                marker[path.relative_to(tree).as_posix()] = path.stat().st_mtime_ns
+    return marker
+
+
+def touched(tree, name):
+    """The files quilt saved before applying a patch, without reading them."""
+    folder = tree / '.pc' / name
+    return [
+        path.relative_to(folder).as_posix() for path in folder.rglob('*')
+        if path.is_file() and not path.is_symlink() and path.name != '.timestamp'
+    ]
+
+
+def snapshot(tree, keep):
+    """Records a hash and the mtime of every file the patches above `keep`
+    touched, so restore() can tell a rewrite of the same bytes from a real
+    change and give the old mtime back.
+
+    A record left by a sync that failed after its pop is kept, as long as no
+    build ran since: its files were rewritten by that pop, and the retry
+    pops less, so a fresh record alone would miss them. Its entries win over
+    the new ones, since they hold the tree from before that sync."""
+    marker = build_marker(tree)
+    pending = read_mtimes(tree)
+    files = {}
+    if pending is not None and pending['build'] == marker:
+        files = pending['files']
+    for name in applied(tree)[keep:]:
+        for file in touched(tree, name):
+            path = tree / file
+            if file not in files and path.is_file() and not path.is_symlink():
+                files[file] = {'mtime_ns': path.stat().st_mtime_ns,
+                               'sha256': file_digest(path)}
+    path = tree / '.pc' / MTIMES
+    temporary = path.with_name(MTIMES + '.tmp')
+    temporary.write_text(json.dumps({'build': marker, 'files': files},
+                                    indent=0, sort_keys=True))
+    temporary.replace(path)
+
+
+def read_mtimes(tree):
+    """The mtime record, checked like dev_names.py checks its backups: every
+    entry must be a plain relative path inside the tree with the right
+    fields. A malformed record is dropped with a warning."""
+    path = tree / '.pc' / MTIMES
+    if not path.exists():
+        return None
+    root = tree.resolve()
+    try:
+        record = json.loads(path.read_text())
+        files, build = record['files'], record['build']
+        if not isinstance(files, dict) or not isinstance(build, dict):
+            raise ValueError('expected {"files": {...}, "build": {...}}')
+        for name, entry in files.items():
+            if (not isinstance(name, str)
+                    or not (root / name).resolve().is_relative_to(root)):
+                raise ValueError(f'unexpected path: {name}')
+            if (not isinstance(entry, dict) or set(entry) != {'mtime_ns', 'sha256'}
+                    or not isinstance(entry['mtime_ns'], int)
+                    or not 0 <= entry['mtime_ns'] < 1 << 63
+                    or not isinstance(entry['sha256'], str)):
+                raise ValueError(f'unexpected entry for {name}')
+        if not all(isinstance(name, str) and isinstance(mtime, int)
+                   for name, mtime in build.items()):
+            raise ValueError('unexpected build marker')
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f'rac worktree: ignoring malformed {MTIMES}: {error}', file=sys.stderr)
+        path.unlink(missing_ok=True)
+        return None
+    return record
+
+
+def restore(tree):
+    """Gives the recorded mtime back to each file a pop and push left with
+    the same bytes, so mtime-based builds see no change. Runs after the push
+    while the name passes are still reverted, matching the state snapshot()
+    saw. The record is used once, then deleted."""
+    path = tree / '.pc' / MTIMES
+    record = read_mtimes(tree)
+    if record is None:
+        return
+    path.unlink()
+    if record['build'] != build_marker(tree):
+        print('rac worktree: the tree was built since the snapshot; '
+              'keeping the new mtimes', file=sys.stderr)
+        return
+    kept = changed = 0
+    for name, entry in record['files'].items():
+        target = tree / name
+        if (not target.is_file() or target.is_symlink()
+                or file_digest(target) != entry['sha256']):
+            changed += 1
+            continue
+        os.utime(target, ns=(target.stat().st_atime_ns, entry['mtime_ns']))
+        kept += 1
+    print(f'rac worktree: kept mtimes on {kept} unchanged files ({changed} changed)',
+          file=sys.stderr)
+
+
 def main():
     tree, patches, command = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
     if command == 'record':
@@ -268,6 +384,10 @@ def main():
         sys.exit(0 if series(patches) == applied(tree) else 1)
     elif command == 'check':
         check(tree, patches, int(sys.argv[4]))
+    elif command == 'snapshot':
+        snapshot(tree, int(sys.argv[4]))
+    elif command == 'restore':
+        restore(tree)
     else:
         sys.exit(__doc__)
 

@@ -123,6 +123,9 @@ cmd_sync() {
     log "popping $((applied - keep)) changed or removed patches"
     local target=-a
     [ "$keep" -eq 0 ] || target=$(sed -n "${keep}p" "$src/.pc/applied-patches")
+    # A pop and push rewrite files with the same bytes but new mtimes, which
+    # siso would rebuild; restore gives their old mtimes back below.
+    stack snapshot "$keep" || die "couldn't record file times"
     quilt_ pop -f -q "$target" >/dev/null || die "quilt pop failed; see the error above"
   fi
 
@@ -135,6 +138,10 @@ cmd_sync() {
   fi
 
   stack record
+  # The tree still has the upstream names, matching the state the snapshot
+  # was taken in. Runs even without a pop, in case a sync that failed after
+  # its pop left a record behind.
+  stack restore || die "couldn't restore file times"
   dev_names sub
   python3 "$root/devutils/rac/rac_version.py" -t "$src" || die "rac_version.py failed"
   log "patch stack is in sync ($(wc -l < "$src/.pc/applied-patches" | tr -d ' ') applied)"
