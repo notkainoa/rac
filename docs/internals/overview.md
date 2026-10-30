@@ -68,7 +68,7 @@ Install the requirements in [building.md](../building.md) first.
 
 ### Patch design for low-maintenance updates
 
-Chromium releases a new major version roughly every four weeks, and Helium
+Chromium releases a new major version every two weeks (since M153), and Helium
 follows quickly. Every rac patch has to be refreshed against each new release.
 To keep that cheap:
 

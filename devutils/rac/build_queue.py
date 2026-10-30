@@ -24,6 +24,14 @@ usage: devutils/rac/build-queue.sh [options] <command> [args...]
   --max-steps N       stop the build if it shows more than N steps
                       (default 20000)
   --allow-main        allow building in the main checkout
+  --pass-fds N[,N...] hands open file descriptors to the command, e.g.
+                      --pass-fds 3,4 for --remote-debugging-pipe. The fds
+                      must reach build-queue.sh itself as inheritable
+                      descriptors (subprocess.Popen(..., pass_fds=(r, w)),
+                      or bash `3<&$r 4>&$w`), since non-inheritable fds
+                      don't survive into the queue. The queue drops its
+                      own copies once the command starts, so the caller
+                      still sees EOF when the command closes its end.
 
 There are two build slots and two run slots. A slot is a directory under
 ~/.rac-build-queue holding holder.json and a lock file that its queue process
@@ -733,12 +741,21 @@ class Queue:
 
     def run_child(self):
         piped = self.pool == 'build'
+        # pass_fds hands the caller's descriptors (e.g. a debugging pipe)
+        # to the command. The queue's lock files stay out: os.open makes
+        # them non-inheritable.
         defer_signals()
         try:
             self.child = subprocess.Popen(
                 self.resolved, start_new_session=True,
                 stdout=subprocess.PIPE if piped else None,
-                stderr=subprocess.STDOUT if piped else None)
+                stderr=subprocess.STDOUT if piped else None,
+                pass_fds=self.args.pass_fds)
+            # The child has its own copies now; drop the queue's so a
+            # caller waiting on the other end sees EOF when the child
+            # closes them or exits, not only when this queue ends.
+            for fd in self.args.pass_fds:
+                os.close(fd)
             self.info['pgid'] = self.child.pid
             self.update_holders()
             if piped:
@@ -955,6 +972,26 @@ def show_log(lines):
     return 0
 
 
+def parse_pass_fds(text):
+    """Fd numbers from --pass-fds, checked against this process."""
+    fds = []
+    for token in text.split(','):
+        token = token.strip()
+        try:
+            fd = int(token)
+        except ValueError:
+            raise ValueError(f'{token!r} is not a file descriptor number')
+        if fd < 3:
+            raise ValueError(f'{fd} is a standard stream; pass fds 3 and above')
+        try:
+            os.fstat(fd)
+        except (OSError, OverflowError):
+            raise ValueError(f'{fd} is not open in this process')
+        if fd not in fds:
+            fds.append(fd)
+    return tuple(fds)
+
+
 def main(argv):
     parser = argparse.ArgumentParser(
         prog='build-queue.sh', usage=__doc__.split('\n\n')[2].removeprefix('usage: '),
@@ -964,6 +1001,7 @@ def main(argv):
     parser.add_argument('--priority', action='store_true')
     parser.add_argument('--max-steps', type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument('--allow-main', action='store_true')
+    parser.add_argument('--pass-fds', metavar='N[,N...]', default='')
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
 
@@ -980,6 +1018,10 @@ def main(argv):
         parser.error('--full needs a note naming the approval, e.g. "D6 item 2"')
     if args.max_steps <= 0:
         parser.error('--max-steps needs a positive number')
+    try:
+        args.pass_fds = parse_pass_fds(args.pass_fds) if args.pass_fds else ()
+    except ValueError as e:
+        parser.error(f'--pass-fds: {e}')
     if is_run_command(args.command):
         args.run = True
     if args.run and args.full is not None:

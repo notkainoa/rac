@@ -347,13 +347,22 @@ def extract_file(path, wanted, source, out_dir):
         return extract_tar(stream, wanted, source, out_dir)
 
 
+# tarballs.imput.net answers Python's default User-Agent with 403 Forbidden.
+USER_AGENT = 'rac-checks (+https://github.com/notkainoa/rac)'
+
+
+def open_url(url, timeout):
+    request = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
+    return urllib.request.urlopen(request, timeout=timeout)  # nosec: fixed https URLs
+
+
 def fetch_text(url):
-    with urllib.request.urlopen(url, timeout=60) as response:  # nosec: fixed https URLs
+    with open_url(url, timeout=60) as response:
         return response.read().decode('utf-8')
 
 
 def download(url, destination):
-    with urllib.request.urlopen(url, timeout=120) as response:  # nosec: fixed https URLs
+    with open_url(url, timeout=120) as response:
         with open(destination, 'wb') as sink:
             shutil.copyfileobj(response, sink, 1 << 20)
 

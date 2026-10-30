@@ -25,7 +25,8 @@ def get_asset_url(release, arch):
   for asset in release['assets']:
       if asset['name'].endswith(f'_{arch}-macos.dmg'):
         return asset['browser_download_url']
-  assert(False)
+  # rac releases may cover only some architectures (arm64 by default).
+  return None
 
 
 def get_historic_dmg_urls():
@@ -67,9 +68,13 @@ def do_diff(old_path, new_path, out_path):
 
 
 def generate_delta_for(version, urls, args):
+  made = 0
   for i, arch in enumerate(['arm64', 'x86_64']):
     if args[i] is None:
       print(f'skipping {arch}')
+      continue
+    if urls[i] is None:
+      print(f'skipping {arch} for {version}: that release has no {arch} disk image')
       continue
 
     with tempfile.NamedTemporaryFile(suffix='.dmg') as f:
@@ -80,11 +85,15 @@ def generate_delta_for(version, urls, args):
       with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
         with mount(f.name, d1), mount(args[i], d2):
           do_diff(d1 + '/rac.app', d2 + '/rac.app', f'{args[2]}/{version}-{arch}.delta')
+          made += 1
+  return made
 
 
 if __name__ == '__main__':
   args = parse_args()
   versions = get_historic_dmg_urls()
+  total = 0
   for version in versions:
     print(f'doing {version}')
-    generate_delta_for(version, versions[version], args)
+    total += generate_delta_for(version, versions[version], args)
+  print(f'made {total} deltas')

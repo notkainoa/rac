@@ -2,10 +2,38 @@
 
 rac is released from GitHub Actions with the **Build macOS binaries of
 Helium** workflow (`.github/workflows/build.yml`). It builds Apple Silicon
-by default (Intel or both are options), packages and signs each disk image,
+by default (Intel or both are options), signs and packages each disk image,
 writes the update feeds, and publishes a GitHub release. Installed copies
 of rac find the new version through that release. How updates work, and why,
 is in [internals/overview.md](../internals/overview.md#versions-and-updates).
+
+The build phases only compile. They run on the **Runner** input's machine
+and get no signing or notarization secrets; the phase that finishes uploads
+the unsigned app. A last `sign` job in `building.yml`, always on GitHub's
+own `macos-latest`, then:
+
+1. checks the binaries for rac's developer switches (the G6 gate, below);
+2. imports the certificate into a temporary keychain, which is deleted
+   when the job ends, even if it fails;
+3. signs, notarizes and staples the app, packages the disk image, then
+   signs, notarizes and staples the disk image too;
+4. mounts the disk image and checks it (`codesign --verify --deep
+   --strict`, `spctl` saying `Notarized Developer ID` for the app and the
+   disk image, `stapler validate`, the signing team, and no entitlement that
+   needs a provisioning profile it doesn't have). The mount has no
+   quarantine flag, so this doesn't replay a first launch from a browser;
+5. makes the update deltas.
+
+The release job also runs on GitHub's runner, because it holds the update
+signing key. So moving the compile to another provider never moves a key.
+Before it writes the update feeds, it runs the same disk image check on every
+downloaded image (notarized builds only), so an artifact swapped after the
+`sign` job isn't signed into a feed.
+
+The one thing a build phase learns about the entitlements profile is whether
+it exists: the `settings` job in `building.yml` turns that into a plain
+`true` or `false` for `RAC_BRANDED_ENTITLEMENTS`. The profile itself only
+reaches the `sign` job.
 
 ## One-time setup
 
@@ -31,12 +59,18 @@ is in [internals/overview.md](../internals/overview.md#versions-and-updates).
    `PROD_MACOS_CERTIFICATE_PWD`, `PROD_MACOS_CERTIFICATE_NAME`,
    `PROD_MACOS_CI_KEYCHAIN_PWD` (any new password),
    `PROD_MACOS_NOTARIZATION_APPLE_ID`, `PROD_MACOS_NOTARIZATION_TEAM_ID`, and
-   `PROD_MACOS_NOTARIZATION_PWD` (an app-specific password). Without them,
-   CI signs ad hoc, and macOS blocks the first launch of the downloaded app
-   until it's allowed in **System Settings > Privacy & Security**. Updates
-   still work, because Sparkle checks rac's own signature.
+   `PROD_MACOS_NOTARIZATION_PWD` (an app-specific password). Only the
+   `sign` job reads them. Without them, CI signs ad hoc, and macOS blocks
+   the first launch of the downloaded app until it's allowed in **System
+   Settings > Privacy & Security**. Updates still work, because Sparkle
+   checks rac's own signature.
    `PROD_MACOS_SPECIAL_ENTITLEMENTS_PROFILE_B64` (a base64 provisioning
-   profile) is optional; without it the build has no branded entitlements.
+   profile) is optional; without it the build has no branded entitlements,
+   so passkeys saved with Touch ID or in iCloud Keychain, and other features
+   that need keychain access groups, are unavailable.
+   Before adding it, set `MAC_TEAM_ID` in `rac/branding/identity.patch`
+   (it's empty), or the app claims an application identifier with no team
+   and won't launch. The `sign` job fails on that rather than ship it.
 
 Never change the signing key once rac is released. Builds only accept updates
 signed with the key they were built with.
@@ -74,6 +108,8 @@ download page is hidden and shows sample data.
    to build Intel too. A full build takes several hours per architecture. One
    architecture failing doesn't cancel the other. If a build phase can't
    download the previous phase's checkpoint, it retries twice before failing.
+   If only the `sign` job fails (a notarization timeout, say), use **Re-run
+   failed jobs**: the unsigned app is kept, so nothing is compiled again.
 3. When it finishes, check the new release. It should have a disk image and
    `appcast-<arch>.xml` for each architecture you built, and a `.delta` file
    from each of the last few releases (none on the first). A release only
@@ -88,8 +124,60 @@ Installed copies check the feed at launch and then hourly, download the update i
 the background, and install it when rac quits. The feed's address
 (`notkainoa/rac`) is built into rac, in `rac/updates/update-feed.patch`.
 
-Don't mark a release as a prerelease or a draft. GitHub's `latest` link
-skips them, so nobody would get the update.
+Don't mark a good release as a prerelease or a draft. GitHub's `latest`
+link skips them, so nobody would get the update. (Marking a bad one is the
+point of the next section.)
+
+## If a release is bad
+
+Whether a release is bad is the maintainer's call. An agent flips a release
+only on their word.
+
+1. Un-publish it fast. On GitHub, edit the bad release and mark it a
+   **pre-release**. `releases/latest` then points back at the previous
+   release, so no new install or update is offered the bad one. Copies that
+   already updated keep it.
+2. Never delete a published tag: installed copies may have updated to it,
+   and versions in `rac_version.txt` only go up. Fix forward instead —
+   raise the version and put out a higher release, within 48 hours when the
+   bad one breaks the browser.
+3. When the bad build can't launch at all, its users have to download rac
+   again by hand. Post a note on the release and on the site, both through
+   the maintainer.
+4. Afterwards, read the live feed (and `appcast-x86_64.xml` if you built
+   Intel) and confirm it names the release before the bad one:
+   ```sh
+   curl -fsSL https://github.com/notkainoa/rac/releases/latest/download/appcast-arm64.xml
+   ```
+   Copies already on the bad version ignore that feed, because Sparkle only
+   offers a higher version. They wait for the fix. Then rebuild the website
+   (see [The website](#the-website)), so its download page, which reads
+   `releases/latest`, stops showing the bad release.
+
+Before a release goes out, or when one looks wrong, run the **Release smoke
+tests** workflow (`.github/workflows/smoke.yml`) from **Actions > Release
+smoke tests > Run workflow**. Give it a build run's ID to test its
+disk-image artifact, or a release tag to test a published one. Add an
+earlier release tag to run the update check too, and tick **Require
+Gatekeeper approval** for signed and notarized builds. Each job uploads its
+summary and the window screenshot it captured as an artifact. The update
+check swaps the old app bundle for the new one, which proves profile
+carry-over and version ordering — it doesn't drive Sparkle's download and
+install, which stays the by-hand check under [Testing an update
+locally](#testing-an-update-locally).
+
+### The developer-switch gate (G6)
+
+Release builds must not contain rac's developer switches
+(`--rac-agent-debug`, `--rac-agent-mcp-echo`, `--rac-window-screenshot`,
+`--rac-launch-in-background`). Before signing, the `sign` job runs
+`.github/scripts/github_check_release_binary.sh`, which reads every Mach-O
+file in the app with `strings` and names each binary and match it finds.
+
+The workflow's **Developer switches (G6)** input decides what a match does:
+`warn` (the default) annotates the run and carries on; `enforce` fails the
+build. It stays `warn` until the switches are compiled only into dev builds;
+then change the input's default in `build.yml` to `enforce`.
 
 ## Testing an update locally
 
