@@ -11,7 +11,7 @@ become CSS linear() curves sampled from the same spring math as rac::Spring.
 
 By default both files are read from the build tree. Without one, use
 `--check --patches patches`: it reads both files from the rac patch that
-creates them, so a later patch that edits either file isn't seen.
+creates them, and fails if a later patch edits either one.
 
 usage: tokens.py [--check] [-t <build/src> | --patches <dir>]
                  [--header <file>] [--css <file>]
@@ -138,6 +138,9 @@ def statements(region):
         if css:
             css_lines.append(css.group('css'))
             continue
+        if 'rac-css:' in stripped:
+            raise TokenError('write a CSS-only line as `// rac-css: --rac-name: value;`, '
+                             f'not {stripped}')
         if stripped.startswith('//') and not current:
             comment.append(stripped[2:].strip())
             continue
@@ -173,6 +176,8 @@ def parse_duration(text, known):
     n = number(match.group('n'))
     unit = match.group('unit')
     if unit == 'Hertz':
+        if n != int(n) or n <= 0:
+            raise TokenError(f'not a whole, positive frequency: {text}')
         # base::Hertz divides whole microseconds, rounding down.
         return 1_000_000 // int(n)
     scale = {'Microseconds': 1, 'Milliseconds': 1000, 'Seconds': 1_000_000}[unit]
@@ -395,15 +400,24 @@ def render_css(items):
 
 
 def new_file_from_patches(patches, path):
-    """The contents of `path` as created by a patch under `patches`, or None."""
+    """The contents of `path` as created by a patch under `patches`, or None.
+
+    Fails if another patch edits the file, since only the creation is read.
+    """
     # quilt writes `b/` paths with rac's settings and `src/` without them.
     targets = tuple(f'+++ {prefix}/{path.as_posix()}' for prefix in ('b', 'src'))
+    created = None
     for patch in sorted(Path(patches).rglob('*.patch')):
         lines = patch.read_text(encoding='utf-8', errors='replace').splitlines()
         for i, line in enumerate(lines):
-            if (line.split('\t')[0] not in targets or i == 0 or
-                    not lines[i - 1].startswith('--- /dev/null')):
+            if line.split('\t')[0] not in targets:
                 continue
+            if i == 0 or not lines[i - 1].startswith('--- /dev/null'):
+                # Only the creating patch is read, so an edit would go unseen.
+                raise TokenError(f'{patch.name} edits {path}; check in a build tree '
+                                 'or fold the edit into the patch that creates it')
+            if created is not None:
+                raise TokenError(f'two patches create {path}')
             body = []
             for line_after in lines[i + 2:]:
                 if line_after.startswith('+'):
@@ -412,8 +426,8 @@ def new_file_from_patches(patches, path):
                     continue
                 else:
                     break
-            return '\n'.join(body) + '\n'
-    return None
+            created = '\n'.join(body) + '\n'
+    return created
 
 
 def main():
