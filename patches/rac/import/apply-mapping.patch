@@ -2,7 +2,7 @@ The pure half of the Arc import: maps an import plan onto spaces, pinned tabs,
 and favorites, and keeps the import record. No profile or browser state.
 --- a/chrome/browser/rac/import/BUILD.gn
 +++ b/chrome/browser/rac/import/BUILD.gn
-@@ -43,23 +43,49 @@
+@@ -46,23 +46,49 @@ source_set("arc_source") {
    ]
  }
  
@@ -54,7 +54,7 @@ and favorites, and keeps the import record. No profile or browser state.
  }
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_import_mapping.cc
-@@ -0,0 +1,654 @@
+@@ -0,0 +1,690 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -703,15 +703,51 @@ and favorites, and keeps the import record. No profile or browser state.
 +}
 +
 +bool IsImportableUrl(const GURL& url) {
-+  return url.is_valid() &&
-+         (url.SchemeIsHTTPOrHTTPS() || url.SchemeIsFile() ||
-+          url.SchemeIs("chrome"));
++  return url.is_valid() && (url.SchemeIsHTTPOrHTTPS() || url.SchemeIsFile() ||
++                            url.IsAboutBlank());
++}
++
++ArcUndoPinEntry::ArcUndoPinEntry() = default;
++ArcUndoPinEntry::ArcUndoPinEntry(const ArcUndoPinEntry&) = default;
++ArcUndoPinEntry& ArcUndoPinEntry::operator=(const ArcUndoPinEntry&) = default;
++ArcUndoPinEntry::~ArcUndoPinEntry() = default;
++
++ArcKeptPin::ArcKeptPin() = default;
++ArcKeptPin::ArcKeptPin(const ArcKeptPin&) = default;
++ArcKeptPin& ArcKeptPin::operator=(const ArcKeptPin&) = default;
++ArcKeptPin::~ArcKeptPin() = default;
++
++std::vector<ArcKeptPin> PlanKeptPins(
++    const std::vector<ArcUndoPinEntry>& entries,
++    const base::flat_set<std::string>& run_ids) {
++  std::vector<ArcKeptPin> kept;
++  for (const ArcUndoPinEntry& entry : entries) {
++    ArcKeptPin pin;
++    if (!entry.is_folder) {
++      if (run_ids.contains(entry.id)) {
++        continue;
++      }
++      pin.item_ids.push_back(entry.id);
++    } else {
++      pin.folder_id = entry.id;
++      for (const std::string& item_id : entry.item_ids) {
++        if (!run_ids.contains(item_id)) {
++          pin.item_ids.push_back(item_id);
++        }
++      }
++      if (pin.item_ids.empty()) {
++        continue;
++      }
++    }
++    kept.push_back(std::move(pin));
++  }
++  return kept;
 +}
 +
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_import_mapping.h
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,288 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -736,11 +772,11 @@ and favorites, and keeps the import record. No profile or browser state.
 +// Turns one Arc profile of an ImportPlan into what the applier writes: rac
 +// spaces, pinned lists, favorites, and open tabs, minus what an earlier
 +// import already brought. Pure: no profile, no services, no files, so every
-+// rule is unit-tested. The applier (chrome/browser/ui/rac/import/
-+// arc_importer.h) gathers ArcLiveSidebar, calls MapArcProfile(), and writes
-+// the result through SpacesService and SidebarItems.
++// rule is unit-tested. The applier gathers ArcLiveSidebar, calls
++// MapArcProfile(), and writes the result through SpacesService and
++// SidebarItems.
 +//
-+// The rules (plan 04 M1 task 4, and scratch/design/apply.md):
++// The rules:
 +//
 +// - Each Arc space becomes its own rac space, keyed by its Arc id. Spaces are
 +//   never matched by title, neither with each other nor with a rac space the
@@ -755,8 +791,8 @@ and favorites, and keeps the import record. No profile or browser state.
 +//   gets them.
 +// - Favorites (Top Apps) are flattened to tabs, and a URL the profile
 +//   already has as a favorite isn't added again.
-+// - URLs that GURL rejects, or that rac won't open from the sidebar, are left
-+//   out and counted.
++// - URLs are kept to an allowlist: http, https, file, and about:blank.
++//   Anything else, and anything GURL rejects, is left out and counted.
 +// - A rerun skips everything the import record maps, wherever it is now.
 +//   New Arc items in a mapped space are appended to it; new tabs in a mapped
 +//   folder are appended to that folder. Items whose rac space or folder the
@@ -890,15 +926,16 @@ and favorites, and keeps the import record. No profile or browser state.
 +                           const ArcLiveSidebar& live,
 +                           const ArcImportOptions& options);
 +
-+// Themes. Agreed with UI design; plan 02 may refine.
++// Themes.
 +//
 +// - A gradient: its first two base colors.
 +// - One flat color, or a theme the reader picked from Arc's palette: that
 +//   color for both stops.
 +// - Separate light and dark looks: the light look's stops, mode Auto, and the
 +//   dark look's stops under kDarkStop1Key/kDarkStop2Key in
-+//   SpaceTheme::unknown_fields (see apply.md: SpaceTheme needs to read them).
-+//   With only one of the two looks, that one, as for a single look.
++//   SpaceTheme::unknown_fields, which a Space keeps when it writes the
++//   theme back.
++// - With only one of the two looks, that one, as for a single look.
 +// - Mode: from Arc's `contentOverBackgroundAppearance`; else from the stops'
 +//   mean relative luminance, light at kLightLuminance or above.
 +// - Colors outside sRGB are brought in by GamutMapToSrgb().
@@ -912,7 +949,7 @@ and favorites, and keeps the import record. No profile or browser state.
 +inline constexpr char kDarkStop2Key[] = "dark2";
 +inline constexpr double kLightLuminance = 0.18;
 +
-+// DRAFT, to be replaced by UI design's version. Brings a color whose
++// Brings a color whose
 +// channels may be outside 0..1 (Arc's `extendedSRGB`: sRGB primaries, the
 +// sRGB curve extended past both ends) into sRGB by lowering its OKLCH chroma
 +// while keeping lightness and hue. Lightness at or past either end gives
@@ -955,17 +992,53 @@ and favorites, and keeps the import record. No profile or browser state.
 +std::string JoinFolderPath(const std::vector<std::string>& titles);
 +
 +// Whether rac imports a pin, favorite, or open tab with this URL: http,
-+// https, file, and chrome. javascript:, data:, blob:, Arc's own pages, and
-+// extension pages are left out: they can't be opened from the sidebar, or
-+// shouldn't be.
++// https, file, and about:blank only. Everything else (chrome:, javascript:,
++// data:, blob:, Arc's own pages, extension pages, and so on) is left out
++// and counted as unsupported.
 +bool IsImportableUrl(const GURL& url);
++
++// One top-level entry of a space's pinned list, as Undo sees it.
++struct ArcUndoPinEntry {
++  ArcUndoPinEntry();
++  ArcUndoPinEntry(const ArcUndoPinEntry&);
++  ArcUndoPinEntry& operator=(const ArcUndoPinEntry&);
++  ~ArcUndoPinEntry();
++  // The item's id, or the folder's id.
++  std::string id;
++  bool is_folder = false;
++  // For a folder: the ids of its items, in order. Empty for an item.
++  std::vector<std::string> item_ids;
++};
++
++// What Undo moves out of a space it is about to delete.
++struct ArcKeptPin {
++  ArcKeptPin();
++  ArcKeptPin(const ArcKeptPin&);
++  ArcKeptPin& operator=(const ArcKeptPin&);
++  ~ArcKeptPin();
++  // The id of the folder these items are in, or empty for a loose item.
++  std::string folder_id;
++  // A loose item: exactly its id. A folder: the ids of its items to keep.
++  std::vector<std::string> item_ids;
++};
++
++// `run_ids` is every rac id the import run mapped (spaces' items, folders,
++// favorites). Returns, in list order, the entries the run did not make:
++// - a loose item whose id is not in `run_ids`;
++// - for a folder, its items whose ids are not in `run_ids`, if there is at
++//   least one (the folder itself may or may not be the run's: either way the
++//   user's pins in it are kept). A folder whose items are all the run's is
++//   dropped.
++std::vector<ArcKeptPin> PlanKeptPins(
++    const std::vector<ArcUndoPinEntry>& entries,
++    const base::flat_set<std::string>& run_ids);
 +
 +}  // namespace rac
 +
 +#endif  // CHROME_BROWSER_RAC_IMPORT_ARC_IMPORT_MAPPING_H_
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_import_mapping_unittest.cc
-@@ -0,0 +1,1269 @@
+@@ -0,0 +1,1389 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1500,10 +1573,14 @@ and favorites, and keeps the import record. No profile or browser state.
 +      "S", "Work",
 +      {Tab("bad1", "not a url"), Tab("bad2", "http://"),
 +       Tab("js", "javascript:alert(1)"), Tab("data", "data:text/html,x"),
-+       Tab("arc", "arc://boost"),
++       Tab("blob", "blob:https://a.example/abc"),
++       Tab("ftp", "ftp://a.example/x"),
++       Tab("view", "view-source:https://a.example/"),
++       Tab("chrome", "chrome://settings/"),
 +       Tab("ext", "chrome-extension://abc/x.html"),
++       Tab("about", "about:flags"), Tab("arc", "arc://boost"),
 +       Tab("ok1", "https://a.example/"), Tab("ok2", "http://b.example/"),
-+       Tab("ok3", "file:///tmp/x.html"), Tab("ok4", "chrome://settings/")}));
++       Tab("ok3", "file:///tmp/x.html"), Tab("ok4", "about:blank")}));
 +
 +  const ArcApplyPlan plan = MapFresh(profile);
 +
@@ -1513,9 +1590,9 @@ and favorites, and keeps the import record. No profile or browser state.
 +  EXPECT_EQ(std::get<ArcApplyTab>(pinned[0]).url.spec(), "https://a.example/");
 +  EXPECT_EQ(std::get<ArcApplyTab>(pinned[1]).url.spec(), "http://b.example/");
 +  EXPECT_EQ(std::get<ArcApplyTab>(pinned[2]).url.spec(), "file:///tmp/x.html");
-+  EXPECT_EQ(std::get<ArcApplyTab>(pinned[3]).url.spec(), "chrome://settings/");
++  EXPECT_EQ(std::get<ArcApplyTab>(pinned[3]).url.spec(), "about:blank");
 +  EXPECT_EQ(plan.counts.invalid_urls, 2);
-+  EXPECT_EQ(plan.counts.unsupported_urls, 4);
++  EXPECT_EQ(plan.counts.unsupported_urls, 9);
 +  EXPECT_EQ(plan.counts.pinned_tabs, 4);
 +}
 +
@@ -1523,15 +1600,19 @@ and favorites, and keeps the import record. No profile or browser state.
 +  EXPECT_TRUE(IsImportableUrl(GURL("https://a.example/")));
 +  EXPECT_TRUE(IsImportableUrl(GURL("http://a.example/")));
 +  EXPECT_TRUE(IsImportableUrl(GURL("file:///tmp/x.html")));
-+  EXPECT_TRUE(IsImportableUrl(GURL("chrome://settings/")));
++  EXPECT_TRUE(IsImportableUrl(GURL("about:blank")));
 +
 +  EXPECT_FALSE(IsImportableUrl(GURL()));
 +  EXPECT_FALSE(IsImportableUrl(GURL("not a url")));
 +  EXPECT_FALSE(IsImportableUrl(GURL("javascript:alert(1)")));
 +  EXPECT_FALSE(IsImportableUrl(GURL("data:text/html,x")));
 +  EXPECT_FALSE(IsImportableUrl(GURL("blob:https://a.example/abc")));
-+  EXPECT_FALSE(IsImportableUrl(GURL("arc://boost")));
++  EXPECT_FALSE(IsImportableUrl(GURL("ftp://a.example/x")));
++  EXPECT_FALSE(IsImportableUrl(GURL("view-source:https://a.example/")));
++  EXPECT_FALSE(IsImportableUrl(GURL("chrome://settings/")));
 +  EXPECT_FALSE(IsImportableUrl(GURL("chrome-extension://abc/x.html")));
++  EXPECT_FALSE(IsImportableUrl(GURL("about:flags")));
++  EXPECT_FALSE(IsImportableUrl(GURL("arc://boost")));
 +}
 +
 +// ---------------------------------------------------------------------------
@@ -2233,6 +2314,118 @@ and favorites, and keeps the import record. No profile or browser state.
 +  EXPECT_EQ(plan.counts.removed_since, 0);
 +}
 +
++// ---------------------------------------------------------------------------
++// Undo.
++
++ArcUndoPinEntry UndoItem(const std::string& id) {
++  ArcUndoPinEntry entry;
++  entry.id = id;
++  return entry;
++}
++
++ArcUndoPinEntry UndoFolder(const std::string& id,
++                           std::vector<std::string> item_ids) {
++  ArcUndoPinEntry entry;
++  entry.id = id;
++  entry.is_folder = true;
++  entry.item_ids = std::move(item_ids);
++  return entry;
++}
++
++// "item:<id>" or "folder:<id>[<item ids>]", like Describe() for the apply
++// plan.
++std::string DescribeKept(const ArcKeptPin& pin) {
++  if (pin.folder_id.empty()) {
++    return "item:" + pin.item_ids[0];
++  }
++  return "folder:" + pin.folder_id + "[" +
++         base::JoinString(pin.item_ids, ",") + "]";
++}
++
++std::vector<std::string> DescribeAllKept(const std::vector<ArcKeptPin>& pins) {
++  std::vector<std::string> out;
++  for (const ArcKeptPin& pin : pins) {
++    out.push_back(DescribeKept(pin));
++  }
++  return out;
++}
++
++TEST(ArcImportMappingTest, KeptPinsEmptyInput) {
++  EXPECT_THAT(PlanKeptPins({}, {"r1"}), IsEmpty());
++  EXPECT_THAT(PlanKeptPins({}, {}), IsEmpty());
++}
++
++TEST(ArcImportMappingTest, KeptPinsAllRunItemsKeepsNothing) {
++  const std::vector<ArcUndoPinEntry> entries = {
++      UndoItem("r1"), UndoFolder("rf", {"r2", "r3"}), UndoItem("r4")};
++
++  EXPECT_THAT(PlanKeptPins(entries, {"r1", "r2", "r3", "r4", "rf"}),
++              IsEmpty());
++}
++
++TEST(ArcImportMappingTest, KeptPinsUserItemBetweenRunItemsIsKept) {
++  const std::vector<ArcUndoPinEntry> entries = {
++      UndoItem("r1"), UndoItem("user"), UndoItem("r2")};
++
++  const std::vector<ArcKeptPin> kept = PlanKeptPins(entries, {"r1", "r2"});
++
++  ASSERT_EQ(kept.size(), 1u);
++  EXPECT_TRUE(kept[0].folder_id.empty());
++  EXPECT_THAT(kept[0].item_ids, ElementsAre("user"));
++}
++
++TEST(ArcImportMappingTest, KeptPinsKeepListOrder) {
++  const std::vector<ArcUndoPinEntry> entries = {
++      UndoItem("u1"),
++      UndoFolder("fa", {"ua1", "r1"}),
++      UndoItem("r2"),
++      UndoFolder("fb", {"r3", "ub1", "ub2"}),
++      UndoItem("u2")};
++
++  EXPECT_THAT(DescribeAllKept(PlanKeptPins(entries, {"r1", "r2", "r3"})),
++              ElementsAre("item:u1", "folder:fa[ua1]", "folder:fb[ub1,ub2]",
++                          "item:u2"));
++}
++
++TEST(ArcImportMappingTest, KeptPinsFolderOfOnlyRunItemsIsDropped) {
++  const std::vector<ArcUndoPinEntry> entries = {
++      UndoItem("u1"), UndoFolder("user-folder", {"r1", "r2"}),
++      UndoItem("u2")};
++
++  EXPECT_THAT(DescribeAllKept(PlanKeptPins(entries, {"r1", "r2"})),
++              ElementsAre("item:u1", "item:u2"));
++}
++
++TEST(ArcImportMappingTest, KeptPinsRunFolderKeepsUserItemsOnly) {
++  const std::vector<ArcUndoPinEntry> entries = {
++      UndoFolder("run-folder", {"r1", "user", "r2"})};
++
++  const std::vector<ArcKeptPin> kept =
++      PlanKeptPins(entries, {"run-folder", "r1", "r2"});
++
++  ASSERT_EQ(kept.size(), 1u);
++  EXPECT_EQ(kept[0].folder_id, "run-folder");
++  EXPECT_THAT(kept[0].item_ids, ElementsAre("user"));
++}
++
++TEST(ArcImportMappingTest, KeptPinsUserFolderKeepsNonRunItemsOnly) {
++  const std::vector<ArcUndoPinEntry> entries = {
++      UndoFolder("user-folder", {"u1", "r1", "u2", "r2"})};
++
++  const std::vector<ArcKeptPin> kept = PlanKeptPins(entries, {"r1", "r2"});
++
++  ASSERT_EQ(kept.size(), 1u);
++  EXPECT_EQ(kept[0].folder_id, "user-folder");
++  EXPECT_THAT(kept[0].item_ids, ElementsAre("u1", "u2"));
++}
++
++TEST(ArcImportMappingTest, KeptPinsUserFolderOfOnlyRunItemsIsDropped) {
++  const std::vector<ArcUndoPinEntry> entries = {
++      UndoFolder("user-folder", {"r1", "r2"})};
++
++  EXPECT_THAT(PlanKeptPins(entries, {"r1", "r2"}), IsEmpty());
++}
++
 +}  // namespace
 +}  // namespace rac
 --- /dev/null
@@ -2493,7 +2686,7 @@ and favorites, and keeps the import record. No profile or browser state.
 +  }
 +  std::string json;
 +  if (!base::ReadFileToStringWithMaxSize(path, &json, kMaxFileSize)) {
-+    return {.status = ReadStatus::kCorrupt};
++    return {.status = ReadStatus::kUnreadable};
 +  }
 +  return Parse(json);
 +}
@@ -2779,7 +2972,7 @@ and favorites, and keeps the import record. No profile or browser state.
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_import_record.h
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,224 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -2807,7 +3000,7 @@ and favorites, and keeps the import record. No profile or browser state.
 +// `Preferences`, so a `Preferences` reset doesn't make the next import add
 +// everything twice.
 +//
-+// It holds ids, times, counts, and the hand-offs other plans pick up later.
++// It holds ids, times, counts, and the hand-offs later features pick up.
 +// No URLs or titles of tabs: those are in the sidebar itself, and in the
 +// pre-import snapshot for its 7 days.
 +//
@@ -2844,7 +3037,7 @@ and favorites, and keeps the import record. No profile or browser state.
 +  // Where a record that couldn't be parsed is moved before a fresh one is
 +  // written. One copy is kept.
 +  static constexpr char kBadFileName[] = "arc.json.bad";
-+  // Larger files are treated as unreadable.
++  // Files over this size are not read; Read() reports them as kUnreadable.
 +  static constexpr size_t kMaxFileSize = 16 * 1024 * 1024;
 +  // Older runs are dropped from `runs`. Their mappings stay.
 +  static constexpr size_t kMaxRuns = 20;
@@ -2900,6 +3093,10 @@ and favorites, and keeps the import record. No profile or browser state.
 +    kOk,
 +    // Not a record this build understands. The applier moves it aside.
 +    kCorrupt,
++    // The file exists but couldn't be read, or is over kMaxFileSize. Not
++    // known to be damaged, so it is left alone and the import refuses to
++    // run.
++    kUnreadable,
 +    // Written by a newer rac. Leave it alone.
 +    kTooNew,
 +  };
@@ -2977,8 +3174,8 @@ and favorites, and keeps the import record. No profile or browser state.
 +  // When Helium's importer last brought this profile's history. Null if it
 +  // never did. History isn't imported twice: it would duplicate visits.
 +  base::Time history_imported;
-+  // Hand-offs for plans 07 and 01, kept, not applied. Only in the record of
-+  // the profile the import started from.
++  // Hand-offs for later features (link routing, tab archive), kept, not
++  // applied. Only in the record of the profile the import started from.
 +  ImportHandoffs handoffs;
 +  // ImportProfile::pinned_extension_ids, kept, never installed.
 +  std::vector<std::string> pinned_extension_ids;
@@ -3002,7 +3199,7 @@ and favorites, and keeps the import record. No profile or browser state.
 +#endif  // CHROME_BROWSER_RAC_IMPORT_ARC_IMPORT_RECORD_H_
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_import_record_unittest.cc
-@@ -0,0 +1,958 @@
+@@ -0,0 +1,975 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -3505,6 +3702,24 @@ and favorites, and keeps the import record. No profile or browser state.
 +  EXPECT_EQ(ArcImportRecord::Read(profile).status, ReadStatus::kCorrupt);
 +}
 +
++TEST(ArcImportRecordTest, ReadDirectoryIsUnreadableAndLeftAlone) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath profile = temp.GetPath();
++  const base::FilePath dir = ArcImportRecord::DirFor(profile);
++  const base::FilePath file = ArcImportRecord::PathFor(profile);
++  ASSERT_TRUE(base::CreateDirectory(dir));
++  // A directory where the record file should be: the path exists, but it
++  // cannot be read as a file.
++  ASSERT_TRUE(base::CreateDirectory(file));
++
++  EXPECT_EQ(ArcImportRecord::Read(profile).status, ReadStatus::kUnreadable);
++
++  // Not known to be damaged: it is left alone, not moved aside.
++  EXPECT_TRUE(base::DirectoryExists(file));
++  EXPECT_THAT(NamesIn(dir), ElementsAre("arc.json"));
++}
++
 +TEST(ArcImportRecordTest, ReadTooNewFileIsTooNew) {
 +  base::ScopedTempDir temp;
 +  ASSERT_TRUE(temp.CreateUniqueTempDir());
@@ -3932,18 +4147,17 @@ and favorites, and keeps the import record. No profile or browser state.
 +  EXPECT_THAT(record.SpacesOfRun("run-2"), ElementsAre("rac-2"));
 +}
 +
-+TEST(ArcImportRecordTest, LargeFileIsCorrupt) {
++TEST(ArcImportRecordTest, LargeFileIsUnreadable) {
 +  base::ScopedTempDir temp;
 +  ASSERT_TRUE(temp.CreateUniqueTempDir());
 +  const base::FilePath profile = temp.GetPath();
 +  ASSERT_TRUE(base::CreateDirectory(ArcImportRecord::DirFor(profile)));
 +
-+  // Valid JSON, padded with spaces to one byte over the limit.
-+  std::string text = R"({"version":1})";
-+  text.resize(ArcImportRecord::kMaxFileSize + 1, ' ');
++  // One byte over the limit, so the file is never parsed.
++  const std::string text(ArcImportRecord::kMaxFileSize + 1, ' ');
 +  ASSERT_TRUE(WriteText(ArcImportRecord::PathFor(profile), text));
 +
-+  EXPECT_EQ(ArcImportRecord::Read(profile).status, ReadStatus::kCorrupt);
++  EXPECT_EQ(ArcImportRecord::Read(profile).status, ReadStatus::kUnreadable);
 +}
 +
 +TEST(ArcImportRecordTest, FileAtMaxSizeIsRead) {
@@ -4019,7 +4233,7 @@ and favorites, and keeps the import record. No profile or browser state.
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/rac/import/arc_import_types.h
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,242 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -4036,8 +4250,8 @@ and favorites, and keeps the import record. No profile or browser state.
 +#include "base/time/time.h"
 +
 +// What the import screens send to the Arc applier and get back from it. Plain
-+// structs: no profile, no browser state. The applier is
-+// chrome/browser/ui/rac/import/arc_importer.h.
++// structs: no profile, no browser state. The applier lives under
++// chrome/browser/ui/rac/import/.
 +
 +namespace rac {
 +
@@ -4050,13 +4264,13 @@ and favorites, and keeps the import record. No profile or browser state.
 +
 +  // ImportProfile::source_key of each profile left unchecked. A checked
 +  // default profile goes into the profile that started the import; other
-+  // checked ones go into new rac profiles (D44), made by the sign-ins step.
++  // checked ones go into new rac profiles, made by the sign-ins step.
 +  base::flat_set<std::string> skipped_profile_keys;
 +  // Arc's Today tabs, created unloaded, for spaces this import creates.
 +  bool open_tabs = true;
 +  // Arc's browsing history, through Helium's importer, history only.
 +  bool history = true;
-+  // Plan 04 M2. Ignored until the sign-ins step is built.
++  // Ignored until the sign-ins step is built.
 +  bool sign_ins = false;
 +};
 +
@@ -4068,11 +4282,11 @@ and favorites, and keeps the import record. No profile or browser state.
 +    kSnapshot,
 +    // One event per Arc space, written or already there.
 +    kSpaces,
-+    // Helium's importer, run separately (04 M1 task 7).
++    // Helium's importer, run separately.
 +    kHistory,
-+    // 04 M2: per profile.
++    // During the sign-ins step, one event per profile.
 +    kSignIns,
-+    // 04 M2: macOS is showing its Keychain prompt.
++    // macOS is showing its Keychain prompt.
 +    kWaitingForMac,
 +  };
 +
@@ -4147,8 +4361,13 @@ and favorites, and keeps the import record. No profile or browser state.
 +  // The import record was written by a newer rac. Importing again could
 +  // lose what it records.
 +  kRecordTooNew,
++  // The import record exists but couldn't be read, so it was left alone
++  // and the import refused to run.
++  kRecordUnreadable,
 +  // The import record couldn't be saved, so the import was taken back.
 +  kRecordNotSaved,
++  // Imports and Undo go into regular profiles only.
++  kOffTheRecord,
 +  // The profile went away while importing.
 +  kProfileGone,
 +};
@@ -4161,7 +4380,7 @@ and favorites, and keeps the import record. No profile or browser state.
 +    // Unchecked on the Arc step.
 +    kSkipped,
 +    // Not the default profile, and no sign-ins step to make its rac profile
-+    // yet (04 M2 not merged).
++    // yet.
 +    kNeedsProfile,
 +    kFailed,
 +  };
