@@ -22,7 +22,9 @@
 #                                     the clone's build/shots; the inputs
 #                                     --rac-arc-import-fixture= and
 #                                     --rac-import-source-root= are relative to
-#                                     the clone and must exist there
+#                                     the clone and must exist there; a bare
+#                                     arg (a URL to Chromium) and a URL-valued
+#                                     switch take the same URL allowlist
 #   pull <worktree> <remote path> <local path>
 #                                     rsync a file inside the clone back
 #   log [lines]                       the base's bootstrap phases and the
@@ -1031,6 +1033,11 @@ check_run_arg() {
             *=?*) ;;
             *) refuse "give the screenshot file as --rac-window-screenshot=<name>.png" ;;
           esac ;;
+        # Ways around the requests checks: DevTools or a debugging port
+        # drive the browser freely, and these open local files to pages.
+        remote-debugging-* | auto-open-devtools-for-tabs | \
+          allow-file-access-from-files | disable-web-security | no-sandbox)
+          refuse "--$name drives or unsandboxes the browser on the Pro" ;;
       esac ;;
   esac
   value=$arg
@@ -1042,6 +1049,15 @@ check_run_arg() {
     .. | ../* | */../* | */..)
       refuse "run args can't leave the clone ($arg)" ;;
   esac
+  # Chromium opens a bare argument as a URL (file: and view-source:
+  # included), and some switches take one: both get the URL allowlist.
+  case "$lower" in
+    --*://* | --*=file:* | --*=data:* | --*=javascript:* | --*=view-source:* | \
+      --*=filesystem:* | --*=blob:*)
+      python3 "$here/remote_requests.py" --url "$value" || exit 2 ;;
+    --*) ;;
+    *) python3 "$here/remote_requests.py" --url "$value" || exit 2 ;;
+  esac
 }
 
 cmd_run() {
@@ -1051,7 +1067,8 @@ cmd_run() {
     case "$1" in
       --requests-file)
         [ $# -ge 2 ] || die "run: --requests-file needs a file on this Mac"
-        # The checked line, then one `file REL` / `dir REL` per path in it.
+        # The checked line, then `verbs VERB...` and one `file REL` /
+        # `dir REL` / `expect REL` per path in it.
         checked=$(python3 "$here/remote_requests.py" "$2") || exit 2
         requests=${checked%%$'\n'*}
         outputs=
@@ -1139,7 +1156,18 @@ if [ -n "$shot" ]; then
   # A shot left by an earlier run would end the wait at once.
   rm -f "$shot"
 fi
+# Every process running from the clone's app, never anything else.
+app="$clone/build/src/out/Default/rac.app/"
+clone_pids() {
+  ps -axo pid=,command= | P="$app" awk '{ pid = $1; sub(/^ *[0-9]+ +/, ""); if (index($0, ENVIRON["P"]) == 1) print pid }'
+}
 if [ -n "$requests" ]; then
+  # A browser already running from this clone polls the same req.txt and
+  # would take this line, under whatever profile settings it started with.
+  [ -z "$(clone_pids)" ] || {
+    echo "rac remote: refusing requests: a browser from this clone is running" >&2
+    exit 2
+  }
   # The Air checked the line and listed every path in it, each relative to
   # build/shots and marked @SHOTS@ in the line. The harness splits on
   # spaces, so the clone's own path has to be one plain word.
@@ -1157,8 +1185,14 @@ if [ -n "$requests" ]; then
   # Each destination stays in the clone before and after its folder is
   # made. Read from the list, never by splitting the line: typed text in
   # it would glob. `expect` files are the screenshots the run waits for.
+  verbs=
   while read -r kind rel; do
     [ -n "$kind" ] || continue
+    # The checker lists the line's verbs for the harness check below.
+    if [ "$kind" = verbs ]; then
+      verbs=$rel
+      continue
+    fi
     case "$rel" in
       '' | /* | *[!A-Za-z0-9._/-]* | . | .. | ./* | ../* | */. | */.. | */./* | */../* | *//*)
         echo "rac remote: refusing: bad requests path '$rel'" >&2
@@ -1176,6 +1210,22 @@ if [ -n "$requests" ]; then
     case "$kind/$word" in file/*.png | expect/*) rm -f "$word" ;; esac
     [ "$kind" != expect ] || expected+=("$word")
   done <<<"$outputs"
+  # Every verb the Air's checker saw must be a string literal in this
+  # clone's own harness sources: a verb the clone never built would run
+  # as an output path inside `after`.
+  harness=$clone/build/src/chrome/browser/ui/views/rac
+  for verb in $verbs; do
+    case "$verb" in
+      '' | *[!A-Za-z-]*)
+        echo "rac remote: refusing: bad verb '$verb'" >&2
+        exit 2 ;;
+    esac
+    if ! grep -F -q "\"$verb\"" "$harness/window_screenshot.mm" \
+         "$harness"/dev/*.mm "$harness"/dev/*.cc 2>/dev/null; then
+      echo "rac remote: refusing: the clone's harness has no \"$verb\" request" >&2
+      exit 2
+    fi
+  done
   requests=${requests//@SHOTS@/$shots}
   # Write beside the file and rename, so the polling harness never reads
   # half a line; remove both names first so neither can be a symlink the
@@ -1187,11 +1237,6 @@ if [ -n "$requests" ]; then
   args+=("--rac-window-screenshot-requests=$req")
   [ -z "$shot" ] || expected+=("$shot")
 fi
-# Every process running from the clone's app, never anything else.
-app="$clone/build/src/out/Default/rac.app/"
-clone_pids() {
-  ps -axo pid=,command= | P="$app" awk '{ pid = $1; sub(/^ *[0-9]+ +/, ""); if (index($0, ENVIRON["P"]) == 1) print pid }'
-}
 # $launcher plus every descendant: the queue starts the browser in a new
 # session, so only a parent-pid walk finds its whole tree.
 family_pids() {
@@ -1254,6 +1299,67 @@ if [ "$fresh" = 1 ]; then
   }
   rm -rf -- "$profile"
   echo "rac remote: deleted $profile" >&2
+fi
+# Downloads land only in the clone: a URL the harness opens can start
+# one, and the default folder is the Pro's own Downloads. Before every
+# launch, point the clone profile's downloads and saves at build/downloads
+# and turn file dialogs off (Local State's select_file_dialogs.allowed,
+# the AllowFileSelectionDialogs policy's pref), so no open, save or upload
+# dialog can be steered to the Pro's own files. A browser already running
+# from this clone (another run's, which did the same; a requests run
+# refused above) read its prefs at startup and rewrites them on exit.
+profile=$clone/build/profile
+downloads=$clone/build/downloads
+if [ -n "$(clone_pids)" ]; then
+  echo "rac remote: a browser from this clone is running; its profile already points downloads inside the clone" >&2
+else
+  for path in "$clone/build" "$profile" "$profile/Default" "$downloads" \
+              "$profile/Default/Preferences" "$profile/Local State"; do
+    [ ! -L "$path" ] || { echo "rac remote: refusing: $path is a symlink" >&2; exit 2; }
+    inside_clone "$clone" "$path" || { echo "rac remote: refusing: $path leaves the clone" >&2; exit 2; }
+  done
+  mkdir -p "$profile/Default" "$downloads"
+  # Keep every other preference; a missing or unreadable file starts
+  # empty. Write a new file beside each (never through a planted link)
+  # and rename it over, so the browser never reads half a file.
+  python3 - "$profile" "$downloads" <<'PY'
+import json, os, sys
+profile, downloads = sys.argv[1:3]
+
+def patch(path, values):
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    for dotted, value in values.items():
+        section, key = dotted.split('.')
+        if not isinstance(data.get(section), dict):
+            data[section] = {}
+        data[section][key] = value
+    tmp = path + '.tmp'
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+patch(os.path.join(profile, 'Default', 'Preferences'), {
+    'download.default_directory': downloads,
+    'download.prompt_for_download': False,
+    'download.directory_upgrade': True,
+    'savefile.default_directory': downloads,
+    'selectfile.last_directory': downloads,
+})
+patch(os.path.join(profile, 'Local State'), {
+    'select_file_dialogs.allowed': False,
+})
+PY
 fi
 launcher=
 browser_pids=

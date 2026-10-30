@@ -1305,11 +1305,25 @@ class BuildTest(RemoteBuildTest):
                     'remote-build.sh drives macOS hosts')
 class RunTest(RemoteBuildTest):
 
+    # Every verb the deployed harness knows, as the checker lists them.
+    HARNESS_VERBS = '''after appearance burst capture-window click command
+        contrast hit key move nsflags nskey nspress nstype open-urls
+        pointer pointer-path profile-window record space-new space-theme
+        swipe target type wheel windows'''.split()
+
     def setUp(self):
         super().setUp()
         self.remote_root = self.seed_remote()
         self.clone = self.remote_clone('feature')
         self.wt = self.make_repo(self.folder / 'feature', branch='feat/x')
+        self.seed_harness()
+
+    def seed_harness(self, without=()):
+        """The verbs the fake clone's harness knows, as string literals."""
+        rac = self.clone / 'build/src/chrome/browser/ui/views/rac'
+        write(rac / 'window_screenshot.mm',
+              ''.join(f'if (verb == "{verb}") {{\n' for verb in
+                      self.HARNESS_VERBS if verb not in without))
 
     def test_run_refuses_profile_and_foreground_args(self):
         for args, why in [
@@ -1337,10 +1351,41 @@ class RunTest(RemoteBuildTest):
             (('--', '--rac-window-screenshot=../../x.png'), 'leave the clone'),
             (('--', '--rac-window-screenshot', 'x.png'), '--rac-window-screenshot='),
             (('--', '--disk-cache-dir=/tmp/c'), 'absolute'),
+            # Chromium opens a bare argument as a URL, so it gets the
+            # requests file's URL allowlist, as do URL-valued switches.
+            (('--', 'file:///Users/k/.ssh/id_rsa', '--rac-window-screenshot=x.png'),
+             'may only open'),
+            (('--', 'view-source:file:///etc/hosts'), 'may only open'),
+            (('--', 'https://evil.com/x.dmg'), 'may only open'),
+            (('--', 'evil.com'), 'may only open'),
+            (('--', 'notes.txt'), 'may only open'),
+            (('--', '--app=file:///Users/k/.ssh/id_rsa'), 'may only open'),
+            (('--', '--homepage=https://evil.com/'), 'may only open'),
+            (('--', '--x=JavaScript:alert(1)'), 'may only open'),
+            # DevTools and a debugging port drive the browser freely.
+            (('--', '--remote-debugging-port=9222'), 'drives'),
+            (('--', '--remote-debugging-pipe'), 'drives'),
+            (('--', '--auto-open-devtools-for-tabs'), 'drives'),
+            (('--', '--allow-file-access-from-files'), 'drives'),
         ]:
             result = self.run_rb('run', self.wt, *args, success=False)
             self.assertEqual(result.returncode, 2, (args, result.stderr))
             self.assertIn(why, result.stderr)
+        self.assertEqual(self.calls(), '')
+
+    def test_run_opens_allowed_url_args(self):
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    'http://localhost:8000/x', 'chrome://settings',
+                    '--enable-features=A:b/c', success=True)
+        self.assertIn('http://localhost:8000/x chrome://settings', self.calls())
+
+    def test_run_refuses_a_malformed_allowed_hosts_list(self):
+        req = self.folder / 'req.txt'
+        write(req, 'key tab\n')
+        result = self.run_rb('run', self.wt, '--requests-file', req,
+                             success=False, RAC_REMOTE_ALLOWED_HOSTS='evil.com/x')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('RAC_REMOTE_ALLOWED_HOSTS', result.stderr)
         self.assertEqual(self.calls(), '')
 
     def test_run_screenshots_and_stops_the_clone(self):
@@ -1372,7 +1417,7 @@ class RunTest(RemoteBuildTest):
         # The line's paths are relative on the Air and land, absolute, in the
         # clone's build/shots on the Pro; the browser gets the file's path.
         req = self.folder / 'req.txt'
-        write(req, 'after 500 nspress t cmd ; after 900 nstype quokka/x ; '
+        write(req, 'after 500 nspress t cmd ; after 900 nstype quokka ; '
                    'after 1500 bar/first.png ; burst frames 3 100\n')
         shot = self.clone / 'build/shots/x.png'
         self.run_rb('run', self.wt, '--timeout', '30', '--requests-file', req,
@@ -1381,7 +1426,7 @@ class RunTest(RemoteBuildTest):
         shots = f'{os.path.realpath(self.clone)}/build/shots'
         self.assertIn(f'after 1500 {shots}/bar/first.png', written)
         self.assertIn(f'burst {shots}/frames 3 100', written)
-        self.assertIn('nstype quokka/x', written)
+        self.assertIn('nstype quokka', written)
         self.assertNotIn('@SHOTS@', written)
         self.assertTrue((self.clone / 'build/shots/bar').is_dir())
         # The harness writes a burst's frames into DIR without making it.
@@ -1389,6 +1434,126 @@ class RunTest(RemoteBuildTest):
         self.assertIn(f'--rac-window-screenshot-requests={os.path.realpath(self.clone)}'
                       '/build/req/req.txt', self.log.read_text())
         self.assertTrue(shot.exists())
+
+    def test_run_refuses_a_verb_the_clone_harness_lacks(self):
+        # The Air's table can't know what this clone built: a verb absent
+        # from the clone's harness sources would run as an output path
+        # inside `after`, so the Pro refuses it before writing req.txt.
+        self.seed_harness(without=('nspress',))
+        req = self.folder / 'req.txt'
+        write(req, 'after 5 nspress t cmd ; capture-window first x.png\n')
+        result = self.run_rb('run', self.wt, '--requests-file', req, success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('nspress', result.stderr)
+        self.assertFalse((self.clone / 'build/req/req.txt').exists())
+        # With the verb in the clone's harness sources the same line runs.
+        self.seed_harness()
+        self.run_rb('run', self.wt, '--requests-file', req, success=True)
+
+    def test_run_confines_downloads_to_the_clone(self):
+        # A URL the harness opens can start a download; before the browser
+        # launches, its profile Preferences must send downloads inside the
+        # clone — never the Pro's own Downloads folder.
+        prefs = self.clone / 'build/profile/Default/Preferences'
+        write(prefs, '{"ui": {"scale": 2},'
+                    ' "download": {"other": 1, "prompt_for_download": true}}\n')
+        self.run_rb('run', self.wt, '--timeout', '3', success=True)
+        data = json.loads(prefs.read_text())
+        downloads = str(os.path.realpath(self.clone / 'build/downloads'))
+        self.assertEqual(data['download']['default_directory'], downloads)
+        self.assertEqual(data['download']['prompt_for_download'], False)
+        self.assertEqual(data['download']['directory_upgrade'], True)
+        self.assertEqual(data['savefile']['default_directory'], downloads)
+        self.assertEqual(data['selectfile']['last_directory'], downloads)
+        # No open, save or upload dialog can be walked to the Pro's files.
+        state = json.loads((self.clone / 'build/profile/Local State').read_text())
+        self.assertEqual(state['select_file_dialogs']['allowed'], False)
+        # Every unrelated preference survives.
+        self.assertEqual(data['download']['other'], 1)
+        self.assertEqual(data['ui']['scale'], 2)
+        self.assertTrue((self.clone / 'build/downloads').is_dir())
+        self.assertFalse((self.remote / 'Downloads').exists())
+
+    def test_run_patches_preferences_for_a_fresh_profile(self):
+        prefs = self.clone / 'build/profile/Default/Preferences'
+        write(prefs, '{"ui": {"scale": 2}}\n')
+        self.run_rb('run', self.wt, '--timeout', '3', '--fresh-profile',
+                    success=True)
+        data = json.loads(prefs.read_text())
+        downloads = str(os.path.realpath(self.clone / 'build/downloads'))
+        self.assertEqual(data['download']['default_directory'], downloads)
+        self.assertEqual(data['savefile']['default_directory'], downloads)
+
+    def test_run_refuses_a_symlinked_preferences(self):
+        prefs = self.clone / 'build/profile/Default/Preferences'
+        write(prefs, '{}')
+        target = self.folder / 'outside-prefs.json'
+        write(target, '{"keep": true}')
+        prefs.unlink()
+        prefs.symlink_to(target)
+        result = self.run_rb('run', self.wt, '--timeout', '3', success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('symlink', result.stderr)
+        self.assertEqual(target.read_text(), '{"keep": true}')
+        self.assertFalse((self.remote / 'Downloads').exists())
+
+    def test_run_keeps_local_state_and_refuses_a_symlinked_one(self):
+        state = self.clone / 'build/profile/Local State'
+        write(state, '{"browser": {"x": 1}, "select_file_dialogs": 5}')
+        self.run_rb('run', self.wt, '--timeout', '3', success=True)
+        data = json.loads(state.read_text())
+        self.assertEqual(data['browser'], {'x': 1})
+        self.assertEqual(data['select_file_dialogs'], {'allowed': False})
+        target = self.folder / 'outside-state.json'
+        write(target, '{"keep": true}')
+        state.unlink()
+        state.symlink_to(target)
+        result = self.run_rb('run', self.wt, '--timeout', '3', success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('symlink', result.stderr)
+        self.assertEqual(target.read_text(), '{"keep": true}')
+
+    def test_run_writes_prefs_through_no_planted_tmp_link(self):
+        target = self.folder / 'outside-tmp.json'
+        write(target, 'keep')
+        prefs = self.clone / 'build/profile/Default/Preferences'
+        write(prefs, '{}')
+        (self.clone / 'build/profile/Default/Preferences.tmp').symlink_to(target)
+        self.run_rb('run', self.wt, '--timeout', '3', success=True)
+        self.assertEqual(target.read_text(), 'keep')
+        self.assertFalse(prefs.is_symlink())
+        self.assertIn('default_directory', prefs.read_text())
+
+    def test_run_refuses_a_symlinked_downloads_dir(self):
+        outside = self.folder / 'outside-downloads'
+        outside.mkdir()
+        (self.clone / 'build').mkdir(exist_ok=True)
+        (self.clone / 'build/downloads').symlink_to(outside)
+        result = self.run_rb('run', self.wt, '--timeout', '3', success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('symlink', result.stderr)
+
+    def test_run_skips_the_prefs_patch_while_a_clone_browser_runs(self):
+        # A running browser read its profile's Preferences at startup and
+        # rewrites them on exit — patching them now would be lost anyway.
+        app = f'{self.clone}/build/src/out/Default/rac.app/'
+        rogue = subprocess.Popen(
+            ['bash', '-c', 'exec -a "$1" sleep 60', '_',
+             f'{app}Contents/MacOS/rac'])
+        self.addCleanup(lambda: (rogue.kill(), rogue.wait()))
+        time.sleep(0.3)
+        prefs = self.clone / 'build/profile/Default/Preferences'
+        write(prefs, '{"keep": true}')
+        self.run_rb('run', self.wt, '--timeout', '3', success=True)
+        self.assertEqual(prefs.read_text(), '{"keep": true}')
+        # That browser polls the same req.txt: a requests run would hand it
+        # the line under settings this run never saw, so it is refused.
+        req = self.folder / 'req.txt'
+        write(req, 'key tab\n')
+        result = self.run_rb('run', self.wt, '--requests-file', req, success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('a browser from this clone is running', result.stderr)
+        self.assertFalse((self.clone / 'build/req/req.txt').exists())
 
     def test_run_refuses_unsafe_requests_files(self):
         for line in ('/tmp/x.png', '../x.png', '~/x.png', 'burst /tmp 3 100',
@@ -1450,12 +1615,12 @@ class RunTest(RemoteBuildTest):
         keep = self.clone / 'build/shots/keep.png'
         write(keep, 'old\n')
         req = self.folder / 'req.txt'
-        write(req, f'type {os.path.realpath(self.clone)}/build/shots/*.png\n')
+        write(req, 'type *.png * build shots\n')
         self.run_rb('run', self.wt, '--timeout', '3', '--requests-file', req,
                     success=True)
         self.assertTrue(keep.exists())
         written = (self.clone / 'build/req/req.txt').read_text()
-        self.assertIn('/build/shots/*.png', written)
+        self.assertIn('type *.png * build shots', written)
 
     def test_run_writes_the_requests_file_through_no_symlink(self):
         # A planted req.txt.tmp or req.txt symlink must not redirect the
@@ -1539,7 +1704,12 @@ class RunTest(RemoteBuildTest):
         (self.clone / sample).mkdir(parents=True)
         result = self.run_rb('run', self.wt, '--timeout', '3', '--fresh-profile',
                              '--', f'--rac-import-source-root={sample}', success=True)
-        self.assertFalse((self.clone / 'build/profile').exists(), result.stderr)
+        # The run then points a fresh profile's downloads inside the clone
+        # and turns its file dialogs off.
+        self.assertEqual(
+            sorted(str(p.relative_to(self.clone / 'build/profile'))
+                   for p in (self.clone / 'build/profile').rglob('*')),
+            ['Default', 'Default/Preferences', 'Local State'], result.stderr)
         self.assertTrue(keep.exists())
         self.assertIn(f'--rac-import-source-root={os.path.realpath(self.clone)}/{sample}',
                       self.calls())
@@ -1547,7 +1717,7 @@ class RunTest(RemoteBuildTest):
     def test_run_fresh_profile_refuses_a_symlinked_profile(self):
         outside = self.folder / 'outside'
         write(outside / 'Default/Preferences', 'keep\n')
-        (self.clone / 'build').mkdir()
+        (self.clone / 'build').mkdir(exist_ok=True)
         (self.clone / 'build/profile').symlink_to(outside)
         result = self.run_rb('run', self.wt, '--timeout', '3', '--fresh-profile',
                              success=False)
@@ -1560,6 +1730,7 @@ class RunTest(RemoteBuildTest):
     def test_run_fresh_profile_refuses_a_symlinked_build_dir(self):
         outside = self.folder / 'outside'
         write(outside / 'profile/Default/Preferences', 'keep\n')
+        shutil.rmtree(self.clone / 'build')
         (self.clone / 'build').symlink_to(outside)
         result = self.run_rb('run', self.wt, '--timeout', '3', '--fresh-profile',
                              success=False)
@@ -1588,7 +1759,7 @@ class RunTest(RemoteBuildTest):
         self.assertEqual((self.clone / 'build/shots/x.png').read_text(), 'png\n')
 
     def test_run_passes_odd_args_through_intact(self):
-        odd = "it's $HOME `id` *"
+        odd = "--rac-x=it's $HOME `id` *"
         self.run_rb('run', self.wt, '--timeout', '3', '--', odd, success=True)
         self.assertIn(f'--rac-launch-in-background {odd}', self.calls())
 
@@ -1601,7 +1772,7 @@ class RunTest(RemoteBuildTest):
         # build/shots -> outside the clone would write the PNG anywhere.
         outside = self.folder / 'outside'
         outside.mkdir()
-        (self.clone / 'build').mkdir()
+        (self.clone / 'build').mkdir(exist_ok=True)
         (self.clone / 'build/shots').symlink_to(outside)
         result = self.run_rb('run', self.wt, '--timeout', '5', '--',
                              '--rac-window-screenshot=x.png', success=False)
@@ -1614,6 +1785,7 @@ class RunTest(RemoteBuildTest):
         # makes build/shots outside the clone first.
         outside = self.folder / 'outside'
         outside.mkdir()
+        shutil.rmtree(self.clone / 'build')
         (self.clone / 'build').symlink_to(outside)
         result = self.run_rb('run', self.wt, '--timeout', '5', '--',
                              '--rac-window-screenshot=x.png', success=False)
@@ -1875,79 +2047,6 @@ class DryRunTest(RemoteBuildTest):
         result = self.run_rb('--dry-run', 'push', wt, success=True)
         self.assertIn('push --force', result.stderr)
         self.assertFalse((self.remote_root / 'wt/sync-wt').exists())
-
-
-class RemoteRequestsTest(unittest.TestCase):
-    """remote_requests.py against the harness's grammar (window_screenshot.mm
-    and dev/*): every path it writes is marked, and nothing it can't
-    recognise passes."""
-
-    def setUp(self):
-        sys.path.insert(0, str(HERE))
-        self.addCleanup(sys.path.remove, str(HERE))
-        import remote_requests
-        self.rr = remote_requests
-
-    def ok(self, line):
-        return self.rr.check_line(line)
-
-    def refused(self, line):
-        with self.assertRaises(self.rr.Refused, msg=repr(line)):
-            self.rr.check_line(line)
-
-    def test_marks_every_path_the_harness_writes(self):
-        for line, out, outputs in [
-            ('a/b.png', '@SHOTS@/a/b.png', ['expect a/b.png']),
-            ('hit 10 20 views.txt', 'hit 10 20 @SHOTS@/views.txt', ['file views.txt']),
-            ('windows list', 'windows @SHOTS@/list', ['file list']),
-            ('record rec 500 0.5', 'record @SHOTS@/rec 500 0.5', ['dir rec']),
-            ('burst b 3 100', 'burst @SHOTS@/b 3 100',
-             ['dir b', 'expect b/f00.png', 'expect b/f01.png', 'expect b/f02.png']),
-            ('burst b 0 100', 'burst @SHOTS@/b 0 100', ['dir b']),
-            ('capture-window app:x c.png', 'capture-window app:x @SHOTS@/c.png',
-             ['expect c.png']),
-            ('after 5 after 6 d.png', 'after 5 after 6 @SHOTS@/d.png', ['expect d.png']),
-            ('click 1 2 ; after 10 e.png', 'click 1 2 ; after 10 @SHOTS@/e.png',
-             ['expect e.png']),
-        ]:
-            self.assertEqual(self.ok(line), (out, outputs), line)
-
-    def test_passes_input_verbs_unchanged(self):
-        for line in ('command 34000', 'move 1 2', 'click -1 2', 'wheel 1 2 -3',
-                     'key escape', 'nspress t cmd,shift', 'nspress pagedown',
-                     'nskey tab down ctrl', 'nsflags none', 'swipe 1 2 end',
-                     'swipe 1 2 -4.5 10 hold', 'appearance dark', 'contrast on',
-                     'space-theme 3 dark', 'space-theme -', 'space-new',
-                     'pointer off', 'pointer 1.5 2', 'pointer-path 0 0 10 10 200',
-                     'target name:x', 'target #2', 'profile-window Profile_2',
-                     'open-urls https://example.com/a?b chrome://settings about:blank',
-                     'type hello / world.png ~', 'nstype a*b'):
-            self.assertEqual(self.ok(line), (line, []), line)
-
-    def test_refuses_what_the_harness_would_misread(self):
-        for line in [
-            # Whitespace the harness keeps inside a word would let the
-            # checker see one request (typed text) where it sees two.
-            'type\u00a0;\u00a0after 0 x.png', 'type a\u2003; b.png',
-            # An `after` whose request the harness doesn't recognise is
-            # captured to a file named after the request's text.
-            'after 5 unknown words', 'after 5 click a b', 'after 5 windows x',
-            'after 5 hit 1 2 x', 'after 99999999999 x.png', 'after \u00b2 x.png',
-            # Paths in every verb that writes one.
-            'hit 1 2 /tmp/x', 'windows /tmp/x', 'windows ../x', 'record /tmp 5',
-            'record ../x 5', 'burst ~/x 1 1', 'capture-window app ../x.png',
-            'capture-window app x.txt', 'x.PNG', 'a//b.png', './a.png',
-            # Downloads land outside the clone.
-            'open-urls data:application/octet-stream,x', 'open-urls javascript:x',
-            'open-urls file:///etc/hosts', 'open-urls example.com',
-            # Unknown verbs and arguments, a bare PNG among several requests,
-            # a lone ';' in typed text, and too many burst frames.
-            'rm x', 'click 1', 'key ../x.json', 'appearance x', 'a.png ; b.png',
-            'type a ; ; b.png', 'nstype ;', 'burst b 100000 1', 'hit 1 2 x ; key tab',
-            '', 'x.png\ny.png', '@SHOTS@/x.png', 'type a\tb',
-        ]:
-            self.refused(line)
-
 
 if __name__ == '__main__':
     unittest.main()
