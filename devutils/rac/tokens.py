@@ -136,7 +136,11 @@ def statements(region):
         stripped = line.strip()
         css = CSS_LINE.match(stripped)
         if css:
-            css_lines.append(css.group('css'))
+            value = css.group('css')
+            # The line is pasted into a `:root { ... }` rule and a comment.
+            if '}' in value or '*/' in value:
+                raise TokenError(f'a `// rac-css:` value can not hold `}}` or `*/`: {stripped}')
+            css_lines.append(value)
             continue
         if 'rac-css:' in stripped:
             raise TokenError('write a CSS-only line as `// rac-css: --rac-name: value;`, '

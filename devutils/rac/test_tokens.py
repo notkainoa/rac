@@ -114,6 +114,9 @@ class ParseTest(unittest.TestCase):
             'inline constexpr int kRadius4 = 4',
             'inline constexpr base::TimeDelta kLoopStep = base::Hertz(0);',
             '// rac-css: --rac-radius-pill = 9999px\ninline constexpr int kRadius4 = 4;',
+            '// rac-css: --rac-a: 1px } body { display: none;\ninline constexpr int kRadius4 = 4;',
+            '// rac-css: --rac-a: 1px */ x;\ninline constexpr int kRadius4 = 4;',
+            '// rac-css: --rac-a: }1px;\n',
         ]
         for body in bad:
             with self.subTest(body=body), self.assertRaises(tokens.TokenError):
