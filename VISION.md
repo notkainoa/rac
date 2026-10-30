@@ -127,6 +127,9 @@ These aren't ruled out forever, just not on the roadmap:
 - Auto-archiving old tabs
 - Peek-style link previews in a floating window
 - A settings page for everything
+- A second, more Arc-like layout for spaces and profiles: one window where
+  each space picks a profile, switchable with today's layout (maybe later;
+  see the [roadmap](docs/roadmap.md#later))
 - Sync (maybe later)
 - Linux and Windows (maybe someday)
 - iOS (probably someday)

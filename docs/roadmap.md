@@ -153,6 +153,13 @@ No order and no promises:
   through MCP (rac's own MCP server serves only the agent it launched)
 - Cloud agents (exploring)
 - Air Traffic Control (routing links to the right space)
+- A second layout for spaces and profiles, which people could switch
+  between. Today's layout, the one rac ships first, gives each profile its
+  own window, and each profile has its own spaces. The second layout would be
+  more like Arc: a single window where each space picks a profile (the same
+  profile for several spaces, or a different one for each), so choosing a
+  profile never opens a new window. No date. The shipped layout stays the
+  default until this is built.
 - Little Arc (a mini window for links opened from other apps)
 - Notes and easels
 - Sync
