@@ -71,6 +71,9 @@ INTERNAL_PAGES = frozenset((
 ))
 INTERNAL_URL = re.compile(r'(?:chrome|rac)://([!-\[\]-~]*)', re.ASCII | re.I)
 SETUP_STEP = re.compile(r'setup/[A-Za-z0-9-]+')
+# The welcome tour opened straight at its Arc import step. The query must
+# be exactly "arc"; only the host's case is free.
+SETUP_ARC = re.compile(r'(?i:setup)\?arc')
 TEST_HOSTS = {'localhost', '127.0.0.1', '[::1]',
               'example.com', 'example.org', 'example.net'}
 TEST_SUFFIXES = ('.test', '.localhost',
@@ -188,11 +191,14 @@ def internal_page(word):
     allowlisted, else None. Scheme and host are case-insensitive and one
     trailing slash is optional; a query, fragment, '..' or
     percent-escape can never match, since host+path must come out to an
-    INTERNAL_PAGES entry or setup/<one segment of [A-Za-z0-9-]>."""
+    INTERNAL_PAGES entry or setup/<one segment of [A-Za-z0-9-]>. The one
+    query allowed is setup?arc, the Arc import step."""
     match = INTERNAL_URL.fullmatch(word)
     if not match:
         return None
     page = match.group(1)
+    if SETUP_ARC.fullmatch(page):
+        return 'setup?arc'
     if page.endswith('/'):
         page = page[:-1]
     host, slash, path = page.partition('/')

@@ -1595,6 +1595,7 @@ class RunTest(RemoteBuildTest):
         # while also passing an import input.
         req = self.folder / 'req.txt'
         for line in ('open-urls chrome://setup', 'open-urls chrome://setup/a-1',
+                     'open-urls chrome://setup?arc', 'open-urls rac://setup?arc',
                      'open-urls rac://setup', 'open-urls chrome://version '
                      'chrome://setup'):
             write(req, line + '\n')
@@ -1603,7 +1604,7 @@ class RunTest(RemoteBuildTest):
             self.assertEqual(result.returncode, 2, line)
             self.assertIn('import', result.stderr, line)
         for arg in ('chrome://setup', 'chrome://setup/x-1', 'rac://setup',
-                    'CHROME://SETUP'):
+                    'CHROME://SETUP', 'chrome://setup?arc', 'rac://setup?arc'):
             result = self.run_rb('run', self.wt, '--', arg, success=False)
             self.assertEqual(result.returncode, 2, arg)
             self.assertIn('import', result.stderr, arg)
@@ -1617,6 +1618,8 @@ class RunTest(RemoteBuildTest):
                     '--', '--rac-arc-import-fixture=devutils/fixtures/arc/StorableSidebar.json',
                     success=True)
         self.run_rb('run', self.wt, '--timeout', '3', '--', 'chrome://setup',
+                    '--rac-import-source-root=build/arc-root', success=True)
+        self.run_rb('run', self.wt, '--timeout', '3', '--', 'chrome://setup?arc',
                     '--rac-import-source-root=build/arc-root', success=True)
         write(req, 'open-urls chrome://version\n')
         self.run_rb('run', self.wt, '--requests-file', req, '--timeout', '3',
