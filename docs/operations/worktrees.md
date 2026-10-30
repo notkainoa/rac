@@ -117,6 +117,43 @@ devutils/rac/build-queue.sh log          # recent starts, ends, and refusals
   It predates the queue and only works one way: whoever holds it can't see
   builds in the queue. Use it only when the queue itself is broken.
 
+## Building on the MacBook Pro
+
+`devutils/rac/remote-build.sh` moves Chromium compiles and screenshot
+launches to the maintainer's MacBook Pro over ssh; threads, git, and
+reviews stay on the Air. Everything on the Pro lives in `~/rac-remote`:
+the bare `rac.git` and `helium-chromium.git`, a `base/` the Pro clones
+and cold-builds itself (the Air→Pro link can't carry a built tree), one
+clone per worktree in `wt/<name>`, the queue's state, and `logs/`.
+`setup-host` runs once and reports both Macs' Xcode and SDK, which need
+not match.
+
+`build-base <ref>` clones a GitHub ref into `base/` and bootstraps it:
+`he presetup`, `he merge`, an explicit `quilt push -a --fuzz 0` (never
+`he push`, whose `--refresh` rewrites patches; `worktree.sh sync` needs
+the `.pc` state it makes), `worktree.sh sync`, then `he configure`. Each
+phase prints a timestamped heartbeat, also kept in `logs/bootstrap.log`,
+and a bootstrap that stopped picks up where it stopped on a rerun. A base
+already bootstrapped at the ref is adopted untouched; one holding a tree
+for another ref is refused, never moved or recloned. Only
+`--approved "<who/when>"` (or `--resume --approved` later) queues the
+cold build, detached; it refuses while a build of the base is already
+queued or running. Follow it with `status` and `log`.
+
+The base's toolchain is recorded once in `base/.rac-toolchain`, and each
+clone keeps a copy in its `build/`. `push`, `build`, `run`, and
+`--resume` refuse when the Pro's Xcode or SDK drifts from it, since a
+build then recompiles all of Chromium. `push` a committed worktree to its
+clone (a new clone waits for the base's finished build), `build` it
+through the queue under `nice` with four cores left free,
+`run -- --rac-window-screenshot=x.png` for a background browser with its
+own profile (the shot lands in the clone's `build/shots/`), and `pull`
+files back. Nobody builds rac natively on the Pro: every build there
+goes through `remote-build.sh`. An Xcode update on a build machine
+invalidates every tree built there (new compiler flags and SDK path), so
+keep Xcode pinned on build machines; `build`, `run` and `push` refuse when
+the Pro's Xcode differs from the one its base recorded.
+
 ## Updating the base
 
 After merging features into `main`, update the main checkout so new
