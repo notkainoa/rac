@@ -1,0 +1,211 @@
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -834,6 +834,15 @@ void VerticalTabStripRegionView::UpdateP
+   if (organizer_panel_view_) {
+     bg->ClipViewToBackground(organizer_panel_view_);
+   }
++  // rac: the focused address bar in the sidebar draws past its edge.
++  const bool popped_out = rac::IsSidebarAddressBarPoppedOut(browser_view());
++  SetClipLayerToVisibleBounds(!popped_out &&
++                              floating_style_ != FloatingStyle::kNone);
++  if (popped_out) {
++    content_area_view_->layer()->SetClipRect(gfx::Rect());
++    content_area_view_->layer()->SetRoundedCornerRadius(gfx::RoundedCornersF());
++    return;
++  }
+   bg->ClipViewToBackground(content_area_view_);
+ }
+ 
+--- a/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.cc
++++ b/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.cc
+@@ -20,6 +20,7 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_view.h"
+ #include "chrome/browser/ui/views/frame/toolbar_button_provider.h"
++#include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/location_bar/location_bar_view.h"
+ #include "chrome/browser/ui/views/rac/rac_look.h"
+ #include "chrome/browser/ui/views/rac/sidebar_visibility.h"
+@@ -284,9 +285,7 @@ RacSidebarHeaderView::RacSidebarHeaderVi
+ }
+ 
+ RacSidebarHeaderView::~RacSidebarHeaderView() {
+-  if (parent()) {
+-    parent()->SetEventTargeter(nullptr);
+-  }
++  SetSidebarTargeters(false);
+   RestoreControls();
+   browser_view_->ClearProperty(kRacSidebarHeaderKey);
+ }
+@@ -611,7 +610,8 @@ void RacSidebarHeaderView::SetPoppedOut(
+       owns_location_bar_layer_ = false;
+     }
+   }
+-  UpdateSidebarClip();
++  // The browser layout this invalidates lifts the sidebar's clip; see
++  // VerticalTabStripRegionView::UpdatePanelClips().
+   InvalidateLayout();
+ }
+ 
+@@ -657,9 +657,22 @@ void RacSidebarHeaderView::SetSuggestion
+   }
+ }
+ 
+-void RacSidebarHeaderView::UpdateSidebarClip() {
+-  if (parent()) {
+-    parent()->SetClipLayerToVisibleBounds(floating_ && !popped_out_);
++void RacSidebarHeaderView::SetSidebarTargeters(bool install) {
++  // The sidebar keeps its rows in a content view, so this view's parent is
++  // not the sidebar itself.
++  views::View* region = parent();
++  while (region && !views::IsViewClass<VerticalTabStripRegionView>(region)) {
++    region = region->parent();
++  }
++  if (!region) {
++    return;
++  }
++  for (views::View* view = parent();; view = view->parent()) {
++    view->SetEventTargeter(install ? std::make_unique<views::ViewTargeter>(this)
++                                   : nullptr);
++    if (view == region) {
++      return;
++    }
+   }
+ }
+ 
+@@ -679,9 +692,7 @@ bool RacSidebarHeaderView::DoesIntersect
+ void RacSidebarHeaderView::AddedToWidget() {
+   views::View::AddedToWidget();
+   SetEventTargeter(std::make_unique<views::ViewTargeter>(this));
+-  if (parent()) {
+-    parent()->SetEventTargeter(std::make_unique<views::ViewTargeter>(this));
+-  }
++  SetSidebarTargeters(true);
+   if (GetFocusManager()) {
+     focus_manager_ = GetFocusManager();
+     focus_manager_->AddFocusChangeListener(this);
+@@ -694,6 +705,7 @@ void RacSidebarHeaderView::OnDidChangeFo
+ }
+ 
+ void RacSidebarHeaderView::RemovedFromWidget() {
++  SetSidebarTargeters(false);
+   if (focus_manager_) {
+     focus_manager_->RemoveFocusChangeListener(this);
+     focus_manager_ = nullptr;
+@@ -704,10 +716,6 @@ void RacSidebarHeaderView::RemovedFromWi
+ void RacSidebarHeaderView::OnBrowserLayout(const gfx::Rect& sidebar_bounds,
+                                            const gfx::Rect& window_buttons,
+                                            bool floating) {
+-  if (floating_ != floating) {
+-    floating_ = floating;
+-    UpdateSidebarClip();
+-  }
+   // Hiding the sidebar or unpinning the toolbar only relays out the window.
+   UpdateTopBarPlacement();
+ 
+@@ -1056,13 +1064,20 @@ float GetWindowButtonsRevealRatio(const
+              : browser_view->GetTopChromeRevealRatio();
+ }
+ 
++bool IsSidebarAddressBarPoppedOut(const views::View* browser_view) {
++  const auto* header = HeaderFor(browser_view);
++  return header && header->is_popped_out();
++}
++
+ bool IsPositionInSidebarHeaderCaption(BrowserView* browser_view,
+                                       views::View* region,
+                                       const gfx::Point& point_in_region,
+                                       bool* in_header) {
+   auto* header = HeaderFor(browser_view);
+   *in_header = false;
+-  if (!header || header->parent() != region) {
++  // The header and footer sit in the sidebar's content view, not in the
++  // sidebar itself.
++  if (!header || !header->parent() || !region->Contains(header)) {
+     return false;
+   }
+   auto hit = [&](views::View* view, gfx::Point* point) {
+@@ -1075,7 +1090,7 @@ bool IsPositionInSidebarHeaderCaption(Br
+     *in_header = true;
+     return header->IsPositionInWindowCaption(point);
+   }
+-  for (views::View* child : region->children()) {
++  for (views::View* child : header->parent()->children()) {
+     auto* footer = views::AsViewClass<RacSidebarFooterView>(child);
+     if (footer && hit(footer, &point)) {
+       *in_header = true;
+--- a/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h
++++ b/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h
+@@ -107,6 +107,8 @@ class RacSidebarHeaderView : public view
+   bool is_beside_top_bar() const { return beside_top_bar_; }
+   bool is_sidebar_on_right() const { return sidebar_on_right_; }
+   bool is_top_bar_on_card() const { return top_bar_on_card_; }
++  // True while the focused address bar grows past the sidebar's edge.
++  bool is_popped_out() const { return popped_out_; }
+ 
+   // Lays the header out right away so the address bar can take focus.
+   void RevealForAddressBar();
+@@ -145,8 +147,8 @@ class RacSidebarHeaderView : public view
+   void RemovedFromWidget() override;
+ 
+   // views::ViewTargeterDelegate:
+-  // Installed on this view and the sidebar, so clicks reach the part of the
+-  // popped-out address bar that lies over the page.
++  // Installed on this view and each view up to the sidebar, so clicks reach
++  // the part of the popped-out address bar that lies over the page.
+   bool DoesIntersectRect(const views::View* target,
+                          const gfx::Rect& rect) const override;
+ 
+@@ -185,9 +187,9 @@ class RacSidebarHeaderView : public view
+   void UpdateWindowButtons(int inset);
+   // Asks AppKit to lay out the titlebar and the window buttons again.
+   void RelayoutWindowButtons();
+-  // A floating sidebar clips its contents; the popped-out address bar has to
+-  // draw past its edge.
+-  void UpdateSidebarClip();
++  // Installs or removes this view's targeter on each view from its parent up
++  // to the sidebar, so clicks reach the popped-out address bar.
++  void SetSidebarTargeters(bool install);
+   void OnCollapseStateChanged(tabs::VerticalTabStripCollapseState state);
+   void OnModeWillChange(tabs::VerticalTabStripStateController* controller);
+   void OnModeChanged(tabs::VerticalTabStripStateController* controller);
+@@ -216,7 +218,6 @@ class RacSidebarHeaderView : public view
+   // a floating sidebar.
+   int window_buttons_inset_ = 0;
+   bool window_buttons_hidden_ = false;
+-  bool floating_ = false;
+   // The sidebar is on the right. Everything in it is mirrored: the window
+   // buttons at its top right, the profile button at the footer's right.
+   bool sidebar_on_right_ = false;
+@@ -278,6 +279,8 @@ views::BubbleBorder::Arrow GetSidebarBub
+ // In frameless mode the window buttons fade with the chrome they sit in:
+ // the sidebar when it holds the address bar, otherwise the toolbar.
+ float GetWindowButtonsRevealRatio(const BrowserView* browser_view);
++// See RacSidebarHeaderView::is_popped_out().
++bool IsSidebarAddressBarPoppedOut(const views::View* browser_view);
+ // Sets `in_header` when `point_in_region` is over the sidebar's header or
+ // footer, and returns whether that spot drags the window.
+ bool IsPositionInSidebarHeaderCaption(BrowserView* browser_view,
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
+@@ -434,12 +434,14 @@ views::ProposedLayout PinnedTabContainer
+                   collapse_state ==
+                       tabs::VerticalTabStripCollapseState::kCollapsed
+               ? 1
+-              : std::min({children_on_row,
+-                          rac::sidebar_style::kMaxFavoritesPerRow,
+-                          static_cast<int>(
+-                              std::floor((available_width - child_width) /
+-                                         (child_width + kTabPadding)) +
+-                              1)});
++              : std::max(
++                    1,
++                    std::min({children_on_row,
++                              rac::sidebar_style::kMaxFavoritesPerRow,
++                              static_cast<int>(
++                                  std::floor((available_width - child_width) /
++                                             (child_width + kTabPadding)) +
++                                  1)}));
+ 
+       if (!contains_split && children_on_row > 1) {
+         child_width = rac::sidebar_style::kFavoriteTileWidth;
