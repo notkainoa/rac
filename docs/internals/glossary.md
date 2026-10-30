@@ -38,8 +38,8 @@ Use these words consistently in code, docs, issues, and PRs.
 - **Edge reveal**: moving the mouse to the left edge of the screen to
   temporarily show the full sidebar over the page while it's hidden,
   or to the top edge to show the hidden toolbar.
-- **Command bar**: the quick launcher for tabs, history, and actions. Users
-  can choose it in place of the new tab page.
+- **Command bar**: the quick launcher for tabs, history, and actions. ⌘T
+  and ⌘L open it; one setting gives ⌘T back to the new tab page.
 - **New tab page**: the page that opens in a new tab.
 - **Boost**: a user's custom CSS and JavaScript for a specific site.
 - **Theme**: the colors of a space, including gradients.
