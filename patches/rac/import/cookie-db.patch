@@ -2,9 +2,11 @@ Copies a Chromium cookie database, with its -wal and -shm files, into a
 private temp folder and reads its rows, leaving encrypted_value as opaque
 bytes. Adds a test-only builder for Chromium-shaped cookie databases, and the
 unit tests. Nothing here decrypts.
---- a/chrome/browser/rac/import/BUILD.gn
-+++ b/chrome/browser/rac/import/BUILD.gn
-@@ -80,6 +80,31 @@
+Index: src/chrome/browser/rac/import/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/import/BUILD.gn
++++ src/chrome/browser/rac/import/BUILD.gn
+@@ -83,6 +83,31 @@ source_set("cookie_crypto") {
    ]
  }
  
@@ -36,7 +38,7 @@ unit tests. Nothing here decrypts.
  # Build with `autoninja -C out/Default
  # chrome/browser/rac/import:rac_import_unittests`. It's separate from
  # Chromium's unit_tests, which takes hours to build.
-@@ -89,6 +114,7 @@
+@@ -92,6 +117,7 @@ test("rac_import_unittests") {
      "arc_import_record_unittest.cc",
      "arc_reader_unittest.cc",
      "arc_source_root_unittest.cc",
@@ -44,7 +46,7 @@ unit tests. Nothing here decrypts.
      "cookie_test_vectors.inc",
      "imported_cookie_crypto_unittest.cc",
    ]
-@@ -97,12 +123,16 @@
+@@ -100,12 +126,16 @@ test("rac_import_unittests") {
      ":arc_reader",
      ":arc_source",
      ":cookie_crypto",
@@ -61,15 +63,18 @@ unit tests. Nothing here decrypts.
      "//testing/gmock",
      "//testing/gtest",
  
+Index: src/chrome/browser/rac/import/cookie_db_rows.cc
+===================================================================
 --- /dev/null
-+++ b/chrome/browser/rac/import/cookie_db_rows.cc
-@@ -0,0 +1,264 @@
++++ src/chrome/browser/rac/import/cookie_db_rows.cc
+@@ -0,0 +1,297 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#include "chrome/browser/rac/import/cookie_db_rows.h"
 +
++#include <optional>
 +#include <string>
 +#include <string_view>
 +#include <utility>
@@ -83,6 +88,8 @@ unit tests. Nothing here decrypts.
 +#include "base/strings/strcat.h"
 +#include "base/strings/string_util.h"
 +#include "base/threading/scoped_blocking_call.h"
++#include "base/types/expected.h"
++#include "base/types/expected_macros.h"
 +#include "sql/database.h"
 +#include "sql/meta_table.h"
 +#include "sql/statement.h"
@@ -207,6 +214,33 @@ unit tests. Nothing here decrypts.
 +                                           base::FILE_PERMISSION_WRITE_BY_USER);
 +}
 +
++// Copies `from` like CopyPrivate(), unless it's larger than `max_bytes`. The
++// copy is measured too, in case the source grew while it was copied (for
++// example, while Arc is open).
++base::expected<void, CookieDbReadError> CopyPrivateCapped(
++    const base::FilePath& from,
++    const base::FilePath& to,
++    int64_t max_bytes) {
++  std::optional<int64_t> size = base::GetFileSize(from);
++  if (!size) {
++    return base::unexpected(CookieDbReadError::kCopyFailed);
++  }
++  if (*size > max_bytes) {
++    return base::unexpected(CookieDbReadError::kSourceTooLarge);
++  }
++  if (!CopyPrivate(from, to)) {
++    return base::unexpected(CookieDbReadError::kCopyFailed);
++  }
++  size = base::GetFileSize(to);
++  if (!size) {
++    return base::unexpected(CookieDbReadError::kCopyFailed);
++  }
++  if (*size > max_bytes) {
++    return base::unexpected(CookieDbReadError::kSourceTooLarge);
++  }
++  return base::ok();
++}
++
 +bool MakePrivateDir(base::ScopedTempDir& dir) {
 +  // CreateUniqueTempDir() uses mkdtemp(), which already creates 0700. Set and
 +  // verify it anyway so a future base change can't widen it silently.
@@ -246,7 +280,8 @@ unit tests. Nothing here decrypts.
 +CookieDbSnapshot::~CookieDbSnapshot() = default;
 +
 +base::expected<CookieDbSnapshot, CookieDbReadError> ReadCookieDbRows(
-+    const base::FilePath& cookies_db) {
++    const base::FilePath& cookies_db,
++    const CookieDbReadLimits& limits) {
 +  base::ScopedBlockingCall blocking(FROM_HERE, base::BlockingType::MAY_BLOCK);
 +
 +  if (!base::PathExists(cookies_db) || base::DirectoryExists(cookies_db)) {
@@ -262,14 +297,12 @@ unit tests. Nothing here decrypts.
 +
 +  // The copy keeps one base name so SQLite finds "<name>-wal" next to it.
 +  const base::FilePath copy = temp_dir.GetPath().Append(kCopyName);
-+  if (!CopyPrivate(cookies_db, copy)) {
-+    return base::unexpected(CookieDbReadError::kCopyFailed);
-+  }
++  RETURN_IF_ERROR(CopyPrivateCapped(cookies_db, copy, limits.max_file_bytes));
 +  for (const base::FilePath::CharType* suffix : kSidecarSuffixes) {
 +    const base::FilePath from = WithSuffix(cookies_db, suffix);
-+    if (base::PathExists(from) &&
-+        !CopyPrivate(from, WithSuffix(copy, suffix))) {
-+      return base::unexpected(CookieDbReadError::kCopyFailed);
++    if (base::PathExists(from)) {
++      RETURN_IF_ERROR(CopyPrivateCapped(from, WithSuffix(copy, suffix),
++                                        limits.max_file_bytes));
 +    }
 +  }
 +
@@ -312,12 +345,16 @@ unit tests. Nothing here decrypts.
 +    return base::unexpected(CookieDbReadError::kQueryFailed);
 +  }
 +  while (s.Step()) {
++    if (snapshot.rows.size() >= limits.max_rows) {
++      snapshot.rows_truncated = true;
++      break;
++    }
 +    CookieDbRow& row = snapshot.rows.emplace_back();
 +    for (size_t i = 0; i < present.size(); ++i) {
 +      present[i]->read(s, static_cast<int>(i), row);
 +    }
 +  }
-+  if (!s.Succeeded()) {
++  if (!snapshot.rows_truncated && !s.Succeeded()) {
 +    return base::unexpected(CookieDbReadError::kQueryFailed);
 +  }
 +
@@ -328,9 +365,11 @@ unit tests. Nothing here decrypts.
 +}
 +
 +}  // namespace rac::import
+Index: src/chrome/browser/rac/import/cookie_db_rows.h
+===================================================================
 --- /dev/null
-+++ b/chrome/browser/rac/import/cookie_db_rows.h
-@@ -0,0 +1,93 @@
++++ src/chrome/browser/rac/import/cookie_db_rows.h
+@@ -0,0 +1,112 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -338,6 +377,7 @@ unit tests. Nothing here decrypts.
 +#ifndef CHROME_BROWSER_RAC_IMPORT_COOKIE_DB_ROWS_H_
 +#define CHROME_BROWSER_RAC_IMPORT_COOKIE_DB_ROWS_H_
 +
++#include <cstddef>
 +#include <cstdint>
 +#include <string>
 +#include <vector>
@@ -397,10 +437,27 @@ unit tests. Nothing here decrypts.
 +  // SHA-256(host_key) (version >= 24).
 +  int meta_version = 0;
 +  std::vector<CookieDbRow> rows;
++  // True if the table had more rows than CookieDbReadLimits::max_rows. `rows`
++  // then holds the first max_rows in SQLite's order, and the rest were never
++  // read. The caller can still import those and say that some were left out.
++  bool rows_truncated = false;
++};
++
++// How much ReadCookieDbRows() takes from a source DB. A real cookie store is a
++// few MB with a few thousand rows, so anything far past these isn't one, and
++// copying or loading it would only cost disk and memory.
++struct CookieDbReadLimits {
++  // The largest DB file, and the largest -wal or -shm file, that is copied.
++  int64_t max_file_bytes = 256 * 1024 * 1024;
++  // Rows past this many are left unread, and the snapshot says so.
++  size_t max_rows = 100'000;
 +};
 +
 +enum class CookieDbReadError {
 +  kSourceMissing,
++  // The DB, its -wal, or its -shm is larger than
++  // CookieDbReadLimits::max_file_bytes. Nothing is read.
++  kSourceTooLarge,
 +  kTempDirFailed,
 +  kCopyFailed,
 +  kOpenFailed,
@@ -410,23 +467,26 @@ unit tests. Nothing here decrypts.
 +};
 +
 +// Copies `cookies_db` and any `-wal` / `-shm` siblings into a fresh private
-+// (0700) temp directory, opens the copy read-only, and returns every row.
-+// The source files are only ever opened for reading, by the copy. The temp
-+// directory is deleted before returning.
++// (0700) temp directory, opens the copy read-only, and returns its rows, up
++// to `limits`. The source files are only ever opened for reading, by the copy.
++// The temp directory is deleted before returning.
 +//
 +// Required columns: host_key, name, value, encrypted_value, path. Every other
 +// column is optional and looked up by name.
 +//
 +// Blocking. Call on a sequence that allows blocking IO.
 +base::expected<CookieDbSnapshot, CookieDbReadError> ReadCookieDbRows(
-+    const base::FilePath& cookies_db);
++    const base::FilePath& cookies_db,
++    const CookieDbReadLimits& limits = CookieDbReadLimits());
 +
 +}  // namespace rac::import
 +
 +#endif  // CHROME_BROWSER_RAC_IMPORT_COOKIE_DB_ROWS_H_
+Index: src/chrome/browser/rac/import/cookie_db_rows_unittest.cc
+===================================================================
 --- /dev/null
-+++ b/chrome/browser/rac/import/cookie_db_rows_unittest.cc
-@@ -0,0 +1,305 @@
++++ src/chrome/browser/rac/import/cookie_db_rows_unittest.cc
+@@ -0,0 +1,379 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -434,6 +494,7 @@ unit tests. Nothing here decrypts.
 +#include "chrome/browser/rac/import/cookie_db_rows.h"
 +
 +#include <cstdint>
++#include <optional>
 +#include <string>
 +#include <string_view>
 +#include <vector>
@@ -725,6 +786,79 @@ unit tests. Nothing here decrypts.
 +              result.error() == CookieDbReadError::kNoCookiesTable);
 +}
 +
++std::vector<FixtureCookieRow> NumberedRows(int count) {
++  std::vector<FixtureCookieRow> rows;
++  for (int i = 0; i < count; ++i) {
++    FixtureCookieRow row;
++    row.host_key = "example.com";
++    row.name = "c" + base::NumberToString(i);  // Unique for the index.
++    row.value = "v";
++    rows.push_back(row);
++  }
++  return rows;
++}
++
++// Rows past the cap are left unread, and the snapshot says some were.
++TEST_F(CookieDbRowsFileTest, StopsAtRowCap) {
++  {
++    auto fixture = CookieFixtureDb::Create(db_path_, {});
++    ASSERT_TRUE(fixture);
++    ASSERT_TRUE(fixture->AddRows(NumberedRows(5)));
++  }
++
++  auto capped = ReadCookieDbRows(db_path_, {.max_rows = 3});
++  ASSERT_TRUE(capped.has_value());
++  EXPECT_EQ(3u, capped->rows.size());
++  EXPECT_TRUE(capped->rows_truncated);
++
++  // Exactly at the cap is not truncated.
++  auto exact = ReadCookieDbRows(db_path_, {.max_rows = 5});
++  ASSERT_TRUE(exact.has_value());
++  EXPECT_EQ(5u, exact->rows.size());
++  EXPECT_FALSE(exact->rows_truncated);
++
++  auto uncapped = ReadCookieDbRows(db_path_);
++  ASSERT_TRUE(uncapped.has_value());
++  EXPECT_EQ(5u, uncapped->rows.size());
++  EXPECT_FALSE(uncapped->rows_truncated);
++}
++
++TEST_F(CookieDbRowsFileTest, RefusesDbOverSizeCap) {
++  {
++    auto fixture = CookieFixtureDb::Create(db_path_, {});
++    ASSERT_TRUE(fixture);
++    ASSERT_TRUE(fixture->AddRow(FullRow()));
++  }
++  std::optional<int64_t> size = base::GetFileSize(db_path_);
++  ASSERT_TRUE(size);
++
++  EXPECT_EQ(CookieDbReadError::kSourceTooLarge,
++            ReadCookieDbRows(db_path_, {.max_file_bytes = *size - 1}).error());
++  auto at_cap = ReadCookieDbRows(db_path_, {.max_file_bytes = *size});
++  ASSERT_TRUE(at_cap.has_value());
++  EXPECT_EQ(1u, at_cap->rows.size());
++}
++
++// The -wal is capped on its own: a small DB with a large -wal is refused.
++TEST_F(CookieDbRowsFileTest, RefusesWalOverSizeCap) {
++  auto fixture = CookieFixtureDb::Create(db_path_, {.wal_mode = true});
++  ASSERT_TRUE(fixture);
++  ASSERT_TRUE(fixture->AddRows(NumberedRows(2000)));
++  const base::FilePath wal(db_path_.value() + FILE_PATH_LITERAL("-wal"));
++  const base::FilePath shm(db_path_.value() + FILE_PATH_LITERAL("-shm"));
++  std::optional<int64_t> db_size = base::GetFileSize(db_path_);
++  std::optional<int64_t> wal_size = base::GetFileSize(wal);
++  std::optional<int64_t> shm_size = base::GetFileSize(shm);
++  ASSERT_TRUE(db_size && wal_size && shm_size);
++  // Only the -wal is over the cap below.
++  ASSERT_LT(*db_size, *wal_size);
++  ASSERT_LT(*shm_size, *wal_size);
++
++  EXPECT_EQ(
++      CookieDbReadError::kSourceTooLarge,
++      ReadCookieDbRows(db_path_, {.max_file_bytes = *wal_size - 1}).error());
++}
++
 +TEST_F(CookieDbRowsFileTest, FixtureRejectsUnsupportedVersion) {
 +  EXPECT_FALSE(CookieFixtureDb::Create(db_path_, {.meta_version = 22}));
 +  EXPECT_FALSE(base::PathExists(db_path_));
@@ -732,8 +866,10 @@ unit tests. Nothing here decrypts.
 +
 +}  // namespace
 +}  // namespace rac::import
+Index: src/chrome/browser/rac/import/cookie_fixture_db.cc
+===================================================================
 --- /dev/null
-+++ b/chrome/browser/rac/import/cookie_fixture_db.cc
++++ src/chrome/browser/rac/import/cookie_fixture_db.cc
 @@ -0,0 +1,166 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
@@ -901,8 +1037,10 @@ unit tests. Nothing here decrypts.
 +}
 +
 +}  // namespace rac::import::test
+Index: src/chrome/browser/rac/import/cookie_fixture_db.h
+===================================================================
 --- /dev/null
-+++ b/chrome/browser/rac/import/cookie_fixture_db.h
++++ src/chrome/browser/rac/import/cookie_fixture_db.h
 @@ -0,0 +1,93 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
