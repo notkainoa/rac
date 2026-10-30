@@ -124,8 +124,11 @@ passes on `build/src` and saves the files it changes in
 `build/src/.rac_names/`, so `dev_names.py unsub` can put them back.
 `devutils/rac/worktree.sh sync` keeps this up to date: it reverts the names
 before quilt pops or pushes patches, then applies them again. Applying them
-takes about a minute, and the next build redoes the string packs (about 500
-steps). Dev trees skip Helium's translations of its own strings, so those
+takes about a minute. String files a patch didn't change keep their mtimes
+across the sync, so the next build redoes only the string packs a patch
+really changed. If the tree was built in the middle of a sync, the saved
+mtimes are dropped and the next build reruns the string steps (about 500)
+once. Dev trees skip Helium's translations of its own strings, so those
 show in English in other languages.
 
 While the names are applied, string files (`.grd`, `.grdp`, `.xtb`) in
