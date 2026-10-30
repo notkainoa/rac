@@ -34,7 +34,7 @@
  action("emoji_data_inc") {
 --- /dev/null
 +++ b/chrome/browser/ui/views/rac/motion/rac_spring.cc
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,296 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -57,6 +57,10 @@
 +constexpr double kCriticalTolerance = 1e-9;
 +// Searches stop once the window is this small, in seconds.
 +constexpr double kSearchPrecision = 1e-10;
++// The most turns SettleTime walks through. A spring with a response of 1 ms
++// turns 120000 times in 60 s, so this is a backstop for NaN and other
++// numbers gone wrong; the time limit is what ends an undamped spring.
++constexpr int kMaxSettleTurns = 20000;
 +
 +double ToSeconds(base::TimeDelta time) {
 +  return std::max(0.0, time.InSecondsF());
@@ -233,8 +237,12 @@
 +  };
 +  // From rest the value only climbs until its first turn.
 +  double hi = NextTurn(motion, 0).value_or(response_);
++  const double longest = kLongestSettle.InSecondsF();
 +  while (!reached(hi)) {
 +    hi *= 2;
++    if (!(hi < longest)) {
++      return kLongestSettle;
++    }
 +  }
 +  return CeilToMicroseconds(Search(0, hi, reached));
 +}
@@ -268,7 +276,14 @@
 +    last_far = 0;
 +  }
 +  std::optional<double> next = NextTurn(*this, 0);
++  // An undamped spring never settles, so the walk ends at the time limit or
++  // the turn limit, whichever comes first, and reports the limit.
++  const double longest = Spring::kLongestSettle.InSecondsF();
++  int turns = 0;
 +  while (next && !settled(*next)) {
++    if (!(*next < longest) || ++turns > kMaxSettleTurns) {
++      return Spring::kLongestSettle;
++    }
 +    last_far = *next;
 +    next = NextTurn(*this, *next);
 +  }
@@ -283,9 +298,13 @@
 +    hi = *last_far + spring.response();
 +    while (!settled(hi)) {
 +      hi += spring.response();
++      if (!(hi < longest)) {
++        return Spring::kLongestSettle;
++      }
 +    }
 +  }
-+  return CeilToMicroseconds(Search(*last_far, hi, settled));
++  return std::min(CeilToMicroseconds(Search(*last_far, hi, settled)),
++                  Spring::kLongestSettle);
 +}
 +
 +base::TimeDelta SpringMotion::RestTime(const RestRule& rule) const {
@@ -314,7 +333,7 @@
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/ui/views/rac/motion/rac_spring.h
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,131 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -322,6 +341,7 @@
 +#ifndef CHROME_BROWSER_UI_VIEWS_RAC_MOTION_RAC_SPRING_H_
 +#define CHROME_BROWSER_UI_VIEWS_RAC_MOTION_RAC_SPRING_H_
 +
++#include "base/check_op.h"
 +#include "base/time/time.h"
 +
 +namespace rac {
@@ -348,8 +368,26 @@
 +// actual place and speed.
 +class Spring {
 + public:
++  // The shortest response a spring keeps, in seconds.
++  static constexpr double kMinResponse = 0.001;
++  // The longest SettleTime() and SettleTime(distance) will report. A spring
++  // that has not settled by then, such as an undamped one, reports this.
++  static constexpr base::TimeDelta kLongestSettle = base::Seconds(60);
++
++  // `response` must be above 0 and `damping_ratio` must be 0 or more. A ratio
++  // of 0 is allowed and means an undamped spring, which swings forever and so
++  // never settles: SettleTime() reports kLongestSettle for it. That keeps
++  // the spring maths well defined at the edge of its range, and tests use it.
++  // Anything else (a response of 0 or less, a negative ratio, NaN) is a
++  // mistake in the caller. It DCHECKs, and in release builds is clamped to
++  // kMinResponse or to an undamped spring, so the maths below never divides
++  // by zero or returns NaN, and no search can hang.
 +  constexpr Spring(double response, double damping_ratio)
-+      : response_(response), damping_ratio_(damping_ratio) {}
++      : response_(ClampedResponse(response)),
++        damping_ratio_(ClampedRatio(damping_ratio)) {
++    DCHECK_GT(response, 0);
++    DCHECK_GE(damping_ratio, 0);
++  }
 +
 +  constexpr double response() const { return response_; }
 +  constexpr double damping_ratio() const { return damping_ratio_; }
@@ -361,9 +399,10 @@
 +  double ValueAt(base::TimeDelta time, double initial_velocity = 0) const;
 +  double VelocityAt(base::TimeDelta time, double initial_velocity = 0) const;
 +  // From then on the value stays within `epsilon` of 1. SettleTime(0.01) is
-+  // the table's "within 1% at".
++  // the table's "within 1% at". At most kLongestSettle.
 +  base::TimeDelta SettleTime(double epsilon, double initial_velocity = 0) const;
-+  // When a move from rest first reaches `fraction`, such as 0.9.
++  // When a move from rest first reaches `fraction`, such as 0.9, or
++  // kLongestSettle if it takes longer.
 +  base::TimeDelta TimeToReach(double fraction) const;
 +  // How far past 1 a move from rest goes, as a fraction of the move. 0 for a
 +  // ratio of 1 or more.
@@ -372,6 +411,22 @@
 +  constexpr bool operator==(const Spring&) const = default;
 +
 + private:
++  // Written so NaN fails the comparison and is clamped too. Huge values are
++  // capped: the over- and underdamped forms lose all precision long before.
++  static constexpr double ClampedResponse(double response) {
++    if (!(response >= kMinResponse)) {
++      return kMinResponse;
++    }
++    return response <= kLargest ? response : kLargest;
++  }
++  static constexpr double ClampedRatio(double damping_ratio) {
++    if (!(damping_ratio >= 0)) {
++      return 0;
++    }
++    return damping_ratio <= kLargest ? damping_ratio : kLargest;
++  }
++  static constexpr double kLargest = 1e9;
++
 +  double response_;
 +  double damping_ratio_;
 +};
@@ -389,7 +444,8 @@
 +
 +  double OffsetAt(base::TimeDelta time) const;
 +  double VelocityAt(base::TimeDelta time) const;
-+  // From then on the offset stays within `distance` of rest.
++  // From then on the offset stays within `distance` of rest. Never more than
++  // Spring::kLongestSettle: an undamped motion never settles and reports that.
 +  base::TimeDelta SettleTime(double distance) const;
 +  // The first `rule.step` at which the motion is at rest under `rule`, or
 +  // `rule.longest`. With tokens::kSpringRest this is exactly what the space
