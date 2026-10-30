@@ -61,11 +61,26 @@ class DecideTest(unittest.TestCase):
         self.assertEqual((d.calls, d.text), ([], "Done reading."))
 
     def test_unresolved_step_stops_instead_of_guessing(self):
-        script = {"steps": [{"tool": "click", "args": {"ref": {"ref_of": "link \"Nope\""}}}], "final": "x"}
+        script = {"steps": [{"tool": "click", "args": {"ref": {"find": "never-seen"}}}], "final": "x"}
         msgs = [{"role": "user", "content": "hi"}, assistant_call("c0", "snapshot"), tool_msg("c0", SNAP)]
         d = fake_model.decide({**script, "steps": [{"tool": "snapshot"}] + script["steps"]}, msgs)
         self.assertEqual(d.calls, [])
         self.assertIn("unresolved", d.notes[0])
+
+    def test_unresolved_page_spec_waits_for_the_page(self):
+        script = {"steps": [{"tool": "click", "args": {"ref": {"ref_of": "link \"Nope\""}}}], "final": "x"}
+        msgs = [{"role": "user", "content": "hi"}, assistant_call("c0", "snapshot"), tool_msg("c0", SNAP)]
+        script = {**script, "steps": [{"tool": "snapshot"}] + script["steps"]}
+        d = fake_model.decide(script, msgs)
+        self.assertEqual([c["name"] for c in d.calls], ["wait_for_settle"])
+        self.assertIn("unresolved", d.notes[0])
+        # The wait is bounded: after three the turn really does end.
+        for i in range(1, 4):
+            msgs += [assistant_call(f"w{i}", "wait_for_settle"),
+                     tool_msg(f"w{i}", '{"ok": true, "data": {"text": ""}}')]
+        d = fake_model.decide(script, msgs)
+        self.assertEqual(d.calls, [])
+        self.assertEqual(d.text, "x")
 
     def test_optional_step_is_skipped_and_position_stays_consistent(self):
         script = {"steps": [

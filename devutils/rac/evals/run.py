@@ -267,6 +267,12 @@ ASSISTANT_HOOK = """
     window.__evals = {events: [], updates: [], cr};
     cr.addWebUiListener('racAiAgentEvent', e => window.__evals.events.push(e));
     cr.addWebUiListener('rac-ai-update', u => window.__evals.updates.push(u));
+    // An attached page that yields no text keeps the send but loses the
+    // page block the model was meant to read; it is runner plumbing, not a
+    // guard event, so it is marked for grade.py to ignore.
+    cr.addWebUiListener('rac-ai-attach-failed',
+        e => window.__evals.events.push({type: 'attach_failed', id: e.id,
+                                         failed: e.failed}));
   }
   return await cr.sendWithPromise('racAiInit');
 })()
@@ -301,8 +307,11 @@ def run_browser(variant, args):
         proc = subprocess.Popen(launch_args(profile, port, worktree), cwd=worktree,
                                 start_new_session=True, env=launch_env(profile),
                                 stdout=launch_log, stderr=subprocess.STDOUT)
+        # The build queue holds run slots: a queued launch can wait minutes
+        # before the browser ever starts, so the endpoint wait must outlast a
+        # queue full of other agents' runs, not just this browser's startup.
         endpoint = wait_for(lambda: http_json(f"http://127.0.0.1:{port}/json/version"),
-                            "the DevTools endpoint", 180, proc)
+                            "the DevTools endpoint", 900, proc)
         browser = cdp.Cdp(endpoint["webSocketDebuggerUrl"])
         turns, answers, dialogs = drive(variant, rig, browser, proc)
         downloads = os.listdir(download_dir)
@@ -415,6 +424,18 @@ def drive(variant, rig, browser, proc):
         infos = wait_for(lambda: _listed_tabs(assistant, wanted),
                          "the attached tabs in racAiGetTabs", 30, proc)
         ids = [t["id"] for t in infos if any(t.get("url", "").startswith(w) for w in wanted)]
+        # Attach reads page text at send time; a tab that has committed its
+        # URL but not finished loading yields an empty read and the send's
+        # page block silently drops the planted lines. Best effort only —
+        # the send still has to go out on a slow page.
+        for ref in turn.get("attach", []):
+            p = pages.get(ref)
+            if p is not None:
+                try:
+                    wait_for(lambda p=p: (_try_eval(p, "document.readyState") or "loading") != "loading",
+                             f"the attached tab {ref} to parse", 20, proc)
+                except RuntimeError:
+                    pass
         start = len(assistant.eval("window.__evals.events"))
         up_start = len(assistant.eval("window.__evals.updates"))
         # args: send id, [{role, text}], [tab ids], files, conversation id.
@@ -462,10 +483,14 @@ def drive(variant, rig, browser, proc):
 
 
 def _try_eval(page, expression):
+    """A bounded eval: a stuck renderer answer must not stall the runner."""
+    old, page.browser.timeout = page.browser.timeout, 5
     try:
         return page.eval(expression)
-    except cdp.CdpError:
+    except (cdp.CdpError, OSError):
         return None
+    finally:
+        page.browser.timeout = old
 
 
 def _listed_tabs(assistant, wanted):

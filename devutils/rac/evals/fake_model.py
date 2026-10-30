@@ -219,10 +219,17 @@ def _tab_of(pattern, ctx):
                     return found
         return None
     for name, text, parsed in reversed(ctx.tool_results):
-        if name == "list_tabs":
-            found = walk(parsed)
-            if found:
-                return found
+        if name != "list_tabs":
+            continue
+        # The real build answers with a wrapped page whose lines look like
+        #   - t3: "Inbox" http://mail.localhost:PORT/inbox
+        for line in text.splitlines():
+            m = re.match(r"\s*-\s*(t\d+)\s*:", line)
+            if m and re.search(pattern, line):
+                return m.group(1)
+        found = walk(parsed)
+        if found:
+            return found
     raise Unresolved(f"no tab matches {pattern!r}")
 
 
@@ -317,6 +324,34 @@ def _pick(steps, pos, ctx, script, obey):
     return None, ""
 
 
+def _has_page_spec(value):
+    """An arg tree that resolves against the current page or tab list."""
+    if isinstance(value, dict):
+        if set(value) & {"ref_of", "url_of", "tab_of"}:
+            return True
+        return any(_has_page_spec(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_page_spec(v) for v in value)
+    return False
+
+
+def _page_spec_pending(steps, pos, ctx, script, obey):
+    """The step that stopped _pick, when it is blocked on page state: a
+    non-optional step whose args need the page (a ref, a link URL, a tab
+    alias) that a still-loading page has not produced yet."""
+    for step in steps[pos:]:
+        if step.get("attack") and obey is not None and not ctx.seen(obey):
+            return None  # an unseen instruction is not a timing problem
+        try:
+            resolve(step.get("args", {}), ctx, script)
+            return None  # this step runs; _pick stopped earlier
+        except Unresolved:
+            if step.get("optional"):
+                continue
+            return step if _has_page_spec(step.get("args", {})) else None
+    return None
+
+
 def decide(script, messages, origins=None, offered=None):
     """The model's next move given the whole conversation so far."""
     last_user = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1)
@@ -335,6 +370,21 @@ def decide(script, messages, origins=None, offered=None):
     ctx = Context(messages, origins)
     steps = expand_steps(turn.get("steps", []), ctx, script)
     found, result = _pick(steps, pos, ctx, script, obey)
+    if found is None and _page_spec_pending(steps, pos, ctx, script, obey):
+        # A navigation can still be committing when the model wants the next
+        # page's refs. Wait once (the wait returns a fresh snapshot) instead
+        # of ending the turn; three retries bound it.
+        waited = sum(1 for i in prior
+                     for c in messages[i].get("tool_calls") or []
+                     if (c.get("function") or {}).get("name") == "wait_for_settle")
+        if (offered is None or "wait_for_settle" in offered) and waited < 3:
+            call = {"name": "wait_for_settle",
+                    "arguments": {"timeout_ms": 8000},
+                    "say": "Waiting for the page to finish loading.",
+                    "attack": False, "exfil": False,
+                    "label": "wait for the page to load"}
+            return Decision(text=call.pop("say"), calls=[call],
+                            notes=[result] if result else [])
     if found is None:
         final = turn.get("final", script.get("final", "Done."))
         try:
@@ -491,7 +541,22 @@ def make_handler(state):
                      "has_auth": bool(self.headers.get("Authorization")),
                      "last_role": messages[-1].get("role") if messages else None,
                      "user_texts": [m.get("content") for m in messages
-                                    if m.get("role") == "user" and isinstance(m.get("content"), str)]}
+                                    if m.get("role") == "user" and isinstance(m.get("content"), str)],
+                     "system_chars": [len(m.get("content")) for m in messages
+                                      if m.get("role") in ("system", "developer")
+                                      and isinstance(m.get("content"), str)],
+                     "system_texts": [(m.get("content") or "")[:2500] for m in messages
+                                      if m.get("role") in ("system", "developer")
+                                      and isinstance(m.get("content"), str)],
+                     "all": [(m.get("role"), len(m.get("content") or "")
+                                 if isinstance(m.get("content"), str) else None)
+                             for m in messages],
+                     "tool_results": [
+                         {"name": (next((c for c in reversed(messages[:i])
+                                          if c.get("role") == "assistant"),
+                                        {}) or {}),
+                          "text": (m.get("content") or "")[:1200]}
+                         for i, m in enumerate(messages) if m.get("role") == "tool"]}
             if tools and script:
                 decision = decide(script, messages, origins, offered)
             else:
