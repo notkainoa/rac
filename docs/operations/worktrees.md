@@ -149,7 +149,10 @@ through the queue under `nice` with four cores left free,
 `run -- --rac-window-screenshot=x.png` for a background browser with its
 own profile (the shot lands in the clone's `build/shots/`), and `pull`
 files back. Nobody builds rac natively on the Pro: every build there
-goes through `remote-build.sh`.
+goes through `remote-build.sh`. An Xcode update on a build machine
+invalidates every tree built there (new compiler flags and SDK path), so
+keep Xcode pinned on build machines; `build`, `run` and `push` refuse when
+the Pro's Xcode differs from the one its base recorded.
 
 ## Updating the base
 
