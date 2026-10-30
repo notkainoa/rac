@@ -87,7 +87,7 @@ Index: src/chrome/browser/ui/rac/import/arc_dev_trigger.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/rac/import/arc_dev_trigger.cc
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,94 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -106,7 +106,6 @@ Index: src/chrome/browser/ui/rac/import/arc_dev_trigger.cc
 +#include "base/memory/weak_ptr.h"
 +#include "base/task/single_thread_task_runner.h"
 +#include "base/task/thread_pool.h"
-+#include "base/time/time.h"
 +#include "base/types/expected.h"
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/rac/import/arc_import_types.h"
@@ -124,9 +123,6 @@ Index: src/chrome/browser/ui/rac/import/arc_dev_trigger.cc
 +
 +// Not in release builds.
 +constexpr char kImportArcNowSwitch[] = "rac-import-arc-now";
-+// Long enough for the first window to be up, so the importer can show the
-+// first imported space in it.
-+constexpr base::TimeDelta kStartDelay = base::Seconds(3);
 +
 +bool g_started = false;
 +
@@ -165,16 +161,23 @@ Index: src/chrome/browser/ui/rac/import/arc_dev_trigger.cc
 +
 +#endif  // BUILDFLAG(RAC_DEV_SWITCHES)
 +
++bool DevArcImportRequested() {
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(
++      kImportArcNowSwitch);
++#else
++  return false;
++#endif  // BUILDFLAG(RAC_DEV_SWITCHES)
++}
++
 +void MaybeStartDevArcImport(Profile* profile) {
 +#if BUILDFLAG(RAC_DEV_SWITCHES)
-+  if (g_started || !profile->IsRegularProfile() ||
-+      !base::CommandLine::ForCurrentProcess()->HasSwitch(
-+          kImportArcNowSwitch)) {
++  if (g_started || !profile->IsRegularProfile() || !DevArcImportRequested()) {
 +    return;
 +  }
 +  g_started = true;
-+  base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
-+      FROM_HERE, base::BindOnce(&Start, profile->GetWeakPtr()), kStartDelay);
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&Start, profile->GetWeakPtr()));
 +#endif  // BUILDFLAG(RAC_DEV_SWITCHES)
 +}
 +
@@ -183,7 +186,7 @@ Index: src/chrome/browser/ui/rac/import/arc_dev_trigger.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/rac/import/arc_dev_trigger.h
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,26 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -195,11 +198,16 @@ Index: src/chrome/browser/ui/rac/import/arc_dev_trigger.h
 +
 +namespace rac {
 +
++// Dev builds only: true when the process was launched with the Arc import
++// switch. The spaces store loads at a higher priority then, because an
++// import is waiting on it. Always false in release builds.
++bool DevArcImportRequested();
++
 +// Dev builds only. With --rac-import-arc-now, imports Arc into `profile`,
-+// reading from --rac-import-source-root, a few seconds after startup, once
-+// per run. It exists so the sidebar can be screenshotted before and after an
-+// import without clicking through the import screens. Does nothing in
-+// release builds, where the switch doesn't exist.
++// reading from --rac-import-source-root, as soon as the spaces store is
++// loaded, once per run. It exists so the sidebar can be screenshotted
++// before and after an import without clicking through the import screens.
++// Does nothing in release builds, where the switch doesn't exist.
 +void MaybeStartDevArcImport(Profile* profile);
 +
 +}  // namespace rac
@@ -209,7 +217,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/rac/import/arc_importer.cc
-@@ -0,0 +1,1413 @@
+@@ -0,0 +1,1433 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -268,6 +276,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
 +#include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
 +#include "chrome/browser/ui/rac/spaces/spaces_window_manager_factory.h"
 +#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/common/webui_url_constants.h"
 +#include "chrome/grit/generated_resources.h"
 +#include "components/favicon/core/favicon_service.h"
 +#include "components/favicon_base/favicon_types.h"
@@ -327,11 +336,15 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
 +  return services;
 +}
 +
-+// Same test as SpacesWindowManager's IsUnusedInitialTab().
++// Same idea as SpacesWindowManager's IsUnusedInitialTab(), with the
++// URL-only checks first: IsNTPOrRelatedURL needs the default search
++// provider, which can still be loading this early in a cold start.
 +bool IsUnusedTab(tabs::TabInterface* tab, Profile* profile) {
 +  content::WebContents* contents = tab->GetContents();
++  const GURL& url = contents->GetVisibleURL();
 +  return contents->GetController().IsInitialBlankNavigation() ||
-+         search::IsNTPOrRelatedURL(contents->GetVisibleURL(), profile);
++         url.IsAboutBlank() || url == chrome::ChromeUINewTabURLAsGURL() ||
++         search::IsNTPURL(url) || search::IsNTPOrRelatedURL(url, profile);
 +}
 +
 +// The profile's only space, if a new profile would look like this: no name,
@@ -490,13 +503,18 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
 +    }
 +  }
 +  // A folder the run made goes when it's empty. One the user has since put
-+  // their own pins in is theirs, and stays.
++  // their own pins in is theirs, and stays; its mapping stays too, so a
++  // later import doesn't make it a second time.
 +  for (const std::string& id : record.ItemsOfRun(run.id, ItemKind::kFolder)) {
 +    const std::string key = FindFolderListKey(s, id);
-+    if (!key.empty() && s.items->GetList(key).FindFolder(id)->items.empty()) {
-+      s.items->RemoveFolder(id);
++    if (key.empty()) {
++      result.removed.insert(id);
++      continue;
 +    }
-+    result.removed.insert(id);
++    if (s.items->GetList(key).FindFolder(id)->items.empty()) {
++      s.items->RemoveFolder(id);
++      result.removed.insert(id);
++    }
 +  }
 +  return result;
 +}
@@ -941,6 +959,13 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
 +      Fail(ArcImportFailure::kRecordNotSaved);
 +      return;
 +    }
++    if (!saved && !wrote_sidebar) {
++      // The nothing-new run's record couldn't be saved, so the hand-offs
++      // and other profiles' names it held are gone. Report it and carry on
++      // to favicons and history.
++      result_.status = ArcProfileResult::Status::kFailed;
++      result_.failure = ArcImportFailure::kRecordNotSaved;
++    }
 +    if (wrote_sidebar) {
 +      operation_->MarkDataChanged();
 +    }
@@ -1259,11 +1284,14 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
 +    } else {
 +      result_.status = ArcImportResult::Status::kNothingNew;
 +    }
-+    // Hand-offs live only in the starting profile's record.
++    // Hand-offs live only in the starting profile's record. A nothing-new
++    // run writes that record only when other profiles' names had to go
++    // into it for Undo.
 +    result_.handoffs_saved =
 +        origin_result_ &&
 +        (origin_result_->status == ArcProfileResult::Status::kDone ||
-+         origin_result_->status == ArcProfileResult::Status::kNothingNew) &&
++         (origin_result_->status == ArcProfileResult::Status::kNothingNew &&
++          !other_profiles_.empty())) &&
 +        (!plan_.handoffs.routing_rules_json.empty() ||
 +         !plan_.handoffs.auto_archive_raw.empty());
 +    std::move(done_).Run(result_);
@@ -2206,9 +2234,22 @@ Index: src/chrome/browser/ui/rac/spaces/spaces_window_manager.cc
  #include "chrome/browser/ui/rac/spaces/hidden_space.h"
  #include "chrome/browser/ui/rac/spaces/space_elsewhere_dialog.h"
  #include "chrome/browser/ui/rac/spaces/spaces_snapshot.h"
-@@ -952,6 +953,7 @@ void SpacesWindowManager::OnStoreReady()
-   for (auto& callback : ready_callbacks) {
-     std::move(callback).Run();
+@@ -134,8 +135,11 @@ SpacesWindowManager::SpacesWindowManager
+     : profile_(profile), spaces_(spaces), store_(profile_->GetPath()) {
+   CHECK(profile_);
+   CHECK(spaces_);
++  // BEST_EFFORT unless a dev import is waiting on the store.
+   store_.LoadAsync(base::BindOnce(&SpacesWindowManager::OnStoreReady,
+-                                  weak_ptr_factory_.GetWeakPtr()));
++                                  weak_ptr_factory_.GetWeakPtr()),
++                   DevArcImportRequested() ? base::TaskPriority::USER_VISIBLE
++                                           : base::TaskPriority::BEST_EFFORT);
+   ProfileBrowserCollection* collection =
+       ProfileBrowserCollection::GetForProfile(profile_);
+   browser_collection_observation_.Observe(collection);
+@@ -958,6 +962,7 @@ void SpacesWindowManager::OnStoreReady()
+       return;
+     }
    }
 +  MaybeStartDevArcImport(profile_);
  }
