@@ -2,7 +2,7 @@ Rolling backups of the profile's sidebar data, with the restore plan and the
 profile-keyed factory. The restore UI and the registration hooks come later.
 --- a/chrome/browser/prefs/BUILD.gn
 +++ b/chrome/browser/prefs/BUILD.gn
-@@ -107,6 +107,7 @@
+@@ -107,6 +107,7 @@ source_set("impl") {
      "//chrome/browser/rac/import:arc_source",
      "//chrome/browser/rac/pip",
      "//chrome/browser/rac/spaces",
@@ -74,7 +74,7 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +}
 --- /dev/null
 +++ b/chrome/browser/rac/storage/data_backups.cc
-@@ -0,0 +1,1266 @@
+@@ -0,0 +1,1283 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -425,12 +425,14 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  return backups;
 +}
 +
-+// When a backup stops being kept. Daily backups are kept by count instead.
++// When a backup stops being kept. A daily backup expires too, once it passes
++// kDailyLifetime, on top of the count cap.
 +//
 +// A snapshot's lifetime starts at the older of the time in its name and its
 +// file's time, so neither a renamed file nor a skewed name keeps open-tab
-+// URLs longer. A pre-reset copy's starts when it became one (rotation sets
-+// its file time), so the copy an offer points at always outlives the offer.
++// URLs longer. A daily's starts the same way. A pre-reset copy's starts when
++// it became one (rotation sets its file time), so the copy an offer points
++// at always outlives the offer.
 +//
 +// If the start is more than kClockSkewAllowance in the future, the clock
 +// moved back since it was written. The lifetime then restarts now, recorded
@@ -441,7 +443,8 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  base::Time start = std::min(file.created, file.modified);
 +  switch (file.kind) {
 +    case Kind::kDaily:
-+      return std::nullopt;
++      lifetime = DataBackups::kDailyLifetime;
++      break;
 +    case Kind::kPreReset:
 +      lifetime = DataBackups::kPreResetLifetime;
 +      start = file.modified;
@@ -645,11 +648,10 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +
 +// Runs once per `Preferences`, when kInitializedPref is unset. Backup files
 +// then mean `Preferences` was reset: every daily backup becomes a pre-reset
-+// copy, so nothing written from now on can replace it. If the live sidebar
-+// is empty, the newest backup with data in it is offered.
-+ResetCheck CheckForReset(const base::FilePath& dir,
-+                         bool live_empty,
-+                         base::Time now) {
++// copy, so nothing written from now on can replace it. The newest backup
++// with data in it is offered even if the live sidebar isn't empty, because
++// restoring merges with whatever is there.
++ResetCheck CheckForReset(const base::FilePath& dir, base::Time now) {
 +  ResetCheck result;
 +  std::vector<BackupFile> backups = ListBackups(dir);
 +  if (backups.empty()) {
@@ -673,9 +675,6 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +      LOG(ERROR) << "rac: couldn't keep a backup from before a reset";
 +      result.rotated = false;
 +    }
-+  }
-+  if (!live_empty) {
-+    return result;
 +  }
 +  std::optional<DataBackups::Contents> best =
 +      NewestWithData(dir, now, /*skip_id=*/std::string_view());
@@ -909,10 +908,11 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +    }
 +  }
 +  if (!prefs_->GetBoolean(kInitializedPref)) {
-+    PostFileTask(base::BindOnce(&CheckForReset, dir_, IsLiveEmpty(), Now()),
++    PostFileTask(base::BindOnce(&CheckForReset, dir_, Now()),
 +                 base::BindOnce(&DataBackups::DidCheckForReset,
 +                                weak_factory_.GetWeakPtr()));
 +  }
++  startup_prune_time_ = Now() + kStartupPruneDelay;
 +  startup_run_time_ = Now() + kStartupDelay;
 +  ScheduleWork(kStartupDelay);
 +}
@@ -1039,7 +1039,7 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  file.Set(kPrefsKey, CapturePrefs());
 +
 +  // For this session only. If the browser quits first, the prune at the next
-+  // launch's kStartupDelay deletes it.
++  // launch's kStartupPruneDelay deletes it.
 +  const base::Time expiry = created + kSnapshotLifetime;
 +  next_expiry_ = next_expiry_ ? std::min(*next_expiry_, expiry) : expiry;
 +
@@ -1173,9 +1173,10 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  if (result.rotated) {
 +    prefs_->SetBoolean(kInitializedPref, true);
 +  }
-+  // The user may have started over while the files were read. Then there's
-+  // nothing to offer: a restore would replace what they just made.
-+  if (result.offer && !restore_offer_ && IsLiveEmpty()) {
++  // The offer stands even if the sidebar filled in while the files were
++  // read: restoring merges, so it replaces nothing. An offer already stored
++  // in prefs still wins.
++  if (result.offer && !restore_offer_) {
 +    SetRestoreOffer(std::move(result.offer));
 +  }
 +  ScheduleWork(kMinRunInterval);
@@ -1221,8 +1222,11 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +void DataBackups::ScheduleWork(base::TimeDelta min_delay) {
 +  const base::Time now = Now();
 +  base::Time due = base::Time::Max();
-+  if (!startup_run_time_.is_null()) {
-+    // Nothing runs before the first run, which handles everything due.
++  if (!startup_prune_time_.is_null()) {
++    // The early startup prune goes first, at its own time.
++    due = startup_prune_time_;
++  } else if (!startup_run_time_.is_null()) {
++    // Nothing runs before the first full run, which handles everything due.
 +    due = startup_run_time_;
 +  } else {
 +    due = std::min(due, DailyDueTime());
@@ -1238,14 +1242,27 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +    timer_.Stop();
 +    return;
 +  }
-+  timer_.Start(FROM_HERE, std::max(due, now + min_delay),
++  // The startup prune keeps its due time; anything else waits at least
++  // min_delay so replies don't thrash the timer.
++  const base::Time at = !startup_prune_time_.is_null()
++                            ? due
++                            : std::max(due, now + min_delay);
++  timer_.Start(FROM_HERE, at,
 +               base::BindOnce(&DataBackups::RunScheduledWork,
 +                              base::Unretained(this)));
 +}
 +
 +void DataBackups::RunScheduledWork() {
 +  const base::Time now = Now();
-+  startup_run_time_ = base::Time();
++  // A run while the early prune is still pending and before the first full
++  // run only prunes. The full run still happens at kStartupDelay, and
++  // nothing else runs before it.
++  const bool prune_only =
++      !startup_prune_time_.is_null() && now < startup_run_time_;
++  startup_prune_time_ = base::Time();
++  if (!prune_only) {
++    startup_run_time_ = base::Time();
++  }
 +  if (restore_offer_ && now >= OfferLapseTime()) {
 +    // Nobody answered. It lapses as if dismissed; the pre-reset copy stays.
 +    SetRestoreOffer(std::nullopt);
@@ -1253,7 +1270,7 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  std::optional<std::pair<std::string, base::DictValue>> daily;
 +  bool daily_attempted = false;
 +  // An import, Undo, or restore schedules a daily for when it ends.
-+  if (!operation_running_ && DailyDueTime() <= now) {
++  if (!prune_only && !operation_running_ && DailyDueTime() <= now) {
 +    if (IsLiveEmpty()) {
 +      // Never back up an empty sidebar, and don't wake up to check again.
 +      WaitForSidebarData();
@@ -1343,7 +1360,7 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/rac/storage/data_backups.h
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,404 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1397,7 +1414,7 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +//   "Undo import" lasts, so open-tab URLs are never kept longer than that.
 +// - Daily backups hold the backed-up prefs only: spaces, themes, pinned tabs,
 +//   favorites, and agent site rules. No open tabs. The newest
-+//   kDailyGenerations are kept.
++//   kDailyGenerations are kept, and none past kDailyLifetime.
 +// - Pre-reset copies. When `Preferences` turns out to have been reset (see
 +//   kInitializedPref), every daily backup is renamed to a pre-reset copy and
 +//   kept kPreResetLifetime, so nothing written after the reset can replace
@@ -1408,9 +1425,11 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +// restore itself goes through SpacesService and SidebarItems, in
 +// DataRestorer, because they keep the live copy of this data.
 +//
-+// While the live data is fine, startup does no file work here: everything the
-+// service needs to decide is already in prefs. All methods must be called on
-+// the UI thread. Files are read and written on a background sequence.
++// While the live data is fine, deciding takes no file work: everything the
++// service needs is already in prefs. The only file task before the first
++// full run is the early prune at kStartupPruneDelay. All methods must be
++// called on the UI thread. Files are read and written on a background
++// sequence.
 +class DataBackups : public KeyedService {
 + public:
 +  // The newest format this build writes, and the oldest build that can read
@@ -1428,11 +1447,17 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  static constexpr base::TimeDelta kDailyInterval = base::Days(1);
 +  // Daily backups kept, newest first. About this many days of history.
 +  static constexpr size_t kDailyGenerations = 3;
++  // No daily backup is kept past this, however few are left.
++  static constexpr base::TimeDelta kDailyLifetime = base::Days(30);
 +  // How long an unanswered restore offer stays. The backup it points at is a
 +  // pre-reset copy, which outlives it.
 +  static constexpr base::TimeDelta kRestoreOfferLifetime = base::Days(7);
-+  // Scheduled work first runs this long after the service is created, so it
-+  // never competes with startup. That run always prunes expired files.
++  // An even earlier run that only prunes, so an expired file is gone seconds
++  // after launch instead of minutes.
++  static constexpr base::TimeDelta kStartupPruneDelay = base::Seconds(10);
++  // Scheduled work's first full run is this long after the service is
++  // created, so it never competes with startup. Every run prunes expired
++  // files; this one also takes the daily backup.
 +  static constexpr base::TimeDelta kStartupDelay = base::Minutes(2);
 +  // After an import or a restore, the daily backup is refreshed this soon.
 +  static constexpr base::TimeDelta kDailyAfterChangeDelay = base::Minutes(1);
@@ -1537,8 +1562,10 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  static constexpr size_t kMaxSummaryEmojiBytes = 32;
 +
 +  // "Restore your spaces from <created>." Made once, when a reset is found
-+  // and the live sidebar is empty. It points at a pre-reset copy, which
-+  // outlives the offer. The UI shows it while ShouldShowRestoreOffer().
++  // and a backup with data exists. It doesn't wait for an empty sidebar,
++  // because restoring merges with what's there. It points at a pre-reset
++  // copy, which outlives the offer. The UI shows it while
++  // ShouldShowRestoreOffer().
 +  struct RestoreOffer {
 +    std::string backup_id;
 +    base::Time created;
@@ -1716,8 +1743,11 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  bool operation_running_ = false;
 +  // Keeps snapshot ids unique when two are taken in the same millisecond.
 +  base::Time last_snapshot_time_;
-+  // The first scheduled run, which always prunes. Null once it has run.
++  // The first full scheduled run. Null once it has run.
 +  base::Time startup_run_time_;
++  // The earlier prune-only run. While it's pending it's the next due time,
++  // and a run before startup_run_time_ only prunes. Null once it has run.
++  base::Time startup_prune_time_;
 +  // When the next pre-reset copy or snapshot expires, from the last prune.
 +  std::optional<base::Time> next_expiry_;
 +  // A daily backup due sooner than usual, after an import or a restore.
@@ -1857,7 +1887,7 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +#endif  // CHROME_BROWSER_RAC_STORAGE_DATA_BACKUPS_FACTORY_H_
 --- /dev/null
 +++ b/chrome/browser/rac/storage/data_backups_unittest.cc
-@@ -0,0 +1,1380 @@
+@@ -0,0 +1,1449 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -2459,12 +2489,14 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  EXPECT_FALSE(ReadContents(*backups, *id));
 +}
 +
-+// The expiry isn't kept anywhere that a crash could lose: the first run
-+// after every launch prunes, so a snapshot left by a session that never got
-+// to delete it goes kStartupDelay after the next launch.
-+TEST_F(DataBackupsTest, PrunesExpiredSnapshotsAtStartupDelay) {
++// The expiry isn't kept anywhere that a crash could lose: a prune-only run
++// goes seconds after every launch, so a snapshot left by a session that
++// never got to delete it goes at kStartupPruneDelay, before the first full
++// run.
++TEST_F(DataBackupsTest, StartupPruneDeletesExpiredSnapshots) {
 +  std::optional<std::string> id;
 +  {
++    SetUserData();
 +    std::unique_ptr<DataBackups> backups = Make();
 +    id = TakeSnapshot(*backups, kImportReason);
 +    ASSERT_TRUE(id);
@@ -2475,8 +2507,13 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  std::unique_ptr<DataBackups> backups = Make();
 +  task_environment_.RunUntilIdle();
 +  EXPECT_TRUE(FileExists(BackupFile(*id)));
-+  FastForward(DataBackups::kStartupDelay);
++  FastForward(DataBackups::kStartupPruneDelay + base::Seconds(1));
 +  EXPECT_FALSE(FileExists(BackupFile(*id)));
++  // The early run only prunes; the daily backup still waits for
++  // kStartupDelay.
++  EXPECT_TRUE(Ids("daily-").empty());
++  FastForward(DataBackups::kStartupDelay);
++  EXPECT_EQ(Ids("daily-").size(), 1u);
 +}
 +
 +// A snapshot's lifetime is capped by its file's time too, so a file whose
@@ -2661,6 +2698,34 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  EXPECT_EQ(Ids("daily-").size(), DataBackups::kDailyGenerations);
 +}
 +
++// A daily backup older than kDailyLifetime is pruned even when it's well
++// inside the generation cap. A younger one stays.
++TEST_F(DataBackupsTest, DailyBackupExpiresAfterLifetime) {
++  base::SimpleTestClock test_clock;
++  test_clock.SetNow(RealisticTime());
++  // With the initialized flag set, no reset check renames these files.
++  prefs_.SetBoolean(DataBackups::kInitializedPref, true);
++  const base::Time now = test_clock.Now();
++  const std::string old_id = WriteDailyFile(
++      DataBackups::kMinReaderVersion,
++      now - DataBackups::kDailyLifetime - base::Days(1));
++  const std::string fresh_id = WriteDailyFile(
++      DataBackups::kMinReaderVersion,
++      now - DataBackups::kDailyLifetime + base::Days(1));
++  SetFileTime(BackupFile(old_id),
++              now - DataBackups::kDailyLifetime - base::Days(1));
++  SetFileTime(BackupFile(fresh_id),
++              now - DataBackups::kDailyLifetime + base::Days(1));
++
++  {
++    DataBackups backups(&prefs_, dir_.GetPath(), &test_clock);
++    backups.RunScheduledWorkForTesting();
++    Flush(backups);
++  }
++  EXPECT_FALSE(FileExists(BackupFile(old_id)));
++  EXPECT_TRUE(FileExists(BackupFile(fresh_id)));
++}
++
 +// After an import changes the data, the daily backup is refreshed
 +// kDailyAfterChangeDelay after the import ends, not a day later.
 +TEST_F(DataBackupsTest, DailyRefreshedSoonAfterImport) {
@@ -2701,10 +2766,10 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  EXPECT_EQ(Ids("daily-").size(), 1u);
 +}
 +
-+// While the live data is fine, startup does no file work at all, even with
-+// a stale `Preferences.bad` lying around. The first file work is the prune
-+// at kStartupDelay.
-+TEST_F(DataBackupsTest, StartupDoesNoFileWorkWhenDataIsFine) {
++// While the live data is fine, deciding takes no file work, even with a
++// stale `Preferences.bad` lying around. The first file task is the prune at
++// kStartupPruneDelay.
++TEST_F(DataBackupsTest, StartupDoesNoFileWorkBeforeEarlyPrune) {
 +  ASSERT_FALSE(WriteDaily().is_null());
 +  WriteTextFile(dir_.GetPath().AppendASCII("Preferences.bad"), "{ not json");
 +
@@ -2713,8 +2778,12 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  EXPECT_EQ(backups->file_tasks_posted_for_testing(), 0u);
 +  EXPECT_FALSE(backups->restore_offer());
 +
-+  FastForward(DataBackups::kStartupDelay - base::Seconds(1));
++  FastForward(DataBackups::kStartupPruneDelay - base::Seconds(1));
 +  EXPECT_EQ(backups->file_tasks_posted_for_testing(), 0u);
++
++  // The early run is the first file task, and it only prunes.
++  FastForward(base::Seconds(2));
++  EXPECT_EQ(backups->file_tasks_posted_for_testing(), 1u);
 +}
 +
 +// A new profile checks the backups folder once, finds nothing, and never
@@ -2768,6 +2837,36 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  EXPECT_EQ(stored->backup_id, offer.backup_id);
 +  EXPECT_EQ(stored->created, offer.created);
 +  backups->RemoveObserver(&observer);
++}
++
++// The offer doesn't wait for an empty sidebar, because restoring merges. A
++// reset found while the live sidebar already holds data is still offered.
++TEST_F(DataBackupsTest, OffersRestoreWhenSidebarIsNotEmpty) {
++  ASSERT_FALSE(WriteDaily().is_null());
++  ResetPreferences();
++  // Session restore and the window sync can repopulate the sidebar before
++  // the service is even created.
++  SetUserData();
++
++  std::unique_ptr<DataBackups> backups = Make();
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(backups->restore_offer());
++  EXPECT_EQ(backups->restore_offer()->counts, kUserDataCounts);
++  EXPECT_TRUE(backups->ShouldShowRestoreOffer());
++}
++
++// And the offer stands when the sidebar fills in between the check being
++// posted and its reply, the way session restore repopulates it at launch.
++TEST_F(DataBackupsTest, OfferSurvivesSidebarFillingBeforeReply) {
++  ASSERT_FALSE(WriteDaily().is_null());
++  ResetPreferences();
++  std::unique_ptr<DataBackups> backups = Make();
++  // The reset check is in flight; the live data arrives before its reply
++  // runs.
++  SetUserData();
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(backups->restore_offer());
++  EXPECT_EQ(backups->restore_offer()->counts, kUserDataCounts);
 +}
 +
 +// The pre-reset copy is never replaced: not after the user dismisses the
@@ -2922,8 +3021,8 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  EXPECT_EQ(restarted->restore_offer()->counts, first->counts);
 +}
 +
-+// Once dismissed, an offer isn't repeated, even after a restart with the
-+// sidebar still empty. The reset is handled once per `Preferences`.
++// Once dismissed, an offer isn't repeated, even after a restart. The reset
++// is handled once per `Preferences`.
 +TEST_F(DataBackupsTest, DismissedOfferIsNotRepeated) {
 +  {
 +    std::unique_ptr<DataBackups> backups;
@@ -3240,7 +3339,7 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/rac/storage/restore_plan.cc
-@@ -0,0 +1,273 @@
+@@ -0,0 +1,271 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -3436,9 +3535,11 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +      if (mode == RestoreMode::kExact) {
 +        plan.delete_spaces.push_back(*id);
 +      } else if (!plan.move_tabs_from && !plan.spaces.empty() &&
-+                 IsBlankSpace(space.GetDict(), live_lists)) {
++                 IsBlankSpace(space.GetDict(), live_lists) &&
++                 !live.spaces_with_stored_tabs.contains(*id)) {
 +        // The space a reset leaves. Whatever is open in it moves, so a merge
-+        // closes nothing.
++        // closes nothing. A space with stored tabs isn't blank: only open
++        // tabs move, and deleting it would drop those.
 +        plan.move_tabs_from = *id;
 +        plan.move_tabs_to = *plan.spaces.front().FindString(kSpaceIdKey);
 +        plan.delete_spaces.push_back(*id);
@@ -3489,20 +3590,16 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +    }
 +  }
 +
-+  // 5. Agent permissions.
++  // 5. Agent permissions. Merged the same way in both modes, so a restore
++  // never loosens the level and never drops a live "never" rule.
 +  const base::Value* backup_rules =
 +      backup.prefs.Find(DataBackups::kAgentSiteRulesPref);
 +  const base::Value* backup_level =
 +      backup.prefs.Find(DataBackups::kAgentPermissionLevelPref);
-+  if (mode == RestoreMode::kExact) {
-+    plan.agent_site_rules = CloneOrNull(backup_rules);
-+    plan.agent_permission_level = CloneOrNull(backup_level);
-+  } else {
-+    plan.agent_site_rules = MergeSiteRules(
-+        backup_rules, live.prefs.Find(DataBackups::kAgentSiteRulesPref));
-+    plan.agent_permission_level = MergePermissionLevel(
-+        backup_level, live.prefs.Find(DataBackups::kAgentPermissionLevelPref));
-+  }
++  plan.agent_site_rules = MergeSiteRules(
++      backup_rules, live.prefs.Find(DataBackups::kAgentSiteRulesPref));
++  plan.agent_permission_level = MergePermissionLevel(
++      backup_level, live.prefs.Find(DataBackups::kAgentPermissionLevelPref));
 +  return plan;
 +}
 +
@@ -3516,7 +3613,7 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/rac/storage/restore_plan.h
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,92 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -3536,10 +3633,12 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +namespace rac {
 +
 +enum class RestoreMode {
-+  // For Undo. The sidebar becomes exactly the backup: its spaces in its
-+  // order, its favorites and pinned tabs, its agent rules, and, if the backup
-+  // has `rac spaces`, its hidden spaces' tabs. Spaces the backup doesn't have
-+  // are deleted, which closes their tabs (they stay in History).
++  // For a full restore. The sidebar becomes exactly the backup: its spaces
++  // in its order, its favorites and pinned tabs, and, if the backup has
++  // `rac spaces`, its hidden spaces' tabs. Spaces the backup doesn't have
++  // are deleted, which closes their tabs (they stay in History). Agent
++  // permissions are the exception: they only ever get stricter, as in
++  // kMerge.
 +  kExact,
 +  // For the restore prompt. The backup's spaces, favorites, and pinned tabs
 +  // come back first, and everything live is kept after them. Nothing is
@@ -3609,7 +3708,7 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +#endif  // CHROME_BROWSER_RAC_STORAGE_RESTORE_PLAN_H_
 --- /dev/null
 +++ b/chrome/browser/rac/storage/restore_plan_unittest.cc
-@@ -0,0 +1,414 @@
+@@ -0,0 +1,458 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -3720,10 +3819,11 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  return ids;
 +}
 +
-+// The permission level a merge picks, or nullopt if it clears the pref.
-+std::optional<std::string> MergedLevel(
++// The permission level a restore picks, or nullopt if it clears the pref.
++std::optional<std::string> RestoredLevel(
 +    const std::optional<std::string>& backup_level,
-+    const std::optional<std::string>& live_level) {
++    const std::optional<std::string>& live_level,
++    RestoreMode mode) {
 +  DataBackups::Contents backup;
 +  LiveSidebar live;
 +  if (backup_level) {
@@ -3732,20 +3832,21 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  if (live_level) {
 +    live.prefs.Set(DataBackups::kAgentPermissionLevelPref, *live_level);
 +  }
-+  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  RestorePlan plan = MakeRestorePlan(backup, live, mode);
 +  if (!plan.agent_permission_level) {
 +    return std::nullopt;
 +  }
 +  return plan.agent_permission_level->GetString();
 +}
 +
-+RestorePlan MergeRules(base::DictValue backup_rules,
-+                       base::DictValue live_rules) {
++RestorePlan RestoredRules(base::DictValue backup_rules,
++                          base::DictValue live_rules,
++                          RestoreMode mode) {
 +  DataBackups::Contents backup;
 +  backup.prefs.Set(DataBackups::kAgentSiteRulesPref, std::move(backup_rules));
 +  LiveSidebar live;
 +  live.prefs.Set(DataBackups::kAgentSiteRulesPref, std::move(live_rules));
-+  return MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  return MakeRestorePlan(backup, live, mode);
 +}
 +
 +// A backup with no `rac spaces` says nothing about stored tabs, so a merge
@@ -3886,6 +3987,21 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +  EXPECT_TRUE(plan.delete_spaces.empty());
 +}
 +
++// A blank space that has stored tabs isn't the placeholder: only open tabs
++// move, and deleting the space would drop the stored ones.
++TEST(RestorePlanTest, MergeKeepsBlankSpaceWithStoredTabs) {
++  DataBackups::Contents backup =
++      MakeBackup(MakePrefs({{"s1", "Work"}, {"s2", "Play"}}));
++  LiveSidebar live = MakeLive(base::DictValue().Set(
++      DataBackups::kSpacesPref, MakeSpacesPref({{"reset", ""}})));
++  live.spaces_with_stored_tabs.insert("reset");
++
++  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kMerge);
++  EXPECT_FALSE(plan.move_tabs_from.has_value());
++  EXPECT_TRUE(plan.delete_spaces.empty());
++  EXPECT_EQ(IdsOf(plan.spaces), Ids({"s1", "s2"}));
++}
++
 +// A merge puts the backup's favorites first and adds the live ones it doesn't
 +// have. Live pinned lists stay, and the placeholder's own list is dropped.
 +TEST(RestorePlanTest, MergeAppendsLiveSidebarEntries) {
@@ -3945,60 +4061,87 @@ profile-keyed factory. The restore UI and the registration hooks come later.
 +// a "never" for a site wins over an "always".
 +TEST(RestorePlanTest, MergeKeepsStricterAgentPermissions) {
 +  using Level = std::optional<std::string>;
-+  EXPECT_EQ(MergedLevel(DataBackups::kAgentPermissionAsk, std::nullopt),
++  EXPECT_EQ(RestoredLevel(DataBackups::kAgentPermissionAsk, std::nullopt,
++                          RestoreMode::kMerge),
 +            Level("ask"));
-+  EXPECT_EQ(MergedLevel("auto", DataBackups::kAgentPermissionAsk),
++  EXPECT_EQ(RestoredLevel("auto", DataBackups::kAgentPermissionAsk,
++                          RestoreMode::kMerge),
 +            Level("ask"));
-+  EXPECT_EQ(MergedLevel(DataBackups::kAgentPermissionAsk, "auto"),
++  EXPECT_EQ(RestoredLevel(DataBackups::kAgentPermissionAsk, "auto",
++                          RestoreMode::kMerge),
 +            Level("ask"));
-+  EXPECT_EQ(MergedLevel(std::nullopt, DataBackups::kAgentPermissionCareful),
++  EXPECT_EQ(RestoredLevel(std::nullopt, DataBackups::kAgentPermissionCareful,
++                          RestoreMode::kMerge),
 +            Level("careful"));
-+  EXPECT_EQ(MergedLevel(DataBackups::kAgentPermissionAsk,
-+                        DataBackups::kAgentPermissionCareful),
++  EXPECT_EQ(RestoredLevel(DataBackups::kAgentPermissionAsk,
++                          DataBackups::kAgentPermissionCareful,
++                          RestoreMode::kMerge),
 +            Level("ask"));
-+  EXPECT_FALSE(MergedLevel(std::nullopt, std::nullopt).has_value());
++  EXPECT_FALSE(
++      RestoredLevel(std::nullopt, std::nullopt, RestoreMode::kMerge)
++          .has_value());
 +
-+  RestorePlan plan =
-+      MergeRules(base::test::ParseJsonDict(R"({"a":"always","b":"always"})"),
-+                 base::test::ParseJsonDict(R"({"a":"never","c":"always"})"));
++  RestorePlan plan = RestoredRules(
++      base::test::ParseJsonDict(R"({"a":"always","b":"always"})"),
++      base::test::ParseJsonDict(R"({"a":"never","c":"always"})"),
++      RestoreMode::kMerge);
 +  ASSERT_TRUE(plan.agent_site_rules.has_value());
 +  EXPECT_EQ(*plan.agent_site_rules,
 +            base::Value(base::test::ParseJsonDict(
 +                R"({"a":"never","b":"always","c":"always"})")));
 +
-+  plan = MergeRules(base::test::ParseJsonDict(R"({"d":"never"})"),
-+                    base::test::ParseJsonDict(R"({"d":"always"})"));
++  plan = RestoredRules(base::test::ParseJsonDict(R"({"d":"never"})"),
++                       base::test::ParseJsonDict(R"({"d":"always"})"),
++                       RestoreMode::kMerge);
 +  ASSERT_TRUE(plan.agent_site_rules.has_value());
 +  EXPECT_EQ(*plan.agent_site_rules,
 +            base::Value(base::test::ParseJsonDict(R"({"d":"never"})")));
 +}
 +
-+// An exact restore sets the agent's rules and level to the backup's, even if
-+// that is looser than what's live, and clears them if the backup has none.
-+TEST(RestorePlanTest, ExactAgentPrefsAreTheBackups) {
-+  DataBackups::Contents backup = MakeBackup(
-+      base::DictValue()
-+          .Set(DataBackups::kAgentSiteRulesPref,
-+               base::test::ParseJsonDict(R"({"a":"always"})"))
-+          .Set(DataBackups::kAgentPermissionLevelPref, "auto"));
++// An exact restore never loosens the agent's permissions either: a live
++// level stricter than the backup's is kept, a backup "ask" over a live
++// "auto" gives "ask", and a live "never" survives while the backup's rules
++// for other sites come back.
++TEST(RestorePlanTest, ExactAgentPermissionsOnlyTighten) {
++  using Level = std::optional<std::string>;
++  EXPECT_EQ(RestoredLevel("auto", DataBackups::kAgentPermissionAsk,
++                          RestoreMode::kExact),
++            Level("ask"));
++  EXPECT_EQ(RestoredLevel("auto", DataBackups::kAgentPermissionCareful,
++                          RestoreMode::kExact),
++            Level("careful"));
++  EXPECT_EQ(RestoredLevel(DataBackups::kAgentPermissionAsk, "auto",
++                          RestoreMode::kExact),
++            Level("ask"));
++
++  RestorePlan plan = RestoredRules(
++      base::test::ParseJsonDict(R"({"a":"always","b":"always"})"),
++      base::test::ParseJsonDict(R"({"a":"never","c":"always"})"),
++      RestoreMode::kExact);
++  ASSERT_TRUE(plan.agent_site_rules.has_value());
++  EXPECT_EQ(*plan.agent_site_rules,
++            base::Value(base::test::ParseJsonDict(
++                R"({"a":"never","b":"always","c":"always"})")));
++}
++
++// An exact restore with no agent prefs in the backup doesn't clear the live
++// ones: the merge keeps whatever was already there.
++TEST(RestorePlanTest, ExactKeepsLiveAgentPrefsWhenBackupHasNone) {
++  DataBackups::Contents empty_backup;
 +  LiveSidebar live = MakeLive(
 +      base::DictValue()
 +          .Set(DataBackups::kAgentSiteRulesPref,
-+               base::test::ParseJsonDict(R"({"a":"never","c":"never"})"))
++               base::test::ParseJsonDict(R"({"a":"never","c":"always"})"))
 +          .Set(DataBackups::kAgentPermissionLevelPref,
 +               DataBackups::kAgentPermissionAsk));
 +
-+  RestorePlan plan = MakeRestorePlan(backup, live, RestoreMode::kExact);
++  RestorePlan plan = MakeRestorePlan(empty_backup, live, RestoreMode::kExact);
 +  ASSERT_TRUE(plan.agent_site_rules.has_value());
 +  EXPECT_EQ(*plan.agent_site_rules,
-+            base::Value(base::test::ParseJsonDict(R"({"a":"always"})")));
++            base::Value(base::test::ParseJsonDict(
++                R"({"a":"never","c":"always"})")));
 +  ASSERT_TRUE(plan.agent_permission_level.has_value());
-+  EXPECT_EQ(*plan.agent_permission_level, base::Value("auto"));
-+
-+  DataBackups::Contents empty_backup;
-+  plan = MakeRestorePlan(empty_backup, live, RestoreMode::kExact);
-+  EXPECT_FALSE(plan.agent_site_rules.has_value());
-+  EXPECT_FALSE(plan.agent_permission_level.has_value());
++  EXPECT_EQ(*plan.agent_permission_level, base::Value("ask"));
 +}
 +
 +// Merging into a sidebar with nothing a user made loses nothing, so it skips
