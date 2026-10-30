@@ -117,6 +117,23 @@ devutils/rac/build-queue.sh log          # recent starts, ends, and refusals
   It predates the queue and only works one way: whoever holds it can't see
   builds in the queue. Use it only when the queue itself is broken.
 
+## Building on the MacBook Pro
+
+`devutils/rac/remote-build.sh` moves Chromium compiles and screenshot
+launches to the maintainer's MacBook Pro over ssh; threads, git, and
+reviews stay on the Air. The Pro is the maintainer's own Mac, so
+everything lives in `~/rac-remote` there, including the queue's state in
+`~/rac-remote/build-queue`, and the tool deletes nothing. `setup-host` and
+`seed-base <sync worktree> <tag>` run once. Both refuse unless the two Macs
+have the same Xcode build and SDK, since a copied tree would otherwise
+rebuild all of Chromium. Then `push` a committed worktree to its clone in
+`wt/<name>`, `build` it through the queue under `nice` with four cores
+left free, `run -- --rac-window-screenshot=x.png` to launch it in the
+background with its own profile (the shot lands in the clone's
+`build/shots/`), and `pull` files back. `run` refuses arguments with
+absolute paths, `..`, or a profile folder, and stops only processes from
+the clone's own app.
+
 ## Updating the base
 
 After merging features into `main`, update the main checkout so new
