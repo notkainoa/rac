@@ -21,9 +21,11 @@ usage: remote_requests.py <file>
 
 Prints the checked line, a `verbs VERB...` line listing every request
 verb it uses (the Pro checks each is a string literal in the clone's own
-harness sources), a `pages URL` line per chrome:/rac: page open-urls
-visits (the Air reads them back: a run that opens chrome://setup needs
-an Arc import input in the same run), then one line per path in it, REL
+harness sources, and the Air reads them back: a settings page opened as
+a run arg allows no input verb), a `pages URL` line per chrome:/rac:
+page open-urls visits (the Air reads them back too: a run that opens
+chrome://setup needs an Arc import input in the same run), then one line
+per path in it, REL
 under build/shots/, so the Pro side never has to parse the line:
 `file REL` (a file it writes), `dir REL` (a folder it writes into) or
 `expect REL` (a screenshot the run waits for: bare PNG paths,
@@ -60,9 +62,11 @@ HTTP_URL = re.compile(r'https?://(?P<host>\[::1\]|[A-Za-z0-9.-]+)(:[0-9]{1,5})?'
 # optional trailing slash; a query, fragment, ".." or percent-escape can
 # never match. Never add pages that read the maintainer's data or open
 # the browser to control (importData, passwords, flags, downloads,
-# history, devtools, ...).
+# history, devtools, ...). The settings root is off the list on purpose:
+# only these three sub-pages may open, and a run that opens one may take
+# screenshots only -- the script may not send input (see check_line).
 INTERNAL_PAGES = frozenset((
-    'setup', 'version', 'newtab', 'settings', 'settings/assistant',
+    'setup', 'version', 'newtab', 'settings/assistant',
     'settings/privacy', 'settings/appearance', 'rac-ai',
 ))
 INTERNAL_URL = re.compile(r'(?:chrome|rac)://([!-\[\]-~]*)', re.ASCII | re.I)
@@ -71,6 +75,18 @@ TEST_HOSTS = {'localhost', '127.0.0.1', '[::1]',
               'example.com', 'example.org', 'example.net'}
 TEST_SUFFIXES = ('.test', '.localhost',
                  '.example.com', '.example.org', '.example.net')
+# A RAC_REMOTE_ALLOWED_HOSTS wildcard whose suffix is itself a public
+# suffix would let a run open a whole slice of the internet, not one
+# host's family, so it is refused as malformed like any other bad entry.
+# Any single-label suffix is refused (every TLD, including ones nobody
+# lists, like *.horse) except the reserved names below, and so are the
+# well-known two-label public suffixes.
+RESERVED_LABELS = frozenset(('test', 'localhost', 'internal', 'example',
+                             'invalid'))
+PUBLIC_SUFFIXES = frozenset((
+    'co.uk', 'com.au', 'github.io', 'pages.dev', 'vercel.app',
+    'netlify.app', 'herokuapp.com',
+))
 HOSTNAME = re.compile(r'[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
                       r'(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*', re.ASCII | re.I)
 MODS = {'ctrl', 'shift', 'cmd', 'alt'}
@@ -78,16 +94,17 @@ WINDOW_KINDS = {'first', 'normal', 'incognito', 'app', 'popup', 'devtools',
                 'pip', 'browser', 'onboarding', 'child', 'other'}
 KEYS = {'return', 'escape', 'tab', 'backspace', 'up', 'down', 'left', 'right'}
 NSPRESS_KEYS = KEYS | {'space', 'home', 'end', 'pageup', 'pagedown'}
-# Typed text goes to whatever has focus: the address bar, a page, a
-# dialog. Without these it can't spell a scheme or a path, however the
-# pieces are typed, edited or submitted (return, a click on a suggestion).
-UNTYPABLE = set(':/\\~%')
-# The denied page names typed text may never spell, even spread over
-# several type/nstype/nspress pieces and with spaces and punctuation
-# removed: after `open-urls chrome://settings/` an End, `type
-# importData` and return edits the open page's URL into a denied one
-# without ever typing a scheme. `about` is on the list because
-# about:blank is the only allowed about: page.
+# Typed text is plain words only: ASCII letters, digits, spaces, '-'
+# and '_'. Without dots, colons or slashes it can't spell a URL, a host
+# name or a path, however the pieces join or whatever submits it.
+TYPED_TEXT = re.compile(r'[A-Za-z0-9 _-]+')
+# Whole words the typed text may never spell: the denied page names,
+# checked against every run of letters and digits in the joined typed
+# text (spaces, '-' and '_' separate words; case is folded). `type my
+# history book` refuses on `history`; `type histories` and `type
+# chromebook` pass. `about` is on the list because about:blank is the
+# only allowed about: page, and setup/import/chrome because those pages
+# read the maintainer's real data.
 TYPED_PAGE_TOKENS = frozenset((
     'importdata', 'passwords', 'password', 'clearbrowserdata',
     'extensions', 'inspect', 'flags', 'netinternals', 'downloads',
@@ -149,6 +166,11 @@ def extra_allowed_hosts():
         if not HOSTNAME.fullmatch(name):
             raise Refused('RAC_REMOTE_ALLOWED_HOSTS entries are hostnames or '
                           f'*.suffixes, not {raw.strip()!r}')
+        if entry.startswith('*.') and (
+                name in PUBLIC_SUFFIXES
+                or ('.' not in name and name not in RESERVED_LABELS)):
+            raise Refused('RAC_REMOTE_ALLOWED_HOSTS wildcards may not cover a '
+                          f'public suffix: {raw.strip()!r}')
         hosts.add('.' + name if entry.startswith('*.') else name)
     return hosts
 
@@ -191,22 +213,14 @@ def url_allowed(word):
 
 
 def check_typed(text):
-    """Refuses typed text that could spell a scheme or a path, or name a
-    host outside the allowlist (`evil.com` then return navigates)."""
-    # `type` inserts any text into the focused field, and the omnibox maps
-    # full-width and other non-ASCII look-alikes onto ASCII hosts and
-    # page names, past every check below.
-    if not text.isascii():
-        raise Refused(f'typed text must be ASCII: {text!r}')
-    bad = sorted(UNTYPABLE.intersection(text))
-    if bad:
-        raise Refused(f'typed text may not hold {" ".join(bad)} (open URLs '
-                      f'with open-urls): {text!r}')
-    for word in text.split(' '):
-        # The host the omnibox would read: no user@, no #fragment or ?query.
-        host = re.split(r'[#?]', word.strip('.,!?\'"()').rsplit('@', 1)[-1])[0]
-        if '.' in host and HOSTNAME.fullmatch(host) and not host_allowed(host):
-            raise Refused(f'typed text may only name allowed hosts: {word!r}')
+    """Typed text is plain words: ASCII letters, digits, spaces, '-' and
+    '_'. With no dot, colon or slash it can't spell a URL, a host name or
+    a path, and with no other characters there is nothing to smuggle one
+    in with. (Non-ASCII fails the charset too, so the omnibox's
+    full-width look-alike mapping stays out.)"""
+    if not TYPED_TEXT.fullmatch(text):
+        raise Refused('typed text is plain words only: ASCII letters, '
+                      'digits, spaces, "-" and "_": ' + repr(text))
 
 
 def harness_words(request):
@@ -229,8 +243,16 @@ class Checker:
         self.outputs = []
         self.verbs = []
         # Every character typed into the focused field, in order: pieces
-        # typed one after another can join into a host name.
+        # typed one after another can join into a page name.
         self.typed = ''
+        # Each input-ish request, in order: 'type' for type/nstype,
+        # 'letter' for an unmodified nspress letter (which types too),
+        # 'return' for key return, and 'input' for everything else that
+        # moves the caret, the pointer or the app. Capture and state
+        # verbs record nothing.
+        self.events = []
+        # A chrome:/rac: settings page the line opens.
+        self.settings = False
 
     def path(self, word, kind='file', png=False):
         if word.startswith(('/', '~')) or '\\' in word:
@@ -284,6 +306,7 @@ class Checker:
                 raise Refused(f'{verb} text may not hold " ; ": {" ".join(words)!r}')
             check_typed(' '.join(args))
             self.typed += ' '.join(args)
+            self.events.append('type')
             return words
         if n == 0 and verb.endswith('.png'):
             if not (top or after):
@@ -327,15 +350,19 @@ class Checker:
                 if not url_allowed(url):
                     raise Refused('open-urls may open the allowlisted '
                                   'internal pages (chrome://version, '
-                                  'chrome://settings, chrome://setup, '
-                                  'rac://..., about:blank) or http(s) to '
-                                  'an allowed host (localhost, '
-                                  '127.0.0.1, [::1], example.*, *.test, '
-                                  f'*.localhost): {url!r}')
+                                  'chrome://settings/appearance and its '
+                                  'kin, chrome://setup, rac://..., '
+                                  'about:blank) or http(s) to an allowed '
+                                  'host (localhost, 127.0.0.1, [::1], '
+                                  f'example.*, *.test, *.localhost): {url!r}')
+                page = internal_page(url)
                 # The Air checks pages it opened against the run args: a
-                # chrome://setup run needs an Arc import input.
-                if internal_page(url) is not None:
+                # chrome://setup run needs an Arc import input. A
+                # settings page makes the whole run screenshot-only.
+                if page is not None:
                     self.outputs.append(f'pages {url}')
+                    if page == 'settings' or page.startswith('settings/'):
+                        self.settings = True
             return words
         simple = {
             'command': n == 1 and ints(*args),
@@ -368,20 +395,31 @@ class Checker:
         if verb == 'command' and int(args[0]) not in COMMANDS_ALLOWED:
             raise Refused(f'command {args[0]} is not an allowed command id '
                           '(see COMMANDS_ALLOWED); ask Ship to allow it')
-        if verb == 'nspress':
-            held = set(args[1].split(',')) if n == 2 else set()
+        if verb == 'key':
+            self.events.append('return' if args[0] == 'return' else 'input')
+        elif verb in ('click', 'move', 'swipe', 'wheel', 'pointer',
+                      'pointer-path', 'nskey', 'nsflags', 'command'):
+            self.events.append('input')
+        elif verb == 'nspress':
+            held = (set() if n == 1 or args[1] == 'none'
+                    else set(args[1].split(',')))
             if 'cmd' in held and any(args[0] == key and mods <= held
                                      for key, mods in CMD_CHORDS_DENIED):
                 raise Refused(f'nspress {" ".join(args)} opens an internal '
                               'page that is not on the allowlist')
-        if verb == 'nspress' and len(args[0]) == 1:
-            held = set(args[1].split(',')) if n == 2 else set()
-            if 'cmd' in held and args[0] in (
-                    CMD_SHIFT_DENIED if 'shift' in held else CMD_DENIED):
-                raise Refused(f'nspress {" ".join(args)} reaches a dialog, the '
-                              'clipboard, DevTools or another app')
-            if not held - {'shift'}:
-                self.typed += args[0]
+            if len(args[0]) == 1:
+                if 'cmd' in held and args[0] in (
+                        CMD_SHIFT_DENIED if 'shift' in held else CMD_DENIED):
+                    raise Refused(f'nspress {" ".join(args)} reaches a dialog, '
+                                  'the clipboard, DevTools or another app')
+                if not held - {'shift'}:
+                    # An unmodified letter types into the focused field.
+                    self.typed += args[0]
+                    self.events.append('letter')
+                else:
+                    self.events.append('input')
+            else:
+                self.events.append('input')
         return words
 
 
@@ -409,12 +447,34 @@ def check_line(text):
     # The harness has to split the line it gets exactly as it was checked.
     if [harness_words(r) for r in harness_requests(out)] != checked:
         raise Refused('the request line splits differently in the browser')
-    check_typed(checker.typed)
-    # Across the whole script the typed pieces join into whatever the
-    # omnibox shows; a denied page name spelled in pieces or in one piece
-    # edits an open page's URL into it (End, type, return).
-    squashed = re.sub(r'[^a-z0-9]', '', checker.typed.lower())
-    denied = sorted(token for token in TYPED_PAGE_TOKENS if token in squashed)
+    # A script that types (type/nstype, or unmodified nspress letters)
+    # may not also move the caret, the pointer or the app: the text lands
+    # wherever focus happens to be, and only the plain-words rule keeps
+    # it harmless. With a real type/nstype present even nspress letters
+    # are refused. At most one `key return` may follow the last typed
+    # piece; the rest stay capture and state verbs.
+    events = checker.events
+    if 'type' in events or 'letter' in events:
+        if 'input' in events or ('type' in events and 'letter' in events):
+            raise Refused('a script that types may not move the caret or '
+                          'click; ask Ship')
+        # A return between typed pieces would submit the first and start
+        # a fresh field, so the joined-words check below would miss it.
+        last = max(i for i, e in enumerate(events)
+                   if e in ('type', 'letter'))
+        if events[:last].count('return') or events[last + 1:].count('return') > 1:
+            raise Refused('a script that types may press return at most '
+                          'once, after its last typed text; ask Ship')
+    # A run that opens a settings page may only take screenshots: every
+    # recorded event is an input the settings UI could be walked with.
+    if checker.settings and events:
+        raise Refused('a run that opens a settings page may only take '
+                      'screenshots; the script may not send input')
+    # The typed words themselves are checked against the denied page
+    # names: pieces join in order, and a whole word naming a page the
+    # browser may not open edits the open page's URL into it.
+    typed_words = {w for w in re.split(r'[\s_-]+', checker.typed.lower()) if w}
+    denied = sorted(typed_words & TYPED_PAGE_TOKENS)
     if denied:
         raise Refused('typed text spells a page the browser may not open: '
                       + ', '.join(denied))

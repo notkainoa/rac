@@ -12,27 +12,51 @@
 #                                     updating its clone
 #   build <worktree> [-- targets...]  build the clone through the remote queue
 #   run <worktree> [--timeout S] [--requests-file F] [--fresh-profile]
-#       [-- args...]                  launch the clone's browser, then stop it;
-#                                     --fresh-profile first deletes the clone's
-#                                     throwaway build/profile (never while a
-#                                     browser from the clone runs);
-#                                     F is a screenshot-requests line on the
-#                                     Air, checked by remote_requests.py. After
+#       [-- args...]                  launch the clone's browser directly (no
+#                                     UI DevTools: worktree.sh run's
+#                                     --enable-ui-devtools is never passed),
+#                                     then stop it; --fresh-profile first
+#                                     deletes the clone's throwaway
+#                                     build/profile (never while a browser
+#                                     from the clone runs); F is a
+#                                     screenshot-requests line on the Air,
+#                                     checked by remote_requests.py. After
 #                                     --, args are a fixed allowlist:
-#                                     --no-first-run,
-#                                     --rac-launch-in-background and
-#                                     --rac-import-arc-now (only with
-#                                     --rac-import-source-root=),
-#                                     --rac-window-screenshot=<path> (a shot
-#                                     under the clone's build/shots) and
+#                                     --no-first-run (skip first-run UI),
+#                                     --rac-launch-in-background (never
+#                                     activate the browser),
+#                                     --rac-import-arc-now (import at startup,
+#                                     only with --rac-import-source-root=),
+#                                     --rac-arc-import-fixture=<path> and
+#                                     --rac-import-source-root=<path> (Arc
+#                                     import inputs, relative to the clone,
+#                                     that must exist there),
+#                                     --rac-window-screenshot=<name>.png
+#                                     (first shot; lands in build/shots) and
 #                                     --rac-window-screenshot-delay=<1-4
-#                                     digits>, and the inputs
-#                                     --rac-arc-import-fixture= and
-#                                     --rac-import-source-root= (paths relative
-#                                     to the clone that must exist there); a
-#                                     bare arg is a URL and gets open-urls'
-#                                     allowlist. A run that opens
-#                                     chrome://setup needs an import input.
+#                                     digits> (ms before it fires),
+#                                     --log-net-log=<name>.json and
+#                                     --rac-frame-log=<name>.log (logs; land
+#                                     in build/logs),
+#                                     --net-log-capture-mode=Default|
+#                                     IncludeSensitive|Everything,
+#                                     --enable-logging=stderr,
+#                                     --vmodule=<spec> (verbose logging),
+#                                     --force-prefers-reduced-motion,
+#                                     --rac-force-increased-contrast,
+#                                     --disable-backgrounding-occluded-windows,
+#                                     --rac-force-color-mode=light|dark|
+#                                     system. A bare arg is a URL and gets
+#                                     open-urls' allowlist. A run that opens
+#                                     chrome://setup needs an import input; a
+#                                     run that opens a settings page may only
+#                                     take screenshots, so its requests file
+#                                     may not send input. In the requests
+#                                     line, pages and command ids are
+#                                     allowlists, typed text is plain words
+#                                     only, and a script that types may not
+#                                     move the caret or click (at most one
+#                                     `key return`, after the last type).
 #   pull <worktree> <remote path> <local path>
 #                                     rsync a file inside the clone back
 #   log [lines]                       the base's bootstrap phases and the
@@ -53,6 +77,10 @@ set -euo pipefail
 die() { echo "rac remote: $*" >&2; exit 1; }
 refuse() { echo "rac remote: refusing: $*" >&2; exit 2; }
 log() { echo "rac remote: $*" >&2; }
+# The comment block at the top of this file is the manual.
+usage() {
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+}
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 
 host=${RAC_REMOTE_HOST:-kainoas-macbook-pro}
@@ -1016,8 +1044,8 @@ EOS
 # and the last copy of a switch wins), so only the spellings below pass
 # and every other argument starting with `-` is refused. Paths are
 # compared without case, as APFS does. The tool's own switches never go
-# through here: worktree.sh run adds the clone's --user-data-dir itself,
-# and the Pro adds --rac-window-screenshot-requests for a requests run.
+# through here: the Pro's launch adds the clone's --user-data-dir itself,
+# and --rac-window-screenshot-requests for a requests run.
 check_run_arg() {
   local arg=$1 lower value
   lower=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
@@ -1026,13 +1054,19 @@ check_run_arg() {
       refuse "run args may not touch a real profile folder ($arg)" ;;
   esac
   case "$arg" in
-    --no-first-run | --rac-launch-in-background | --rac-import-arc-now)
+    --no-first-run | --rac-launch-in-background | --rac-import-arc-now | \
+      --force-prefers-reduced-motion | --rac-force-increased-contrast | \
+      --disable-backgrounding-occluded-windows)
       return 0 ;;
     --rac-window-screenshot=?* | --rac-arc-import-fixture=?* | \
-      --rac-import-source-root=?*)
+      --rac-import-source-root=?* | --log-net-log=?* | --rac-frame-log=?*)
       value=${arg#*=} ;;
     --rac-window-screenshot | --rac-window-screenshot=)
       refuse "give the screenshot file as --rac-window-screenshot=<name>.png" ;;
+    --log-net-log | --log-net-log=)
+      refuse "give the net log as --log-net-log=<name>.json" ;;
+    --rac-frame-log | --rac-frame-log=)
+      refuse "give the frame log as --rac-frame-log=<name>.log" ;;
     --rac-arc-import-fixture= | --rac-import-source-root=)
       refuse "${arg%%=*} needs a path in the clone" ;;
     --rac-window-screenshot-delay=*)
@@ -1042,6 +1076,29 @@ check_run_arg() {
           refuse "--rac-window-screenshot-delay takes 1-4 digits, not '$value'" ;;
       esac
       return 0 ;;
+    --net-log-capture-mode=*)
+      case "${arg#*=}" in
+        Default | IncludeSensitive | Everything) return 0 ;;
+      esac
+      refuse "--net-log-capture-mode takes Default, IncludeSensitive or Everything, not '${arg#*=}'" ;;
+    --enable-logging=*)
+      [ "$arg" = --enable-logging=stderr ] \
+        || refuse "--enable-logging only takes stderr, not '${arg#*=}'"
+      return 0 ;;
+    --vmodule=*)
+      value=${arg#*=}
+      case "$value" in
+        '' | *[!A-Za-z0-9_=,\*/-]*)
+          refuse "--vmodule takes a spec of letters, digits and _=,*/-, not '$value'" ;;
+      esac
+      [ "${#value}" -le 200 ] \
+        || refuse "--vmodule takes at most 200 characters"
+      return 0 ;;
+    --rac-force-color-mode=*)
+      case "${arg#*=}" in
+        light | dark | system) return 0 ;;
+      esac
+      refuse "--rac-force-color-mode takes light, dark or system, not '${arg#*=}'" ;;
     -*)
       refuse "'$arg' is not an allowed run arg; ask Ship to allow it" ;;
     *)
@@ -1064,12 +1121,19 @@ check_run_arg() {
     --rac-window-screenshot=*.png) ;;
     --rac-window-screenshot=*)
       refuse "a screenshot path ends in .png ($arg)" ;;
+    --log-net-log=*.json) ;;
+    --log-net-log=*)
+      refuse "a net log path ends in .json ($arg)" ;;
+    --rac-frame-log=*.log) ;;
+    --rac-frame-log=*)
+      refuse "a frame log path ends in .log ($arg)" ;;
   esac
 }
 
 cmd_run() {
   local name=$1 timeout=90 requests='' outputs='' fresh=0 checked
-  local req_pages='' import_input=0 setup_page=0 source_root=0 arc_now=0
+  local req_pages='' req_verbs='' import_input=0 setup_page=0 source_root=0
+  local arc_now=0 settings_page=0
   shift
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1084,6 +1148,7 @@ cmd_run() {
         outputs=
         case "$checked" in *$'\n'*) outputs=${checked#*$'\n'} ;; esac
         req_pages=$(printf '%s\n' "$outputs" | awk '$1 == "pages" { print $2 }')
+        req_verbs=$(printf '%s\n' "$outputs" | awk '$1 == "verbs" { $1=""; print }')
         outputs=$(printf '%s\n' "$outputs" | awk '$1 != "pages"')
         shift 2 ;;
       --fresh-profile) fresh=1; shift ;;
@@ -1111,6 +1176,8 @@ cmd_run() {
     case "$lower" in
       chrome://setup | chrome://setup/* | rac://setup | rac://setup/*)
         setup_page=1 ;;
+      chrome://settings | chrome://settings/* | rac://settings | rac://settings/*)
+        settings_page=1 ;;
     esac
   done
   for arg in $req_pages; do
@@ -1118,6 +1185,8 @@ cmd_run() {
     case "$lower" in
       chrome://setup | chrome://setup/* | rac://setup | rac://setup/*)
         setup_page=1 ;;
+      chrome://settings | chrome://settings/* | rac://settings | rac://settings/*)
+        settings_page=1 ;;
     esac
   done
   # chrome://setup is the Arc import screen: without an import input in
@@ -1129,6 +1198,19 @@ cmd_run() {
   # and from the maintainer's real Arc when that switch is missing.
   if [ "$arc_now" = 1 ] && [ "$source_root" = 0 ]; then
     refuse "--rac-import-arc-now needs --rac-import-source-root= in the same run, or it imports the Pro's real Arc data"
+  fi
+  # A run that opens a settings page may only take screenshots. A script
+  # that opens settings itself was refused by the checker if it carries
+  # input; a settings page passed as a run arg is checked against the
+  # requests file's verbs here.
+  if [ "$settings_page" = 1 ]; then
+    for arg in $req_verbs; do
+      case "$arg" in
+        click | command | key | move | nspress | nsflags | nskey | nstype | \
+        pointer | pointer-path | swipe | type | wheel)
+          refuse "a run that opens a settings page may only take screenshots; the requests file may not send input" ;;
+      esac
+    done
   fi
   remote "$name" "$timeout" "$queue_wait" "$requests" "$outputs" "$fresh" "$@" <<'EOS'
 set -e
@@ -1155,11 +1237,19 @@ shot=
 args=()
 # The files a requests run waits for; the first shot alone ends a plain run.
 expected=()
+# Log files the browser is asked to write, mapped under build/logs.
+logfiles=()
 for arg in "$@"; do
   case "$arg" in
     --rac-window-screenshot=*)
       shot="$clone/build/shots/${arg#--rac-window-screenshot=}"
       arg="--rac-window-screenshot=$shot" ;;
+    # Logs land in build/logs under the same checks screenshots get in
+    # build/shots: never inside build/profile.
+    --log-net-log=* | --rac-frame-log=*)
+      log="$clone/build/logs/${arg#*=}"
+      arg="${arg%%=*}=$log"
+      logfiles+=("$log") ;;
     # Inputs rac reads Arc data from, which need absolute paths: relative
     # to the clone, existing, and still inside it once symlinks resolve.
     # Nothing is created for them.
@@ -1194,6 +1284,28 @@ if [ -n "$shot" ]; then
   }
   # A shot left by an earlier run would end the wait at once.
   rm -f "$shot"
+fi
+if [ "${#logfiles[@]}" -gt 0 ]; then
+  # The same checks screenshots get: a symlinked build/logs, or a symlink
+  # anywhere on the way, would write the log outside the clone -- and
+  # build/logs can never be build/profile.
+  [ ! -L "$clone/build/logs" ] || {
+    echo "rac remote: refusing: $clone/build/logs is a symlink" >&2
+    exit 2
+  }
+  for log in ${logfiles[@]+"${logfiles[@]}"}; do
+    inside_clone "$clone" "$log" || {
+      echo "rac remote: refusing: $log leaves the clone through a symlink" >&2
+      exit 2
+    }
+    mkdir -p "$(dirname "$log")"
+    inside_clone "$clone" "$log" || {
+      echo "rac remote: refusing: $log leaves the clone through a symlink" >&2
+      exit 2
+    }
+    # A stale log isn't this run's output.
+    rm -f "$log"
+  done
 fi
 # Every process running from the clone's app, never anything else.
 app="$clone/build/src/out/Default/rac.app/"
@@ -1324,8 +1436,8 @@ stop_own() {
   done
 }
 if [ "$fresh" = 1 ]; then
-  # Only the clone's own throwaway profile, the --user-data-dir worktree.sh
-  # run gives it, and never one a running browser holds.
+  # Only the clone's own throwaway profile, the --user-data-dir the launch
+  # below gives it, and never one a running browser holds.
   [ -n "$clone" ] && [ "$clone" != / ] || { echo "rac remote: refusing: no clone path" >&2; exit 2; }
   profile="$clone/build/profile"
   for dir in "$clone/build" "$profile"; do
@@ -1412,12 +1524,25 @@ cleanup() {
   stop_own
 }
 trap 'cleanup; exit 130' INT TERM HUP
+# The clone's own worktree.sh run would add --enable-ui-devtools: a
+# full-UI-control WebSocket a mistake in a request could drive the whole
+# browser with. Launch the built binary directly instead, with exactly
+# worktree.sh's own flags minus that one. The queue gets --run: nothing
+# in this command still says "worktree.sh run".
+app_bin="$clone/build/src/out/Default/rac.app/Contents/MacOS/rac"
+[ -x "$app_bin" ] || {
+  echo "rac remote: no built browser at $app_bin; run build first" >&2
+  exit 1
+}
 # setsid gives the launcher its own session, so a signal that hits this
 # script's process group can't take the tree down before the trap can
 # choose what to stop.
 python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-  nice -n 10 taskpolicy -c utility devutils/rac/build-queue.sh \
-  devutils/rac/worktree.sh run --rac-launch-in-background ${args[@]+"${args[@]}"} &
+  env BREAKPAD_DUMP_LOCATION="$clone/build/profile/Crashpad" \
+  nice -n 10 taskpolicy -c utility devutils/rac/build-queue.sh --run \
+  "$app_bin" --user-data-dir="$clone/build/profile" --use-mock-keychain \
+  --disable-features=DialMediaRouteProvider --rac-launch-in-background \
+  ${args[@]+"${args[@]}"} &
 launcher=$!
 spawned=$launcher
 end=
@@ -1554,6 +1679,8 @@ if [ "${1:-}" = "--dry-run" ]; then
   shift
 fi
 case "${1:-}" in
+  help | --help | -h)
+    usage ;;
   setup-host)
     [ $# = 1 ] || die "usage: remote-build.sh setup-host"
     cmd_setup_host ;;

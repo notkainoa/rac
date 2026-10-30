@@ -61,15 +61,16 @@ class RemoteRequestsTest(unittest.TestCase):
                      'space-theme 3 dark', 'space-theme -', 'space-new',
                      'pointer off', 'pointer 1.5 2', 'pointer-path 0 0 10 10 200',
                      'target name:x', 'target #2', 'profile-window Profile_2',
-                     'type hello world', 'nstype a*b'):
+                     'type hello world', 'nstype plain-words_ok'):
             self.assertEqual(self.ok(line), (line, []), line)
         # Internal pages also report themselves so the Air can check a
         # chrome://setup run carries an import input.
         self.assertEqual(
-            self.ok('open-urls https://example.com/a?b chrome://settings '
-                    'about:blank'),
-            ('open-urls https://example.com/a?b chrome://settings about:blank',
-             ['pages chrome://settings']))
+            self.ok('open-urls https://example.com/a?b '
+                    'chrome://settings/appearance about:blank'),
+            ('open-urls https://example.com/a?b '
+             'chrome://settings/appearance about:blank',
+             ['pages chrome://settings/appearance']))
 
     def test_refuses_what_the_harness_would_misread(self):
         for line in [
@@ -134,7 +135,8 @@ class RemoteRequestsTest(unittest.TestCase):
                      'open-urls localhost:@evil.com/x.dmg'):
             self.refused(line)
         for line, outputs in (
-                ('open-urls chrome://settings', ['pages chrome://settings']),
+                ('open-urls chrome://settings/assistant',
+                 ['pages chrome://settings/assistant']),
                 ('open-urls chrome://version about:blank rac://newtab',
                  ['pages chrome://version', 'pages rac://newtab']),
                 ('open-urls http://localhost/', []),
@@ -161,20 +163,22 @@ class RemoteRequestsTest(unittest.TestCase):
                 ('open-urls chrome://setup/', ['pages chrome://setup/']),
                 ('open-urls chrome://version', ['pages chrome://version']),
                 ('open-urls chrome://newtab', ['pages chrome://newtab']),
-                ('open-urls chrome://settings chrome://settings/assistant '
+                ('open-urls chrome://settings/assistant '
                  'chrome://settings/privacy chrome://settings/appearance',
-                 ['pages chrome://settings',
-                  'pages chrome://settings/assistant',
+                 ['pages chrome://settings/assistant',
                   'pages chrome://settings/privacy',
                   'pages chrome://settings/appearance']),
-                ('open-urls chrome://settings/', ['pages chrome://settings/']),
                 ('open-urls chrome://rac-ai', ['pages chrome://rac-ai']),
                 ('open-urls rac://version rac://settings/privacy rac://rac-ai',
                  ['pages rac://version', 'pages rac://settings/privacy',
                   'pages rac://rac-ai']),
                 ('open-urls about:blank ABOUT:Blank', [])):
             self.assertEqual(self.ok(line), (line, outputs), line)
-        for line in ('open-urls chrome://settings/importData',
+        for line in ('open-urls chrome://settings',
+                     'open-urls chrome://settings/',
+                     'open-urls rac://settings',
+                     'open-urls rac://settings/',
+                     'open-urls chrome://settings/importData',
                      'open-urls chrome://settings/passwords',
                      'open-urls chrome://settings/clearBrowserData',
                      'open-urls chrome://extensions',
@@ -270,38 +274,41 @@ class RemoteRequestsTest(unittest.TestCase):
                      'nstype view-source ; nstype :file ; nstype :Users',
                      'type localhost:@evil.com/x.dmg'):
             self.refused(line)
-        # A host name the omnibox would open must be an allowed one, also
-        # when typed in pieces or with nspress letters between them.
+        # Typed text is plain words only, so no host name, path or
+        # punctuation can be typed at all -- and a script that types may
+        # not also move the caret or click.
         for line in ('type evil.com ; key return',
                      'type evil ; type .com ; key return',
                      'type evil ; nspress x ; type .com',
                      'type 192.168.1.1', 'type see e.g. this',
                      'type me@evil.com', 'type evil.com#x.test',
-                     'type evil.com?q'):
-            self.refused(line)
-        for line in ('type hello world',
+                     'type evil.com?q',
                      'type Summarize this page.',
                      'type hello, world! (twice)',
                      'nstype a*b',
                      'type *.png files',
                      'type example.com',
                      'type me@app.test',
-                     'type localhost ; key return',
-                     'type plain words ; after 5 key return',
                      'type safe ; click 1 2 ; key tab',
                      'type search terms ; nspress return',
                      'type x ; nspress t cmd ; type .test'):
+            self.refused(line)
+        for line in ('type hello world',
+                     'type words with_underscore-and-dash',
+                     'type localhost ; key return',
+                     'type plain words ; after 5 key return'):
             self.assertEqual(self.ok(line), (line, []), line)
 
     def test_typed_text_cannot_edit_into_a_denied_page(self):
         # The review's follow-up: after open-urls lands on an allowed
         # page, focusing the omnibox and typing onto the end of its URL
-        # reaches a denied page without typing a scheme. The joined
-        # typed text, squashed of spaces and punctuation, may never
-        # spell a denied page name.
-        for line in ('open-urls chrome://settings/ ; nspress end '
+        # reaches a denied page without typing a scheme. Caret and
+        # pointer input can't appear in a script that types at all, and
+        # the joined typed text's whole words may never spell a denied
+        # page name.
+        for line in ('open-urls chrome://version ; nspress end '
                      '; type importData ; key return',
-                     'open-urls chrome://settings/ ; key end '
+                     'open-urls chrome://version ; key end '
                      '; type importData ; key return',
                      'open-urls chrome://version ; nspress end '
                      '; type /importData ; key return',
@@ -320,12 +327,14 @@ class RemoteRequestsTest(unittest.TestCase):
                      # even innocuous text spelling them is refused.
                      'type the people i know',
                      'type download ; nspress s',
-                     'type local ; type state',
-                     'type reset profile ; type settings'):
+                     'type local ; type state'):
             self.refused(line)
         for line in ('type hello world',
-                     'type Summarize this page.',
                      'type load a fixture',
+                     # Whole words only: 'profilesettings' never spells
+                     # 'resetprofilesettings', and 'settings' alone names
+                     # no denied page.
+                     'type reset profile ; type settings',
                      'type settings ; key return'):
             self.assertEqual(self.ok(line), (line, []), line)
 
@@ -391,6 +400,101 @@ class RemoteRequestsTest(unittest.TestCase):
         for line in ('open-urls chrome://version ; key end ; type setup ; key return',
                      'type set ; type up', 'type import', 'nstype chrome'):
             self.refused(line)
+
+    def test_typing_scripts_carry_no_caret_or_clicks(self):
+        # A script that types may not also move the caret, the pointer or
+        # the app; unmodified nspress letters count as typing too.
+        for line in ('click 300 40 ; key right ; key backspace ; type tData '
+                     '; key left ; type impor ; key return',
+                     'click 300 40 ; type com ; key left ; type evil ; key return',
+                     'type evil.com ; key return',
+                     'type hello ; key return ; key return',
+                     'type hello ; nspress a',
+                     'nspress h ; nspress i ; click 10 10',
+                     'type a ; command 34014',
+                     'type x ; move 1 2', 'type x ; wheel 1 2 3',
+                     'type x ; swipe 1 2 end', 'type x ; pointer 1 2',
+                     'type x ; pointer-path 0 0 1 1 5',
+                     'type x ; key tab', 'type x ; nskey tab down',
+                     'type x ; nsflags cmd', 'nstype y ; nspress a',
+                     'type x ; command 34000',
+                     'type x ; after 5 click 1 2'):
+            self.refused(line)
+        for line in ('type hello world ; key return',
+                     'open-urls http://localhost:8000/ ; type hello ; key return',
+                     'type x ; after 5 key return',
+                     'type x ; type y ; key return',
+                     'nspress h ; nspress i ; key return'):
+            self.assertEqual(self.ok(line), (line, []), line)
+
+    def test_typing_scripts_press_return_only_at_the_end(self):
+        # A return between typed pieces submits the first and starts a
+        # fresh field, which the joined-words check can't see.
+        for line in ('type my ; key return ; type history ; key return',
+                     'key return ; type x ; key return',
+                     'key return ; type x',
+                     'nspress a ; key return ; nspress b'):
+            self.refused(line)
+        self.assertEqual(
+            self.ok('type hello ; burst shots 3 100'),
+            ('type hello ; burst @SHOTS@/shots 3 100',
+             ['dir shots', 'expect shots/f00.png', 'expect shots/f01.png',
+              'expect shots/f02.png']))
+
+    def test_typing_refusal_names_the_rule(self):
+        try:
+            self.rr.check_line('type a ; click 1 2')
+            self.fail('not refused')
+        except self.rr.Refused as e:
+            self.assertIn('a script that types may not move the caret or '
+                          'click; ask Ship', str(e))
+
+    def test_settings_pages_take_screenshots_only(self):
+        # The three settings pages that may open take shots only: any
+        # input verb in the same script refuses, on top of the typing
+        # rule's own restrictions.
+        for line in ('open-urls chrome://settings/privacy ; click 10 10',
+                     'open-urls chrome://settings/assistant ; key tab',
+                     'open-urls chrome://settings/appearance ; type x',
+                     'open-urls chrome://settings/privacy ; nspress a',
+                     'open-urls rac://settings/privacy ; wheel 1 2 3',
+                     'open-urls chrome://settings/appearance ; move 1 2',
+                     'open-urls chrome://settings/assistant ; command 34000',
+                     'open-urls chrome://settings/privacy ; swipe 1 2 end',
+                     'open-urls chrome://settings/assistant ; pointer 1 2',
+                     'open-urls chrome://settings/appearance '
+                     '; after 5 click 1 2'):
+            self.refused(line)
+        for line, outputs in (
+                ('open-urls chrome://settings/appearance ; burst shots 3 100',
+                 ['pages chrome://settings/appearance', 'dir shots',
+                  'expect shots/f00.png', 'expect shots/f01.png',
+                  'expect shots/f02.png']),
+                ('open-urls chrome://settings/privacy '
+                 '; capture-window first shot.png',
+                 ['pages chrome://settings/privacy', 'expect shot.png']),
+                ('open-urls chrome://settings/appearance ; windows windows.txt',
+                 ['pages chrome://settings/appearance', 'file windows.txt'])):
+            self.assertEqual(self.ok(line)[1], outputs, line)
+
+    def test_env_wildcards_may_not_cover_public_suffixes(self):
+        # *.com or *.github.io would open a slice of the internet, not one
+        # host's family; like any malformed entry they refuse every line.
+        for entry in ('*.com', '*.dev', '*.io', '*.horse', '*.zz',
+                      '*.local', '*.co.uk', '*.com.au',
+                      '*.github.io', '*.pages.dev', '*.vercel.app',
+                      '*.netlify.app', '*.herokuapp.com',
+                      'build.local, *.ai'):
+            with unittest.mock.patch.dict(
+                    os.environ, {'RAC_REMOTE_ALLOWED_HOSTS': entry}):
+                self.refused('open-urls https://a.github.io/x')
+                self.refused('key tab')
+        for entry in ('*.test', '*.localhost', '*.example.com',
+                      '*.internal', '*.example', '*.invalid',
+                      '*.co.uk.evil.test', '*.foo.horse', 'horse'):
+            with unittest.mock.patch.dict(
+                    os.environ, {'RAC_REMOTE_ALLOWED_HOSTS': entry}):
+                self.ok('key tab')
 
     def test_lists_every_verb_the_line_uses(self):
         # The Pro refuses a verb missing from the clone's harness sources;
