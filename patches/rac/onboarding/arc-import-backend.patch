@@ -67,7 +67,7 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_backend.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/rac/onboarding/arc_import_backend.cc
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,100 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -85,6 +85,7 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_backend.cc
 +
 +#if BUILDFLAG(RAC_DEV_SWITCHES)
 +#include "base/command_line.h"
++#include "base/threading/thread_restrictions.h"
 +#include "chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.h"
 +#endif
 +
@@ -136,6 +137,9 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_backend.cc
 +  const base::FilePath path =
 +      command_line.GetSwitchValuePath(kArcImportFixtureSwitch);
 +  std::string json;
++  // Dev builds only: a few KB, read once when a page opens, so it doesn't
++  // need a trip to the thread pool before the page's first message.
++  base::ScopedAllowBlockingForTesting allow_blocking;
 +  if (!path.IsAbsolute() || !base::ReadFileToString(path, &json)) {
 +    LOG(ERROR) << "--" << kArcImportFixtureSwitch
 +               << " needs an absolute path to a readable file";
@@ -364,7 +368,7 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_handler.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/rac/onboarding/arc_import_handler.cc
-@@ -0,0 +1,468 @@
+@@ -0,0 +1,478 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -810,9 +814,14 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_handler.cc
 +    ResolveJavascriptCallback(args[0], base::Value(false));
 +    return;
 +  }
-+  const bool restore = args[1].GetIfBool().value_or(false);
++  // Only an explicit answer counts: "start fresh" drops the offer for good.
++  const std::optional<bool> restore = args[1].GetIfBool();
++  if (!restore) {
++    RejectJavascriptCallback(args[0], base::Value());
++    return;
++  }
 +  backend_->AnswerRestoreOffer(
-+      restore,
++      *restore,
 +      base::BindOnce(
 +          [](base::WeakPtr<ArcImportHandler> self, base::Value callback_id,
 +             bool restored) {
@@ -825,6 +834,11 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_handler.cc
 +}
 +
 +void ArcImportHandler::HandleShowArcImport(const base::ListValue& args) {
++  // The import fills a regular profile's sidebar; never an off-the-record
++  // or guest one.
++  if (!profile_->IsRegularProfile()) {
++    return;
++  }
 +  ShowArcImport(profile_);
 +}
 +
@@ -931,7 +945,7 @@ Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
-@@ -0,0 +1,665 @@
+@@ -0,0 +1,683 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1271,6 +1285,13 @@ Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
 +  base::OneShotTimer timer_;
 +};
 +
++// The import state every fixture in this run shares once an import or Undo
++// changed it, so the tour and Settings agree, as they do over the real record.
++std::optional<ArcImportState>& RecordedState() {
++  static std::optional<ArcImportState> state;
++  return state;
++}
++
 +}  // namespace
 +
 +FixtureArcImportBackend::FixtureArcImportBackend(base::DictValue script)
@@ -1353,14 +1374,15 @@ Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
 +void FixtureArcImportBackend::GetImportState(
 +    base::OnceCallback<void(const ArcImportState&)> done) {
 +  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
-+      FROM_HERE, base::BindOnce(std::move(done), state_));
++      FROM_HERE,
++      base::BindOnce(std::move(done), RecordedState().value_or(state_)));
 +}
 +
 +void FixtureArcImportBackend::GetSummary(
 +    base::OnceCallback<void(const ArcImportSummary&)> done) {
 +  ArcImportSummary summary;
 +  summary.found = found_;
-+  summary.state = state_;
++  summary.state = RecordedState().value_or(state_);
 +  if (const base::DictValue* scripted = script_.FindDict("summary")) {
 +    if (const std::string* text = scripted->FindString("foundSummary")) {
 +      summary.found_summary = *text;
@@ -1518,6 +1540,14 @@ Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
 +    ArcImportDoneCallback done = std::move(done_);
 +    progress_.Reset();
 +    timer_.Stop();
++    if (result_.status == ArcImportResult::Status::kDone) {
++      const base::Time now = base::Time::Now();
++      ArcImportState recorded;
++      recorded.last_import = now;
++      recorded.undo_until = result_.undo_until.value_or(now + base::Days(7));
++      recorded.undo_snapshot_time = now;
++      RecordedState() = recorded;
++    }
 +    std::move(done).Run(result_);
 +    return;
 +  }
@@ -1530,8 +1560,10 @@ Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
 +    base::OnceCallback<void(ArcUndoResult)> done) {
 +  if (undo_result_ == ArcUndoResult::kUndone ||
 +      undo_result_ == ArcUndoResult::kPartlyUndone) {
-+    state_.undo_until.reset();
-+    state_.undo_snapshot_time.reset();
++    ArcImportState state = RecordedState().value_or(state_);
++    state.undo_until.reset();
++    state.undo_snapshot_time.reset();
++    RecordedState() = state;
 +  }
 +  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
 +      FROM_HERE, base::BindOnce(std::move(done), undo_result_),
@@ -1737,7 +1769,7 @@ Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
-@@ -0,0 +1,450 @@
+@@ -0,0 +1,455 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1753,6 +1785,7 @@ Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
 +#include "base/location.h"
 +#include "base/strings/string_number_conversions.h"
 +#include "base/strings/utf_string_conversions.h"
++#include "third_party/icu/source/common/unicode/utf16.h"
 +#include "base/task/sequenced_task_runner.h"
 +#include "base/task/thread_pool.h"
 +#include "base/time/time.h"
@@ -1805,7 +1838,9 @@ Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
 +  if (text.empty()) {
 +    return "·";
 +  }
-+  return base::UTF16ToUTF8(base::i18n::ToUpper(text.substr(0, 1)));
++  // The first character, never half of a surrogate pair (an emoji title).
++  const size_t length = U16_IS_LEAD(text[0]) && text.size() > 1 ? 2 : 1;
++  return base::UTF16ToUTF8(base::i18n::ToUpper(text.substr(0, length)));
 +}
 +
 +// Tabs count wherever they sit; split views and tab groups aren't folders
@@ -1838,7 +1873,9 @@ Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
 +  if (const ArcImportRecord::Run* run =
 +          read.record.UndoableRun(base::Time::Now())) {
 +    state.undo_until = run->undo_until;
-+    state.undo_snapshot_time = run->snapshot_time;
++    if (!run->snapshot_time.is_null()) {
++      state.undo_snapshot_time = run->snapshot_time;
++    }
 +  }
 +  return state;
 +}
