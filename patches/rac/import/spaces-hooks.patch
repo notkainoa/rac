@@ -238,7 +238,53 @@ Index: src/chrome/browser/rac/spaces/spaces_store.cc
  #include "base/json/json_reader.h"
  #include "base/json/json_writer.h"
  #include "base/json/values_util.h"
-@@ -332,6 +333,14 @@ void SpacesStore::SaveNow() {
+@@ -19,6 +20,7 @@
+ #include "base/pickle.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "base/token.h"
+ 
+@@ -233,11 +235,34 @@ void SpacesStore::Load() {
+   DidLoad(base::OnceClosure(), ReadData(dir_));
+ }
+ 
+-void SpacesStore::LoadAsync(base::OnceClosure ready) {
++void SpacesStore::LoadAsync(base::OnceClosure ready,
++                            base::TaskPriority priority) {
+   CHECK(!loading_ && !write_pending_ && spaces_.empty());
+   loading_ = true;
+-  write_task_runner_->PostTaskAndReplyWithResult(
+-      FROM_HERE, base::BindOnce(&SpacesStore::ReadData, dir_),
++  if (priority == base::TaskPriority::BEST_EFFORT) {
++    write_task_runner_->PostTaskAndReplyWithResult(
++        FROM_HERE, base::BindOnce(&SpacesStore::ReadData, dir_),
++        base::BindOnce(&SpacesStore::DidLoad, weak_factory_.GetWeakPtr(),
++                       std::move(ready)));
++    return;
++  }
++  // The read starts from a later task on this sequence, not from here: it
++  // decodes stored tabs with the session navigation driver, which Chrome
++  // installs after the profile (and so this store) is created, and a read
++  // that decodes first leaves the browser with the wrong driver.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&SpacesStore::StartRead,
++                                weak_factory_.GetWeakPtr(), std::move(ready),
++                                priority));
++}
++
++void SpacesStore::StartRead(base::OnceClosure ready,
++                            base::TaskPriority priority) {
++  // Reading on a different sequence from the writer is safe: Put and Remove
++  // CHECK `!loading_`, so no write can be pending before the load finishes.
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), priority},
++      base::BindOnce(&SpacesStore::ReadData, dir_),
+       base::BindOnce(&SpacesStore::DidLoad, weak_factory_.GetWeakPtr(),
+                      std::move(ready)));
+ }
+@@ -332,6 +357,14 @@ void SpacesStore::SaveNow() {
    write_pending_ = false;
  }
  
@@ -257,7 +303,29 @@ Index: src/chrome/browser/rac/spaces/spaces_store.h
 ===================================================================
 --- src.orig/chrome/browser/rac/spaces/spaces_store.h
 +++ src/chrome/browser/rac/spaces/spaces_store.h
-@@ -95,6 +95,11 @@ class SpacesStore {
+@@ -15,6 +15,7 @@
+ #include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "base/task/task_traits.h"
+ #include "base/time/time.h"
+ #include "base/timer/timer.h"
+ #include "base/uuid.h"
+@@ -81,8 +82,11 @@ class SpacesStore {
+   // Reads the file. Call once, early.
+   void Load();
+   // Reads and decodes on the storage sequence. Do not mutate the store until
+-  // `ready` runs. Destroying the store safely cancels the reply.
+-  void LoadAsync(base::OnceClosure ready);
++  // `ready` runs. Destroying the store safely cancels the reply. `priority`
++  // is the read's task priority; the default shares the write sequence's
++  // BEST_EFFORT priority.
++  void LoadAsync(base::OnceClosure ready,
++                 base::TaskPriority priority = base::TaskPriority::BEST_EFFORT);
+ 
+   // The stored space, or null. Doesn't remove it; call Remove once the tabs
+   // are live again.
+@@ -95,10 +99,16 @@ class SpacesStore {
    bool HasPendingWrite() const;
    // Posts the pending snapshot for writing without blocking the caller.
    void SaveNow();
@@ -269,11 +337,45 @@ Index: src/chrome/browser/rac/spaces/spaces_store.h
  
   private:
    struct LoadedData;
+   static LoadedData ReadData(const base::FilePath& dir);
++  void StartRead(base::OnceClosure ready, base::TaskPriority priority);
+   void DidLoad(base::OnceClosure ready, LoadedData data);
+   base::DictValue ToDict() const;
+ 
 Index: src/chrome/browser/rac/spaces/spaces_store_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/rac/spaces/spaces_store_unittest.cc
 +++ src/chrome/browser/rac/spaces/spaces_store_unittest.cc
-@@ -230,6 +230,36 @@ TEST_F(SpacesStoreTest, AsyncLoadCanOutl
+@@ -217,6 +217,28 @@ TEST_F(SpacesStoreTest, AsyncLoadDoesNot
+   EXPECT_FALSE(store.HasPendingWrite());
+ }
+ 
++TEST_F(SpacesStoreTest, AsyncLoadAtHigherPriorityLoadsTheSameData) {
++  const auto id = base::Uuid::GenerateRandomV4();
++  {
++    SpacesStore initial(dir_.GetPath());
++    initial.Put(MakeSpace(id, "retained"));
++  }
++  task_environment_.RunUntilIdle();
++
++  SpacesStore store(dir_.GetPath());
++  base::test::TestFuture<void> ready;
++  {
++    base::ScopedDisallowBlocking disallow_blocking;
++    store.LoadAsync(ready.GetCallback(), base::TaskPriority::USER_VISIBLE);
++    EXPECT_FALSE(ready.IsReady());
++    task_environment_.RunUntilIdle();
++  }
++  ASSERT_TRUE(ready.IsReady());
++  ASSERT_TRUE(store.Find(id));
++  EXPECT_EQ(*store.Find(id)->unknown_fields.FindString("marker"), "retained");
++  EXPECT_FALSE(store.HasPendingWrite());
++}
++
+ TEST_F(SpacesStoreTest, AsyncLoadCanOutliveStoreWithoutCallingClient) {
+   base::test::TestFuture<void> ready;
+   {
+@@ -230,6 +252,36 @@ TEST_F(SpacesStoreTest, AsyncLoadCanOutl
    EXPECT_FALSE(base::PathExists(dir_.GetPath().AppendASCII("rac spaces")));
  }
  
@@ -707,15 +809,21 @@ Index: src/chrome/browser/ui/rac/spaces/spaces_window_manager.cc
  void SpacesWindowManager::AddObserver(Observer* observer) {
    observers_.AddObserver(observer);
  }
-@@ -740,6 +946,12 @@ void SpacesWindowManager::OnStoreReady()
+@@ -740,6 +946,18 @@ void SpacesWindowManager::OnStoreReady()
        ReconcileWindow(browser);
      }
    }
 +  // Swapped out first: a callback may queue another or destroy this manager.
 +  std::vector<base::OnceClosure> ready_callbacks;
 +  ready_callbacks.swap(store_ready_callbacks_);
++  const base::WeakPtr<SpacesWindowManager> weak =
++      weak_ptr_factory_.GetWeakPtr();
 +  for (auto& callback : ready_callbacks) {
 +    std::move(callback).Run();
++    // A callback may have destroyed this manager; the rest are dropped with it.
++    if (!weak) {
++      return;
++    }
 +  }
  }
  
