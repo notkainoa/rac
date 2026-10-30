@@ -4,6 +4,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -178,6 +179,24 @@ class LaunchEnvTest(unittest.TestCase):
     def test_crash_dumps_stay_in_the_throwaway_profile(self):
         env = run.launch_env("/tmp/rac-evals-x")
         self.assertEqual(env["BREAKPAD_DUMP_LOCATION"], "/tmp/rac-evals-x/Crashpad")
+
+
+class StaleProfileTest(unittest.TestCase):
+    def test_old_unused_profiles_go_and_new_ones_stay(self):
+        with tempfile.TemporaryDirectory() as wt:
+            build = os.path.join(wt, "build")
+            old = os.path.join(build, "rac-evals-old")
+            new = os.path.join(build, "rac-evals-new")
+            other = os.path.join(build, "profile")
+            for d in (old, new, other):
+                os.makedirs(d)
+            past = time.time() - 7 * 3600
+            os.utime(old, (past, past))
+            os.utime(other, (past, past))
+            run.clean_stale_profiles(wt)
+            self.assertFalse(os.path.exists(old))
+            self.assertTrue(os.path.exists(new))
+            self.assertTrue(os.path.exists(other))
 
 
 if __name__ == "__main__":

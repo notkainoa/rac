@@ -39,7 +39,12 @@ import threading
 import time
 import urllib.request
 
-import cdp
+# The runner's own modules sit next to it; make that work under python3 -I too.
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import cdp  # noqa: E402
 import fake_model
 import fixture_server
 import grade
@@ -47,7 +52,6 @@ import sim_agent
 import sim_browser
 import variants
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 STATUS_CONTEXT = "rac/agent-evals"
 RUN_TIMEOUT = 120          # seconds a turn may take before it counts as timed out
@@ -181,6 +185,26 @@ def make_profile(worktree, base_dir=None):
     return path
 
 
+def clean_stale_profiles(worktree, max_age_s=6 * 3600):
+    """Removes rac-evals-* profiles a killed run or --keep-profile left in
+    <worktree>/build, once they are older than max_age_s and no process
+    still uses them."""
+    base = os.path.join(worktree, "build")
+    if not os.path.isdir(base):
+        return
+    now = time.time()
+    for name in os.listdir(base):
+        path = os.path.join(base, name)
+        if not name.startswith("rac-evals-") or not os.path.isdir(path):
+            continue
+        if now - os.path.getmtime(path) < max_age_s:
+            continue
+        busy = subprocess.run(["pgrep", "-f", "--", f"--user-data-dir={path}"],
+                              capture_output=True).returncode == 0
+        if not busy:
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def free_port():
     import socket
     s = socket.socket()
@@ -245,7 +269,7 @@ def kill_run(proc, profile, grace=20):
         return
     except subprocess.TimeoutExpired:
         pass
-    out = subprocess.run(["pgrep", "-f", f"--user-data-dir={profile}"],
+    out = subprocess.run(["pgrep", "-f", "--", f"--user-data-dir={profile}"],
                          capture_output=True, text=True).stdout
     for pid in (int(p) for p in out.split() if p.isdigit()):
         try:
@@ -589,6 +613,8 @@ def main(argv=None):
             print(f"{v['id']:34} {v['kind']:10} {v['title']}")
         return 0
     os.makedirs(args.results_dir, exist_ok=True)
+    if not args.dry_run and not args.keep_profile:
+        clean_stale_profiles(os.path.realpath(args.worktree))
     outcomes = []
     for v in chosen:
         print(f"== {v['id']}", flush=True)
