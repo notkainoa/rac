@@ -61,6 +61,13 @@
 #                                     `key return`, after the last type).
 #   pull <worktree> <remote path> <local path>
 #                                     rsync a file inside the clone back
+#   verify-series [--keep] <branch>   fetch <branch> from GitHub on the Pro
+#                                     and apply its whole patch stack in a
+#                                     throwaway clone the way the macOS CI
+#                                     sanity job does: fails when a patch
+#                                     doesn't apply or any hunk needs an
+#                                     offset or fuzz. --keep leaves the
+#                                     clone in wt/verify-<branch> to look at
 #   log [lines]                       the base's bootstrap phases and the
 #                                     end of its cold-build log
 #   status                            remote uptime, disk, and build queue
@@ -1678,6 +1685,203 @@ fi
 EOS
 }
 
+# The macOS CI sanity job applies the merged stack to a pristine Chromium
+# with `he push` and fails when its log shows a hunk applied with an offset
+# or fuzz; the fast Linux checks never apply the stack, so they can't see
+# that. This reproduces it on the Pro: fetch the branch from GitHub into the
+# base (as the Pro's attach.sh does), make a throwaway clone
+# wt/verify-<branch> from the base's built tree, then, holding one build
+# slot, revert rac's dev names (quilt can't pop patches on files they
+# changed), pop the whole stack and push it again with --fuzz 0. The push
+# log stays in logs/verify-<branch>.log. The clone is removed at the end,
+# also on failure, unless --keep. It never builds.
+cmd_verify_series() {
+  remote "$1" "$2" <<'EOS'
+set -e
+branch=$1
+keep=$2
+case "$branch" in
+  '' | -* | /* | */ | *..* | *[!A-Za-z0-9._/-]*)
+    echo "rac remote: bad branch name '$branch'" >&2
+    exit 2 ;;
+esac
+name="verify-${branch//\//-}"
+safe_name "$name" || { echo "rac remote: bad clone name '$name'" >&2; exit 2; }
+base="$HOME/rac-remote/base"
+clone="$HOME/rac-remote/wt/$name"
+logs="$HOME/rac-remote/logs"
+log="$logs/$name.log"
+[ -d "$base" ] || {
+  echo "rac remote: no base checkout at $base; run build-base first" >&2
+  exit 1
+}
+if busy=$(queue_busy "$base"); then
+  echo "rac remote: refusing: the base's build is queued or running" >&2
+  echo "  ($busy); verify once it finishes (see: status, log)" >&2
+  exit 2
+fi
+[ -f "$base/build/src/out/Default/.siso_fs_state" ] || {
+  echo "rac remote: refusing: the base has no finished build to clone yet;" >&2
+  echo "  run build-base first, or wait for its cold build (see: log)" >&2
+  exit 2
+}
+mkdir -p "$logs" "$HOME/rac-remote/wt"
+# One verify per clone name at a time; the lock lasts as long as this
+# shell (and everything it starts) keeps the file open.
+exec 8>>"$logs/.$name.lock"
+python3 -c 'import fcntl; fcntl.flock(8, fcntl.LOCK_EX | fcntl.LOCK_NB)' 2>/dev/null || {
+  echo "rac remote: refusing: another verify-series of '$branch' is running" >&2
+  exit 2
+}
+# A verify clone is a worktree of the base whose git dir holds the marker
+# this command writes; nothing else under wt/ is ever removed here.
+is_verify_clone() {
+  local top gitdir
+  top=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null) || return 1
+  [ "$top" = "$(cd "$1" && pwd -P)" ] || return 1
+  gitdir=$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null) || return 1
+  [ -f "$gitdir/rac-verify" ]
+}
+# worktree.sh cleanup moves the clone's tree to the base's trash and
+# deletes it in the background; then git forgets the worktree.
+remove_clone() {
+  local out
+  if [ -x "$clone/devutils/rac/worktree.sh" ]; then
+    out=$(cd "$clone" && devutils/rac/worktree.sh cleanup 2>&1) \
+      || printf '%s\n' "$out" >&2
+  fi
+  git -C "$base" worktree remove --force "$clone"
+}
+if [ -e "$clone" ] || [ -L "$clone" ]; then
+  is_verify_clone "$clone" || {
+    echo "rac remote: refusing: $clone exists and is not a verify-series clone" >&2
+    exit 2
+  }
+  if busy=$(queue_busy "$clone"); then
+    echo "rac remote: refusing: the queue still holds work for $clone ($busy)" >&2
+    exit 2
+  fi
+  procs=$(tree_procs "$clone")
+  [ -z "$procs" ] || {
+    echo "rac remote: refusing: processes are still running under $clone:" >&2
+    echo "$procs" >&2
+    exit 2
+  }
+  echo "rac remote: removing the previous verify clone $clone" >&2
+  remove_clone
+fi
+git -C "$base" worktree prune
+# The branch comes from GitHub over the Pro's own internet, into the base's
+# origin refs; --no-recurse-submodules like every other fetch here.
+git -C "$base" fetch -q --no-recurse-submodules origin \
+  "+refs/heads/$branch:refs/remotes/origin/$branch" || {
+  echo "rac remote: couldn't fetch branch '$branch' from $(git -C "$base" remote get-url origin)" >&2
+  exit 1
+}
+commit=$(git -C "$base" rev-parse "refs/remotes/origin/$branch^{commit}")
+# Keep going if the ssh session drops, so the clone is still cleaned up.
+trap '' HUP PIPE
+made=0
+finish() {
+  local status=$?
+  cd "$HOME/rac-remote"
+  if [ "$made" = 1 ] && [ -e "$clone" ]; then
+    if [ "$keep" = 1 ]; then
+      echo "rac remote: kept the verify clone at $clone; the next verify-series of '$branch' replaces it" >&2
+    elif ! remove_clone; then
+      echo "rac remote: couldn't remove $clone; run verify-series again to replace it" >&2
+      [ "$status" != 0 ] || status=1
+    fi
+  fi
+  exit "$status"
+}
+trap finish EXIT
+trap 'exit 130' INT TERM
+made=1
+# Detached, so no branch in the base moves (a push clone may have this
+# branch checked out).
+git -C "$base" worktree add -q --detach "$clone" "$commit"
+: > "$(git -C "$clone" rev-parse --absolute-git-dir)/rac-verify"
+cd "$clone"
+# setup checks out helium-chromium from the base's own; a pin the base
+# doesn't hold comes from the url .gitmodules records (GitHub).
+sub=$(git ls-tree HEAD helium-chromium | awk '$2 == "commit" {print $3}')
+if [ -n "$sub" ] && ! git -C "$base/helium-chromium" cat-file -e "$sub^{commit}" 2>/dev/null; then
+  git -c protocol.file.allow=always submodule update --init --quiet helium-chromium
+fi
+# Runs inside the queue's build slot, from the clone. setup clones the
+# base's tree, merges the patches, and syncs the branch's stack onto it
+# with rac's names applied.
+verify_tree() {
+  set -e
+  local clone=$1 base=$2 log=$3 status=0
+  cd "$clone"
+  devutils/rac/worktree.sh setup "$base"
+  [ -f patches/series.merged ] || devutils/update_patches.sh merge
+  python3 devutils/rac/dev_names.py unsub
+  cd build/src
+  export QUILT_PATCHES="$clone/patches" QUILT_SERIES=series.merged \
+    QUILT_PATCH_OPTS="--unified --reject-format=unified"
+  unset QUILT_PATCHES_PREFIX
+  # quilt exits 2 when there was nothing to pop.
+  quilt --quiltrc - pop -a -q || status=$?
+  [ "$status" = 0 ] || [ "$status" = 2 ] || {
+    echo "rac remote: quilt pop -a failed (exit $status)" >&2
+    exit 1
+  }
+  status=0
+  quilt --quiltrc - push -a --fuzz 0 > "$log" 2>&1 || status=$?
+  echo "$status" > "$log.exit"
+}
+rm -f "$log" "$log.exit"
+echo "rac remote: verifying $branch ($(git log --oneline -1 HEAD)) in $clone" >&2
+qstatus=0
+# The function travels in the environment, so the queue's status shows a
+# short command.
+RAC_VERIFY_TREE=$(declare -f verify_tree) \
+  nice -n 10 taskpolicy -c utility "$base/devutils/rac/build-queue.sh" \
+  bash -c 'eval "$RAC_VERIFY_TREE"; verify_tree "$@"' rac-verify \
+  "$clone" "$base" "$log" || qstatus=$?
+[ -f "$log.exit" ] || {
+  echo "rac remote: making the clone or popping its stack failed (exit $qstatus); see above" >&2
+  exit 1
+}
+pushed=$(cat "$log.exit")
+offenders=$(P="$clone/patches/" awk '
+  /^Applying patch / {
+    p = $3
+    if (index(p, ENVIRON["P"]) == 1) p = substr(p, length(ENVIRON["P"]) + 1)
+  }
+  /^patching file / { f = $3 }
+  /offset .* line|with fuzz/ { print p " | " f " | " $0 }' "$log")
+applied=0
+[ ! -f build/src/.pc/applied-patches ] \
+  || applied=$(awk 'END { print NR }' build/src/.pc/applied-patches)
+total=$(awk '!/^[[:space:]]*(#|$)/ { n++ } END { print n + 0 }' patches/series.merged)
+failed=0
+if [ "$pushed" != 0 ]; then
+  echo "rac remote: quilt push -a --fuzz 0 failed (exit $pushed); the end of $log:" >&2
+  tail -n 30 "$log" >&2 || true
+  failed=1
+fi
+if [ -n "$offenders" ]; then
+  echo "rac remote: these hunks applied with an offset or fuzz, which fails the" >&2
+  echo "  macOS sanity job (patch | file | hunk); refresh the patch:" >&2
+  printf '%s\n' "$offenders" | sed 's/^/  /' >&2
+  failed=1
+fi
+if [ "$applied" != "$total" ]; then
+  echo "rac remote: applied $applied of the $total patches in series.merged" >&2
+  failed=1
+fi
+if [ "$failed" = 1 ]; then
+  echo "rac remote: verify-series failed for $branch (full log: $log)" >&2
+  exit 1
+fi
+echo "rac remote: $branch applies cleanly: $applied of $total patches, no offsets or fuzz"
+EOS
+}
+
 if [ "${1:-}" = "--dry-run" ]; then
   dry=1
   shift
@@ -1765,5 +1969,31 @@ case "${1:-}" in
   status)
     [ $# = 1 ] || die "usage: remote-build.sh status"
     cmd_status ;;
-  *) die "usage: remote-build.sh [--dry-run] <setup-host|build-base|push|build|run|pull|log|status>" ;;
+  verify-series)
+    shift
+    keep=0 branch='' given=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --keep) keep=1; shift ;;
+        --)
+          shift
+          [ $# = 1 ] || die "usage: remote-build.sh verify-series [--keep] <branch>"
+          [ "$given" = 0 ] || die "verify-series takes one branch, not also '$1'"
+          branch=$1 given=1
+          shift ;;
+        -*) die "usage: remote-build.sh verify-series [--keep] <branch>" ;;
+        *)
+          [ "$given" = 0 ] || die "verify-series takes one branch, not also '$1'"
+          branch=$1 given=1
+          shift ;;
+      esac
+    done
+    [ "$given" = 1 ] || die "usage: remote-build.sh verify-series [--keep] <branch>"
+    # The name travels to git on the Pro: a plain GitHub branch name only.
+    case "$branch" in
+      '' | -* | /* | */ | *..* | *[!A-Za-z0-9._/-]*)
+        refuse "verify-series takes a branch name of letters, digits, '.', '_', '-' and '/', not '$branch'" ;;
+    esac
+    cmd_verify_series "$branch" "$keep" ;;
+  *) die "usage: remote-build.sh [--dry-run] <setup-host|build-base|push|build|run|pull|log|status|verify-series>" ;;
 esac
