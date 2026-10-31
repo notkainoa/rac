@@ -16,7 +16,7 @@ A real run, per variant, in a throwaway profile:
   2. seed <profile>/Default/Preferences: AI on, browser control on, the Custom
      provider pointed at the fake model, the level and site rules under test;
   3. launch the built binary `build/src/out/Default/rac.app/Contents/MacOS/rac`
-     with `--user-data-dir=<profile> --remote-debugging-port` (through the
+     with `--user-data-dir=<profile> --remote-debugging-port=0` (through the
      build queue's run slot unless RAC_EVALS_NO_QUEUE=1), save the fake
      provider's key through Settings;
   4. open the fixture tabs and drive the assistant: with --screenshots
@@ -173,6 +173,9 @@ def build_preferences(variant, origins, model_base_url, download_dir):
         "download.default_directory": download_dir,
         "download.prompt_for_download": False,
         "helium.browser.layout": 2,
+        # pref_names.h kHeliumServicesEnabled: a throwaway profile never
+        # reaches Helium's services (filter lists through their proxy).
+        "helium.services.enabled": False,
     }.items():
         deep_set(prefs, dotted, value)
     for dotted, value in flat_prefs(variant, origins).items():
@@ -237,7 +240,7 @@ def browser_binary(worktree):
                         "rac.app", "Contents", "MacOS", "rac")
 
 
-def launch_args(profile, port, worktree, shots=None):
+def launch_args(profile, worktree, shots=None):
     """The launch command: the app binary itself, so a remote eval host needs
     only the build output, not the checkout's run scripts. --use-mock-keychain
     lets OSCrypt store the fake provider's key without the real keychain (what
@@ -250,7 +253,13 @@ def launch_args(profile, port, worktree, shots=None):
     argv = [binary,
             f"--user-data-dir={profile}", "--use-mock-keychain",
             "--disable-features=DialMediaRouteProvider",
-            f"--remote-debugging-port={port}", "--remote-debugging-address=127.0.0.1",
+            # Port 0: Chromium picks the port and writes it to
+            # <profile>/DevToolsActivePort, so two launches can never be
+            # handed the same "free" port. Headed Chromium's DevTools
+            # server only ever binds loopback (remote_debugging_server.cc
+            # CreateLocalHostServerSocket), so no
+            # --remote-debugging-address.
+            "--remote-debugging-port=0",
             "--rac-launch-in-background", "--no-first-run", "--no-default-browser-check",
             "--disable-background-networking", "--disable-component-update"]
     if shots is not None:
@@ -294,6 +303,17 @@ def kill_run(proc, profile, grace=20):
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         pass
+
+
+def devtools_port(profile):
+    """The port the launch's --remote-debugging-port=0 picked, read from
+    the first line of <profile>/DevToolsActivePort (what ChromeDriver and
+    Telemetry read). None until the browser writes it."""
+    try:
+        with open(os.path.join(profile, "DevToolsActivePort")) as f:
+            return int(f.readline().strip())
+    except (OSError, ValueError):
+        return None
 
 
 def _port_open(port):
@@ -756,16 +776,18 @@ def run_browser(variant, args):
         prefs = build_preferences(variant, rig.fixtures.base, rig.model_url, download_dir)
         with open(os.path.join(profile, "Default", "Preferences"), "w") as f:
             json.dump(prefs, f)
-        port = free_port()  # fresh per launch: the last variant's may linger
         # A run command's output isn't piped through the queue, so browser
         # and queue write the same file; a pipe nobody drains would stall them.
         launch_log = open(os.path.join(profile, "browser.log"), "wb")
-        proc = subprocess.Popen(launch_args(profile, port, worktree, shots), cwd=worktree,
+        proc = subprocess.Popen(launch_args(profile, worktree, shots), cwd=worktree,
                                 start_new_session=True, env=launch_env(profile),
                                 stdout=launch_log, stderr=subprocess.STDOUT)
         # The build queue holds run slots: a queued launch can wait minutes
-        # before the browser ever starts, so the endpoint wait must outlast a
-        # queue full of other agents' runs, not just this browser's startup.
+        # before the browser ever starts, so the port-file and endpoint
+        # waits must outlast a queue full of other agents' runs, not just
+        # this browser's startup.
+        port = wait_for(lambda: devtools_port(profile),
+                        "the DevTools port file", 900, proc)
         endpoint = wait_for(lambda: http_json(f"http://127.0.0.1:{port}/json/version"),
                             "the DevTools endpoint", 900, proc)
         browser = cdp.Cdp(endpoint["webSocketDebuggerUrl"])
@@ -1113,7 +1135,21 @@ def select(args):
     return loaded
 
 
+def _raise_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
+def install_cleanup_handlers():
+    """Makes SIGTERM and SIGHUP act like Ctrl-C, so a killed standalone
+    runner still runs every finally — kill_run included. Python dies on
+    those signals without it, leaving the browser up with an open DevTools
+    port."""
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _raise_interrupt)
+
+
 def main(argv=None):
+    install_cleanup_handlers()
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--dry-run", choices=("today", "d19"), help="no browser; see the module doc")

@@ -82,7 +82,9 @@ Each is marked `TODO(binary)` in the code.
    exec the browser, so the pid `Popen` returns is not used).
 5. **Pref names** in `seed_preferences`: `rac.ai.enabled`,
    `rac.ai.provider`, `rac.ai.provider_settings.custom.base_url`,
-   `rac.ai.browser_control`, `rac.ai.agent_permission_level`.
+   `rac.ai.browser_control`, `rac.ai.agent_permission_level`, and
+   `helium.services.enabled` (off, so a throwaway profile never reaches
+   Helium's services).
 6. **Toggling AI** with `chrome.settingsPrivate.setPref('rac.ai.enabled', ...)`
    on `chrome://settings`. It needs that pref in the settings-private
    allow-list. If it isn't, click the switch on `chrome://settings/assistant`.

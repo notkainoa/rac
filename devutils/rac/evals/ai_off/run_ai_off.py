@@ -73,7 +73,8 @@ def assert_safe_profile(path, worktree=ROOT):
 def seed_preferences(model_url):
     """Default/Preferences with AI off. Pref names checked against ai_prefs.h
     (kEnabled, kProvider, kProviderSettings, kBrowserControl,
-    kAgentPermissionLevel)."""
+    kAgentPermissionLevel) and pref_names.h (kHeliumServicesEnabled, so a
+    throwaway profile never reaches Helium's services)."""
     prefs = {}
 
     def put(dotted, value):
@@ -87,6 +88,7 @@ def seed_preferences(model_url):
     put("rac.ai.provider_settings.custom.base_url", model_url)
     put("rac.ai.browser_control", True)
     put("rac.ai.agent_permission_level", "auto")
+    put("helium.services.enabled", False)
     return prefs
 
 
@@ -345,23 +347,38 @@ class Session:
     def __init__(self, run, worktree, profile, bundle, netlog):
         self.run, self.worktree, self.profile = run, worktree, profile
         self.bundle, self.netlog = bundle, netlog
-        self.port = run.free_port()
         self.log = open(os.path.join(profile, "launch.log"), "ab")
+        # Session B relaunches on session A's profile: the stale
+        # DevToolsActivePort must go first, or the wait below reads the
+        # dead port and the new launch looks like it never came up.
+        try:
+            os.remove(os.path.join(profile, "DevToolsActivePort"))
+        except OSError:
+            pass
         # run.launch_args launches the app binary itself and passes the extra
         # flags through to the browser; the build queue wraps it unless
         # RAC_EVALS_NO_QUEUE=1.
-        argv = run.launch_args(profile, self.port, worktree) + [
+        argv = run.launch_args(profile, worktree) + [
             f"--log-net-log={netlog}", "--net-log-capture-mode=Everything"]
         self.proc = subprocess.Popen(argv, cwd=worktree, start_new_session=True,
                                      env=run.launch_env(profile),
                                      stdout=self.log, stderr=subprocess.STDOUT)
-        endpoint = run.wait_for(lambda: run.http_json(f"http://127.0.0.1:{self.port}/json/version"),
-                                "the DevTools endpoint", 120, self.proc)
-        import cdp
-        self.cdp = cdp.Cdp(endpoint["webSocketDebuggerUrl"])
-        self.pid = run.wait_for(lambda: find_browser_pid(sh("ps", "-axo", "pid=,ppid=,command="),
-                                                         profile, bundle),
-                                "the browser process", 30, self.proc)
+        try:
+            self.port = run.wait_for(lambda: run.devtools_port(profile),
+                                     "the DevTools port file", 120, self.proc)
+            endpoint = run.wait_for(lambda: run.http_json(f"http://127.0.0.1:{self.port}/json/version"),
+                                    "the DevTools endpoint", 120, self.proc)
+            import cdp
+            self.cdp = cdp.Cdp(endpoint["webSocketDebuggerUrl"])
+            self.pid = run.wait_for(lambda: find_browser_pid(sh("ps", "-axo", "pid=,ppid=,command="),
+                                                             profile, bundle),
+                                    "the browser process", 30, self.proc)
+        except Exception:
+            # A launch that never came up must not leak: kill it before
+            # real_run's finally deletes the profile out from under it.
+            run.kill_run(self.proc, profile)
+            self.log.close()
+            raise
 
     def open_page(self, url):
         target = self.cdp.call("Target.createTarget", {"url": url})["targetId"]
@@ -481,7 +498,16 @@ def print_summary(results, out=print):
     return all(not p for _, p in results)
 
 
+def _raise_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main(argv=None):
+    # A killed run must still reach real_run's finally: without this,
+    # SIGTERM/SIGHUP drop the process outright and leave the browser up
+    # with an open DevTools port.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _raise_interrupt)
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--self-test", "--dry-run", dest="self_test", action="store_true",
                     help="check the checks on fabricated input; no browser")

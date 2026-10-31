@@ -77,26 +77,27 @@ class LaunchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as wt, mock.patch.dict(os.environ) as env:
             env.pop("RAC_EVALS_NO_QUEUE", None)
             binary = self.make_worktree(wt)
-            args = run.launch_args("/tmp/rac-evals-x", 9333, wt)
+            args = run.launch_args("/tmp/rac-evals-x", wt)
         self.assertTrue(args[0].endswith("devutils/rac/build-queue.sh"))
         self.assertEqual(args[1], "--run")
         self.assertEqual(args[2], binary)
         self.assertEqual(args[3:], [
             "--user-data-dir=/tmp/rac-evals-x", "--use-mock-keychain",
             "--disable-features=DialMediaRouteProvider",
-            "--remote-debugging-port=9333", "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-port=0",  # the port comes from DevToolsActivePort
             "--rac-launch-in-background",  # never takes the foreground
             "--no-first-run", "--no-default-browser-check",
             "--disable-background-networking", "--disable-component-update"])
         self.assertNotIn("open", args)
         self.assertFalse([a for a in args if "remote-allow-origins" in a])
+        self.assertFalse([a for a in args if "remote-debugging-address" in a])
         self.assertFalse([a for a in args if "Application Support" in a or "me.kainoa.rac" in a])
 
     def test_no_queue_env_launches_the_binary_directly(self):
         with tempfile.TemporaryDirectory() as wt, \
                 mock.patch.dict(os.environ, {"RAC_EVALS_NO_QUEUE": "1"}):
             binary = self.make_worktree(wt)
-            args = run.launch_args("/tmp/rac-evals-x", 9333, wt)
+            args = run.launch_args("/tmp/rac-evals-x", wt)
         self.assertEqual(args[0], binary)
         self.assertEqual(args[1], "--user-data-dir=/tmp/rac-evals-x")
         self.assertFalse([a for a in args if "build-queue" in a or "remote-allow-origins" in a])
@@ -105,13 +106,13 @@ class LaunchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as wt, mock.patch.dict(os.environ) as env:
             env.pop("RAC_EVALS_NO_QUEUE", None)
             with self.assertRaisesRegex(RuntimeError, "no built rac"):
-                run.launch_args("/tmp/rac-evals-x", 9333, wt)
+                run.launch_args("/tmp/rac-evals-x", wt)
             binary = self.make_worktree(wt)
             os.remove(os.path.join(wt, "devutils", "rac", "build-queue.sh"))
             with self.assertRaisesRegex(RuntimeError, "no build queue"):
-                run.launch_args("/tmp/rac-evals-x", 9333, wt)
+                run.launch_args("/tmp/rac-evals-x", wt)
             with mock.patch.dict(os.environ, {"RAC_EVALS_NO_QUEUE": "1"}):
-                self.assertEqual(run.launch_args("/tmp/rac-evals-x", 9333, wt)[0], binary)
+                self.assertEqual(run.launch_args("/tmp/rac-evals-x", wt)[0], binary)
 
     def test_profile_is_a_fresh_folder_named_for_evals_under_the_given_base(self):
         with tempfile.TemporaryDirectory() as base:
@@ -134,6 +135,16 @@ class LaunchTest(unittest.TestCase):
 
     def test_free_port_is_usable(self):
         self.assertGreater(run.free_port(), 1023)
+
+    def test_devtools_port_reads_the_active_port_file_or_is_none(self):
+        with tempfile.TemporaryDirectory() as profile:
+            self.assertIsNone(run.devtools_port(profile))
+            with open(os.path.join(profile, "DevToolsActivePort"), "w") as f:
+                f.write("")  # created but not written yet
+            self.assertIsNone(run.devtools_port(profile))
+            with open(os.path.join(profile, "DevToolsActivePort"), "w") as f:
+                f.write("41234\n/devtools/browser/abc-123\n")
+            self.assertEqual(run.devtools_port(profile), 41234)
 
 
 class StatusTest(unittest.TestCase):
@@ -287,10 +298,10 @@ class ShotsTest(unittest.TestCase):
             binary = wt_test.make_worktree(wt)
             shots = run.Shots(d)
             shots.boot = os.path.join(d, "v-boot.png")
-            args = run.launch_args("/tmp/p", 9333, wt, shots)
+            args = run.launch_args("/tmp/p", wt, shots)
             self.assertIn(f"--rac-window-screenshot={shots.boot}", args)
             self.assertIn(f"--rac-window-screenshot-requests={shots.requests}", args)
-            args = run.launch_args("/tmp/p", 9333, wt)
+            args = run.launch_args("/tmp/p", wt)
             self.assertEqual(args[0], binary)
             self.assertFalse([a for a in args if "screenshot" in a])
 
