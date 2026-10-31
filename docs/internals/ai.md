@@ -530,8 +530,8 @@ list, so the assistant can't read it. You can change this in Settings >
 Assistant." A link summary checks the link before it fetches and the
 loaded page (redirects, frames) before the model sees it, and shows the
 same message on its card. The strings are in `chrome/app/rac_strings.grd`.
-The rules apply whether or not browser control is on, but Settings only
-shows the site-rule list while it is on.
+The rules apply whether or not browser control is on, and Settings shows
+the site-rule list whenever AI is on.
 
 A rule the guard can't read counts as never for the host it names, read as
 best it can be: a value other than `always` or `never`, or `always` under
