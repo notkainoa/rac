@@ -3,12 +3,16 @@
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
+import cdp
 import fake_model
 import run
 import variants
@@ -197,6 +201,194 @@ class StaleProfileTest(unittest.TestCase):
             self.assertFalse(os.path.exists(old))
             self.assertTrue(os.path.exists(new))
             self.assertTrue(os.path.exists(other))
+
+
+class ShotsTest(unittest.TestCase):
+    def test_prepare_creates_the_folder_and_a_second_call_is_fine(self):
+        with tempfile.TemporaryDirectory() as results:
+            shots = run.Shots.prepare(results)
+            self.assertEqual(shots.dir, os.path.join(os.path.abspath(results), "shots"))
+            self.assertTrue(os.path.isdir(shots.dir))
+            self.assertEqual(shots.requests, os.path.join(shots.dir, "requests"))
+            run.Shots.prepare(results)
+
+    def test_prepare_refuses_a_symlinked_shots_folder(self):
+        with tempfile.TemporaryDirectory() as results, \
+                tempfile.TemporaryDirectory() as elsewhere:
+            os.symlink(elsewhere, os.path.join(results, "shots"))
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                run.Shots.prepare(results)
+
+    def test_request_writes_the_line_atomically(self):
+        with tempfile.TemporaryDirectory() as d:
+            shots = run.Shots(d)
+            shots.request("/tmp/one.png")
+            with open(shots.requests) as f:
+                self.assertEqual(f.read(), "/tmp/one.png")
+            shots.request("click 10 20")
+            with open(shots.requests) as f:
+                self.assertEqual(f.read(), "click 10 20")
+            self.assertNotIn("requests.tmp", os.listdir(d))
+
+    def serve_pngs(self, shots, stop):
+        """Plays the browser: takes the request, writes the named PNG."""
+        while not stop:
+            if os.path.exists(shots.requests):
+                with open(shots.requests) as f:
+                    out = f.read().strip()
+                os.remove(shots.requests)
+                if out.endswith(".png"):
+                    with open(out, "wb") as f:
+                        f.write(b"\x89PNG pretend")
+            time.sleep(0.02)
+
+    def test_capture_activates_the_tab_then_waits_for_a_real_png(self):
+        with tempfile.TemporaryDirectory() as d:
+            shots = run.Shots(d)
+            stop, calls = [], []
+            browser = mock.Mock()
+            browser.call.side_effect = lambda m, p=None: calls.append((m, p)) or {}
+            t = threading.Thread(target=self.serve_pngs, args=(shots, stop), daemon=True)
+            t.start()
+            try:
+                self.assertTrue(shots.capture("v-1-card.png", browser=browser,
+                                              activate="T1", timeout=5))
+            finally:
+                stop.append(True)
+                t.join()
+            self.assertEqual(calls, [("Target.activateTarget", {"targetId": "T1"})])
+            self.assertEqual(shots.taken,
+                             [{"name": "v-1-card.png", "ok": True, "error": None}])
+            self.assertGreater(os.path.getsize(os.path.join(d, "v-1-card.png")), 0)
+
+    def test_a_missing_png_is_an_error_entry_never_an_exception(self):
+        with tempfile.TemporaryDirectory() as d:
+            shots = run.Shots(d)
+            self.assertFalse(shots.capture("v-2-after.png", timeout=0.5))
+            self.assertEqual(len(shots.taken), 1)
+            entry = shots.taken[0]
+            self.assertEqual(entry["name"], "v-2-after.png")
+            self.assertFalse(entry["ok"])
+            self.assertIn("timed out", entry["error"])
+
+    def test_an_activate_failure_is_an_error_entry_too(self):
+        with tempfile.TemporaryDirectory() as d:
+            shots = run.Shots(d)
+            browser = mock.Mock()
+            browser.call.side_effect = cdp.CdpError("ws gone")
+            self.assertFalse(shots.capture("v-1-card.png", browser=browser,
+                                           activate="T1", timeout=0.5))
+            self.assertIn("ws gone", shots.taken[0]["error"])
+
+    def test_launch_args_adds_the_screenshot_switches_only_with_shots(self):
+        wt_test = LaunchTest()
+        with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict(os.environ, {"RAC_EVALS_NO_QUEUE": "1"}):
+            binary = wt_test.make_worktree(wt)
+            shots = run.Shots(d)
+            shots.boot = os.path.join(d, "v-boot.png")
+            args = run.launch_args("/tmp/p", 9333, wt, shots)
+            self.assertIn(f"--rac-window-screenshot={shots.boot}", args)
+            self.assertIn(f"--rac-window-screenshot-requests={shots.requests}", args)
+            args = run.launch_args("/tmp/p", 9333, wt)
+            self.assertEqual(args[0], binary)
+            self.assertFalse([a for a in args if "screenshot" in a])
+
+
+class RelaunchTest(unittest.TestCase):
+    def test_port_open(self):
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+        self.assertTrue(run._port_open(port))
+        s.close()
+        self.assertFalse(run._port_open(port))
+
+    def hold_profile(self, profile, seconds):
+        """A process whose argv carries the flag, as a launched browser's
+        does; pgrep -f sees it until it exits."""
+        proc = subprocess.Popen([sys.executable, "-c",
+                                 f"import time; time.sleep({seconds})",
+                                 f"--user-data-dir={profile}"])
+        threading.Thread(target=proc.wait, daemon=True).start()  # reap the zombie
+        for _ in range(100):  # wait until exec makes it visible to pgrep
+            if subprocess.run(["pgrep", "-f", "--", f"--user-data-dir={profile}"],
+                              capture_output=True).returncode == 0:
+                return proc
+            time.sleep(0.05)
+        proc.kill()
+        self.fail("the holder never became visible to pgrep")
+
+    def test_wait_released_returns_at_once_when_nothing_holds(self):
+        self.assertTrue(run.wait_released("/tmp/rac-evals-none", run.free_port(), timeout=2))
+
+    def test_wait_released_blocks_until_the_holder_exits(self):
+        profile = "/tmp/rac-evals-hold-test"
+        proc = self.hold_profile(profile, 1.2)
+        try:
+            start = time.time()
+            self.assertTrue(run.wait_released(profile, run.free_port(), timeout=10))
+            self.assertGreater(time.time() - start, 0.5)
+        finally:
+            proc.kill()
+
+    def test_wait_released_gives_up_when_still_held(self):
+        profile = "/tmp/rac-evals-stuck-test"
+        proc = self.hold_profile(profile, 30)
+        try:
+            start = time.time()
+            self.assertFalse(run.wait_released(profile, run.free_port(), timeout=1))
+            self.assertGreaterEqual(time.time() - start, 1)
+        finally:
+            proc.kill()
+
+
+class AttachWaitTest(unittest.TestCase):
+    class FakeAssistant:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def eval(self, expression, await_promise=True):
+            return self.payload
+
+    def test_returns_once_every_wanted_url_is_listed(self):
+        infos = [{"id": 1, "url": "http://wanted/page"}, {"id": 2, "url": "http://other/"}]
+        got = run.await_attached_tabs(self.FakeAssistant(infos), ["http://wanted/"],
+                                      mock.Mock(), None, timeout=2)
+        self.assertEqual(got, infos)
+
+    def test_timeout_raises_with_the_last_payload_and_get_targets(self):
+        assistant = self.FakeAssistant([{"id": 1, "url": "http://other/"}])
+        browser = mock.Mock()
+        browser.call.return_value = {"targetInfos": [{"targetId": "t9",
+                                                      "url": "chrome://rac-ai/"}]}
+        try:
+            run.await_attached_tabs(assistant, ["http://wanted/"], browser, None, timeout=0.3)
+            self.fail("should have timed out")
+        except RuntimeError as e:
+            msg = str(e)
+        self.assertIn("racAiGetTabs", msg)
+        self.assertIn("http://other/", msg)
+        self.assertIn("Target.getTargets", msg)
+        self.assertIn("t9", msg)
+
+    def test_get_targets_failure_is_reported_not_raised(self):
+        browser = mock.Mock()
+        browser.call.side_effect = cdp.CdpError("ws gone")
+        try:
+            run.await_attached_tabs(self.FakeAssistant([]), ["http://wanted/"],
+                                    browser, None, timeout=0.3)
+            self.fail("should have timed out")
+        except RuntimeError as e:
+            self.assertIn("ws gone", str(e))
+
+    def test_listed_tabs_stashes_the_raw_payload_for_diagnosis(self):
+        last = {}
+        infos = [{"id": 1, "url": "http://x/page"}]
+        self.assertEqual(run._listed_tabs(self.FakeAssistant(infos), ["http://x/"], last), infos)
+        self.assertEqual(last["get_tabs"], infos)
 
 
 if __name__ == "__main__":

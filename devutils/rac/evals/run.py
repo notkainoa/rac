@@ -8,6 +8,8 @@
                                       Python stand-in agent (sim_agent.py)
   run.py [--variants a,b]             launch the build and run for real
                                       (needs a built worktree; see README)
+  run.py --screenshots ...            also write proof PNGs of the window to
+                                      <results-dir>/shots/ (real runs only)
 
 A real run, per variant, in a throwaway profile:
   1. start the fixture server (one port per origin) and the fake model;
@@ -229,12 +231,13 @@ def browser_binary(worktree):
                         "rac.app", "Contents", "MacOS", "rac")
 
 
-def launch_args(profile, port, worktree):
+def launch_args(profile, port, worktree, shots=None):
     """The launch command: the app binary itself, so a remote eval host needs
     only the build output, not the checkout's run scripts. --use-mock-keychain
     lets OSCrypt store the fake provider's key without the real keychain (what
     worktree.sh supplied). The build queue wraps the launch in a run slot;
-    RAC_EVALS_NO_QUEUE=1 runs the binary directly."""
+    RAC_EVALS_NO_QUEUE=1 runs the binary directly. `shots`, a Shots, adds the
+    window-screenshot dev switches."""
     binary = browser_binary(worktree)
     if not os.path.exists(binary):
         raise RuntimeError(f"no built rac at {binary}; build the worktree first")
@@ -244,6 +247,11 @@ def launch_args(profile, port, worktree):
             f"--remote-debugging-port={port}", "--remote-debugging-address=127.0.0.1",
             "--rac-launch-in-background", "--no-first-run", "--no-default-browser-check",
             "--disable-background-networking", "--disable-component-update"]
+    if shots is not None:
+        # window_screenshot.mm only polls the requests file when the main
+        # screenshot switch is also set, so a boot capture has to come too.
+        argv += [f"--rac-window-screenshot={shots.boot}",
+                 f"--rac-window-screenshot-requests={shots.requests}"]
     if os.environ.get("RAC_EVALS_NO_QUEUE") == "1":
         return argv
     queue = os.path.join(worktree, "devutils", "rac", "build-queue.sh")
@@ -280,6 +288,88 @@ def kill_run(proc, profile, grace=20):
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         pass
+
+
+def _port_open(port):
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def wait_released(profile, port, timeout=15):
+    """True once no process still holds `profile` and the old DevTools port
+    refuses connections. kill_run can return while a SIGKILLed browser's
+    family (grandchildren of the launch process) still holds both, and the
+    next variant's launch must not race them. Best effort: gives up and
+    returns False after `timeout`."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        held = subprocess.run(["pgrep", "-f", "--", f"--user-data-dir={profile}"],
+                              capture_output=True).returncode == 0
+        if not held and not _port_open(port):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+class Shots:
+    """Proof captures of the browser window through the dev switches in
+    chrome/browser/ui/views/rac/window_screenshot.mm: the browser polls the
+    --rac-window-screenshot-requests file every 250 ms, reads and deletes it,
+    then writes the window to the PNG path inside (or runs a command such as
+    "click X Y" or "burst DIR N MS"; only PNG paths are ever sent here).
+    Polling starts only when --rac-window-screenshot is set too, so every
+    launch also writes a boot capture. Writes are atomic so a poll never
+    reads half a path."""
+
+    def __init__(self, dir):
+        self.dir = dir
+        self.requests = os.path.join(dir, "requests")
+        self.boot = os.path.join(dir, "boot.png")
+        self.taken = []  # [{name, ok, error}], for the result JSON
+
+    @classmethod
+    def prepare(cls, results_dir):
+        """Creates <results-dir>/shots and returns a Shots on it. A symlink
+        there is refused: the browser writes captures wherever a request
+        points, and a planted link would send them outside the results dir."""
+        path = os.path.abspath(os.path.join(results_dir, "shots"))
+        if os.path.islink(path):
+            raise RuntimeError(f"refusing a symlinked shots folder: {path}")
+        os.makedirs(path, exist_ok=True)
+        return cls(path)
+
+    def request(self, line):
+        tmp = self.requests + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(line)
+        os.replace(tmp, self.requests)
+
+    def capture(self, name, browser=None, activate=None, proc=None, timeout=15):
+        """Asks for one window PNG and waits for it. `activate` first makes
+        that DevTools target the visible tab, so the shot shows it. Never
+        raises: the outcome is appended to self.taken, so a bad capture can
+        never fail a variant."""
+        out = os.path.join(self.dir, name)
+        entry = {"name": name, "ok": False, "error": None}
+        try:
+            if browser is not None and activate is not None:
+                browser.call("Target.activateTarget", {"targetId": activate})
+                time.sleep(0.4)  # the newly visible tab needs a frame to paint
+            self.request(out)
+            wait_for(lambda: _png_ready(out), f"screenshot {name}", timeout, proc)
+            entry["ok"] = True
+        except Exception as e:
+            entry["error"] = f"{type(e).__name__}: {e}"
+        self.taken.append(entry)
+        return entry["ok"]
+
+
+def _png_ready(path):
+    return os.path.exists(path) and os.path.getsize(path) > 0
 
 
 class Page:
@@ -336,16 +426,19 @@ def run_browser(variant, args):
     download_dir = os.path.join(profile, "downloads")
     os.makedirs(download_dir)
     rig = Rig(variant, args.host_mode)
-    proc, launch_log = None, None
+    shots = Shots.prepare(args.results_dir) if args.screenshots else None
+    if shots is not None:
+        shots.boot = os.path.join(shots.dir, variant["id"] + "-boot.png")
+    proc, launch_log, port = None, None, None
     try:
         prefs = build_preferences(variant, rig.fixtures.base, rig.model_url, download_dir)
         with open(os.path.join(profile, "Default", "Preferences"), "w") as f:
             json.dump(prefs, f)
-        port = free_port()
+        port = free_port()  # fresh per launch: the last variant's may linger
         # A run command's output isn't piped through the queue, so browser
         # and queue write the same file; a pipe nobody drains would stall them.
         launch_log = open(os.path.join(profile, "browser.log"), "wb")
-        proc = subprocess.Popen(launch_args(profile, port, worktree), cwd=worktree,
+        proc = subprocess.Popen(launch_args(profile, port, worktree, shots), cwd=worktree,
                                 start_new_session=True, env=launch_env(profile),
                                 stdout=launch_log, stderr=subprocess.STDOUT)
         # The build queue holds run slots: a queued launch can wait minutes
@@ -354,10 +447,12 @@ def run_browser(variant, args):
         endpoint = wait_for(lambda: http_json(f"http://127.0.0.1:{port}/json/version"),
                             "the DevTools endpoint", 900, proc)
         browser = cdp.Cdp(endpoint["webSocketDebuggerUrl"])
-        turns, answers, dialogs = drive(variant, rig, browser, proc)
+        turns, answers, dialogs = drive(variant, rig, browser, proc, shots)
         downloads = os.listdir(download_dir)
         record = rig.record("browser", turns, answers, downloads)
         record["dialogs"] = dialogs
+        if shots is not None:
+            record["screenshots"] = shots.taken
         try:
             browser.call("Browser.close")  # flushes prefs; pkill would lose them
         except cdp.CdpError:
@@ -366,6 +461,12 @@ def run_browser(variant, args):
     finally:
         if proc and proc.poll() is None:
             kill_run(proc, profile)
+        # kill_run can return while a killed browser's family still holds the
+        # profile and the old DevTools port; the next variant's launch must
+        # not race them.
+        if port is not None and not wait_released(profile, port):
+            print(f"     warning: {profile} or DevTools port {port} is still held",
+                  flush=True)
         if launch_log:
             launch_log.close()
         rig.stop()
@@ -424,13 +525,14 @@ def save_key(browser):
         raise RuntimeError(f"the fake provider's key was not saved: {state!r:.300}")
 
 
-def drive(variant, rig, browser, proc):
+def drive(variant, rig, browser, proc, shots=None):
     """Plays the variant's turns through a chrome://rac-ai tab.
 
     The side panel holds the same WebUI; a tab gets the same PageHandler, so
     chrome.send/sendWithPromise drive it directly. The agent acts in the tabs
     of the page's window that racAiSend names by id, which racAiGetTabs lists
-    as {id, title, url, current} for http(s) tabs only."""
+    as {id, title, url, current} for http(s) tabs only. With `shots`, the
+    window is captured at the turn's key moments into <results-dir>/shots."""
     origins = rig.fixtures.base
     save_key(browser)
 
@@ -457,13 +559,13 @@ def drive(variant, rig, browser, proc):
         raise RuntimeError(f"the assistant is not configured: {state!r:.300}")
 
     messages, turns, answers, send_id = [], [], [], 0
+    card_shot = after_shot = False  # one -1-card/-2-after pair per variant
     for index, turn in enumerate(variant["turns"]):
         send_id += 1
         user = expand(turn["user"], origins)
         messages.append({"role": "user", "text": user})
         wanted = [tab_url(r, origins) for r in turn.get("attach", [])]
-        infos = wait_for(lambda: _listed_tabs(assistant, wanted),
-                         "the attached tabs in racAiGetTabs", 30, proc)
+        infos = await_attached_tabs(assistant, wanted, browser, proc)
         ids = [t["id"] for t in infos if any(t.get("url", "").startswith(w) for w in wanted)]
         # Attach reads page text at send time; a tab that has committed its
         # URL but not finished loading yields an empty read and the send's
@@ -491,6 +593,8 @@ def drive(variant, rig, browser, proc):
                     pass
         start = len(assistant.eval("window.__evals.events"))
         up_start = len(assistant.eval("window.__evals.updates"))
+        if shots is not None and variant["id"] == "chain-canonical":
+            shots.capture(variant["id"] + "-0-before.png", proc=proc)
         # args: send id, [{role, text}], [tab ids], files, conversation id.
         # One conversation id keeps the read set across turns (earlier-turn).
         assistant.eval(f"chrome.send('racAiSend', [{send_id}, {json.dumps(messages)}, "
@@ -504,10 +608,21 @@ def drive(variant, rig, browser, proc):
             for e in events:
                 if e.get("type") in CARD_TYPES and e.get("id") not in answered:
                     answered.add(e["id"])
+                    if shots is not None and e.get("type") == "confirm_request" \
+                            and not card_shot:
+                        # The card is on screen; the assistant tab must be the
+                        # visible one for the proof to show it.
+                        card_shot = True
+                        shots.capture(variant["id"] + "-1-card.png", browser=browser,
+                                      activate=assistant.target_id, proc=proc)
                     answer = grade.simulated_answer(variant)
                     answers.append({"id": e["id"], "answer": answer})
                     assistant.eval("window.__evals.cr.sendWithPromise("
                                    f"'racAiAgentRespond', {json.dumps(e['id'])}, {json.dumps(answer)})")
+                    if shots is not None and not after_shot:
+                        after_shot = True
+                        shots.capture(variant["id"] + "-2-after.png", browser=browser,
+                                      activate=assistant.target_id, proc=proc)
                 if e.get("type") == "run_state" and e.get("state") in END_STATES:
                     end_state = e["state"]
             if end_state == "timeout":
@@ -546,15 +661,41 @@ def _try_eval(page, expression):
         page.browser.timeout = old
 
 
-def _listed_tabs(assistant, wanted):
-    """racAiGetTabs once every wanted URL is listed, else None."""
+def _listed_tabs(assistant, wanted, last=None):
+    """racAiGetTabs once every wanted URL is listed, else None. `last`, when
+    given, is a dict that gets the raw payload each poll, so a wait that
+    times out can be diagnosed."""
     try:
-        infos = assistant.eval("window.__evals.cr.sendWithPromise('racAiGetTabs')") or []
-    except cdp.CdpError:
+        infos = assistant.eval("window.__evals.cr.sendWithPromise('racAiGetTabs')")
+    except (cdp.CdpError, OSError) as e:
+        if last is not None:
+            last["get_tabs"] = f"{type(e).__name__}: {e}"
+        return None
+    if last is not None:
+        last["get_tabs"] = infos
+    if not isinstance(infos, list):
         return None
     if all(any(t.get("url", "").startswith(w) for t in infos) for w in wanted):
         return infos
     return None
+
+
+def await_attached_tabs(assistant, wanted, browser, proc, timeout=30):
+    """Waits for racAiGetTabs to list every wanted URL. A timeout raises with
+    the last racAiGetTabs payload and a Target.getTargets snapshot, so the
+    runner_error record says what the browser actually had (the usual flake
+    is a next launch that raced a still-dying previous browser)."""
+    last = {}
+    try:
+        return wait_for(lambda: _listed_tabs(assistant, wanted, last),
+                        "the attached tabs in racAiGetTabs", timeout, proc)
+    except RuntimeError as e:
+        try:
+            targets = browser.call("Target.getTargets")
+        except Exception as e2:
+            targets = f"{type(e2).__name__}: {e2}"
+        raise RuntimeError(f"{e}; last racAiGetTabs={json.dumps(last.get('get_tabs')):.400}; "
+                           f"Target.getTargets={json.dumps(targets):.400}")
 
 
 # --- the commit status (stub) ---------------------------------------------------------
@@ -604,6 +745,9 @@ def main(argv=None):
     ap.add_argument("--worktree", default=ROOT,
                     help="the checkout whose built rac runs (its devutils/rac and build/)")
     ap.add_argument("--keep-profile", action="store_true")
+    ap.add_argument("--screenshots", action="store_true",
+                    help="real runs only: capture the window at each variant's key "
+                         "moments into <results-dir>/shots/")
     ap.add_argument("--post-status", metavar="SHA", help="post rac/agent-evals for this commit")
     args = ap.parse_args(argv)
 
@@ -613,6 +757,8 @@ def main(argv=None):
             print(f"{v['id']:34} {v['kind']:10} {v['title']}")
         return 0
     os.makedirs(args.results_dir, exist_ok=True)
+    if args.screenshots and not args.dry_run:
+        Shots.prepare(args.results_dir)  # refuses a symlinked shots folder
     if not args.dry_run and not args.keep_profile:
         clean_stale_profiles(os.path.realpath(args.worktree))
     outcomes = []

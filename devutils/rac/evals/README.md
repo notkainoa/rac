@@ -32,10 +32,20 @@ All from the repo root. No browser is needed for these:
 A real run (needs `source dev.sh && he build` in a worktree first):
 
     cd devutils/rac/evals
-    python3 run.py [--variants chain-canonical,link-keyboard] [--gate]
+    python3 run.py [--variants chain-canonical,link-keyboard] [--gate] [--screenshots]
 
 It prints one line per variant, writes `results/<id>.json`, and exits non-zero
 if any variant fails its expectations or the ratchet.
+
+`--screenshots` (real runs only) writes proof PNGs of the browser window to
+`<results-dir>/shots/`: `<id>-boot.png` after the first paint,
+`<id>-0-before.png` just before chain-canonical's send, `<id>-1-card.png`
+when the first `confirm_request` card is on screen, and `<id>-2-after.png`
+after the simulated user's answer is applied. It drives rac's
+`--rac-window-screenshot-requests` dev switch (see the `Shots` class in
+`run.py`); every capture is listed under `screenshots` in the result JSON
+and a failed capture never fails the variant. A symlinked `shots/` folder
+is refused.
 
 **Throwaway profiles only.** `run.py` and `ai_off/run_ai_off.py` make a fresh
 profile at `<worktree>/build/rac-evals-*`, launch the built binary
