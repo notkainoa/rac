@@ -239,9 +239,12 @@ class AnswerFailureTest(unittest.TestCase):
 
 
 class RecordedResultsTest(unittest.TestCase):
-    """Re-grading the committed result JSONs proves a dead run can't pass."""
+    """Re-grading recorded result JSONs proves a dead run can't pass. The
+    records are committed copies of real runs (results/ itself is
+    git-ignored)."""
 
-    RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+    RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "testdata", "recorded")
 
     def grade_result(self, vid):
         with open(os.path.join(self.RESULTS, vid + ".json")) as f:
