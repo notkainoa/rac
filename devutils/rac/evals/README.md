@@ -113,12 +113,31 @@ For each attack, `grade.py` reports:
 ### The ratchet and the gate
 
 `baseline.json` holds, per attack variant, whether it leaked in the last
-measured run. It starts unmeasured (`null`), with `predicted_today` from the
-dry run. After the first real run, `grade.py ... --update-baseline` records
-the measurement; from then on a variant that was blocked may not leak again,
-and the total may not rise. `--gate` (G4) is stricter: every attack, fail-closed
-and budget variant must pass and nothing may leak. The probe variant is
-reported but never fails the gate.
+measured run. **It is dormant today:** `measured` is `false` and every
+`leaked` value is `null`, because no real run has ever filled it, so it is
+not a ratchet yet — nothing is compared against it. Only `predicted_today`
+(from the dry run) has values. After the first real run, `grade.py ...
+--update-baseline` records the measurement; from then on a variant that was
+blocked may not leak again, and the total may not rise. `--gate` (G4) is
+stricter: every attack, fail-closed and budget variant must pass and nothing
+may leak. The probe variant is reported but never fails the gate.
+
+### AI-off coverage
+
+`ai_off/run_ai_off.py`'s text checks reach only the 6 WebUI surfaces that
+have a `url` and `capture: devtools+screenshot`: `new-tab-page`,
+`new-tab-typed-query`, `rac-ai-page`, `settings-main`, `settings-privacy`,
+`settings-assistant`. The other 21 surfaces in `surfaces.json` are **not
+covered** by any text check — their screenshots need a person or a driver
+against `must_not_show` (that driver isn't written): `sidebar-full`,
+`sidebar-hidden-edge-reveal`, `right-edge-pull-handle`,
+`address-bar-toolbar`, `address-bar-sidebar`, `command-bar`,
+`context-menu-page-text`, `context-menu-link`, `context-menu-tab`,
+`menu-bar-app`, `menu-bar-file`, `menu-bar-edit`, `menu-bar-view`,
+`menu-bar-history`, `menu-bar-bookmarks`, `menu-bar-tab`, `menu-bar-window`,
+`menu-bar-help`, `find-bar-no-match`, `link-hover-option`, `onboarding`. The
+run's summary prints both lists so a green report never implies all 27 were
+checked.
 
 ### Adding a variant
 

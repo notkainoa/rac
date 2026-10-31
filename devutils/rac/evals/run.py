@@ -131,8 +131,17 @@ def expand(obj, origins):
 
 
 def flat_prefs(variant, origins):
+    """The variant's own prefs. Only the allow-listed keys (variants.PREF_KEYS:
+    the agent level and site rules under test) may come from the fixture —
+    anything else would let a variant rewrite the safety prefs the run depends
+    on, so an unknown key is refused outright."""
     prefs = {"rac.ai.agent_permission_level": variant["level"]}
-    prefs.update(variant.get("prefs", {}))
+    for key, value in variant.get("prefs", {}).items():
+        if key not in variants.PREF_KEYS:
+            raise variants.VariantError(
+                f"{variant['id']}: pref {key!r} is not allowed; a variant may only "
+                f"set {', '.join(variants.PREF_KEYS)}")
+        prefs[key] = value
     return expand(prefs, origins)
 
 
@@ -205,8 +214,21 @@ def run_dry(variant, mode):
 # --- real browser ---------------------------------------------------------------
 
 def build_preferences(variant, origins, model_base_url, download_dir):
-    """The seeded Default/Preferences, as nested JSON."""
+    """The seeded Default/Preferences, as nested JSON. The variant's own
+    (allow-listed) prefs go first; the safety prefs go last so nothing — a
+    variant pref, a spec suffix — can override them."""
     prefs = {}
+    for dotted, value in flat_prefs(variant, origins).items():
+        deep_set(prefs, dotted, value)
+    # The run's :light/:dark and :narrow/:wide suffixes; see the constants
+    # above for why these prefs and not Chromium's color-scheme pref.
+    if variant.get("appearance"):
+        deep_set(prefs, SPACES_PREF, {"version": 1, "spaces": [
+            {"id": EVALS_SPACE_ID, "name": "",
+             "theme": {**EVALS_SPACE_COLORS, "mode": variant["appearance"]}}]})
+    if variant.get("panel_width"):
+        deep_set(prefs, PANEL_WIDTH_PREF,
+                 {ASSISTANT_PANEL_ID: PANEL_WIDTHS[variant["panel_width"]]})
     for dotted, value in {
         "rac.ai.enabled": True,
         "rac.ai.provider": "custom",
@@ -222,17 +244,6 @@ def build_preferences(variant, origins, model_base_url, download_dir):
         # reaches Helium's services (filter lists through their proxy).
         "helium.services.enabled": False,
     }.items():
-        deep_set(prefs, dotted, value)
-    # The run's :light/:dark and :narrow/:wide suffixes; see the constants
-    # above for why these prefs and not Chromium's color-scheme pref.
-    if variant.get("appearance"):
-        deep_set(prefs, SPACES_PREF, {"version": 1, "spaces": [
-            {"id": EVALS_SPACE_ID, "name": "",
-             "theme": {**EVALS_SPACE_COLORS, "mode": variant["appearance"]}}]})
-    if variant.get("panel_width"):
-        deep_set(prefs, PANEL_WIDTH_PREF,
-                 {ASSISTANT_PANEL_ID: PANEL_WIDTHS[variant["panel_width"]]})
-    for dotted, value in flat_prefs(variant, origins).items():
         deep_set(prefs, dotted, value)
     return prefs
 
@@ -280,10 +291,14 @@ def free_port():
 
 
 def launch_env(profile):
-    """The launch environment. Crash dumps go into the throwaway profile, so a
-    dev run never writes the real me.kainoa.rac/Crashpad (PR #25 does the
-    same in worktree.sh; this holds even without it)."""
-    env = dict(os.environ)
+    """The launch environment: an explicit minimal set, because the browser
+    loads hostile fixture pages and must not inherit this shell's secrets —
+    under ssh that means SSH_AUTH_SOCK and whatever else is exported. Crash
+    dumps go into the throwaway profile, so a dev run never writes the real
+    me.kainoa.rac/Crashpad (PR #25 does the same in worktree.sh; this holds
+    even without it)."""
+    env = {key: os.environ[key] for key in ("HOME", "PATH", "TMPDIR", "LANG")
+           if key in os.environ}
     env["BREAKPAD_DUMP_LOCATION"] = os.path.join(profile, "Crashpad")
     return env
 
@@ -781,6 +796,26 @@ def _wait_card_resolved(panel, card_id, proc, timeout=5):
         pass
 
 
+def answer_card(assistant, card_id, answer, proc, shots):
+    """Answers one card and returns its `answers` entry. The entry is
+    {"id", "answer"} only when the click or the respond call is confirmed to
+    have gone through — the panel's button status is "clicked", or the
+    racAiAgentRespond evaluate returns instead of raising (a rejected promise
+    lands in exceptionDetails). Otherwise the entry is {"id", "error"}: a card
+    the runner could not answer never reads as a deny in the record."""
+    if shots is not None:
+        status = panel_answer(assistant, card_id, answer, proc)
+        if status == "clicked":
+            return {"id": card_id, "answer": answer}
+        return {"id": card_id, "error": f"card buttons: {status}"}
+    try:
+        assistant.eval("window.__evals.cr.sendWithPromise("
+                       f"'racAiAgentRespond', {json.dumps(card_id)}, {json.dumps(answer)})")
+    except (cdp.CdpError, OSError) as e:
+        return {"id": card_id, "error": f"racAiAgentRespond: {e}"}
+    return {"id": card_id, "answer": answer}
+
+
 # racAiInit calls AllowJavascript() and subscribes the page to the profile's
 # agent events; without it FireWebUIListener is a no-op and racAiAgentEvent
 # never arrives. Returns the init state ({enabled, configured, needsKey...}).
@@ -1046,23 +1081,16 @@ def drive(variant, rig, browser, proc, shots=None):
                                            assistant, agent_page(pages, turn),
                                            card_id=e["id"], proc=proc)
                     answer = grade.simulated_answer(variant)
-                    rec = {"id": e["id"], "answer": answer}
-                    answers.append(rec)
-                    if shots is not None:
-                        # The card's own buttons answer it, armed first;
-                        # the click is what a user would do.
-                        clicked = panel_answer(assistant, e["id"], answer, proc)
-                        if clicked != "clicked":
-                            rec["click"] = clicked
-                        if not after_shot:
-                            # The resolved card then shows beside the page
-                            # it guarded, applied or not.
-                            after_shot = True
-                            _wait_card_resolved(assistant, e["id"], proc)
-                            shots.capture(variant["id"] + "-2-after.png", proc=proc)
-                    else:
-                        assistant.eval("window.__evals.cr.sendWithPromise("
-                                       f"'racAiAgentRespond', {json.dumps(e['id'])}, {json.dumps(answer)})")
+                    # The answer is recorded only once the click or respond
+                    # call is confirmed; a failure is recorded instead, so a
+                    # card nobody answered can't masquerade as a deny.
+                    answers.append(answer_card(assistant, e["id"], answer, proc, shots))
+                    if shots is not None and not after_shot:
+                        # The resolved card then shows beside the page it
+                        # guarded, applied or not.
+                        after_shot = True
+                        _wait_card_resolved(assistant, e["id"], proc)
+                        shots.capture(variant["id"] + "-2-after.png", proc=proc)
                 if e.get("type") == "run_state" and e.get("state") in END_STATES:
                     end_state = e["state"]
             if end_state == "timeout":

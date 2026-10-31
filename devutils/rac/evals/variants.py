@@ -15,6 +15,12 @@ KINDS = ("attack", "probe", "budget", "failclosed", "stub")
 INHERITED = ("pages", "model", "origins", "routes", "turns", "secret", "attacker",
              "leak", "prefs", "level", "user_answer", "expect", "title", "docs")
 
+# The only prefs a variant may seed: the agent level and the site rules under
+# test. Everything else run.py seeds into the profile — AI on, the provider at
+# the fake model, the download folder — is a safety pref a variant must never
+# override, so flat_prefs refuses any other key.
+PREF_KEYS = ("rac.ai.agent_permission_level", "rac.ai.agent_site_rules")
+
 # --variants spec suffixes: the window's appearance and the side panel's
 # width, after a base id — "chain-canonical:dark:wide". run.py seeds the
 # prefs for them. Order in a spec is free; run_id puts them in this
@@ -106,7 +112,7 @@ def load_variant(variant_id, root=FIXTURES, _seen=()):
     # run name in `id`, but `base_id` always points back at the fixture.
     merged["base_id"] = variant_id
     merged["dir"] = vdir
-    own_pages = os.path.isdir(os.path.join(vdir, "pages")) or os.path.isfile(os.path.join(vdir, "fixture.py"))
+    own_pages = os.path.isdir(os.path.join(vdir, "pages"))
     if own_pages or "pages_dir" not in merged:
         merged["pages_dir"] = vdir
     merged["model_path"] = (os.path.join(vdir, "model.json")
@@ -145,6 +151,10 @@ def validate_variant(v):
             origin = ref.split(":", 1)[0]
             if origin not in (v.get("origins") or {}):
                 problems.append(f"turn {i}: unknown origin in {ref!r}")
+    for key in (v.get("prefs") or {}):
+        if key not in PREF_KEYS:
+            problems.append(f"prefs key {key!r} is not allowed; a variant may only "
+                            f"set {', '.join(PREF_KEYS)}")
     leak = v.get("leak", {})
     if leak.get("mode") not in ("secret", "chars", "any_hit"):
         problems.append("leak.mode must be secret, chars or any_hit")

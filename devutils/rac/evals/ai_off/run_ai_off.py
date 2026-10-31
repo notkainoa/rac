@@ -408,7 +408,43 @@ def find_bundle(worktree):
     return found[0] if found else None
 
 
-SETTINGS_SET_PREF = ("new Promise(r => chrome.settingsPrivate.setPref('rac.ai.enabled', %s, '', r))")
+# Writes rac.ai.enabled through the same call the toggle makes, then reads the
+# pref back, resolving to {ok, value}: ok false when settingsPrivate reports a
+# lastError, value the read-back pref (null when it can't be read). Without
+# the read-back a failed write is silent and the run ends up comparing
+# "never on" with "still off".
+SETTINGS_SET_PREF = (
+    "new Promise(r => chrome.settingsPrivate.setPref('rac.ai.enabled', %s, '', () => {"
+    "  const e = chrome.runtime.lastError;"
+    "  if (e) { r({ok: false, value: null, error: e.message}); return; }"
+    "  try {"
+    "    chrome.settingsPrivate.getPref('rac.ai.enabled', p => r({ok: true, value: p ? p.value : null}));"
+    "  } catch (err) { r({ok: true, value: null}); }"
+    "}))")
+
+
+def set_ai_enabled(settings, enabled):
+    """One toggle: setPref(rac.ai.enabled, `enabled`) on the Settings page,
+    verified. True only when the write went through without a lastError and
+    the pref reads back as `enabled` (or can't be read back at all); False
+    means the toggle provably didn't take."""
+    try:
+        got = settings.eval(SETTINGS_SET_PREF % json.dumps(enabled))
+    except Exception:
+        return False
+    if not isinstance(got, dict) or not got.get("ok"):
+        return False
+    return got.get("value") in (None, enabled)
+
+
+def surface_coverage():
+    """(covered, uncovered) surface ids: `covered` are read by the run's WebUI
+    text check (the same predicate real_run uses), `uncovered` are everything
+    else — screenshot-only surfaces nobody's text check reads."""
+    covered = {s["id"] for s in surfaces.load()
+               if s.get("capture") == "devtools+screenshot" and s.get("url")}
+    all_ids = [s["id"] for s in surfaces.load()]
+    return [i for i in all_ids if i in covered], [i for i in all_ids if i not in covered]
 
 
 def real_run(args):
@@ -467,18 +503,26 @@ def real_run(args):
         settings = session.open_page("chrome://settings/")
         time.sleep(2)
         # rac.ai.enabled is in the settingsPrivate allow-list (prefs_util.cc),
-        # so the same call the toggle button makes flips it.
-        settings.eval(SETTINGS_SET_PREF % "true")
+        # so the same call the toggle button makes flips it. Each write is
+        # verified: a toggle that didn't take would make the before/after
+        # comparison meaningless ("never on" vs "still off" both look clean).
+        toggle = []
+        if not set_ai_enabled(settings, True):
+            toggle.append("setPref(rac.ai.enabled, true) did not take; "
+                          "the 'on' half of this item never ran")
         time.sleep(SETTLE_SECONDS)
         off_at = len(rig.model_state.log)
-        settings.eval(SETTINGS_SET_PREF % "false")
+        if not set_ai_enabled(settings, False):
+            toggle.append("setPref(rac.ai.enabled, false) did not take; "
+                          "AI may still be on")
         time.sleep(SETTLE_SECONDS)
         ps_text, lsof_text = session.collect()
         after = checks.make_state(ps_text, session.pid, lsof_text, profile,
                                   rig.model_state.log[off_at:], ignore=tmp_before)
         session.close()
         session = None
-        results.append(("AI on then off returns to baseline", checks.compare_states(before, after)))
+        results.append(("AI on then off returns to baseline",
+                        toggle + checks.compare_states(before, after)))
     finally:
         if session:
             session.close()
@@ -495,6 +539,15 @@ def print_summary(results, out=print):
         out(f"{name:40} {'PASS' if not problems else 'FAIL (%d)' % len(problems)}")
         for p in problems:
             out(f"    {p}")
+    # Never let a green summary imply every surface was checked: only the
+    # WebUI surfaces have a text check; the rest are screenshot-only.
+    covered, uncovered = surface_coverage()
+    out(f"\nWebUI text checks cover {len(covered)} of "
+        f"{len(covered) + len(uncovered)} surfaces:")
+    out("    " + ", ".join(covered))
+    out(f"NOT covered by text checks ({len(uncovered)} surfaces; screenshots "
+        "need a person or a driver against must_not_show):")
+    out("    " + ", ".join(uncovered))
     return all(not p for _, p in results)
 
 

@@ -17,7 +17,7 @@ has never run.
 | 3 | `check_process_tree` | A descendant of the browser is not a Chromium helper from inside the app bundle (gpu, renderer, an allow-listed utility, or the crashpad handler). `node`, `npx`, `claude`, `codex`, `nc` and the rest fail by name. |
 | 4 | `check_no_provider_requests` | The fake model logged any request, or the net-log has a `URL_REQUEST_START_JOB` with the `rac_ai_chat` or `rac_ai_models` annotation hash, or any event names the fake model's host:port. The profile is seeded so a stray request lands on the fake model. |
 | 5 | `find_forbidden_labels`, `surfaces.check_text` | A surface other than `settings-assistant` shows Assistant, Ask AI, Ask, AI, Chat, Summarize, Agent, and so on. Whole words only. |
-| 6 | `compare_states` | After AI is turned on and off there is a new kind of process, a new socket path, a new MCP directory, or more provider requests than before. |
+| 6 | `compare_states`, `set_ai_enabled` | After AI is turned on and off there is a new kind of process, a new socket path, a new MCP directory, or more provider requests than before; or either `setPref` toggle didn't take (a silent failure would compare "never on" with "still off"). |
 
 Turning AI off leaves an existing service in memory, dormant (ai.md), so item
 6 only compares what can be observed. Children are compared by name, not
@@ -47,9 +47,13 @@ and the `--rac-window-screenshot=<path>` flag (rac writes its own window after
 the first paint; `screencapture -l` of another app is blank on macOS 26).
 WebUI surfaces (`capture: devtools+screenshot`) can also be read through
 DevTools with `surfaces.PAGE_TEXT_JS` and checked with `surfaces.check_text`.
-`run_ai_off.py` does that part. Native surfaces (menus, context menus, the
-pull handle, sidebar states) need the screenshot and a person or a Cua driver
-to compare it with `must_not_show`; that driver is not written.
+`run_ai_off.py` does that part, on 6 of the 27 surfaces (`new-tab-page`,
+`new-tab-typed-query`, `rac-ai-page`, `settings-main`, `settings-privacy`,
+`settings-assistant`). The other 21 — native surfaces (menus, context menus,
+the pull handle, sidebar states) — need the screenshot and a person or a Cua
+driver to compare it with `must_not_show`; that driver is not written. The
+run's summary prints both lists, so the report never implies all 27 were
+checked.
 
 ## The traffic annotation hash
 

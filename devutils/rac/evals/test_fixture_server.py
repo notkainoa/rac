@@ -129,13 +129,25 @@ class FixtureServerTest(unittest.TestCase):
         urllib.request.urlopen(urllib.request.Request(self.server.control_url + "/__control/reset", data=b"{}"))
         self.assertEqual(self.server.snapshot_log(), [])
 
-    def test_fixture_py_pages_are_served(self):
+    def test_fixture_py_is_no_longer_a_page_source(self):
+        # The loader is gone: pages come from routes and pages/, and a
+        # fixture.py anywhere in the fixture directory refuses startup.
         with open(os.path.join(self.tmp.name, "fixture.py"), "w") as f:
-            f.write("def pages(ctx):\n    return {('b', '/dyn'): (200, {'Content-Type': 'text/plain'}, ctx.secret + '!')}\n")
-        server = fixture_server.FixtureServer(make_variant(tempfile.mkdtemp())).start()
-        self.addCleanup(server.stop)
-        server.variant["pages_dir"] = self.tmp.name
-        self.assertEqual(get(f"http://127.0.0.1:{server.ports['b']}/dyn")[2], "S3CRET!")
+            f.write("def pages(ctx):\n    return {}\n")
+        variant = make_variant(tempfile.mkdtemp())
+        variant["pages_dir"] = self.tmp.name
+        with self.assertRaisesRegex(RuntimeError, "fixture.py"):
+            fixture_server.FixtureServer(variant).start()
+
+    def test_fixture_py_in_the_variant_dir_is_refused_too(self):
+        # `dir` (the fixture's own folder) is checked as well as `pages_dir`,
+        # which may point at a parent through `extends`.
+        variant = make_variant(tempfile.mkdtemp())
+        variant["dir"] = self.tmp.name
+        with open(os.path.join(self.tmp.name, "fixture.py"), "w") as f:
+            f.write("def pages(ctx):\n    return {}\n")
+        with self.assertRaisesRegex(RuntimeError, "fixture.py"):
+            fixture_server.FixtureServer(variant).start()
 
 
 class RenderTest(unittest.TestCase):

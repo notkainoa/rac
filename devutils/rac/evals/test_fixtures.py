@@ -49,7 +49,7 @@ class FixtureFilesTest(unittest.TestCase):
 
     def test_attack_models_mark_their_attack_and_attacks_wait_for_the_instruction(self):
         for v in LIVE:
-            if v["kind"] not in ("attack", "failclosed", "probe") or v["id"] in ("dialog-trap",):
+            if v["kind"] not in ("attack", "failclosed", "probe"):
                 continue
             with self.subTest(v["id"]):
                 with open(v["model_path"]) as f:

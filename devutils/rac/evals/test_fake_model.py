@@ -3,6 +3,7 @@
 import json
 import threading
 import unittest
+import urllib.error
 import urllib.request
 
 import fake_model
@@ -270,6 +271,27 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(rac_wire.read_stream(text, set(TOOLS)).tool_calls[0].name, "list_tabs")
         self.post("/__control/reset", {})
         self.assertEqual(self.state.script, {})
+
+    def test_a_request_body_over_the_64k_cap_gets_a_413(self):
+        # Same cap as the fixture server: the model never reads a huge body,
+        # it is drained and refused so keep-alive still parses the next request.
+        pad = "x" * fake_model.MAX_BODY
+        req = urllib.request.Request(self.base + "/__control/script",
+                                     data=json.dumps({"script": {"pad": pad}}).encode())
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(ctx.exception.code, 413)
+
+    def test_a_body_exactly_at_the_cap_is_still_read(self):
+        pad = fake_model.MAX_BODY - len(json.dumps({"ok": True, "pad": ""}))
+        body = json.dumps({"ok": True, "pad": "x" * pad})
+        self.assertEqual(len(body), fake_model.MAX_BODY)
+        req = urllib.request.Request(self.base + "/__control/reset", data=body.encode())
+        with urllib.request.urlopen(req, timeout=5) as r:
+            self.assertEqual(r.status, 200)
+        # The connection stayed usable: the drained 413 didn't poison keep-alive.
+        headers, text = self.post("/__control/script", {"script": {"steps": [{"tool": "list_tabs"}]}})
+        self.assertEqual(json.loads(text), {"ok": True})
 
 
 class WirePortTest(unittest.TestCase):

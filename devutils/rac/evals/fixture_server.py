@@ -12,9 +12,11 @@ every origin, for a browser or OS that won't.
 
 Page sources, first match wins:
   1. the variant's `routes` table (variant.json)
-  2. fixture.py: `def pages(ctx) -> {(origin, path): (status, headers, body)}`
-  3. fixtures/<id>/pages/<origin>/<path> (`/` is index.html, `/x` is x.html or x)
-  4. attacker origins answer anything with a small "Thanks" page; others 404
+  2. fixtures/<id>/pages/<origin>/<path> (`/` is index.html, `/x` is x.html or x)
+  3. attacker origins answer anything with a small "Thanks" page; others 404
+
+There is no fixture.py: pages never come from executable fixture code, and the
+server refuses to start in a fixture directory that still has one.
 
 Templates in page text: {{secret}} {{origin:NAME}} {{host:NAME}} {{port:NAME}}
 and {{keyboard origin=NAME path=/key param=c}}, a row of one-character links
@@ -30,7 +32,6 @@ import string
 import sys
 import threading
 import time
-import importlib.util
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, urlsplit
 
@@ -44,7 +45,8 @@ MAX_BODY = 64 * 1024
 
 
 class Ctx:
-    """What a fixture.py `pages(ctx)` sees."""
+    """What render() sees for one variant: the resolved secret, each origin's
+    base URL, and each origin's port."""
 
     def __init__(self, variant, base, ports):
         self.variant, self.base, self.ports = variant, base, ports
@@ -108,10 +110,17 @@ class FixtureServer:
         self.ports = {}
         self.base = {}
         self.control = None
-        self._pages = None
 
     # -- lifecycle --
     def start(self):
+        # Refuse any leftover fixture.py: fixture pages come from routes and
+        # pages/, never from executable fixture code.
+        for d in {self.variant.get("dir"), self.variant.get("pages_dir")} - {None}:
+            fixture_py = os.path.join(d, "fixture.py")
+            if os.path.isfile(fixture_py):
+                raise RuntimeError(
+                    f"{fixture_py}: fixture.py is not supported; delete it — "
+                    "pages come from variant.json routes and pages/ only")
         for name, spec in self.variant["origins"].items():
             server = QuietHTTPServer((self.host, 0), self._handler(name))
             self.servers[name] = server
@@ -148,17 +157,6 @@ class FixtureServer:
                    for p in scope.get("paths", []))
 
     # -- pages --
-    def _fixture_pages(self):
-        if self._pages is None:
-            self._pages = {}
-            path = os.path.join(self.variant["pages_dir"], "fixture.py")
-            if os.path.isfile(path):
-                spec = importlib.util.spec_from_file_location("fixture_" + self.variant["id"].replace("-", "_"), path)
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                self._pages = module.pages(Ctx(self.variant, self.base, self.ports))
-        return self._pages
-
     def _static(self, origin, path):
         root = os.path.join(self.variant["pages_dir"], "pages", origin)
         rel = path.lstrip("/")
@@ -181,11 +179,6 @@ class FixtureServer:
             headers = {"Content-Type": route.get("content_type", "text/html; charset=utf-8"),
                        **route.get("headers", {})}
             return route.get("status", 200), headers, body
-        page = self._fixture_pages().get((origin, path))
-        if page is not None:
-            status, headers, body = page
-            body = body.encode() if isinstance(body, str) else body
-            return status, dict(headers), body
         full = self._static(origin, path)
         if full:
             ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"

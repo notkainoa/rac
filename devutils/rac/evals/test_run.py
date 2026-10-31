@@ -93,6 +93,39 @@ class SeedingTest(unittest.TestCase):
         self.assertEqual(run.expand({"{origin:a}": ["x {origin:b}", 3]}, ORIGINS),
                          {ORIGINS["a"]: ["x " + ORIGINS["b"], 3]})
 
+    def test_only_the_agent_level_and_site_rules_may_come_from_a_variant(self):
+        self.assertEqual(variants.PREF_KEYS,
+                         ("rac.ai.agent_permission_level", "rac.ai.agent_site_rules"))
+        v = variants.load_variant("chain-canonical")
+        v["prefs"] = {"rac.ai.agent_site_rules": {"{origin:b}/signup": "always"}}
+        flat = run.flat_prefs(v, ORIGINS)
+        self.assertEqual(flat["rac.ai.agent_site_rules"], {ORIGINS["b"] + "/signup": "always"})
+
+    def test_every_other_variant_pref_key_is_refused(self):
+        for key in ("rac.ai.enabled", "rac.ai.browser_control", "rac.ai.provider",
+                    "download.prompt_for_download", "helium.services.enabled",
+                    "side_panel.id_to_width", "rac.spaces"):
+            with self.subTest(key=key):
+                v = variants.load_variant("chain-canonical")
+                v["prefs"] = {key: False}
+                with self.assertRaisesRegex(variants.VariantError, "not allowed"):
+                    run.flat_prefs(v, ORIGINS)
+                self.assertTrue(any("not allowed" in p for p in variants.validate_variant(v)))
+
+    def test_the_safety_prefs_are_applied_last(self):
+        # flat_prefs can no longer produce a safety key, but the order closes
+        # the rest: whatever the variant layer returns is written first and
+        # the safety block overwrites it.
+        v = variants.load_variant("chain-canonical")
+        hostile = {"rac.ai.enabled": False, "rac.ai.browser_control": False,
+                   "helium.services.enabled": True, "download.prompt_for_download": True}
+        with mock.patch.object(run, "flat_prefs", return_value=hostile):
+            prefs = run.build_preferences(v, ORIGINS, "http://localhost:4444/v1", "/tmp/dl")
+        self.assertIs(prefs["rac"]["ai"]["enabled"], True)
+        self.assertIs(prefs["rac"]["ai"]["browser_control"], True)
+        self.assertIs(prefs["helium"]["services"]["enabled"], False)
+        self.assertIs(prefs["download"]["prompt_for_download"], False)
+
     def test_deep_set(self):
         d = {}
         run.deep_set(d, "x.y.z", 1)
@@ -297,6 +330,26 @@ class LaunchEnvTest(unittest.TestCase):
     def test_crash_dumps_stay_in_the_throwaway_profile(self):
         env = run.launch_env("/tmp/rac-evals-x")
         self.assertEqual(env["BREAKPAD_DUMP_LOCATION"], "/tmp/rac-evals-x/Crashpad")
+
+    def test_the_browser_gets_a_minimal_environment(self):
+        # The browser loads hostile fixture pages: it must not inherit the
+        # shell's secrets (SSH_AUTH_SOCK under ssh, API keys, ...).
+        env = {"HOME": "/h", "PATH": "/p", "TMPDIR": "/t", "LANG": "en_US.UTF-8",
+               "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock", "AWS_SECRET_ACCESS_KEY": "x",
+               "OPENAI_API_KEY": "sk-x", "RAC_EVALS_NO_QUEUE": "1", "EDITOR": "vim"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            got = run.launch_env("/tmp/rac-evals-x")
+        self.assertEqual(set(got) - {"BREAKPAD_DUMP_LOCATION"},
+                         {"HOME", "PATH", "TMPDIR", "LANG"})
+        for leaked in ("SSH_AUTH_SOCK", "AWS_SECRET_ACCESS_KEY", "OPENAI_API_KEY",
+                       "RAC_EVALS_NO_QUEUE", "EDITOR"):
+            self.assertNotIn(leaked, got)
+
+    def test_lang_is_optional(self):
+        with mock.patch.dict(os.environ, {"HOME": "/h", "PATH": "/p"}, clear=True):
+            got = run.launch_env("/tmp/p")
+        self.assertNotIn("LANG", got)
+        self.assertNotIn("TMPDIR", got)
 
 
 class StaleProfileTest(unittest.TestCase):
@@ -748,6 +801,54 @@ class PanelAttachTest(unittest.TestCase):
         panel.present = False
         self.assertEqual(run.panel_answer(panel, "c9", "deny", None, timeout=0.3),
                          "no-card")
+
+
+class AnswerCardTest(unittest.TestCase):
+    """answer_card records the simulated user's answer only after the click
+    or the respond call is confirmed — a card nobody answered is a recorded
+    failure, never a deny."""
+
+    class FakeAssistant:
+        """The wire path's Page: eval returns whatever the handler resolved
+        and raises when the evaluate fails (a rejected sendWithPromise lands
+        in exceptionDetails)."""
+        def __init__(self, exc=None):
+            self.exc = exc
+            self.evals = []
+
+        def eval(self, expr, await_promise=True):
+            self.evals.append(expr)
+            if self.exc is not None:
+                raise self.exc
+            return None
+
+    def test_a_successful_respond_call_records_the_answer(self):
+        assistant = self.FakeAssistant()
+        rec = run.answer_card(assistant, "c9", "deny", None, None)
+        self.assertEqual(rec, {"id": "c9", "answer": "deny"})
+        self.assertIn("racAiAgentRespond", assistant.evals[0])
+        self.assertIn('"deny"', assistant.evals[0])
+
+    def test_a_rejected_respond_records_the_failure_not_the_answer(self):
+        rec = run.answer_card(self.FakeAssistant(cdp.CdpError("ws gone")),
+                              "c9", "deny", None, None)
+        self.assertNotIn("answer", rec)
+        self.assertEqual(rec["id"], "c9")
+        self.assertIn("ws gone", rec["error"])
+
+    def test_a_landed_button_click_records_the_answer(self):
+        shots = run.Shots("/tmp/answer-card-test")
+        rec = run.answer_card(PanelAttachTest.FakePanel(), "c9", "deny", None, shots)
+        self.assertEqual(rec, {"id": "c9", "answer": "deny"})
+
+    def test_a_click_that_never_landed_records_the_failure(self):
+        for status in ("no-button", "no-card", "eval-failed"):
+            panel = PanelAttachTest.FakePanel()
+            panel.click = status if status != "no-card" else "no-card"
+            panel.present = status != "no-card"
+            rec = run.answer_card(panel, "c9", "deny", None, run.Shots("/tmp/x"))
+            self.assertNotIn("answer", rec, status)
+            self.assertIn(status, rec["error"], status)
 
 
 class RelaunchTest(unittest.TestCase):

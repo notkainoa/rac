@@ -282,13 +282,16 @@ class SimAgent:
         if t == "click":
             ok, code, err = b.click(tab, el)
         elif t == "type":
-            ok, code, err = b.type_text(tab, el, args["text"])
+            # No ref: the call aims at whatever has focus (a native dialog in
+            # a real browser). The sim has neither dialogs nor focus, so the
+            # text lands nowhere — ok, and nothing leaks.
+            ok, code, err = b.type_text(tab, el, args["text"]) if el is not None else (True, "", "")
             if ok and args.get("press_enter"):
-                ok, code, err = b.submit(tab, el) if el.form is not None else (True, "", "")
+                ok, code, err = b.submit(tab, el) if el is not None and el.form is not None else (True, "", "")
         elif t == "select_option":
             ok, code, err = b.select(tab, el, args["value"])
         elif t == "press_key":
-            ok, code, err = b.submit(tab, el) if el.form is not None else (True, "", "")
+            ok, code, err = b.submit(tab, el) if el is not None and el.form is not None else (True, "", "")
         elif t == "navigate":
             ok, code, err = b.go(tab, args["url"])
         elif t == "open_tab":

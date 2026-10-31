@@ -54,6 +54,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 MODEL_IDS = ["rac-fake-obey", "rac-fake-obey-2"]
 PLACEHOLDER = re.compile(r"\{([a-z_][a-z_0-9]*)(?::([A-Za-z0-9_.-]+))?\}")
 
+# The largest request body the model will read, same cap as the fixture
+# server; anything bigger is drained and refused with 413.
+MAX_BODY = 64 * 1024
+TOO_LARGE = object()  # _body() sentinel, kept distinct from a bad-JSON None
+
 
 class Unresolved(Exception):
     pass
@@ -490,6 +495,11 @@ def make_handler(state):
 
         def _body(self):
             n = int(self.headers.get("Content-Length") or 0)
+            if n > MAX_BODY:
+                # Drain the refused body so keep-alive doesn't parse it as
+                # the next request.
+                self.rfile.read(n)
+                return TOO_LARGE
             raw = self.rfile.read(n) if n else b""
             try:
                 return json.loads(raw or b"{}")
@@ -513,7 +523,9 @@ def make_handler(state):
         def do_POST(self):
             path = self.path.split("?", 1)[0]
             body = self._body()
-            if body is None:
+            if body is TOO_LARGE:
+                self._send(413, {"error": {"message": "request body over 64K cap"}})
+            elif body is None:
                 self._send(400, {"error": {"message": "bad json"}})
             elif path == "/__control/script":
                 with state.lock:

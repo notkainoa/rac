@@ -480,6 +480,75 @@ class SurfacesTest(unittest.TestCase):
         self.assertTrue(surfaces.check_text(by["onboarding"], "Chat with Assistant"))
 
 
+class ToggleTest(unittest.TestCase):
+    """Item 6's AI on/off must take: a silent setPref failure would compare
+    "never on" with "still off" and look clean."""
+
+    class FakeSettings:
+        """The chrome://settings Page: eval resolves with the promise value
+        or raises when the evaluate fails."""
+        def __init__(self, result=None, exc=None):
+            self.result, self.exc = result, exc
+
+        def eval(self, expr, await_promise=True):
+            if self.exc is not None:
+                raise self.exc
+            return self.result
+
+    def test_a_verified_toggle_took(self):
+        self.assertTrue(run_ai_off.set_ai_enabled(
+            self.FakeSettings({"ok": True, "value": True}), True))
+        self.assertTrue(run_ai_off.set_ai_enabled(
+            self.FakeSettings({"ok": True, "value": False}), False))
+
+    def test_a_readback_that_disagrees_means_the_toggle_didnt_take(self):
+        self.assertFalse(run_ai_off.set_ai_enabled(
+            self.FakeSettings({"ok": True, "value": False}), True))
+        self.assertFalse(run_ai_off.set_ai_enabled(
+            self.FakeSettings({"ok": True, "value": True}), False))
+
+    def test_a_settingsprivate_error_or_a_failed_eval_is_a_failed_toggle(self):
+        self.assertFalse(run_ai_off.set_ai_enabled(
+            self.FakeSettings({"ok": False, "value": None, "error": "not allowed"}), True))
+        self.assertFalse(run_ai_off.set_ai_enabled(
+            self.FakeSettings(exc=RuntimeError("eval died")), True))
+        self.assertFalse(run_ai_off.set_ai_enabled(self.FakeSettings("nope"), True))
+
+    def test_an_unreadable_pref_is_trusted_when_the_write_reported_ok(self):
+        self.assertTrue(run_ai_off.set_ai_enabled(
+            self.FakeSettings({"ok": True, "value": None}), True))
+
+    def test_the_pref_script_reads_the_value_back_and_sees_lasterror(self):
+        self.assertIn("getPref", run_ai_off.SETTINGS_SET_PREF)
+        self.assertIn("lastError", run_ai_off.SETTINGS_SET_PREF)
+
+
+class CoverageTest(unittest.TestCase):
+    """The summary must never imply all 27 surfaces were text-checked."""
+
+    def test_text_checks_cover_exactly_the_webui_surfaces_with_a_url(self):
+        covered, uncovered = run_ai_off.surface_coverage()
+        self.assertEqual(covered, ["new-tab-page", "new-tab-typed-query", "rac-ai-page",
+                                   "settings-main", "settings-privacy", "settings-assistant"])
+        self.assertEqual(len(covered), 6)
+        self.assertEqual(len(uncovered), 21)
+        self.assertEqual(set(covered) | set(uncovered),
+                         {s["id"] for s in surfaces.load()})
+        for native in ("sidebar-full", "right-edge-pull-handle", "command-bar",
+                       "context-menu-link", "menu-bar-file", "onboarding"):
+            self.assertIn(native, uncovered)
+
+    def test_the_summary_names_covered_and_uncovered_surfaces(self):
+        lines = []
+        run_ai_off.print_summary([("a", [])], out=lines.append)
+        text = "\n".join(lines)
+        self.assertIn("cover 6 of 27", text)
+        self.assertIn("NOT covered", text)
+        self.assertIn("new-tab-page", text)
+        self.assertIn("sidebar-full", text)
+        self.assertIn("onboarding", text)
+
+
 class RunnerTest(unittest.TestCase):
     def test_self_test_passes(self):
         self.assertEqual(run_ai_off.main(["--self-test"]), 0)
