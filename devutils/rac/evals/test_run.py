@@ -61,7 +61,7 @@ class SeedingTest(unittest.TestCase):
         self.assertNotIn("side_panel", p)
 
     def test_a_dark_run_seeds_one_space_in_dark_mode(self):
-        stored = self.suffixed_prefs("chain-canonical:dark")["rac"]["spaces"]
+        stored = self.suffixed_prefs("chain-canonical_dark")["rac"]["spaces"]
         self.assertEqual(stored["version"], 1)
         [space] = stored["spaces"]
         self.assertEqual(space["theme"]["mode"], "dark")
@@ -71,19 +71,19 @@ class SeedingTest(unittest.TestCase):
         self.assertTrue(space["id"])
 
     def test_a_light_run_seeds_light_and_no_panel_width(self):
-        p = self.suffixed_prefs("chain-canonical:light")
+        p = self.suffixed_prefs("chain-canonical_light")
         self.assertEqual(p["rac"]["spaces"]["spaces"][0]["theme"]["mode"], "light")
         self.assertNotIn("side_panel", p)
 
     def test_narrow_seeds_the_panels_minimum_width(self):
-        p = self.suffixed_prefs("chain-canonical:narrow")
+        p = self.suffixed_prefs("chain-canonical_narrow")
         self.assertEqual(p["side_panel"]["id_to_width"],
                          {"kRacAi": run.PANEL_NARROW_WIDTH})
         # kSidePanelMinimumContentWidth 200 + the 11 px border insets.
         self.assertEqual(run.PANEL_NARROW_WIDTH, 211)
 
     def test_wide_seeds_560_and_no_space(self):
-        p = self.suffixed_prefs("chain-canonical:wide")
+        p = self.suffixed_prefs("chain-canonical_wide")
         self.assertEqual(p["side_panel"]["id_to_width"],
                          {"kRacAi": run.PANEL_WIDE_WIDTH})
         self.assertEqual(run.PANEL_WIDE_WIDTH, 560)
@@ -142,19 +142,19 @@ class VariantSpecTest(unittest.TestCase):
                          ("chain-canonical", None, None))
 
     def test_one_suffix_of_either_kind(self):
-        for spec, want in (("v:light", ("v", "light", None)),
-                           ("v:dark", ("v", "dark", None)),
-                           ("v:narrow", ("v", None, "narrow")),
-                           ("v:wide", ("v", None, "wide"))):
+        for spec, want in (("v_light", ("v", "light", None)),
+                           ("v_dark", ("v", "dark", None)),
+                           ("v_narrow", ("v", None, "narrow")),
+                           ("v_wide", ("v", None, "wide"))):
             self.assertEqual(self.parse(spec), want, spec)
 
     def test_both_suffixes_in_either_order(self):
-        self.assertEqual(self.parse("v:dark:narrow"), ("v", "dark", "narrow"))
-        self.assertEqual(self.parse("v:narrow:dark"), ("v", "dark", "narrow"))
+        self.assertEqual(self.parse("v_dark_narrow"), ("v", "dark", "narrow"))
+        self.assertEqual(self.parse("v_narrow_dark"), ("v", "dark", "narrow"))
 
     def test_unknown_empty_or_duplicate_suffixes_are_errors(self):
-        for spec in ("v:sepia", "v:", "v:light:", ":light", "v:light:dark",
-                     "v:wide:narrow", "v:light:light", "v::light"):
+        for spec in ("v_sepia", "v_", "v_light_", "_light", "v_light_dark",
+                     "v_wide_narrow", "v_light_light", "v__light"):
             with self.assertRaises(variants.VariantError, msg=spec):
                 self.parse(spec)
 
@@ -168,7 +168,7 @@ class VariantSpecTest(unittest.TestCase):
         return run.select(mock.Mock(variants=spec, fixtures_dir=variants.FIXTURES))
 
     def test_a_suffixed_run_keeps_the_base_fixture_under_a_new_id(self):
-        [v] = self.selected("chain-canonical:dark:wide")
+        [v] = self.selected("chain-canonical_dark_wide")
         self.assertEqual(v["id"], "chain-canonical-dark-wide")
         self.assertEqual(v["base_id"], "chain-canonical")
         self.assertEqual(v["appearance"], "dark")
@@ -177,8 +177,8 @@ class VariantSpecTest(unittest.TestCase):
         self.assertEqual(v["turns"], variants.load_variant("chain-canonical")["turns"])
 
     def test_each_combination_names_its_own_record_and_shots(self):
-        vs = self.selected("chain-canonical,chain-canonical:light,"
-                           "chain-canonical:dark:narrow,chain-canonical:narrow:dark")
+        vs = self.selected("chain-canonical,chain-canonical_light,"
+                           "chain-canonical_dark_narrow,chain-canonical_narrow_dark")
         self.assertEqual([v["id"] for v in vs], ["chain-canonical",
                                                  "chain-canonical-light",
                                                  "chain-canonical-dark-narrow"])
@@ -192,8 +192,8 @@ class VariantSpecTest(unittest.TestCase):
         self.assertEqual(v["base_id"], "chain-canonical")
 
     def test_bad_specs_and_unknown_bases_exit(self):
-        for spec in ("nope", "chain-canonical:sepia", "chain-canonical:light:dark",
-                     "chain-canonical:", ":light"):
+        for spec in ("nope", "chain-canonical_sepia", "chain-canonical_light_dark",
+                     "chain-canonical:", "_light"):
             with self.assertRaises(SystemExit, msg=spec):
                 self.selected(spec)
 

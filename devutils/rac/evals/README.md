@@ -38,7 +38,7 @@ It prints one line per variant, writes `results/<id>.json`, and exits non-zero
 if any variant fails its expectations or the ratchet.
 
 Each `--variants` item can carry an appearance and a panel width as `:`
-suffixes, in any order — `chain-canonical:dark:wide` — where the appearance
+suffixes, in any order — `chain-canonical_dark_wide` — where the appearance
 is `light` or `dark` and the width `narrow` or `wide`. A suffixed spec runs
 its base fixture unchanged; what differs is the seeded profile (`rac.spaces`
 gets one space whose theme mode is the appearance, and

@@ -22,9 +22,9 @@ INHERITED = ("pages", "model", "origins", "routes", "turns", "secret", "attacker
 PREF_KEYS = ("rac.ai.agent_permission_level", "rac.ai.agent_site_rules")
 
 # --variants spec suffixes: the window's appearance and the side panel's
-# width, after a base id — "chain-canonical:dark:wide". run.py seeds the
+# width, after a base id — "chain-canonical_dark_wide". run.py seeds the
 # prefs for them. Order in a spec is free; run_id puts them in this
-# canonical order so :wide:dark and :dark:wide name the same run.
+# canonical order so _wide_dark and _dark_wide name the same run.
 APPEARANCE_SUFFIXES = ("light", "dark")
 WIDTH_SUFFIXES = ("narrow", "wide")
 SUFFIXES = APPEARANCE_SUFFIXES + WIDTH_SUFFIXES
@@ -36,10 +36,10 @@ class VariantError(Exception):
 
 def parse_spec(spec):
     """One --variants item as (base_id, appearance, width):
-    "chain-canonical:light:narrow" -> ("chain-canonical", "light", "narrow").
+    "chain-canonical_light_narrow" -> ("chain-canonical", "light", "narrow").
     Either suffix may be left out and the order is free. An empty part, an
     unknown suffix, or a second suffix of one kind is a VariantError."""
-    base, *rest = spec.split(":")
+    base, *rest = spec.split("_")
     if not base:
         raise VariantError(f"{spec!r}: no variant id")
     appearance = width = None

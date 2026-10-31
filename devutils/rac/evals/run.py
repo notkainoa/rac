@@ -6,7 +6,7 @@
   run.py --list                       the variants
   run.py --dry-run today|d19          no browser: fixtures + fake model + the
                                       Python stand-in agent (sim_agent.py)
-  run.py [--variants a[:light|dark][:narrow|wide],b]
+  run.py [--variants a[_light|_dark][_narrow|_wide],b]
                                       launch the build and run for real
                                       (needs a built worktree; see README)
   run.py --screenshots ...            also write proof PNGs of the window to
@@ -67,7 +67,7 @@ FAKE_KEY = "eval-fake-key"  # the fake model ignores it; Custom insists on one
 # through the screenshot requests file as "command 40701".
 IDC_RAC_ASSISTANT_TOGGLE = 40701
 
-# --- prefs the :light/:dark and :narrow/:wide spec suffixes seed -----------
+# --- prefs the _light/_dark and _narrow/_wide spec suffixes seed -----------
 #
 # Appearance is rac's per-space theme mode, seeded as one space in
 # rac.spaces. SpacesWindowManager::UpdateColorMode turns theme.mode into the
@@ -87,7 +87,7 @@ SPACES_PREF = "rac.spaces"
 EVALS_SPACE_ID = "0e5af240-0000-4000-8000-000000000000"
 # SpaceTheme::FromDict needs both stops to parse at all; Neutral's
 # (chrome/browser/rac/spaces/space.cc kPresets[0]) paint the default flat
-# gray, so :light and :dark differ only in mode.
+# gray, so _light and _dark differ only in mode.
 EVALS_SPACE_COLORS = {"color1": "#FFFFD7", "color2": "#FFD9FB"}
 
 # side_panel.id_to_width maps SidePanelEntryIdToString of a SidePanelEntryId
@@ -220,7 +220,7 @@ def build_preferences(variant, origins, model_base_url, download_dir):
     prefs = {}
     for dotted, value in flat_prefs(variant, origins).items():
         deep_set(prefs, dotted, value)
-    # The run's :light/:dark and :narrow/:wide suffixes; see the constants
+    # The run's _light/_dark and _narrow/_wide suffixes; see the constants
     # above for why these prefs and not Chromium's color-scheme pref.
     if variant.get("appearance"):
         deep_set(prefs, SPACES_PREF, {"version": 1, "spaces": [
@@ -1205,7 +1205,7 @@ def post_status(sha, state, description, execute=False):
 # --- main ------------------------------------------------------------------------------
 
 def suffixed(variant, appearance, width):
-    """The variant dict for a `--variants id:light:narrow` run: it runs
+    """The variant dict for a `--variants id_light_narrow` run: it runs
     exactly like `variant`, with the appearance/panel prefs seeded and `id`
     carrying the suffixes so its record, results file and shot names can't
     collide with another run of the same base. `variant` itself when
@@ -1236,7 +1236,7 @@ def select(args):
     if missing:
         sys.exit(f"unknown variants: {missing}")
     # Fixture order, with each spec's runs where its base would have been.
-    # The same run spelled twice — "v:dark:wide,v:wide:dark" — runs once.
+    # The same run spelled twice — "v_dark_wide,v_wide_dark" — runs once.
     chosen, seen = [], set()
     for v in loaded:
         for _raw, base, appearance, width in specs:
@@ -1268,7 +1268,7 @@ def main(argv=None):
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--dry-run", choices=("today", "d19"), help="no browser; see the module doc")
     ap.add_argument("--variants", help="comma-separated ids, each optionally "
-                                       "suffixed :light|:dark and :narrow|:wide "
+                                       "suffixed _light|_dark and _narrow|_wide "
                                        "in any order; default all")
     ap.add_argument("--fixtures-dir", default=variants.FIXTURES)
     ap.add_argument("--results-dir", default=os.path.join(HERE, "results"))
