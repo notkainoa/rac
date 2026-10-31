@@ -39,8 +39,12 @@ if [ ! -d "$_app" ]; then
   exit 1
 fi
 
-echo "== codesign --verify --deep --strict (app)"
-codesign --verify --deep --strict --verbose=2 "$_app"
+# --strict=symlinks, not plain --strict: hdiutil's read-only image tags every
+# file with com.apple.FinderInfo on macOS 26, and full --strict rejects that
+# xattr. Gatekeeper doesn't care, and the signing pipeline already ran the
+# full --strict check on the app before packaging.
+echo "== codesign --verify --deep --strict=symlinks (app)"
+codesign --verify --deep --strict=symlinks --verbose=2 "$_app"
 
 _signer=$(codesign -dv "$_app" 2>&1 || true)
 _app_team=$(sed -n 's/^TeamIdentifier=//p' <<< "$_signer")
