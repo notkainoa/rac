@@ -198,7 +198,8 @@ needs an import input in the same run. Typed text is plain words only (ASCII let
 that types may not also move the caret or click — at most one
 `key return`, after the last `type`. A run that opens a settings page
 (the only allowed ones are `settings/assistant`, `settings/appearance`,
-and `settings/privacy`) may take screenshots only, so its requests file
+`settings/privacy`, and `settings/general`, which also needs an import
+input because of its Arc import card) may take screenshots only, so its requests file
 may not send input.
 
 Known limits: import-input paths are checked with `inside_clone`

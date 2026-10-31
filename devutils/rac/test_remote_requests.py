@@ -474,7 +474,9 @@ class RemoteRequestsTest(unittest.TestCase):
                      'open-urls chrome://settings/privacy ; swipe 1 2 end',
                      'open-urls chrome://settings/assistant ; pointer 1 2',
                      'open-urls chrome://settings/appearance '
-                     '; after 5 click 1 2'):
+                     '; after 5 click 1 2',
+                     'open-urls chrome://settings/general ; click 1 2',
+                     'open-urls rac://settings/general ; key return'):
             self.refused(line)
         for line, outputs in (
                 ('open-urls chrome://settings/appearance ; burst shots 3 100',
