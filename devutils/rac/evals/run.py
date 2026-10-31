@@ -19,9 +19,12 @@ A real run, per variant, in a throwaway profile:
      with `--user-data-dir=<profile> --remote-debugging-port` (through the
      build queue's run slot unless RAC_EVALS_NO_QUEUE=1), save the fake
      provider's key through Settings;
-  4. open the fixture tabs, open chrome://rac-ai, send each turn with
-     racAiSend, answer every card as grade.simulated_answer says, wait for
-     the run to end;
+  4. open the fixture tabs and drive the assistant: with --screenshots
+     through the side panel's own UI (the + menu attaches, the composer
+     sends, a card's buttons answer — only the sending page owns the run
+     and renders its cards), otherwise racAiSend/racAiAgentRespond on a
+     chrome://rac-ai tab. Every card is answered as grade.simulated_answer
+     says; then wait for the run to end;
   5. write results/<id>.json (the run record grade.py reads) and grade it.
 
 Everything that needs the binary is marked TODO(binary) and untested: nothing
@@ -371,28 +374,21 @@ class Shots:
         self.taken.append(entry)
         return entry["ok"]
 
-    def capture_card(self, name, browser, assistant, page, proc=None, timeout=10):
-        """The -1-card shot. A card renders in the assistant's side panel —
-        the chat tab only carries a "waiting in the sidebar" pill — so the
-        window is arranged first: the tab the agent acts on becomes the
-        visible one, and the panel is opened with a "command" request (the
-        toggle also closes it, so it's sent only when Target.getTargets
-        shows no panel yet). The PNG then waits for the card's element in
-        the panel's own page; a panel that never shows one is captured
+    def capture_card(self, name, browser, panel, page, card_id=None,
+                     proc=None, timeout=10):
+        """The -1-card shot. The panel is already open (drive opens it
+        before the first turn) and the run's events render the card in it,
+        so the window only needs arranging: the tab the agent acts on
+        becomes the visible one, then the PNG waits for this card's element
+        in the panel's own page. A panel that never shows one is captured
         anyway, marked "card not in side panel"."""
+        present = card_present_js(card_id) if card_id else CARD_PRESENT
         error = None
         try:
             if page is not None:
                 browser.call("Target.activateTarget", {"targetId": page.target_id})
-            if _panel_info(browser, assistant.target_id) is None:
-                self.request(f"command {IDC_RAC_ASSISTANT_TOGGLE}")
-            deadline = time.time() + timeout
-            info = wait_for(lambda: _panel_info(browser, assistant.target_id),
-                            "the assistant side panel", timeout, proc)
-            panel = Page(browser, info["targetId"])
-            wait_for(lambda: _try_eval(panel, CARD_PRESENT),
-                     "the card in the side panel",
-                     max(0.5, deadline - time.time()), proc)
+            wait_for(lambda: _try_eval(panel, present),
+                     "the card in the side panel", timeout, proc)
         except RuntimeError:
             error = "card not in side panel"
         except (cdp.CdpError, OSError) as e:
@@ -438,7 +434,8 @@ def panel_target(target_infos, assistant_tid):
     """The side panel's target, or None while the panel is closed. It's a
     second rac-ai page next to the assistant tab: mode=panel in the URL
     marks it, but any rac-ai target that isn't the tab itself counts. The
-    tab's own id is passed so it never counts."""
+    tab's own id is passed so it never counts — or None when the run never
+    opened a chat tab (screenshot runs work in the panel alone)."""
     ai = rac_ai_targets(target_infos)
     for t in ai:
         if "mode=panel" in t.get("url", ""):
@@ -460,6 +457,254 @@ def agent_page(pages, turn):
         if ref in pages:
             return pages[ref]
     return list(pages.values())[-1] if pages else None
+
+
+# --- the side panel's real UI (screenshot runs) -----------------------------
+#
+# With --screenshots, turns go through chrome://rac-ai/?mode=panel the way a
+# user's do instead of calling the message handler from the chat tab: the
+# composer's textarea takes the text, the send button submits it, the +
+# menu attaches tabs, and a card's own buttons answer it. Only the panel
+# that sent a turn hears its agent events (PageHandler::OnAgentTaskEvent
+# fires racAiAgentEvent on the run's owner alone), which is also why the
+# chat-tab send left the panel empty: its PageHandler never owned the run.
+#
+# The page's own listeners and click handlers do the work — selectors and
+# flows come from chrome/browser/resources/rac_ai/index.html and app.ts /
+# agent_cards.ts next to it:
+#   #input   the composer's <textarea>; its 'input' listener runs
+#            resizeInput/onTextChanged/updateControls, which arms #send
+#   #send    the send button; its click runs submit() -> send()
+#   #addTab  the attach button; its click runs toggleMenu -> openPicker,
+#            which lists racAiGetTabs and opens a native menu through
+#            racAiShowMenu. A pick fires "rac-ai-menu" {token, id:"tab:<id>"}
+#            into the page's onMenuEvent -> attachTabs
+#   #chips   the attached tabs' chips; a chip's title is the tab's URL
+#   .agent-card   a card in the thread: [data-confirm-id] or [data-plan-id]
+#            is the confirm_request/plan_request event's id. The actions
+#            row's buttons are .pill-action: Allow once/Allow is .primary,
+#            "Don't allow" is the plain one, grant/always and the plan
+#            card's Stop are .quiet. Confirm buttons arm ~300 ms after the
+#            card appears (CONFIRM_ARM_MS).
+#   #stop    the composer's stop button; its click runs stop(), which ends
+#            the chat session and the agent turn both
+
+
+def send_path(shots):
+    """How a turn is driven: "ui" through the side panel's composer and
+    cards when --screenshots is on, "wire" — the chat tab's handler called
+    directly — otherwise. The gate run without --screenshots is unchanged."""
+    return "ui" if shots is not None else "wire"
+
+
+def open_panel(browser, shots, proc, timeout=30):
+    """The side panel's Page. The toggle is a command request, and the
+    command also closes the panel, so it's sent only while Target.getTargets
+    shows no panel; the target that appears is then hooked like the chat
+    tab."""
+    info = _panel_info(browser, None)
+    if info is None:
+        shots.request(f"command {IDC_RAC_ASSISTANT_TOGGLE}")
+        info = wait_for(lambda: _panel_info(browser, None),
+                        "the assistant side panel", timeout, proc)
+    return Page(browser, info["targetId"])
+
+
+def panel_type_js(text):
+    """Puts `text` into the composer the way the textarea's own 'input'
+    listener expects (app.ts): set the value, then dispatch input."""
+    return ("(() => { const i = document.getElementById('input');"
+            " if (!i) return 'no-input';"
+            " i.value = " + json.dumps(text) + ";"
+            " i.dispatchEvent(new Event('input', {bubbles: true}));"
+            " return 'typed'; })()")
+
+
+# #send's click is submit(); it's only enabled once updateControls sees text.
+PANEL_SUBMIT_JS = (
+    "(() => { const s = document.getElementById('send');"
+    " if (!s || s.disabled) return 'send-disabled';"
+    " s.click(); return 'sent'; })()")
+
+# #stop's click is stop(): racAiAgentStop + racAiStop + streaming=false, so a
+# timed-out turn doesn't leave the composer stuck.
+PANEL_STOP_JS = (
+    "(() => { const s = document.getElementById('stop');"
+    " if (!s) return 'no-stop'; s.click(); return 'stopped'; })()")
+
+# The titles of the composer's chips — one per attached tab (the current
+# tab's card plus the picked extras); a tab chip's title is the tab's URL.
+CHIP_URLS = ("[...document.querySelectorAll('#chips .attachment')]"
+             ".map(e => e.title)")
+
+
+def panel_attach_js(tab_id):
+    """Attaches one tab the way the + menu does: #addTab's click runs
+    openPicker, which shows a native menu through chrome.send
+    ('racAiShowMenu', token). The menu is native, so the pick is replayed
+    through cr.webUIListenerCallback — the exact call the menu's answer
+    takes (a pick lands in onMenuEvent -> attachTabs, which then closes
+    the real menu with racAiCloseMenu). If the token can't be captured
+    (chrome.send unwrappable), recent tokens are tried; a wrong token is
+    ignored by onMenuEvent, as is a 'tab:<id>' no menu ever offered."""
+    return ("(async () => {\n"
+            "  const e = window.__evals;\n"
+            "  if (!e || !e.cr || typeof chrome === 'undefined' || !chrome.send)"
+            " return 'no-hook';\n"
+            "  if (!e.menu) {\n"
+            "    e.menu = {token: 0};\n"
+            "    const send = chrome.send;\n"
+            "    try {\n"
+            "      chrome.send = function (name, args) {\n"
+            "        if (name === 'racAiShowMenu' && args && args.length)\n"
+            " e.menu.token = args[0];\n"
+            "        return send.apply(chrome, arguments);\n"
+            "      };\n"
+            "    } catch (err) {}\n"
+            "  }\n"
+            "  const add = document.getElementById('addTab');\n"
+            "  if (!add || add.disabled) return 'no-addTab';\n"
+            "  e.menu.token = 0;\n"
+            "  add.click();\n"
+            "  const deadline = Date.now() + 4000;\n"
+            "  while (!e.menu.token && Date.now() < deadline)\n"
+            "    await new Promise(r => setTimeout(r, 50));\n"
+            "  const tab = 'tab:" + str(int(tab_id)) + "';\n"
+            "  if (!e.menu.token) {\n"
+            "    for (let t = 1; t <= 40; t++)\n"
+            "      e.cr.webUIListenerCallback('rac-ai-menu', {token: t, id: tab});\n"
+            "    return 'picked-guessed';\n"
+            "  }\n"
+            "  e.cr.webUIListenerCallback('rac-ai-menu',\n"
+            "      {token: e.menu.token, id: tab});\n"
+            "  return 'picked';\n"
+            "})()")
+
+
+def _card_selector(card_id):
+    """The card element for one confirm_request/plan_request event id:
+    buildConfirmCard/buildPlanCard keep it on data-confirm-id/data-plan-id."""
+    q = json.dumps(card_id)
+    return (".agent-card[data-confirm-id=" + q + "]," +
+            ".agent-card[data-plan-id=" + q + "]")
+
+
+def card_present_js(card_id):
+    return "!!document.querySelector(" + json.dumps(_card_selector(card_id)) + ")"
+
+
+def card_resolved_js(card_id):
+    """True once the card's answer is applied: a confirm card leaves the
+    DOM; the plan card stays as a collapsed row with data-status set."""
+    return ("(() => { const c = document.querySelector(" +
+            json.dumps(_card_selector(card_id)) + ");"
+            " return !c || (c.dataset.status && c.dataset.status !== 'pending');"
+            " })()")
+
+
+def card_click_js(card_id, answer):
+    """Clicks the card's own button for the simulated answer after the
+    buttons arm: 'allow_once' the .primary Allow once/Allow; 'deny' the
+    plain "Don't allow" — never the .quiet grant/always — or, on a plan
+    card, its quiet Stop."""
+    return ("(async () => {\n"
+            "  const card = document.querySelector(" +
+            json.dumps(_card_selector(card_id)) + ");\n"
+            "  if (!card) return 'no-card';\n"
+            "  const actions = card.querySelector('.agent-actions');\n"
+            "  const buttons = actions ?"
+            " [...actions.querySelectorAll('button.pill-action')] : [];\n"
+            "  const pick = " + json.dumps(answer) + " === 'allow_once'\n"
+            "      ? buttons.find(b => b.classList.contains('primary'))\n"
+            "      : buttons.find(b => !b.classList.contains('primary') &&"
+            " !b.classList.contains('quiet')) ||\n"
+            "        (card.classList.contains('plan-card') ?"
+            " buttons.find(b => b.classList.contains('quiet')) : null);\n"
+            "  if (!pick) return 'no-button';\n"
+            "  const deadline = Date.now() + 4000;\n"
+            "  while (actions.inert && Date.now() < deadline)\n"
+            "    await new Promise(r => setTimeout(r, 25));\n"
+            "  pick.click();\n"
+            "  return 'clicked';\n"
+            "})()")
+
+
+def _chip_covers(panel, url):
+    """True once a composer chip carries this URL — the current tab's card
+    (followCurrent) or one picked in the + menu."""
+    have = _try_eval(panel, CHIP_URLS)
+    return isinstance(have, list) and any(str(u).startswith(url) for u in have)
+
+
+def panel_prune_js(wanted):
+    """Clicks the .card-remove of one chip whose URL isn't wanted — the
+    remove control removeTab is bound to (app.ts). One chip per call, so
+    the loop in attach_panel_turn sees the re-render each time."""
+    return ("(() => { const keep = " + json.dumps(list(wanted)) + ";"
+            " for (const c of document.querySelectorAll('#chips .attachment')) {"
+            "   const t = c.title || '';"
+            "   if (t && !keep.some(u => t.startsWith(u))) {"
+            "     const r = c.querySelector('.card-remove');"
+            "     if (r) { r.click(); return 'removed'; }"
+            "   }"
+            " } return 'clean'; })()")
+
+
+def attach_panel_turn(panel, wanted_ids, proc, timeout=30):
+    """Attaches the turn's tabs through the panel's UI. The current-tab
+    chip covers the tab in front (attachCurrentTab is on by default and
+    rac-ai-current-tab keeps it following); every other wanted tab is
+    picked in the + menu. A pick of the tab the chip is about to cover is
+    harmless — attachTabs dedups by id. Chips the turn didn't ask for —
+    usually the current tab's own on a turn that attaches nothing — come
+    back off, so the send's tab list is the turn's own, as the wire
+    path's was."""
+    deadline = time.time() + timeout
+    for url, tab_id in wanted_ids.items():
+        while not _chip_covers(panel, url):
+            if time.time() > deadline:
+                return  # the send still goes; the read just misses a page
+            status = _ui_eval(panel, panel_attach_js(tab_id)) or ""
+            if status == "picked":
+                # The pick ran attachTabs; a chip that lags is only the
+                # readout, so don't pick the same tab again — and don't
+                # fail the turn on it.
+                try:
+                    wait_for(lambda u=url: _chip_covers(panel, u),
+                             "the attached tab's chip", 10, proc)
+                except RuntimeError:
+                    break
+            else:
+                # 'picked-guessed' may have missed; anything else means no
+                # menu opened. Either way, try again until the deadline.
+                time.sleep(0.5)
+    prune_deadline = time.time() + 10
+    while (_ui_eval(panel, panel_prune_js(wanted_ids)) or "clean") == "removed":
+        if time.time() > prune_deadline:
+            break
+        time.sleep(0.2)
+
+
+def panel_answer(panel, card_id, answer, proc, timeout=10):
+    """Answers a card through the panel's UI: waits for its element (the
+    event lands before its render), then clicks the button the answer
+    means. Returns the JS status string, 'clicked' on success."""
+    try:
+        wait_for(lambda: _try_eval(panel, card_present_js(card_id)),
+                 "the card in the side panel", timeout, proc)
+    except RuntimeError:
+        return "no-card"
+    return _ui_eval(panel, card_click_js(card_id, answer)) or "eval-failed"
+
+
+def _wait_card_resolved(panel, card_id, proc, timeout=5):
+    """Bounded wait for an answered card to apply — the -2-after shot then
+    shows the decision it made. Never raises."""
+    try:
+        wait_for(lambda: _try_eval(panel, card_resolved_js(card_id)),
+                 "the card to apply the answer", timeout, proc)
+    except RuntimeError:
+        pass
 
 
 # racAiInit calls AllowJavascript() and subscribes the page to the profile's
@@ -603,13 +848,20 @@ def save_key(browser):
 
 
 def drive(variant, rig, browser, proc, shots=None):
-    """Plays the variant's turns through a chrome://rac-ai tab.
+    """Plays the variant's turns.
 
-    The side panel holds the same WebUI; a tab gets the same PageHandler, so
-    chrome.send/sendWithPromise drive it directly. The agent acts in the tabs
-    of the page's window that racAiSend names by id, which racAiGetTabs lists
-    as {id, title, url, current} for http(s) tabs only. With `shots`, the
-    window is captured at the turn's key moments into <results-dir>/shots."""
+    The side panel holds the same WebUI; a tab gets the same PageHandler.
+    Without `shots` the runner drives a chrome://rac-ai tab's handler
+    directly (racAiSend/racAiAgentRespond) — the agent acts in the tabs of
+    the page's window that racAiSend names by id, which racAiGetTabs lists
+    as {id, title, url, current} for http(s) tabs only. With `shots` it
+    works the way a user does instead: the variant's page tab comes to the
+    front, the side panel opens on the toggle command, each turn is typed
+    into the panel's composer and sent with its button, tabs are attached
+    through the + menu (or the current tab's own chip), and a card's own
+    buttons answer it. The sending page owns the run, so the panel renders
+    the conversation and its cards — and carries the agent events the
+    grader reads — where the chat-tab send left it empty."""
     origins = rig.fixtures.base
     save_key(browser)
 
@@ -629,8 +881,19 @@ def drive(variant, rig, browser, proc, shots=None):
                     pass
                 pages[ref] = page
 
-    assistant = Page(browser, browser.call(
-        "Target.createTarget", {"url": "chrome://rac-ai/"})["targetId"])
+    if send_path(shots) == "ui":
+        # The page tab the variant acts on goes in front — what a user
+        # opens the panel on, and what its current-tab chip picks up.
+        front = agent_page(pages, variant["turns"][0]) if variant["turns"] else None
+        if front is not None:
+            try:
+                browser.call("Target.activateTarget", {"targetId": front.target_id})
+            except cdp.CdpError:
+                pass
+        assistant = open_panel(browser, shots, proc)
+    else:
+        assistant = Page(browser, browser.call(
+            "Target.createTarget", {"url": "chrome://rac-ai/"})["targetId"])
     state = eval_retry(assistant, ASSISTANT_HOOK, 120, proc)
     if not state.get("enabled") or not state.get("configured"):
         raise RuntimeError(f"the assistant is not configured: {state!r:.300}")
@@ -670,12 +933,27 @@ def drive(variant, rig, browser, proc, shots=None):
                     pass
         start = len(assistant.eval("window.__evals.events"))
         up_start = len(assistant.eval("window.__evals.updates"))
-        if shots is not None and variant["id"] == "chain-canonical":
-            shots.capture(variant["id"] + "-0-before.png", proc=proc)
-        # args: send id, [{role, text}], [tab ids], files, conversation id.
-        # One conversation id keeps the read set across turns (earlier-turn).
-        assistant.eval(f"chrome.send('racAiSend', [{send_id}, {json.dumps(messages)}, "
-                       f"{json.dumps(ids)}, [], 'eval']); true", await_promise=False)
+        if shots is not None:
+            # Send through the panel's UI: the + menu (or the current tab's
+            # chip) attaches, the composer's textarea takes the text, and
+            # #send submits it.
+            wanted_ids = {}
+            for t in infos:
+                for w in wanted:
+                    if t.get("url", "").startswith(w):
+                        wanted_ids.setdefault(w, t["id"])
+            attach_panel_turn(assistant, wanted_ids, proc)
+            _ui_eval(assistant, panel_type_js(user))
+            if variant["id"] == "chain-canonical":
+                shots.capture(variant["id"] + "-0-before.png", proc=proc)
+            sent = _ui_eval(assistant, PANEL_SUBMIT_JS)
+        else:
+            # args: send id, [{role, text}], [tab ids], files, conversation
+            # id. One conversation id keeps the read set across turns
+            # (earlier-turn).
+            assistant.eval(f"chrome.send('racAiSend', [{send_id}, {json.dumps(messages)}, "
+                           f"{json.dumps(ids)}, [], 'eval']); true", await_promise=False)
+            sent = "sent"
         events, end_state = [], "timeout"
         answered, deadline = set(), time.time() + RUN_TIMEOUT
         while time.time() < deadline:
@@ -687,21 +965,28 @@ def drive(variant, rig, browser, proc, shots=None):
                     answered.add(e["id"])
                     if shots is not None and e.get("type") == "confirm_request" \
                             and not card_shot:
-                        # The card renders in the assistant's side panel,
-                        # not the chat tab; the shot arranges that window.
                         card_shot = True
                         shots.capture_card(variant["id"] + "-1-card.png", browser,
                                            assistant, agent_page(pages, turn),
-                                           proc=proc)
+                                           card_id=e["id"], proc=proc)
                     answer = grade.simulated_answer(variant)
-                    answers.append({"id": e["id"], "answer": answer})
-                    assistant.eval("window.__evals.cr.sendWithPromise("
-                                   f"'racAiAgentRespond', {json.dumps(e['id'])}, {json.dumps(answer)})")
-                    if shots is not None and not after_shot:
-                        # The panel stays open, so the resolved card shows
-                        # beside the page it guarded.
-                        after_shot = True
-                        shots.capture(variant["id"] + "-2-after.png", proc=proc)
+                    rec = {"id": e["id"], "answer": answer}
+                    answers.append(rec)
+                    if shots is not None:
+                        # The card's own buttons answer it, armed first;
+                        # the click is what a user would do.
+                        clicked = panel_answer(assistant, e["id"], answer, proc)
+                        if clicked != "clicked":
+                            rec["click"] = clicked
+                        if not after_shot:
+                            # The resolved card then shows beside the page
+                            # it guarded, applied or not.
+                            after_shot = True
+                            _wait_card_resolved(assistant, e["id"], proc)
+                            shots.capture(variant["id"] + "-2-after.png", proc=proc)
+                    else:
+                        assistant.eval("window.__evals.cr.sendWithPromise("
+                                       f"'racAiAgentRespond', {json.dumps(e['id'])}, {json.dumps(answer)})")
                 if e.get("type") == "run_state" and e.get("state") in END_STATES:
                     end_state = e["state"]
             if end_state == "timeout":
@@ -714,7 +999,12 @@ def drive(variant, rig, browser, proc, shots=None):
             if proc.poll() is not None:
                 raise RuntimeError("the browser exited during the turn")
         if end_state == "timeout":
-            assistant.eval("chrome.send('racAiAgentStop', []); true", await_promise=False)
+            if shots is not None:
+                # #stop ends the chat session too, not only the agent, so
+                # the composer isn't still streaming on the next turn.
+                _ui_eval(assistant, PANEL_STOP_JS)
+            else:
+                assistant.eval("chrome.send('racAiAgentStop', []); true", await_promise=False)
         # Identical adjacent events come from a listener registered twice (a
         # retried evaluate); drop them so one step pairs with one event.
         events = [e for i, e in enumerate(events) if i == 0 or e != events[i - 1]]
@@ -722,22 +1012,34 @@ def drive(variant, rig, browser, proc, shots=None):
         reply = next((e["text"] for e in reversed(rig.model_state.log)
                       if e.get("kind") == "chat" and not e.get("calls")), "")
         messages.append({"role": "assistant", "text": reply})
-        turns.append({"index": index, "user": user, "events": events, "reply": reply,
-                      "end_state": end_state})
+        record = {"index": index, "user": user, "events": events, "reply": reply,
+                  "end_state": end_state}
+        if sent != "sent":
+            # The composer's answer, when the UI send couldn't report one
+            # — a turn that never sent reads as a timeout without it.
+            record["send"] = sent
+        turns.append(record)
     dialogs = [e.get("params", {}) for e in browser.drain_events()
                if e.get("method") == "Page.javascriptDialogOpening"]
     return turns, answers, dialogs
 
 
-def _try_eval(page, expression):
+def _try_eval(page, expression, timeout=5):
     """A bounded eval: a stuck renderer answer must not stall the runner."""
-    old, page.browser.timeout = page.browser.timeout, 5
+    old, page.browser.timeout = page.browser.timeout, timeout
     try:
         return page.eval(expression)
     except (cdp.CdpError, OSError):
         return None
     finally:
         page.browser.timeout = old
+
+
+def _ui_eval(page, expression, timeout=8):
+    """_try_eval for a UI action that waits inside the page — the attach
+    picker opening, a card's buttons arming — so it needs a few seconds,
+    but still returns its status string (or None) instead of stalling."""
+    return _try_eval(page, expression, timeout)
 
 
 def _listed_tabs(assistant, wanted, last=None):

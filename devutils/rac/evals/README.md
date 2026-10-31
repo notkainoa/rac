@@ -47,6 +47,19 @@ after the simulated user's answer is applied. It drives rac's
 and a failed capture never fails the variant. A symlinked `shots/` folder
 is refused.
 
+A `--screenshots` run also drives the assistant the way a user does — the
+only way the panel ever shows the run's cards, because the WebUI page that
+sent a turn owns its agent events. Before the first turn the runner opens
+the side panel (`command 40701` in the requests file, only if no panel
+target exists) with the variant's page tab in front. Each turn is typed
+into the panel's `#input` textarea and sent with `#send`; tabs are
+attached by the current tab's chip or picked in the `+` menu (a native
+menu, replayed through the page's own `rac-ai-menu` listener), and chips
+for tabs the turn didn't ask for are removed. A `confirm_request` /
+`plan_request` card is answered by clicking its own buttons once the
+~300 ms arming delay clears. Without `--screenshots` the run keeps calling
+the page handler directly from a `chrome://rac-ai/` tab.
+
 **Throwaway profiles only.** `run.py` and `ai_off/run_ai_off.py` make a fresh
 profile at `<worktree>/build/rac-evals-*`, launch the built binary
 `<worktree>/build/src/out/Default/rac.app/Contents/MacOS/rac` with
@@ -124,9 +137,10 @@ All marked `TODO(binary)`:
 1. **Saving the fake provider's key.** Keys are encrypted into prefs, so the
    runner calls the settings handler `racAiSetKey` from `chrome://settings`.
    Confirm that page registers the handler and the call works.
-2. **Where the assistant lives.** The runner opens `chrome://rac-ai/` as a tab
-   and drives it. The real assistant is a side panel that may not be a
-   DevTools target. Confirm the agent acts in tabs attached from that page.
+2. **Where the assistant lives.** A gate run opens `chrome://rac-ai/` as a
+   tab and drives its handler directly; a `--screenshots` run works through
+   the side panel's UI (the `?mode=panel` target). Confirm the agent acts
+   in tabs attached from either page.
 3. **Tab ids for `racAiSend`.** `racAiGetTabs` field names (`id`, `url`) are a
    guess.
 4. **Event names.** The runner listens for `racAiAgentEvent` through the
