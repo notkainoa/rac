@@ -48,6 +48,7 @@ last_tag=$(git describe --tags --abbrev=0 --match '*.*.*' --exclude '*.*.*.*' 2>
     git -C helium-chromium log --oneline "$commit_then..$commit_now"
     printf '```\n\n---\n\n'
   fi
-  printf 'See [this GitHub Actions Run](%s) for the [Workflow file](%s/workflow) used '
-  printf 'as well as the build logs and artifacts\n' "$_gh_run_href" "$_gh_run_href" 
+  printf 'See [this GitHub Actions Run](%s) for the [Workflow file](%s/workflow) used ' \
+    "$_gh_run_href" "$_gh_run_href"
+  printf 'as well as the build logs and artifacts\n'
 } | tee -a ./github_release_note.md
