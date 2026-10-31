@@ -154,7 +154,7 @@
  }
 --- /dev/null
 +++ b/chrome/browser/rac/devtools/BUILD.gn
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,39 @@
 +# Copyright 2026 The rac Authors
 +# Use of this source code is governed by a GPL-3.0 license.
 +
@@ -169,6 +169,7 @@
 +  deps = [
 +    "//base",
 +    "//chrome/common:constants",
++    "//components/os_crypt/common:switches",
 +    "//content/public/common",
 +  ]
 +}
@@ -188,13 +189,14 @@
 +    "//base/test:run_all_unittests",
 +    "//base/test:test_support",
 +    "//chrome/common:constants",
++    "//components/os_crypt/common:switches",
 +    "//content/public/common",
 +    "//testing/gtest",
 +  ]
 +}
 --- /dev/null
 +++ b/chrome/browser/rac/devtools/default_dir.cc
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,289 @@
 +// Copyright 2026 The rac Authors
 +// Use of this source code is governed by a GPL-3.0 license.
 +
@@ -202,6 +204,7 @@
 +
 +#include <errno.h>
 +#include <pwd.h>
++#include <stdio.h>
 +#include <stdlib.h>
 +#include <sys/stat.h>
 +#include <unistd.h>
@@ -222,6 +225,7 @@
 +#include "base/path_service.h"
 +#include "chrome/common/chrome_paths.h"
 +#include "chrome/common/chrome_paths_internal.h"
++#include "components/os_crypt/common/os_crypt_switches.h"
 +#include "content/public/common/content_switches.h"
 +
 +namespace rac {
@@ -330,6 +334,11 @@
 +  return default_dirs.empty() || IsInsideDefaultDir(path, default_dirs);
 +}
 +
++bool AsksForADebugDoor(const base::CommandLine& command_line) {
++  return command_line.HasSwitch(::switches::kRemoteDebuggingPort) ||
++         command_line.HasSwitch(::switches::kRemoteDebuggingPipe);
++}
++
 +}  // namespace
 +
 +bool IsInsideDefaultDir(const base::FilePath& path,
@@ -431,14 +440,31 @@
 +  // No door is open yet. The first profile loads before RemoteDebuggingServer
 +  // starts, so if a door was asked for, note a real profile loading and let
 +  // RefusesDebugDoors() keep the doors shut instead.
-+  const base::CommandLine& command_line =
-+      *base::CommandLine::ForCurrentProcess();
-+  if ((command_line.HasSwitch(::switches::kRemoteDebuggingPort) ||
-+       command_line.HasSwitch(::switches::kRemoteDebuggingPipe)) &&
++  if (AsksForADebugDoor(*base::CommandLine::ForCurrentProcess()) &&
 +      IsInsideDefaultDirs(profile_dir)) {
 +    g_real_profile_loaded = true;
 +  }
 +  return false;
++}
++
++bool ShouldForceMockKeychain(const base::CommandLine& command_line,
++                             std::optional<bool> is_default_by_path) {
++  return AsksForADebugDoor(command_line) && is_default_by_path == false;
++}
++
++void ForceMockKeychainIfDebugDoorRequested() {
++  base::CommandLine& command_line = *base::CommandLine::ForCurrentProcess();
++  if (!ShouldForceMockKeychain(command_line,
++                               chrome::IsUsingDefaultDataDirectory())) {
++    return;
++  }
++  if (!command_line.HasSwitch(os_crypt::switches::kUseMockKeychain)) {
++    command_line.AppendSwitch(os_crypt::switches::kUseMockKeychain);
++  }
++  fprintf(stderr,
++          "rac: remote debugging requested; using a mock keychain so saved "
++          "logins in this profile can't be read\n");
++  fflush(stderr);
 +}
 +
 +std::optional<base::FilePath> LookUpPasswordDatabaseHomeForTesting(
@@ -462,7 +488,7 @@
 +}  // namespace rac
 --- /dev/null
 +++ b/chrome/browser/rac/devtools/default_dir.h
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,133 @@
 +// Copyright 2026 The rac Authors
 +// Use of this source code is governed by a GPL-3.0 license.
 +
@@ -475,6 +501,7 @@
 +#include <vector>
 +
 +namespace base {
++class CommandLine;
 +class FilePath;
 +}  // namespace base
 +
@@ -499,7 +526,8 @@
 +// loads the first profile before RemoteDebuggingServer starts, so at startup
 +// the door is the one refused and the profile still opens.
 +//
-+// Not covered, because file identity can't see them:
++// File identity can't see these, so they can still reach the real profile's
++// files with a door open:
 +// - Links planted inside an allowed profile that point at the real profile's
 +//   files: symlinks to its files, or hard links, which share their inodes.
 +// - Swapping folders after the check, such as renaming the real profile into
@@ -507,10 +535,13 @@
 +// - Copies of the real profile's files.
 +// - Cross-device mounts of the real profile (an NFS, bindfs, or other
 +//   re-export), whose files have different identities.
-+// Reading cookies or passwords through any of these needs the Keychain key
-+// that decrypts them, and every user data dir shares that key. Forcing the
-+// mock keychain while a door is open would close them; whether to is an open
-+// decision for the maintainer, not implemented here.
++// Its cookies, passwords, and other encrypted data stay sealed anyway: they're
++// encrypted with a
++// Keychain key that every user data dir shares, so whenever a door is asked
++// for, ForceMockKeychainIfDebugDoorRequested() swaps in the mock keychain
++// before OSCrypt reads that key. The files' other contents (history,
++// bookmarks, and anything else stored in the clear) stay readable through
++// them.
 +//
 +// The file checks run only when a door was asked for, so a normal launch
 +// does no file I/O here. They use plain syscalls, not base's file helpers,
@@ -539,6 +570,26 @@
 +// opens, such a profile loads, and RefusesDebugDoors() then keeps the doors
 +// shut. Without a door switch on the command line, it touches no files.
 +bool RefusesProfileForDebugDoors(const base::FilePath& profile_dir);
++
++// Whether the browser must use the mock keychain: `command_line` asks for a
++// door (--remote-debugging-port or --remote-debugging-pipe), whether or not
++// it will open, and `is_default_by_path` (chrome::IsUsingDefaultDataDirectory)
++// is false. When it's true or unknown, RefusesDebugDoors() refuses on that
++// value alone, without touching the file system, so every session either
++// uses the mock keychain or can't open a door. Skipping the mock there keeps
++// the real profile intact: under the mock its encrypted data can't be read,
++// and Chromium on macOS deletes saved passwords it can't decrypt when no
++// --user-data-dir is given.
++bool ShouldForceMockKeychain(const base::CommandLine& command_line,
++                             std::optional<bool> is_default_by_path);
++
++// Adds --use-mock-keychain to this process's command line when
++// ShouldForceMockKeychain() says so for chrome::IsUsingDefaultDataDirectory(),
++// and says so on stderr. ChromeMainDelegate::PostEarlyInitialization() calls
++// it in the browser process, after the process singleton and about:flags
++// switches and before the thread pool starts, so it runs before OSCrypt's
++// KeychainKeyProvider reads the switch and before any profile opens.
++void ForceMockKeychainIfDebugDoorRequested();
 +
 +// The identity check behind all of these: true if `path`, resolved, is one of
 +// `default_dirs` or inside one. A default dir that doesn't exist has no
@@ -573,7 +624,7 @@
 +#endif  // CHROME_BROWSER_RAC_DEVTOOLS_DEFAULT_DIR_H_
 --- /dev/null
 +++ b/chrome/browser/rac/devtools/default_dir_unittest.cc
-@@ -0,0 +1,460 @@
+@@ -0,0 +1,534 @@
 +// Copyright 2026 The rac Authors
 +// Use of this source code is governed by a GPL-3.0 license.
 +
@@ -599,6 +650,7 @@
 +#include "chrome/browser/devtools/features.h"
 +#include "chrome/common/chrome_paths.h"
 +#include "chrome/common/chrome_paths_internal.h"
++#include "components/os_crypt/common/os_crypt_switches.h"
 +#include "content/public/common/content_switches.h"
 +#include "testing/gtest/include/gtest/gtest.h"
 +
@@ -1006,6 +1058,79 @@
 +  EXPECT_FALSE(IsDefaultUserDataDir(/*is_default_by_path=*/false));
 +}
 +
++// The mock keychain.
++
++base::CommandLine DoorCommandLine(const char* door_switch) {
++  base::CommandLine command_line(base::CommandLine::NO_PROGRAM);
++  if (door_switch) {
++    command_line.AppendSwitchASCII(door_switch, "0");
++  }
++  return command_line;
++}
++
++TEST(RacMockKeychainTest, ForcedWithThePort) {
++  EXPECT_TRUE(ShouldForceMockKeychain(
++      DoorCommandLine(::switches::kRemoteDebuggingPort), false));
++}
++
++TEST(RacMockKeychainTest, ForcedWithThePipe) {
++  EXPECT_TRUE(ShouldForceMockKeychain(
++      DoorCommandLine(::switches::kRemoteDebuggingPipe), false));
++}
++
++TEST(RacMockKeychainTest, NotForcedWithoutADoor) {
++  EXPECT_FALSE(ShouldForceMockKeychain(DoorCommandLine(nullptr), false));
++  EXPECT_FALSE(ShouldForceMockKeychain(
++      DoorCommandLine("remote-debugging-address"), false));
++}
++
++// On the default dir by path, or when that's unknown, the door is refused
++// before any file is checked, and the real profile keeps its Keychain key.
++TEST_F(RacDefaultDirTest, MockKeychainOrRefusedForEveryDoorRequest) {
++  UseUserDataDir(other_);
++  for (const char* door_switch :
++       {::switches::kRemoteDebuggingPort, ::switches::kRemoteDebuggingPipe}) {
++    const base::CommandLine command_line = DoorCommandLine(door_switch);
++    for (const std::optional<bool> is_default_by_path :
++         {std::optional<bool>(true), std::optional<bool>(false),
++          std::optional<bool>()}) {
++      const bool mock =
++          ShouldForceMockKeychain(command_line, is_default_by_path);
++      EXPECT_EQ(mock, is_default_by_path == false) << door_switch;
++      EXPECT_TRUE(mock || IsDefaultUserDataDir(is_default_by_path))
++          << door_switch;
++    }
++  }
++}
++
++TEST_F(RacDefaultDirTest, ForceMockKeychainAddsTheSwitchOnce) {
++  chrome::SetUsingDefaultUserDataDirectoryForTesting(false);
++  AskForThePort();
++  base::CommandLine* command_line = command_line_.GetProcessCommandLine();
++  ForceMockKeychainIfDebugDoorRequested();
++  EXPECT_TRUE(command_line->HasSwitch(os_crypt::switches::kUseMockKeychain));
++
++  const size_t argc = command_line->argv().size();
++  ForceMockKeychainIfDebugDoorRequested();
++  EXPECT_EQ(command_line->argv().size(), argc);
++}
++
++TEST_F(RacDefaultDirTest, ForceMockKeychainLeavesANormalLaunchAlone) {
++  chrome::SetUsingDefaultUserDataDirectoryForTesting(false);
++  base::CommandLine* command_line = command_line_.GetProcessCommandLine();
++  const base::CommandLine::StringVector argv = command_line->argv();
++  ForceMockKeychainIfDebugDoorRequested();
++  EXPECT_EQ(command_line->argv(), argv);
++}
++
++TEST_F(RacDefaultDirTest, ForceMockKeychainLeavesTheDefaultDirAlone) {
++  chrome::SetUsingDefaultUserDataDirectoryForTesting(true);
++  AskForThePort();
++  ForceMockKeychainIfDebugDoorRequested();
++  EXPECT_FALSE(command_line_.GetProcessCommandLine()->HasSwitch(
++      os_crypt::switches::kUseMockKeychain));
++}
++
 +// A one-byte buffer can't hold any password database entry, so getpwuid_r()
 +// reports ERANGE and the lookup retries with bigger buffers. Only the home's
 +// path is read, never anything inside it.
@@ -1071,3 +1196,23 @@
  #endif
  
    return true;
+--- a/chrome/app/chrome_main_delegate.cc
++++ b/chrome/app/chrome_main_delegate.cc
+@@ -195,6 +195,7 @@
+ #include "chrome/browser/headless/headless_mode_util.h"  // nogncheck
+ #include "chrome/browser/lifetime/browser_shutdown.h"  // nogncheck
+ #include "chrome/browser/metrics/chrome_feature_list_creator.h"  // nogncheck
++#include "chrome/browser/rac/devtools/default_dir.h"  // nogncheck
+ #include "chrome/browser/startup_data.h"  // nogncheck
+ #include "chrome/gpu/chrome_content_gpu_client.h"  // nogncheck
+ #include "chrome/utility/chrome_content_utility_client.h"  // nogncheck
+@@ -950,6 +951,9 @@ std::optional<int> ChromeMainDelegate::P
+     chrome_feature_list_creator->CreateFeatureList();
+   }
+ 
++  // rac: before OSCrypt reads the Keychain, with every switch in place (D20).
++  rac::ForceMockKeychainIfDebugDoorRequested();
++
+   content::InitializeMojoCore();
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
