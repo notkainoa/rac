@@ -15,9 +15,54 @@ KINDS = ("attack", "probe", "budget", "failclosed", "stub")
 INHERITED = ("pages", "model", "origins", "routes", "turns", "secret", "attacker",
              "leak", "prefs", "level", "user_answer", "expect", "title", "docs")
 
+# --variants spec suffixes: the window's appearance and the side panel's
+# width, after a base id — "chain-canonical:dark:wide". run.py seeds the
+# prefs for them. Order in a spec is free; run_id puts them in this
+# canonical order so :wide:dark and :dark:wide name the same run.
+APPEARANCE_SUFFIXES = ("light", "dark")
+WIDTH_SUFFIXES = ("narrow", "wide")
+SUFFIXES = APPEARANCE_SUFFIXES + WIDTH_SUFFIXES
+
 
 class VariantError(Exception):
     pass
+
+
+def parse_spec(spec):
+    """One --variants item as (base_id, appearance, width):
+    "chain-canonical:light:narrow" -> ("chain-canonical", "light", "narrow").
+    Either suffix may be left out and the order is free. An empty part, an
+    unknown suffix, or a second suffix of one kind is a VariantError."""
+    base, *rest = spec.split(":")
+    if not base:
+        raise VariantError(f"{spec!r}: no variant id")
+    appearance = width = None
+    for s in rest:
+        if s in APPEARANCE_SUFFIXES:
+            if appearance is not None:
+                raise VariantError(f"{spec!r}: two appearance suffixes")
+            appearance = s
+        elif s in WIDTH_SUFFIXES:
+            if width is not None:
+                raise VariantError(f"{spec!r}: two width suffixes")
+            width = s
+        else:
+            raise VariantError(f"{spec!r}: unknown suffix {s!r} "
+                               f"(one of {', '.join(SUFFIXES)})")
+    return base, appearance, width
+
+
+def run_id(base, appearance=None, width=None):
+    """A suffixed run's canonical name — base plus suffixes, appearance
+    then width — used for the record's `variant`, its results file and the
+    shot names, so several appearances of one variant can run in a single
+    invocation without overwriting each other."""
+    parts = [base]
+    if appearance:
+        parts.append(appearance)
+    if width:
+        parts.append(width)
+    return "-".join(parts)
 
 
 def _read_json(path):
@@ -57,6 +102,9 @@ def load_variant(variant_id, root=FIXTURES, _seen=()):
         else:
             merged[key] = value
     merged["id"] = variant_id
+    # The fixture this variant was loaded from. run.py may put a suffixed
+    # run name in `id`, but `base_id` always points back at the fixture.
+    merged["base_id"] = variant_id
     merged["dir"] = vdir
     own_pages = os.path.isdir(os.path.join(vdir, "pages")) or os.path.isfile(os.path.join(vdir, "fixture.py"))
     if own_pages or "pages_dir" not in merged:

@@ -51,6 +51,44 @@ class SeedingTest(unittest.TestCase):
         rules = self.prefs("failclosed-site-rule-key")["rac"]["ai"]["agent_site_rules"]
         self.assertEqual(rules, {ORIGINS["b"] + "/signup": "always"})
 
+    def suffixed_prefs(self, spec):
+        [v] = run.select(mock.Mock(variants=spec, fixtures_dir=variants.FIXTURES))
+        return run.build_preferences(v, ORIGINS, "http://localhost:4444/v1", "/tmp/dl")
+
+    def test_an_unsuffixed_run_seeds_no_space_or_panel_width(self):
+        p = self.prefs()
+        self.assertNotIn("spaces", p["rac"])
+        self.assertNotIn("side_panel", p)
+
+    def test_a_dark_run_seeds_one_space_in_dark_mode(self):
+        stored = self.suffixed_prefs("chain-canonical:dark")["rac"]["spaces"]
+        self.assertEqual(stored["version"], 1)
+        [space] = stored["spaces"]
+        self.assertEqual(space["theme"]["mode"], "dark")
+        # SpaceTheme::FromDict needs both stops or the theme never parses.
+        self.assertRegex(space["theme"]["color1"], r"^#[0-9A-Fa-f]{6}$")
+        self.assertRegex(space["theme"]["color2"], r"^#[0-9A-Fa-f]{6}$")
+        self.assertTrue(space["id"])
+
+    def test_a_light_run_seeds_light_and_no_panel_width(self):
+        p = self.suffixed_prefs("chain-canonical:light")
+        self.assertEqual(p["rac"]["spaces"]["spaces"][0]["theme"]["mode"], "light")
+        self.assertNotIn("side_panel", p)
+
+    def test_narrow_seeds_the_panels_minimum_width(self):
+        p = self.suffixed_prefs("chain-canonical:narrow")
+        self.assertEqual(p["side_panel"]["id_to_width"],
+                         {"kRacAi": run.PANEL_NARROW_WIDTH})
+        # kSidePanelMinimumContentWidth 200 + the 11 px border insets.
+        self.assertEqual(run.PANEL_NARROW_WIDTH, 211)
+
+    def test_wide_seeds_560_and_no_space(self):
+        p = self.suffixed_prefs("chain-canonical:wide")
+        self.assertEqual(p["side_panel"]["id_to_width"],
+                         {"kRacAi": run.PANEL_WIDE_WIDTH})
+        self.assertEqual(run.PANEL_WIDE_WIDTH, 560)
+        self.assertNotIn("spaces", p["rac"])
+
     def test_expand_fills_keys_values_and_nested_lists(self):
         self.assertEqual(run.expand({"{origin:a}": ["x {origin:b}", 3]}, ORIGINS),
                          {ORIGINS["a"]: ["x " + ORIGINS["b"], 3]})
@@ -60,6 +98,71 @@ class SeedingTest(unittest.TestCase):
         run.deep_set(d, "x.y.z", 1)
         run.deep_set(d, "x.y.w", 2)
         self.assertEqual(d, {"x": {"y": {"z": 1, "w": 2}}})
+
+
+class VariantSpecTest(unittest.TestCase):
+    def parse(self, spec):
+        return variants.parse_spec(spec)
+
+    def test_a_bare_id_has_no_suffixes(self):
+        self.assertEqual(self.parse("chain-canonical"),
+                         ("chain-canonical", None, None))
+
+    def test_one_suffix_of_either_kind(self):
+        for spec, want in (("v:light", ("v", "light", None)),
+                           ("v:dark", ("v", "dark", None)),
+                           ("v:narrow", ("v", None, "narrow")),
+                           ("v:wide", ("v", None, "wide"))):
+            self.assertEqual(self.parse(spec), want, spec)
+
+    def test_both_suffixes_in_either_order(self):
+        self.assertEqual(self.parse("v:dark:narrow"), ("v", "dark", "narrow"))
+        self.assertEqual(self.parse("v:narrow:dark"), ("v", "dark", "narrow"))
+
+    def test_unknown_empty_or_duplicate_suffixes_are_errors(self):
+        for spec in ("v:sepia", "v:", "v:light:", ":light", "v:light:dark",
+                     "v:wide:narrow", "v:light:light", "v::light"):
+            with self.assertRaises(variants.VariantError, msg=spec):
+                self.parse(spec)
+
+    def test_run_id_joins_the_parts_in_a_fixed_order(self):
+        self.assertEqual(variants.run_id("chain-canonical"), "chain-canonical")
+        self.assertEqual(variants.run_id("v", "dark"), "v-dark")
+        self.assertEqual(variants.run_id("v", None, "narrow"), "v-narrow")
+        self.assertEqual(variants.run_id("v", "light", "narrow"), "v-light-narrow")
+
+    def selected(self, spec):
+        return run.select(mock.Mock(variants=spec, fixtures_dir=variants.FIXTURES))
+
+    def test_a_suffixed_run_keeps_the_base_fixture_under_a_new_id(self):
+        [v] = self.selected("chain-canonical:dark:wide")
+        self.assertEqual(v["id"], "chain-canonical-dark-wide")
+        self.assertEqual(v["base_id"], "chain-canonical")
+        self.assertEqual(v["appearance"], "dark")
+        self.assertEqual(v["panel_width"], "wide")
+        # Same fixture content: the run drives the base variant's steps.
+        self.assertEqual(v["turns"], variants.load_variant("chain-canonical")["turns"])
+
+    def test_each_combination_names_its_own_record_and_shots(self):
+        vs = self.selected("chain-canonical,chain-canonical:light,"
+                           "chain-canonical:dark:narrow,chain-canonical:narrow:dark")
+        self.assertEqual([v["id"] for v in vs], ["chain-canonical",
+                                                 "chain-canonical-light",
+                                                 "chain-canonical-dark-narrow"])
+        # Records are <id>.json, shots <id>-*.png: distinct ids can't collide.
+        self.assertEqual(len({v["id"] for v in vs}), len(vs))
+
+    def test_an_unsuffixed_run_carries_no_suffix_metadata(self):
+        [v] = self.selected("chain-canonical")
+        self.assertNotIn("appearance", v)
+        self.assertNotIn("panel_width", v)
+        self.assertEqual(v["base_id"], "chain-canonical")
+
+    def test_bad_specs_and_unknown_bases_exit(self):
+        for spec in ("nope", "chain-canonical:sepia", "chain-canonical:light:dark",
+                     "chain-canonical:", ":light"):
+            with self.assertRaises(SystemExit, msg=spec):
+                self.selected(spec)
 
 
 class LaunchTest(unittest.TestCase):

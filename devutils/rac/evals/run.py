@@ -6,7 +6,8 @@
   run.py --list                       the variants
   run.py --dry-run today|d19          no browser: fixtures + fake model + the
                                       Python stand-in agent (sim_agent.py)
-  run.py [--variants a,b]             launch the build and run for real
+  run.py [--variants a[:light|dark][:narrow|wide],b]
+                                      launch the build and run for real
                                       (needs a built worktree; see README)
   run.py --screenshots ...            also write proof PNGs of the window to
                                       <results-dir>/shots/ (real runs only)
@@ -14,7 +15,8 @@
 A real run, per variant, in a throwaway profile:
   1. start the fixture server (one port per origin) and the fake model;
   2. seed <profile>/Default/Preferences: AI on, browser control on, the Custom
-     provider pointed at the fake model, the level and site rules under test;
+     provider pointed at the fake model, the level and site rules under test,
+     plus the space theme mode and side-panel width a suffixed spec asks for;
   3. launch the built binary `build/src/out/Default/rac.app/Contents/MacOS/rac`
      with `--user-data-dir=<profile> --remote-debugging-port=0` (through the
      build queue's run slot unless RAC_EVALS_NO_QUEUE=1), save the fake
@@ -64,6 +66,48 @@ FAKE_KEY = "eval-fake-key"  # the fake model ignores it; Custom insists on one
 # chrome/app/chrome_command_ids.h: toggles the assistant side panel, sent
 # through the screenshot requests file as "command 40701".
 IDC_RAC_ASSISTANT_TOGGLE = 40701
+
+# --- prefs the :light/:dark and :narrow/:wide spec suffixes seed -----------
+#
+# Appearance is rac's per-space theme mode, seeded as one space in
+# rac.spaces. SpacesWindowManager::UpdateColorMode turns theme.mode into the
+# window widget's SetColorModeOverride
+# (chrome/browser/ui/rac/spaces/spaces_window_manager.cc), which wins over
+# ThemeService in BrowserWidget::GetColorProviderKey
+# (chrome/browser/ui/views/frame/browser_widget.cc) and so decides every
+# WebContents' color mode in the window — page tabs through
+# ColorProviderBrowserHelper, the assistant side panel through
+# WebView::AddedToWidget — which is what blink's prefers-color-scheme reads
+# (chrome_content_browser_client.cc GetPreferredColorScheme). Chromium's own
+# browser.theme.color_scheme2 can't be used instead: rac forces it back to
+# system on startup and on every theme change
+# (SpacesWindowManager::ResetBrowserTheme).
+SPACES_PREF = "rac.spaces"
+# A fixed id: the seeded space only lives in the throwaway profile.
+EVALS_SPACE_ID = "0e5af240-0000-4000-8000-000000000000"
+# SpaceTheme::FromDict needs both stops to parse at all; Neutral's
+# (chrome/browser/rac/spaces/space.cc kPresets[0]) paint the default flat
+# gray, so :light and :dark differ only in mode.
+EVALS_SPACE_COLORS = {"color1": "#FFFFD7", "color2": "#FFD9FB"}
+
+# side_panel.id_to_width maps SidePanelEntryIdToString of a SidePanelEntryId
+# — "kRacAi" for the assistant (chrome/browser/ui/side_panel/
+# side_panel_entry_id.h) — to the panel's whole width, borders included
+# (SidePanel::UpdateSidePanelWidthPref/UpdateWidthOnEntryChanged,
+# chrome/browser/ui/views/side_panel/side_panel.cc).
+PANEL_WIDTH_PREF = "side_panel.id_to_width"
+ASSISTANT_PANEL_ID = "kRacAi"
+# SidePanel::GetMinimumSize().width(): kSidePanelMinimumContentWidth (200)
+# plus the borders — content margin 3 + separator 1 on one side, resize
+# area 6 + separator 1 on the other. A smaller seeded width still lays out
+# at this.
+PANEL_NARROW_WIDTH = 211
+# SidePanelType::kContent panels get at most 2/3 of the window's client
+# width (kMaxContentsHeightSidePanelFraction in
+# browser_view_tabbed_layout_impl.cc), so this is wide while still fitting
+# an ~840 px window.
+PANEL_WIDE_WIDTH = 560
+PANEL_WIDTHS = {"narrow": PANEL_NARROW_WIDTH, "wide": PANEL_WIDE_WIDTH}
 
 
 # --- small helpers ---------------------------------------------------------
@@ -121,7 +165,8 @@ class Rig:
         return f"http://localhost:{self.model.server_address[1]}/v1"
 
     def record(self, mode, turns, answers, downloads=()):
-        return {"variant": self.variant["id"], "mode": mode, "level": self.variant["level"],
+        return {"variant": self.variant["id"], "base_id": self.variant["base_id"],
+                "mode": mode, "level": self.variant["level"],
                 "turns": turns, "model_log": list(self.model_state.log),
                 "attacker_log": self.fixtures.snapshot_log(), "answers": answers,
                 "downloads": list(downloads)}
@@ -178,6 +223,15 @@ def build_preferences(variant, origins, model_base_url, download_dir):
         "helium.services.enabled": False,
     }.items():
         deep_set(prefs, dotted, value)
+    # The run's :light/:dark and :narrow/:wide suffixes; see the constants
+    # above for why these prefs and not Chromium's color-scheme pref.
+    if variant.get("appearance"):
+        deep_set(prefs, SPACES_PREF, {"version": 1, "spaces": [
+            {"id": EVALS_SPACE_ID, "name": "",
+             "theme": {**EVALS_SPACE_COLORS, "mode": variant["appearance"]}}]})
+    if variant.get("panel_width"):
+        deep_set(prefs, PANEL_WIDTH_PREF,
+                 {ASSISTANT_PANEL_ID: PANEL_WIDTHS[variant["panel_width"]]})
     for dotted, value in flat_prefs(variant, origins).items():
         deep_set(prefs, dotted, value)
     return prefs
@@ -966,7 +1020,7 @@ def drive(variant, rig, browser, proc, shots=None):
                         wanted_ids.setdefault(w, t["id"])
             attach_panel_turn(assistant, wanted_ids, proc)
             _ui_eval(assistant, panel_type_js(user))
-            if variant["id"] == "chain-canonical":
+            if variant["base_id"] == "chain-canonical":
                 shots.capture(variant["id"] + "-0-before.png", proc=proc)
             sent = _ui_eval(assistant, PANEL_SUBMIT_JS)
         else:
@@ -1122,17 +1176,49 @@ def post_status(sha, state, description, execute=False):
 
 # --- main ------------------------------------------------------------------------------
 
+def suffixed(variant, appearance, width):
+    """The variant dict for a `--variants id:light:narrow` run: it runs
+    exactly like `variant`, with the appearance/panel prefs seeded and `id`
+    carrying the suffixes so its record, results file and shot names can't
+    collide with another run of the same base. `variant` itself when
+    neither suffix is given."""
+    if appearance is None and width is None:
+        return variant
+    v = dict(variant)
+    v["id"] = variants.run_id(variant["base_id"], appearance, width)
+    v["appearance"] = appearance
+    v["panel_width"] = width
+    return v
+
+
 def select(args):
     ids = variants.list_variant_ids(args.fixtures_dir)
     loaded = [variants.load_variant(i, args.fixtures_dir) for i in ids]
     loaded = [v for v in loaded if v["kind"] != "stub"]
-    if args.variants:
-        want = args.variants.split(",")
-        missing = set(want) - {v["id"] for v in loaded}
-        if missing:
-            sys.exit(f"unknown variants: {sorted(missing)}")
-        loaded = [v for v in loaded if v["id"] in want]
-    return loaded
+    if not args.variants:
+        return loaded
+    specs = []
+    for raw in args.variants.split(","):
+        try:
+            specs.append((raw, *variants.parse_spec(raw)))
+        except variants.VariantError as e:
+            sys.exit(str(e))
+    have = {v["id"] for v in loaded}
+    missing = sorted({raw for raw, base, _a, _w in specs if base not in have})
+    if missing:
+        sys.exit(f"unknown variants: {missing}")
+    # Fixture order, with each spec's runs where its base would have been.
+    # The same run spelled twice — "v:dark:wide,v:wide:dark" — runs once.
+    chosen, seen = [], set()
+    for v in loaded:
+        for _raw, base, appearance, width in specs:
+            if base != v["id"]:
+                continue
+            rid = variants.run_id(base, appearance, width)
+            if rid not in seen:
+                seen.add(rid)
+                chosen.append(suffixed(v, appearance, width))
+    return chosen
 
 
 def _raise_interrupt(signum, frame):
@@ -1153,7 +1239,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--dry-run", choices=("today", "d19"), help="no browser; see the module doc")
-    ap.add_argument("--variants", help="comma-separated ids; default all")
+    ap.add_argument("--variants", help="comma-separated ids, each optionally "
+                                       "suffixed :light|:dark and :narrow|:wide "
+                                       "in any order; default all")
     ap.add_argument("--fixtures-dir", default=variants.FIXTURES)
     ap.add_argument("--results-dir", default=os.path.join(HERE, "results"))
     ap.add_argument("--host-mode", choices=("names", "loopback"), default="names")
@@ -1186,7 +1274,8 @@ def main(argv=None):
         except Exception as e:
             # One variant's runner failure must not lose the rest of the run:
             # the record still grades (attempted False, gate "none") as a fail.
-            record = {"variant": v["id"], "mode": "browser" if not args.dry_run else "sim-" + args.dry_run,
+            record = {"variant": v["id"], "base_id": v["base_id"],
+                      "mode": "browser" if not args.dry_run else "sim-" + args.dry_run,
                       "level": v["level"], "turns": [], "model_log": [], "attacker_log": [],
                       "answers": [], "downloads": [], "runner_error": f"{type(e).__name__}: {e}"}
             print(f"     runner failed: {e}", flush=True)

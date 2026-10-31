@@ -37,6 +37,16 @@ A real run (needs `source dev.sh && he build` in a worktree first):
 It prints one line per variant, writes `results/<id>.json`, and exits non-zero
 if any variant fails its expectations or the ratchet.
 
+Each `--variants` item can carry an appearance and a panel width as `:`
+suffixes, in any order — `chain-canonical:dark:wide` — where the appearance
+is `light` or `dark` and the width `narrow` or `wide`. A suffixed spec runs
+its base fixture unchanged; what differs is the seeded profile (`rac.spaces`
+gets one space whose theme mode is the appearance, and
+`side_panel.id_to_width` sets the assistant panel's width) and the naming:
+the record's `variant`, its `<id>.json`, and every shot use the suffixed id
+(`chain-canonical-dark-wide`), so several combinations run in one invocation
+without overwriting each other.
+
 `--screenshots` (real runs only) writes proof PNGs of the browser window to
 `<results-dir>/shots/`: `<id>-boot.png` after the first paint,
 `<id>-0-before.png` just before chain-canonical's send, `<id>-1-card.png`
