@@ -148,8 +148,10 @@ xattr -dr com.apple.quarantine "$_app" >/dev/null 2>&1 || true
 
 _version="$(python3 "$_smoke_py" plist-value "$_app/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null)"
 
-if _out="$(codesign --verify --deep --strict --verbose=2 "$_app" 2>&1)"; then
-  record PASS "code signature" "codesign --verify --deep --strict passed"
+# --strict=symlinks: the disk image tags every file with com.apple.FinderInfo
+# on macOS 26, which full --strict rejects (see github_verify_dmg.sh).
+if _out="$(codesign --verify --deep --strict=symlinks --verbose=2 "$_app" 2>&1)"; then
+  record PASS "code signature" "codesign --verify --deep --strict=symlinks passed"
 else
   record FAIL "code signature" "$_out"
 fi
