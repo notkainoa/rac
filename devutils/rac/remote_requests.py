@@ -67,7 +67,7 @@ HTTP_URL = re.compile(r'https?://(?P<host>\[::1\]|[A-Za-z0-9.-]+)(:[0-9]{1,5})?'
 # screenshots only -- the script may not send input (see check_line).
 INTERNAL_PAGES = frozenset((
     'setup', 'version', 'newtab', 'settings/assistant',
-    'settings/privacy', 'settings/appearance', 'rac-ai',
+    'settings/privacy', 'settings/appearance', 'settings/general', 'rac-ai',
 ))
 INTERNAL_URL = re.compile(r'(?:chrome|rac)://([!-\[\]-~]*)', re.ASCII | re.I)
 SETUP_STEP = re.compile(r'setup/[A-Za-z0-9-]+')

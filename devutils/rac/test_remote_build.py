@@ -1642,6 +1642,36 @@ class RunTest(RemoteBuildTest):
         self.assertIn('symlink', result.stderr)
         self.assertFalse((outside / 'x.json').exists())
 
+    def test_run_settings_general_needs_an_import_input(self):
+        # Settings > General shows the Arc import card, so a run that
+        # opens it (URL arg or requests file) must feed it a fixture,
+        # and stays screenshot-only like the other settings pages.
+        req = self.folder / 'req.txt'
+        for url in ('chrome://settings/general', 'rac://settings/general/',
+                    'CHROME://SETTINGS/general'):
+            result = self.run_rb('run', self.wt, '--', url, success=False)
+            self.assertEqual(result.returncode, 2, url)
+            self.assertIn('import', result.stderr, url)
+        write(req, 'open-urls chrome://settings/general ; burst shots 2 100\n')
+        result = self.run_rb('run', self.wt, '--requests-file', req,
+                             success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('import', result.stderr)
+        self.assertEqual(self.calls(), '')
+        write(self.clone / 'devutils/fixtures/arc/StorableSidebar.json', '{}\n')
+        fixture = '--rac-arc-import-fixture=devutils/fixtures/arc/StorableSidebar.json'
+        self.run_rb('run', self.wt, '--requests-file', req, '--timeout', '5',
+                    '--', fixture, success=True)
+        write(req, 'burst shots 2 100\n')
+        self.run_rb('run', self.wt, '--requests-file', req, '--timeout', '5',
+                    '--', 'chrome://settings/general', fixture, success=True)
+        write(req, 'key tab\n')
+        result = self.run_rb('run', self.wt, '--requests-file', req,
+                             '--', 'chrome://settings/general', fixture,
+                             success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('screenshots', result.stderr)
+
     def test_run_opening_a_settings_page_is_screenshot_only(self):
         # A settings page as a run arg allows only capture verbs in the
         # requests file: the Air refuses input before anything launches.

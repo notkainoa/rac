@@ -1191,7 +1191,7 @@ check_run_arg() {
 
 cmd_run() {
   local name=$1 timeout=90 requests='' outputs='' fresh=0 checked
-  local req_pages='' req_verbs='' import_input=0 setup_page=0 source_root=0
+  local req_pages='' req_verbs='' import_input=0 setup_page=0 general_page=0 source_root=0
   local arc_now=0 settings_page=0
   shift
   while [ $# -gt 0 ]; do
@@ -1236,6 +1236,9 @@ cmd_run() {
       chrome://setup | chrome://setup/* | rac://setup | rac://setup/* | \
         'chrome://setup?arc' | 'rac://setup?arc')
         setup_page=1 ;;
+      chrome://settings/general | chrome://settings/general/ | \
+        rac://settings/general | rac://settings/general/)
+        settings_page=1 general_page=1 ;;
       chrome://settings | chrome://settings/* | rac://settings | rac://settings/*)
         settings_page=1 ;;
     esac
@@ -1246,6 +1249,9 @@ cmd_run() {
       chrome://setup | chrome://setup/* | rac://setup | rac://setup/* | \
         'chrome://setup?arc' | 'rac://setup?arc')
         setup_page=1 ;;
+      chrome://settings/general | chrome://settings/general/ | \
+        rac://settings/general | rac://settings/general/)
+        settings_page=1 general_page=1 ;;
       chrome://settings | chrome://settings/* | rac://settings | rac://settings/*)
         settings_page=1 ;;
     esac
@@ -1254,6 +1260,11 @@ cmd_run() {
   # the same run it would read the maintainer's real Arc data.
   if [ "$setup_page" = 1 ] && [ "$import_input" = 0 ]; then
     refuse "opening chrome://setup needs --rac-arc-import-fixture= or --rac-import-source-root= in the same run, so the import screen reads a fixture, not the Pro's real Arc data"
+  fi
+  # Settings > General holds the Arc import card, which reads Arc data
+  # when it loads; the run feeds it a fixture instead.
+  if [ "$general_page" = 1 ] && [ "$import_input" = 0 ]; then
+    refuse "opening chrome://settings/general needs --rac-arc-import-fixture= or --rac-import-source-root= in the same run, so its import card reads a fixture, not the Pro's real Arc data"
   fi
   # --rac-import-arc-now imports at startup from --rac-import-source-root,
   # and from the maintainer's real Arc when that switch is missing.
