@@ -1,0 +1,1228 @@
+--- a/chrome/browser/devtools/BUILD.gn
++++ b/chrome/browser/devtools/BUILD.gn
+@@ -300,6 +300,7 @@ static_library("devtools") {
+       "//chrome/app/theme:theme_resources",
+       "//chrome/browser/infobars",
+       "//chrome/browser/media/router:media_router_feature",
++      "//chrome/browser/rac/devtools",
+       "//chrome/browser/ui:tab_modal_confirm_dialog",
+       "//chrome/browser/ui/exclusive_access",
+       "//chrome/browser/ui/navigator",
+--- a/chrome/browser/devtools/features.cc
++++ b/chrome/browser/devtools/features.cc
+@@ -205,8 +205,9 @@ BASE_FEATURE(kDevToolsEnableDurableMessa
+ BASE_FEATURE(kDevToolsAcceptDebuggingConnections,
+              base::FEATURE_DISABLED_BY_DEFAULT);
+ #else
++// rac: off, so chrome://inspect can't open a door on the real profile (D20).
+ BASE_FEATURE(kDevToolsAcceptDebuggingConnections,
+-             base::FEATURE_ENABLED_BY_DEFAULT);
++             base::FEATURE_DISABLED_BY_DEFAULT);
+ #endif  // BUILDFLAG(IS_CHROMEOS)
+ 
+ BASE_FEATURE(kDevToolsAiAssistanceContextSelectionAgent,
+--- a/chrome/browser/devtools/remote_debugging_server.cc
++++ b/chrome/browser/devtools/remote_debugging_server.cc
+@@ -25,6 +25,7 @@
+ #include "chrome/browser/devtools/devtools_window.h"
+ #include "chrome/browser/devtools/features.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/devtools/default_dir.h"
+ #include "chrome/common/chrome_paths.h"
+ #include "chrome/common/chrome_paths_internal.h"
+ #include "chrome/common/chrome_switches.h"
+@@ -169,12 +170,12 @@ IsRemoteDebuggingAllowed(const std::opti
+ #if BUILDFLAG(GOOGLE_CHROME_BRANDING)
+   constexpr bool default_user_data_dir_check_enabled = true;
+ #else
+-  const bool default_user_data_dir_check_enabled =
+-      g_enable_default_user_data_dir_check_for_chromium_branding_for_testing;
++  // rac: always refuse the debug doors on the real profile (D20).
++  const bool default_user_data_dir_check_enabled = true;
+ #endif
+ 
+   if (default_user_data_dir_check_enabled &&
+-      is_default_user_data_dir.value_or(true)) {
++      rac::RefusesDebugDoors(is_default_user_data_dir)) {
+     return base::unexpected(
+         RemoteDebuggingServer::NotStartedReason::kDisabledByDefaultUserDataDir);
+   }
+@@ -394,29 +395,12 @@ RemoteDebuggingServer::GetInstance(PrefS
+         content::DevToolsAgentHost::RemoteDebuggingServerMode::kDefault);
+   }
+ 
+-  // `--remote-debugging-port` and `--remote-debugging-pipe`
+-  // take precedence over the new mode.
+-#if !BUILDFLAG(IS_ANDROID)
+-  if (!debugging_server_started &&
+-      base::FeatureList::IsEnabled(
+-          ::features::kDevToolsAcceptDebuggingConnections)) {
+-    // In approval mode, each incoming connection needs to be approved by
+-    // the user (allow/disallow actions are tracked via the
+-    // DevToolsRemoteDebuggingConnectionPermission histogram).
+-    if (!local_state->GetBoolean(prefs::kDevToolsRemoteDebuggingAllowed)) {
+-      return base::unexpected(
+-          RemoteDebuggingServer::NotStartedReason::kDisabledByPolicy);
+-    }
+-    // Listening for pref changes in case the server is started later.
+-    server->StartHttpServerInApprovalModeIfEnabled(local_state);
+-    // We indicate that the server was started to prevent the instance
+-    // from being destructed. The actual websocket server is only started
+-    // if the preference is also enabled.
+-    debugging_server_started = true;
+-  }
+-#endif  // !BUILDFLAG(IS_ANDROID)
++  // rac: chrome://inspect's approval mode never starts, even with
++  // kDevToolsAcceptDebuggingConnections forced on (D20).
+ 
+   if (debugging_server_started) {
++    // rac: a door is open, so ProfileManager refuses the real profile (D20).
++    rac::SetDebugDoorOpen();
+     return server;
+   }
+ 
+--- a/chrome/browser/devtools/remote_debugging_server_unittest.cc
++++ b/chrome/browser/devtools/remote_debugging_server_unittest.cc
+@@ -11,6 +11,7 @@
+ #include "base/run_loop.h"
+ #include "base/test/scoped_feature_list.h"
+ #include "chrome/browser/devtools/features.h"
++#include "chrome/common/chrome_paths_internal.h"
+ #include "chrome/common/pref_names.h"
+ #include "chrome/test/base/testing_browser_process.h"
+ #include "chrome/test/base/testing_profile_manager.h"
+@@ -24,6 +25,7 @@
+ #include "content/public/browser/devtools_agent_host.h"
+ #include "content/public/browser/devtools_socket_factory.h"
+ #include "content/public/common/content_constants.h"
++#include "content/public/common/content_switches.h"
+ #include "content/public/test/browser_task_environment.h"
+ #include "testing/gmock/include/gmock/gmock.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+@@ -188,12 +190,49 @@ TEST_F(RemoteDebuggingServerTest, GetPor
+ }
+ 
+ TEST_F(RemoteDebuggingServerTest, ReturnsInstanceWhenPrefDisabled) {
+-  // The instance needs to be returned because the server can be started later
+-  // in the approval mode and the instance is listening to the pref changes.
++  // rac: approval mode never starts, so there is no instance to listen to the
++  // pref (D20). The fixture forces kDevToolsAcceptDebuggingConnections on.
+   TestingPrefServiceSimple* local_state =
+       TestingBrowserProcess::GetGlobal()->GetTestingLocalState();
+   local_state->SetUserPref(prefs::kDevToolsRemoteDebuggingEnabled,
+                            std::make_unique<base::Value>(false));
+   auto server = RemoteDebuggingServer::GetInstance(local_state);
+-  EXPECT_TRUE(server.has_value());
++  EXPECT_EQ(server.error(),
++            RemoteDebuggingServer::NotStartedReason::kNotRequested);
++}
++
++TEST_F(RemoteDebuggingServerTest, NeverStartsApprovalMode) {
++  TestingPrefServiceSimple* local_state =
++      TestingBrowserProcess::GetGlobal()->GetTestingLocalState();
++  local_state->SetUserPref(prefs::kDevToolsRemoteDebuggingEnabled,
++                           std::make_unique<base::Value>(true));
++  auto server = RemoteDebuggingServer::GetInstance(local_state);
++  EXPECT_EQ(server.error(),
++            RemoteDebuggingServer::NotStartedReason::kNotRequested);
++}
++
++// rac: both debug doors are refused on the default user data dir (D20),
++// without EnableDefaultUserDataDirCheckForTesting().
++TEST_F(RemoteDebuggingServerTest, RefusesPortOnDefaultUserDataDir) {
++  chrome::SetUsingDefaultUserDataDirectoryForTesting(true);
++  base::CommandLine::ForCurrentProcess()->AppendSwitchASCII(
++      ::switches::kRemoteDebuggingPort, "0");
++  auto server = RemoteDebuggingServer::GetInstance(
++      TestingBrowserProcess::GetGlobal()->GetTestingLocalState());
++  EXPECT_EQ(
++      server.error(),
++      RemoteDebuggingServer::NotStartedReason::kDisabledByDefaultUserDataDir);
++  chrome::SetUsingDefaultUserDataDirectoryForTesting(std::nullopt);
++}
++
++TEST_F(RemoteDebuggingServerTest, RefusesPipeOnDefaultUserDataDir) {
++  chrome::SetUsingDefaultUserDataDirectoryForTesting(true);
++  base::CommandLine::ForCurrentProcess()->AppendSwitch(
++      ::switches::kRemoteDebuggingPipe);
++  auto server = RemoteDebuggingServer::GetInstance(
++      TestingBrowserProcess::GetGlobal()->GetTestingLocalState());
++  EXPECT_EQ(
++      server.error(),
++      RemoteDebuggingServer::NotStartedReason::kDisabledByDefaultUserDataDir);
++  chrome::SetUsingDefaultUserDataDirectoryForTesting(std::nullopt);
+ }
+--- /dev/null
++++ b/chrome/browser/rac/devtools/BUILD.gn
+@@ -0,0 +1,39 @@
++# Copyright 2026 The rac Authors
++# Use of this source code is governed by a GPL-3.0 license.
++
++import("//testing/test.gni")
++
++# Refuses Chromium's debug doors on the real profile (decision D20).
++source_set("devtools") {
++  sources = [
++    "default_dir.cc",
++    "default_dir.h",
++  ]
++  deps = [
++    "//base",
++    "//chrome/common:constants",
++    "//components/os_crypt/common:switches",
++    "//content/public/common",
++  ]
++}
++
++test("rac_devtools_unittests") {
++  sources = [
++    "default_dir_unittest.cc",
++
++    # Compiled in here, not linked from //chrome/browser/devtools, so the test
++    # checks the feature default that rac ships without that whole library.
++    "//chrome/browser/devtools/features.cc",
++    "//chrome/browser/devtools/features.h",
++  ]
++  deps = [
++    ":devtools",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//chrome/common:constants",
++    "//components/os_crypt/common:switches",
++    "//content/public/common",
++    "//testing/gtest",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/rac/devtools/default_dir.cc
+@@ -0,0 +1,289 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/devtools/default_dir.h"
++
++#include <errno.h>
++#include <pwd.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <atomic>
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/base_paths.h"
++#include "base/command_line.h"
++#include "base/files/file_path.h"
++#include "base/memory/free_deleter.h"
++#include "base/no_destructor.h"
++#include "base/path_service.h"
++#include "chrome/common/chrome_paths.h"
++#include "chrome/common/chrome_paths_internal.h"
++#include "components/os_crypt/common/os_crypt_switches.h"
++#include "content/public/common/content_switches.h"
++
++namespace rac {
++
++namespace {
++
++// rac's own product dir, set by rac/branding/identity.patch. It's protected
++// even when Info.plist's CrProductDirName names another folder.
++constexpr char kRacProductDir[] = "me.kainoa.rac";
++
++// A getpwuid_r() buffer that big means the lookup failed for another reason.
++constexpr size_t kMaxPasswordBufferSize = 1024 * 1024;
++
++std::atomic<bool> g_debug_door_open{false};
++std::atomic<bool> g_real_profile_loaded{false};
++
++enum class Lookup { kFound, kMissing, kUnreadable };
++
++Lookup FromErrno() {
++  const int error = errno;
++  return error == ENOENT || error == ENOTDIR ? Lookup::kMissing
++                                             : Lookup::kUnreadable;
++}
++
++// stat() follows symlinks, and on a case-insensitive volume a case variant
++// names the same inode, so both land on the directory they point to.
++Lookup StatPath(const base::FilePath& path, struct stat* info) {
++  return stat(path.value().c_str(), info) == 0 ? Lookup::kFound : FromErrno();
++}
++
++// realpath() resolves every symlink and `..`, so walking up the result visits
++// the directories that really contain `path`.
++Lookup RealPath(const base::FilePath& path, base::FilePath* resolved) {
++  std::unique_ptr<char, base::FreeDeleter> result(
++      realpath(path.value().c_str(), nullptr));
++  if (!result) {
++    return FromErrno();
++  }
++  *resolved = base::FilePath(result.get());
++  return Lookup::kFound;
++}
++
++// `path` resolved, or its nearest existing ancestor resolved when `path`
++// doesn't exist yet (a profile folder about to be created). Dropping missing
++// names is only safe without `..`, which could climb out of them once they
++// exist, so such a path is unknown.
++std::optional<base::FilePath> ResolveNearestExisting(base::FilePath path) {
++  while (true) {
++    base::FilePath resolved;
++    switch (RealPath(path, &resolved)) {
++      case Lookup::kFound:
++        return resolved;
++      case Lookup::kUnreadable:
++        return std::nullopt;
++      case Lookup::kMissing:
++        break;
++    }
++    const base::FilePath parent = path.DirName();
++    if (path.ReferencesParent() || parent == path) {
++      return std::nullopt;
++    }
++    path = parent;
++  }
++}
++
++std::optional<base::FilePath>& PasswordDatabaseHomeOverride() {
++  static base::NoDestructor<std::optional<base::FilePath>> home;
++  return *home;
++}
++
++std::optional<base::FilePath>& ProductDirOverride() {
++  static base::NoDestructor<std::optional<base::FilePath>> product_dir;
++  return *product_dir;
++}
++
++// getpwuid_r() reports ERANGE when the entry doesn't fit `buffer_size`, so the
++// buffer doubles until it does.
++std::optional<base::FilePath> LookUpPasswordDatabaseHome(size_t buffer_size) {
++  while (true) {
++    struct passwd entry = {};
++    struct passwd* found = nullptr;
++    std::string buffer(buffer_size, '\0');
++    const int error =
++        getpwuid_r(getuid(), &entry, buffer.data(), buffer.size(), &found);
++    if (error == ERANGE && buffer_size < kMaxPasswordBufferSize) {
++      buffer_size = std::max<size_t>(buffer_size, 1) * 2;
++      continue;
++    }
++    if (error != 0 || !found || !found->pw_dir || found->pw_dir[0] != '/') {
++      return std::nullopt;
++    }
++    return base::FilePath(found->pw_dir);
++  }
++}
++
++std::optional<base::FilePath> PasswordDatabaseHome() {
++  if (const std::optional<base::FilePath>& home =
++          PasswordDatabaseHomeOverride()) {
++    return home->empty() ? std::nullopt : home;
++  }
++  return LookUpPasswordDatabaseHome(16 * 1024);
++}
++
++bool IsInsideDefaultDirs(const base::FilePath& path) {
++  const std::vector<base::FilePath> default_dirs = GetDefaultUserDataDirs();
++  return default_dirs.empty() || IsInsideDefaultDir(path, default_dirs);
++}
++
++bool AsksForADebugDoor(const base::CommandLine& command_line) {
++  return command_line.HasSwitch(::switches::kRemoteDebuggingPort) ||
++         command_line.HasSwitch(::switches::kRemoteDebuggingPipe);
++}
++
++}  // namespace
++
++bool IsInsideDefaultDir(const base::FilePath& path,
++                        const std::vector<base::FilePath>& default_dirs) {
++  std::vector<struct stat> defaults;
++  for (const base::FilePath& default_dir : default_dirs) {
++    struct stat info = {};
++    switch (StatPath(default_dir, &info)) {
++      case Lookup::kFound:
++        defaults.push_back(info);
++        break;
++      case Lookup::kMissing:
++        break;
++      case Lookup::kUnreadable:
++        return true;
++    }
++  }
++  if (defaults.empty()) {
++    return false;
++  }
++
++  const std::optional<base::FilePath> resolved = ResolveNearestExisting(path);
++  if (!resolved) {
++    return true;
++  }
++  for (base::FilePath dir = *resolved;; dir = dir.DirName()) {
++    struct stat info = {};
++    if (StatPath(dir, &info) != Lookup::kFound) {
++      return true;
++    }
++    for (const struct stat& default_info : defaults) {
++      if (info.st_dev == default_info.st_dev &&
++          info.st_ino == default_info.st_ino) {
++        return true;
++      }
++    }
++    if (dir.DirName() == dir) {
++      return false;
++    }
++  }
++}
++
++std::vector<base::FilePath> GetDefaultUserDataDirs() {
++  base::FilePath default_dir;
++  base::FilePath app_data;
++  base::FilePath product_dir;
++  if (!chrome::GetDefaultUserDataDirectory(&default_dir) ||
++      !base::PathService::Get(base::DIR_APP_DATA, &app_data) ||
++      !app_data.AppendRelativePath(default_dir, &product_dir)) {
++    return {};
++  }
++  if (const std::optional<base::FilePath>& product_dir_override =
++          ProductDirOverride()) {
++    product_dir = *product_dir_override;
++  }
++  const std::optional<base::FilePath> home = PasswordDatabaseHome();
++  if (!home) {
++    return {};
++  }
++  const base::FilePath app_data_dirs[] = {
++      app_data, home->Append("Library").Append("Application Support")};
++  const base::FilePath product_dirs[] = {product_dir,
++                                         base::FilePath(kRacProductDir)};
++  std::vector<base::FilePath> default_dirs;
++  for (const base::FilePath& app_data_dir : app_data_dirs) {
++    for (const base::FilePath& name : product_dirs) {
++      const base::FilePath dir = app_data_dir.Append(name);
++      if (!std::ranges::contains(default_dirs, dir)) {
++        default_dirs.push_back(dir);
++      }
++    }
++  }
++  return default_dirs;
++}
++
++bool RefusesDebugDoors(std::optional<bool> is_default_by_path) {
++  return g_real_profile_loaded || IsDefaultUserDataDir(is_default_by_path);
++}
++
++void SetDebugDoorOpen() {
++  g_debug_door_open = true;
++}
++
++bool IsDefaultUserDataDir(std::optional<bool> is_default_by_path) {
++  if (is_default_by_path.value_or(true)) {
++    return true;
++  }
++  base::FilePath user_data_dir;
++  if (!base::PathService::Get(chrome::DIR_USER_DATA, &user_data_dir)) {
++    return true;
++  }
++  return IsInsideDefaultDirs(user_data_dir);
++}
++
++bool RefusesProfileForDebugDoors(const base::FilePath& profile_dir) {
++  if (g_debug_door_open) {
++    return IsInsideDefaultDirs(profile_dir);
++  }
++  // No door is open yet. The first profile loads before RemoteDebuggingServer
++  // starts, so if a door was asked for, note a real profile loading and let
++  // RefusesDebugDoors() keep the doors shut instead.
++  if (AsksForADebugDoor(*base::CommandLine::ForCurrentProcess()) &&
++      IsInsideDefaultDirs(profile_dir)) {
++    g_real_profile_loaded = true;
++  }
++  return false;
++}
++
++bool ShouldForceMockKeychain(const base::CommandLine& command_line,
++                             std::optional<bool> is_default_by_path) {
++  return AsksForADebugDoor(command_line) && is_default_by_path == false;
++}
++
++void ForceMockKeychainIfDebugDoorRequested() {
++  base::CommandLine& command_line = *base::CommandLine::ForCurrentProcess();
++  if (!ShouldForceMockKeychain(command_line,
++                               chrome::IsUsingDefaultDataDirectory())) {
++    return;
++  }
++  if (!command_line.HasSwitch(os_crypt::switches::kUseMockKeychain)) {
++    command_line.AppendSwitch(os_crypt::switches::kUseMockKeychain);
++  }
++  fprintf(stderr,
++          "rac: remote debugging requested; using a mock keychain so saved "
++          "logins in this profile can't be read\n");
++  fflush(stderr);
++}
++
++std::optional<base::FilePath> LookUpPasswordDatabaseHomeForTesting(
++    size_t buffer_size) {
++  return LookUpPasswordDatabaseHome(buffer_size);
++}
++
++void SetPasswordDatabaseHomeForTesting(std::optional<base::FilePath> home) {
++  PasswordDatabaseHomeOverride() = std::move(home);
++}
++
++void SetProductDirForTesting(std::optional<base::FilePath> product_dir) {
++  ProductDirOverride() = std::move(product_dir);
++}
++
++void ResetDebugDoorsForTesting() {
++  g_debug_door_open = false;
++  g_real_profile_loaded = false;
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/devtools/default_dir.h
+@@ -0,0 +1,143 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_DEVTOOLS_DEFAULT_DIR_H_
++#define CHROME_BROWSER_RAC_DEVTOOLS_DEFAULT_DIR_H_
++
++#include <stddef.h>
++
++#include <optional>
++#include <vector>
++
++namespace base {
++class CommandLine;
++class FilePath;
++}  // namespace base
++
++namespace rac {
++
++// rac refuses Chromium's debug doors (--remote-debugging-port and
++// --remote-debugging-pipe, decision D20) on the user's real profile: the
++// default user data dir, or anything inside it. "The default" is
++// chrome::GetDefaultUserDataDirectory(), which follows $HOME and the
++// CrProductDirName key in Info.plist. The same folder under the home
++// directory in the password database counts too, so pointing $HOME elsewhere
++// doesn't hide the real one. So does rac's own `me.kainoa.rac` under both
++// homes, so a copy of the app with an edited Info.plist can't redefine it.
++// Paths are compared by file identity, so a symlink, a case variant, a
++// firmlink, or a `..` path to it counts too. When the answer is unknown, the
++// doors are refused.
++//
++// Two checks keep a door and the real profile from being open together,
++// whichever comes first. The door check refuses a door when DIR_USER_DATA is
++// the real profile, or when a profile inside it already loaded. Once a door
++// is open, the profile check refuses any profile inside the real one. Chrome
++// loads the first profile before RemoteDebuggingServer starts, so at startup
++// the door is the one refused and the profile still opens.
++//
++// File identity can't see these, so they can still reach the real profile's
++// files with a door open:
++// - Links planted inside an allowed profile that point at the real profile's
++//   files: symlinks to its files, or hard links, which share their inodes.
++// - Swapping folders after the check, such as renaming the real profile into
++//   place once its path has passed.
++// - Copies of the real profile's files.
++// - Cross-device mounts of the real profile (an NFS, bindfs, or other
++//   re-export), whose files have different identities.
++// Encrypted data (cookies, passwords) is a different matter, but only for
++// these two doors. Every user data dir shares one Keychain key, so a launch
++// that asks for --remote-debugging-port or --remote-debugging-pipe off the
++// default profile runs on the mock keychain:
++// ForceMockKeychainIfDebugDoorRequested() adds --use-mock-keychain before
++// OSCrypt reads the key. Planted links or copies can't be decrypted through
++// those doors. The files' other contents (history, bookmarks, and anything
++// else stored in the clear) stay readable through them.
++//
++// Other switches still read a planted profile with the real Keychain key:
++// --load-extension (blocked only in Google builds), and --log-net-log with
++// --net-log-capture-mode=Everything. That is a known gap, tracked in issue
++// #65 ("G5b: other switches that read a planted profile").
++//
++// The mock keychain makes a new random key each launch, so a debug-door
++// session loses its cookies and saved logins between runs; nothing is
++// deleted.
++//
++// The file checks run only when a door was asked for, so a normal launch
++// does no file I/O here. They use plain syscalls, not base's file helpers,
++// because profiles can load on the UI thread after blocking is disallowed
++// there; they stat a few local folders.
++
++// Whether RemoteDebuggingServer must refuse a debug door: DIR_USER_DATA is
++// the real profile (IsDefaultUserDataDir()), or RefusesProfileForDebugDoors()
++// already let a profile inside the real one load.
++bool RefusesDebugDoors(std::optional<bool> is_default_by_path);
++
++// Records that RemoteDebuggingServer opened a debug door. From then on,
++// RefusesProfileForDebugDoors() refuses profiles inside the real one.
++void SetDebugDoorOpen();
++
++// Whether DIR_USER_DATA is the real profile's user data dir, or inside it.
++// `is_default_by_path` is chrome::IsUsingDefaultDataDirectory(), a plain path
++// compare; true or unknown (nullopt) counts as default.
++bool IsDefaultUserDataDir(std::optional<bool> is_default_by_path);
++
++// Whether ProfileManager must refuse to load the profile at `profile_dir`:
++// a debug door is open (SetDebugDoorOpen()) and `profile_dir` is the real
++// profile's user data dir or inside it. This closes a profile that escapes
++// DIR_USER_DATA, such as a `Default` symlink into the real profile or
++// `--profile-directory=..` from a user data dir inside it. Before a door
++// opens, such a profile loads, and RefusesDebugDoors() then keeps the doors
++// shut. Without a door switch on the command line, it touches no files.
++bool RefusesProfileForDebugDoors(const base::FilePath& profile_dir);
++
++// Whether the browser must use the mock keychain: `command_line` asks for a
++// door (--remote-debugging-port or --remote-debugging-pipe), whether or not
++// it will open, and `is_default_by_path` (chrome::IsUsingDefaultDataDirectory)
++// is false. When it's true or unknown, RefusesDebugDoors() refuses on that
++// value alone, without touching the file system, so every session either
++// uses the mock keychain or can't open a door. Skipping the mock there keeps
++// the real profile intact: under the mock its encrypted data can't be read,
++// and Chromium on macOS deletes saved passwords it can't decrypt when no
++// --user-data-dir is given.
++bool ShouldForceMockKeychain(const base::CommandLine& command_line,
++                             std::optional<bool> is_default_by_path);
++
++// Adds --use-mock-keychain to this process's command line when
++// ShouldForceMockKeychain() says so for chrome::IsUsingDefaultDataDirectory(),
++// and says so on stderr. ChromeMainDelegate::PostEarlyInitialization() calls
++// it in the browser process, after the process singleton and about:flags
++// switches and before the thread pool starts, so it runs before OSCrypt's
++// KeychainKeyProvider reads the switch and before any profile opens.
++void ForceMockKeychainIfDebugDoorRequested();
++
++// The identity check behind all of these: true if `path`, resolved, is one of
++// `default_dirs` or inside one. A default dir that doesn't exist has no
++// profile to protect and is skipped. True if any path can't be read for
++// another reason, or if `path` doesn't exist and has a `..` component.
++bool IsInsideDefaultDir(const base::FilePath& path,
++                        const std::vector<base::FilePath>& default_dirs);
++
++// The default user data dirs to protect, or none if they can't be computed
++// (then every check refuses).
++std::vector<base::FilePath> GetDefaultUserDataDirs();
++
++// The home directory in the password database, starting getpwuid_r() with a
++// `buffer_size` buffer and growing it while the entry doesn't fit.
++std::optional<base::FilePath> LookUpPasswordDatabaseHomeForTesting(
++    size_t buffer_size);
++
++// Replaces the home directory from the password database in tests, so they
++// never look at the real profile. An empty path acts as a failed lookup.
++// Pass nullopt to restore it.
++void SetPasswordDatabaseHomeForTesting(std::optional<base::FilePath> home);
++
++// Replaces the product dir that CrProductDirName names, the way an edited
++// Info.plist would. Pass nullopt to restore it.
++void SetProductDirForTesting(std::optional<base::FilePath> product_dir);
++
++// Forgets SetDebugDoorOpen() and any real profile that loaded.
++void ResetDebugDoorsForTesting();
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_DEVTOOLS_DEFAULT_DIR_H_
+--- /dev/null
++++ b/chrome/browser/rac/devtools/default_dir_unittest.cc
+@@ -0,0 +1,534 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/devtools/default_dir.h"
++
++#include <errno.h>
++#include <pwd.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <optional>
++#include <string>
++
++#include "base/base_paths.h"
++#include "base/command_line.h"
++#include "base/feature_list.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/strings/string_util.h"
++#include "base/test/scoped_command_line.h"
++#include "base/test/scoped_path_override.h"
++#include "chrome/browser/devtools/features.h"
++#include "chrome/common/chrome_paths.h"
++#include "chrome/common/chrome_paths_internal.h"
++#include "components/os_crypt/common/os_crypt_switches.h"
++#include "content/public/common/content_switches.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++// Every path here lives in a temp dir: base::DIR_APP_DATA and the password
++// database's home are overridden, so every "default" user data dir is a temp
++// folder, never the real profile.
++class RacDefaultDirTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    ASSERT_TRUE(temp_dir_.CreateUniqueTempDir());
++    // Resolved, so /var -> /private/var doesn't change any path below.
++    root_ = base::MakeAbsoluteFilePath(temp_dir_.GetPath());
++    ASSERT_FALSE(root_.empty());
++    app_data_.emplace(base::DIR_APP_DATA, root_.AppendASCII("AppData"),
++                      /*is_absolute=*/true, /*create=*/true);
++    ASSERT_TRUE(chrome::GetDefaultUserDataDirectory(&default_dir_));
++    ASSERT_TRUE(root_.IsParent(default_dir_)) << default_dir_;
++    ASSERT_TRUE(base::CreateDirectory(default_dir_));
++
++    // The home in the password database, where $HOME would point if it
++    // weren't changed. Its default dir doesn't exist unless a test makes it.
++    passwd_home_ = root_.AppendASCII("RealHome");
++    ASSERT_TRUE(base::CreateDirectory(passwd_home_));
++    SetPasswordDatabaseHomeForTesting(passwd_home_);
++    // The test binary has no CrProductDirName, so the product dir is rac's
++    // literal one and each home has a single default.
++    ASSERT_EQ(default_dir_.BaseName().value(), "me.kainoa.rac");
++    const std::vector<base::FilePath> dirs = GetDefaultUserDataDirs();
++    ASSERT_EQ(dirs.size(), 2u);
++    EXPECT_EQ(dirs[0], default_dir_);
++    passwd_default_dir_ = dirs[1];
++    ASSERT_TRUE(passwd_home_.IsParent(passwd_default_dir_));
++    EXPECT_EQ(passwd_default_dir_.BaseName(), default_dir_.BaseName());
++
++    other_ = root_.AppendASCII("profile");
++    ASSERT_TRUE(base::CreateDirectory(other_));
++  }
++
++  void TearDown() override {
++    chrome::SetUsingDefaultUserDataDirectoryForTesting(std::nullopt);
++    SetPasswordDatabaseHomeForTesting(std::nullopt);
++    SetProductDirForTesting(std::nullopt);
++    ResetDebugDoorsForTesting();
++  }
++
++  // Sets DIR_USER_DATA to `path` exactly as given. PathService would
++  // otherwise resolve it with realpath(), hiding what this test checks.
++  void UseUserDataDir(const base::FilePath& path) {
++    user_data_dir_.reset();
++    user_data_dir_.emplace(chrome::DIR_USER_DATA, path, /*is_absolute=*/true,
++                           /*create=*/false);
++  }
++
++  // What IsRemoteDebuggingAllowed() decides for the port and the pipe alike:
++  // both pass it the same chrome::IsUsingDefaultDataDirectory() value.
++  bool Refused() {
++    return IsDefaultUserDataDir(chrome::IsUsingDefaultDataDirectory());
++  }
++
++  void AskForThePort() {
++    command_line_.GetProcessCommandLine()->AppendSwitchASCII(
++        ::switches::kRemoteDebuggingPort, "0");
++  }
++
++  // What ProfileManager::CanCreateProfileAtPath() asks with the port open on
++  // `other_`, the way a test runner launches rac.
++  bool ProfileRefused(const base::FilePath& profile_dir) {
++    UseUserDataDir(other_);
++    AskForThePort();
++    SetDebugDoorOpen();
++    return RefusesProfileForDebugDoors(profile_dir);
++  }
++
++  base::ScopedTempDir temp_dir_;
++  base::FilePath root_;
++  base::FilePath default_dir_;
++  base::FilePath passwd_home_;
++  base::FilePath passwd_default_dir_;
++  base::FilePath other_;
++  base::test::ScopedCommandLine command_line_;
++  std::optional<base::ScopedPathOverride> app_data_;
++  std::optional<base::ScopedPathOverride> user_data_dir_;
++};
++
++// The user data dir.
++
++TEST_F(RacDefaultDirTest, RefusedWhenUsingTheDefaultDir) {
++  chrome::SetUsingDefaultUserDataDirectoryForTesting(true);
++  EXPECT_TRUE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, RefusedWhenUnknown) {
++  EXPECT_TRUE(IsDefaultUserDataDir(std::nullopt));
++}
++
++TEST_F(RacDefaultDirTest, RefusedOnTheDefaultPath) {
++  UseUserDataDir(default_dir_);
++  EXPECT_EQ(chrome::IsUsingDefaultDataDirectory(), true);
++  EXPECT_TRUE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, AllowedWithAnotherDir) {
++  UseUserDataDir(other_);
++  EXPECT_EQ(chrome::IsUsingDefaultDataDirectory(), false);
++  EXPECT_FALSE(Refused());
++}
++
++// A sibling whose name starts with the default's, like rac's dev profile
++// `me.kainoa.rac.dev` next to `me.kainoa.rac`.
++TEST_F(RacDefaultDirTest, AllowedNextToTheDefaultDir) {
++  const base::FilePath dev = default_dir_.AddExtensionASCII("dev");
++  ASSERT_TRUE(base::CreateDirectory(dev));
++  UseUserDataDir(dev);
++  EXPECT_FALSE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, AllowedWhenNoDefaultDirExists) {
++  ASSERT_TRUE(base::DeletePathRecursively(default_dir_));
++  UseUserDataDir(other_);
++  EXPECT_FALSE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, RefusedInsideTheDefaultDir) {
++  const base::FilePath inside = default_dir_.AppendASCII("Default");
++  ASSERT_TRUE(base::CreateDirectory(inside.AppendASCII("deeper")));
++  UseUserDataDir(inside);
++  EXPECT_EQ(chrome::IsUsingDefaultDataDirectory(), false);
++  EXPECT_TRUE(Refused());
++  UseUserDataDir(inside.AppendASCII("deeper"));
++  EXPECT_TRUE(Refused());
++}
++
++// $HOME points elsewhere, so GetDefaultUserDataDirectory() names a folder
++// that isn't the real profile; the password database still names it.
++TEST_F(RacDefaultDirTest, RefusedOnTheRealHomesDefaultWhenHomeMoved) {
++  ASSERT_TRUE(base::CreateDirectory(passwd_default_dir_));
++  UseUserDataDir(passwd_default_dir_);
++  EXPECT_EQ(chrome::IsUsingDefaultDataDirectory(), false);
++  EXPECT_TRUE(Refused());
++
++  // Also when $HOME's default doesn't exist at all.
++  ASSERT_TRUE(base::DeletePathRecursively(default_dir_));
++  EXPECT_TRUE(Refused());
++  UseUserDataDir(passwd_default_dir_.AppendASCII("Default"));
++  EXPECT_TRUE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, RefusedThroughASymlink) {
++  const base::FilePath link = root_.AppendASCII("link");
++  ASSERT_TRUE(base::CreateSymbolicLink(default_dir_, link));
++  UseUserDataDir(link);
++  // The path compare alone misses it.
++  EXPECT_EQ(chrome::IsUsingDefaultDataDirectory(), false);
++  EXPECT_TRUE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, RefusedThroughASymlinkedParent) {
++  const base::FilePath link = root_.AppendASCII("link");
++  ASSERT_TRUE(base::CreateSymbolicLink(default_dir_.DirName(), link));
++  UseUserDataDir(link.Append(default_dir_.BaseName()));
++  EXPECT_EQ(chrome::IsUsingDefaultDataDirectory(), false);
++  EXPECT_TRUE(Refused());
++}
++
++// The real profile moved to another disk and linked back: the path compare
++// sees the link, the switch names where it points.
++TEST_F(RacDefaultDirTest, RefusedWhenTheDefaultIsASymlink) {
++  const base::FilePath moved = root_.AppendASCII("moved");
++  ASSERT_TRUE(base::DeletePathRecursively(default_dir_));
++  ASSERT_TRUE(base::CreateDirectory(moved));
++  ASSERT_TRUE(base::CreateSymbolicLink(moved, default_dir_));
++  UseUserDataDir(moved);
++  EXPECT_EQ(chrome::IsUsingDefaultDataDirectory(), false);
++  EXPECT_TRUE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, RefusedThroughACaseVariant) {
++  const base::FilePath variant = default_dir_.DirName().AppendASCII(
++      base::ToUpperASCII(default_dir_.BaseName().value()));
++  ASSERT_NE(variant, default_dir_);
++  if (!base::DirectoryExists(variant)) {
++    GTEST_SKIP() << "The temp volume is case-sensitive.";
++  }
++  UseUserDataDir(variant);
++  EXPECT_EQ(chrome::IsUsingDefaultDataDirectory(), false);
++  EXPECT_TRUE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, RefusedThroughDotDot) {
++  const base::FilePath sibling = default_dir_.DirName().AppendASCII("other");
++  ASSERT_TRUE(base::CreateDirectory(sibling));
++  UseUserDataDir(sibling.AppendASCII("..").Append(default_dir_.BaseName()));
++  EXPECT_EQ(chrome::IsUsingDefaultDataDirectory(), false);
++  EXPECT_TRUE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, RefusedWhenTheUserDataDirCannotBeRead) {
++  // Missing with a `..` after it: once created, it could climb anywhere.
++  UseUserDataDir(root_.AppendASCII("missing").AppendASCII(".."));
++  EXPECT_TRUE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, RefusedWhenTheRealHomeIsUnknown) {
++  UseUserDataDir(other_);
++  SetPasswordDatabaseHomeForTesting(base::FilePath());
++  EXPECT_TRUE(GetDefaultUserDataDirs().empty());
++  EXPECT_TRUE(Refused());
++}
++
++TEST_F(RacDefaultDirTest, IsInsideDefaultDir) {
++  const base::FilePath missing_default = root_.AppendASCII("no-default");
++  EXPECT_TRUE(IsInsideDefaultDir(default_dir_, {default_dir_}));
++  EXPECT_FALSE(IsInsideDefaultDir(other_, {default_dir_}));
++  EXPECT_FALSE(IsInsideDefaultDir(default_dir_, {missing_default}));
++  EXPECT_TRUE(
++      IsInsideDefaultDir(default_dir_, {missing_default, default_dir_}));
++  // A path that doesn't exist yet is judged by its nearest existing folder.
++  EXPECT_TRUE(IsInsideDefaultDir(
++      default_dir_.AppendASCII("new").AppendASCII("Default"), {default_dir_}));
++  EXPECT_FALSE(
++      IsInsideDefaultDir(other_.AppendASCII("Profile 1"), {default_dir_}));
++}
++
++// Profiles, which ProfileManager loads from DIR_USER_DATA.Append(name).
++
++TEST_F(RacDefaultDirTest, ProfileAllowedInsideAnotherDir) {
++  ASSERT_TRUE(base::CreateDirectory(other_.AppendASCII("Default")));
++  EXPECT_FALSE(ProfileRefused(other_.AppendASCII("Default")));
++  // A profile folder about to be created.
++  EXPECT_FALSE(ProfileRefused(other_.AppendASCII("Profile 1")));
++}
++
++// --user-data-dir=/tmp/x "--profile-directory=../../<real>/Default".
++TEST_F(RacDefaultDirTest, ProfileRefusedThroughDotDot) {
++  const base::FilePath real_profile = default_dir_.AppendASCII("Default");
++  ASSERT_TRUE(base::CreateDirectory(real_profile));
++  base::FilePath escape = other_;
++  for (size_t i = 0; i < other_.GetComponents().size() - 1; ++i) {
++    escape = escape.AppendASCII("..");
++  }
++  for (size_t i = 1; i < real_profile.GetComponents().size(); ++i) {
++    escape = escape.Append(real_profile.GetComponents()[i]);
++  }
++  ASSERT_TRUE(base::DirectoryExists(escape)) << escape;
++  EXPECT_TRUE(ProfileRefused(escape));
++}
++
++// --user-data-dir=<real>/Default/x --profile-directory=.., which also passes
++// ProfileManager::IsAllowedProfilePath() since DirName() strips the `..`.
++TEST_F(RacDefaultDirTest, ProfileRefusedThroughDotDotFromInside) {
++  const base::FilePath inside =
++      default_dir_.AppendASCII("Default").AppendASCII("x");
++  ASSERT_TRUE(base::CreateDirectory(inside));
++  UseUserDataDir(inside);
++  AskForThePort();
++  SetDebugDoorOpen();
++  EXPECT_TRUE(RefusesProfileForDebugDoors(inside.AppendASCII("..")));
++}
++
++TEST_F(RacDefaultDirTest, ProfileRefusedAtAnAbsolutePath) {
++  EXPECT_TRUE(ProfileRefused(default_dir_.AppendASCII("Default")));
++  EXPECT_TRUE(ProfileRefused(default_dir_));
++}
++
++// /tmp/x/Default is a symlink to the real profile: no switch names it.
++TEST_F(RacDefaultDirTest, ProfileRefusedThroughASymlink) {
++  const base::FilePath real_profile = default_dir_.AppendASCII("Default");
++  ASSERT_TRUE(base::CreateDirectory(real_profile));
++  const base::FilePath link = other_.AppendASCII("Default");
++  ASSERT_TRUE(base::CreateSymbolicLink(real_profile, link));
++  EXPECT_TRUE(ProfileRefused(link));
++}
++
++TEST_F(RacDefaultDirTest, ProfileRefusedInTheRealHomeWhenHomeMoved) {
++  const base::FilePath real_profile =
++      passwd_default_dir_.AppendASCII("Default");
++  ASSERT_TRUE(base::CreateDirectory(real_profile));
++  ASSERT_TRUE(base::DeletePathRecursively(default_dir_));
++  const base::FilePath link = other_.AppendASCII("Default");
++  ASSERT_TRUE(base::CreateSymbolicLink(real_profile, link));
++  EXPECT_TRUE(ProfileRefused(link));
++}
++
++TEST_F(RacDefaultDirTest, ProfileRefusedWithThePipe) {
++  const base::FilePath real_profile = default_dir_.AppendASCII("Default");
++  ASSERT_TRUE(base::CreateDirectory(real_profile));
++  UseUserDataDir(other_);
++  command_line_.GetProcessCommandLine()->AppendSwitch(
++      ::switches::kRemoteDebuggingPipe);
++  SetDebugDoorOpen();
++  EXPECT_TRUE(RefusesProfileForDebugDoors(real_profile));
++}
++
++// Without a door switch, every profile loads as usual, nothing touches the
++// disk, and nothing is noted for the doors.
++TEST_F(RacDefaultDirTest, ProfileAllowedWithoutADoorSwitch) {
++  const base::FilePath real_profile = default_dir_.AppendASCII("Default");
++  ASSERT_TRUE(base::CreateDirectory(real_profile));
++  UseUserDataDir(other_);
++  EXPECT_FALSE(RefusesProfileForDebugDoors(real_profile));
++  EXPECT_FALSE(RefusesDebugDoors(chrome::IsUsingDefaultDataDirectory()));
++}
++
++// A door switch alone refuses no profile: only an open door does. Here the
++// real profile is reached through a symlinked user data dir, so the door is
++// refused and the profile still opens instead of showing a profile error.
++TEST_F(RacDefaultDirTest, ProfileAllowedWhenTheDoorWasRefused) {
++  const base::FilePath link = root_.AppendASCII("link");
++  ASSERT_TRUE(base::CreateSymbolicLink(default_dir_, link));
++  UseUserDataDir(link);
++  AskForThePort();
++  EXPECT_TRUE(RefusesDebugDoors(chrome::IsUsingDefaultDataDirectory()));
++  EXPECT_FALSE(RefusesProfileForDebugDoors(link.AppendASCII("Default")));
++
++  // The same through a symlinked home that holds the default dir.
++  const base::FilePath home_link = root_.AppendASCII("home-link");
++  ASSERT_TRUE(base::CreateSymbolicLink(root_, home_link));
++  const base::FilePath via_home =
++      home_link.Append(default_dir_.DirName().BaseName())
++          .Append(default_dir_.BaseName());
++  UseUserDataDir(via_home);
++  EXPECT_TRUE(RefusesDebugDoors(chrome::IsUsingDefaultDataDirectory()));
++  EXPECT_FALSE(RefusesProfileForDebugDoors(via_home.AppendASCII("Default")));
++}
++
++// On the default dir by path, the doors stay shut and its profiles open.
++TEST_F(RacDefaultDirTest, ProfileAllowedOnTheDefaultDirWithADoorSwitch) {
++  UseUserDataDir(default_dir_);
++  command_line_.GetProcessCommandLine()->AppendSwitchASCII(
++      ::switches::kRemoteDebuggingPort, "9222");
++  EXPECT_TRUE(RefusesDebugDoors(chrome::IsUsingDefaultDataDirectory()));
++  EXPECT_FALSE(
++      RefusesProfileForDebugDoors(default_dir_.AppendASCII("Default")));
++}
++
++// Chrome loads the first profile before it opens a door. A `Default` symlink
++// into the real profile loads, and then the door is refused.
++TEST_F(RacDefaultDirTest, DoorRefusedOnceTheRealProfileLoaded) {
++  const base::FilePath real_profile = default_dir_.AppendASCII("Default");
++  ASSERT_TRUE(base::CreateDirectory(real_profile));
++  const base::FilePath link = other_.AppendASCII("Default");
++  ASSERT_TRUE(base::CreateSymbolicLink(real_profile, link));
++  UseUserDataDir(other_);
++  AskForThePort();
++  EXPECT_FALSE(RefusesDebugDoors(chrome::IsUsingDefaultDataDirectory()));
++  EXPECT_FALSE(RefusesProfileForDebugDoors(other_.AppendASCII("Profile 1")));
++  EXPECT_FALSE(RefusesDebugDoors(chrome::IsUsingDefaultDataDirectory()));
++  EXPECT_FALSE(RefusesProfileForDebugDoors(link));
++  EXPECT_TRUE(RefusesDebugDoors(chrome::IsUsingDefaultDataDirectory()));
++}
++
++// Once a door is open, only profiles inside the real one are refused.
++TEST_F(RacDefaultDirTest, ProfileRefusedOnlyOnceADoorIsOpen) {
++  const base::FilePath real_profile = default_dir_.AppendASCII("Default");
++  ASSERT_TRUE(base::CreateDirectory(real_profile));
++  const base::FilePath link = other_.AppendASCII("Default");
++  ASSERT_TRUE(base::CreateSymbolicLink(real_profile, link));
++  UseUserDataDir(other_);
++  AskForThePort();
++  EXPECT_FALSE(RefusesProfileForDebugDoors(other_.AppendASCII("Profile 1")));
++  SetDebugDoorOpen();
++  EXPECT_TRUE(RefusesProfileForDebugDoors(link));
++  EXPECT_FALSE(RefusesProfileForDebugDoors(other_.AppendASCII("Profile 1")));
++  // Refusing it didn't note it as loaded.
++  EXPECT_FALSE(RefusesDebugDoors(chrome::IsUsingDefaultDataDirectory()));
++}
++
++// A copy of rac whose Info.plist sets CrProductDirName to another folder still
++// can't open a door on `me.kainoa.rac`, under either home.
++TEST_F(RacDefaultDirTest, RefusedOnRacsProductDirWhenThePlistRenamesIt) {
++  SetProductDirForTesting(base::FilePath("net.example.edited"));
++  const base::FilePath edited =
++      default_dir_.DirName().Append("net.example.edited");
++  const base::FilePath passwd_rac = passwd_home_.Append("Library")
++                                        .Append("Application Support")
++                                        .Append("me.kainoa.rac");
++  const std::vector<base::FilePath> dirs = GetDefaultUserDataDirs();
++  ASSERT_EQ(dirs.size(), 4u);
++  EXPECT_EQ(dirs[0], edited);
++  EXPECT_TRUE(std::ranges::contains(dirs, default_dir_));
++  EXPECT_TRUE(std::ranges::contains(dirs, passwd_rac));
++  EXPECT_TRUE(std::ranges::contains(dirs, passwd_home_.Append("Library")
++                                              .Append("Application Support")
++                                              .Append("net.example.edited")));
++
++  // The path compare follows the edited name, so it says "not default".
++  UseUserDataDir(default_dir_);
++  EXPECT_TRUE(IsDefaultUserDataDir(/*is_default_by_path=*/false));
++  UseUserDataDir(default_dir_.AppendASCII("Default"));
++  EXPECT_TRUE(IsDefaultUserDataDir(/*is_default_by_path=*/false));
++
++  ASSERT_TRUE(base::DeletePathRecursively(default_dir_));
++  ASSERT_TRUE(base::CreateDirectory(passwd_rac));
++  UseUserDataDir(passwd_rac);
++  EXPECT_TRUE(IsDefaultUserDataDir(/*is_default_by_path=*/false));
++
++  // The edited folder is protected as well, and an unrelated one isn't.
++  ASSERT_TRUE(base::CreateDirectory(edited));
++  UseUserDataDir(edited);
++  EXPECT_TRUE(IsDefaultUserDataDir(/*is_default_by_path=*/false));
++  UseUserDataDir(other_);
++  EXPECT_FALSE(IsDefaultUserDataDir(/*is_default_by_path=*/false));
++}
++
++// The mock keychain.
++
++base::CommandLine DoorCommandLine(const char* door_switch) {
++  base::CommandLine command_line(base::CommandLine::NO_PROGRAM);
++  if (door_switch) {
++    command_line.AppendSwitchASCII(door_switch, "0");
++  }
++  return command_line;
++}
++
++TEST(RacMockKeychainTest, ForcedWithThePort) {
++  EXPECT_TRUE(ShouldForceMockKeychain(
++      DoorCommandLine(::switches::kRemoteDebuggingPort), false));
++}
++
++TEST(RacMockKeychainTest, ForcedWithThePipe) {
++  EXPECT_TRUE(ShouldForceMockKeychain(
++      DoorCommandLine(::switches::kRemoteDebuggingPipe), false));
++}
++
++TEST(RacMockKeychainTest, NotForcedWithoutADoor) {
++  EXPECT_FALSE(ShouldForceMockKeychain(DoorCommandLine(nullptr), false));
++  EXPECT_FALSE(ShouldForceMockKeychain(
++      DoorCommandLine("remote-debugging-address"), false));
++}
++
++// On the default dir by path, or when that's unknown, the door is refused
++// before any file is checked, and the real profile keeps its Keychain key.
++TEST_F(RacDefaultDirTest, MockKeychainOrRefusedForEveryDoorRequest) {
++  UseUserDataDir(other_);
++  for (const char* door_switch :
++       {::switches::kRemoteDebuggingPort, ::switches::kRemoteDebuggingPipe}) {
++    const base::CommandLine command_line = DoorCommandLine(door_switch);
++    for (const std::optional<bool> is_default_by_path :
++         {std::optional<bool>(true), std::optional<bool>(false),
++          std::optional<bool>()}) {
++      const bool mock =
++          ShouldForceMockKeychain(command_line, is_default_by_path);
++      EXPECT_EQ(mock, is_default_by_path == false) << door_switch;
++      EXPECT_TRUE(mock || IsDefaultUserDataDir(is_default_by_path))
++          << door_switch;
++    }
++  }
++}
++
++TEST_F(RacDefaultDirTest, ForceMockKeychainAddsTheSwitchOnce) {
++  chrome::SetUsingDefaultUserDataDirectoryForTesting(false);
++  AskForThePort();
++  base::CommandLine* command_line = command_line_.GetProcessCommandLine();
++  ForceMockKeychainIfDebugDoorRequested();
++  EXPECT_TRUE(command_line->HasSwitch(os_crypt::switches::kUseMockKeychain));
++
++  const size_t argc = command_line->argv().size();
++  ForceMockKeychainIfDebugDoorRequested();
++  EXPECT_EQ(command_line->argv().size(), argc);
++}
++
++TEST_F(RacDefaultDirTest, ForceMockKeychainLeavesANormalLaunchAlone) {
++  chrome::SetUsingDefaultUserDataDirectoryForTesting(false);
++  base::CommandLine* command_line = command_line_.GetProcessCommandLine();
++  const base::CommandLine::StringVector argv = command_line->argv();
++  ForceMockKeychainIfDebugDoorRequested();
++  EXPECT_EQ(command_line->argv(), argv);
++}
++
++TEST_F(RacDefaultDirTest, ForceMockKeychainLeavesTheDefaultDirAlone) {
++  chrome::SetUsingDefaultUserDataDirectoryForTesting(true);
++  AskForThePort();
++  ForceMockKeychainIfDebugDoorRequested();
++  EXPECT_FALSE(command_line_.GetProcessCommandLine()->HasSwitch(
++      os_crypt::switches::kUseMockKeychain));
++}
++
++// A one-byte buffer can't hold any password database entry, so getpwuid_r()
++// reports ERANGE and the lookup retries with bigger buffers. Only the home's
++// path is read, never anything inside it.
++TEST(RacPasswordDatabaseTest, LookupRetriesWithABiggerBuffer) {
++  struct passwd entry = {};
++  struct passwd* found = nullptr;
++  std::string tiny(1, '\0');
++  ASSERT_EQ(getpwuid_r(getuid(), &entry, tiny.data(), tiny.size(), &found),
++            ERANGE);
++
++  const std::optional<base::FilePath> home =
++      LookUpPasswordDatabaseHomeForTesting(16 * 1024);
++  ASSERT_TRUE(home.has_value());
++  EXPECT_TRUE(home->IsAbsolute());
++  EXPECT_EQ(LookUpPasswordDatabaseHomeForTesting(1), home);
++  EXPECT_EQ(LookUpPasswordDatabaseHomeForTesting(0), home);
++}
++
++// With the feature off, chrome://inspect hides its approval-mode toggle.
++// RemoteDebuggingServer::GetInstance() never starts approval mode at all,
++// even with the feature forced on.
++TEST(RacDebugDoorsTest, ApprovalModeIsOffByDefault) {
++  EXPECT_FALSE(base::FeatureList::IsEnabled(
++      features::kDevToolsAcceptDebuggingConnections));
++}
++
++}  // namespace
++}  // namespace rac
+--- a/chrome/browser/profiles/BUILD.gn
++++ b/chrome/browser/profiles/BUILD.gn
+@@ -493,6 +493,7 @@ source_set("profile_manager_impl") {
+     "//chrome/browser/navigation_predictor",
+     "//chrome/browser/prefs",
+     "//chrome/browser/profiles/keep_alive",
++    "//chrome/browser/rac/devtools",
+     "//chrome/browser/signin",
+     "//chrome/browser/supervised_user",
+     "//chrome/browser/ui:ui_features",
+--- a/chrome/browser/profiles/profile_manager.cc
++++ b/chrome/browser/profiles/profile_manager.cc
+@@ -64,6 +64,7 @@
+ #include "chrome/browser/profiles/profile_metrics.h"
+ #include "chrome/browser/profiles/profile_selections.h"
+ #include "chrome/browser/profiles/profiles_state.h"
++#include "chrome/browser/rac/devtools/default_dir.h"
+ #include "chrome/browser/signin/account_reconcilor_factory.h"
+ #include "chrome/browser/signin/identity_manager_factory.h"
+ #include "chrome/browser/signin/signin_util.h"
+@@ -994,9 +995,15 @@ bool ProfileManager::CanCreateProfileAtP
+     return false;
+   }
+ 
++  // rac: never load the real profile while a debug door is open (D20).
++  if (rac::RefusesProfileForDebugDoors(path)) {
++    return false;
++  }
++
+ #if !BUILDFLAG(IS_ANDROID)
+-  if (IsProfileDirectoryMarkedForDeletion(path))
++  if (IsProfileDirectoryMarkedForDeletion(path)) {
+     return false;
++  }
+ #endif
+ 
+   return true;
+--- a/chrome/app/chrome_main_delegate.cc
++++ b/chrome/app/chrome_main_delegate.cc
+@@ -195,6 +195,7 @@
+ #include "chrome/browser/headless/headless_mode_util.h"  // nogncheck
+ #include "chrome/browser/lifetime/browser_shutdown.h"  // nogncheck
+ #include "chrome/browser/metrics/chrome_feature_list_creator.h"  // nogncheck
++#include "chrome/browser/rac/devtools/default_dir.h"  // nogncheck
+ #include "chrome/browser/startup_data.h"  // nogncheck
+ #include "chrome/gpu/chrome_content_gpu_client.h"  // nogncheck
+ #include "chrome/utility/chrome_content_utility_client.h"  // nogncheck
+@@ -950,6 +951,9 @@ std::optional<int> ChromeMainDelegate::P
+     chrome_feature_list_creator->CreateFeatureList();
+   }
+ 
++  // rac: before OSCrypt reads the Keychain, with every switch in place (D20).
++  rac::ForceMockKeychainIfDebugDoorRequested();
++
+   content::InitializeMojoCore();
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
