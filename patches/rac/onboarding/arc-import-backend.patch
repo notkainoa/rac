@@ -1,7 +1,5 @@
-Index: src/chrome/browser/ui/rac/onboarding/BUILD.gn
-===================================================================
---- src.orig/chrome/browser/ui/rac/onboarding/BUILD.gn
-+++ src/chrome/browser/ui/rac/onboarding/BUILD.gn
+--- a/chrome/browser/ui/rac/onboarding/BUILD.gn
++++ b/chrome/browser/ui/rac/onboarding/BUILD.gn
 @@ -2,6 +2,8 @@
  # You can use, redistribute, and/or modify this source code under
  # the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -63,11 +61,9 @@ Index: src/chrome/browser/ui/rac/onboarding/BUILD.gn
 +    "//url",
    ]
  }
-Index: src/chrome/browser/ui/rac/onboarding/arc_import_backend.cc
-===================================================================
 --- /dev/null
-+++ src/chrome/browser/ui/rac/onboarding/arc_import_backend.cc
-@@ -0,0 +1,129 @@
++++ b/chrome/browser/ui/rac/onboarding/arc_import_backend.cc
+@@ -0,0 +1,133 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -104,8 +100,10 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_backend.cc
 +// The scripted backend, or null if the file can't be read or isn't a JSON
 +// object. Fields (all optional):
 +//
-+//   state: {found, signInsAvailable, importedDaysAgo, undoUntilDays,
-+//           undoSnapshotHoursAgo}
++//   state: {found, signInsAvailable, status, importedDaysAgo,
++//           undoUntilDays, undoSnapshotHoursAgo, undoneHoursAgo}; `status`
++//           is 'none'|'undoable'|'undone'|'expired', else it follows from
++//           the dates like the record's
 +//   arcRunning, arcQuitAfterMs — the sign-ins quit gate, scripted
 +//   readError — racArcImportRead fails
 +//   preview — the page's preview dictionary, verbatim
@@ -119,6 +117,8 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_backend.cc
 +//            path, history, undoUntilDays, pinnedExtensions, <counts>}
 +//   undoResult — 'undone'|'partlyUndone'|'busy'|'expired'|'nothingToUndo'|
 +//                'failed'
++//   undoKeptSpaces, undoBlockedProfiles — string lists: what a
++//                'partlyUndone' Undo reports as kept and blocked
 +//   restoreOffer — {createdHoursAgo, counts, spaces:[{name, emoji, light,
 +//            mode}]}; a space's `mode` is "light", "dark", or "auto", and a
 +//            scripted `dark` pair is ignored, like the real summary
@@ -197,11 +197,9 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_backend.cc
 +}
 +
 +}  // namespace rac::onboarding
-Index: src/chrome/browser/ui/rac/onboarding/arc_import_backend.h
-===================================================================
 --- /dev/null
-+++ src/chrome/browser/ui/rac/onboarding/arc_import_backend.h
-@@ -0,0 +1,194 @@
++++ b/chrome/browser/ui/rac/onboarding/arc_import_backend.h
+@@ -0,0 +1,195 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -354,8 +352,9 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_backend.h
 +
 +  // UndoArcImport(): removes what the newest import added, in every
 +  // profile it touched, and puts back the blank space it replaced. Never
-+  // deletes a profile.
-+  virtual void UndoImport(base::OnceCallback<void(ArcUndoResult)> done) = 0;
++  // deletes a profile. For kPartlyUndone the outcome names the spaces a
++  // page kept open and the profiles with a newer import to undo first.
++  virtual void UndoImport(base::OnceCallback<void(ArcUndoOutcome)> done) = 0;
 +
 +  // Opens a browser window on a profile this import created.
 +  // `profile_path` is one of the paths a result's `newProfiles` carried.
@@ -396,11 +395,9 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_backend.h
 +}  // namespace rac::onboarding
 +
 +#endif  // CHROME_BROWSER_UI_RAC_ONBOARDING_ARC_IMPORT_BACKEND_H_
-Index: src/chrome/browser/ui/rac/onboarding/arc_import_handler.cc
-===================================================================
 --- /dev/null
-+++ src/chrome/browser/ui/rac/onboarding/arc_import_handler.cc
-@@ -0,0 +1,532 @@
++++ b/chrome/browser/ui/rac/onboarding/arc_import_handler.cc
+@@ -0,0 +1,574 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -411,6 +408,7 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_handler.cc
 +#include <string>
 +#include <string_view>
 +#include <utility>
++#include <vector>
 +
 +#include "base/check_op.h"
 +#include "base/functional/bind.h"
@@ -532,6 +530,52 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_handler.cc
 +  NOTREACHED();
 +}
 +
++const char* StateStatusName(ArcImportState::Status status) {
++  switch (status) {
++    case ArcImportState::Status::kNone:
++      return "none";
++    case ArcImportState::Status::kUndoable:
++      return "undoable";
++    case ArcImportState::Status::kUndone:
++      return "undone";
++    case ArcImportState::Status::kExpired:
++      return "expired";
++  }
++  NOTREACHED();
++}
++
++// The fields both state replies share: what GetArcImportState() says, with
++// its dates localized. `undoneAt` is null when the record predates it.
++void SetStateFields(const ArcImportState& state, base::DictValue& value) {
++  value.Set("status", StateStatusName(state.status));
++  value.Set("importedAt", ArcDateOrNull(state.last_import, "MMMMd"));
++  value.Set("undoUntil", ArcDateOrNull(state.undo_until, "EEEEMMMMd"));
++  // For the Undo prompt's "Your sidebar goes back to how it was on…".
++  value.Set("undoSnapshot", ArcDateOrNull(state.undo_snapshot_time, "MMMMd"));
++  value.Set("undoneAt",
++            state.undone_at.is_null()
++                ? base::Value()
++                : base::Value(FormatArcDate(state.undone_at, "MMMMd")));
++}
++
++base::ListValue NamesValue(const std::vector<std::u16string>& names) {
++  base::ListValue list;
++  for (const std::u16string& name : names) {
++    list.Append(name);
++  }
++  return list;
++}
++
++// Undo's reply: the result, and for 'partlyUndone' the spaces a page kept
++// open and the profiles whose newer import has to be undone first.
++base::DictValue UndoOutcomeValue(const ArcUndoOutcome& outcome) {
++  base::DictValue value;
++  value.Set("undoResult", UndoResultName(outcome.result));
++  value.Set("keptSpaces", NamesValue(outcome.kept_spaces));
++  value.Set("blockedProfiles", NamesValue(outcome.blocked_profiles));
++  return value;
++}
++
 +}  // namespace
 +
 +ArcImportHandler::ArcImportHandler(Profile* profile)
@@ -601,11 +645,7 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_handler.cc
 +        }
 +        base::DictValue value;
 +        value.Set("found", found);
-+        value.Set("importedAt", ArcDateOrNull(state.last_import, "MMMMd"));
-+        value.Set("undoUntil", ArcDateOrNull(state.undo_until, "EEEEMMMMd"));
-+        // For the Undo prompt's "Your sidebar goes back to how it was on…".
-+        value.Set("undoSnapshot",
-+                  ArcDateOrNull(state.undo_snapshot_time, "MMMMd"));
++        SetStateFields(state, value);
 +        value.Set("signInsAvailable", self->backend_->SignInsAvailable());
 +        self->ResolveJavascriptCallback(callback_id, std::move(value));
 +      },
@@ -623,10 +663,7 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_handler.cc
 +        }
 +        base::DictValue value;
 +        value.Set("found", summary.found);
-+        value.Set("importedAt",
-+                  ArcDateOrNull(summary.state.last_import, "MMMMd"));
-+        value.Set("undoUntil",
-+                  ArcDateOrNull(summary.state.undo_until, "EEEEMMMMd"));
++        SetStateFields(summary.state, value);
 +        value.Set("foundSummary", summary.found_summary);
 +        value.Set("importedSummary", summary.imported_summary);
 +        base::ListValue tiles;
@@ -769,8 +806,8 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_handler.cc
 +  value.Set("splitViews", counts.split_views);
 +  value.Set("tabGroups", counts.tab_groups);
 +
-+  // What the reader left out or couldn't read; the importer's rejected
-+  // URLs join the damage line.
++  // What the reader left out or couldn't read, including what was past its
++  // count limits; the importer's rejected URLs join the damage line.
 +  const ImportReport& report = plan_ ? plan_->report : ImportReport();
 +  value.Set("skippedLiveFolders", report.skipped_live_folders);
 +  value.Set("skippedEasels", report.skipped_easels);
@@ -842,19 +879,21 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_handler.cc
 +  CHECK_EQ(1U, args.size());
 +  AllowJavascript();
 +  if (importing_) {
-+    ResolveJavascriptCallback(args[0], base::Value("busy"));
++    ArcUndoOutcome busy;
++    busy.result = ArcUndoResult::kBusy;
++    ResolveJavascriptCallback(args[0], UndoOutcomeValue(busy));
 +    return;
 +  }
 +  backend_->UndoImport(base::BindOnce(
 +      [](base::WeakPtr<ArcImportHandler> self, base::Value callback_id,
-+         ArcUndoResult result) {
++         ArcUndoOutcome outcome) {
 +        if (!self) {
 +          return;
 +        }
 +        self->ResolveJavascriptCallback(callback_id,
-+                                        base::Value(UndoResultName(result)));
-+        if (result == ArcUndoResult::kUndone ||
-+            result == ArcUndoResult::kPartlyUndone) {
++                                        UndoOutcomeValue(outcome));
++        if (outcome.result == ArcUndoResult::kUndone ||
++            outcome.result == ArcUndoResult::kPartlyUndone) {
 +          ChangedCallbacks().Notify(self->profile_);
 +        }
 +      },
@@ -933,10 +972,8 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_handler.cc
 +}
 +
 +}  // namespace rac::onboarding
-Index: src/chrome/browser/ui/rac/onboarding/arc_import_handler.h
-===================================================================
 --- /dev/null
-+++ src/chrome/browser/ui/rac/onboarding/arc_import_handler.h
++++ b/chrome/browser/ui/rac/onboarding/arc_import_handler.h
 @@ -0,0 +1,89 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
@@ -1027,11 +1064,9 @@ Index: src/chrome/browser/ui/rac/onboarding/arc_import_handler.h
 +}  // namespace rac::onboarding
 +
 +#endif  // CHROME_BROWSER_UI_RAC_ONBOARDING_ARC_IMPORT_HANDLER_H_
-Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
-===================================================================
 --- /dev/null
-+++ src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
-@@ -0,0 +1,701 @@
++++ b/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
+@@ -0,0 +1,758 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1042,11 +1077,13 @@ Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
 +#include <string>
 +#include <string_view>
 +#include <utility>
++#include <vector>
 +
 +#include "base/files/file_path.h"
 +#include "base/functional/bind.h"
 +#include "base/location.h"
 +#include "base/memory/raw_ptr.h"
++#include "base/strings/utf_string_conversions.h"
 +#include "base/task/sequenced_task_runner.h"
 +#include "base/time/time.h"
 +#include "base/timer/timer.h"
@@ -1171,6 +1208,39 @@ Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
 +  return ArcUndoResult::kUndone;
 +}
 +
++// A scripted list of names, as Undo's outcome carries them.
++std::vector<std::u16string> NamesAt(const base::DictValue& dict,
++                                    std::string_view key) {
++  std::vector<std::u16string> names;
++  if (const base::ListValue* list = dict.FindList(key)) {
++    for (const base::Value& entry : *list) {
++      if (entry.is_string()) {
++        names.push_back(base::UTF8ToUTF16(entry.GetString()));
++      }
++    }
++  }
++  return names;
++}
++
++std::optional<ArcImportState::Status> ParseStateStatus(
++    const std::string* status) {
++  static constexpr std::pair<std::string_view, ArcImportState::Status>
++      kStatuses[] = {
++          {"none", ArcImportState::Status::kNone},
++          {"undoable", ArcImportState::Status::kUndoable},
++          {"undone", ArcImportState::Status::kUndone},
++          {"expired", ArcImportState::Status::kExpired},
++      };
++  if (status) {
++    for (const auto& [name, value] : kStatuses) {
++      if (*status == name) {
++        return value;
++      }
++    }
++  }
++  return std::nullopt;
++}
++
 +int IntAt(const base::DictValue& dict, std::string_view key) {
 +  return static_cast<int>(dict.FindDouble(key).value_or(0));
 +}
@@ -1230,6 +1300,7 @@ Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
 +    out.too_deep = IntAt(*report, "tooDeep");
 +    out.malformed_entries = IntAt(*report, "malformedEntries");
 +    out.invalid_urls = IntAt(*report, "invalidUrls");
++    out.over_limit = IntAt(*report, "overLimit");
 +    out.open_tabs = IntAt(*report, "openTabs");
 +    if (const std::string* path = report->FindString("firstNestedFolderPath")) {
 +      out.first_nested_folder_path = *path;
@@ -1285,16 +1356,33 @@ Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
 +  return result;
 +}
 +
++// The scripted state, shaped like ArcImportRecord::StateAt(): the Undo
++// dates only while undoable, `undone_at` only once undone.
 +ArcImportState StateFromScript(const base::DictValue& state) {
 +  ArcImportState out;
 +  if (state.FindDouble("importedDaysAgo")) {
 +    out.last_import = DaysAgo(state, "importedDaysAgo");
 +  }
-+  if (state.FindDouble("undoUntilDays")) {
-+    out.undo_until = DaysAhead(state, "undoUntilDays");
++  const std::optional<ArcImportState::Status> status =
++      ParseStateStatus(state.FindString("status"));
++  if (status) {
++    out.status = *status;
++  } else if (state.FindDouble("undoUntilDays")) {
++    out.status = ArcImportState::Status::kUndoable;
++  } else if (out.last_import) {
++    out.status = ArcImportState::Status::kExpired;
++  }
++  if (out.status == ArcImportState::Status::kUndoable) {
++    out.undo_until = state.FindDouble("undoUntilDays")
++                         ? DaysAhead(state, "undoUntilDays")
++                         : base::Time::Now() + base::Days(7);
 +    out.undo_snapshot_time = state.FindDouble("undoSnapshotHoursAgo")
 +                                 ? HoursAgo(state, "undoSnapshotHoursAgo")
-+                                 : out.undo_until;
++                                 : out.last_import.value_or(base::Time::Now());
++  }
++  if (out.status == ArcImportState::Status::kUndone &&
++      state.FindDouble("undoneHoursAgo")) {
++    out.undone_at = HoursAgo(state, "undoneHoursAgo");
 +  }
 +  return out;
 +}
@@ -1415,7 +1503,12 @@ Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
 +  progress_interval_ = base::Milliseconds(static_cast<int64_t>(
 +      script_.FindDouble("progressIntervalMs").value_or(150)));
 +  offer_ = OfferFromScript(script_.FindDict("restoreOffer"));
-+  undo_result_ = ParseUndoResult(script_.FindString("undoResult"));
++  undo_outcome_.result = ParseUndoResult(script_.FindString("undoResult"));
++  // Like Data's Undo: the lists are only ever filled for kPartlyUndone.
++  if (undo_outcome_.result == ArcUndoResult::kPartlyUndone) {
++    undo_outcome_.kept_spaces = NamesAt(script_, "undoKeptSpaces");
++    undo_outcome_.blocked_profiles = NamesAt(script_, "undoBlockedProfiles");
++  }
 +  result_ = script_.FindDict("result")
 +                ? ResultFromScript(*script_.FindDict("result"))
 +                : ArcImportResult();
@@ -1643,6 +1736,7 @@ Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
 +    if (result_.status == ArcImportResult::Status::kDone) {
 +      const base::Time now = base::Time::Now();
 +      ArcImportState recorded;
++      recorded.status = ArcImportState::Status::kUndoable;
 +      recorded.last_import = now;
 +      recorded.undo_until = result_.undo_until.value_or(now + base::Days(7));
 +      recorded.undo_snapshot_time = now;
@@ -1657,21 +1751,19 @@ Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
 +}
 +
 +void FixtureArcImportBackend::UndoImport(
-+    base::OnceCallback<void(ArcUndoResult)> done) {
-+  if (undo_result_ == ArcUndoResult::kUndone ||
-+      undo_result_ == ArcUndoResult::kPartlyUndone) {
-+    // An undone import leaves nothing to show; a partly undone one keeps
-+    // its date, like the record.
++    base::OnceCallback<void(ArcUndoOutcome)> done) {
++  // Like the record: an undone import keeps its date and gains `undone_at`;
++  // a partly undone one stays undoable, so Undo can be tried again.
++  if (undo_outcome_.result == ArcUndoResult::kUndone) {
 +    ArcImportState state = RecordedState().value_or(state_);
-+    if (undo_result_ == ArcUndoResult::kUndone) {
-+      state.last_import.reset();
-+    }
++    state.status = ArcImportState::Status::kUndone;
++    state.undone_at = base::Time::Now();
 +    state.undo_until.reset();
 +    state.undo_snapshot_time.reset();
 +    RecordedState() = state;
 +  }
 +  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
-+      FROM_HERE, base::BindOnce(std::move(done), undo_result_),
++      FROM_HERE, base::BindOnce(std::move(done), undo_outcome_),
 +      progress_interval_ * 2);
 +}
 +
@@ -1733,10 +1825,8 @@ Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.cc
 +}
 +
 +}  // namespace rac::onboarding
-Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.h
-===================================================================
 --- /dev/null
-+++ src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.h
++++ b/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.h
 @@ -0,0 +1,104 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
@@ -1784,7 +1874,7 @@ Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.h
 +                   ArcImportDoneCallback done) override;
 +  void RetrySignIns(ArcImportProgressCallback progress,
 +                    ArcImportDoneCallback done) override;
-+  void UndoImport(base::OnceCallback<void(ArcUndoResult)> done) override;
++  void UndoImport(base::OnceCallback<void(ArcUndoOutcome)> done) override;
 +  void OpenProfile(const base::FilePath& profile_path,
 +                   base::OnceCallback<void(bool)> done) override;
 +  const DataBackups::RestoreOffer* GetRestoreOffer() override;
@@ -1825,7 +1915,7 @@ Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.h
 +  ArcImportState state_;
 +  std::optional<DataBackups::RestoreOffer> offer_;
 +  ArcImportResult result_;
-+  ArcUndoResult undo_result_;
++  ArcUndoOutcome undo_outcome_;
 +
 +  // The in-flight import or retry.
 +  std::vector<ArcImportProgress> pending_;
@@ -1842,10 +1932,8 @@ Index: src/chrome/browser/ui/rac/onboarding/fixture_arc_import_backend.h
 +}  // namespace rac::onboarding
 +
 +#endif  // CHROME_BROWSER_UI_RAC_ONBOARDING_FIXTURE_ARC_IMPORT_BACKEND_H_
-Index: src/chrome/browser/ui/rac/onboarding/onboarding_window.h
-===================================================================
---- src.orig/chrome/browser/ui/rac/onboarding/onboarding_window.h
-+++ src/chrome/browser/ui/rac/onboarding/onboarding_window.h
+--- a/chrome/browser/ui/rac/onboarding/onboarding_window.h
++++ b/chrome/browser/ui/rac/onboarding/onboarding_window.h
 @@ -26,6 +26,10 @@ namespace rac::onboarding {
  // Shows the tour window, or brings the open one to the front.
  void ShowWelcomeTour(Profile* profile);
@@ -1869,11 +1957,9 @@ Index: src/chrome/browser/ui/rac/onboarding/onboarding_window.h
  }  // namespace rac::onboarding
  
  #endif  // CHROME_BROWSER_UI_RAC_ONBOARDING_ONBOARDING_WINDOW_H_
-Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
-===================================================================
 --- /dev/null
-+++ src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
-@@ -0,0 +1,461 @@
++++ b/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
+@@ -0,0 +1,420 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1971,24 +2057,6 @@ Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
 +    }
 +  }
 +  return {std::move(summary), std::move(space_ids)};
-+}
-+
-+// The time of the newest import into `profile_dir` that wasn't undone, or
-+// nullopt if every one was. `fallback` when the record can't say.
-+std::optional<base::Time> StandingImportTime(const base::FilePath& profile_dir,
-+                                             base::Time fallback) {
-+  ArcImportRecord::ReadResult read = ArcImportRecord::Read(profile_dir);
-+  if (read.status != ArcImportRecord::ReadStatus::kOk ||
-+      read.record.runs().empty()) {
-+    return fallback;
-+  }
-+  const std::vector<ArcImportRecord::Run>& runs = read.record.runs();
-+  for (auto run = runs.rbegin(); run != runs.rend(); ++run) {
-+    if (!run->undone) {
-+      return run->time.is_null() ? fallback : run->time;
-+    }
-+  }
-+  return std::nullopt;
 +}
 +
 +// A QuitWait while the sign-ins step isn't in this build: nothing waits on
@@ -2137,35 +2205,12 @@ Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
 +
 +void RealArcImportBackend::GetImportState(
 +    base::OnceCallback<void(const ArcImportState&)> done) {
++  // The state's `status` tells an undone import from an expired one.
 +  rac::GetArcImportState(
 +      profile_,
-+      base::BindOnce(
-+          [](base::FilePath profile_dir,
-+             base::OnceCallback<void(const ArcImportState&)> done,
-+             ArcImportState state) {
-+            // An import that can still be undone stands, and so does the
-+            // date of one whose 7 days are over.
-+            if (!state.last_import || state.undo_until) {
-+              std::move(done).Run(state);
-+              return;
-+            }
-+            // The state keeps the date of an import even once it was
-+            // undone; the page must not read that as "the 7 days have
-+            // passed". Take the newest import that still stands instead.
-+            base::ThreadPool::PostTaskAndReplyWithResult(
-+                FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
-+                base::BindOnce(&StandingImportTime, profile_dir,
-+                               *state.last_import),
-+                base::BindOnce(
-+                    [](ArcImportState state,
-+                       base::OnceCallback<void(const ArcImportState&)> done,
-+                       std::optional<base::Time> standing) {
-+                      state.last_import = standing;
-+                      std::move(done).Run(state);
-+                    },
-+                    std::move(state), std::move(done)));
-+          },
-+          profile_->GetPath(), std::move(done)));
++      base::BindOnce([](base::OnceCallback<void(const ArcImportState&)> done,
++                        ArcImportState state) { std::move(done).Run(state); },
++                     std::move(done)));
 +}
 +
 +void RealArcImportBackend::GetSummary(
@@ -2242,7 +2287,7 @@ Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
 +}
 +
 +void RealArcImportBackend::UndoImport(
-+    base::OnceCallback<void(ArcUndoResult)> done) {
++    base::OnceCallback<void(ArcUndoOutcome)> done) {
 +  rac::UndoArcImport(profile_, std::move(done));
 +}
 +
@@ -2335,10 +2380,8 @@ Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
 +}
 +
 +}  // namespace rac::onboarding
-Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.h
-===================================================================
 --- /dev/null
-+++ src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.h
++++ b/chrome/browser/ui/rac/onboarding/real_arc_import_backend.h
 @@ -0,0 +1,90 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
@@ -2388,7 +2431,7 @@ Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.h
 +                   ArcImportDoneCallback done) override;
 +  void RetrySignIns(ArcImportProgressCallback progress,
 +                    ArcImportDoneCallback done) override;
-+  void UndoImport(base::OnceCallback<void(ArcUndoResult)> done) override;
++  void UndoImport(base::OnceCallback<void(ArcUndoOutcome)> done) override;
 +  void OpenProfile(const base::FilePath& profile_path,
 +                   base::OnceCallback<void(bool)> done) override;
 +  const DataBackups::RestoreOffer* GetRestoreOffer() override;
@@ -2430,10 +2473,8 @@ Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.h
 +}  // namespace rac::onboarding
 +
 +#endif  // CHROME_BROWSER_UI_RAC_ONBOARDING_REAL_ARC_IMPORT_BACKEND_H_
-Index: src/chrome/browser/ui/views/rac/onboarding/onboarding_window.cc
-===================================================================
---- src.orig/chrome/browser/ui/views/rac/onboarding/onboarding_window.cc
-+++ src/chrome/browser/ui/views/rac/onboarding/onboarding_window.cc
+--- a/chrome/browser/ui/views/rac/onboarding/onboarding_window.cc
++++ b/chrome/browser/ui/views/rac/onboarding/onboarding_window.cc
 @@ -60,6 +60,7 @@ constexpr gfx::Size kDefaultSize(940, 62
  
  // The page tells its window mode from the query, see app.ts.
@@ -2512,10 +2553,8 @@ Index: src/chrome/browser/ui/views/rac/onboarding/onboarding_window.cc
  }
  
  }  // namespace rac::onboarding
-Index: src/chrome/browser/ui/webui/onboarding/onboarding_page_ui.cc
-===================================================================
---- src.orig/chrome/browser/ui/webui/onboarding/onboarding_page_ui.cc
-+++ src/chrome/browser/ui/webui/onboarding/onboarding_page_ui.cc
+--- a/chrome/browser/ui/webui/onboarding/onboarding_page_ui.cc
++++ b/chrome/browser/ui/webui/onboarding/onboarding_page_ui.cc
 @@ -7,6 +7,7 @@
  #include "base/strings/strcat.h"
  #include "build/build_config.h"
@@ -2533,10 +2572,8 @@ Index: src/chrome/browser/ui/webui/onboarding/onboarding_page_ui.cc
  }
  
  HeliumOnboardingPage::~HeliumOnboardingPage() = default;
-Index: src/chrome/browser/ui/webui/settings/settings_ui.cc
-===================================================================
---- src.orig/chrome/browser/ui/webui/settings/settings_ui.cc
-+++ src/chrome/browser/ui/webui/settings/settings_ui.cc
+--- a/chrome/browser/ui/webui/settings/settings_ui.cc
++++ b/chrome/browser/ui/webui/settings/settings_ui.cc
 @@ -51,6 +51,7 @@
  #include "chrome/browser/ui/hats/hats_service_factory.h"
  #include "chrome/browser/ui/managed_ui.h"
