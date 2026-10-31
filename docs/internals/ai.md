@@ -452,7 +452,7 @@ never counts as named.
 | A plain text field or a select | asks | asks (the critic can't judge it) | free |
 | Risky (the list above) | asks | asks | asks |
 | Once it has read a site: a click, a select, Enter, Back, a page link, or typing the model's text, seen by a site that hasn't seen what it read | asks | asks | asks |
-| Once it has read a site: scroll, switch tabs, a URL the user typed, or the user's own words on a named site, seen by such a site | as above, at most 12 free a turn, then asks | same | same |
+| Once it has read a site: scroll the page, switch tabs, a URL the user typed, or the user's own words on a named site, seen by such a site | as above, at most 12 free a turn, then asks | same | same |
 
 The last two rows are the data-flow rule (below). They sit on top of the
 others: a step another row lets through can still ask under them.
@@ -493,14 +493,16 @@ count), and not a risky step. `ask` never offers one, since a grant
 wouldn't skip a card there. Past 256 sites the read set stops growing: a new
 site counts as `earlier`, and every grant that covered `earlier` loses it.
 
-The other steps still pick among a few options a page sees: which tab comes
+The other steps still pick among options a page sees: which tab comes
 forward, which way it scrolls, which field gets the user's words. Seen by a
 site that hasn't seen the read set, they are free for 12 steps a turn
-(`kFreeStepsPerTurn`), and then each asks with the same card. A scroll that
-counts as one of those steps, or that such a card allowed once, moves by a
-fixed 600 DIP step in the direction asked, so the distance can't spell
-anything. Waiting is free and uncounted. What still gets through is in Open
-concerns.
+(`kFreeStepsPerTurn`), and then each asks with the same card. A free scroll
+moves the page itself. A scroll that names an element asks with the same
+card, free steps left or not: a page can build hundreds of scrollable boxes,
+so which one moves would spell a byte a step. A scroll that counts as a free
+step, or that a card allowed once, moves by a fixed 600 DIP step in the
+direction asked, so the distance can't spell anything. Waiting is free and
+uncounted. What still gets through is in Open concerns.
 
 **Site rules** (`rac.ai.agent_site_rules`, origin to `always` or `never`)
 sit on top of any level. `always` makes the origin count as named, so the
@@ -836,9 +838,17 @@ detach is posted.
   carry what the model read to a site that hasn't seen it asks, but some
   bits still get through. Timing: when steps happen, and how long a wait
   lasts (the model picks up to 10 seconds; waits are free and uncounted).
-  Choice: a turn's 12 free steps each pick among a few options a page sees
-  (which of the user's words, which field, which tab, which way to
-  scroll). Hosts: a card names `http://a` and `https://a` both as "a".
+  Choice: each of a turn's 12 free steps picks one option a page sees, so
+  it carries the log of how many options there were. A scroll carries its
+  direction only, about 2 bits, since it moves the page itself by the fixed
+  step. Switching to or closing one of the agent's tabs, or opening one of
+  the URLs the user typed, carries which one (log2 of the tabs or URLs).
+  Typing the user's own words carries the most: which field, log2 of the
+  text fields on the page, and which run of whole words from this turn's
+  message, about log2(n²/2) for n words (some 8 bits for 20 words). So a
+  long message and a page full of fields give a free step about 13 bits,
+  and a turn some 150 at worst. Hosts: a card names `http://a` and
+  `https://a` both as "a".
 - **Rough edges in the tools.** `press_key` is Enter on an element only, and
   the guard always treats it as a possible submit. Forms that target a named
   window or a new window are denied. The agent can't close the user's own
