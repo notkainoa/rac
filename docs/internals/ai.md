@@ -512,8 +512,26 @@ and on every subdomain: a rule for `https://bank.example` also stops
 Settings › Assistant. The agent can't read it either: a snapshot, page
 text, or find on the site, or on a page showing a frame from it, is denied,
 a snapshot after a step that lands there is withheld (and doesn't become
-the base of the next delta), and the tab list leaves the tab out. Chat
-attachments are the exception (see Open concerns).
+the base of the next delta), and the tab list leaves the tab out.
+
+The chat reads none either, and asks the same matcher
+(`rac::agent::NeverRuleOrigin`, which the guard's `ReadBlockedReason` also
+uses) through `rac::ai::NeverReadHost`, rules re-read from the pref each
+time. An attached tab on a never site is refused before its text is read,
+and again after, when the frames it showed are known; a never frame keeps
+the whole page back, as it does for the agent. With "attach the current
+tab" on, a never site's card stays in the composer, dimmed, reading "On
+your Never list", and is never sent; the tab menu lists such tabs greyed
+out with the reason, and leaves them out of "All tabs". Find's Ask goes
+through the same send. A rule added mid-conversation drops that site's
+pages from the prompt cache (`PagePromptCache::DropNeverSites`) before the
+next send. Each refusal is a note on the reply: "<host> is on your Never
+list, so the assistant can't read it. You can change this in Settings >
+Assistant." A link summary checks the link before it fetches and the
+loaded page (redirects, frames) before the model sees it, and shows the
+same message on its card. The strings are in `chrome/app/rac_strings.grd`.
+The rules apply whether or not browser control is on, but Settings only
+shows the site-rule list while it is on.
 
 A rule the guard can't read counts as never for the host it names, read as
 best it can be: a value other than `always` or `never`, or `always` under
@@ -821,12 +839,6 @@ detach is posted.
   Choice: a turn's 12 free steps each pick among a few options a page sees
   (which of the user's words, which field, which tab, which way to
   scroll). Hosts: a card names `http://a` and `https://a` both as "a".
-- **Never sites in chat attachments.** A `never` rule stops the agent's
-  reads, but the chat page attaches tabs on its own path, so a never site's
-  text still reaches the model when the user attaches it, or when "attach
-  the current tab" is on and it's the current tab. Closing it means the
-  attach path asks the guard's rules (`ActionGuard::ReadBlockedReason`),
-  and deciding what an explicit attach of a never site should do.
 - **Rough edges in the tools.** `press_key` is Enter on an element only, and
   the guard always treats it as a possible submit. Forms that target a named
   window or a new window are denied. The agent can't close the user's own
