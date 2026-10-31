@@ -295,6 +295,150 @@ class ShotsTest(unittest.TestCase):
             self.assertFalse([a for a in args if "screenshot" in a])
 
 
+class PanelTargetTest(unittest.TestCase):
+    """Picking the side panel out of a Target.getTargets list."""
+
+    AI_TAB = {"targetId": "T-AI", "type": "page", "url": "chrome://rac-ai/"}
+    PANEL = {"targetId": "T-P", "type": "page", "url": "chrome://rac-ai/?mode=panel"}
+    PAGE = {"targetId": "T1", "type": "page", "url": "http://site/"}
+
+    def test_only_the_chat_tab_means_no_panel(self):
+        self.assertIsNone(run.panel_target([self.AI_TAB, self.PAGE], "T-AI"))
+
+    def test_the_mode_panel_url_picks_the_panel(self):
+        got = run.panel_target([self.PAGE, self.AI_TAB, self.PANEL], "T-AI")
+        self.assertIs(got, self.PANEL)
+
+    def test_a_second_rac_ai_target_is_the_panel_even_without_the_marker(self):
+        other = {"targetId": "T-P2", "type": "other", "url": "rac://rac-ai"}
+        got = run.panel_target([self.AI_TAB, self.PAGE, other], "T-AI")
+        self.assertIs(got, other)
+
+    def test_the_assistant_tab_itself_is_never_the_panel(self):
+        self.assertIsNone(run.panel_target([self.AI_TAB], "T-AI"))
+
+    def test_urls_that_arent_the_assistant_never_match(self):
+        targets = [{"targetId": "T1", "url": "chrome://settings/assistant"},
+                   {"targetId": "T2", "url": "http://rac-ai.example/"}]
+        self.assertIsNone(run.panel_target(targets, "T-AI"))
+
+
+class AgentPageTest(unittest.TestCase):
+    """Which page tab the -1-card shot puts in front of the panel."""
+
+    def test_the_turns_attached_tab_wins(self):
+        pages = {"a:/inbox": mock.Mock(target_id="T1"),
+                 "b:/form": mock.Mock(target_id="T2")}
+        self.assertIs(run.agent_page(pages, {"attach": ["b:/form", "a:/inbox"]}),
+                      pages["b:/form"])
+
+    def test_an_unopened_attach_ref_is_skipped(self):
+        self.assertEqual(run.agent_page({"a:/inbox": "P1"}, {"attach": ["b:/x"]}), "P1")
+
+    def test_without_attach_the_last_opened_page_is_used(self):
+        pages = {"a:/x": "P1", "b:/y": "P2"}
+        self.assertEqual(run.agent_page(pages, {"user": "x"}), "P2")
+
+    def test_no_pages_means_none(self):
+        self.assertIsNone(run.agent_page({}, {"attach": ["a:/x"]}))
+
+
+class CardShotTest(unittest.TestCase):
+    """capture_card: the window arrangement behind the -1-card shot."""
+
+    class FakeBrowser:
+        """Answers the CDP calls capture_card makes. `open` reports the
+        side panel's target from getTargets; the serve thread sets it when
+        a "command" request arrives, like the real browser."""
+        def __init__(self):
+            self.calls = []
+            self.timeout = 15  # _try_eval bounds each eval on this
+            self.open = False
+            self.card = True
+            self.evals = []
+
+        def call(self, method, params=None, session_id=None):
+            self.calls.append((method, params))
+            if method == "Target.getTargets":
+                infos = [{"targetId": "T-AI", "type": "page",
+                          "url": "chrome://rac-ai/"}]
+                if self.open:
+                    infos.append({"targetId": "T-P", "type": "page",
+                                  "url": "chrome://rac-ai/?mode=panel"})
+                return {"targetInfos": infos}
+            if method == "Target.attachToTarget":
+                return {"sessionId": "S-" + params["targetId"]}
+            if method == "Runtime.evaluate":
+                self.evals.append((session_id, params["expression"]))
+                return {"result": {"value": self.card}}
+            return {}
+
+    @staticmethod
+    def serve(shots, browser, lines, stop):
+        """The browser's end of the requests file: "command ID" opens the
+        fake panel, a PNG path gets written."""
+        while not stop:
+            if os.path.exists(shots.requests):
+                with open(shots.requests) as f:
+                    line = f.read().strip()
+                os.remove(shots.requests)
+                lines.append(line)
+                if line.startswith("command "):
+                    browser.open = True
+                elif line.endswith(".png"):
+                    with open(line, "wb") as f:
+                        f.write(b"\x89PNG pretend")
+            time.sleep(0.02)
+
+    def run_shot(self, browser, timeout=5):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        shots = run.Shots(d.name)
+        lines, stop = [], []
+        t = threading.Thread(target=self.serve, args=(shots, browser, lines, stop),
+                             daemon=True)
+        t.start()
+        try:
+            ok = shots.capture_card("v-1-card.png", browser,
+                                    mock.Mock(target_id="T-AI"),
+                                    mock.Mock(target_id="T1"), timeout=timeout)
+        finally:
+            stop.append(True)
+            t.join()
+        return shots, lines, ok
+
+    def test_a_closed_panel_gets_the_toggle_command_then_the_card_shot(self):
+        browser = self.FakeBrowser()
+        shots, lines, ok = self.run_shot(browser)
+        self.assertTrue(ok)
+        self.assertEqual(lines, ["command 40701",
+                                 os.path.join(shots.dir, "v-1-card.png")])
+        self.assertEqual(shots.taken,
+                         [{"name": "v-1-card.png", "ok": True, "error": None}])
+        # the acted-on page is made visible before anything else
+        self.assertEqual(browser.calls[0],
+                         ("Target.activateTarget", {"targetId": "T1"}))
+        # the card check ran in the panel's own session, not the tab's
+        self.assertIn(("S-T-P", run.CARD_PRESENT), browser.evals)
+
+    def test_an_open_panel_is_never_sent_the_toggle(self):
+        browser = self.FakeBrowser()
+        browser.open = True
+        shots, lines, ok = self.run_shot(browser)
+        self.assertTrue(ok)
+        self.assertEqual(lines, [os.path.join(shots.dir, "v-1-card.png")])
+
+    def test_no_card_in_the_panel_still_writes_the_png_marked(self):
+        browser = self.FakeBrowser()
+        browser.card = False
+        shots, lines, ok = self.run_shot(browser, timeout=1)
+        self.assertFalse(ok)
+        entry = shots.taken[0]
+        self.assertFalse(entry["ok"])
+        self.assertEqual(entry["error"], "card not in side panel")
+        self.assertTrue(os.path.exists(os.path.join(shots.dir, "v-1-card.png")))
+
+
 class RelaunchTest(unittest.TestCase):
     def test_port_open(self):
         import socket

@@ -58,6 +58,9 @@ ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 STATUS_CONTEXT = "rac/agent-evals"
 RUN_TIMEOUT = 120          # seconds a turn may take before it counts as timed out
 FAKE_KEY = "eval-fake-key"  # the fake model ignores it; Custom insists on one
+# chrome/app/chrome_command_ids.h: toggles the assistant side panel, sent
+# through the screenshot requests file as "command 40701".
+IDC_RAC_ASSISTANT_TOGGLE = 40701
 
 
 # --- small helpers ---------------------------------------------------------
@@ -320,10 +323,11 @@ class Shots:
     chrome/browser/ui/views/rac/window_screenshot.mm: the browser polls the
     --rac-window-screenshot-requests file every 250 ms, reads and deletes it,
     then writes the window to the PNG path inside (or runs a command such as
-    "click X Y" or "burst DIR N MS"; only PNG paths are ever sent here).
-    Polling starts only when --rac-window-screenshot is set too, so every
-    launch also writes a boot capture. Writes are atomic so a poll never
-    reads half a path."""
+    "click X Y", "command ID", or "burst DIR N MS"; capture_card sends one
+    command, IDC_RAC_ASSISTANT_TOGGLE, to open the side panel). Polling
+    starts only when --rac-window-screenshot is set too, so every launch
+    also writes a boot capture. Writes are atomic so a poll never reads
+    half a path."""
 
     def __init__(self, dir):
         self.dir = dir
@@ -367,6 +371,41 @@ class Shots:
         self.taken.append(entry)
         return entry["ok"]
 
+    def capture_card(self, name, browser, assistant, page, proc=None, timeout=10):
+        """The -1-card shot. A card renders in the assistant's side panel —
+        the chat tab only carries a "waiting in the sidebar" pill — so the
+        window is arranged first: the tab the agent acts on becomes the
+        visible one, and the panel is opened with a "command" request (the
+        toggle also closes it, so it's sent only when Target.getTargets
+        shows no panel yet). The PNG then waits for the card's element in
+        the panel's own page; a panel that never shows one is captured
+        anyway, marked "card not in side panel"."""
+        error = None
+        try:
+            if page is not None:
+                browser.call("Target.activateTarget", {"targetId": page.target_id})
+            if _panel_info(browser, assistant.target_id) is None:
+                self.request(f"command {IDC_RAC_ASSISTANT_TOGGLE}")
+            deadline = time.time() + timeout
+            info = wait_for(lambda: _panel_info(browser, assistant.target_id),
+                            "the assistant side panel", timeout, proc)
+            panel = Page(browser, info["targetId"])
+            wait_for(lambda: _try_eval(panel, CARD_PRESENT),
+                     "the card in the side panel",
+                     max(0.5, deadline - time.time()), proc)
+        except RuntimeError:
+            error = "card not in side panel"
+        except (cdp.CdpError, OSError) as e:
+            error = f"{type(e).__name__}: {e}"
+        self.capture(name, browser=browser,
+                     activate=page.target_id if page is not None else None,
+                     proc=proc)
+        entry = self.taken[-1]
+        if error is not None:
+            entry["ok"] = False
+            entry["error"] = "; ".join(e for e in (entry["error"], error) if e)
+        return entry["ok"]
+
 
 def _png_ready(path):
     return os.path.exists(path) and os.path.getsize(path) > 0
@@ -386,6 +425,41 @@ class Page:
         if r.get("exceptionDetails"):
             raise cdp.CdpError("page error: " + json.dumps(r["exceptionDetails"])[:300])
         return r["result"].get("value")
+
+
+def rac_ai_targets(target_infos):
+    """The assistant's entries in a Target.getTargets list: the chat tab,
+    and the side panel's page while it's open."""
+    return [t for t in target_infos
+            if t.get("url", "").startswith(("chrome://rac-ai", "rac://rac-ai"))]
+
+
+def panel_target(target_infos, assistant_tid):
+    """The side panel's target, or None while the panel is closed. It's a
+    second rac-ai page next to the assistant tab: mode=panel in the URL
+    marks it, but any rac-ai target that isn't the tab itself counts. The
+    tab's own id is passed so it never counts."""
+    ai = rac_ai_targets(target_infos)
+    for t in ai:
+        if "mode=panel" in t.get("url", ""):
+            return t
+    return next((t for t in ai if t.get("targetId") != assistant_tid), None)
+
+
+def _panel_info(browser, assistant_tid):
+    """panel_target on a live Target.getTargets call; None while closed."""
+    infos = browser.call("Target.getTargets").get("targetInfos", [])
+    return panel_target(infos, assistant_tid)
+
+
+def agent_page(pages, turn):
+    """The page tab the agent is acting on this turn — what the -1-card
+    shot puts beside the panel: the first attached tab, else the most
+    recently opened one."""
+    for ref in turn.get("attach", []):
+        if ref in pages:
+            return pages[ref]
+    return list(pages.values())[-1] if pages else None
 
 
 # racAiInit calls AllowJavascript() and subscribes the page to the profile's
@@ -417,6 +491,9 @@ SET_PROVIDER_KEY = ("import('chrome://resources/js/cr.js').then(m => "
 
 # Messages racAiSend answers to the page with. Card ids are "approval-N".
 CARD_TYPES = ("confirm_request", "plan_request")
+# agent_cards.ts buildConfirmCard's root, looked for in the side panel's
+# own page before the -1-card shot.
+CARD_PRESENT = "!!document.querySelector('.agent-card.confirm-card')"
 END_STATES = ("done", "stopped", "error")
 
 
@@ -610,19 +687,21 @@ def drive(variant, rig, browser, proc, shots=None):
                     answered.add(e["id"])
                     if shots is not None and e.get("type") == "confirm_request" \
                             and not card_shot:
-                        # The card is on screen; the assistant tab must be the
-                        # visible one for the proof to show it.
+                        # The card renders in the assistant's side panel,
+                        # not the chat tab; the shot arranges that window.
                         card_shot = True
-                        shots.capture(variant["id"] + "-1-card.png", browser=browser,
-                                      activate=assistant.target_id, proc=proc)
+                        shots.capture_card(variant["id"] + "-1-card.png", browser,
+                                           assistant, agent_page(pages, turn),
+                                           proc=proc)
                     answer = grade.simulated_answer(variant)
                     answers.append({"id": e["id"], "answer": answer})
                     assistant.eval("window.__evals.cr.sendWithPromise("
                                    f"'racAiAgentRespond', {json.dumps(e['id'])}, {json.dumps(answer)})")
                     if shots is not None and not after_shot:
+                        # The panel stays open, so the resolved card shows
+                        # beside the page it guarded.
                         after_shot = True
-                        shots.capture(variant["id"] + "-2-after.png", browser=browser,
-                                      activate=assistant.target_id, proc=proc)
+                        shots.capture(variant["id"] + "-2-after.png", proc=proc)
                 if e.get("type") == "run_state" and e.get("state") in END_STATES:
                     end_state = e["state"]
             if end_state == "timeout":
