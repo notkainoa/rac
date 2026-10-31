@@ -176,6 +176,7 @@ class Rig:
     def record(self, mode, turns, answers, downloads=()):
         return {"variant": self.variant["id"], "base_id": self.variant["base_id"],
                 "mode": mode, "level": self.variant["level"],
+                "origins": dict(self.fixtures.base),
                 "turns": turns, "model_log": list(self.model_state.log),
                 "attacker_log": self.fixtures.snapshot_log(), "answers": answers,
                 "downloads": list(downloads)}
@@ -491,6 +492,33 @@ class Shots:
             entry["error"] = "; ".join(e for e in (entry["error"], error) if e)
         return entry["ok"]
 
+    def capture_reply(self, name, browser, panel, page, proc=None, timeout=10):
+        """The -1-reply shot for a turn whose reply carries a note instead of
+        a card. The panel is already open and renders the run's replies, so
+        the window only needs arranging: the tab the agent acted on becomes
+        the visible one (for a Never-listed tab that is also what puts its
+        dimmed chip up), then the PNG waits for a note row in the panel. A
+        reply with no note is captured anyway, marked "note not in side
+        panel"."""
+        error = None
+        try:
+            if page is not None:
+                browser.call("Target.activateTarget", {"targetId": page.target_id})
+            wait_for(lambda: _try_eval(panel, NOTE_PRESENT),
+                     "the reply's note in the side panel", timeout, proc)
+        except RuntimeError:
+            error = "note not in side panel"
+        except (cdp.CdpError, OSError) as e:
+            error = f"{type(e).__name__}: {e}"
+        self.capture(name, browser=browser,
+                     activate=page.target_id if page is not None else None,
+                     proc=proc)
+        entry = self.taken[-1]
+        if error is not None:
+            entry["ok"] = False
+            entry["error"] = "; ".join(e for e in (entry["error"], error) if e)
+        return entry["ok"]
+
 
 def _png_ready(path):
     return os.path.exists(path) and os.path.getsize(path) > 0
@@ -728,9 +756,13 @@ def _chip_covers(panel, url):
 def panel_prune_js(wanted):
     """Clicks the .card-remove of one chip whose URL isn't wanted — the
     remove control removeTab is bound to (app.ts). One chip per call, so
-    the loop in attach_panel_turn sees the re-render each time."""
+    the loop in attach_panel_turn sees the re-render each time. A chip
+    marked .unavailable (the dimmed card for a tab on the user's Never
+    list) is left alone: it isn't an attachment, it only says why the tab
+    can't be one."""
     return ("(() => { const keep = " + json.dumps(list(wanted)) + ";"
             " for (const c of document.querySelectorAll('#chips .attachment')) {"
+            "   if (c.classList.contains('unavailable')) continue;"
             "   const t = c.title || '';"
             "   if (t && !keep.some(u => t.startsWith(u))) {"
             "     const r = c.querySelector('.card-remove');"
@@ -831,7 +863,7 @@ ASSISTANT_HOOK = """
     // guard event, so it is marked for grade.py to ignore.
     cr.addWebUiListener('rac-ai-attach-failed',
         e => window.__evals.events.push({type: 'attach_failed', id: e.id,
-                                         failed: e.failed}));
+                                         failed: e.failed, never: e.never}));
   }
   return await cr.sendWithPromise('racAiInit');
 })()
@@ -848,7 +880,29 @@ CARD_TYPES = ("confirm_request", "plan_request")
 # agent_cards.ts buildConfirmCard's root, looked for in the side panel's
 # own page before the -1-card shot.
 CARD_PRESENT = "!!document.querySelector('.agent-card.confirm-card')"
+# The reply's note rows — renderAssistantMessage renders each
+# message.notice (an attach failure, a Never-list site, "stopped") as a
+# .message-note under the reply (agent_cards.ts). Read before the
+# -1-reply shot and recorded as the turn's `notes`.
+NOTE_PRESENT = "!!document.querySelector('.message-note')"
+NOTE_TEXTS = ("[...document.querySelectorAll('.message-note')]"
+              ".map(e => e.textContent)")
 END_STATES = ("done", "stopped", "error")
+
+
+def reply_notes(events):
+    """The note texts a send's events put on its reply: every host an
+    attach_failed event names in `never` becomes the Never-list line on the
+    reply (app.ts neverMessage). A wire-driven run renders no reply in the
+    page, so this is how the record carries what the note says."""
+    notes = []
+    for e in events:
+        if e.get("type") == "attach_failed":
+            for host in e.get("never") or []:
+                note = grade.NEVER_NOTE.format(host=host)
+                if note not in notes:
+                    notes.append(note)
+    return notes
 
 
 def run_browser(variant, args):
@@ -1010,7 +1064,7 @@ def drive(variant, rig, browser, proc, shots=None):
         raise RuntimeError(f"the assistant is not configured: {state!r:.300}")
 
     messages, turns, answers, send_id = [], [], [], 0
-    card_shot = after_shot = False  # one -1-card/-2-after pair per variant
+    card_shot = after_shot = reply_shot = False  # one shot per kind per variant
     for index, turn in enumerate(variant["turns"]):
         send_id += 1
         user = expand(turn["user"], origins)
@@ -1047,9 +1101,12 @@ def drive(variant, rig, browser, proc, shots=None):
         if shots is not None:
             # Send through the panel's UI: the + menu (or the current tab's
             # chip) attaches, the composer's textarea takes the text, and
-            # #send submits it.
+            # #send submits it. A tab on the user's Never list is disabled
+            # in the + menu — its chip only says why — so it isn't picked.
             wanted_ids = {}
             for t in infos:
+                if t.get("never"):
+                    continue
                 for w in wanted:
                     if t.get("url", "").startswith(w):
                         wanted_ids.setdefault(w, t["id"])
@@ -1116,8 +1173,22 @@ def drive(variant, rig, browser, proc, shots=None):
         reply = next((e["text"] for e in reversed(rig.model_state.log)
                       if e.get("kind") == "chat" and not e.get("calls")), "")
         messages.append({"role": "assistant", "text": reply})
+        # The reply's notes: the .message-note rows the sending page
+        # rendered, plus the notes its attach_failed events carry — the
+        # Never-list line a wire-driven reply still means.
+        page_notes = _try_eval(assistant, NOTE_TEXTS)
+        notes = ([n for n in page_notes if isinstance(n, str)]
+                 if isinstance(page_notes, list) else [])
+        notes += [n for n in reply_notes(events) if n not in notes]
         record = {"index": index, "user": user, "events": events, "reply": reply,
-                  "end_state": end_state}
+                  "notes": notes, "end_state": end_state}
+        if shots is not None and variant.get("reply_shot") and not reply_shot:
+            # A variant whose reply carries a note instead of a card gets
+            # its own shot after the reply: the note in the panel, and the
+            # acted-on tab in front (a Never-listed tab's dimmed chip).
+            reply_shot = True
+            shots.capture_reply(variant["id"] + "-1-reply.png", browser,
+                                assistant, agent_page(pages, turn), proc=proc)
         if sent != "sent":
             # The composer's answer, when the UI send couldn't report one
             # — a turn that never sent reads as a timeout without it.

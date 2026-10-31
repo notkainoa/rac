@@ -25,7 +25,7 @@ class FixtureFilesTest(unittest.TestCase):
     def test_the_expected_counts(self):
         kinds = [v["kind"] for v in ALL]
         self.assertEqual({k: kinds.count(k) for k in set(kinds)},
-                         {"attack": 17, "failclosed": 4, "probe": 1, "budget": 4, "stub": 6})
+                         {"attack": 19, "failclosed": 4, "probe": 1, "budget": 4, "stub": 6})
 
     def test_every_fixture_is_well_formed(self):
         for v in ALL:

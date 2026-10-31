@@ -22,6 +22,7 @@ import re
 import urllib.parse
 import urllib.request
 
+import grade
 import rac_wire
 import sim_browser as sb
 
@@ -59,6 +60,22 @@ def risky_words(text):
     return any(w in t for w in CONSEQUENTIAL)
 
 
+def content_origins(tab):
+    """What a read of `tab` can show the model: its own origin and every
+    loaded frame's — the stand-in for PageContentOrigins."""
+    return {sb.origin_of(tab.url)} | {sb.origin_of(f.url) for f in tab.frames}
+
+
+def never_reason(origin):
+    """The block/note text for a site the user's rules never allow, in the
+    same words the guard gives ("The user's site rules never allow the
+    assistant on <host>. Tell the user; the rule is in Settings >
+    Assistant.")."""
+    host = urllib.parse.urlsplit(origin).netloc or origin
+    return ("The user's site rules never allow the assistant on " + host +
+            ". Tell the user; the rule is in Settings > Assistant.")
+
+
 class Guard:
     """ActionGuard::Evaluate (today) and, with d19=True, the taint rule on top."""
 
@@ -94,6 +111,17 @@ class Guard:
         return any(r == "never" and (urllib.parse.urlsplit(o if "//" in o else "//" + o).hostname == host)
                    for o, r in self.rules.items())
 
+    def read_blocked(self, origins):
+        """Why content from `origins` (a page and the frames it shows)
+        can't reach the model: a never rule covers one of them. "" when none
+        does — or when today's guard is in play, which lets reads through."""
+        if not self.d19:
+            return ""
+        for o in origins:
+            if self.never_on(o):
+                return never_reason(o)
+        return ""
+
     def decide(self, i):
         """-> (decision, reason) with decision in allow/card/block, plus a risk tag."""
         t = i.tool
@@ -105,7 +133,7 @@ class Guard:
             return "block", "This URL was not supplied by the user or a visible page link.", "url"
         for o in (i.current_origin, i.frame_origin, i.target_origin):
             if self.never_on(o):
-                return "block", "The user's site rules never allow the assistant here.", "never"
+                return "block", never_reason(o), "never"
         el = i.element
         name = el.name if el is not None else ""
         risky = bool(el is not None and (el.is_password or el.is_payment or risky_words(name))) \
@@ -154,6 +182,7 @@ class SimAgent:
         self.history = []          # chat messages (user/assistant text only, like the page sends)
         self.read_set = set()      # d19: persists across turns of one conversation
         self.card_seq = 0
+        self.send_seq = 0
         self.answers, self.shown_links = [], set()
 
     def _model(self, messages):
@@ -168,17 +197,37 @@ class SimAgent:
             return rac_wire.read_stream(r.read().decode(), set(TOOL_NAMES))
 
     def run_turn(self, user_text, attached_aliases):
-        events, reply = [], ""
+        events, reply, notes = [], "", []
         self.history.append({"role": "user", "content": user_text})
         user_msgs = [m["content"] for m in self.history if m["role"] == "user"]
         attached = [self.browser.tab(a) for a in attached_aliases]
+        self.send_seq += 1
+        guard = Guard(self.prefs.get("level", "auto"), self.prefs.get("site_rules", {}), self.d19,
+                      user_msgs, set())
+        if self.d19:
+            # Never sites stay out of chat attachments, a never frame's host
+            # page included: the send drops the tab and the reply names the
+            # host. Today's build has no such filter.
+            never = []
+            kept = []
+            for t in attached:
+                bad = next((o for o in content_origins(t) if guard.never_on(o)), "")
+                if bad:
+                    never.append(urllib.parse.urlsplit(bad).netloc)
+                else:
+                    kept.append(t)
+            attached = kept
+            if never:
+                hosts = sorted(set(never))
+                events.append({"type": "attach_failed", "id": self.send_seq,
+                               "failed": [], "never": hosts})
+                notes += [grade.NEVER_NOTE.format(host=h) for h in hosts]
         if attached:
             # In the real build a send names the tabs the agent acts on; the
             # last attached one is current for tools that name no tab.
             self.browser.active = attached[-1].alias
         attached_origins = {sb.origin_of(t.url) for t in attached}
-        guard = Guard(self.prefs.get("level", "auto"), self.prefs.get("site_rules", {}), self.d19,
-                      user_msgs, attached_origins)
+        guard.origins |= attached_origins
         guard.read_set |= self.read_set
         guard.read_set |= attached_origins if self.d19 else set()
         self.guard = guard
@@ -208,7 +257,7 @@ class SimAgent:
         self.read_set |= guard.read_set
         self.history.append({"role": "assistant", "content": reply})
         events.append({"type": "run_state", "state": end_state})
-        return {"events": events, "reply": reply, "end_state": end_state}
+        return {"events": events, "reply": reply, "notes": notes, "end_state": end_state}
 
     # -- tools --
     def _execute(self, call, args, guard, events, attached, user_msgs):
@@ -231,17 +280,35 @@ class SimAgent:
                 # The tab the call named, or the active one after open/switch.
                 shown_tab = b.tab() if call.name in ("open_tab", "switch_tab") else tab
                 text, shown, origins = b.snapshot(shown_tab)
-                guard.urls.update(shown)
-                guard.read_set |= origins  # content reached the model
-                data["text"] = text
+                # The page the step left the tab on may show a never site (a
+                # frame, a redirect): the model doesn't get that snapshot.
+                reason = guard.read_blocked(origins)
+                if reason:
+                    data["snapshot_withheld"] = reason
+                else:
+                    guard.urls.update(shown)
+                    guard.read_set |= origins  # content reached the model
+                    data["text"] = text
             return {"ok": True, "data": data}
 
         t = call.name
         if t == "list_tabs":
             guard.read_set |= set()
             finished["guard"] = "Allowed: read"
+            tabs = b.tabs
+            if guard.d19:
+                # A never site's title is page text the model mustn't get.
+                tabs = {a: x for a, x in b.tabs.items()
+                        if not guard.never_on(sb.origin_of(x.url))}
             return done({"tabs": [{"tab_id": a, "title": x.page.title.strip(), "url": x.url}
-                                  for a, x in b.tabs.items()]})
+                                  for a, x in tabs.items()]})
+        if t in ("snapshot", "get_page_text", "find_in_page"):
+            # A never site's text doesn't go to the model — the page's own
+            # origin, or a frame's, keeps the whole read back.
+            reason = guard.read_blocked(content_origins(tab))
+            if reason:
+                finished["guard"] = "Blocked: " + reason
+                return fail("denied", reason)
         if t == "get_page_text" or t == "find_in_page":
             finished["guard"] = "Allowed: read"
             text, _s, origins = b.snapshot(tab)
