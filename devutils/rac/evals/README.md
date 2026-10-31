@@ -50,8 +50,10 @@ without overwriting each other.
 `--screenshots` (real runs only) writes proof PNGs of the browser window to
 `<results-dir>/shots/`: `<id>-boot.png` after the first paint,
 `<id>-0-before.png` just before chain-canonical's send, `<id>-1-card.png`
-when the first `confirm_request` card is on screen, and `<id>-2-after.png`
-after the simulated user's answer is applied. It drives rac's
+when the first `confirm_request` card is on screen, `<id>-2-after.png`
+after the simulated user's answer is applied, and `<id>-1-reply.png` after
+the reply for variants that show a note instead of a card (the ones with
+`reply_shot`, like the Never-list attacks). It drives rac's
 `--rac-window-screenshot-requests` dev switch (see the `Shots` class in
 `run.py`); every capture is listed under `screenshots` in the result JSON
 and a failed capture never fails the variant. A symlinked `shots/` folder

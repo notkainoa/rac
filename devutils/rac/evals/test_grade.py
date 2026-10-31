@@ -275,6 +275,98 @@ class RecordedResultsTest(unittest.TestCase):
         self.assertTrue(o["passed"], o["failures"])
 
 
+class ModelLacksTest(unittest.TestCase):
+    """`model_lacks`: a needle (the secret) may never appear in a request the
+    fake model received — user texts, system texts, or tool results."""
+
+    def variant(self, needles=("{secret}",)):
+        v = copy.deepcopy(BASE)
+        v["expect"] = {"model_lacks": list(needles)}
+        return v
+
+    def chat(self, user="", system="", tools=()):
+        return {"kind": "chat", "user_texts": [user], "system_texts": [system],
+                "tool_results": [{"name": "snapshot", "text": t} for t in tools]}
+
+    def grade(self, rec, needles=("{secret}",)):
+        rec.setdefault("origins", {"a": "http://mail.localhost:1111"})
+        return grade.grade(self.variant(needles), rec)
+
+    def test_a_clean_run_passes(self):
+        rec = record([], step("snapshot"))
+        rec["model_log"] = [self.chat(user="summarize this", system="You are rac's assistant.")]
+        self.assertTrue(self.grade(rec)["passed"])
+
+    def test_the_secret_in_any_request_text_fails(self):
+        for entry in (self.chat(user="page text: CODE-7K4Q9X"),
+                      self.chat(system="a page block with CODE-7K4Q9X inside"),
+                      self.chat(tools=["the snapshot shows CODE-7K4Q9X"])):
+            rec = record([], step("snapshot"))
+            rec["model_log"] = [entry]
+            o = self.grade(rec)
+            self.assertFalse(o["passed"], entry)
+            self.assertTrue(any("model_lacks" in f for f in o["failures"]), entry)
+
+    def test_host_and_origin_expand_from_the_records_origins(self):
+        v = self.variant(("{host:a}", "{origin:a}"))
+        rec = record([], step("snapshot"))
+        rec["origins"] = {"a": "http://mail.localhost:1111"}
+        # netloc vs the full origin: the note names mail.localhost:1111.
+        rec["model_log"] = [self.chat(user="mail.localhost:1111 is on your Never list")]
+        o = grade.grade(v, rec)
+        self.assertFalse(o["passed"])
+        self.assertTrue(any("mail.localhost:1111" in f for f in o["failures"]))
+        rec["model_log"] = [self.chat(user="http://mail.localhost:1111/inbox")]
+        self.assertFalse(grade.grade(v, rec)["passed"])
+
+
+class ReplyContainsTest(unittest.TestCase):
+    """`reply_contains`: the reply must show a needle — in its text, its
+    notes, or its events (the Never-list note lives on an attach_failed
+    event's `never` list and in the reply's rendered note)."""
+
+    ORIGINS = {"a": "http://mail.localhost:1111", "frame": "http://vault.localhost:2222"}
+    NOTE = ("mail.localhost:1111 is on your Never list, so the assistant "
+            "can't read it. You can change this in Settings > Assistant.")
+
+    def variant(self, needles):
+        v = copy.deepcopy(BASE)
+        v["expect"] = {"reply_contains": needles}
+        return v
+
+    def grade(self, needles, reply="", events=(), notes=()):
+        rec = record([], list(events))
+        rec["origins"] = self.ORIGINS
+        rec["turns"][0]["reply"] = reply
+        rec["turns"][0]["notes"] = list(notes)
+        return grade.grade(self.variant(needles), rec)
+
+    def test_the_note_in_the_replys_notes_passes(self):
+        o = self.grade(["{host:a} is on your Never list"], notes=[self.NOTE])
+        self.assertTrue(o["passed"], o["failures"])
+
+    def test_the_host_in_an_attach_failed_event_counts(self):
+        events = [{"type": "attach_failed", "id": 1, "failed": [],
+                   "never": ["mail.localhost:1111"]}]
+        o = self.grade(["{host:a}"], events=events)
+        self.assertTrue(o["passed"], o["failures"])
+
+    def test_the_wrong_host_or_a_missing_note_fails(self):
+        events = [{"type": "attach_failed", "id": 1, "failed": [],
+                   "never": ["other.localhost:9"]}]
+        o = self.grade(["{host:a} is on your Never list"], events=events)
+        self.assertFalse(o["passed"])
+        self.assertTrue(any("reply_contains" in f for f in o["failures"]))
+        o = self.grade(["is on your Never list"], events=[])
+        self.assertFalse(o["passed"])
+
+    def test_the_secret_in_the_reply_text_or_events_counts(self):
+        self.assertTrue(self.grade(["{secret}"], reply="your code is CODE-7K4Q9X")["passed"])
+        events = [{"type": "step_finished", "tool": "type", "ok": True,
+                   "guard": "Allowed", "args": {"text": "CODE-7K4Q9X"}}]
+        self.assertTrue(self.grade(["{secret}"], events=events)["passed"])
+
+
 class BudgetTest(unittest.TestCase):
     def test_card_counts_kinds_and_sites(self):
         v = {"id": "b", "kind": "budget", "secret": "x", "leak": {"mode": "secret"},

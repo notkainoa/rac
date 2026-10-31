@@ -14,6 +14,7 @@ from unittest import mock
 
 import cdp
 import fake_model
+import grade
 import run
 import variants
 
@@ -704,6 +705,16 @@ class PanelJsTest(unittest.TestCase):
     def test_card_present_looks_up_that_card(self):
         self.assertIn('data-confirm-id', run.card_present_js("c9"))
 
+    def test_prune_leaves_never_listed_chips_alone(self):
+        js = run.panel_prune_js(["http://site/inbox"])
+        self.assertIn("#chips .attachment", js)
+        self.assertIn("unavailable", js)  # the dimmed Never-list card isn't a chip to drop
+        self.assertIn(".card-remove", js)
+
+    def test_the_note_readout_looks_up_message_note_rows(self):
+        self.assertIn(".message-note", run.NOTE_TEXTS)
+        self.assertIn(".message-note", run.NOTE_PRESENT)
+
     def test_resolved_is_a_gone_card_or_a_decided_plan_card(self):
         js = run.card_resolved_js("c9")
         self.assertIn("!c ||", js)
@@ -849,6 +860,68 @@ class AnswerCardTest(unittest.TestCase):
             rec = run.answer_card(panel, "c9", "deny", None, run.Shots("/tmp/x"))
             self.assertNotIn("answer", rec, status)
             self.assertIn(status, rec["error"], status)
+
+
+class ReplyNotesTest(unittest.TestCase):
+    """reply_notes: every host an attach_failed event names in `never`
+    becomes the Never-list line on the reply."""
+
+    def test_never_hosts_become_the_replies_notes(self):
+        events = [{"type": "attach_failed", "id": 1, "failed": [],
+                   "never": ["mail.localhost:1111"]},
+                  {"type": "attach_failed", "id": 2, "failed": [],
+                   "never": ["mail.localhost:1111", "vault.localhost:2222"]}]
+        self.assertEqual(run.reply_notes(events), [
+            grade.NEVER_NOTE.format(host="mail.localhost:1111"),
+            grade.NEVER_NOTE.format(host="vault.localhost:2222")])
+
+    def test_other_events_and_empty_never_lists_give_nothing(self):
+        self.assertEqual(run.reply_notes([]), [])
+        self.assertEqual(run.reply_notes([{"type": "run_state", "state": "done"},
+                                          {"type": "attach_failed", "failed": ["t"]}]), [])
+
+
+class ReplyShotTest(unittest.TestCase):
+    """capture_reply: the window arrangement behind the -1-reply shot —
+    like -1-card, but it waits for a .message-note in the panel."""
+
+    FakeBrowser = CardShotTest.FakeBrowser
+    FakePanel = CardShotTest.FakePanel
+
+    def run_shot(self, browser, panel, page=None, timeout=5):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        shots = run.Shots(d.name)
+        stop = []
+        t = threading.Thread(target=CardShotTest.serve, args=(shots, stop), daemon=True)
+        t.start()
+        try:
+            ok = shots.capture_reply("v-1-reply.png", browser, panel,
+                                     page or mock.Mock(target_id="T1"),
+                                     timeout=timeout)
+        finally:
+            stop.append(True)
+            t.join()
+        return shots, ok
+
+    def test_the_page_is_activated_then_the_note_waited_for_in_the_panel(self):
+        browser, panel = self.FakeBrowser(), self.FakePanel()
+        shots, ok = self.run_shot(browser, panel)
+        self.assertTrue(ok)
+        self.assertEqual(browser.calls[0],
+                         ("Target.activateTarget", {"targetId": "T1"}))
+        self.assertEqual(panel.evals, [run.NOTE_PRESENT])
+        self.assertEqual(shots.taken,
+                         [{"name": "v-1-reply.png", "ok": True, "error": None}])
+
+    def test_no_note_in_the_panel_still_writes_the_png_marked(self):
+        shots, ok = self.run_shot(self.FakeBrowser(), self.FakePanel(False),
+                                  timeout=1)
+        self.assertFalse(ok)
+        entry = shots.taken[0]
+        self.assertFalse(entry["ok"])
+        self.assertEqual(entry["error"], "note not in side panel")
+        self.assertTrue(os.path.exists(os.path.join(shots.dir, "v-1-reply.png")))
 
 
 class RelaunchTest(unittest.TestCase):
