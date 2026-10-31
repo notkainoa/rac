@@ -147,9 +147,10 @@ build then recompiles all of Chromium. `push` a committed worktree to its
 clone (a new clone waits for the base's finished build), `build` it
 through the queue under `nice` with four cores left free,
 `run -- --rac-window-screenshot=x.png` for a background browser with its
-own profile (the shot lands in the clone's `build/shots/`), and `pull`
-files back. Nobody builds rac natively on the Pro: every build there
-goes through `remote-build.sh`. An Xcode update on a build machine
+own profile (the shot lands in the clone's `build/shots/`), `evals` for
+the agent-safety eval suite (see [below](#agent-evals-on-the-pro)), and
+`pull` files back. Nobody builds rac natively on the Pro: every build
+there goes through `remote-build.sh`. An Xcode update on a build machine
 invalidates every tree built there (new compiler flags and SDK path), so
 keep Xcode pinned on build machines; `build`, `run` and `push` refuse when
 the Pro's Xcode differs from the one its base recorded.
@@ -205,6 +206,42 @@ before launch, but a path swapped for a symlink between the check and the
 browser reading it isn't caught — accepted, since our own agents write
 the scripts. A `sandbox-exec` profile for remote runs is the planned
 longer-term fix.
+
+### Agent evals on the Pro
+
+`evals <worktree>` runs Core's agent-safety eval runner
+(`devutils/rac/evals/run.py`, stdlib Python) against the clone's built
+browser. The runner is reviewed code fetched from a branch, not an
+agent-written script — that is why this verb alone may hand the browser a
+remote-debugging port. The verb fetches `--ref`'s branch (default
+`feat/agent-evals`) from the rac repo's GitHub URL into the bare
+`~/rac-remote/rac.git`, extracts only the `devutils/rac/evals` subtree
+into a fresh `~/rac-remote/evals/<clone>` (one per clone, so two clones'
+evals can't clobber each other), and runs it from there with `python3 -I`
+under one run slot held for the whole eval (`--timeout`, 1 to 14400s,
+default 3600s, queue wait included). The clone must have a built browser
+and no browser from it running.
+
+The runner starts its own servers on 127.0.0.1 and launches
+`build/src/out/Default/rac.app/Contents/MacOS/rac` directly — never
+`worktree.sh run`, no UI DevTools, no `--remote-allow-origins` — with a
+throwaway profile under the clone's `build/` (its `TMPDIR` is
+`build/evals/tmp`), one launch at a time, killing each before the next.
+Core owns that side of the runner. `RAC_EVALS_NO_QUEUE=1` keeps it from
+taking a second queue slot for those launches, and the verb's allowlist
+after `--` (`--gate`, `--keep-profile`, `--screenshots`, `--list`,
+`--variants=<ids>`, `--host-mode=names|loopback`) is all that reaches it. When the runner
+ends, fails, times out, or is interrupted, the verb kills its process
+group and every browser from the clone, then exits with the runner's own
+status.
+
+Results land in the clone's `build/evals/results`, and `--screenshots`
+PNGs in `build/evals/results/shots` (old `*.json` and `*.png` there are
+cleared first). Fetch them with:
+
+```sh
+devutils/rac/remote-build.sh pull <worktree> build/evals/results <local dir>
+```
 
 ## Updating the base
 

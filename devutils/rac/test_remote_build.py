@@ -316,6 +316,46 @@ if log:
     with open(log, 'a') as f:
         f.write('%s ' + ' '.join(sys.argv[1:]) + '\\n')
 '''
+# The evals runner stand-in, committed on the fixture repo's
+# feat/agent-evals branch and extracted by `evals` through git archive:
+# it logs its argv and the env the verb promises it, writes a result JSON
+# into --results-dir, and can fake a browser-launching, long-running eval
+# for the timeout test (RUNPY_BROWSER, RUNPY_SLEEP, RUNPY_EXIT).
+STUB_RUN_PY = '''\
+import json, os, subprocess, sys, time
+# Like the real run.py's `import cdp`: a sibling module, which python3 -I
+# alone would not find.
+import evalslib
+log = os.environ.get('RAC_FAKE_LOG')
+if log:
+    with open(log, 'a') as f:
+        f.write('run.py ' + ' '.join(sys.argv[1:]) + '\\n')
+        f.write('run.py isolated=%d sibling=%s\\n' % (
+            sys.flags.isolated, evalslib.NAME))
+        f.write('run.py env RAC_EVALS_NO_QUEUE=%s TMPDIR=%s\\n' % (
+            os.environ.get('RAC_EVALS_NO_QUEUE', ''),
+            os.environ.get('TMPDIR', '')))
+args = sys.argv[1:]
+if '--list' in args:
+    sys.exit(0)
+worktree, results = '', ''
+for i, arg in enumerate(args):
+    if arg == '--worktree':
+        worktree = args[i + 1]
+    elif arg == '--results-dir':
+        results = args[i + 1]
+if results:
+    os.makedirs(results, exist_ok=True)
+    with open(os.path.join(results, 'result.json'), 'w') as f:
+        json.dump({'ok': True}, f)
+if os.environ.get('RUNPY_BROWSER'):
+    subprocess.Popen([worktree +
+                      '/build/src/out/Default/rac.app/Contents/MacOS/rac'])
+nap = float(os.environ.get('RUNPY_SLEEP', '0'))
+if nap:
+    time.sleep(nap)
+sys.exit(int(os.environ.get('RUNPY_EXIT', '0')))
+'''
 
 
 def git(repo, *args, check=True):
@@ -2192,6 +2232,337 @@ class RunTest(RemoteBuildTest):
             if a.poll() is None:
                 a.kill()
                 a.communicate()
+
+
+@unittest.skipUnless(sys.platform == 'darwin',
+                    'remote-build.sh drives macOS hosts')
+class EvalsTest(RemoteBuildTest):
+    """evals: fetches the reviewed runner from a GitHub branch into the
+    Pro's bare rac.git, extracts only its devutils/rac/evals tree, and
+    runs it against the clone's built browser under one run slot.
+    RAC_REMOTE_REPO_URL points the fetch at a local fixture so nothing
+    here touches the network."""
+
+    def setUp(self):
+        super().setUp()
+        self.remote_root = self.seed_remote()
+        self.clone = self.remote_clone('feature')
+        self.wt = self.make_repo(self.folder / 'feature', branch='feat/x')
+        # The GitHub stand-in: the same repo fixture, plus the runner and
+        # a fixture page on feat/agent-evals, plus a file outside the
+        # evals subtree that must never be extracted.
+        self.origin = self.make_repo(self.folder / 'gh-rac')
+        git(self.origin, 'checkout', '-q', '-b', 'feat/agent-evals')
+        write(self.origin / 'devutils/rac/evals/run.py', STUB_RUN_PY)
+        write(self.origin / 'devutils/rac/evals/evalslib.py',
+              "NAME = 'evalslib'\n")
+        write(self.origin / 'devutils/rac/evals/fixtures/hostile.html',
+              '<title>fixture</title>\n')
+        write(self.origin / 'not-evals.txt', 'outside the subtree\n')
+        git(self.origin, 'add', '-A')
+        git(self.origin, 'commit', '-qm', 'evals runner')
+        self.runner_sha = git(self.origin, 'rev-parse',
+                              'feat/agent-evals').stdout.strip()
+
+    def run_evals(self, *args, **env):
+        env.setdefault('RAC_REMOTE_REPO_URL', str(self.origin))
+        return self.run_rb('evals', self.wt, *args, **env)
+
+    def test_evals_fetches_extracts_and_runs_the_runner(self):
+        result = self.run_evals('--ref', 'feat/agent-evals', '--', '--gate',
+                                '--variants=a1,b2', '--host-mode', 'loopback',
+                                success=True)
+        clone = os.path.realpath(self.clone)
+        calls = self.calls()
+        # The whole eval holds one run slot, niced and deprioritized.
+        self.assertIn('nice -n 10', calls)
+        self.assertIn('taskpolicy -c utility', calls)
+        self.assertIn('queue --run', calls)
+        # ...which runs the extracted run.py under `python3 -I` with the
+        # verb-owned arguments plus the allowlisted ones.
+        runner = self.remote_root / 'evals/feature'
+        self.assertIn('python3 -I -c', calls)
+        self.assertIn(f'{runner}/devutils/rac/evals/run.py --worktree', calls)
+        self.assertIn(f'--worktree {clone}', calls)
+        self.assertIn(f'--results-dir {clone}/build/evals/results', calls)
+        for arg in ('--gate', '--variants=a1,b2', '--host-mode loopback'):
+            self.assertIn(arg, calls, arg)
+        # The runner saw the env that keeps it off the queue and inside
+        # the clone for temp files.
+        self.assertIn('run.py env RAC_EVALS_NO_QUEUE=1 '
+                      f'TMPDIR={clone}/build/evals/tmp', calls)
+        # Only the runner's own subtree was extracted, into a fresh dir.
+        self.assertEqual([p.name for p in runner.iterdir()], ['devutils'])
+        self.assertTrue((runner / 'devutils/rac/evals/run.py').exists())
+        self.assertTrue(
+            (runner / 'devutils/rac/evals/fixtures/hostile.html').exists())
+        self.assertFalse((runner / 'not-evals.txt').exists())
+        self.assertFalse((runner / 'devutils/rac/worktree.sh').exists())
+        # The resolved commit printed, and where results are + the pull.
+        self.assertIn(self.runner_sha, result.stderr)
+        self.assertIn('build/evals/results', result.stderr)
+        self.assertIn('pull', result.stderr)
+        self.assertEqual(
+            json.loads(
+                (self.clone / 'build/evals/results/result.json').read_text()),
+            {'ok': True})
+
+    def test_evals_uses_the_default_ref(self):
+        result = self.run_evals(success=True)
+        self.assertIn('feat/agent-evals', result.stderr)
+        self.assertIn(self.runner_sha, result.stderr)
+
+    def test_evals_accepts_the_allowlisted_args(self):
+        self.run_evals('--', '--gate', '--keep-profile', '--screenshots',
+                       '--variants=a1,b2',
+                       '--variants', 'c3-d4,e5', '--host-mode=names',
+                       '--host-mode', 'loopback', '--list', success=True)
+        calls = self.calls()
+        for arg in ('--gate', '--keep-profile', '--screenshots', '--variants=a1,b2',
+                    '--variants c3-d4,e5', '--host-mode=names',
+                    '--host-mode loopback', '--list'):
+            self.assertIn(arg, calls, arg)
+
+    def test_evals_refuses_bad_refs(self):
+        for ref in ('../x', '-x', 'a..b', '/abs', '', 'x;', 'a b', '$HOME'):
+            result = self.run_evals('--ref', ref, success=False)
+            self.assertIn('branch', result.stderr, ref)
+        self.assertEqual(self.calls(), '')
+
+    def test_evals_refuses_disallowed_runner_args(self):
+        # Everything not on the allowlist is refused on the Air —
+        # especially the switches the verb owns or that would change
+        # where the runner reads or writes.
+        for args in (
+            ('--worktree', '/tmp/x'), ('--worktree=/tmp/x',),
+            ('--results-dir', '/tmp/x'), ('--results-dir=/tmp/x',),
+            ('--fixtures-dir', '/tmp/x'), ('--fixtures-dir=/tmp/x',),
+            ('--baseline',), ('--baseline=/tmp/x',),
+            ('--post-status',), ('--post-status=x',),
+            ('--dry-run',), ('--list=x',),
+            ('--remote-debugging-port=9222',),
+            ('--remote-debugging-address=0.0.0.0',),
+            ('--remote-allow-origins=*',),
+            ('--foo',), ('-x',), ('bareword',), ('--',),
+            ('--host-mode=weird',), ('--host-mode', 'weird'),
+            ('--host-mode=',), ('--host-mode', '--gate'),
+            ('--variants=a b',), ('--variants=',), ('--variants', 'a;b'),
+            # An id list that reads as the runner's next switch.
+            ('--variants', '--dry-run'), ('--variants', '-x'),
+            ('--variants=-x',),
+            ('--keep-profile=x',), ('--gate=x',), ('--screenshots=x',),
+            ('--screenshot',),
+        ):
+            result = self.run_evals('--', *args, success=False)
+            self.assertEqual(result.returncode, 2, (args, result.stderr))
+        self.assertEqual(self.calls(), '')
+        # Missing values for the two-word forms die, not refuse.
+        for args in (('--variants',), ('--host-mode',)):
+            result = self.run_evals('--', *args, success=False)
+
+    def test_evals_refuses_unknown_verb_options(self):
+        for args in (('--bogus',), ('--ref',), ('--timeout',),
+                     ('--timeout', 'abc'), ('--timeout', '-5'),
+                     ('--timeout=5',), ('positional',)):
+            result = self.run_evals(*args, success=False)
+        self.assertEqual(self.calls(), '')
+        # The timeout cap is 14400 seconds; more is refused here.
+        result = self.run_evals('--timeout', '14401', success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('14400', result.stderr)
+        self.assertEqual(self.calls(), '')
+
+    def test_evals_refuses_without_a_built_browser(self):
+        (self.clone / 'build/src/out/Default/rac.app/Contents/MacOS/rac'
+         ).unlink()
+        result = self.run_evals(success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('no built browser', result.stderr)
+        self.assertNotIn('run.py', self.calls())
+
+    def test_evals_refuses_while_a_clone_browser_runs(self):
+        app = f'{self.clone}/build/src/out/Default/rac.app/'
+        rogue = subprocess.Popen(
+            ['bash', '-c', 'exec -a "$1" sleep 300', '_',
+             f'{app}Contents/MacOS/rac'])
+        self.addCleanup(lambda: (rogue.kill(), rogue.wait()))
+        time.sleep(0.3)
+        result = self.run_evals(success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('a browser from this clone is running', result.stderr)
+        self.assertIsNone(rogue.poll())
+        self.assertNotIn('run.py', self.calls())
+
+    def test_evals_refuses_while_the_clone_is_busy(self):
+        slot = self.remote_root / 'build-queue/build-1'
+        slot.mkdir(parents=True)
+        (slot / 'holder.json').write_text(json.dumps({
+            'pid': os.getpid(), 'pgid': None,
+            'worktree': os.path.realpath(self.clone),
+            'kind': 'build', 'command': 'he build'}) + '\n')
+        result = self.run_evals(success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('queue', result.stderr)
+        self.assertNotIn('run.py', self.calls())
+
+    def test_evals_refuses_a_symlinked_evals_dir(self):
+        outside = self.folder / 'outside'
+        outside.mkdir()
+        (self.clone / 'build').mkdir(exist_ok=True)
+        (self.clone / 'build/evals').symlink_to(outside)
+        result = self.run_evals(success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('symlink', result.stderr)
+        self.assertFalse((outside / 'results').exists())
+        self.assertNotIn('run.py', self.calls())
+
+    def test_evals_recreates_runner_and_refuses_its_symlink(self):
+        runner = self.remote_root / 'evals/feature'
+        write(runner / 'stale.txt', 'old\n')
+        write(runner / 'devutils/rac/evals/stale.py', 'old\n')
+        self.run_evals(success=True)
+        self.assertFalse((runner / 'stale.txt').exists())
+        self.assertFalse((runner / 'devutils/rac/evals/stale.py').exists())
+        self.assertTrue((runner / 'devutils/rac/evals/run.py').exists())
+        # A planted symlink where the runner lands is refused, not
+        # followed out of ~/rac-remote.
+        shutil.rmtree(runner)
+        runner.symlink_to(self.folder / 'elsewhere')
+        result = self.run_evals(success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('symlink', result.stderr)
+
+    def test_evals_clears_old_results_but_only_json(self):
+        results = self.clone / 'build/evals/results'
+        write(results / 'old.json', '{}\n')
+        write(results / 'keep.txt', 'x\n')
+        write(results / 'sub/inner.json', '{}\n')
+        self.run_evals(success=True)
+        self.assertFalse((results / 'old.json').exists())
+        self.assertTrue((results / 'keep.txt').exists())
+        # Not recursive: a nested file is the runner's to keep or clean.
+        self.assertTrue((results / 'sub/inner.json').exists())
+        self.assertTrue((results / 'result.json').exists())
+
+    def test_evals_fails_when_the_branch_is_missing(self):
+        result = self.run_evals('--ref', 'no-such-branch', success=False)
+        self.assertIn('no-such-branch', result.stderr)
+        self.assertNotIn('run.py', self.calls())
+
+    def test_evals_exit_status_is_the_runners(self):
+        result = self.run_evals(success=False, RUNPY_EXIT='7')
+        self.assertEqual(result.returncode, 7)
+
+    def test_evals_timeout_kills_the_runner_and_its_browser(self):
+        app = f'{self.clone}/build/src/out/Default/rac.app/'
+        started = time.monotonic()
+        result = self.run_evals('--timeout', '4', success=False,
+                                RUNPY_SLEEP='300', RUNPY_BROWSER='1')
+        self.assertLess(time.monotonic() - started, 120, result.stderr)
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertIn('timeout', result.stderr)
+        # The runner and its browser went down with it.
+        self.assertEqual(self.procs_starting(app), [])
+        self.assertEqual(self.runner_procs(), [])
+
+    def runner_procs(self, name='feature'):
+        """PIDs running from clone `name`'s extracted runner."""
+        path = f'{self.remote_root}/evals/{name}/'
+        out = subprocess.run(['ps', '-axo', 'pid=,command='],
+                             capture_output=True, text=True).stdout
+        found = []
+        for line in out.splitlines():
+            pid, _, command = line.strip().partition(' ')
+            if pid.isdigit() and path in command:
+                found.append(int(pid))
+        return found
+
+    def test_evals_runner_imports_its_own_modules_under_isolated_python(self):
+        # python3 -I leaves the script's folder off sys.path; the real
+        # run.py imports cdp, grade and the rest from beside itself.
+        self.run_evals(success=True)
+        self.assertIn('run.py isolated=1 sibling=evalslib', self.calls())
+
+    def test_evals_refuses_zero_padded_and_huge_timeouts(self):
+        for timeout in ('0', '00', '010', '0300', '100000',
+                        '99999999999999999999'):
+            result = self.run_evals('--timeout', timeout, success=False)
+            self.assertEqual(result.returncode, 2, (timeout, result.stderr))
+        self.assertEqual(self.calls(), '')
+        self.run_evals('--timeout', '14400', success=True)
+
+    def test_evals_interrupt_kills_the_runner_and_its_browser(self):
+        app = f'{self.clone}/build/src/out/Default/rac.app/'
+        proc = subprocess.Popen(
+            ['/bin/bash', SCRIPT, 'evals', str(self.wt), '--timeout', '300'],
+            env=self.env(RAC_REMOTE_REPO_URL=str(self.origin),
+                         RUNPY_SLEEP='300', RUNPY_BROWSER='1'),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        try:
+            self.wait_for(lambda: self.procs_starting(app), timeout=30)
+            self.assertTrue(self.runner_procs())
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.communicate(timeout=60)
+            # The verb's own trap stopped them; reap only mops up after a
+            # failure.
+            self.wait_for(lambda: not self.procs_starting(app)
+                          and not self.runner_procs())
+        finally:
+            self.reap(proc, app)
+
+    def reap(self, proc, app):
+        """Ends a backgrounded evals run whatever state a failed test left
+        it in, so no stand-in outlives the test holding its pipes."""
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+        for pid in self.procs_starting(app) + self.runner_procs():
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if proc.stdout and not proc.stdout.closed:
+            proc.communicate(timeout=30)
+
+    def test_evals_on_another_clone_leaves_this_eval_alone(self):
+        self.remote_clone('other')
+        other_wt = self.make_repo(self.folder / 'other', branch='feat/y')
+        app = f'{self.clone}/build/src/out/Default/rac.app/'
+        proc = subprocess.Popen(
+            ['/bin/bash', SCRIPT, 'evals', str(self.wt), '--timeout', '300'],
+            env=self.env(RAC_REMOTE_REPO_URL=str(self.origin),
+                         RUNPY_SLEEP='300', RUNPY_BROWSER='1'),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        try:
+            self.wait_for(lambda: self.procs_starting(app), timeout=30)
+            runner_pids = self.runner_procs()
+            browser_pids = self.procs_starting(app)
+            self.assertTrue(runner_pids)
+            # The other clone's eval runs start to finish meanwhile: its
+            # fresh extraction and its cleanup stay in its own runner dir.
+            self.run_rb('evals', other_wt, success=True,
+                        RAC_REMOTE_REPO_URL=str(self.origin))
+            self.assertTrue(self.runner_procs('other') == [])
+            self.assertEqual(self.runner_procs(), runner_pids)
+            self.assertEqual(self.procs_starting(app), browser_pids)
+            self.assertTrue((self.remote_root /
+                             'evals/feature/devutils/rac/evals/run.py').exists())
+            self.assertIsNone(proc.poll())
+        finally:
+            self.reap(proc, app)
+
+    def test_evals_is_in_the_usage(self):
+        result = self.run_rb('--help', success=True)
+        self.assertIn('evals', result.stdout)
 
 
 @unittest.skipUnless(sys.platform == 'darwin',
