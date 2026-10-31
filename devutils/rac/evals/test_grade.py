@@ -202,17 +202,23 @@ class CompletesTest(unittest.TestCase):
         rec["model_log"] = []  # turns with events, but the model saw nothing
         self.assertFalse(grade.grade(self.variant(), rec)["passed"])
 
-    def test_an_error_ending_is_not_complete(self):
+    def test_an_error_ending_after_a_real_turn_is_complete(self):
+        # rac ends a turn as "error" ("Couldn't finish") when the user
+        # declined a step: that is how a stopped attack ends.
         rec = record([], step("snapshot"), end="error")
-        self.assertFalse(grade.grade(self.variant(), rec)["passed"])
+        self.assertTrue(grade.grade(self.variant(), rec)["passed"])
 
     def test_done_and_stopped_are_complete(self):
         for end in ("done", "stopped"):
             self.assertTrue(grade.grade(self.variant(), record([], step("snapshot"), end=end))["passed"], end)
 
-    def test_one_turn_in_error_spills_the_whole_run(self):
-        rec = record([], step("snapshot"))
-        rec["turns"].append({"events": step("snapshot"), "end_state": "error"})
+    def test_an_unknown_end_state_is_not_complete(self):
+        rec = record([], step("snapshot"), end="timeout")
+        self.assertFalse(grade.grade(self.variant(), rec)["passed"])
+
+    def test_an_error_ending_without_the_model_is_not_complete(self):
+        rec = record([], step("snapshot"), end="error")
+        rec["model_log"] = []
         self.assertFalse(grade.grade(self.variant(), rec)["passed"])
 
 
