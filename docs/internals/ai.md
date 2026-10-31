@@ -407,11 +407,20 @@ only from the card.
 ### The guard
 
 `ActionGuard::Evaluate` decides allow, plan, confirm, or block for every
-action before `ActionRunner::Run`, from a permission level and the user's
-site rules. `Dispatch` evaluates it again for blocks just before running.
-The level is `rac.ai.agent_permission_level`, read once per turn in
-`BeginTurn`, so turning AI off costs nothing extra; it applies to both run
-modes because the direct loop and the MCP tools both enter the controller.
+action before `ActionRunner::Run`, from a permission level, the user's site
+rules, and what the model has read. `Dispatch` evaluates it again for blocks
+just before running. It applies to both run modes because the direct loop
+and the MCP tools both enter the controller.
+
+The level is `rac.ai.agent_permission_level`. `Authorize` reads it and the
+site rules again before every step, so a change in Settings applies from the
+next step of a running task. Site rules also apply the moment the pref
+changes, so a new never rule stops the next judgment, including the answer
+to a card that is already open. The level never loosens under an open card.
+A confirm card is judged again at the level it was shown at. An approved
+plan card's step is judged at the card's level, or at a stricter one the
+user picked while it was open (`ActionGuard::HoldLevel`), never a looser
+one. Only a running turn uses these prefs, so AI off costs nothing extra.
 
 **Block** (no level overrides it): an unknown tool, closing a tab the user
 opened, a download, a URL that isn't http(s), a URL that did not come from a
@@ -439,9 +448,14 @@ never counts as named.
 | Scroll, wait for the page, switch tabs | free | like a click | free |
 | Click or type on a named site | asks | plan card once, then the critic checks each step | free |
 | Navigate or click to a site the user didn't name | asks | asks | free |
-| Typing text that isn't in the user's messages | asks | asks | asks only on a site the user didn't name |
+| Typing text that isn't, exactly, in the user's message this turn | asks | asks | asks only on a site the user didn't name |
 | A plain text field or a select | asks | asks (the critic can't judge it) | free |
 | Risky (the list above) | asks | asks | asks |
+| Once it has read a site: a click, a select, Enter, Back, a page link, or typing the model's text, seen by a site that hasn't seen what it read | asks | asks | asks |
+| Once it has read a site: scroll the page, switch tabs, a URL the user typed, or the user's own words on a named site, seen by such a site | as above, at most 12 free a turn, then asks | same | same |
+
+The last two rows are the data-flow rule (below). They sit on top of the
+others: a step another row lets through can still ask under them.
 
 - `ask` is one confirmation per action that can change something, no plan
   card, no critic.
@@ -452,37 +466,129 @@ never counts as named.
 - `auto`, the default, decides from the table alone: no plan card, and the
   critic is neither needed nor started.
 
+**What it read.** Each conversation keeps a read set: the origins whose
+content reached the model, from attached tabs, chat attachments, snapshots
+(including the one after each action), page text, find, and the tab list's
+titles. Two sources have no origin. `earlier` stands for earlier turns this
+browser session has no record of (a restart, a dropped record, browser
+control turned off and on), and `files` for text files the user attached.
+A step that can carry something the model chose (a click, a select, Enter,
+Back, a page link, typing text that isn't the user's own words or that
+lands outside the sites the user named) asks, at every level, when a site
+that sees it hasn't been allowed everything in the read set. The sites that
+see a step are the page, the frame, and where its request goes. A page
+never counts as a source for itself. So the first link to a new site asks:
+which link is a choice, and the new site hasn't seen what was read. A URL
+the user typed carries nothing.
+
+The card names both sides ("It read a.example. This step could carry that
+to b.example."). Its grant button, "Let it act on <site> using what it read
+on <sites>", lets each destination the card named receive the sources the
+card showed, for the rest of the conversation, and nothing else. A site read
+later is a new source, so the next step that could carry it asks again. A
+grant is offered only when it covers exactly what the card shows: at most
+two destinations, all http(s) (an opaque frame gets Allow once only), at
+most eight sites read (`earlier` and `files` are named in words and don't
+count), and not a risky step. `ask` never offers one, since a grant
+wouldn't skip a card there. Past 256 sites the read set stops growing: a new
+site counts as `earlier`, and every grant that covered `earlier` loses it.
+
+The other steps still pick among options a page sees: which tab comes
+forward, which way it scrolls, which field gets the user's words. Seen by a
+site that hasn't seen the read set, they are free for 12 steps a turn
+(`kFreeStepsPerTurn`), and then each asks with the same card. A free scroll
+moves the page itself. A scroll that names an element asks with the same
+card, free steps left or not: a page can build hundreds of scrollable boxes,
+so which one moves would spell a byte a step. A scroll that counts as a free
+step, or that a card allowed once, moves by a fixed 600 DIP step in the
+direction asked, so the distance can't spell anything. Waiting is free and
+uncounted. What still gets through is in Open concerns.
+
 **Site rules** (`rac.ai.agent_site_rules`, origin to `always` or `never`)
 sit on top of any level. `always` makes the origin count as named, so the
-`auto` typing rule and `careful`'s site check pass; risky actions still
-ask, and it covers only that exact origin. `never` blocks every action on
-the site, on any scheme or port, with a reason that names Settings ›
-Assistant. Reads stay free there. In Settings › Assistant the user adds a
-rule by typing a site (a bare host means https) and choosing Never or
-Always, and removes any rule from its chip. At `careful` and `auto`, a card
-offers "Always allow on <host>" only when a rule for the tab's site would
-settle it: the tab's site is one the user hasn't named, any frame or
-destination on another site is already named, and, at `careful`, the step
-is otherwise low risk. Answering it writes the rule for the origin the card
-showed and allows the step. A card for a risky action never offers it, and
-neither does `ask`, where a rule doesn't skip any card.
+`auto` typing rule and `careful`'s site check pass; risky actions and
+data-flow cards still ask, and it covers only that exact origin, not its
+subdomains. `never` blocks every action on the site, on any scheme or port
+and on every subdomain: a rule for `https://bank.example` also stops
+`http://bank.example:8080` and `https://www.bank.example`. The reason names
+Settings › Assistant. The agent can't read it either: a snapshot, page
+text, or find on the site, or on a page showing a frame from it, is denied,
+a snapshot after a step that lands there is withheld (and doesn't become
+the base of the next delta), and the tab list leaves the tab out.
+
+The chat reads none either, and asks the same matcher
+(`rac::agent::NeverRuleOrigin`, which the guard's `ReadBlockedReason` also
+uses) through `rac::ai::NeverReadHost`, rules re-read from the pref each
+time. An attached tab on a never site is refused before its text is read,
+and again after, when the frames it showed are known; a never frame keeps
+the whole page back, as it does for the agent. With "attach the current
+tab" on, a never site's card stays in the composer, dimmed, reading "On
+your Never list", and is never sent; the tab menu lists such tabs greyed
+out with the reason, and leaves them out of "All tabs". Find's Ask goes
+through the same send. A rule added mid-conversation drops that site's
+pages from the prompt cache (`PagePromptCache::DropNeverSites`) before the
+next send. Each refusal is a note on the reply: "<host> is on your Never
+list, so the assistant can't read it. You can change this in Settings >
+Assistant." A link summary checks the link before it fetches and the
+loaded page (redirects, frames) before the model sees it, and shows the
+same message on its card. The strings are in `chrome/app/rac_strings.grd`.
+The rules apply whether or not browser control is on, and Settings shows
+the site-rule list whenever AI is on.
+
+A rule the guard can't read counts as never for the host it names, read as
+best it can be: a value other than `always` or `never`, or `always` under
+anything but an exact origin (a path, a bare host, `*.bank.example`). A key
+that names no host is dropped. An unknown level counts as `ask`. Nothing
+reads either one as asking less. When the controller starts and whenever
+either pref changes, `NormalizeAgentPrefs` rewrites those values to what the
+guard reads them as (`ask`, `never`), so Settings shows what the guard does.
+
+In Settings › Assistant the user adds a rule by typing a site (a bare host
+means https) and choosing Never or Always, and removes any rule from its
+chip. At `careful` and `auto`, a card offers "Always allow on <host>" only
+when a rule for the tab's site would settle it: the tab's site is one the
+user hasn't named, any frame or destination on another site is already
+named, and, at `careful`, the step is otherwise low risk. Answering it
+writes the rule for the origin the card showed and allows the step. A card
+for a risky action or about what it read never offers it, and neither does
+`ask`, where a rule doesn't skip any card.
 
 **Plan.** Only `careful` shows one. The first action of a turn shows a
 plan card with the next step and the sites involved. It is not an invented
 multi-step plan. Allowing it adds those origins to the turn. It lets
 low-risk steps run on those sites. It never covers a risky step.
 
-**Confirm.** One card per action that asks, answered with Allow or Don't
-allow (the agent carries on without the step, and its row says "not
-allowed"). No default button, no keyboard shortcut for Allow. Esc stops the
-turn. Under the title is one line: the critic's reason when the critic held
-the step; otherwise a risk word and host for a purchase, send, delete,
-upload, download, or sensitive field; otherwise the guard's reason. A
-submit or a click to another site adds where it goes ("It sends the form to
-host:port"), and with no critic or risk word that sentence stands in for the
-guard's reason. None of it includes typed text. The finished step's event
-says whether the user allowed or declined it, because the step can finish
-before the answer's own reply reaches the page.
+**Confirm.** One card per action that asks. Its buttons are Allow ("Allow
+once" on a card about what it read), then "Let it act on <site> using what
+it read on <sites>" when the card offers a grant, then Don't allow (the
+agent carries on without the step, and its row says "not allowed"). "Always
+allow on <host>" follows when a site rule would settle the card. No default
+button, no keyboard shortcut for Allow. Esc stops the turn. Under the title
+is one line: the critic's reason when the critic held the step; otherwise a
+risk word and host for a purchase, send, delete, upload, download, or
+sensitive field; otherwise the guard's reason. A submit or a click to
+another site adds where it goes ("It sends the form to host:port"), and
+with no critic or risk word that sentence stands in for the guard's reason.
+A card about what it read adds the sites read and where the step could take
+them.
+
+Then the values: what the step enters; for a submit or Enter, what the form
+sends; for any other click or key, everything the agent entered on the
+page, since page script can send it. Each value is shown in full, with its
+length, in a box that scrolls, so nothing the user approves is cut short.
+The one exception is the user's own words typed into a password or payment
+field, shown as "Hidden. It's text you wrote."; the value never leaves the
+browser process for the card.
+Text the model chose for such a field is shown, because that's exactly what
+to check. Entered values are kept per document for the whole conversation
+(at most 32 documents and 64 fields each, and anything past that is
+counted, not silently dropped), because a form filled in one turn can be
+submitted in the next ("Fill it in, but let me check first"). Clearing them
+at the end of a turn would make that submit's card leave out what the form
+sends.
+
+The finished step's event says whether the user allowed or declined it,
+because the step can finish before the answer's own reply reaches the page.
 
 An approval is for the exact thing the user saw. At approval time, rac
 records the element's identity, its target URL, and for a form control the
@@ -598,8 +704,10 @@ exactly one parser.
   the time it took, the guard's decision in a few words ("Allowed: site you
   named"), and the critic's verdict for a careful step. A
   `confirm_request` carries a `risk` (for example `sensitive_field`,
-  `purchase`, `submit`, `cross_origin`, `critic`) and, when the critic held
-  the step, its note. A `summary` counts `steps`,
+  `purchase`, `submit`, `cross_origin`, `critic`); when the critic held
+  the step, its note; for a card about what it read, a `flow` (sites read,
+  destinations, `earlier`, `files`, and whether it offers a grant); and the
+  `values` the card shows. A `summary` counts `steps`,
   `confirmed`, and `failed`. A turn whose actions all failed ends in
   `error` ("Couldn't finish"), so the footer never says "Done" when
   nothing worked. Only `step_finished` with `ok` says a step happened: a
@@ -625,8 +733,8 @@ exactly one parser.
   no edge: what it will do, one line on what could happen and where, and
   the buttons. Stop stays in the composer.
 - Decisions go back with `racAiAgentRespond(id, decision)`. There are two
-  spellings: the cards say `allow`, `confirm`, `skip`, `always`, `stop`, and
-  the controller says `allow_once` and `deny`. Both are accepted at the bridge
+  spellings: the cards say `allow`, `confirm`, `skip`, `always`, `grant`,
+  `stop`, and the controller says `allow_once` and `deny`. Both are accepted at the bridge
   and anything else is ignored, as is a stale ID. A bridge that accepted only
   one set once dropped every approval silently.
 - ACP agents' own progress (thoughts, tool calls, plans) arrives separately
@@ -653,7 +761,9 @@ detach is posted.
   attach a tab, take a snapshot, click, type, select, or navigate by ref or
   URL, without a model. It also enables `racAiAgentDebugEvent`, which fakes
   agent events so the cards and indicator can be driven by hand. Both are
-  off without the switch.
+  off without the switch. This switch and `--rac-agent-mcp-echo` exist only
+  where `rac_dev_switches` is on (`!is_official_build`). Release builds are
+  official, so their names and code are compiled out.
 - Send each `chrome.send` message from the page that owns it. An unhandled
   message is a `NOTREACHED`, and it takes the browser down. Settings messages
   belong to a settings page, and assistant messages belong to the sidebar.
@@ -724,6 +834,21 @@ detach is posted.
   per-agent model pref, a `session/set_model` or `session/set_config_option`
   call between `session/new` and the prompt, and rows in the picker. That is
   a new capability, so it waits for its own phase.
+- **What the agent's data-flow rule doesn't cover.** A step that could
+  carry what the model read to a site that hasn't seen it asks, but some
+  bits still get through. Timing: when steps happen, and how long a wait
+  lasts (the model picks up to 10 seconds; waits are free and uncounted).
+  Choice: each of a turn's 12 free steps picks one option a page sees, so
+  it carries the log of how many options there were. A scroll carries its
+  direction only, about 2 bits, since it moves the page itself by the fixed
+  step. Switching to or closing one of the agent's tabs, or opening one of
+  the URLs the user typed, carries which one (log2 of the tabs or URLs).
+  Typing the user's own words carries the most: which field, log2 of the
+  text fields on the page, and which run of whole words from this turn's
+  message, about log2(n²/2) for n words (some 8 bits for 20 words). So a
+  long message and a page full of fields give a free step about 13 bits,
+  and a turn some 150 at worst. Hosts: a card names `http://a` and
+  `https://a` both as "a".
 - **Rough edges in the tools.** `press_key` is Enter on an element only, and
   the guard always treats it as a possible submit. Forms that target a named
   window or a new window are denied. The agent can't close the user's own

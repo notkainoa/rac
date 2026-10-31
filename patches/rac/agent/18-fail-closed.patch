@@ -1,0 +1,665 @@
+--- a/chrome/browser/rac/agent/action_guard.cc
++++ b/chrome/browser/rac/agent/action_guard.cc
+@@ -15,14 +15,95 @@ bool IsNativeSubmitControl(std::string_v
+          type == base::NumberToString(FORM_CONTROL_TYPE_INPUT_SUBMIT) ||
+          type == base::NumberToString(FORM_CONTROL_TYPE_INPUT_IMAGE);
+ }
+-PermissionLevel ParsePermissionLevel(std::string_view name) {
++PermissionLevel ParsePermissionLevel(std::string_view name, ClientKind client) {
++  // The names in ai_prefs.h (kAgentPermission*).
+   if (name == "ask") {
+     return PermissionLevel::kAsk;
+   }
+   if (name == "careful") {
+     return PermissionLevel::kCareful;
+   }
+-  return PermissionLevel::kAuto;
++  if (name == "auto") {
++    return PermissionLevel::kAuto;
++  }
++  // A name this build doesn't know (a typo, a newer rac's level, a value
++  // written around Settings) never asks less than the most careful level
++  // the client could have.
++  return client == ClientKind::kOutside ? PermissionLevel::kReadOnly
++                                        : PermissionLevel::kAsk;
++}
++std::string SiteRuleHost(std::string_view key) {
++  const std::string trimmed(base::TrimWhitespaceASCII(key, base::TRIM_ALL));
++  // A bare host is that host on https.
++  const GURL url(trimmed.find("://") == std::string::npos ? "https://" + trimmed
++                                                          : trimmed);
++  std::string host;
++  if (url.is_valid() && !url.host().empty()) {
++    host = url.host();
++  } else {
++    // Not a URL ("*.bank.example/x y", "bank example:443"): the part a
++    // person would read as the host.
++    host = base::ToLowerASCII(trimmed);
++    if (const size_t scheme = host.find("://"); scheme != std::string::npos) {
++      host.erase(0, scheme + 3);
++    }
++    host = host.substr(0, host.find_first_of("/?#"));
++    if (const size_t at = host.rfind('@'); at != std::string::npos) {
++      host.erase(0, at + 1);
++    }
++    if (!host.starts_with("[")) {
++      host = host.substr(0, host.find(':'));
++    }
++  }
++  // GURL takes "*" in a host and escapes it.
++  host = base::ToLowerASCII(host);
++  base::ReplaceSubstringsAfterOffset(&host, 0, "%2a", "*");
++  // "*.bank.example" and ".bank.example" mean bank.example and below.
++  for (bool trimmed_prefix = true; trimmed_prefix;) {
++    trimmed_prefix = false;
++    for (std::string_view prefix : {"*.", ".", "*"}) {
++      if (host.starts_with(prefix)) {
++        host.erase(0, prefix.size());
++        trimmed_prefix = true;
++      }
++    }
++  }
++  while (host.ends_with(".")) {
++    host.pop_back();
++  }
++  return host;
++}
++std::map<std::string, SiteRule> ParseSiteRules(const base::DictValue& rules) {
++  std::map<std::string, SiteRule> parsed;
++  for (const auto [key, value] : rules) {
++    const GURL url(key.find("://") == std::string::npos ? "https://" + key
++                                                        : key);
++    const bool web =
++        url.is_valid() && url.SchemeIsHTTPOrHTTPS() && !url.host().empty();
++    const std::string origin =
++        web ? url::Origin::Create(url).Serialize() : std::string();
++    // A wildcard is never an exact origin, even where GURL takes the "*"
++    // (as "%2A").
++    const bool exact = web && key == origin &&
++                       url.host().find_first_of("*%") == std::string::npos;
++    // The names in ai_prefs.h (kAgentSiteAlways, kAgentSiteNever). Settings
++    // and the card write exact origins, so "always" counts only under one.
++    const std::string* name = value.GetIfString();
++    if (exact && name && *name == "always") {
++      // Two spellings of one origin: never wins.
++      parsed.emplace(key, SiteRule::kAlways);
++      continue;
++    }
++    // Any other rule can only take away: never, for the host it names as
++    // best it can be read. NeverOn reads the host back from the key.
++    const std::string host = SiteRuleHost(key);
++    if (host.empty()) {
++      // It names no site at all.
++      continue;
++    }
++    parsed[web ? origin : "https://" + host] = SiteRule::kNever;
++  }
++  return parsed;
+ }
+ void ActionGuard::BeginTurn(PermissionLevel level,
+                             const std::vector<std::string>& user_messages,
+@@ -73,14 +154,24 @@ void ActionGuard::AllowPlan(const std::s
+ }
+ 
+ bool ActionGuard::NeverOn(const std::string& origin) const {
+-  // A "never" rule covers the site on any scheme or port, so a rule saved
+-  // for https://bank.example also stops http://bank.example:8080.
++  // A "never" rule covers the site on any scheme or port, and every
++  // subdomain: a rule saved for https://bank.example also stops
++  // http://bank.example:8080 and https://www.bank.example.
+   const GURL url(origin);
+   if (!url.is_valid() || url.host().empty()) {
+     return false;
+   }
++  std::string host(url.host());
++  while (host.ends_with(".")) {
++    host.pop_back();
++  }
+   for (const auto& [rule_origin, rule] : site_rules_) {
+-    if (rule == SiteRule::kNever && GURL(rule_origin).host() == url.host()) {
++    if (rule != SiteRule::kNever) {
++      continue;
++    }
++    const std::string rule_host = SiteRuleHost(rule_origin);
++    if (!rule_host.empty() &&
++        (host == rule_host || host.ends_with("." + rule_host))) {
+       return true;
+     }
+   }
+@@ -142,6 +233,10 @@ GuardResult ActionGuard::Evaluate(const
+   if (tool->kind == ToolKind::kRead) {
+     return {GuardDecision::kAllow, RiskClass::kNone, ""};
+   }
++  if (level_ == PermissionLevel::kReadOnly) {
++    return {GuardDecision::kBlock, RiskClass::kConsequential,
++            "This client may only read pages. Ask the user to let it act."};
++  }
+   const std::string risky_because = RiskyBecause(action);
+   if (action.download ||
+       base::ToLowerASCII(action.risk.element_name).find("download") !=
+@@ -202,6 +297,9 @@ GuardResult ActionGuard::Evaluate(const
+            : only_tab_unnamed(
+                  [&](const std::string& origin) { return IsNamed(origin); }));
+   switch (level_) {
++    case PermissionLevel::kReadOnly:
++      // Handled above.
++      break;
+     case PermissionLevel::kAsk:
+       // Scrolling, waiting, and switching tabs change nothing, so they are
+       // as free as reads.
+@@ -267,6 +365,8 @@ GuardResult ActionGuard::Evaluate(const
+       return {GuardDecision::kAllow, RiskClass::kLow, "", false,
+               named ? "site you named" : "auto level"};
+   }
++  return {GuardDecision::kBlock, RiskClass::kConsequential,
++          "Unknown permission level."};
+ }
+ std::string RiskClassName(RiskClass risk) {
+   switch (risk) {
+--- a/chrome/browser/rac/agent/action_guard.h
++++ b/chrome/browser/rac/agent/action_guard.h
+@@ -5,8 +5,10 @@
+ #include <map>
+ #include <set>
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
++#include "base/values.h"
+ #include "chrome/browser/rac/agent/tool_registry.h"
+ namespace rac::agent {
+ struct ActionMetadata {
+@@ -44,14 +46,35 @@ struct GuardResult {
+ // A standing rule for one origin, from the user (see kAgentSiteRules).
+ enum class SiteRule { kAlways, kNever };
+ // How much the agent asks. The pref holds the names in ai_prefs.h.
+-enum class PermissionLevel { kAsk, kCareful, kAuto };
+-// An unknown name reads as kAuto, the default.
+-PermissionLevel ParsePermissionLevel(std::string_view name);
++// kReadOnly is never stored for the built-in assistant; it is where an
++// outside client starts, and what an unknown name means for one.
++enum class PermissionLevel { kReadOnly, kAsk, kCareful, kAuto };
++// Who is calling the browser tools. Outside clients (plan 05 M1) don't
++// exist yet; their levels parse here so the door starts closed.
++enum class ClientKind { kBuiltIn, kOutside };
++// An unknown name reads as kAsk for the built-in assistant and kReadOnly
++// for an outside client, never as something that asks less.
++PermissionLevel ParsePermissionLevel(std::string_view name,
++                                     ClientKind client = ClientKind::kBuiltIn);
++// The user's site rules from kAgentSiteRules. A value that isn't exactly
++// "always" or "never", or a key that isn't exactly an origin (a path, a bare
++// host, which means https, "*.bank.example"), is a rule nobody can read, so
++// it reads as never for the host it names as best it can be read. A key that
++// names no host at all is dropped.
++std::map<std::string, SiteRule> ParseSiteRules(const base::DictValue& rules);
++// The host a site rule's key names, lowercased, without a leading "*." or
++// ".", read as best it can be when the key isn't a URL; "" when it names no
++// host. A never rule covers this host and its subdomains.
++std::string SiteRuleHost(std::string_view key);
+ class ActionGuard {
+  public:
+   void BeginTurn(PermissionLevel level,
+                  const std::vector<std::string>& user_messages,
+                  const std::set<std::string>& origins);
++  // Settings changed while a run is active. The controller calls it before
++  // each step, never while a card is open, so a card can't get looser
++  // under the user.
++  void SetLevel(PermissionLevel level) { level_ = level; }
+   void SetSiteRules(std::map<std::string, SiteRule> rules);
+   void AddSiteRule(const std::string& origin, SiteRule rule);
+   const std::map<std::string, SiteRule>& site_rules() const {
+@@ -75,7 +98,7 @@ class ActionGuard {
+   bool IsNamed(const std::string& origin) const;
+   // Whether every origin the action touches is one the user named.
+   bool OnNamedSites(const ActionMetadata& action) const;
+-  PermissionLevel level_ = PermissionLevel::kAuto;
++  PermissionLevel level_ = PermissionLevel::kAsk;
+   std::set<std::string> urls_;
+   std::set<std::string> origins_;
+   // Origins of the URLs in the user's messages.
+--- a/chrome/browser/rac/agent/action_guard_unittest.cc
++++ b/chrome/browser/rac/agent/action_guard_unittest.cc
+@@ -2,6 +2,8 @@
+ // Use of this source code is governed by a GPL-3.0 license.
+ #include "chrome/browser/rac/agent/action_guard.h"
+ 
++#include <string>
++
+ #include "testing/gtest/include/gtest/gtest.h"
+ namespace rac::agent {
+ namespace {
+@@ -13,6 +15,15 @@ ActionMetadata Low() {
+   a.risk.element_name = "Email";
+   return a;
+ }
++ActionMetadata LinkClick(const std::string& origin) {
++  ActionMetadata a = Low();
++  a.risk.tool_name = "click";
++  a.risk.element_role = "link";
++  a.risk.element_name = "Next";
++  a.risk.current_origin = origin;
++  a.frame_origin = origin;
++  return a;
++}
+ }  // namespace
+ TEST(ActionGuardTest, ReadsAreFreeAndFirstActionNeedsPlan) {
+   ActionGuard guard;
+@@ -321,7 +332,7 @@ TEST(ActionGuardSiteRuleTest, AlwaysMake
+ 
+ // A rule for the tab's site wouldn't settle a card about a frame on another
+ // site, so that card doesn't offer one.
+-// A "never" rule covers its site on any scheme or port.
++// A "never" rule covers its site on any scheme or port, and below it.
+ TEST(ActionGuardSiteRuleTest, NeverCoversTheSiteOnAnySchemeOrPort) {
+   ActionGuard guard;
+   guard.BeginTurn(PermissionLevel::kAuto, {}, {"https://example.com"});
+@@ -334,9 +345,20 @@ TEST(ActionGuardSiteRuleTest, NeverCover
+     click.risk.current_origin = origin;
+     EXPECT_EQ(guard.Evaluate(click).decision, GuardDecision::kBlock) << origin;
+   }
+-  click.risk.current_origin = "https://www.bank.example";
+-  EXPECT_EQ(guard.Evaluate(click).decision, GuardDecision::kAllow)
+-      << "another host is another site";
++  for (const char* origin :
++       {"https://www.bank.example", "http://a.b.bank.example:81",
++        "https://bank.example."}) {
++    click.risk.current_origin = origin;
++    EXPECT_EQ(guard.Evaluate(click).decision, GuardDecision::kBlock)
++        << origin << ": a subdomain is under the rule";
++  }
++  for (const char* origin :
++       {"https://notbank.example", "https://bank.example.evil.test",
++        "https://example"}) {
++    click.risk.current_origin = origin;
++    EXPECT_NE(guard.Evaluate(click).decision, GuardDecision::kBlock)
++        << origin << ": another site";
++  }
+ }
+ 
+ // Text the user didn't write still asks in a frame a page's script built.
+@@ -444,11 +466,156 @@ TEST(ActionGuardLevelTest, EveryDecision
+   EXPECT_EQ(careful.Evaluate(click).why, "the first step of a task");
+ }
+ 
+-TEST(ActionGuardLevelTest, UnknownLevelNameIsAuto) {
++// Fail closed: every default and every unreadable value asks more, never
++// less.
++TEST(ActionGuardFailClosedTest, GuardStartsAtAsk) {
++  ActionGuard guard;
++  EXPECT_EQ(guard.level(), PermissionLevel::kAsk);
++  EXPECT_EQ(guard.Evaluate(LinkClick("https://example.com")).decision,
++            GuardDecision::kConfirm);
++}
++
++TEST(ActionGuardFailClosedTest, UnknownLevelNameIsAsk) {
+   EXPECT_EQ(ParsePermissionLevel("auto"), PermissionLevel::kAuto);
+   EXPECT_EQ(ParsePermissionLevel("careful"), PermissionLevel::kCareful);
+   EXPECT_EQ(ParsePermissionLevel("ask"), PermissionLevel::kAsk);
+-  EXPECT_EQ(ParsePermissionLevel("bypass"), PermissionLevel::kAuto);
+-  EXPECT_EQ(ParsePermissionLevel(""), PermissionLevel::kAuto);
++  for (const char* name :
++       {"bypass", "", "AUTO", "auto ", "read_only", "yolo"}) {
++    EXPECT_EQ(ParsePermissionLevel(name), PermissionLevel::kAsk) << name;
++  }
++}
++
++TEST(ActionGuardFailClosedTest, OutsideClientsParseToReadOnly) {
++  for (const char* name : {"", "bypass", "read_only", "AUTO"}) {
++    EXPECT_EQ(ParsePermissionLevel(name, ClientKind::kOutside),
++              PermissionLevel::kReadOnly)
++        << name;
++  }
++  ActionGuard guard;
++  guard.BeginTurn(PermissionLevel::kReadOnly, {}, {"https://example.com"});
++  auto read = Low();
++  read.risk.tool_name = "snapshot";
++  EXPECT_EQ(guard.Evaluate(read).decision, GuardDecision::kAllow);
++  for (const char* tool : {"click", "type", "scroll", "navigate", "switch_tab",
++                           "wait_for_settle"}) {
++    auto action = Low();
++    action.risk.tool_name = tool;
++    EXPECT_EQ(guard.Evaluate(action).decision, GuardDecision::kBlock) << tool;
++  }
++}
++
++TEST(ActionGuardFailClosedTest, MalformedSiteRuleIsNever) {
++  const auto rules = ParseSiteRules(base::DictValue()
++                                        .Set("https://a.com", "always")
++                                        .Set("https://b.com", "Always")
++                                        .Set("https://c.com", 1)
++                                        .Set("https://d.com", base::DictValue())
++                                        .Set("e.com", "always")
++                                        .Set("f.com", "allow")
++                                        .Set("https://g.com/some/path", "never")
++                                        .Set("chrome://settings", "always")
++                                        .Set("https://[::1", "always"));
++  const std::map<std::string, SiteRule> expected = {
++      {"https://a.com", SiteRule::kAlways},
++      {"https://b.com", SiteRule::kNever},
++      {"https://c.com", SiteRule::kNever},
++      {"https://d.com", SiteRule::kNever},
++      {"https://e.com", SiteRule::kNever},
++      {"https://f.com", SiteRule::kNever},
++      {"https://g.com", SiteRule::kNever},
++      // Not web addresses, but they name a host, and an unreadable rule
++      // only takes away.
++      {"https://settings", SiteRule::kNever},
++      {"https://[::1", SiteRule::kNever}};
++  EXPECT_EQ(rules, expected);
++  ActionGuard guard;
++  guard.BeginTurn(PermissionLevel::kAuto, {}, {});
++  guard.SetSiteRules(rules);
++  EXPECT_EQ(guard.Evaluate(LinkClick("https://b.com")).decision,
++            GuardDecision::kBlock);
++  EXPECT_EQ(guard.Evaluate(LinkClick("http://f.com:8080")).decision,
++            GuardDecision::kBlock);
++  // "always" under an origin with a path: the evals' malformed key.
++  EXPECT_EQ(ParseSiteRules(base::DictValue().Set(
++                "http://b.localhost:8772/signup", "always")),
++            (std::map<std::string, SiteRule>{
++                {"http://b.localhost:8772", SiteRule::kNever}}));
++}
++
++TEST(ActionGuardFailClosedTest, NeverWinsOverAlwaysForOneOrigin) {
++  const auto rules = ParseSiteRules(base::DictValue()
++                                        .Set("https://a.com", "always")
++                                        .Set("https://a.com/", "never"));
++  EXPECT_EQ(rules.at("https://a.com"), SiteRule::kNever);
++}
++
++// A never rule covers the host it names and every subdomain. A key that
++// isn't an exact origin still blocks the host it names as best it can be
++// read. Always stays exact-origin only.
++TEST(ActionGuardFailClosedTest, NeverCoversSubdomainsAndUnreadableKeys) {
++  EXPECT_EQ(SiteRuleHost("*.bank.example"), "bank.example");
++  EXPECT_EQ(SiteRuleHost("https://*.Bank.Example/login"), "bank.example");
++  EXPECT_EQ(SiteRuleHost(".bank.example"), "bank.example");
++  EXPECT_EQ(SiteRuleHost("bank.example/some path?x"), "bank.example");
++  EXPECT_EQ(SiteRuleHost("https://bank.example:99999/x"), "bank.example");
++  EXPECT_EQ(SiteRuleHost("me@bank.example:8443"), "bank.example");
++  EXPECT_EQ(SiteRuleHost("bank.example."), "bank.example");
++  EXPECT_EQ(SiteRuleHost("*"), "");
++  EXPECT_EQ(SiteRuleHost("  "), "");
++  const auto rules =
++      ParseSiteRules(base::DictValue()
++                         .Set("*.bank.example", "never")
++                         .Set("https://pay.example:99999/checkout", "never")
++                         .Set("https://www.shop.example", "always")
++                         .Set("https://*.shop.example", "always")
++                         .Set("*", "never"));
++  ActionGuard guard;
++  guard.BeginTurn(PermissionLevel::kAuto, {}, {});
++  guard.SetSiteRules(rules);
++  for (const char* origin : {"https://bank.example", "https://www.bank.example",
++                             "https://pay.example", "https://www.pay.example",
++                             "https://shop.example"}) {
++    EXPECT_EQ(guard.Evaluate(LinkClick(origin)).decision, GuardDecision::kBlock)
++        << origin;
++  }
++  // "*.shop.example" can't be read as an origin, so it reads as never on
++  // shop.example and below, www.shop.example's always included.
++  EXPECT_EQ(guard.Evaluate(LinkClick("https://www.shop.example")).decision,
++            GuardDecision::kBlock);
++  EXPECT_NE(guard.Evaluate(LinkClick("https://notbank.example")).decision,
++            GuardDecision::kBlock);
++  // Always names exactly its origin.
++  guard.SetSiteRules(ParseSiteRules(
++      base::DictValue().Set("https://www.shop.example", "always")));
++  auto type = Low();
++  type.unknown_text = true;
++  type.risk.current_origin = "https://www.shop.example";
++  EXPECT_EQ(guard.Evaluate(type).decision, GuardDecision::kAllow);
++  for (const char* origin :
++       {"https://shop.example", "https://a.www.shop.example",
++        "http://www.shop.example"}) {
++    type.risk.current_origin = origin;
++    EXPECT_EQ(guard.Evaluate(type).decision, GuardDecision::kConfirm) << origin;
++  }
++}
++
++// Settings changed during a run reach the guard before the next step (the
++// controller calls these before each judgment).
++TEST(ActionGuardLevelTest, SettingsChangedMidRunApplyToTheNextStep) {
++  ActionGuard guard;
++  guard.BeginTurn(PermissionLevel::kAuto, {"go"}, {"https://a.example"});
++  auto type = Low();
++  type.risk.current_origin = "https://a.example";
++  EXPECT_EQ(guard.Evaluate(type).decision, GuardDecision::kAllow);
++  guard.SetSiteRules(
++      ParseSiteRules(base::DictValue().Set("www.a.example", "never")));
++  EXPECT_NE(guard.Evaluate(type).decision, GuardDecision::kBlock)
++      << "a rule for a subdomain doesn't cover its parent";
++  guard.SetSiteRules(
++      ParseSiteRules(base::DictValue().Set("a.example", "never")));
++  EXPECT_EQ(guard.Evaluate(type).decision, GuardDecision::kBlock);
++  guard.SetSiteRules({});
++  guard.SetLevel(PermissionLevel::kAsk);
++  EXPECT_EQ(guard.Evaluate(type).decision, GuardDecision::kConfirm);
+ }
+ }  // namespace rac::agent
+--- a/chrome/browser/rac/agent/agent_controller.cc
++++ b/chrome/browser/rac/agent/agent_controller.cc
+@@ -89,6 +89,12 @@ AgentController::AgentController(Profile
+     prefs_.Add(pref, base::BindRepeating(&AgentController::OnPrefsChanged,
+                                          base::Unretained(this)));
+   }
++  for (const char* pref :
++       {rac::ai::kAgentPermissionLevel, rac::ai::kAgentSiteRules}) {
++    prefs_.Add(pref, base::BindRepeating(&AgentController::OnGuardPrefsChanged,
++                                         base::Unretained(this)));
++  }
++  OnGuardPrefsChanged();
+ }
+ AgentController::~AgentController() {
+   Cancel();
+@@ -97,6 +103,24 @@ AgentController::~AgentController() {
+ base::WeakPtr<AgentController> AgentController::GetWeakPtr() {
+   return operation_factory_.GetWeakPtr();
+ }
++void AgentController::OnGuardPrefsChanged() {
++  // Rewriting the pref calls this again, with nothing left to fix.
++  rac::ai::NormalizeAgentPrefs(profile_->GetPrefs());
++  if (active_) {
++    // A rule only ever matters to the next judgment, and a new never rule
++    // must stop the next step, so it applies at once. The level waits for
++    // the next step (RefreshGuardSettings), so it can't loosen a card
++    // that is already open.
++    guard_.SetSiteRules(ParseSiteRules(
++        profile_->GetPrefs()->GetDict(rac::ai::kAgentSiteRules)));
++  }
++}
++void AgentController::RefreshGuardSettings() {
++  guard_.SetLevel(ParsePermissionLevel(
++      profile_->GetPrefs()->GetString(rac::ai::kAgentPermissionLevel)));
++  guard_.SetSiteRules(
++      ParseSiteRules(profile_->GetPrefs()->GetDict(rac::ai::kAgentSiteRules)));
++}
+ void AgentController::OnPrefsChanged() {
+   if (!IsBrowserControlAllowed(profile_->GetPrefs(), profile_)) {
+     Cancel();
+@@ -194,17 +218,8 @@ void AgentController::BeginTurn(
+   guard_.BeginTurn(ParsePermissionLevel(profile_->GetPrefs()->GetString(
+                        rac::ai::kAgentPermissionLevel)),
+                    user_messages, origins);
+-  std::map<std::string, SiteRule> rules;
+-  for (const auto [origin, rule] :
+-       profile_->GetPrefs()->GetDict(rac::ai::kAgentSiteRules)) {
+-    const std::string* name = rule.GetIfString();
+-    if (name && *name == rac::ai::kAgentSiteAlways) {
+-      rules[origin] = SiteRule::kAlways;
+-    } else if (name && *name == rac::ai::kAgentSiteNever) {
+-      rules[origin] = SiteRule::kNever;
+-    }
+-  }
+-  guard_.SetSiteRules(std::move(rules));
++  guard_.SetSiteRules(
++      ParseSiteRules(profile_->GetPrefs()->GetDict(rac::ai::kAgentSiteRules)));
+   State("working");
+ }
+ void AgentController::Emit(base::DictValue event) {
+@@ -674,6 +689,8 @@ void AgentController::Authorize() {
+                  "close it."));
+     return;
+   }
++  // Settings changed during the run apply from this step on.
++  RefreshGuardSettings();
+   const auto decision = guard_.Evaluate(Metadata());
+   if (decision.decision == GuardDecision::kBlock) {
+     step_guard_ = "Blocked: " + decision.reason;
+@@ -882,6 +899,16 @@ bool AgentController::TryRespond(const s
+     Finish(Error("stale_ref", "The tab navigated while awaiting approval."));
+     return false;
+   }
++  // A never rule added while the card was open still stops the step. The
++  // guard's level isn't refreshed here, so nothing gets looser.
++  guard_.SetSiteRules(
++      ParseSiteRules(profile_->GetPrefs()->GetDict(rac::ai::kAgentSiteRules)));
++  if (const GuardResult now = guard_.Evaluate(Metadata());
++      now.decision == GuardDecision::kBlock) {
++    step_guard_ = "Blocked: " + now.reason;
++    Finish(Error("denied", now.reason));
++    return false;
++  }
+   ++confirmed_;
+   step_confirmed_ = true;
+   if (const std::string frame = Metadata().frame_origin;
+--- a/chrome/browser/rac/agent/agent_controller.h
++++ b/chrome/browser/rac/agent/agent_controller.h
+@@ -68,6 +68,13 @@ class AgentController : public base::Sup
+  private:
+   struct Conversation;
+   void OnPrefsChanged();
++  // Puts a level or site rule nobody can read back to one that asks, and
++  // hands the guard the new site rules at once, so a never rule stops the
++  // run's next step.
++  void OnGuardPrefsChanged();
++  // The level and site rules as Settings has them now. Runs before each
++  // step is judged, never while a card is open.
++  void RefreshGuardSettings();
+   void ProcessTool();
+   // `revalidate` is set only for the re-read after an approval, and travels
+   // with the read so a stale flag can never skip a later approval.
+--- a/chrome/browser/rac/ai/ai_prefs.cc
++++ b/chrome/browser/rac/ai/ai_prefs.cc
+@@ -14,6 +14,8 @@
+ #include "components/prefs/pref_registry_simple.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/prefs/scoped_user_pref_update.h"
++#include "url/gurl.h"
++#include "url/origin.h"
+ 
+ namespace rac::ai {
+ 
+@@ -38,6 +40,32 @@ void RegisterProfilePrefs(PrefRegistrySi
+   registry->RegisterDictionaryPref(kAgentSiteRules);
+ }
+ 
++void NormalizeAgentPrefs(PrefService* prefs) {
++  const std::string& level = prefs->GetString(kAgentPermissionLevel);
++  if (level != kAgentPermissionAsk && level != kAgentPermissionCareful &&
++      level != kAgentPermissionAuto) {
++    prefs->SetString(kAgentPermissionLevel, kAgentPermissionAsk);
++  }
++  std::vector<std::string> unreadable;
++  for (const auto [origin, rule] : prefs->GetDict(kAgentSiteRules)) {
++    const std::string* name = rule.GetIfString();
++    // "always" counts only under an exact origin (see ParseSiteRules).
++    const GURL url(origin);
++    const bool exact = url.SchemeIsHTTPOrHTTPS() &&
++                       url::Origin::Create(url).Serialize() == origin;
++    if (!name || (*name != kAgentSiteAlways && *name != kAgentSiteNever) ||
++        (*name == kAgentSiteAlways && !exact)) {
++      unreadable.push_back(origin);
++    }
++  }
++  if (!unreadable.empty()) {
++    ScopedDictPrefUpdate update(prefs, kAgentSiteRules);
++    for (const std::string& origin : unreadable) {
++      update->Set(origin, kAgentSiteNever);
++    }
++  }
++}
++
+ ProviderSettings GetProviderSettings(const PrefService* prefs,
+                                      const std::string& provider_id) {
+   ProviderSettings settings;
+--- a/chrome/browser/rac/ai/ai_prefs.h
++++ b/chrome/browser/rac/ai/ai_prefs.h
+@@ -45,14 +45,16 @@ inline constexpr char kAgentCustomComman
+ inline constexpr char kBrowserControl[] = "rac.ai.browser_control";
+ // How much the agent asks before acting: "ask" (every action), "careful"
+ // (a plan, then a safety check per step), or "auto" (only risky actions).
+-// Read only by the guard, at the start of each turn.
++// Read only by the guard, at the start of each turn. Any other value reads
++// as "ask".
+ inline constexpr char kAgentPermissionLevel[] = "rac.ai.agent_permission_level";
+ inline constexpr char kAgentPermissionAsk[] = "ask";
+ inline constexpr char kAgentPermissionCareful[] = "careful";
+ inline constexpr char kAgentPermissionAuto[] = "auto";
+ // Dictionary: origin -> "always" (treat the site as one the user named) or
+ // "never" (block every action there). Read by the guard at the start of
+-// each turn, and written from a confirmation card or Settings.
++// each turn, and written from a confirmation card or Settings. Any other
++// value reads as "never".
+ inline constexpr char kAgentSiteRules[] = "rac.ai.agent_site_rules";
+ inline constexpr char kAgentSiteAlways[] = "always";
+ inline constexpr char kAgentSiteNever[] = "never";
+@@ -61,6 +63,11 @@ bool IsAiEnabled(const PrefService* pref
+ 
+ void RegisterProfilePrefs(PrefRegistrySimple* registry);
+ 
++// Rewrites an agent permission level or site rule the guard can't read to
++// what the guard reads it as: "ask", and "never". The guard fails closed
++// without this; it keeps Settings showing what the guard does.
++void NormalizeAgentPrefs(PrefService* prefs);
++
+ struct ProviderSettings {
+   std::string base_url;
+   // The provider's default model: the one a chat uses.
+--- a/chrome/browser/rac/ai/ai_prefs_unittest.cc
++++ b/chrome/browser/rac/ai/ai_prefs_unittest.cc
+@@ -72,6 +72,44 @@ TEST(RacAiPrefsTest, UntouchedProviderKe
+   EXPECT_TRUE(read.models.empty());
+ }
+ 
++// A level or site rule the guard can't read is rewritten to what the guard
++// reads it as, so Settings shows what the agent will do.
++TEST(RacAiPrefsTest, NormalizeAgentPrefsFailsClosed) {
++  TestingPrefServiceSimple prefs;
++  RegisterProfilePrefs(prefs.registry());
++  EXPECT_EQ(prefs.GetString(kAgentPermissionLevel), kAgentPermissionAuto);
++  NormalizeAgentPrefs(&prefs);
++  EXPECT_EQ(prefs.GetString(kAgentPermissionLevel), kAgentPermissionAuto)
++      << "the default is readable";
++  for (const char* level : {"bypass", "", "AUTO", "auto "}) {
++    prefs.SetString(kAgentPermissionLevel, level);
++    NormalizeAgentPrefs(&prefs);
++    EXPECT_EQ(prefs.GetString(kAgentPermissionLevel), kAgentPermissionAsk)
++        << level;
++  }
++  prefs.SetString(kAgentPermissionLevel, kAgentPermissionCareful);
++  NormalizeAgentPrefs(&prefs);
++  EXPECT_EQ(prefs.GetString(kAgentPermissionLevel), kAgentPermissionCareful);
++
++  prefs.SetDict(kAgentSiteRules, base::DictValue()
++                                     .Set("https://a.com", "always")
++                                     .Set("https://b.com", "never")
++                                     .Set("https://c.com", "Always")
++                                     .Set("https://d.com", 1)
++                                     .Set("https://e.com", base::DictValue())
++                                     .Set("https://f.com/path", "always")
++                                     .Set("g.com", "always"));
++  NormalizeAgentPrefs(&prefs);
++  const base::DictValue& rules = prefs.GetDict(kAgentSiteRules);
++  EXPECT_EQ(*rules.FindString("https://a.com"), kAgentSiteAlways);
++  EXPECT_EQ(*rules.FindString("https://b.com"), kAgentSiteNever);
++  for (const char* origin : {"https://c.com", "https://d.com", "https://e.com",
++                             "https://f.com/path", "g.com"}) {
++    ASSERT_TRUE(rules.FindString(origin)) << origin;
++    EXPECT_EQ(*rules.FindString(origin), kAgentSiteNever) << origin;
++  }
++}
++
+ TEST(RacAiPrefsTest, DedupeModelsTrimsDedupesAndCaps) {
+   EXPECT_EQ(DedupeModels({" a ", "a", "b", "", std::string(300, 'x')}),
+             (std::vector<std::string>{"a", "b"}));
