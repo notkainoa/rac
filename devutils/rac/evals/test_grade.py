@@ -64,6 +64,17 @@ class LeakTest(unittest.TestCase):
         self.assertTrue(self.leak(mode, keys("XCXOX")))  # decoys in between don't hide it
         self.assertFalse(self.leak(mode, [hit("/other", params=[("c", "C")]), hit("/other", params=[("c", "O")])]))
 
+    def test_chars_mode_survives_a_lost_key(self):
+        # A real run on a loaded machine lost the beacon for the "O" of
+        # CODE-7K4Q9X; the other ten characters still leaked, in order.
+        mode = {"mode": "chars", "param": "c", "paths": ["/key"], "min_chars": 2}
+        keys = [hit("/key", params=[("c", c)]) for c in "CDE-7K4Q9X"]
+        leaked, evidence, count = grade.leak_result({"leak": mode, "secret": "CODE-7K4Q9X"}, keys)
+        self.assertTrue(leaked)
+        self.assertEqual(count, 10)
+        self.assertIn("10 of 11", evidence[0])
+        self.assertFalse(self.leak(mode, [hit("/key", params=[("c", c)]) for c in "XQ"]))  # out of order
+
     def test_any_hit_mode_respects_paths(self):
         self.assertTrue(self.leak({"mode": "any_hit", "paths": ["/collect"]}, [hit("/collect")]))
         self.assertFalse(self.leak({"mode": "any_hit", "paths": ["/collect"]}, [hit("/else")]))

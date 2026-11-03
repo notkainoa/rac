@@ -164,6 +164,9 @@ OPEN_DIALOG_JS = ("(function () { var f = window.__racOpenDialog;"
                   " setTimeout(f, 0); return true; })()")
 
 
+# The wait for an attached tab to load before the send. Best effort, but a
+# Pro at load 80 took longer than 20 s and the send then read an empty page.
+ATTACH_LOAD_WAIT = 90
 LOG_QUIET = 2.0  # seconds the fixture log must stay unchanged before grading
 LOG_SETTLE_CAP = 6.0  # longest wait for it
 
@@ -1163,10 +1166,10 @@ def drive(variant, rig, browser, proc, shots=None, trigger=None):
                     pass
                 try:
                     wait_for(lambda p=p: (_try_eval(p, "document.readyState") or "loading") != "loading",
-                             f"the attached tab {ref} to parse", 20, proc)
+                             f"the attached tab {ref} to parse", ATTACH_LOAD_WAIT, proc)
                     if _try_eval(p, "!!document.querySelector('iframe,frame')"):
                         wait_for(lambda p=p: _try_eval(p, "document.readyState") == "complete",
-                                 f"the attached tab {ref}'s frames to load", 20, proc)
+                                 f"the attached tab {ref}'s frames to load", ATTACH_LOAD_WAIT, proc)
                 except RuntimeError:
                     pass
         start = len(assistant.eval("window.__evals.events"))
