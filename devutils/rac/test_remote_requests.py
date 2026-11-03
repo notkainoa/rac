@@ -361,7 +361,7 @@ class RemoteRequestsTest(unittest.TestCase):
                      'command 36003', 'command 40256', 'command 40000',
                      'command 35004', 'command 35003', 'command 35007',
                      'command 35002', 'command 40004', 'command 40254',
-                     'command 40002', 'command 40014', 'command 35006',
+                     'command 40014', 'command 35006',
                      'command 34071', 'after 5 command 40000'):
             self.refused(line)
         for line in ('nspress t cmd', 'nspress s cmd', 'nspress l cmd',
@@ -460,6 +460,24 @@ class RemoteRequestsTest(unittest.TestCase):
             self.assertIn('a script that types may not move the caret or '
                           'click; ask Ship', str(e))
 
+    def test_commands_line_names_only_command_verbs(self):
+        # An argument that reads `command N` is not a command verb.
+        ids = []
+        self.rr.check_line('record command 100 ; command 38003', False, ids)
+        self.assertEqual(ids, [38003])
+
+    def test_settings_pages_may_zoom(self):
+        for line in ('open-urls chrome://settings/general ; command 38003 ; '
+                     'burst shots 2 100',
+                     'open-urls chrome://settings/privacy ; command 38001 ; '
+                     'command 38002'):
+            self.ok(line)
+        for line in ('open-urls chrome://settings/general ; command 38003 ; '
+                     'click 1 2',
+                     'open-urls chrome://settings/general ; command 40800',
+                     'command 38003 ; type hello'):
+            self.refused(line)
+
     def test_settings_pages_take_screenshots_only(self):
         # The three settings pages that may open take shots only: any
         # input verb in the same script refuses, on top of the typing
@@ -468,7 +486,6 @@ class RemoteRequestsTest(unittest.TestCase):
                      'open-urls chrome://settings/assistant ; key tab',
                      'open-urls chrome://settings/appearance ; type x',
                      'open-urls chrome://settings/privacy ; nspress a',
-                     'open-urls rac://settings/privacy ; wheel 1 2 3',
                      'open-urls chrome://settings/appearance ; move 1 2',
                      'open-urls chrome://settings/assistant ; command 34000',
                      'open-urls chrome://settings/privacy ; swipe 1 2 end',
@@ -489,6 +506,94 @@ class RemoteRequestsTest(unittest.TestCase):
                 ('open-urls chrome://settings/appearance ; windows windows.txt',
                  ['pages chrome://settings/appearance', 'file windows.txt'])):
             self.assertEqual(self.ok(line)[1], outputs, line)
+
+    def test_settings_pages_may_scroll(self):
+        # `wheel X Y DY` is the one input a settings run may send: an
+        # unmodified scroll moves the page and changes nothing on it.
+        for line, outputs in (
+                ('open-urls rac://settings/privacy ; wheel 1 2 3',
+                 ['pages rac://settings/privacy']),
+                ('open-urls chrome://settings/appearance ; wheel 100 200 -5 '
+                 '; after 300 a.png ; after 50 wheel 100 200 5 ; after 0 b.png',
+                 ['pages chrome://settings/appearance', 'expect a.png',
+                  'expect b.png']),
+                ('open-urls chrome://settings/assistant ; after 10 wheel 1 1 1',
+                 ['pages chrome://settings/assistant'])):
+            self.assertEqual(self.ok(line)[1], outputs, line)
+        # Scrolling never opens the door to anything else.
+        for line in ('open-urls chrome://settings/privacy ; wheel 1 2 3 ; click 1 2',
+                     'open-urls chrome://settings/privacy ; wheel 1 2 3 ; key tab',
+                     'open-urls chrome://settings/privacy ; wheel 1 2 3 ; type x',
+                     'open-urls chrome://settings/privacy ; wheel 1 2 3 ; nspress a',
+                     'open-urls chrome://settings/privacy ; wheel 1 2 3 ; move 1 2',
+                     'open-urls chrome://settings/privacy ; wheel 1 2 3 ; swipe 1 2 end',
+                     'open-urls chrome://settings/privacy ; wheel 1 2 3 ; pointer 1 2',
+                     'open-urls chrome://settings/privacy ; wheel 1 2 3 ; nsflags cmd',
+                     'open-urls chrome://settings/privacy ; wheel 1 2 3 ; nskey tab down',
+                     'open-urls chrome://settings/privacy ; wheel 1 2 3 ; command 34000',
+                     'open-urls chrome://settings/privacy ; after 5 wheel 1 2 3 '
+                     '; after 5 click 1 2',
+                     'open-urls chrome://settings/privacy ; wheel 1 2',
+                     'open-urls chrome://settings/privacy ; wheel 1 2 3 cmd'):
+            self.refused(line)
+        # Scrolling still counts as moving things for a script that types.
+        for line in ('type hello ; wheel 1 2 3', 'wheel 1 2 3 ; nspress a'):
+            self.refused(line)
+
+    def test_rac_command_bar_ids(self):
+        # The command bar (with and without the URL), clear tabs and the
+        # little window; copy-as-Markdown writes the clipboard, and the
+        # rest of rac's range is unreviewed.
+        for line in ('command 40800', 'command 40801', 'command 40802',
+                     'command 40803', 'after 5 command 40800'):
+            self.assertEqual(self.ok(line), (line, []), line)
+        for line in ('command 40804', 'command 40805', 'command 40900',
+                     'command 40999', 'after 5 command 40804'):
+            self.refused(line)
+        # A script that types still may not send a command.
+        for line in ('command 40800 ; type hello', 'type hello ; command 40801'):
+            self.refused(line)
+
+    def test_pwa_commands_need_test_type(self):
+        # The install dialog and open-in-app-window pass the checker but
+        # report `needs --test-type`; the Air refuses the run without it.
+        for line in ('command 40002', 'command 34055', 'after 5 command 40002'):
+            self.assertEqual(self.ok(line), (line, ['needs --test-type']), line)
+        out, outputs = self.ok('command 40002 ; after 900 command 34055 ; '
+                               'after 500 a.png')
+        self.assertEqual(outputs, ['needs --test-type', 'expect a.png'])
+        # Other commands need nothing; typing still rules commands out.
+        self.assertEqual(self.ok('command 34014')[1], [])
+        self.refused('command 40002 ; type hello')
+        self.refused('command 40003')
+
+    def test_serve_urls_need_serve(self):
+        # @SERVE@ is the run's own loopback server; the checker accepts it
+        # only when the run passes --serve.
+        for line in ('open-urls @SERVE@/index.html', 'open-urls @SERVE@',
+                     'open-urls @SERVE@/'):
+            self.refused(line)
+            self.assertEqual(self.rr.check_line(line, serve=True),
+                             (line, [], ['open-urls']), line)
+        self.assertTrue(self.rr.url_allowed('@SERVE@/a/b-c_d.html', serve=True))
+        self.assertFalse(self.rr.url_allowed('@SERVE@/a', serve=False))
+
+    def test_serve_urls_reach_only_the_served_folder(self):
+        # Nothing after the placeholder may change the host or port, climb
+        # out of the folder, or smuggle a second placeholder.
+        for line in ('open-urls @SERVE@:8080/', 'open-urls @SERVE@.evil.com/',
+                     'open-urls @SERVE@@evil.com/', 'open-urls @SERVE@evil.com',
+                     'open-urls @SERVE@/../x', 'open-urls @SERVE@/a/..',
+                     'open-urls @SERVE@/a%2e%2e/x', 'open-urls @SERVE@/a?b',
+                     'open-urls @SERVE@/a#b', 'open-urls @SERVE@/a:b',
+                     'open-urls @SERVE@/a@SERVE@', 'open-urls x@SERVE@/',
+                     'open-urls http://localhost/@SERVE@',
+                     'open-urls https://example.com/?u=@SERVE@',
+                     'open-urls @serve@/',
+                     'open-urls @SERVE@/é'):
+            self.refused(line)
+            with self.assertRaises(self.rr.Refused, msg=line):
+                self.rr.check_line(line, serve=True)
 
     def test_env_wildcards_may_not_cover_public_suffixes(self):
         # *.com or *.github.io would open a slice of the internet, not one
