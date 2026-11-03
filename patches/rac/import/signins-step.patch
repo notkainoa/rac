@@ -1,0 +1,3193 @@
+The sign-ins step of the Arc import (plan 04 M2). After a profile's
+sidebar import, it reads a copy of that Arc profile's cookie database, decodes
+it with the key derived from Arc's "Arc Safe Storage" Keychain item (asked for
+once per import, only after the user chose to bring sign-ins over), and writes
+the cookies into the rac profile through the cookie writer. Non-default Arc
+profiles become new rac profiles. Arc must be quit first. Turns on the import
+screens' sign-ins row, Arc-running gate and retry.
+
+Index: src/chrome/browser/rac/import/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/import/BUILD.gn
++++ src/chrome/browser/rac/import/BUILD.gn
+@@ -146,6 +146,47 @@ source_set("cookie_writer_profile") {
+   ]
+ }
+ 
++# The password protecting Arc's cookies: the "Arc Safe Storage" Keychain item
++# on macOS, a test override everywhere.
++source_set("arc_key") {
++  sources = [
++    "arc_safe_storage_key.cc",
++    "arc_safe_storage_key.h",
++  ]
++  public_deps = [ "//base" ]
++  if (is_mac) {
++    sources += [ "arc_safe_storage_key_mac.mm" ]
++    deps = [
++      "//crypto",
++      "//third_party/boringssl",
++    ]
++    frameworks = [
++      "Foundation.framework",
++      "Security.framework",
++    ]
++  }
++}
++
++# Reads one Arc profile's cookie database and decodes it into ImportedCookie
++# records for CookieWriter. Blocking file I/O; no profile or browser state.
++source_set("arc_cookie_import") {
++  sources = [
++    "arc_cookie_import.cc",
++    "arc_cookie_import.h",
++  ]
++  public_deps = [
++    ":cookie_db",
++    ":cookie_writer",
++    "//base",
++  ]
++  deps = [
++    # ArcPathStaysInside(), the same containment rule the reader uses.
++    ":arc_reader",
++    ":cookie_crypto",
++    "//net",
++  ]
++}
++
+ if (is_mac) {
+   # Whether Arc is running, and a watcher that fires when it quits. Built with
+   # ARC, which the observer token's lifetime relies on.
+@@ -160,6 +201,26 @@ if (is_mac) {
+       "Foundation.framework",
+     ]
+   }
++
++  # The sign-ins step's parts that need no profile: the import run's cookie
++  # key, one Arc profile's cookie import behind seams, and its report. The
++  # browser side is //chrome/browser/ui/rac/import/arc_signins.cc.
++  source_set("arc_signins_core") {
++    sources = [
++      "arc_signins_core.cc",
++      "arc_signins_core.h",
++    ]
++    public_deps = [
++      ":apply",
++      ":arc_cookie_import",
++      ":arc_key",
++      ":cookie_crypto",
++      ":cookie_db",
++      ":cookie_writer",
++      "//base",
++    ]
++    deps = [ "//crypto" ]
++  }
+ }
+ 
+ # Build with `autoninja -C out/Default
+@@ -167,10 +228,12 @@ if (is_mac) {
+ # Chromium's unit_tests, which takes hours to build.
+ test("rac_import_unittests") {
+   sources = [
++    "arc_cookie_import_unittest.cc",
+     "arc_import_mapping_unittest.cc",
+     "arc_import_record_unittest.cc",
+     "arc_import_rerun_unittest.cc",
+     "arc_reader_unittest.cc",
++    "arc_safe_storage_key_unittest.cc",
+     "arc_source_root_unittest.cc",
+     "cookie_db_rows_unittest.cc",
+     "cookie_test_vectors.inc",
+@@ -179,6 +242,8 @@ test("rac_import_unittests") {
+   ]
+   deps = [
+     ":apply",
++    ":arc_cookie_import",
++    ":arc_key",
+     ":arc_reader",
+     ":arc_source",
+     ":cookie_crypto",
+@@ -213,8 +278,14 @@ test("rac_import_unittests") {
+   data = [ "//chrome/test/data/rac/import/" ]
+ 
+   if (is_mac) {
+-    sources += [ "arc_app_state_mac_unittest.mm" ]
+-    deps += [ ":arc_app_state" ]
++    sources += [
++      "arc_app_state_mac_unittest.mm",
++      "arc_signins_unittest.cc",
++    ]
++    deps += [
++      ":arc_app_state",
++      ":arc_signins_core",
++    ]
+   }
+ }
+ 
+Index: src/chrome/browser/rac/import/arc_cookie_import.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/import/arc_cookie_import.cc
+@@ -0,0 +1,164 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/arc_cookie_import.h"
++
++#include <optional>
++#include <string_view>
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/strings/string_util.h"
++#include "base/time/time.h"
++#include "base/types/expected_macros.h"
++#include "chrome/browser/rac/import/arc_reader.h"
++#include "chrome/browser/rac/import/imported_cookie_crypto.h"
++#include "net/cookies/cookie_constants.h"
++
++namespace rac::import {
++
++namespace {
++
++static_assert(kImportedCookieKeySize == 16);
++
++constexpr base::FilePath::CharType kUserDataDir[] =
++    FILE_PATH_LITERAL("User Data");
++constexpr base::FilePath::CharType kNetworkDir[] = FILE_PATH_LITERAL("Network");
++constexpr base::FilePath::CharType kCookiesFile[] =
++    FILE_PATH_LITERAL("Cookies");
++
++// Whether `name` names one folder directly inside `User Data`: not empty, not
++// "." or "..", and with no separator or NUL that could reach anywhere else.
++bool IsPlainFolderName(std::string_view name) {
++  if (name.empty() || name == "." || name == ".." ||
++      name.find_first_of(std::string_view("/\\\0", 3)) !=
++          std::string_view::npos ||
++      !base::IsStringUTF8(name)) {
++    return false;
++  }
++  const base::FilePath path = base::FilePath::FromUTF8Unsafe(name);
++  return path.BaseName() == path && !path.ReferencesParent();
++}
++
++bool IsExistingFile(const base::FilePath& path) {
++  return base::PathExists(path) && !base::DirectoryExists(path);
++}
++
++// Chromium's DB stores Windows-epoch microseconds; 0 becomes a null time,
++// which for `expires_utc` means a session cookie.
++base::Time TimeFromDb(int64_t microseconds) {
++  return base::Time::FromDeltaSinceWindowsEpoch(
++      base::Microseconds(microseconds));
++}
++
++// DBCookiePriority in net/extras/sqlite/sqlite_persistent_cookie_store.cc.
++// net::CookiePriority has no fixed underlying type, so casting a value it
++// doesn't name is undefined; unknown values become the default here instead
++// of in the writer.
++net::CookiePriority PriorityFromDb(int priority) {
++  switch (priority) {
++    case 0:
++      return net::COOKIE_PRIORITY_LOW;
++    case 1:
++      return net::COOKIE_PRIORITY_MEDIUM;
++    case 2:
++      return net::COOKIE_PRIORITY_HIGH;
++  }
++  return net::COOKIE_PRIORITY_DEFAULT;
++}
++
++// The row's cookie value, or nullopt if it can't be decoded. Follows
++// SQLitePersistentCookieStore's load: an empty `encrypted_value` means the
++// value is stored in plaintext (possibly empty), and a row with both is
++// refused as ambiguous.
++std::optional<std::string> DecodeValue(CookieDbRow& row,
++                                       base::span<const uint8_t, 16> key,
++                                       int db_version) {
++  if (row.encrypted_value.empty()) {
++    return std::move(row.value);
++  }
++  if (!row.value.empty()) {
++    return std::nullopt;
++  }
++  base::expected<std::string, CookieDecryptError> decrypted =
++      DecryptImportedCookieValue(key, row.encrypted_value, row.host_key,
++                                 db_version);
++  if (!decrypted.has_value()) {
++    return std::nullopt;
++  }
++  return std::move(decrypted).value();
++}
++
++}  // namespace
++
++ArcCookieReadResult::ArcCookieReadResult() = default;
++ArcCookieReadResult::ArcCookieReadResult(ArcCookieReadResult&&) = default;
++ArcCookieReadResult& ArcCookieReadResult::operator=(ArcCookieReadResult&&) =
++    default;
++ArcCookieReadResult::~ArcCookieReadResult() = default;
++
++base::FilePath ArcCookieDbPath(const base::FilePath& arc_support_dir,
++                               const std::string& profile_directory) {
++  if (arc_support_dir.empty() || !IsPlainFolderName(profile_directory)) {
++    return base::FilePath();
++  }
++  const base::FilePath profile_dir =
++      arc_support_dir.Append(kUserDataDir)
++          .Append(base::FilePath::FromUTF8Unsafe(profile_directory));
++  // Chromium moved the cookie store into Network/ in M96; older profiles
++  // still have it at the top.
++  base::FilePath db_path = profile_dir.Append(kNetworkDir).Append(kCookiesFile);
++  if (!IsExistingFile(db_path)) {
++    db_path = profile_dir.Append(kCookiesFile);
++    if (!IsExistingFile(db_path)) {
++      return base::FilePath();
++    }
++  }
++  // A symlink anywhere on the way, the file included, may lead out of Arc's
++  // folder. Don't fall back to the other location then: something is off.
++  if (!ArcPathStaysInside(arc_support_dir, db_path)) {
++    return base::FilePath();
++  }
++  return db_path;
++}
++
++base::expected<ArcCookieReadResult, CookieDbReadError> ReadArcCookies(
++    const base::FilePath& db_path,
++    base::span<const uint8_t, 16> key) {
++  ASSIGN_OR_RETURN(CookieDbSnapshot snapshot, ReadCookieDbRows(db_path));
++
++  ArcCookieReadResult result;
++  result.truncated = snapshot.rows_truncated;
++  result.cookies.reserve(snapshot.rows.size());
++  for (CookieDbRow& row : snapshot.rows) {
++    std::optional<std::string> value =
++        DecodeValue(row, key, snapshot.meta_version);
++    if (!value) {
++      ++result.undecodable;
++      continue;
++    }
++    ImportedCookie& cookie = result.cookies.emplace_back();
++    cookie.name = std::move(row.name);
++    cookie.value = std::move(*value);
++    cookie.host_key = std::move(row.host_key);
++    cookie.path = std::move(row.path);
++    cookie.creation = TimeFromDb(row.creation_utc);
++    cookie.expiry = TimeFromDb(row.expires_utc);
++    cookie.last_access = TimeFromDb(row.last_access_utc);
++    cookie.secure = row.is_secure;
++    cookie.http_only = row.is_httponly;
++    // Both enums have an int underlying type and the DB's numbering, so any
++    // value is safe to carry over; the writer maps unknown ones.
++    cookie.same_site = static_cast<net::CookieSameSite>(row.samesite);
++    cookie.priority = PriorityFromDb(row.priority);
++    cookie.source_scheme =
++        static_cast<net::CookieSourceScheme>(row.source_scheme);
++    cookie.source_port = row.source_port;
++    cookie.partition_key = std::move(row.top_frame_site_key);
++    cookie.has_cross_site_ancestor = row.has_cross_site_ancestor;
++  }
++  return result;
++}
++
++}  // namespace rac::import
+Index: src/chrome/browser/rac/import/arc_cookie_import.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/import/arc_cookie_import.h
+@@ -0,0 +1,51 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_IMPORT_ARC_COOKIE_IMPORT_H_
++#define CHROME_BROWSER_RAC_IMPORT_ARC_COOKIE_IMPORT_H_
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++#include "base/types/expected.h"
++#include "chrome/browser/rac/import/cookie_db_rows.h"
++#include "chrome/browser/rac/import/cookie_writer.h"
++
++namespace rac::import {
++
++// Arc's cookies, decoded and ready for CookieWriter.
++struct ArcCookieReadResult {
++  ArcCookieReadResult();
++  ArcCookieReadResult(ArcCookieReadResult&&);
++  ArcCookieReadResult& operator=(ArcCookieReadResult&&);
++  ~ArcCookieReadResult();
++
++  std::vector<ImportedCookie> cookies;
++  // Rows whose value didn't decode: a wrong key, a corrupt or unsupported
++  // value, a database version the decoder doesn't know, or a row with both a
++  // plaintext and an encrypted value. They're left out of `cookies`.
++  int undecodable = 0;
++  // The reader hit its row cap, so some rows were never read.
++  bool truncated = false;
++};
++
++// The cookie database of one Arc profile: <arc_support_dir>/User Data/
++// <profile_directory>/Network/Cookies if it exists, else .../Cookies. Empty
++// if neither exists, if `profile_directory` isn't one plain folder name, or
++// if the path resolves outside `arc_support_dir`. Blocking.
++base::FilePath ArcCookieDbPath(const base::FilePath& arc_support_dir,
++                               const std::string& profile_directory);
++
++// Reads a copy of `db_path` and decodes every row with `key`. Blocking: call
++// on a MayBlock sequence. Never logs cookie names, values or hosts.
++base::expected<ArcCookieReadResult, CookieDbReadError> ReadArcCookies(
++    const base::FilePath& db_path,
++    base::span<const uint8_t, 16> key);
++
++}  // namespace rac::import
++
++#endif  // CHROME_BROWSER_RAC_IMPORT_ARC_COOKIE_IMPORT_H_
+Index: src/chrome/browser/rac/import/arc_cookie_import_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/import/arc_cookie_import_unittest.cc
+@@ -0,0 +1,455 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/arc_cookie_import.h"
++
++#include <array>
++#include <cstdint>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/notreached.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/time/time.h"
++#include "chrome/browser/rac/import/cookie_db_rows.h"
++#include "chrome/browser/rac/import/cookie_fixture_db.h"
++#include "chrome/browser/rac/import/cookie_writer.h"
++#include "chrome/browser/rac/import/imported_cookie_crypto.h"
++#include "net/cookies/cookie_constants.h"
++#include "sql/database.h"
++#include "sql/test/test_helpers.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::import {
++namespace {
++
++// The layout cookie_test_vectors.inc expects its includer to define.
++struct CookieTestVector {
++  const char* name;
++  const char* host_key;
++  int db_version;
++  const char* encrypted_hex;
++  const char* plaintext;
++  const char* expect;
++};
++
++// Generated from synthetic fixtures with a fixed test password. Defines
++// kTestPassword, kTestDerivedKeyHex, and kCookieTestVectors.
++#include "chrome/browser/rac/import/cookie_test_vectors.inc"
++
++using test::CookieFixtureDb;
++using test::FixtureCookieRow;
++
++// Every v23 vector fails its padding check under the key from this password,
++// so a wrong key is detectable at both versions in these tests. (In general a
++// wrong key passes a v23 value about 1 time in 256.)
++constexpr char kOtherPassword[] = "not the fixture password";
++
++std::array<uint8_t, kImportedCookieKeySize> KeyFor(std::string_view password) {
++  return DeriveImportedCookieKey(base::as_byte_span(password));
++}
++
++std::vector<uint8_t> FromHex(std::string_view hex) {
++  std::vector<uint8_t> bytes;
++  // HexStringToBytes() rejects "", but the empty_blob vector is legitimately
++  // zero bytes.
++  if (!hex.empty()) {
++    EXPECT_TRUE(base::HexStringToBytes(hex, &bytes)) << hex;
++  }
++  return bytes;
++}
++
++const CookieTestVector& VectorNamed(std::string_view name) {
++  for (const CookieTestVector& v : kCookieTestVectors) {
++    if (name == v.name) {
++      return v;
++    }
++  }
++  NOTREACHED() << name;
++}
++
++// A fixture row holding `vector`'s blob, named after the vector so names stay
++// unique for the cookies_unique_index.
++FixtureCookieRow RowFor(const CookieTestVector& vector) {
++  FixtureCookieRow row;
++  row.host_key = vector.host_key;
++  row.name = vector.name;
++  row.encrypted_value = FromHex(vector.encrypted_hex);
++  return row;
++}
++
++std::vector<const CookieTestVector*> OkVectorsAt(int version) {
++  std::vector<const CookieTestVector*> vectors;
++  for (const CookieTestVector& v : kCookieTestVectors) {
++    if (v.db_version == version && std::string_view(v.expect) == "ok") {
++      vectors.push_back(&v);
++    }
++  }
++  return vectors;
++}
++
++const ImportedCookie* CookieNamed(const ArcCookieReadResult& result,
++                                  std::string_view name) {
++  for (const ImportedCookie& cookie : result.cookies) {
++    if (cookie.name == name) {
++      return &cookie;
++    }
++  }
++  return nullptr;
++}
++
++int64_t ToDb(base::Time time) {
++  return time.ToDeltaSinceWindowsEpoch().InMicroseconds();
++}
++
++class ArcCookieImportTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    ASSERT_TRUE(temp_dir_.CreateUniqueTempDir());
++    db_path_ = temp_dir_.GetPath().AppendASCII("Cookies");
++  }
++
++  // Writes `rows` into a fresh fixture DB at `db_path_`.
++  void MakeDb(int version, const std::vector<FixtureCookieRow>& rows) {
++    auto fixture = CookieFixtureDb::Create(db_path_, {.meta_version = version});
++    ASSERT_TRUE(fixture);
++    ASSERT_TRUE(fixture->AddRows(rows));
++  }
++
++  const std::array<uint8_t, kImportedCookieKeySize> key_ =
++      KeyFor(kTestPassword);
++  base::ScopedTempDir temp_dir_;
++  base::FilePath db_path_;
++};
++
++TEST_F(ArcCookieImportTest, TestKeyMatchesVectors) {
++  EXPECT_EQ(base::HexEncodeLower(key_), kTestDerivedKeyHex);
++}
++
++class ArcCookieImportVersionTest : public ArcCookieImportTest,
++                                   public testing::WithParamInterface<int> {};
++
++// Every decodable vector at the DB's version comes back with its plaintext.
++TEST_P(ArcCookieImportVersionTest, DecodesGoodRows) {
++  const int version = GetParam();
++  const std::vector<const CookieTestVector*> vectors = OkVectorsAt(version);
++  ASSERT_FALSE(vectors.empty());
++  std::vector<FixtureCookieRow> rows;
++  for (const CookieTestVector* v : vectors) {
++    rows.push_back(RowFor(*v));
++  }
++  ASSERT_NO_FATAL_FAILURE(MakeDb(version, rows));
++
++  auto result = ReadArcCookies(db_path_, key_);
++  ASSERT_TRUE(result.has_value());
++  EXPECT_EQ(0, result->undecodable);
++  EXPECT_FALSE(result->truncated);
++  ASSERT_EQ(vectors.size(), result->cookies.size());
++  for (const CookieTestVector* v : vectors) {
++    SCOPED_TRACE(v->name);
++    const ImportedCookie* cookie = CookieNamed(*result, v->name);
++    ASSERT_TRUE(cookie);
++    EXPECT_EQ(v->plaintext, cookie->value);
++    EXPECT_EQ(v->host_key, cookie->host_key);
++  }
++}
++
++// Every column the writer uses lands in its field.
++TEST_P(ArcCookieImportVersionTest, MapsEveryField) {
++  const int version = GetParam();
++  FixtureCookieRow row =
++      RowFor(VectorNamed(version == 23 ? "plain_v23" : "plain_v24"));
++  row.name = "session";
++  row.creation_utc = 13'380'000'000'000'001;
++  row.top_frame_site_key = "https://toplevel.example";
++  row.path = "/account";
++  row.expires_utc = 13'390'000'000'000'002;
++  row.is_secure = true;
++  row.is_httponly = true;
++  row.last_access_utc = 13'380'000'000'000'003;
++  row.has_expires = true;
++  row.priority = 2;
++  row.samesite = 2;
++  row.source_scheme = 2;
++  row.source_port = 443;
++  row.has_cross_site_ancestor = true;
++  ASSERT_NO_FATAL_FAILURE(MakeDb(version, {row}));
++
++  auto result = ReadArcCookies(db_path_, key_);
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(1u, result->cookies.size());
++  const ImportedCookie& cookie = result->cookies[0];
++  EXPECT_EQ("session", cookie.name);
++  EXPECT_EQ("session=abc123", cookie.value);
++  EXPECT_EQ("example.com", cookie.host_key);
++  EXPECT_EQ("/account", cookie.path);
++  EXPECT_EQ(row.creation_utc, ToDb(cookie.creation));
++  EXPECT_EQ(row.expires_utc, ToDb(cookie.expiry));
++  EXPECT_EQ(row.last_access_utc, ToDb(cookie.last_access));
++  EXPECT_TRUE(cookie.secure);
++  EXPECT_TRUE(cookie.http_only);
++  EXPECT_EQ(net::CookieSameSite::STRICT_MODE, cookie.same_site);
++  EXPECT_EQ(net::COOKIE_PRIORITY_HIGH, cookie.priority);
++  EXPECT_EQ(net::CookieSourceScheme::kSecure, cookie.source_scheme);
++  EXPECT_EQ(443, cookie.source_port);
++  EXPECT_EQ("https://toplevel.example", cookie.partition_key);
++  EXPECT_TRUE(cookie.has_cross_site_ancestor);
++}
++
++// The wrong key fails every encrypted row without crashing.
++TEST_P(ArcCookieImportVersionTest, WrongKeyGivesUndecodableRows) {
++  const int version = GetParam();
++  const std::vector<const CookieTestVector*> vectors = OkVectorsAt(version);
++  std::vector<FixtureCookieRow> rows;
++  for (const CookieTestVector* v : vectors) {
++    rows.push_back(RowFor(*v));
++  }
++  ASSERT_NO_FATAL_FAILURE(MakeDb(version, rows));
++
++  auto result = ReadArcCookies(db_path_, KeyFor(kOtherPassword));
++  ASSERT_TRUE(result.has_value());
++  EXPECT_TRUE(result->cookies.empty());
++  EXPECT_EQ(static_cast<int>(vectors.size()), result->undecodable);
++}
++
++INSTANTIATE_TEST_SUITE_P(MetaVersions,
++                         ArcCookieImportVersionTest,
++                         testing::Values(23, 24));
++
++// The other end of each field: a session cookie, unpartitioned, with the
++// DB's defaults.
++TEST_F(ArcCookieImportTest, MapsDefaults) {
++  FixtureCookieRow row = RowFor(VectorNamed("plain_v24"));
++  row.expires_utc = 0;
++  row.is_persistent = false;
++  row.priority = 0;
++  row.samesite = -1;
++  row.source_scheme = 1;
++  row.has_cross_site_ancestor = false;
++  ASSERT_NO_FATAL_FAILURE(MakeDb(24, {row}));
++
++  auto result = ReadArcCookies(db_path_, key_);
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(1u, result->cookies.size());
++  const ImportedCookie& cookie = result->cookies[0];
++  EXPECT_TRUE(cookie.expiry.is_null());
++  EXPECT_FALSE(cookie.secure);
++  EXPECT_FALSE(cookie.http_only);
++  EXPECT_EQ(net::CookieSameSite::UNSPECIFIED, cookie.same_site);
++  EXPECT_EQ(net::COOKIE_PRIORITY_LOW, cookie.priority);
++  EXPECT_EQ(net::CookieSourceScheme::kNonSecure, cookie.source_scheme);
++  EXPECT_EQ(-1, cookie.source_port);
++  EXPECT_TRUE(cookie.partition_key.empty());
++  EXPECT_FALSE(cookie.has_cross_site_ancestor);
++}
++
++// A priority the DB format doesn't define becomes the default rather than an
++// out-of-range net::CookiePriority.
++TEST_F(ArcCookieImportTest, UnknownPriorityBecomesDefault) {
++  FixtureCookieRow row = RowFor(VectorNamed("plain_v24"));
++  row.priority = 7;
++  ASSERT_NO_FATAL_FAILURE(MakeDb(24, {row}));
++
++  auto result = ReadArcCookies(db_path_, key_);
++  ASSERT_TRUE(result.has_value());
++  ASSERT_EQ(1u, result->cookies.size());
++  EXPECT_EQ(net::COOKIE_PRIORITY_DEFAULT, result->cookies[0].priority);
++}
++
++// Each kind of bad value is counted and left out; the good row still comes
++// through.
++TEST_F(ArcCookieImportTest, CountsAndSkipsUndecodableRows) {
++  std::vector<FixtureCookieRow> rows = {
++      RowFor(VectorNamed("plain_v24")),
++      RowFor(VectorNamed("bad_padding_v24")),
++      RowFor(VectorNamed("host_mismatch_v24")),
++      RowFor(VectorNamed("truncated_v24")),
++      RowFor(VectorNamed("v11_prefix_v24")),
++  };
++  ASSERT_NO_FATAL_FAILURE(MakeDb(24, rows));
++
++  auto result = ReadArcCookies(db_path_, key_);
++  ASSERT_TRUE(result.has_value());
++  EXPECT_EQ(4, result->undecodable);
++  ASSERT_EQ(1u, result->cookies.size());
++  EXPECT_EQ("plain_v24", result->cookies[0].name);
++  EXPECT_EQ("session=abc123", result->cookies[0].value);
++}
++
++// A row with an empty encrypted_value is stored in plaintext. It needs no
++// key, so it comes through even with the wrong one.
++TEST_F(ArcCookieImportTest, UsesPlaintextValueWhenNotEncrypted) {
++  FixtureCookieRow plain;
++  plain.host_key = ".example.org";
++  plain.name = "legacy";
++  plain.value = "plain";
++  FixtureCookieRow empty;
++  empty.host_key = ".example.org";
++  empty.name = "empty";
++  ASSERT_NO_FATAL_FAILURE(MakeDb(24, {plain, empty}));
++
++  for (const auto& key : {key_, KeyFor(kOtherPassword)}) {
++    auto result = ReadArcCookies(db_path_, key);
++    ASSERT_TRUE(result.has_value());
++    EXPECT_EQ(0, result->undecodable);
++    ASSERT_EQ(2u, result->cookies.size());
++    ASSERT_TRUE(CookieNamed(*result, "legacy"));
++    EXPECT_EQ("plain", CookieNamed(*result, "legacy")->value);
++    ASSERT_TRUE(CookieNamed(*result, "empty"));
++    EXPECT_EQ("", CookieNamed(*result, "empty")->value);
++  }
++}
++
++// Chromium's own store refuses a row with both values, since it can't tell
++// which is real. So does the import.
++TEST_F(ArcCookieImportTest, SkipsRowWithBothValues) {
++  FixtureCookieRow row = RowFor(VectorNamed("plain_v24"));
++  row.value = "plaintext too";
++  ASSERT_NO_FATAL_FAILURE(MakeDb(24, {row}));
++
++  auto result = ReadArcCookies(db_path_, key_);
++  ASSERT_TRUE(result.has_value());
++  EXPECT_EQ(1, result->undecodable);
++  EXPECT_TRUE(result->cookies.empty());
++}
++
++// A meta version the decoder doesn't know fails every encrypted row instead
++// of guessing at the format. Plaintext rows still come through.
++TEST_F(ArcCookieImportTest, UnsupportedVersionGivesUndecodableRows) {
++  FixtureCookieRow plain;
++  plain.host_key = "example.com";
++  plain.name = "legacy";
++  plain.value = "plain";
++  ASSERT_NO_FATAL_FAILURE(
++      MakeDb(24, {RowFor(VectorNamed("plain_v24")), plain}));
++  {
++    sql::Database db(sql::test::kTestTag);
++    ASSERT_TRUE(db.Open(db_path_));
++    ASSERT_TRUE(
++        db.Execute("UPDATE meta SET value = '25' WHERE key = 'version'"));
++  }
++
++  auto result = ReadArcCookies(db_path_, key_);
++  ASSERT_TRUE(result.has_value());
++  EXPECT_EQ(1, result->undecodable);
++  ASSERT_EQ(1u, result->cookies.size());
++  EXPECT_EQ("legacy", result->cookies[0].name);
++}
++
++TEST_F(ArcCookieImportTest, PassesReadErrorThrough) {
++  auto result = ReadArcCookies(db_path_, key_);
++  ASSERT_FALSE(result.has_value());
++  EXPECT_EQ(CookieDbReadError::kSourceMissing, result.error());
++}
++
++class ArcCookieDbPathTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    ASSERT_TRUE(temp_dir_.CreateUniqueTempDir());
++    support_ = temp_dir_.GetPath().AppendASCII("Arc");
++    // Arc's real folder name, built at runtime; no file in the repo has a
++    // space in its path.
++    user_data_ = support_.Append(FILE_PATH_LITERAL("User Data"));
++    ASSERT_TRUE(base::CreateDirectory(user_data_));
++  }
++
++  // Creates an empty file at `relative`, under "User Data".
++  base::FilePath Touch(std::string_view relative) {
++    const base::FilePath path = user_data_.AppendASCII(relative);
++    EXPECT_TRUE(base::CreateDirectory(path.DirName()));
++    EXPECT_TRUE(base::WriteFile(path, ""));
++    return path;
++  }
++
++  base::ScopedTempDir temp_dir_;
++  base::FilePath support_;
++  base::FilePath user_data_;
++};
++
++TEST_F(ArcCookieDbPathTest, PrefersNetworkCookies) {
++  const base::FilePath network = Touch("Default/Network/Cookies");
++  Touch("Default/Cookies");
++  EXPECT_EQ(network, ArcCookieDbPath(support_, "Default"));
++}
++
++TEST_F(ArcCookieDbPathTest, FallsBackToProfileCookies) {
++  const base::FilePath legacy = Touch("Profile 1/Cookies");
++  ASSERT_TRUE(base::CreateDirectory(
++      user_data_.AppendASCII("Profile 1").AppendASCII("Network")));
++  EXPECT_EQ(legacy, ArcCookieDbPath(support_, "Profile 1"));
++}
++
++TEST_F(ArcCookieDbPathTest, EmptyWhenNeitherExists) {
++  ASSERT_TRUE(base::CreateDirectory(user_data_.AppendASCII("Default")));
++  EXPECT_TRUE(ArcCookieDbPath(support_, "Default").empty());
++  EXPECT_TRUE(ArcCookieDbPath(support_, "Missing").empty());
++}
++
++// A folder named Cookies isn't a database.
++TEST_F(ArcCookieDbPathTest, IgnoresFolderNamedCookies) {
++  ASSERT_TRUE(
++      base::CreateDirectory(user_data_.AppendASCII("Default/Network/Cookies")));
++  const base::FilePath legacy = Touch("Default/Cookies");
++  EXPECT_EQ(legacy, ArcCookieDbPath(support_, "Default"));
++}
++
++// Names that could reach past one folder in "User Data" are refused, even
++// where a Cookies file waits at the end.
++TEST_F(ArcCookieDbPathTest, RejectsNamesThatArentOneFolder) {
++  // "User Data/.." is Arc's folder itself.
++  ASSERT_TRUE(base::WriteFile(support_.AppendASCII("Cookies"), ""));
++  Touch("a/b/Cookies");
++  Touch("Default/Cookies");
++  for (const char* name :
++       {"..", ".", "", "a/b", "../Arc", "Default/", "/Default", "a\\b"}) {
++    SCOPED_TRACE(name);
++    EXPECT_TRUE(ArcCookieDbPath(support_, name).empty());
++  }
++  EXPECT_TRUE(ArcCookieDbPath(support_, std::string("Default\0x", 9)).empty());
++  EXPECT_TRUE(ArcCookieDbPath(base::FilePath(), "Default").empty());
++}
++
++TEST_F(ArcCookieDbPathTest, RejectsSymlinkOutOfArcFolder) {
++  base::ScopedTempDir outside;
++  ASSERT_TRUE(outside.CreateUniqueTempDir());
++  const base::FilePath target = outside.GetPath().AppendASCII("Cookies");
++  ASSERT_TRUE(base::WriteFile(target, ""));
++  const base::FilePath network =
++      user_data_.AppendASCII("Default").AppendASCII("Network");
++  ASSERT_TRUE(base::CreateDirectory(network));
++  ASSERT_TRUE(base::CreateSymbolicLink(target, network.AppendASCII("Cookies")));
++  // An inside file at the fallback location isn't used instead.
++  Touch("Default/Cookies");
++
++  EXPECT_TRUE(ArcCookieDbPath(support_, "Default").empty());
++}
++
++TEST_F(ArcCookieDbPathTest, RejectsSymlinkedProfileFolderOutOfArcFolder) {
++  base::ScopedTempDir outside;
++  ASSERT_TRUE(outside.CreateUniqueTempDir());
++  ASSERT_TRUE(base::WriteFile(outside.GetPath().AppendASCII("Cookies"), ""));
++  ASSERT_TRUE(base::CreateSymbolicLink(outside.GetPath(),
++                                       user_data_.AppendASCII("Default")));
++
++  EXPECT_TRUE(ArcCookieDbPath(support_, "Default").empty());
++}
++
++TEST_F(ArcCookieDbPathTest, AllowsSymlinkThatStaysInside) {
++  const base::FilePath real = Touch("Default/Cookies");
++  const base::FilePath network =
++      user_data_.AppendASCII("Default").AppendASCII("Network");
++  ASSERT_TRUE(base::CreateDirectory(network));
++  const base::FilePath link = network.AppendASCII("Cookies");
++  ASSERT_TRUE(base::CreateSymbolicLink(real, link));
++
++  EXPECT_EQ(link, ArcCookieDbPath(support_, "Default"));
++}
++
++}  // namespace
++}  // namespace rac::import
+Index: src/chrome/browser/rac/import/arc_import_types.h
+===================================================================
+--- src.orig/chrome/browser/rac/import/arc_import_types.h
++++ src/chrome/browser/rac/import/arc_import_types.h
+@@ -34,7 +34,8 @@ struct ArcImportOptions {
+   bool open_tabs = true;
+   // Arc's browsing history, through Helium's importer, history only.
+   bool history = true;
+-  // Ignored until the sign-ins step is built.
++  // Arc's cookies, after each profile's sidebar part, through the sign-ins
++  // step. Ignored where it isn't registered (ArcSignInsStep).
+   bool sign_ins = false;
+ };
+ 
+@@ -137,6 +138,39 @@ enum class ArcImportFailure {
+   kProfileGone,
+ };
+ 
++// The sign-ins (cookies) part of one Arc profile's import. It never changes
++// the sidebar part's result. The defaults mean it wasn't attempted.
++struct ArcSignInsResult {
++  enum class Status {
++    // Not asked for, no sign-ins step in this build, or the sidebar part
++    // stopped before it.
++    kNotAttempted,
++    kDone,
++    // Arc has no cookie database for this profile, or it holds no cookies.
++    kNoCookies,
++    // Arc was running, so nothing was read. Quit Arc and retry.
++    kArcRunning,
++    // The user refused macOS's Keychain prompt for Arc's key.
++    kDenied,
++    // Arc's key wasn't there, the database couldn't be read or decrypted, or
++    // rac's cookie store refused the cookies.
++    kFailed,
++  };
++
++  Status status = Status::kNotAttempted;
++  // Accepted by rac's cookie store.
++  int written = 0;
++  // Expired, duplicates, not newer than rac's own, or blocked or cleared on
++  // exit by rac's cookie settings (CookieWriteReport::skipped_total()).
++  int skipped = 0;
++  // Refused by validation or by the store.
++  int rejected = 0;
++  // Couldn't be decrypted with Arc's key.
++  int undecodable = 0;
++  // Arc's database had more cookies than the reader takes; the rest stayed.
++  bool truncated = false;
++};
++
+ // One Arc profile's part of an import.
+ struct ArcProfileResult {
+   enum class Status {
+@@ -174,6 +208,7 @@ struct ArcProfileResult {
+   bool new_profile = false;
+   ArcImportCounts counts;
+   History history = History::kNotRequested;
++  ArcSignInsResult sign_ins;
+   // Arc's pinned extensions. Kept in the import record, never installed.
+   int pinned_extensions = 0;
+   // Until when this profile's part can be undone. Unset if nothing was
+Index: src/chrome/browser/rac/import/arc_safe_storage_key.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/import/arc_safe_storage_key.cc
+@@ -0,0 +1,87 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/arc_safe_storage_key.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "base/check.h"
++#include "base/functional/bind.h"
++#include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "base/sequence_checker.h"
++#include "base/task/sequenced_task_runner.h"
++#include "build/build_config.h"
++
++namespace rac::import {
++
++namespace {
++
++// The answer of the live ScopedArcSafeStorageKeyForTesting, if any. Set and
++// read on the test's main thread only.
++std::optional<base::expected<std::string, ArcKeyError>>& TestingAnswer() {
++  static base::NoDestructor<
++      std::optional<base::expected<std::string, ArcKeyError>>>
++      answer;
++  return *answer;
++}
++
++// Replies a fixed answer from a posted task. Serves the test override, and
++// the platforms without Arc's Keychain item.
++class FixedAnswerSource : public ArcSafeStorageKeySource {
++ public:
++  explicit FixedAnswerSource(base::expected<std::string, ArcKeyError> answer)
++      : answer_(std::move(answer)) {}
++  FixedAnswerSource(const FixedAnswerSource&) = delete;
++  FixedAnswerSource& operator=(const FixedAnswerSource&) = delete;
++  ~FixedAnswerSource() override = default;
++
++  void GetPassword(ArcPasswordCallback done) override {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&FixedAnswerSource::Reply,
++                                  weak_factory_.GetWeakPtr(), std::move(done)));
++  }
++
++ private:
++  void Reply(ArcPasswordCallback done) {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    std::move(done).Run(answer_);
++  }
++
++  SEQUENCE_CHECKER(sequence_checker_);
++  const base::expected<std::string, ArcKeyError> answer_;
++  base::WeakPtrFactory<FixedAnswerSource> weak_factory_{this};
++};
++
++}  // namespace
++
++std::unique_ptr<ArcSafeStorageKeySource> CreateArcSafeStorageKeySource() {
++  if (const auto& answer = TestingAnswer(); answer.has_value()) {
++    return std::make_unique<FixedAnswerSource>(*answer);
++  }
++#if BUILDFLAG(IS_MAC)
++  return internal::CreateKeychainArcSafeStorageKey();
++#else
++  return std::make_unique<FixedAnswerSource>(
++      base::unexpected(ArcKeyError::kFailed));
++#endif
++}
++
++ScopedArcSafeStorageKeyForTesting::ScopedArcSafeStorageKeyForTesting(
++    base::expected<std::string, ArcKeyError> answer) {
++  CHECK(!TestingAnswer().has_value())
++      << "ScopedArcSafeStorageKeyForTesting can't nest";
++  TestingAnswer().emplace(std::move(answer));
++}
++
++ScopedArcSafeStorageKeyForTesting::~ScopedArcSafeStorageKeyForTesting() {
++  CHECK(TestingAnswer().has_value());
++  TestingAnswer().reset();
++}
++
++}  // namespace rac::import
+Index: src/chrome/browser/rac/import/arc_safe_storage_key.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/import/arc_safe_storage_key.h
+@@ -0,0 +1,85 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_IMPORT_ARC_SAFE_STORAGE_KEY_H_
++#define CHROME_BROWSER_RAC_IMPORT_ARC_SAFE_STORAGE_KEY_H_
++
++#include <memory>
++#include <string>
++
++#include "base/functional/callback.h"
++#include "base/types/expected.h"
++#include "build/build_config.h"
++
++#if BUILDFLAG(IS_MAC)
++#include <MacTypes.h>
++#endif
++
++// The password that protects Arc's cookies.
++//
++// Arc, like every Chromium browser on macOS, encrypts cookie values with a key
++// derived from a random password it keeps in the user's login Keychain. To
++// bring sign-ins over, rac reads that password, which makes macOS show its own
++// prompt asking the user to allow access. The read never adds, changes or
++// deletes a Keychain item.
++
++namespace rac::import {
++
++enum class ArcKeyError {
++  // The user denied access at the macOS prompt, or cancelled it.
++  kDenied,
++  // There is no "Arc Safe Storage" item: Arc never stored a cookie key.
++  kNotFound,
++  // Anything else, including every platform but macOS.
++  kFailed,
++};
++
++using ArcPasswordCallback =
++    base::OnceCallback<void(base::expected<std::string, ArcKeyError>)>;
++
++// Where the password protecting Arc's cookies comes from.
++class ArcSafeStorageKeySource {
++ public:
++  virtual ~ArcSafeStorageKeySource() = default;
++  // May show a macOS access prompt: call only after the user asked to bring
++  // sign-ins over. Replies once, on the calling sequence, never re-entrantly.
++  // Destroying the source before it replies drops `done` without running it.
++  virtual void GetPassword(ArcPasswordCallback done) = 0;
++};
++
++// The real source (the "Arc Safe Storage" Keychain item), or the testing
++// answer while a ScopedArcSafeStorageKeyForTesting is alive.
++std::unique_ptr<ArcSafeStorageKeySource> CreateArcSafeStorageKeySource();
++
++// Test seam. While alive, CreateArcSafeStorageKeySource() returns a source that
++// replies `answer` and never touches the Keychain. Nesting is a CHECK failure.
++// A source created while the override was alive keeps replying `answer` after
++// the override is gone.
++class ScopedArcSafeStorageKeyForTesting {
++ public:
++  explicit ScopedArcSafeStorageKeyForTesting(
++      base::expected<std::string, ArcKeyError> answer);
++  ScopedArcSafeStorageKeyForTesting(const ScopedArcSafeStorageKeyForTesting&) =
++      delete;
++  ScopedArcSafeStorageKeyForTesting& operator=(
++      const ScopedArcSafeStorageKeyForTesting&) = delete;
++  ~ScopedArcSafeStorageKeyForTesting();
++};
++
++namespace internal {
++
++#if BUILDFLAG(IS_MAC)
++// The Keychain-backed source. Use CreateArcSafeStorageKeySource() instead,
++// which honors the test override.
++std::unique_ptr<ArcSafeStorageKeySource> CreateKeychainArcSafeStorageKey();
++
++// How a SecItemCopyMatching() status maps to an error. Not for errSecSuccess.
++ArcKeyError ArcKeyErrorFromStatus(OSStatus status);
++#endif
++
++}  // namespace internal
++
++}  // namespace rac::import
++
++#endif  // CHROME_BROWSER_RAC_IMPORT_ARC_SAFE_STORAGE_KEY_H_
+Index: src/chrome/browser/rac/import/arc_safe_storage_key_mac.mm
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/import/arc_safe_storage_key_mac.mm
+@@ -0,0 +1,144 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/arc_safe_storage_key.h"
++
++#import <Foundation/Foundation.h>
++#include <Security/Security.h>
++
++#include <memory>
++#include <string>
++#include <utility>
++
++#include "base/apple/foundation_util.h"
++#include "base/apple/osstatus_logging.h"
++#include "base/apple/scoped_cftyperef.h"
++#include "base/containers/span.h"
++#include "base/functional/bind.h"
++#include "base/memory/weak_ptr.h"
++#include "base/sequence_checker.h"
++#include "base/task/thread_pool.h"
++#include "crypto/apple/keychain_v2.h"
++#include "third_party/boringssl/src/include/openssl/mem.h"
++
++namespace rac::import {
++
++namespace {
++
++using PasswordResult = base::expected<std::string, ArcKeyError>;
++
++// The generic password Arc keeps in the login Keychain. The service and
++// account names are the ones Cra's MIT-licensed import uses for Arc
++// (Sources/Cra/Services/Import/BrowserSources.swift, read through
++// ChromiumCrypto.keychainSecret in CredentialImport.swift).
++NSString* const kArcKeychainService = @"Arc Safe Storage";
++NSString* const kArcKeychainAccount = @"Arc";
++
++// Overwrites the password in `result`, if it holds one.
++void Wipe(PasswordResult& result) {
++  if (result.has_value() && !result->empty()) {
++    OPENSSL_cleanse(result->data(), result->size());
++  }
++}
++
++// Reads the password. Blocks while macOS shows its access prompt, so it runs
++// on the thread pool. Read only: it never adds, updates or deletes an item.
++PasswordResult ReadArcPasswordFromKeychain() {
++  @autoreleasepool {
++    // No kSecUseDataProtectionKeychain: Arc's item is in the file-based login
++    // Keychain, which a data protection query would never search.
++    NSDictionary* query = @{
++      (__bridge id)kSecClass : (__bridge id)kSecClassGenericPassword,
++      (__bridge id)kSecAttrService : kArcKeychainService,
++      (__bridge id)kSecAttrAccount : kArcKeychainAccount,
++      (__bridge id)kSecReturnData : @YES,
++      (__bridge id)kSecMatchLimit : (__bridge id)kSecMatchLimitOne,
++    };
++
++    base::apple::ScopedCFTypeRef<CFTypeRef> result;
++    OSStatus status = crypto::apple::KeychainV2::GetInstance().ItemCopyMatching(
++        (__bridge CFDictionaryRef)query, result.InitializeInto());
++    if (status != errSecSuccess) {
++      ArcKeyError error = internal::ArcKeyErrorFromStatus(status);
++      if (error == ArcKeyError::kFailed) {
++        OSSTATUS_DLOG(WARNING, status) << "Reading Arc Safe Storage failed";
++      }
++      return base::unexpected(error);
++    }
++
++    CFDataRef data = base::apple::CFCast<CFDataRef>(result.get());
++    if (!data || CFDataGetLength(data) == 0) {
++      return base::unexpected(ArcKeyError::kFailed);
++    }
++    // The password goes straight into the string handed to the caller. The
++    // CFData belongs to the Security framework and is immutable, so it is
++    // released, not overwritten.
++    return std::string(base::as_string_view(base::apple::CFDataToSpan(data)));
++  }
++}
++
++// Reads Arc's "Arc Safe Storage" item with SecItemCopyMatching.
++class KeychainArcSafeStorageKeySource : public ArcSafeStorageKeySource {
++ public:
++  KeychainArcSafeStorageKeySource() = default;
++  KeychainArcSafeStorageKeySource(const KeychainArcSafeStorageKeySource&) =
++      delete;
++  KeychainArcSafeStorageKeySource& operator=(
++      const KeychainArcSafeStorageKeySource&) = delete;
++  ~KeychainArcSafeStorageKeySource() override = default;
++
++  void GetPassword(ArcPasswordCallback done) override {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    // USER_BLOCKING: the user just clicked and is waiting on the prompt.
++    // CONTINUE_ON_SHUTDOWN: a prompt left open must not hold up quitting. The
++    // task touches nothing that shutdown destroys.
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE,
++        {base::MayBlock(), base::TaskPriority::USER_BLOCKING,
++         base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
++        base::BindOnce(&ReadArcPasswordFromKeychain),
++        base::BindOnce(&KeychainArcSafeStorageKeySource::OnRead,
++                       weak_factory_.GetWeakPtr(), std::move(done)));
++  }
++
++ private:
++  // Static so the password is wiped even when the source is gone.
++  static void OnRead(base::WeakPtr<KeychainArcSafeStorageKeySource> source,
++                     ArcPasswordCallback done,
++                     PasswordResult result) {
++    if (!source) {
++      Wipe(result);
++      return;
++    }
++    DCHECK_CALLED_ON_VALID_SEQUENCE(source->sequence_checker_);
++    std::move(done).Run(std::move(result));
++  }
++
++  SEQUENCE_CHECKER(sequence_checker_);
++  base::WeakPtrFactory<KeychainArcSafeStorageKeySource> weak_factory_{this};
++};
++
++}  // namespace
++
++namespace internal {
++
++std::unique_ptr<ArcSafeStorageKeySource> CreateKeychainArcSafeStorageKey() {
++  return std::make_unique<KeychainArcSafeStorageKeySource>();
++}
++
++ArcKeyError ArcKeyErrorFromStatus(OSStatus status) {
++  switch (status) {
++    case errSecUserCanceled:
++    case errSecAuthFailed:
++      return ArcKeyError::kDenied;
++    case errSecItemNotFound:
++      return ArcKeyError::kNotFound;
++    default:
++      return ArcKeyError::kFailed;
++  }
++}
++
++}  // namespace internal
++
++}  // namespace rac::import
+Index: src/chrome/browser/rac/import/arc_safe_storage_key_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/import/arc_safe_storage_key_unittest.cc
+@@ -0,0 +1,145 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/arc_safe_storage_key.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "base/run_loop.h"
++#include "base/test/bind.h"
++#include "base/test/gtest_util.h"
++#include "base/test/task_environment.h"
++#include "base/test/test_future.h"
++#include "build/build_config.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++#if BUILDFLAG(IS_MAC)
++#include <Security/SecBase.h>
++#endif
++
++// Every test that creates a source holds a ScopedArcSafeStorageKeyForTesting
++// while it does, so none of them reaches the Keychain.
++
++namespace rac::import {
++namespace {
++
++using PasswordResult = base::expected<std::string, ArcKeyError>;
++
++constexpr char kTestPassword[] = "test-only-arc-safe-storage";
++
++class ArcSafeStorageKeyTest : public testing::Test {
++ protected:
++  base::test::TaskEnvironment task_environment_;
++};
++
++using ArcSafeStorageKeyDeathTest = ArcSafeStorageKeyTest;
++
++TEST_F(ArcSafeStorageKeyTest, OverrideAnswersItsPassword) {
++  ScopedArcSafeStorageKeyForTesting key{PasswordResult(kTestPassword)};
++  std::unique_ptr<ArcSafeStorageKeySource> source =
++      CreateArcSafeStorageKeySource();
++
++  base::test::TestFuture<PasswordResult> future;
++  source->GetPassword(future.GetCallback());
++  EXPECT_EQ(future.Take(), PasswordResult(kTestPassword));
++}
++
++TEST_F(ArcSafeStorageKeyTest, OverrideAnswersAnError) {
++  for (ArcKeyError error :
++       {ArcKeyError::kDenied, ArcKeyError::kNotFound, ArcKeyError::kFailed}) {
++    ScopedArcSafeStorageKeyForTesting key{base::unexpected(error)};
++    std::unique_ptr<ArcSafeStorageKeySource> source =
++        CreateArcSafeStorageKeySource();
++
++    base::test::TestFuture<PasswordResult> future;
++    source->GetPassword(future.GetCallback());
++    PasswordResult result = future.Take();
++    ASSERT_FALSE(result.has_value());
++    EXPECT_EQ(result.error(), error);
++  }
++}
++
++TEST_F(ArcSafeStorageKeyDeathTest, NestedOverridesCheck) {
++  ScopedArcSafeStorageKeyForTesting outer{PasswordResult(kTestPassword)};
++  EXPECT_CHECK_DEATH({
++    ScopedArcSafeStorageKeyForTesting inner{
++        base::unexpected(ArcKeyError::kDenied)};
++  });
++}
++
++TEST_F(ArcSafeStorageKeyTest, RepliesAsynchronously) {
++  ScopedArcSafeStorageKeyForTesting key{PasswordResult(kTestPassword)};
++  std::unique_ptr<ArcSafeStorageKeySource> source =
++      CreateArcSafeStorageKeySource();
++
++  std::optional<PasswordResult> result;
++  base::RunLoop run_loop;
++  source->GetPassword(base::BindLambdaForTesting([&](PasswordResult answer) {
++    result = std::move(answer);
++    run_loop.Quit();
++  }));
++  EXPECT_FALSE(result.has_value()) << "replied inside GetPassword()";
++
++  run_loop.Run();
++  EXPECT_EQ(result, PasswordResult(kTestPassword));
++}
++
++TEST_F(ArcSafeStorageKeyTest, EachCallRepliesOnce) {
++  ScopedArcSafeStorageKeyForTesting key{PasswordResult(kTestPassword)};
++  std::unique_ptr<ArcSafeStorageKeySource> source =
++      CreateArcSafeStorageKeySource();
++
++  int replies = 0;
++  auto count = base::BindLambdaForTesting([&](PasswordResult) { ++replies; });
++  source->GetPassword(count);
++  source->GetPassword(count);
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(replies, 2);
++}
++
++TEST_F(ArcSafeStorageKeyTest, DestroyingTheSourceDropsTheReply) {
++  ScopedArcSafeStorageKeyForTesting key{PasswordResult(kTestPassword)};
++  std::unique_ptr<ArcSafeStorageKeySource> source =
++      CreateArcSafeStorageKeySource();
++
++  bool replied = false;
++  source->GetPassword(
++      base::BindLambdaForTesting([&](PasswordResult) { replied = true; }));
++  source.reset();
++  task_environment_.RunUntilIdle();
++  EXPECT_FALSE(replied);
++}
++
++TEST_F(ArcSafeStorageKeyTest, SourceKeepsTheAnswerAfterTheOverrideEnds) {
++  std::unique_ptr<ArcSafeStorageKeySource> source;
++  {
++    ScopedArcSafeStorageKeyForTesting key{PasswordResult(kTestPassword)};
++    source = CreateArcSafeStorageKeySource();
++  }
++
++  base::test::TestFuture<PasswordResult> future;
++  source->GetPassword(future.GetCallback());
++  EXPECT_EQ(future.Take(), PasswordResult(kTestPassword));
++}
++
++#if BUILDFLAG(IS_MAC)
++TEST(ArcSafeStorageKeyMacTest, MapsKeychainStatuses) {
++  EXPECT_EQ(internal::ArcKeyErrorFromStatus(errSecUserCanceled),
++            ArcKeyError::kDenied);
++  EXPECT_EQ(internal::ArcKeyErrorFromStatus(errSecAuthFailed),
++            ArcKeyError::kDenied);
++  EXPECT_EQ(internal::ArcKeyErrorFromStatus(errSecItemNotFound),
++            ArcKeyError::kNotFound);
++  EXPECT_EQ(internal::ArcKeyErrorFromStatus(errSecInteractionNotAllowed),
++            ArcKeyError::kFailed);
++  EXPECT_EQ(internal::ArcKeyErrorFromStatus(errSecNoSuchKeychain),
++            ArcKeyError::kFailed);
++}
++#endif  // BUILDFLAG(IS_MAC)
++
++}  // namespace
++}  // namespace rac::import
+Index: src/chrome/browser/rac/import/arc_signins_core.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/import/arc_signins_core.cc
+@@ -0,0 +1,315 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/arc_signins_core.h"
++
++#include <optional>
++#include <utility>
++
++#include "base/check.h"
++#include "base/containers/span.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/memory/raw_ref.h"
++#include "base/notreached.h"
++#include "base/numerics/safe_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "crypto/secure_util.h"
++
++namespace rac::import {
++
++namespace {
++
++ArcSignInsResult WithStatus(ArcSignInsResult::Status status) {
++  ArcSignInsResult result;
++  result.status = status;
++  return result;
++}
++
++void PostKey(ArcKeyCallback done, ArcKeyResult key) {
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(std::move(done), std::move(key)));
++}
++
++// One profile's sign-ins. Owns itself from Start() until it posts `done`.
++class SignInsRun {
++ public:
++  SignInsRun(ArcRunKeyCache& keys, ArcSignInsJob job, ArcSignInsCallback done)
++      : keys_(keys), job_(std::move(job)), done_(std::move(done)) {
++    CHECK(job_.is_arc_running);
++    CHECK(job_.read_cookies);
++    CHECK(job_.make_sink);
++  }
++  SignInsRun(const SignInsRun&) = delete;
++  SignInsRun& operator=(const SignInsRun&) = delete;
++  ~SignInsRun() = default;
++
++  void Start() {
++    // Arc keeps its cookie store open while it runs, so a copy could be torn
++    // or stale.
++    if (job_.is_arc_running.Run()) {
++      Finish(WithStatus(ArcSignInsResult::Status::kArcRunning));
++      return;
++    }
++    // Nothing to read, so nothing to ask macOS for.
++    if (job_.arc_support_dir.empty() || job_.profile_directory.empty()) {
++      Finish(WithStatus(ArcSignInsResult::Status::kNoCookies));
++      return;
++    }
++    if (!keys_->HasAnswer(job_.run_id)) {
++      Progress(ArcImportProgress::Step::kWaitingForMac);
++    }
++    keys_->GetKey(job_.run_id, base::BindOnce(&SignInsRun::OnKey,
++                                              weak_factory_.GetWeakPtr()));
++  }
++
++ private:
++  void OnKey(ArcKeyResult key) {
++    if (!key.has_value()) {
++      Finish(WithStatus(SignInsStatusFor(key.error())));
++      return;
++    }
++    Progress(ArcImportProgress::Step::kSignIns);
++    // The task's copy of the key zeroes itself once the read is done.
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE,
++        {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
++         base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
++        base::BindOnce(job_.read_cookies, job_.arc_support_dir,
++                       job_.profile_directory, std::move(key).value()),
++        base::BindOnce(&SignInsRun::OnRead, weak_factory_.GetWeakPtr()));
++  }
++
++  void OnRead(base::expected<ArcCookieReadResult, CookieDbReadError> read) {
++    if (!read.has_value()) {
++      Finish(WithStatus(SignInsStatusFor(read.error())));
++      return;
++    }
++    undecodable_ = read->undecodable;
++    truncated_ = read->truncated;
++    if (read->cookies.empty()) {
++      Finish(FoldArcSignIns(undecodable_, truncated_, CookieWriteReport()));
++      return;
++    }
++    sink_ = std::move(job_.make_sink).Run();
++    if (!sink_) {
++      Finish(WithStatus(ArcSignInsResult::Status::kFailed));
++      return;
++    }
++    sink_->Write(
++        std::move(read->cookies),
++        base::BindOnce(&SignInsRun::OnWritten, weak_factory_.GetWeakPtr()));
++  }
++
++  void OnWritten(const CookieWriteReport& report) {
++    Finish(FoldArcSignIns(undecodable_, truncated_, report));
++  }
++
++  void Progress(ArcImportProgress::Step step) {
++    if (!job_.progress) {
++      return;
++    }
++    ArcImportProgress progress;
++    progress.step = step;
++    job_.progress.Run(progress);
++  }
++
++  void Finish(const ArcSignInsResult& result) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(done_), result));
++    // Also deletes the sink, which the writer allows from its `done`.
++    delete this;
++  }
++
++  const raw_ref<ArcRunKeyCache> keys_;
++  ArcSignInsJob job_;
++  ArcSignInsCallback done_;
++  std::unique_ptr<ArcCookieSink> sink_;
++  int undecodable_ = 0;
++  bool truncated_ = false;
++  base::WeakPtrFactory<SignInsRun> weak_factory_{this};
++};
++
++}  // namespace
++
++ArcCookieKey::ArcCookieKey(
++    base::span<const uint8_t, kImportedCookieKeySize> bytes) {
++  base::span(bytes_).copy_from(bytes);
++}
++
++ArcCookieKey::ArcCookieKey(const ArcCookieKey& other)
++    : ArcCookieKey(other.bytes()) {}
++
++ArcCookieKey& ArcCookieKey::operator=(const ArcCookieKey& other) {
++  base::span(bytes_).copy_from(other.bytes());
++  return *this;
++}
++
++ArcCookieKey::~ArcCookieKey() {
++  crypto::SecureZeroBuffer(bytes_);
++}
++
++struct ArcRunKeyCache::Run {
++  // Set while the password is being asked for.
++  std::unique_ptr<ArcSafeStorageKeySource> source;
++  std::vector<ArcKeyCallback> waiting;
++  // Set once the source has answered.
++  std::optional<ArcKeyResult> answer;
++};
++
++ArcRunKeyCache::ArcRunKeyCache(SourceFactory make_source)
++    : make_source_(std::move(make_source)) {
++  CHECK(make_source_);
++}
++
++// Each run's key zeroes itself as `runs_` goes.
++ArcRunKeyCache::~ArcRunKeyCache() = default;
++
++void ArcRunKeyCache::GetKey(const std::string& run_id, ArcKeyCallback done) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  std::unique_ptr<Run>& run = runs_[run_id];
++  if (!run) {
++    run = std::make_unique<Run>();
++  }
++  if (run->answer) {
++    PostKey(std::move(done), *run->answer);
++    return;
++  }
++  run->waiting.push_back(std::move(done));
++  if (run->source) {
++    return;
++  }
++  run->source = make_source_.Run();
++  if (!run->source) {
++    OnPassword(run_id, base::unexpected(ArcKeyError::kFailed));
++    return;
++  }
++  // `run` may be gone by the time the source answers (EndRun()), so the
++  // answer finds it again by id.
++  run->source->GetPassword(base::BindOnce(&ArcRunKeyCache::OnPassword,
++                                          weak_factory_.GetWeakPtr(), run_id));
++}
++
++bool ArcRunKeyCache::HasAnswer(const std::string& run_id) const {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  const auto it = runs_.find(run_id);
++  return it != runs_.end() && it->second->answer.has_value();
++}
++
++void ArcRunKeyCache::EndRun(const std::string& run_id) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  const auto it = runs_.find(run_id);
++  if (it == runs_.end()) {
++    return;
++  }
++  std::unique_ptr<Run> run = std::move(it->second);
++  runs_.erase(it);
++  for (ArcKeyCallback& done : run->waiting) {
++    PostKey(std::move(done), base::unexpected(ArcKeyError::kFailed));
++  }
++  // `run->answer` zeroes itself here, and dropping `run->source` drops its
++  // request.
++}
++
++void ArcRunKeyCache::OnPassword(
++    const std::string& run_id,
++    base::expected<std::string, ArcKeyError> password) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  std::optional<ArcKeyResult> answer;
++  if (!password.has_value()) {
++    answer.emplace(base::unexpected(password.error()));
++  } else if (password->empty()) {
++    // An empty secret means no key; one derived from it anyone could compute
++    // (imported_cookie_crypto.h).
++    answer.emplace(base::unexpected(ArcKeyError::kFailed));
++  } else {
++    std::array<uint8_t, kImportedCookieKeySize> derived =
++        DeriveImportedCookieKey(base::as_byte_span(*password));
++    answer.emplace(ArcCookieKey(derived));
++    crypto::SecureZeroBuffer(derived);
++  }
++  if (password.has_value()) {
++    crypto::SecureZeroBuffer(base::as_writable_byte_span(*password));
++  }
++
++  const auto it = runs_.find(run_id);
++  if (it == runs_.end()) {
++    // The run ended while the source asked. `answer` zeroes itself.
++    return;
++  }
++  Run& run = *it->second;
++  if (run.source) {
++    // Not deleted here: the source may still be on the stack.
++    base::SequencedTaskRunner::GetCurrentDefault()->DeleteSoon(
++        FROM_HERE, std::move(run.source));
++  }
++  run.answer = std::move(answer);
++  for (ArcKeyCallback& done : std::exchange(run.waiting, {})) {
++    PostKey(std::move(done), *run.answer);
++  }
++}
++
++ArcSignInsJob::ArcSignInsJob() = default;
++ArcSignInsJob::ArcSignInsJob(ArcSignInsJob&&) = default;
++ArcSignInsJob& ArcSignInsJob::operator=(ArcSignInsJob&&) = default;
++ArcSignInsJob::~ArcSignInsJob() = default;
++
++void RunArcSignIns(ArcRunKeyCache& keys,
++                   ArcSignInsJob job,
++                   ArcSignInsCallback done) {
++  (new SignInsRun(keys, std::move(job), std::move(done)))->Start();
++}
++
++ArcSignInsResult FoldArcSignIns(int undecodable,
++                                bool truncated,
++                                const CookieWriteReport& written) {
++  ArcSignInsResult result;
++  result.written = base::saturated_cast<int>(written.set);
++  result.skipped = base::saturated_cast<int>(written.skipped_total());
++  result.rejected = base::saturated_cast<int>(written.rejected_total());
++  result.undecodable = undecodable;
++  result.truncated = truncated;
++  if (written.total == 0) {
++    // Cookies that were there but none decrypted: most likely the wrong key.
++    result.status = undecodable > 0 ? ArcSignInsResult::Status::kFailed
++                                    : ArcSignInsResult::Status::kNoCookies;
++  } else if (written.set == 0 &&
++             written.rejected_count(CookieRejectReason::kStoreRefused) > 0) {
++    // The cookie store wasn't there, or refused everything sent to it.
++    result.status = ArcSignInsResult::Status::kFailed;
++  } else {
++    result.status = ArcSignInsResult::Status::kDone;
++  }
++  return result;
++}
++
++ArcSignInsResult::Status SignInsStatusFor(ArcKeyError error) {
++  switch (error) {
++    case ArcKeyError::kDenied:
++      return ArcSignInsResult::Status::kDenied;
++    case ArcKeyError::kNotFound:
++    case ArcKeyError::kFailed:
++      return ArcSignInsResult::Status::kFailed;
++  }
++  NOTREACHED();
++}
++
++ArcSignInsResult::Status SignInsStatusFor(CookieDbReadError error) {
++  switch (error) {
++    case CookieDbReadError::kSourceMissing:
++      return ArcSignInsResult::Status::kNoCookies;
++    case CookieDbReadError::kSourceTooLarge:
++    case CookieDbReadError::kTempDirFailed:
++    case CookieDbReadError::kCopyFailed:
++    case CookieDbReadError::kOpenFailed:
++    case CookieDbReadError::kNoCookiesTable:
++    case CookieDbReadError::kMissingRequiredColumn:
++    case CookieDbReadError::kQueryFailed:
++      return ArcSignInsResult::Status::kFailed;
++  }
++  NOTREACHED();
++}
++
++}  // namespace rac::import
+Index: src/chrome/browser/rac/import/arc_signins_core.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/import/arc_signins_core.h
+@@ -0,0 +1,173 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_IMPORT_ARC_SIGNINS_CORE_H_
++#define CHROME_BROWSER_RAC_IMPORT_ARC_SIGNINS_CORE_H_
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <map>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++#include "base/sequence_checker.h"
++#include "base/types/expected.h"
++#include "chrome/browser/rac/import/arc_cookie_import.h"
++#include "chrome/browser/rac/import/arc_import_types.h"
++#include "chrome/browser/rac/import/arc_safe_storage_key.h"
++#include "chrome/browser/rac/import/cookie_db_rows.h"
++#include "chrome/browser/rac/import/cookie_writer.h"
++#include "chrome/browser/rac/import/imported_cookie_crypto.h"
++
++// The parts of the Arc sign-ins step that need no profile: the import run's
++// cookie key, one Arc profile's cookie import behind seams, and how its
++// outcome folds into ArcSignInsResult. The browser side, which binds the
++// seams to Arc's Keychain item, Arc's files and a profile's cookie store, is
++// chrome/browser/ui/rac/import/arc_signins.h.
++
++namespace rac::import {
++
++// A cookie key derived from Arc's Safe Storage password. Every copy zeroes
++// itself when it goes.
++class ArcCookieKey {
++ public:
++  explicit ArcCookieKey(
++      base::span<const uint8_t, kImportedCookieKeySize> bytes);
++  ArcCookieKey(const ArcCookieKey&);
++  ArcCookieKey& operator=(const ArcCookieKey&);
++  ~ArcCookieKey();
++
++  base::span<const uint8_t, kImportedCookieKeySize> bytes() const {
++    return bytes_;
++  }
++
++ private:
++  std::array<uint8_t, kImportedCookieKeySize> bytes_;
++};
++
++using ArcKeyResult = base::expected<ArcCookieKey, ArcKeyError>;
++using ArcKeyCallback = base::OnceCallback<void(ArcKeyResult)>;
++
++// Arc's cookie key, per import run. The run's first profile asks the
++// ArcSafeStorageKeySource for Arc's password, which may show macOS's
++// Keychain prompt, and derives the key; the password is zeroed right after.
++// The run's other profiles get the same answer without asking again. A
++// refusal or failure is kept too, so one run never prompts twice. EndRun()
++// zeroes and forgets the run's key. Nothing is written anywhere.
++//
++// UI thread only.
++class ArcRunKeyCache {
++ public:
++  using SourceFactory =
++      base::RepeatingCallback<std::unique_ptr<ArcSafeStorageKeySource>()>;
++
++  explicit ArcRunKeyCache(SourceFactory make_source);
++  ArcRunKeyCache(const ArcRunKeyCache&) = delete;
++  ArcRunKeyCache& operator=(const ArcRunKeyCache&) = delete;
++  ~ArcRunKeyCache();
++
++  // Runs `done` with `run_id`'s key, always from a posted task. Calls made
++  // while the source is asking wait for its answer.
++  void GetKey(const std::string& run_id, ArcKeyCallback done);
++  // Whether `run_id` already has an answer, so GetKey() won't ask.
++  bool HasAnswer(const std::string& run_id) const;
++  // Zeroes and forgets `run_id`'s key, and drops a request still in flight.
++  // Callers still waiting get kFailed.
++  void EndRun(const std::string& run_id);
++
++  size_t run_count_for_testing() const { return runs_.size(); }
++
++ private:
++  struct Run;
++
++  void OnPassword(const std::string& run_id,
++                  base::expected<std::string, ArcKeyError> password);
++
++  SourceFactory make_source_;
++  std::map<std::string, std::unique_ptr<Run>> runs_;
++
++  SEQUENCE_CHECKER(sequence_checker_);
++  base::WeakPtrFactory<ArcRunKeyCache> weak_factory_{this};
++};
++
++// Reads one Arc profile's cookies: ArcCookieDbPath(), then ReadArcCookies().
++// Blocking; runs on the thread pool. kSourceMissing when Arc has no cookie
++// database for the profile.
++using ArcCookieReader = base::RepeatingCallback<
++    base::expected<ArcCookieReadResult, CookieDbReadError>(
++        const base::FilePath& arc_support_dir,
++        const std::string& profile_directory,
++        const ArcCookieKey& key)>;
++
++// Where one profile's cookies go: CookieWriter, in the browser.
++class ArcCookieSink {
++ public:
++  virtual ~ArcCookieSink() = default;
++  // Call once. `done` runs once, in its own task, and may delete the sink.
++  // Deleting the sink first cancels; `done` then never runs.
++  virtual void Write(std::vector<ImportedCookie> cookies,
++                     CookieWriter::DoneCallback done) = 0;
++};
++
++using ArcSignInsProgressCallback =
++    base::RepeatingCallback<void(const ArcImportProgress&)>;
++using ArcSignInsCallback = base::OnceCallback<void(const ArcSignInsResult&)>;
++
++// One Arc profile's sign-ins.
++struct ArcSignInsJob {
++  ArcSignInsJob();
++  ArcSignInsJob(ArcSignInsJob&&);
++  ArcSignInsJob& operator=(ArcSignInsJob&&);
++  ~ArcSignInsJob();
++
++  // ArcImportRun::id: which key the job uses.
++  std::string run_id;
++  // Arc's support folder (ImportPlan::source_dir).
++  base::FilePath arc_support_dir;
++  // ImportProfile::directory.
++  std::string profile_directory;
++  // IsArcRunning(). Must be set.
++  base::RepeatingCallback<bool()> is_arc_running;
++  // Must be set.
++  ArcCookieReader read_cookies;
++  // Makes the target's sink right before the write. Null if the target is
++  // gone or can't take cookies. Must be set.
++  base::OnceCallback<std::unique_ptr<ArcCookieSink>()> make_sink;
++  // kWaitingForMac while the key is asked for, then kSignIns. May be null.
++  ArcSignInsProgressCallback progress;
++};
++
++// Runs `job`, in order:
++//
++// 1. Arc is running: kArcRunning. Nothing is read or asked for.
++// 2. No Arc folder or profile folder: kNoCookies, without asking for the key.
++// 3. The run's key from `keys`; kWaitingForMac first if it has to ask. A
++//    refusal is kDenied; any other key error is kFailed.
++// 4. kSignIns, then `read_cookies` on a MayBlock thread pool task.
++// 5. The cookies go into `make_sink()`, which is kept until it reports.
++// 6. FoldArcSignIns().
++//
++// `done` runs once, always from a posted task. `keys` must outlive the job.
++void RunArcSignIns(ArcRunKeyCache& keys,
++                   ArcSignInsJob job,
++                   ArcSignInsCallback done);
++
++// The outcome of a read that found cookies, or found none (an empty
++// `written`): kDone with the counts, kNoCookies when there were none, or
++// kFailed when none could be decrypted or the store refused them all.
++ArcSignInsResult FoldArcSignIns(int undecodable,
++                                bool truncated,
++                                const CookieWriteReport& written);
++ArcSignInsResult::Status SignInsStatusFor(ArcKeyError error);
++ArcSignInsResult::Status SignInsStatusFor(CookieDbReadError error);
++
++}  // namespace rac::import
++
++#endif  // CHROME_BROWSER_RAC_IMPORT_ARC_SIGNINS_CORE_H_
+Index: src/chrome/browser/rac/import/arc_signins_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/import/arc_signins_unittest.cc
+@@ -0,0 +1,497 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/memory/raw_ptr.h"
++#include "base/run_loop.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/test/bind.h"
++#include "base/test/task_environment.h"
++#include "chrome/browser/rac/import/arc_signins_core.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++// Everything here runs against fakes: no Keychain, no Arc files, no cookie
++// store.
++
++namespace rac::import {
++namespace {
++
++using Status = ArcSignInsResult::Status;
++using Step = ArcImportProgress::Step;
++
++constexpr char kRun[] = "run-1";
++constexpr char kOtherRun[] = "run-2";
++constexpr char kPassword[] = "not-a-real-safe-storage-secret";
++
++std::array<uint8_t, kImportedCookieKeySize> ExpectedKey() {
++  const std::string password(kPassword);
++  return DeriveImportedCookieKey(base::as_byte_span(password));
++}
++
++bool IsExpectedKey(const ArcCookieKey& key) {
++  return std::ranges::equal(key.bytes(), ExpectedKey());
++}
++
++// What the fake Keychain answers, and how often it was asked.
++struct FakeKeychain {
++  int requests = 0;
++  // Unset: the request waits in `held` until the test answers it.
++  std::optional<base::expected<std::string, ArcKeyError>> answer =
++      std::string(kPassword);
++  ArcPasswordCallback held;
++};
++
++class FakeKeySource : public ArcSafeStorageKeySource {
++ public:
++  explicit FakeKeySource(FakeKeychain* keychain) : keychain_(keychain) {}
++
++  // ArcSafeStorageKeySource:
++  void GetPassword(ArcPasswordCallback done) override {
++    ++keychain_->requests;
++    if (!keychain_->answer) {
++      keychain_->held = std::move(done);
++      return;
++    }
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(done), *keychain_->answer));
++  }
++
++ private:
++  raw_ptr<FakeKeychain> keychain_;
++};
++
++// What the fake cookie store took and reports.
++struct FakeStore {
++  int sinks_made = 0;
++  // make_sink() returns null, like a profile that went away.
++  bool gone = false;
++  std::vector<ImportedCookie> written;
++  CookieWriteReport report;
++};
++
++class FakeSink : public ArcCookieSink {
++ public:
++  explicit FakeSink(FakeStore* store) : store_(store) {}
++
++  // ArcCookieSink:
++  void Write(std::vector<ImportedCookie> cookies,
++             CookieWriter::DoneCallback done) override {
++    store_->written = std::move(cookies);
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(done), store_->report));
++  }
++
++ private:
++  raw_ptr<FakeStore> store_;
++};
++
++ImportedCookie Cookie(const std::string& name) {
++  ImportedCookie cookie;
++  cookie.name = name;
++  cookie.value = "value";
++  cookie.host_key = "example.com";
++  cookie.path = "/";
++  return cookie;
++}
++
++class ArcSignInsCoreTest : public testing::Test {
++ protected:
++  ArcRunKeyCache::SourceFactory Keychain() {
++    return base::BindLambdaForTesting(
++        [this]() -> std::unique_ptr<ArcSafeStorageKeySource> {
++          return std::make_unique<FakeKeySource>(&keychain_);
++        });
++  }
++
++  ArcKeyResult GetKey(ArcRunKeyCache& keys, const std::string& run_id) {
++    base::RunLoop loop;
++    std::optional<ArcKeyResult> out;
++    keys.GetKey(run_id, base::BindLambdaForTesting([&](ArcKeyResult key) {
++                  out.emplace(std::move(key));
++                  loop.Quit();
++                }));
++    loop.Run();
++    return std::move(*out);
++  }
++
++  ArcSignInsJob Job(const std::string& run_id) {
++    ArcSignInsJob job;
++    job.run_id = run_id;
++    job.arc_support_dir = base::FilePath(FILE_PATH_LITERAL("/arc-copy"));
++    job.profile_directory = "Default";
++    job.is_arc_running =
++        base::BindLambdaForTesting([this] { return arc_running_; });
++    // Runs on the thread pool.
++    job.read_cookies = base::BindLambdaForTesting(
++        [this](const base::FilePath& arc_support_dir,
++               const std::string& profile_directory, const ArcCookieKey& key) {
++          ++reads_;
++          read_with_expected_key_ = IsExpectedKey(key);
++          return read_result_;
++        });
++    job.make_sink =
++        base::BindLambdaForTesting([this]() -> std::unique_ptr<ArcCookieSink> {
++          ++store_.sinks_made;
++          if (store_.gone) {
++            return nullptr;
++          }
++          return std::make_unique<FakeSink>(&store_);
++        });
++    job.progress =
++        base::BindLambdaForTesting([this](const ArcImportProgress& progress) {
++          steps_.push_back(progress.step);
++        });
++    return job;
++  }
++
++  ArcSignInsResult Run(ArcRunKeyCache& keys, ArcSignInsJob job) {
++    base::RunLoop loop;
++    ArcSignInsResult out;
++    RunArcSignIns(keys, std::move(job),
++                  base::BindLambdaForTesting([&](const ArcSignInsResult& r) {
++                    out = r;
++                    loop.Quit();
++                  }));
++    loop.Run();
++    return out;
++  }
++
++  void SetCookies(int count, int undecodable) {
++    ArcCookieReadResult read;
++    for (int i = 0; i < count; ++i) {
++      read.cookies.push_back(Cookie("c" + std::to_string(i)));
++    }
++    read.undecodable = undecodable;
++    read_result_ = std::move(read);
++  }
++
++  base::test::TaskEnvironment task_environment_;
++  FakeKeychain keychain_;
++  FakeStore store_;
++  bool arc_running_ = false;
++  std::atomic<int> reads_ = 0;
++  std::atomic<bool> read_with_expected_key_ = false;
++  base::expected<ArcCookieReadResult, CookieDbReadError> read_result_ =
++      ArcCookieReadResult();
++  std::vector<Step> steps_;
++};
++
++// The per-run password cache.
++
++TEST_F(ArcSignInsCoreTest, AsksOncePerRun) {
++  ArcRunKeyCache keys(Keychain());
++  EXPECT_FALSE(keys.HasAnswer(kRun));
++  ArcKeyResult first = GetKey(keys, kRun);
++  ArcKeyResult second = GetKey(keys, kRun);
++  ASSERT_TRUE(first.has_value());
++  ASSERT_TRUE(second.has_value());
++  EXPECT_TRUE(IsExpectedKey(*first));
++  EXPECT_TRUE(IsExpectedKey(*second));
++  EXPECT_EQ(keychain_.requests, 1);
++  EXPECT_TRUE(keys.HasAnswer(kRun));
++}
++
++TEST_F(ArcSignInsCoreTest, CallersWhileAskingShareOneRequest) {
++  keychain_.answer.reset();
++  ArcRunKeyCache keys(Keychain());
++  std::optional<ArcKeyResult> first;
++  std::optional<ArcKeyResult> second;
++  keys.GetKey(kRun, base::BindLambdaForTesting(
++                        [&](ArcKeyResult key) { first.emplace(key); }));
++  keys.GetKey(kRun, base::BindLambdaForTesting(
++                        [&](ArcKeyResult key) { second.emplace(key); }));
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(keychain_.requests, 1);
++  EXPECT_FALSE(first.has_value());
++  EXPECT_FALSE(keys.HasAnswer(kRun));
++
++  std::move(keychain_.held).Run(std::string(kPassword));
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(first && first->has_value());
++  ASSERT_TRUE(second && second->has_value());
++  EXPECT_TRUE(IsExpectedKey(**first));
++  EXPECT_TRUE(IsExpectedKey(**second));
++  EXPECT_EQ(keychain_.requests, 1);
++}
++
++TEST_F(ArcSignInsCoreTest, EndRunDropsTheKey) {
++  ArcRunKeyCache keys(Keychain());
++  ASSERT_TRUE(GetKey(keys, kRun).has_value());
++  EXPECT_EQ(keys.run_count_for_testing(), 1u);
++
++  keys.EndRun(kRun);
++  EXPECT_EQ(keys.run_count_for_testing(), 0u);
++  EXPECT_FALSE(keys.HasAnswer(kRun));
++
++  // Nothing is left to reuse: a new request.
++  ASSERT_TRUE(GetKey(keys, kRun).has_value());
++  EXPECT_EQ(keychain_.requests, 2);
++}
++
++TEST_F(ArcSignInsCoreTest, RunsDontShareKeys) {
++  ArcRunKeyCache keys(Keychain());
++  ASSERT_TRUE(GetKey(keys, kRun).has_value());
++  ASSERT_TRUE(GetKey(keys, kOtherRun).has_value());
++  EXPECT_EQ(keychain_.requests, 2);
++
++  keys.EndRun(kRun);
++  EXPECT_FALSE(keys.HasAnswer(kRun));
++  EXPECT_TRUE(keys.HasAnswer(kOtherRun));
++  EXPECT_EQ(keys.run_count_for_testing(), 1u);
++}
++
++TEST_F(ArcSignInsCoreTest, RefusalIsKeptForTheRun) {
++  keychain_.answer = base::unexpected(ArcKeyError::kDenied);
++  ArcRunKeyCache keys(Keychain());
++  ArcKeyResult first = GetKey(keys, kRun);
++  ArcKeyResult second = GetKey(keys, kRun);
++  ASSERT_FALSE(first.has_value());
++  ASSERT_FALSE(second.has_value());
++  EXPECT_EQ(first.error(), ArcKeyError::kDenied);
++  EXPECT_EQ(second.error(), ArcKeyError::kDenied);
++  // One prompt per run, even when refused.
++  EXPECT_EQ(keychain_.requests, 1);
++}
++
++TEST_F(ArcSignInsCoreTest, EmptyPasswordIsNoKey) {
++  keychain_.answer = std::string();
++  ArcRunKeyCache keys(Keychain());
++  ArcKeyResult key = GetKey(keys, kRun);
++  ASSERT_FALSE(key.has_value());
++  EXPECT_EQ(key.error(), ArcKeyError::kFailed);
++}
++
++TEST_F(ArcSignInsCoreTest, NoSourceFails) {
++  ArcRunKeyCache keys(base::BindRepeating(
++      []() -> std::unique_ptr<ArcSafeStorageKeySource> { return nullptr; }));
++  ArcKeyResult key = GetKey(keys, kRun);
++  ASSERT_FALSE(key.has_value());
++  EXPECT_EQ(key.error(), ArcKeyError::kFailed);
++}
++
++TEST_F(ArcSignInsCoreTest, EndRunWhileAskingFailsWaitersAndDropsTheAnswer) {
++  keychain_.answer.reset();
++  ArcRunKeyCache keys(Keychain());
++  std::optional<ArcKeyResult> waiting;
++  keys.GetKey(kRun, base::BindLambdaForTesting(
++                        [&](ArcKeyResult key) { waiting.emplace(key); }));
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(keychain_.held);
++
++  keys.EndRun(kRun);
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(waiting);
++  ASSERT_FALSE(waiting->has_value());
++  EXPECT_EQ(waiting->error(), ArcKeyError::kFailed);
++
++  // A late answer finds no run, and isn't kept.
++  std::move(keychain_.held).Run(std::string(kPassword));
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(keys.run_count_for_testing(), 0u);
++  EXPECT_FALSE(keys.HasAnswer(kRun));
++}
++
++TEST_F(ArcSignInsCoreTest, KeyCopiesKeepTheirBytes) {
++  const std::array<uint8_t, kImportedCookieKeySize> bytes = ExpectedKey();
++  ArcCookieKey key(bytes);
++  ArcCookieKey copy(key);
++  EXPECT_TRUE(IsExpectedKey(copy));
++  {
++    ArcCookieKey other(key);
++    copy = other;
++  }
++  // `other` zeroed only its own bytes.
++  EXPECT_TRUE(IsExpectedKey(key));
++  EXPECT_TRUE(IsExpectedKey(copy));
++}
++
++// Report folding.
++
++TEST_F(ArcSignInsCoreTest, FoldCountsWhatTheWriterReported) {
++  CookieWriteReport report;
++  report.total = 10;
++  report.set = 6;
++  report.skipped_expired = 1;
++  report.skipped_duplicate = 1;
++  report.skipped_blocked_by_settings = 1;
++  report.AddRejected(CookieRejectReason::kInvalidDomain);
++  const ArcSignInsResult result =
++      FoldArcSignIns(/*undecodable=*/2, /*truncated=*/true, report);
++  EXPECT_EQ(result.status, Status::kDone);
++  EXPECT_EQ(result.written, 6);
++  EXPECT_EQ(result.skipped, 3);
++  EXPECT_EQ(result.rejected, 1);
++  EXPECT_EQ(result.undecodable, 2);
++  EXPECT_TRUE(result.truncated);
++}
++
++TEST_F(ArcSignInsCoreTest, FoldNothingThereIsNoCookies) {
++  EXPECT_EQ(FoldArcSignIns(0, false, CookieWriteReport()).status,
++            Status::kNoCookies);
++}
++
++TEST_F(ArcSignInsCoreTest, FoldNothingDecryptedFails) {
++  const ArcSignInsResult result = FoldArcSignIns(3, false, CookieWriteReport());
++  EXPECT_EQ(result.status, Status::kFailed);
++  EXPECT_EQ(result.undecodable, 3);
++}
++
++TEST_F(ArcSignInsCoreTest, FoldStoreRefusingEverythingFails) {
++  CookieWriteReport report;
++  report.total = 2;
++  report.AddRejected(CookieRejectReason::kStoreRefused);
++  report.AddRejected(CookieRejectReason::kStoreRefused);
++  const ArcSignInsResult result = FoldArcSignIns(0, false, report);
++  EXPECT_EQ(result.status, Status::kFailed);
++  EXPECT_EQ(result.rejected, 2);
++}
++
++TEST_F(ArcSignInsCoreTest, FoldAllSkippedIsDone) {
++  // rac already had newer copies: nothing to write, nothing wrong.
++  CookieWriteReport report;
++  report.total = 2;
++  report.skipped_newer_in_rac = 2;
++  const ArcSignInsResult result = FoldArcSignIns(0, false, report);
++  EXPECT_EQ(result.status, Status::kDone);
++  EXPECT_EQ(result.written, 0);
++  EXPECT_EQ(result.skipped, 2);
++}
++
++TEST_F(ArcSignInsCoreTest, ErrorStatuses) {
++  EXPECT_EQ(SignInsStatusFor(ArcKeyError::kDenied), Status::kDenied);
++  EXPECT_EQ(SignInsStatusFor(ArcKeyError::kNotFound), Status::kFailed);
++  EXPECT_EQ(SignInsStatusFor(ArcKeyError::kFailed), Status::kFailed);
++  EXPECT_EQ(SignInsStatusFor(CookieDbReadError::kSourceMissing),
++            Status::kNoCookies);
++  EXPECT_EQ(SignInsStatusFor(CookieDbReadError::kOpenFailed), Status::kFailed);
++  EXPECT_EQ(SignInsStatusFor(CookieDbReadError::kQueryFailed), Status::kFailed);
++}
++
++// One profile's job.
++
++TEST_F(ArcSignInsCoreTest, ArcRunningChangesNothing) {
++  arc_running_ = true;
++  ArcRunKeyCache keys(Keychain());
++  EXPECT_EQ(Run(keys, Job(kRun)).status, Status::kArcRunning);
++  EXPECT_EQ(keychain_.requests, 0);
++  EXPECT_EQ(reads_.load(), 0);
++  EXPECT_EQ(store_.sinks_made, 0);
++  EXPECT_TRUE(steps_.empty());
++}
++
++TEST_F(ArcSignInsCoreTest, NoProfileFolderDoesntAsk) {
++  ArcRunKeyCache keys(Keychain());
++  ArcSignInsJob job = Job(kRun);
++  job.profile_directory.clear();
++  EXPECT_EQ(Run(keys, std::move(job)).status, Status::kNoCookies);
++  EXPECT_EQ(keychain_.requests, 0);
++  EXPECT_EQ(reads_.load(), 0);
++}
++
++TEST_F(ArcSignInsCoreTest, WritesAndReports) {
++  SetCookies(/*count=*/2, /*undecodable=*/1);
++  store_.report.total = 2;
++  store_.report.set = 2;
++  ArcRunKeyCache keys(Keychain());
++  const ArcSignInsResult result = Run(keys, Job(kRun));
++  EXPECT_EQ(result.status, Status::kDone);
++  EXPECT_EQ(result.written, 2);
++  EXPECT_EQ(result.undecodable, 1);
++  EXPECT_EQ(store_.written.size(), 2u);
++  EXPECT_TRUE(read_with_expected_key_.load());
++  EXPECT_EQ(steps_, (std::vector<Step>{Step::kWaitingForMac, Step::kSignIns}));
++}
++
++TEST_F(ArcSignInsCoreTest, LaterProfilesOfTheRunDontAskAgain) {
++  SetCookies(1, 0);
++  store_.report.total = 1;
++  store_.report.set = 1;
++  ArcRunKeyCache keys(Keychain());
++  EXPECT_EQ(Run(keys, Job(kRun)).status, Status::kDone);
++  steps_.clear();
++  EXPECT_EQ(Run(keys, Job(kRun)).status, Status::kDone);
++  EXPECT_EQ(keychain_.requests, 1);
++  EXPECT_EQ(reads_.load(), 2);
++  // No wait for macOS the second time.
++  EXPECT_EQ(steps_, std::vector<Step>{Step::kSignIns});
++}
++
++TEST_F(ArcSignInsCoreTest, LastProfileOfTheRunDropsTheKey) {
++  SetCookies(1, 0);
++  store_.report.total = 1;
++  store_.report.set = 1;
++  ArcRunKeyCache keys(Keychain());
++  Run(keys, Job(kRun));
++  Run(keys, Job(kRun));
++  // What the importer does once the run's last profile is done.
++  keys.EndRun(kRun);
++  EXPECT_EQ(keys.run_count_for_testing(), 0u);
++
++  // A retry is a run of its own, and asks once.
++  Run(keys, Job(kOtherRun));
++  EXPECT_EQ(keychain_.requests, 2);
++}
++
++TEST_F(ArcSignInsCoreTest, RefusedReadsNothing) {
++  keychain_.answer = base::unexpected(ArcKeyError::kDenied);
++  SetCookies(1, 0);
++  ArcRunKeyCache keys(Keychain());
++  EXPECT_EQ(Run(keys, Job(kRun)).status, Status::kDenied);
++  EXPECT_EQ(Run(keys, Job(kRun)).status, Status::kDenied);
++  EXPECT_EQ(keychain_.requests, 1);
++  EXPECT_EQ(reads_.load(), 0);
++  EXPECT_EQ(store_.sinks_made, 0);
++}
++
++TEST_F(ArcSignInsCoreTest, MissingKeyFails) {
++  keychain_.answer = base::unexpected(ArcKeyError::kNotFound);
++  ArcRunKeyCache keys(Keychain());
++  EXPECT_EQ(Run(keys, Job(kRun)).status, Status::kFailed);
++  EXPECT_EQ(reads_.load(), 0);
++}
++
++TEST_F(ArcSignInsCoreTest, NoDatabaseIsNoCookies) {
++  read_result_ = base::unexpected(CookieDbReadError::kSourceMissing);
++  ArcRunKeyCache keys(Keychain());
++  EXPECT_EQ(Run(keys, Job(kRun)).status, Status::kNoCookies);
++  EXPECT_EQ(store_.sinks_made, 0);
++}
++
++TEST_F(ArcSignInsCoreTest, UnreadableDatabaseFails) {
++  read_result_ = base::unexpected(CookieDbReadError::kOpenFailed);
++  ArcRunKeyCache keys(Keychain());
++  EXPECT_EQ(Run(keys, Job(kRun)).status, Status::kFailed);
++  EXPECT_EQ(store_.sinks_made, 0);
++}
++
++TEST_F(ArcSignInsCoreTest, EmptyDatabaseWritesNothing) {
++  SetCookies(0, 0);
++  ArcRunKeyCache keys(Keychain());
++  EXPECT_EQ(Run(keys, Job(kRun)).status, Status::kNoCookies);
++  EXPECT_EQ(store_.sinks_made, 0);
++}
++
++TEST_F(ArcSignInsCoreTest, GoneProfileFails) {
++  SetCookies(1, 0);
++  store_.gone = true;
++  ArcRunKeyCache keys(Keychain());
++  EXPECT_EQ(Run(keys, Job(kRun)).status, Status::kFailed);
++  EXPECT_EQ(store_.sinks_made, 1);
++  EXPECT_TRUE(store_.written.empty());
++}
++
++}  // namespace
++}  // namespace rac::import
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn
++++ src/chrome/browser/ui/BUILD.gn
+@@ -3610,11 +3610,23 @@ static_library("ui") {
+       "//chrome/browser/rac/agent:controller",
+       "//chrome/browser/resources/rac_ai:resources",
+     ]
++    if (is_mac) {
++      deps += [
++        "//chrome/browser/rac/import:arc_app_state",
++        "//chrome/browser/rac/import:arc_cookie_import",
++        "//chrome/browser/rac/import:arc_key",
++        "//chrome/browser/rac/import:arc_signins_core",
++        "//chrome/browser/rac/import:cookie_writer",
++        "//chrome/browser/rac/import:cookie_writer_profile",
++      ]
++    }
+     sources += [
+       "rac/import/arc_dev_trigger.cc",
+       "rac/import/arc_dev_trigger.h",
+       "rac/import/arc_importer.cc",
+       "rac/import/arc_importer.h",
++      "rac/import/arc_signins.cc",
++      "rac/import/arc_signins.h",
+       "rac/spaces/hidden_space.cc",
+       "rac/spaces/hidden_space.h",
+       "rac/spaces/move_tab_to_space_sub_menu_model.cc",
+Index: src/chrome/browser/ui/rac/import/arc_importer.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/import/arc_importer.cc
++++ src/chrome/browser/ui/rac/import/arc_importer.cc
+@@ -89,6 +89,7 @@ namespace {
+ using ItemKind = ArcImportRecord::ItemKind;
+ 
+ ArcProfileMaker* g_profile_maker = nullptr;
++ArcSignInsStep* g_sign_ins_step = nullptr;
+ 
+ constexpr char kSnapshotReason[] = "import-arc";
+ // Arc's favicon cache holds small images. Anything larger isn't one.
+@@ -1214,6 +1215,12 @@ class ArcProfileImport : public ProfileO
+   // ProfileObserver:
+   void OnProfileWillBeDestroyed(Profile* profile) override {
+     profile_observation_.Reset();
++    if (sign_ins_started_) {
++      // The sidebar part has settled; only the sign-ins are cut short.
++      result_.sign_ins.status = ArcSignInsResult::Status::kFailed;
++      Finish();
++      return;
++    }
+     Fail(ArcImportFailure::kProfileGone);
+   }
+ 
+@@ -1245,11 +1252,41 @@ class ArcProfileImport : public ProfileO
+ 
+   void Finish() {
+     // Releasing the token lets DataBackups refresh its daily backup soon.
++    // Sign-ins don't hold it: they don't touch what Undo or a restore does.
+     operation_.reset();
++    if (ShouldImportSignIns()) {
++      ImportSignIns();
++      return;
++    }
+     std::move(done_).Run(result_);
+     delete this;
+   }
+ 
++  // Sign-ins come after the sidebar part, whether or not it had anything
++  // new, and don't change its result. Not after a failure that stopped it
++  // before its record (the import didn't happen here), and not into a
++  // profile that is going away. A profile that only records the run (the
++  // default Arc profile unchecked) has none.
++  bool ShouldImportSignIns() const {
++    return !sign_ins_started_ && run_info_.options.sign_ins &&
++           g_sign_ins_step && !source_.source_key.empty() &&
++           (result_.status != ArcProfileResult::Status::kFailed ||
++            result_.failure == ArcImportFailure::kRecordNotSaved);
++  }
++
++  void ImportSignIns() {
++    sign_ins_started_ = true;
++    g_sign_ins_step->ImportSignIns(
++        profile_, source_, run_info_.id, run_info_.arc_support_dir, progress_,
++        base::BindOnce(&ArcProfileImport::OnSignInsDone,
++                       weak_factory_.GetWeakPtr()));
++  }
++
++  void OnSignInsDone(const ArcSignInsResult& sign_ins) {
++    result_.sign_ins = sign_ins;
++    Finish();
++  }
++
+   const raw_ptr<Profile> profile_;
+   const Services services_;
+   const ImportProfile source_;
+@@ -1276,6 +1313,7 @@ class ArcProfileImport : public ProfileO
+   std::unique_ptr<ArcFaviconWriter> favicon_writer_;
+   raw_ptr<BraveExternalProcessImporterHost> history_host_ = nullptr;
+   bool history_ok_ = false;
++  bool sign_ins_started_ = false;
+ 
+   base::ScopedObservation<Profile, ProfileObserver> profile_observation_{this};
+   base::WeakPtrFactory<ArcProfileImport> weak_factory_{this};
+@@ -1418,6 +1456,10 @@ class ArcImportCoordinator {
+   }
+ 
+   void Finish(ArcImportFailure failure) {
++    // Lets the step drop the run's key.
++    if (g_sign_ins_step) {
++      g_sign_ins_step->EndRun(run_.id, origin_path_);
++    }
+     if (failure == ArcImportFailure::kNone && origin_result_ &&
+         origin_result_->status == ArcProfileResult::Status::kFailed) {
+       failure = origin_result_->failure;
+@@ -1428,7 +1470,8 @@ class ArcImportCoordinator {
+       result_.counts += result.counts;
+       result_.pinned_extensions += result.pinned_extensions;
+       any_done |= result.status == ArcProfileResult::Status::kDone ||
+-                  result.history == ArcProfileResult::History::kImported;
++                  result.history == ArcProfileResult::History::kImported ||
++                  result.sign_ins.written > 0;
+       any_failed |= result.status == ArcProfileResult::Status::kFailed;
+       if (result.undo_until) {
+         result_.undo_until =
+@@ -1888,6 +1931,10 @@ void SetArcProfileMaker(ArcProfileMaker*
+   g_profile_maker = maker;
+ }
+ 
++void SetArcSignInsStep(ArcSignInsStep* step) {
++  g_sign_ins_step = step;
++}
++
+ void StartArcImport(Profile* profile,
+                     ImportPlan plan,
+                     ArcImportOptions options,
+Index: src/chrome/browser/ui/rac/import/arc_importer.h
+===================================================================
+--- src.orig/chrome/browser/ui/rac/import/arc_importer.h
++++ src/chrome/browser/ui/rac/import/arc_importer.h
+@@ -51,6 +51,9 @@ using ArcProfileDoneCallback =
+ //    data decoder's sandbox. Nothing is fetched.
+ // 8. Runs Helium's importer for history only, if asked and not done before.
+ // 9. Operation::MarkDataChanged(), and releases the token.
++// 10. Brings over sign-ins through ArcSignInsStep, if asked, once the
++//     sidebar part has settled. What it reports goes in
++//     ArcProfileResult::sign_ins and never changes the rest of the result.
+ //
+ // An import cut short between steps 4 and 6 (a crash, a power cut) leaves
+ // a record whose run is in progress. The next import or Undo in that
+@@ -77,6 +80,34 @@ class ArcProfileMaker {
+ // Called once at startup by the sign-ins step. Not owned.
+ void SetArcProfileMaker(ArcProfileMaker* maker);
+ 
++using ArcSignInsDoneCallback =
++    base::OnceCallback<void(const ArcSignInsResult&)>;
++
++// The sign-ins step: brings an Arc profile's cookies into its rac profile.
++// The importer calls it after each profile's sidebar part, when the run asks
++// for sign-ins (ArcImportOptions::sign_ins). Until it's registered,
++// ArcProfileResult::sign_ins stays kNotAttempted.
++class ArcSignInsStep {
++ public:
++  virtual ~ArcSignInsStep() = default;
++  // Runs `done` once, on the UI thread, never from inside this call.
++  // `run_id` is ArcImportRun::id, the same for every profile of one import;
++  // `arc_support_dir` is ArcImportRun::arc_support_dir. May show macOS's
++  // Keychain prompt. Never touches the sidebar or the import record.
++  virtual void ImportSignIns(Profile* target,
++                             const ImportProfile& source,
++                             const std::string& run_id,
++                             const base::FilePath& arc_support_dir,
++                             ArcImportProgressCallback progress,
++                             ArcSignInsDoneCallback done) = 0;
++  // Every profile of `run_id` has finished. `origin_path` is the profile the
++  // import started from.
++  virtual void EndRun(const std::string& run_id,
++                      const base::FilePath& origin_path) = 0;
++};
++// Called once at startup by the sign-ins step. Not owned.
++void SetArcSignInsStep(ArcSignInsStep* step);
++
+ // What every profile of one import shares.
+ struct ArcImportRun {
+   ArcImportRun();
+@@ -119,7 +150,8 @@ void StartArcImport(Profile* profile,
+ 
+ // The per-profile entry point, for the sign-ins step when it drives
+ // profiles itself: imports `source` into `target`, which must be a regular
+-// profile. StartArcImport() calls it too.
++// profile. StartArcImport() calls it too. A caller driving profiles itself
++// calls ArcSignInsStep::EndRun() after the run's last one.
+ void ImportArcProfileInto(Profile* target,
+                           ImportProfile source,
+                           ArcImportRun run,
+Index: src/chrome/browser/ui/rac/import/arc_signins.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/import/arc_signins.cc
+@@ -0,0 +1,402 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/import/arc_signins.h"
++
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/task/sequenced_task_runner.h"
++#include "build/build_config.h"
++#include "chrome/browser/rac/import/arc_import_types.h"
++
++#if BUILDFLAG(IS_MAC)
++#include <map>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "base/task/thread_pool.h"
++#include "base/types/expected.h"
++#include "base/uuid.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/keep_alive/profile_keep_alive_types.h"
++#include "chrome/browser/profiles/keep_alive/scoped_profile_keep_alive.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_avatar_icon_util.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/rac/import/arc_app_state_mac.h"
++#include "chrome/browser/rac/import/arc_cookie_import.h"
++#include "chrome/browser/rac/import/arc_reader.h"
++#include "chrome/browser/rac/import/arc_safe_storage_key.h"
++#include "chrome/browser/rac/import/arc_signins_core.h"
++#include "chrome/browser/rac/import/arc_source_root.h"
++#include "chrome/browser/rac/import/cookie_writer.h"
++#include "chrome/browser/rac/import/cookie_writer_profile.h"
++#include "chrome/browser/rac/import/import_plan.h"
++#endif  // BUILDFLAG(IS_MAC)
++
++namespace rac {
++
++#if BUILDFLAG(IS_MAC)
++
++namespace {
++
++// Blocking: runs on the thread pool.
++base::expected<import::ArcCookieReadResult, import::CookieDbReadError>
++ReadProfileCookies(const base::FilePath& arc_support_dir,
++                   const std::string& profile_directory,
++                   const import::ArcCookieKey& key) {
++  const base::FilePath db =
++      import::ArcCookieDbPath(arc_support_dir, profile_directory);
++  if (db.empty()) {
++    return base::unexpected(import::CookieDbReadError::kSourceMissing);
++  }
++  return import::ReadArcCookies(db, key.bytes());
++}
++
++// A profile's cookie store, through the importer's writer.
++class ProfileCookieSink : public import::ArcCookieSink {
++ public:
++  explicit ProfileCookieSink(std::unique_ptr<import::CookieWriter> writer)
++      : writer_(std::move(writer)) {}
++
++  // import::ArcCookieSink:
++  void Write(std::vector<import::ImportedCookie> cookies,
++             import::CookieWriter::DoneCallback done) override {
++    writer_->Write(std::move(cookies), std::move(done));
++  }
++
++ private:
++  std::unique_ptr<import::CookieWriter> writer_;
++};
++
++// Made right before the write: the writer reads the profile's clear-on-exit
++// rules when it's created.
++std::unique_ptr<import::ArcCookieSink> MakeProfileSink(
++    base::WeakPtr<Profile> target) {
++  if (!target) {
++    return nullptr;
++  }
++  return std::make_unique<ProfileCookieSink>(
++      import::CreateCookieWriterForImport(target.get()));
++}
++
++// One profile a run brought sign-ins into, for RetryArcSignIns().
++struct SignInsTarget {
++  base::FilePath profile_path;
++  std::string source_key;
++};
++
++// The profile maker and the sign-ins step, for the whole browser. Made the
++// first time an import screen opens; never destroyed.
++class ArcSignIns : public ArcProfileMaker, public ArcSignInsStep {
++ public:
++  static ArcSignIns& Get() {
++    static base::NoDestructor<ArcSignIns> instance;
++    return *instance;
++  }
++
++  ArcSignIns(const ArcSignIns&) = delete;
++  ArcSignIns& operator=(const ArcSignIns&) = delete;
++
++  // ArcProfileMaker:
++  void MakeProfile(const ImportProfile& source,
++                   const std::u16string& name,
++                   base::OnceCallback<void(Profile*)> done) override {
++    if (!g_browser_process->profile_manager()) {
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(
++                         [](base::OnceCallback<void(Profile*)> done) {
++                           std::move(done).Run(nullptr);
++                         },
++                         std::move(done)));
++      return;
++    }
++    // `done` gets the profile once it's initialized, or null. A new profile
++    // holds ProfileManager's kWaitingForFirstBrowserWindow keep-alive until
++    // its first window closes, so it stays loaded through the import.
++    ProfileManager::CreateMultiProfileAsync(
++        name, profiles::GetPlaceholderAvatarIndex(), /*is_hidden=*/false,
++        std::move(done));
++  }
++
++  // ArcSignInsStep:
++  void ImportSignIns(Profile* target,
++                     const ImportProfile& source,
++                     const std::string& run_id,
++                     const base::FilePath& arc_support_dir,
++                     ArcImportProgressCallback progress,
++                     ArcSignInsDoneCallback done) override {
++    pending_targets_[run_id].push_back({target->GetPath(), source.source_key});
++    Run(target, source.directory, run_id, arc_support_dir, std::move(progress),
++        std::move(done));
++  }
++
++  void EndRun(const std::string& run_id,
++              const base::FilePath& origin_path) override {
++    keys_.EndRun(run_id);
++    // The newest run from `origin_path` is the one a retry repeats, even
++    // when it brought no sign-ins.
++    std::vector<SignInsTarget> targets;
++    if (auto it = pending_targets_.find(run_id); it != pending_targets_.end()) {
++      targets = std::move(it->second);
++      pending_targets_.erase(it);
++    }
++    if (targets.empty()) {
++      last_targets_.erase(origin_path);
++    } else {
++      last_targets_[origin_path] = std::move(targets);
++    }
++  }
++
++  // One profile's sign-ins, under `run_id`'s key.
++  void Run(Profile* target,
++           const std::string& profile_directory,
++           const std::string& run_id,
++           const base::FilePath& arc_support_dir,
++           ArcImportProgressCallback progress,
++           ArcSignInsDoneCallback done) {
++    import::ArcSignInsJob job;
++    job.run_id = run_id;
++    job.arc_support_dir = arc_support_dir;
++    job.profile_directory = profile_directory;
++    job.is_arc_running = base::BindRepeating(&import::IsArcRunning);
++    job.read_cookies = base::BindRepeating(&ReadProfileCookies);
++    job.make_sink = base::BindOnce(&MakeProfileSink, target->GetWeakPtr());
++    job.progress = std::move(progress);
++    import::RunArcSignIns(keys_, std::move(job), std::move(done));
++  }
++
++  // A retry's own run, which no importer ends.
++  void EndRetry(const std::string& run_id) { keys_.EndRun(run_id); }
++
++  std::vector<SignInsTarget> LastTargets(
++      const base::FilePath& origin_path) const {
++    const auto it = last_targets_.find(origin_path);
++    return it != last_targets_.end() ? it->second
++                                     : std::vector<SignInsTarget>();
++  }
++
++ private:
++  friend class base::NoDestructor<ArcSignIns>;
++
++  ArcSignIns() = default;
++  ~ArcSignIns() override = default;
++
++  import::ArcRunKeyCache keys_{
++      base::BindRepeating(&import::CreateArcSafeStorageKeySource)};
++  // Runs still going: the profiles they brought sign-ins into so far.
++  std::map<std::string, std::vector<SignInsTarget>> pending_targets_;
++  // The newest finished run's profiles, by the profile it started from.
++  std::map<base::FilePath, std::vector<SignInsTarget>> last_targets_;
++};
++
++// RetryArcSignIns(). Owns itself from Start() until it runs `done`.
++class ArcSignInsRetry {
++ public:
++  static void Start(base::FilePath origin_path,
++                    std::vector<SignInsTarget> targets,
++                    ArcImportProgressCallback progress,
++                    ArcImportDoneCallback done) {
++    (new ArcSignInsRetry(std::move(origin_path), std::move(targets),
++                         std::move(progress), std::move(done)))
++        ->ReadPlan();
++  }
++
++  ArcSignInsRetry(const ArcSignInsRetry&) = delete;
++  ArcSignInsRetry& operator=(const ArcSignInsRetry&) = delete;
++
++ private:
++  ArcSignInsRetry(base::FilePath origin_path,
++                  std::vector<SignInsTarget> targets,
++                  ArcImportProgressCallback progress,
++                  ArcImportDoneCallback done)
++      : origin_path_(std::move(origin_path)),
++        targets_(std::move(targets)),
++        progress_(std::move(progress)),
++        done_(std::move(done)),
++        run_id_(base::Uuid::GenerateRandomV4().AsLowercaseString()) {
++    for (const SignInsTarget& target : targets_) {
++      ArcProfileResult result;
++      result.source_key = target.source_key;
++      result.profile_path = target.profile_path;
++      // The sidebar part isn't run again.
++      result.status = ArcProfileResult::Status::kNothingNew;
++      result.new_profile = target.profile_path != origin_path_;
++      results_.push_back(std::move(result));
++    }
++  }
++
++  ~ArcSignInsRetry() = default;
++
++  void ReadPlan() {
++    if (targets_.empty()) {
++      PostFinish();
++      return;
++    }
++    // GetArcSourcePaths() can touch the disk under the dev source switch.
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++        base::BindOnce([] { return ReadArc(GetArcSourcePaths()); }),
++        base::BindOnce(&ArcSignInsRetry::OnPlanRead,
++                       weak_factory_.GetWeakPtr()));
++  }
++
++  void OnPlanRead(base::expected<ImportPlan, ArcReadError> plan) {
++    if (!plan.has_value()) {
++      for (ArcProfileResult& result : results_) {
++        result.sign_ins.status = ArcSignInsResult::Status::kFailed;
++      }
++      Finish();
++      return;
++    }
++    plan_ = std::move(plan).value();
++    Next();
++  }
++
++  void Next() {
++    if (next_ == targets_.size()) {
++      Finish();
++      return;
++    }
++    const size_t index = next_++;
++    ProfileManager* manager = g_browser_process->profile_manager();
++    if (!FindSource(targets_[index].source_key) || !manager) {
++      // That Arc profile is gone from Arc, or the browser is shutting down.
++      results_[index].sign_ins.status = ArcSignInsResult::Status::kFailed;
++      PostNext();
++      return;
++    }
++    // Runs `OnProfileLoaded` with null, right away, if the profile is gone.
++    manager->LoadProfileByPath(
++        targets_[index].profile_path, /*incognito=*/false,
++        base::BindOnce(&ArcSignInsRetry::OnProfileLoaded,
++                       weak_factory_.GetWeakPtr(), index));
++  }
++
++  void OnProfileLoaded(size_t index, Profile* profile) {
++    if (profile) {
++      // Nothing else keeps a profile loaded by path alive meanwhile. The
++      // same origin as Undo's.
++      keep_alive_ = ScopedProfileKeepAlive::TryAcquire(
++          profile,
++          ProfileKeepAliveOrigin::kWaitingForBookmarksImportOnFirstRun);
++    }
++    const ImportProfile* source = FindSource(targets_[index].source_key);
++    if (!profile || !keep_alive_ || !source) {
++      results_[index].sign_ins.status = ArcSignInsResult::Status::kFailed;
++      keep_alive_.reset();
++      PostNext();
++      return;
++    }
++    ArcSignIns::Get().Run(profile, source->directory, run_id_, plan_.source_dir,
++                          progress_,
++                          base::BindOnce(&ArcSignInsRetry::OnSignInsDone,
++                                         weak_factory_.GetWeakPtr(), index));
++  }
++
++  void OnSignInsDone(size_t index, const ArcSignInsResult& sign_ins) {
++    results_[index].sign_ins = sign_ins;
++    keep_alive_.reset();
++    Next();
++  }
++
++  const ImportProfile* FindSource(const std::string& source_key) const {
++    for (const ImportProfile& source : plan_.profiles) {
++      if (source.source_key == source_key) {
++        return &source;
++      }
++    }
++    return nullptr;
++  }
++
++  void PostNext() {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(&ArcSignInsRetry::Next, weak_factory_.GetWeakPtr()));
++  }
++
++  void PostFinish() {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(&ArcSignInsRetry::Finish, weak_factory_.GetWeakPtr()));
++  }
++
++  void Finish() {
++    ArcSignIns::Get().EndRetry(run_id_);
++    ArcImportResult result;
++    bool any_written = false;
++    bool any_failed = targets_.empty();
++    for (const ArcProfileResult& profile : results_) {
++      any_written |= profile.sign_ins.written > 0;
++      any_failed |=
++          profile.sign_ins.status == ArcSignInsResult::Status::kFailed ||
++          profile.sign_ins.status == ArcSignInsResult::Status::kDenied ||
++          profile.sign_ins.status == ArcSignInsResult::Status::kArcRunning;
++    }
++    result.status = any_written  ? ArcImportResult::Status::kDone
++                    : any_failed ? ArcImportResult::Status::kFailed
++                                 : ArcImportResult::Status::kNothingNew;
++    result.profiles = std::move(results_);
++    std::move(done_).Run(result);
++    delete this;
++  }
++
++  const base::FilePath origin_path_;
++  const std::vector<SignInsTarget> targets_;
++  ArcImportProgressCallback progress_;
++  ArcImportDoneCallback done_;
++  // Its own key run: the import's ended, and its key with it.
++  const std::string run_id_;
++  ImportPlan plan_;
++  std::vector<ArcProfileResult> results_;
++  size_t next_ = 0;
++  std::unique_ptr<ScopedProfileKeepAlive> keep_alive_;
++  base::WeakPtrFactory<ArcSignInsRetry> weak_factory_{this};
++};
++
++}  // namespace
++
++bool ArcSignInsAvailable() {
++  return true;
++}
++
++void InstallArcSignIns() {
++  ArcSignIns& sign_ins = ArcSignIns::Get();
++  SetArcProfileMaker(&sign_ins);
++  SetArcSignInsStep(&sign_ins);
++}
++
++void RetryArcSignIns(Profile* profile,
++                     ArcImportProgressCallback progress,
++                     ArcImportDoneCallback done) {
++  ArcSignInsRetry::Start(profile->GetPath(),
++                         ArcSignIns::Get().LastTargets(profile->GetPath()),
++                         std::move(progress), std::move(done));
++}
++
++#else  // BUILDFLAG(IS_MAC)
++
++bool ArcSignInsAvailable() {
++  return false;
++}
++
++void InstallArcSignIns() {}
++
++void RetryArcSignIns(Profile* profile,
++                     ArcImportProgressCallback progress,
++                     ArcImportDoneCallback done) {
++  // ArcImportResult starts as kFailed.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(std::move(done), ArcImportResult()));
++}
++
++#endif  // BUILDFLAG(IS_MAC)
++
++}  // namespace rac
+Index: src/chrome/browser/ui/rac/import/arc_signins.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/import/arc_signins.h
+@@ -0,0 +1,48 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_IMPORT_ARC_SIGNINS_H_
++#define CHROME_BROWSER_UI_RAC_IMPORT_ARC_SIGNINS_H_
++
++#include "chrome/browser/ui/rac/import/arc_importer.h"
++
++class Profile;
++
++// The Arc import's sign-ins step: the rac profiles for Arc's other profiles,
++// and Arc's cookies in each. The importer calls it through ArcProfileMaker
++// and ArcSignInsStep; the pure parts are in
++// chrome/browser/rac/import/arc_signins_core.h.
++//
++// For each profile, after its sidebar part: nothing while Arc runs; Arc's
++// password once per import run (macOS may show its Keychain prompt), kept in
++// memory only until the run's last profile finishes, then zeroed; Arc's
++// cookie database copied and read on the thread pool; the cookies written
++// through CreateCookieWriterForImport(). Nothing is sent anywhere. Undo
++// never removes cookies.
++
++namespace rac {
++
++// Whether this build can bring over sign-ins: macOS only, where Arc keeps its
++// key in the Keychain.
++bool ArcSignInsAvailable();
++
++// Registers the profile maker and the sign-ins step with the importer.
++// Idempotent; UI thread. Costs nothing until an import runs. Does nothing
++// where ArcSignInsAvailable() is false.
++void InstallArcSignIns();
++
++// Brings over the sign-ins of the newest import started from `profile` in
++// this session again, into the same rac profiles, and nothing else: for
++// after Arc was quit or the Keychain prompt was refused. Reads Arc's plan
++// again, off the UI thread, and asks for Arc's key again, once. `done` runs
++// once, from a posted task, with each profile's ArcProfileResult::sign_ins;
++// their sidebar parts read kNothingNew. kFailed when there is nothing to
++// retry.
++void RetryArcSignIns(Profile* profile,
++                     ArcImportProgressCallback progress,
++                     ArcImportDoneCallback done);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_RAC_IMPORT_ARC_SIGNINS_H_
+Index: src/chrome/browser/ui/rac/onboarding/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/rac/onboarding/BUILD.gn
++++ src/chrome/browser/ui/rac/onboarding/BUILD.gn
+@@ -62,4 +62,8 @@ source_set("onboarding") {
+     "//ui/base",
+     "//url",
+   ]
++
++  if (is_mac) {
++    deps += [ "//chrome/browser/rac/import:arc_app_state" ]
++  }
+ }
+Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
+===================================================================
+--- src.orig/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
++++ src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.cc
+@@ -19,6 +19,7 @@
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "base/time/time.h"
++#include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/profiles/profile_manager.h"
+@@ -29,11 +30,16 @@
+ #include "chrome/browser/rac/spaces/spaces_service_factory.h"
+ #include "chrome/browser/rac/storage/data_backups_factory.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+-#include "chrome/browser/ui/rac/import/arc_importer.h"  // nogncheck
++#include "chrome/browser/ui/rac/import/arc_importer.h"    // nogncheck
++#include "chrome/browser/ui/rac/import/arc_signins.h"     // nogncheck
+ #include "chrome/browser/ui/rac/storage/data_restorer.h"  // nogncheck
+ #include "third_party/icu/source/common/unicode/utf16.h"
+ #include "url/gurl.h"
+ 
++#if BUILDFLAG(IS_MAC)
++#include "chrome/browser/rac/import/arc_app_state_mac.h"
++#endif
++
+ namespace rac::onboarding {
+ 
+ namespace {
+@@ -76,9 +82,40 @@ void Count(const std::vector<ImportItem>
+   }
+ }
+ 
+-// A QuitWait while the sign-ins step isn't in this build: nothing waits on
+-// Arc quitting, so `on_quit` runs from a posted task, matching the wait's
+-// contract for an app that isn't running.
++#if BUILDFLAG(IS_MAC)
++// The sign-ins row's wait on Arc quitting. ArcQuitWatcher calls back once,
++// never from its constructor; the call goes through one more posted task, so
++// `on_quit` never runs from inside the watcher or an AppKit notification,
++// and dropping the wait cancels it at any point.
++class ArcQuitWait : public ArcImportBackend::QuitWait {
++ public:
++  explicit ArcQuitWait(base::OnceClosure on_quit)
++      : on_quit_(std::move(on_quit)),
++        // The watcher is a member, and destroying it cancels the call.
++        watcher_(
++            base::BindOnce(&ArcQuitWait::OnArcQuit, base::Unretained(this))) {}
++
++ private:
++  void OnArcQuit() {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(&ArcQuitWait::Run, weak_factory_.GetWeakPtr()));
++  }
++
++  void Run() {
++    if (on_quit_) {
++      std::move(on_quit_).Run();
++    }
++  }
++
++  base::OnceClosure on_quit_;
++  rac::import::ArcQuitWatcher watcher_;
++  base::WeakPtrFactory<ArcQuitWait> weak_factory_{this};
++};
++#else
++// Without the sign-ins step nothing waits on Arc quitting, so `on_quit` runs
++// from a posted task, matching the wait's contract for an app that isn't
++// running.
+ class PostedQuitWait : public ArcImportBackend::QuitWait {
+  public:
+   explicit PostedQuitWait(base::OnceClosure on_quit)
+@@ -98,11 +135,15 @@ class PostedQuitWait : public ArcImportB
+   base::OnceClosure on_quit_;
+   base::WeakPtrFactory<PostedQuitWait> weak_factory_{this};
+ };
++#endif  // BUILDFLAG(IS_MAC)
+ 
+ }  // namespace
+ 
+ RealArcImportBackend::RealArcImportBackend(Profile* profile)
+     : profile_(profile) {
++  // Registers the profile maker and the sign-ins step, once per browser.
++  // Nothing runs until an import asks for it.
++  InstallArcSignIns();
+   if (DataBackups* service = backups()) {
+     backups_observation_.Observe(service);
+   }
+@@ -172,7 +213,7 @@ base::DictValue RealArcImportBackend::Pl
+     profile.Set("nameNumber", label.number);
+     profile.Set("isDefault", source.is_default);
+     // Another Arc profile becomes its own rac profile, which only the
+-    // sign-ins step makes; it isn't in this build, so those stay in Arc.
++    // sign-ins step makes; where it isn't in this build, those stay in Arc.
+     profile.Set("offered", source.is_default || SignInsAvailable());
+ 
+     base::ListValue favorites;
+@@ -231,9 +272,9 @@ void RealArcImportBackend::GetImportStat
+ }
+ 
+ bool RealArcImportBackend::SignInsAvailable() const {
+-  // The sign-ins step isn't in this build; the page never offers it while
+-  // this is false.
+-  return false;
++  // The page never offers sign-ins, or Arc's other profiles, while this is
++  // false.
++  return ArcSignInsAvailable();
+ }
+ 
+ void RealArcImportBackend::StartImport(
+@@ -247,17 +288,7 @@ void RealArcImportBackend::StartImport(
+ 
+ void RealArcImportBackend::RetrySignIns(ArcImportProgressCallback progress,
+                                         ArcImportDoneCallback done) {
+-  // Unreachable while the sign-ins step isn't in this build: the page
+-  // never offers it while SignInsAvailable() is false. Still answers like
+-  // a failed import, asynchronously.
+-  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+-      FROM_HERE, base::BindOnce(
+-                     [](ArcImportDoneCallback done) {
+-                       ArcImportResult result;
+-                       result.status = ArcImportResult::Status::kFailed;
+-                       std::move(done).Run(result);
+-                     },
+-                     std::move(done)));
++  rac::RetryArcSignIns(profile_, std::move(progress), std::move(done));
+ }
+ 
+ void RealArcImportBackend::UndoImport(
+@@ -335,16 +366,22 @@ void RealArcImportBackend::AnswerRestore
+ }
+ 
+ bool RealArcImportBackend::IsArcRunning() {
++#if BUILDFLAG(IS_MAC)
++  return rac::import::IsArcRunning();
++#else
+   // Arc only has to be quit for the sign-ins step, which isn't in this
+   // build.
+   return false;
++#endif
+ }
+ 
+ std::unique_ptr<ArcImportBackend::QuitWait>
+ RealArcImportBackend::WatchArcQuit(base::OnceClosure on_quit) {
+-  // Nothing waits on Arc quitting while the sign-ins step isn't in this
+-  // build; `on_quit` still runs from a posted task.
++#if BUILDFLAG(IS_MAC)
++  return std::make_unique<ArcQuitWait>(std::move(on_quit));
++#else
+   return std::make_unique<PostedQuitWait>(std::move(on_quit));
++#endif
+ }
+ 
+ void RealArcImportBackend::OnRestoreOfferChanged() {
+Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.h
+===================================================================
+--- src.orig/chrome/browser/ui/rac/onboarding/real_arc_import_backend.h
++++ src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.h
+@@ -13,8 +13,9 @@
+ namespace rac::onboarding {
+ 
+ // The real Arc import backend: the reader, the importer, the mapping,
+-// DataRestorer, and DataBackups' restore offer. The sign-ins step isn't in
+-// this build, so SignInsAvailable() is false and the page never offers it.
++// DataRestorer, DataBackups' restore offer, and on macOS the sign-ins step
++// (arc_signins.h) with its Arc-quit gate. Elsewhere SignInsAvailable() is
++// false and the page never offers sign-ins.
+ class RealArcImportBackend : public ArcImportBackend,
+                              public DataBackups::Observer {
+  public:
