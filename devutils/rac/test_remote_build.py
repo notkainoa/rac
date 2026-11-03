@@ -1552,14 +1552,24 @@ class RunTest(RemoteBuildTest):
                     '--no-first-run', '--rac-launch-in-background',
                     '--rac-window-screenshot=x.png',
                     '--rac-window-screenshot-delay=1',
-                    '--rac-window-screenshot-delay=9999',
+                    '--rac-window-screenshot-delay=2',
                     '--rac-arc-import-fixture=devutils/fixtures/arc/StorableSidebar.json',
                     '--rac-import-source-root=build/arc-root',
                     success=True)
         calls = self.calls()
         for arg in ('--no-first-run', '--rac-window-screenshot-delay=1',
-                    '--rac-window-screenshot-delay=9999'):
+                    '--rac-window-screenshot-delay=2'):
             self.assertIn(arg, calls, arg)
+
+    def test_run_refuses_a_delay_the_timeout_cuts_off(self):
+        # The delay is in seconds: 4000 meant as ms would never fire.
+        for args in (('--timeout', '90', '--', '--rac-window-screenshot-delay=4000'),
+                     ('--timeout', '30', '--', '--rac-window-screenshot-delay=30'),
+                     ('--', '--rac-window-screenshot-delay=0090')):
+            result = self.run_rb('run', self.wt, *args, success=False)
+            self.assertEqual(result.returncode, 2, args)
+            self.assertIn('in seconds', result.stderr, args)
+        self.assertEqual(self.calls(), '')
 
     def test_run_launches_the_browser_without_ui_devtools(self):
         # The run launches the clone's built binary directly through the

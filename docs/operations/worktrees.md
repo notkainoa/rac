@@ -189,7 +189,8 @@ UI-control WebSocket — with `--user-data-dir` at the clone's throwaway
   that offers a PWA install. It also refuses `--test-type`, `--serve`,
   the PWA commands and http(s) URLs.
 - `--rac-window-screenshot=<name>.png` and
-  `--rac-window-screenshot-delay=<1-4 digits>`; the shot lands in
+  `--rac-window-screenshot-delay=<1-4 digits>`, in seconds and shorter
+  than the run's `--timeout`; the shot lands in
   `build/shots/`.
 - `--log-net-log=<name>.json` and `--rac-frame-log=<name>.log`; the logs
   land in `build/logs/`, never in `build/profile`.
