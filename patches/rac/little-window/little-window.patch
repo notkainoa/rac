@@ -1,0 +1,979 @@
+--- a/chrome/app/rac_strings.grd
++++ b/chrome/app/rac_strings.grd
+@@ -283,6 +283,12 @@
+       <message name="IDS_RAC_ARC_SIGNINS_RETRYING" desc="The Retry button's label while the sign-ins (cookies) are being brought over again.">
+         Retrying…
+       </message>
++      <message name="IDS_RAC_LITTLE_WINDOW_NEW" desc="File menu item and command bar row (shortcut Option-Command-N). Opens a little window: a small window of its own for one page, the kind links from other apps open in.">
++        New Little Window
++      </message>
++      <message name="IDS_RAC_LITTLE_WINDOW_OPEN_AS_TAB" desc="In a little window (a small window that links from other apps open in): the toolbar button's tooltip and the File menu item (Command-O) that move the page into the main window as a tab, without reloading it.">
++        Open as Tab
++      </message>
+     </messages>
+   </release>
+ </grit>
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -114,6 +114,7 @@
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/color_provider_browser_helper.h"
++#include "chrome/browser/ui/views/rac/little_window/little_window.h"
+ #include "chrome/browser/ui/webui/util/webui_util_desktop.h"
+ #include "chrome/browser/web_applications/web_app_helpers.h"
+ #include "chrome/common/channel_info.h"
+@@ -1627,6 +1628,7 @@ class AppControllerProfileObserver : pub
+         case IDC_FOCUS_LOCATION:
+         case IDC_RAC_OPEN_COMMAND_BAR:
+         case IDC_RAC_OPEN_COMMAND_BAR_WITH_URL:
++        case IDC_RAC_OPEN_LITTLE_WINDOW:
+         case IDC_FOCUS_SEARCH:
+         case IDC_SHOW_HISTORY:
+         case IDC_SHOW_BOOKMARK_MANAGER:
+@@ -1781,6 +1783,10 @@ class AppControllerProfileObserver : pub
+       chrome::ExecuteCommand(ActivateOrCreateBrowser(profile),
+                              IDC_RAC_OPEN_COMMAND_BAR_WITH_URL);
+       break;
++    // rac: ⌥⌘N with no window open opens a little window.
++    case IDC_RAC_OPEN_LITTLE_WINDOW:
++      rac::little_window::OpenEmpty(profile->GetOriginalProfile());
++      break;
+     case IDC_FOCUS_SEARCH:
+       chrome::ExecuteCommand(ActivateOrCreateBrowser(profile),
+                              IDC_FOCUS_SEARCH);
+@@ -1965,6 +1971,7 @@ class AppControllerProfileObserver : pub
+   _menuState->UpdateCommandEnabled(IDC_FOCUS_LOCATION, true);
+   _menuState->UpdateCommandEnabled(IDC_RAC_OPEN_COMMAND_BAR, true);
+   _menuState->UpdateCommandEnabled(IDC_RAC_OPEN_COMMAND_BAR_WITH_URL, true);
++  _menuState->UpdateCommandEnabled(IDC_RAC_OPEN_LITTLE_WINDOW, true);
+   _menuState->UpdateCommandEnabled(IDC_FOCUS_SEARCH, true);
+   _menuState->UpdateCommandEnabled(IDC_SHOW_BOOKMARK_MANAGER, true);
+   _menuState->UpdateCommandEnabled(IDC_SHOW_HISTORY, true);
+@@ -2675,6 +2682,10 @@ void OpenStartupTabsInBrowserWithProfile
+     profile = ProfileManager::MaybeForceOffTheRecordMode(
+         profile->GetOriginalProfile());
+   }
++  // rac: one web link from another app opens in a little window.
++  if (rac::little_window::OpenLinksFromOtherApp(tabs, profile)) {
++    return;
++  }
+   // Use FindTabbedBrowser() to ensure URLs open in a normal tabbed browser
+   // window, not in PWA/app windows which cannot accept new tabs.
+   BrowserWindowInterface* browser =
+--- a/chrome/browser/rac/actions/BUILD.gn
++++ b/chrome/browser/rac/actions/BUILD.gn
+@@ -18,6 +18,7 @@ source_set("core") {
+     "rac_actions.h",
+     "rac_actions_agent.cc",
+     "rac_actions_command_bar.cc",
++    "rac_actions_little_window.cc",
+     "rac_actions_groups.h",
+   ]
+ 
+--- a/chrome/browser/rac/actions/rac_action_handler_ids.cc
++++ b/chrome/browser/rac/actions/rac_action_handler_ids.cc
+@@ -10,10 +10,11 @@ namespace rac::action_table {
+ base::span<const std::string_view> HandledActionIds() {
+   // One entry per Dispatch::kBrowser row that has a handler in
+   // chrome/browser/ui/rac/rac_action_handlers.cc.
+-  static constexpr std::array<std::string_view, 3> kIds{
++  static constexpr std::array<std::string_view, 4> kIds{
+       "ask",
+       "open_command_bar",
+       "open_command_bar_with_url",
++      "open_little_window",
+   };
+   return kIds;
+ }
+--- a/chrome/browser/rac/actions/rac_actions.cc
++++ b/chrome/browser/rac/actions/rac_actions.cc
+@@ -18,6 +18,7 @@ using GroupFn = base::span<const Action>
+ constexpr GroupFn kGroups[] = {
+     &AgentActions,
+     &CommandBarActions,
++    &LittleWindowActions,
+ };
+ 
+ bool IsUiSurface(Surface surface) {
+--- a/chrome/browser/rac/actions/rac_actions_groups.h
++++ b/chrome/browser/rac/actions/rac_actions_groups.h
+@@ -18,6 +18,9 @@ base::span<const Action> AgentActions();
+ // The command bar's rows (rac_actions_command_bar.cc).
+ base::span<const Action> CommandBarActions();
+ 
++// The little window's row (rac_actions_little_window.cc).
++base::span<const Action> LittleWindowActions();
++
+ }  // namespace rac::action_table
+ 
+ #endif  // CHROME_BROWSER_RAC_ACTIONS_RAC_ACTIONS_GROUPS_H_
+--- /dev/null
++++ b/chrome/browser/rac/actions/rac_actions_little_window.cc
+@@ -0,0 +1,63 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++// The little window's row in the action table. Pure data, like every row;
++// joins All() through rac_actions_groups.h.
++//
++// ⌥⌘N opens an empty little window (D31). It takes the key from Helium's
++// "Add tab to new split" through `replaces_command_id`; split keeps its menu
++// items and context-menu entry, and a user can bind it a key again. The
++// handler is rac::little_window::OpenLittleWindowAction, in
++// chrome/browser/ui/views/rac/little_window/.
++//
++// Open as Tab (⌘O inside a little window) has no row yet: it rides
++// IDC_OPEN_FILE's key only in little windows, which a global shortcut can't
++// express. Peek's Expand will share a row with it.
++
++#include "base/containers/span.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/rac/actions/rac_action_ids.h"
++#include "chrome/browser/rac/actions/rac_actions.h"
++#include "chrome/browser/rac/actions/rac_actions_groups.h"
++#include "chrome/grit/rac_strings.h"
++#include "ui/events/event_constants.h"
++#include "ui/events/keycodes/keyboard_codes.h"
++
++namespace rac::action_table {
++
++namespace {
++
++constexpr char kNoArgs[] =
++    R"json({"additionalProperties":false,"properties":{},"required":[],"type":"object"})json";
++
++constexpr Action kLittleWindowActions[] = {
++    {
++        .id = "open_little_window",
++        .command_id = IDC_RAC_OPEN_LITTLE_WINDOW,
++        .label_id = IDS_RAC_LITTLE_WINDOW_NEW,
++        .description = "Open an empty little window.",
++        .args_json = kNoArgs,
++        .default_shortcut = {.key = ui::VKEY_N,
++                             .modifiers = ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN,
++                             .replaces_command_id = IDC_NEW_SPLIT_TAB},
++        .surfaces = {Surface::kMenu, Surface::kShortcut, Surface::kCommandBar},
++        .menu = Menu::kFile,
++        .menu_after = IDC_NEW_INCOGNITO_WINDOW,
++        .risk = RiskClass::kNone,
++        .outside = OutsideClass::kNotOffered,
++        // Opens a window and touches nothing outside the browser.
++        .hints = McpHints{.read_only = false,
++                          .destructive = false,
++                          .idempotent = false,
++                          .open_world = false},
++        .dispatch = Dispatch::kBrowser,
++    },
++};
++
++}  // namespace
++
++base::span<const Action> LittleWindowActions() {
++  return kLittleWindowActions;
++}
++
++}  // namespace rac::action_table
+--- a/chrome/browser/rac/actions/rac_actions_unittest.cc
++++ b/chrome/browser/rac/actions/rac_actions_unittest.cc
+@@ -33,6 +33,8 @@ constexpr std::string_view kCommittedIds
+     "open_command_bar", "open_command_bar_with_url", "new_space", "new_window",
+     "new_incognito_window", "show_history", "show_downloads", "open_settings",
+     "edit_space", "ask",
++    // The little window's row.
++    "open_little_window",
+ };
+ 
+ // Plan 05's "Never" class. None of these may have an outside surface.
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3720,6 +3720,14 @@ static_library("ui") {
+       "//chrome/browser/ui/views/rac/command_bar:ranking",
+     ]
+     sources += [
++      "views/rac/little_window/little_window.cc",
++      "views/rac/little_window/little_window.h",
++    ]
++    if (is_mac) {
++      sources += [ "views/rac/little_window/little_window_mac.mm" ]
++    }
++    deps += [ "//chrome/browser/ui/rac/little_window:routing" ]
++    sources += [
+       "views/frame/base_tab_strip_region_view.cc",
+       "views/frame/base_tab_strip_region_view.h",
+       "views/frame/browser_view.cc",
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -81,6 +81,7 @@
+ #include "chrome/browser/ui/rac/rac_action_handlers.h"
+ #include "chrome/browser/ui/rac/sidebar/sidebar_actions.h"
+ #include "chrome/browser/ui/views/rac/ai/assistant_actions.h"
++#include "chrome/browser/ui/views/rac/little_window/little_window.h"
+ #include "chrome/browser/ui/rac/sidebar/sidebar_window_sync.h"
+ #include "chrome/browser/ui/rac/spaces/space_dialogs.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
+@@ -1249,6 +1250,10 @@ void BrowserCommandController::HandleCom
+ 
+     // Show various bits of UI
+     case IDC_OPEN_FILE:
++      // rac: ⌘O in a little window opens its page as a tab.
++      if (rac::little_window::OpenAsTab(browser_)) {
++        break;
++      }
+       BrowserSelectFileDialogController::From(browser_)->OpenFile();
+       break;
+     case IDC_CREATE_SHORTCUT:
+--- /dev/null
++++ b/chrome/browser/ui/rac/little_window/BUILD.gn
+@@ -0,0 +1,40 @@
++# Copyright 2026 The rac Authors
++# Use of this source code is governed by a GPL-3.0 license.
++
++import("//testing/test.gni")
++
++assert(!is_android)
++
++# The little window's routing rules: which links get a little window, and
++# which window, profile and space its tab joins. Pure functions over plain
++# values, so the tests link without a browser. The window itself is in
++# chrome/browser/ui/views/rac/little_window/ (//chrome/browser/ui).
++source_set("routing") {
++  sources = [
++    "little_window_routing.cc",
++    "little_window_routing.h",
++  ]
++  public_deps = [
++    "//base",
++    "//ui/gfx/geometry",
++  ]
++  deps = [
++    "//chrome/browser/ui/views/rac:tokens",
++    "//url",
++  ]
++}
++
++# Build and run on their own (Chromium's unit_tests takes hours):
++#   autoninja -C out/Default chrome/browser/ui/rac/little_window:rac_little_window_unittests
++test("rac_little_window_unittests") {
++  sources = [ "little_window_routing_unittest.cc" ]
++  deps = [
++    ":routing",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//testing/gtest",
++    "//ui/gfx/geometry",
++    "//url",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/rac/little_window/little_window_routing.cc
+@@ -0,0 +1,56 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/ui/rac/little_window/little_window_routing.h"
++
++#include <algorithm>
++
++#include "chrome/browser/ui/views/rac/rac_tokens.h"
++#include "ui/gfx/geometry/size.h"
++#include "url/gurl.h"
++
++namespace rac::little_window {
++namespace {
++
++// Big enough for a page's desktop layout, small enough to read as a preview
++// floating over the main window.
++constexpr gfx::Size kLittleWindowSize(960, 720);
++
++}  // namespace
++
++LinkRoute RouteLinksFromOtherApp(base::span<const GURL> urls) {
++  if (urls.size() != 1) {
++    return LinkRoute::kTabs;
++  }
++  const GURL& url = urls.front();
++  return url.is_valid() && url.SchemeIsHTTPOrHTTPS() ? LinkRoute::kLittleWindow
++                                                     : LinkRoute::kTabs;
++}
++
++ExpandTarget PickExpandTarget(
++    const void* profile,
++    base::span<const WindowFacts> windows_by_activation) {
++  for (size_t i = 0; i < windows_by_activation.size(); ++i) {
++    const WindowFacts& window = windows_by_activation[i];
++    if (window.profile == profile && window.normal && !window.closing &&
++        window.on_current_desktop) {
++      return {.window = i, .space = window.active_space};
++    }
++  }
++  return {};
++}
++
++gfx::Rect LittleWindowBounds(const gfx::Rect& work_area) {
++  gfx::Rect room = work_area;
++  room.Inset(rac::tokens::kSpacing24);
++  if (room.IsEmpty()) {
++    room = work_area;
++  }
++  gfx::Rect bounds(std::min(kLittleWindowSize.width(), room.width()),
++                   std::min(kLittleWindowSize.height(), room.height()));
++  bounds.set_origin(room.CenterPoint() -
++                    gfx::Vector2d(bounds.width() / 2, bounds.height() / 2));
++  return bounds;
++}
++
++}  // namespace rac::little_window
+--- /dev/null
++++ b/chrome/browser/ui/rac/little_window/little_window_routing.h
+@@ -0,0 +1,70 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_UI_RAC_LITTLE_WINDOW_LITTLE_WINDOW_ROUTING_H_
++#define CHROME_BROWSER_UI_RAC_LITTLE_WINDOW_LITTLE_WINDOW_ROUTING_H_
++
++#include <cstddef>
++#include <optional>
++#include <string>
++
++#include "base/containers/span.h"
++#include "ui/gfx/geometry/rect.h"
++
++class GURL;
++
++// Where the little window's links and tabs go. Plain values in, a decision
++// out: no browser, profile, or window objects, so the rules are unit tested
++// without a browser. The browser side
++// (chrome/browser/ui/views/rac/little_window/) gathers the facts and acts.
++namespace rac::little_window {
++
++// What happens to the URLs macOS hands rac from another app: a link clicked
++// in Mail or Slack, a .webloc file, Handoff.
++enum class LinkRoute {
++  // One web link: it opens in a little window.
++  kLittleWindow,
++  // Anything else (several links at once, files, other schemes): Chromium
++  // opens tabs in a normal window, as it always has.
++  kTabs,
++};
++LinkRoute RouteLinksFromOtherApp(base::span<const GURL> urls);
++
++// One open browser window, as the expand decision sees it.
++struct WindowFacts {
++  // Names the window's profile. An incognito profile is not its regular
++  // profile, so an incognito little window never expands into a regular
++  // window, or the reverse.
++  const void* profile = nullptr;
++  // A normal tabbed window: not a popup, a little window, an app, or PiP.
++  bool normal = false;
++  bool closing = false;
++  // On the macOS desktop (Space) the user is looking at.
++  bool on_current_desktop = true;
++  // The rac space the window shows; empty when it has none.
++  std::string active_space;
++};
++
++struct ExpandTarget {
++  // Index into the windows passed in, or nullopt for a new normal window.
++  std::optional<size_t> window;
++  // The rac space the tab joins: the one its window shows. Empty for a new
++  // window, which claims a space the way every new window does.
++  std::string space;
++};
++
++// Where a little window's tab goes when it becomes a tab: the most recently
++// active normal window of the same profile on the current desktop, into the
++// space it shows. `windows_by_activation` is most recently active first.
++ExpandTarget PickExpandTarget(
++    const void* profile,
++    base::span<const WindowFacts> windows_by_activation);
++
++// A new little window's bounds on a display with `work_area`: a fixed size,
++// shrunk to fit inside the work area's margin, centered. A closed little
++// window keeps nothing, so there is no remembered placement.
++gfx::Rect LittleWindowBounds(const gfx::Rect& work_area);
++
++}  // namespace rac::little_window
++
++#endif  // CHROME_BROWSER_UI_RAC_LITTLE_WINDOW_LITTLE_WINDOW_ROUTING_H_
+--- /dev/null
++++ b/chrome/browser/ui/rac/little_window/little_window_routing_unittest.cc
+@@ -0,0 +1,130 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/ui/rac/little_window/little_window_routing.h"
++
++#include <vector>
++
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/gfx/geometry/rect.h"
++#include "url/gurl.h"
++
++namespace rac::little_window {
++namespace {
++
++// Stand-ins for profiles: only their addresses matter.
++const int kRegular = 1;
++const int kIncognito = 2;
++const int kOtherProfile = 3;
++
++WindowFacts Normal(const void* profile, std::string space = "work") {
++  return {.profile = profile, .normal = true, .active_space = space};
++}
++
++LinkRoute Route(std::vector<GURL> urls) {
++  return RouteLinksFromOtherApp(urls);
++}
++
++TEST(LittleWindowRoutingTest, OneWebLinkOpensALittleWindow) {
++  EXPECT_EQ(Route({GURL("https://example.com/a?b#c")}),
++            LinkRoute::kLittleWindow);
++  EXPECT_EQ(Route({GURL("http://example.com")}), LinkRoute::kLittleWindow);
++}
++
++TEST(LittleWindowRoutingTest, EverythingElseOpensTabs) {
++  EXPECT_EQ(Route({}), LinkRoute::kTabs);
++  // Several links at once (a multi-select in Finder) stay tabs, not a
++  // stack of windows.
++  EXPECT_EQ(Route({GURL("https://example.com"), GURL("https://example.org")}),
++            LinkRoute::kTabs);
++  EXPECT_EQ(Route({GURL("file:///Users/me/page.html")}), LinkRoute::kTabs);
++  EXPECT_EQ(Route({GURL("chrome://settings")}), LinkRoute::kTabs);
++  EXPECT_EQ(Route({GURL("mailto:me@example.com")}), LinkRoute::kTabs);
++  EXPECT_EQ(Route({GURL("javascript:alert(1)")}), LinkRoute::kTabs);
++  EXPECT_EQ(Route({GURL("not a url")}), LinkRoute::kTabs);
++}
++
++TEST(LittleWindowRoutingTest, ExpandsIntoTheMostRecentNormalWindow) {
++  const WindowFacts windows[] = {Normal(&kRegular, "work"),
++                                 Normal(&kRegular, "home")};
++  ExpandTarget target = PickExpandTarget(&kRegular, windows);
++  EXPECT_EQ(target.window, 0u);
++  EXPECT_EQ(target.space, "work");
++}
++
++TEST(LittleWindowRoutingTest, JoinsTheSpaceItsWindowShows) {
++  const WindowFacts windows[] = {Normal(&kRegular, "home")};
++  EXPECT_EQ(PickExpandTarget(&kRegular, windows).space, "home");
++}
++
++TEST(LittleWindowRoutingTest, SkipsWindowsThatCantTakeTheTab) {
++  WindowFacts popup = Normal(&kRegular, "");
++  popup.normal = false;  // Another little window, a popup, an app, PiP.
++  WindowFacts closing = Normal(&kRegular, "a");
++  closing.closing = true;
++  WindowFacts elsewhere = Normal(&kRegular, "b");
++  elsewhere.on_current_desktop = false;
++  const WindowFacts windows[] = {popup, closing, elsewhere,
++                                 Normal(&kRegular, "c")};
++  ExpandTarget target = PickExpandTarget(&kRegular, windows);
++  EXPECT_EQ(target.window, 3u);
++  EXPECT_EQ(target.space, "c");
++}
++
++TEST(LittleWindowRoutingTest, StaysInItsOwnProfile) {
++  // The most recent window belongs to another profile; the tab goes to its
++  // own profile's window even though that one is older.
++  const WindowFacts windows[] = {Normal(&kOtherProfile, "x"),
++                                 Normal(&kRegular, "mine")};
++  ExpandTarget target = PickExpandTarget(&kRegular, windows);
++  EXPECT_EQ(target.window, 1u);
++  EXPECT_EQ(target.space, "mine");
++}
++
++TEST(LittleWindowRoutingTest, IncognitoStaysIncognito) {
++  WindowFacts incognito = Normal(&kIncognito, "");
++  const WindowFacts windows[] = {Normal(&kRegular, "work"), incognito};
++  EXPECT_EQ(PickExpandTarget(&kIncognito, windows).window, 1u);
++  // A regular little window never lands in the incognito window.
++  const WindowFacts only_incognito[] = {incognito};
++  EXPECT_FALSE(PickExpandTarget(&kRegular, only_incognito).window);
++}
++
++TEST(LittleWindowRoutingTest, NoWindowMeansANewOne) {
++  ExpandTarget target = PickExpandTarget(&kRegular, {});
++  EXPECT_FALSE(target.window);
++  EXPECT_TRUE(target.space.empty());
++}
++
++TEST(LittleWindowRoutingTest, BoundsAreCenteredAtTheirSize) {
++  const gfx::Rect work_area(0, 25, 1440, 875);
++  const gfx::Rect bounds = LittleWindowBounds(work_area);
++  EXPECT_EQ(bounds.size().ToString(), "960x720");
++  EXPECT_EQ(bounds.CenterPoint().ToString(),
++            work_area.CenterPoint().ToString());
++  EXPECT_TRUE(work_area.Contains(bounds));
++}
++
++TEST(LittleWindowRoutingTest, BoundsFollowTheDisplay) {
++  // A second display to the left of the main one.
++  const gfx::Rect work_area(-1920, 0, 1920, 1080);
++  const gfx::Rect bounds = LittleWindowBounds(work_area);
++  EXPECT_TRUE(work_area.Contains(bounds));
++  EXPECT_EQ(bounds.CenterPoint().ToString(),
++            work_area.CenterPoint().ToString());
++}
++
++TEST(LittleWindowRoutingTest, BoundsShrinkOnASmallDisplay) {
++  const gfx::Rect work_area(0, 0, 800, 600);
++  const gfx::Rect bounds = LittleWindowBounds(work_area);
++  EXPECT_TRUE(work_area.Contains(bounds));
++  EXPECT_LT(bounds.width(), 800);
++  EXPECT_LT(bounds.height(), 600);
++  // A tiny work area still gets a window inside it.
++  const gfx::Rect tiny(0, 0, 40, 30);
++  EXPECT_TRUE(tiny.Contains(LittleWindowBounds(tiny)));
++  EXPECT_FALSE(LittleWindowBounds(tiny).IsEmpty());
++}
++
++}  // namespace
++}  // namespace rac::little_window
+--- a/chrome/browser/ui/rac/rac_action_handlers.cc
++++ b/chrome/browser/ui/rac/rac_action_handlers.cc
+@@ -22,6 +22,7 @@
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/rac/command_bar/command_bar_handlers.h"
++#include "chrome/browser/ui/views/rac/little_window/little_window.h"
+ #include "components/prefs/pref_service.h"
+ #include "content/public/browser/web_contents.h"
+ #include "url/gurl.h"
+@@ -39,11 +40,12 @@ namespace {
+ //
+ // with the function defined above in this anonymous namespace. A handler that
+ // does nothing without a browser checks `context.browser` first.
+-constexpr std::array<std::pair<std::string_view, BrowserActionHandler>, 3>
++constexpr std::array<std::pair<std::string_view, BrowserActionHandler>, 4>
+     kBrowserHandlers{{
+         {"ask", &command_bar::Ask},
+         {"open_command_bar", &command_bar::OpenCommandBar},
+         {"open_command_bar_with_url", &command_bar::OpenCommandBarWithUrl},
++        {"open_little_window", &little_window::OpenLittleWindowAction},
+     }};
+ 
+ // Whether kBrowserHandlers and HandledActionIds() name the same set of rows.
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/little_window/little_window.cc
+@@ -0,0 +1,299 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/ui/views/rac/little_window/little_window.h"
++
++#include <map>
++#include <memory>
++#include <optional>
++#include <utility>
++#include <vector>
++
++#include "base/auto_reset.h"
++#include "base/callback_list.h"
++#include "base/functional/bind.h"
++#include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "chrome/app/vector_icons/vector_icons.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_tabstrip.h"
++#include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/browser_window/public/browser_collection.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/create_browser_window.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "chrome/browser/ui/rac/little_window/little_window_routing.h"
++#include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/toolbar_button_provider.h"
++#include "chrome/browser/ui/views/rac/rac_tokens.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_button.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_view.h"
++#include "chrome/grit/rac_strings.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++#include "ui/display/screen.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/view_class_properties.h"
++#include "url/gurl.h"
++#include "url/origin.h"
++
++namespace rac::little_window {
++namespace {
++
++// True only while CreateLittleWindow builds its popup, so the popup's toolbar
++// can tell it apart from other popups before the window is listed.
++bool g_creating_little_window = false;
++
++// The open little windows. Made with the first one; a window leaves the list
++// when it closes.
++class LittleWindows {
++ public:
++  LittleWindows() = default;
++  LittleWindows(const LittleWindows&) = delete;
++  LittleWindows& operator=(const LittleWindows&) = delete;
++  ~LittleWindows() = default;
++
++  static LittleWindows* Get() { return Instance().get(); }
++
++  static LittleWindows& GetOrCreate() {
++    if (!Instance()) {
++      Instance() = std::make_unique<LittleWindows>();
++    }
++    return *Instance();
++  }
++
++  void Add(BrowserWindowInterface* browser) {
++    Subscriptions& subscriptions = windows_[browser];
++    subscriptions.closed = browser->RegisterBrowserDidClose(
++        base::BindRepeating(&LittleWindows::OnClosed, base::Unretained(this)));
++#if BUILDFLAG(IS_MAC)
++    subscriptions.active = browser->RegisterDidBecomeActive(base::BindRepeating(
++        &LittleWindows::UpdateOpenFileItem, base::Unretained(this)));
++    subscriptions.inactive =
++        browser->RegisterDidBecomeInactive(base::BindRepeating(
++            &LittleWindows::UpdateOpenFileItem, base::Unretained(this)));
++    UpdateOpenFileItem(browser);
++#endif
++  }
++
++  bool Contains(const BrowserWindowInterface* browser) const {
++    return windows_.contains(browser);
++  }
++
++ private:
++  struct Subscriptions {
++    base::CallbackListSubscription closed;
++    base::CallbackListSubscription active;
++    base::CallbackListSubscription inactive;
++  };
++
++  static std::unique_ptr<LittleWindows>& Instance() {
++    static base::NoDestructor<std::unique_ptr<LittleWindows>> instance;
++    return *instance;
++  }
++
++  void OnClosed(BrowserWindowInterface* browser) {
++    windows_.erase(browser);
++#if BUILDFLAG(IS_MAC)
++    UpdateOpenFileItem(browser);
++#endif
++  }
++
++#if BUILDFLAG(IS_MAC)
++  // Activation callbacks can arrive in either order when focus moves from
++  // one little window to another, so this looks at every window instead of
++  // trusting the one that changed.
++  void UpdateOpenFileItem(BrowserWindowInterface* /*changed*/) {
++    bool any_active = false;
++    for (const auto& [window, subscriptions] : windows_) {
++      any_active |= window->IsActive();
++    }
++    SetOpenFileItemOpensAsTab(any_active);
++  }
++#endif
++
++  std::map<const BrowserWindowInterface*, Subscriptions> windows_;
++};
++
++// The ⌘O button at the end of the little window's toolbar.
++void AddOpenAsTabButton(BrowserWindowInterface* browser) {
++  BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser);
++  ToolbarView* toolbar = browser_view ? browser_view->toolbar() : nullptr;
++  if (!toolbar) {
++    return;
++  }
++  auto button = std::make_unique<ToolbarButton>(base::BindRepeating(
++      [](base::WeakPtr<BrowserWindowInterface> window) {
++        if (window) {
++          OpenAsTab(window.get());
++        }
++      },
++      browser->GetWeakPtr()));
++  const std::u16string label =
++      l10n_util::GetStringUTF16(IDS_RAC_LITTLE_WINDOW_OPEN_AS_TAB);
++  button->SetVectorIcon(kOpenInFullIcon);
++  button->SetTooltipText(label);
++  button->GetViewAccessibility().SetName(label);
++  button->SetPreferredSize(
++      browser_view->toolbar_button_provider()->GetToolbarButtonSize());
++  button->SetProperty(
++      views::kMarginsKey,
++      gfx::Insets::TLBR(0, rac::tokens::kSpacing4, 0, rac::tokens::kSpacing4));
++  toolbar->AddChildView(std::move(button));
++}
++
++BrowserWindowInterface* CreateLittleWindow(Profile* profile) {
++  if (!profile || GetBrowserWindowCreationStatusForProfile(*profile) !=
++                      BrowserWindowInterface::CreationStatus::kOk) {
++    return nullptr;
++  }
++  BrowserWindowCreateParams params(BrowserWindowInterface::TYPE_POPUP, *profile,
++                                   /*from_user_gesture=*/true);
++  // A closed little window keeps nothing: no session restore, no remembered
++  // placement. Popups never reach Recently Closed.
++  params.omit_from_session_restore = true;
++  params.should_trigger_session_restore = false;
++  params.initial_bounds = LittleWindowBounds(
++      display::Screen::Get()->GetDisplayForNewWindows().work_area());
++  params.initial_origin_specified =
++      BrowserWindowCreateParams::ValueSpecified::kSpecified;
++
++  BrowserWindowInterface* browser = nullptr;
++  {
++    base::AutoReset<bool> creating(&g_creating_little_window, true);
++    browser = CreateBrowserWindow(std::move(params));
++  }
++  if (!browser) {
++    return nullptr;
++  }
++  LittleWindows::GetOrCreate().Add(browser);
++  AddOpenAsTabButton(browser);
++  return browser;
++}
++
++}  // namespace
++
++bool IsLittleWindow(const BrowserWindowInterface* browser) {
++  if (!browser || browser->GetType() != BrowserWindowInterface::TYPE_POPUP) {
++    return false;
++  }
++  if (g_creating_little_window) {
++    return true;
++  }
++  const LittleWindows* windows = LittleWindows::Get();
++  return windows && windows->Contains(browser);
++}
++
++bool OpenLinksFromOtherApp(const StartupTabs& tabs, Profile* profile) {
++  std::vector<GURL> urls;
++  urls.reserve(tabs.size());
++  for (const StartupTab& tab : tabs) {
++    urls.push_back(tab.url);
++  }
++  if (RouteLinksFromOtherApp(urls) != LinkRoute::kLittleWindow) {
++    return false;
++  }
++  BrowserWindowInterface* browser = CreateLittleWindow(profile);
++  if (!browser) {
++    return false;
++  }
++  // As Chromium's own startup tabs load (StartupBrowserCreatorImpl::
++  // OpenTabsInBrowser): a top-level load from outside the browser.
++  const StartupTab& tab = tabs.front();
++  NavigateParams navigate(browser, tab.url, ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
++  if (tab.is_untrusted_launch) {
++    // A custom scheme launch from another app: an opaque initiator, so the
++    // load is never treated as typed by the user.
++    navigate.initiator_origin = url::Origin();
++  }
++  navigate.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++  navigate.window_action = NavigateParams::WindowAction::kShowWindow;
++  Navigate(&navigate);
++  return true;
++}
++
++BrowserWindowInterface* OpenEmpty(Profile* profile) {
++  BrowserWindowInterface* browser = CreateLittleWindow(profile);
++  if (!browser) {
++    return nullptr;
++  }
++  chrome::AddTabAt(browser, GURL(), /*index=*/-1, /*foreground=*/true,
++                   /*group=*/std::nullopt, /*pinned=*/false,
++                   NavigateParams::WindowAction::kShowWindow);
++  chrome::FocusLocationBar(browser);
++  return browser;
++}
++
++bool OpenAsTab(BrowserWindowInterface* browser) {
++  if (!IsLittleWindow(browser)) {
++    return false;
++  }
++  TabStripModel* tabs = browser->GetTabStripModel();
++  if (tabs->empty()) {
++    return true;
++  }
++  Profile* profile = browser->GetProfile();
++
++  std::vector<BrowserWindowInterface*> windows;
++  std::vector<WindowFacts> facts;
++  GlobalBrowserCollection::GetInstance()->ForEach(
++      [&](BrowserWindowInterface* window) {
++        WindowFacts fact{
++            .profile = window->GetProfile(),
++            .normal = window->GetType() == BrowserWindowInterface::TYPE_NORMAL,
++            .closing = window->IsDeleteScheduled()};
++        if (BrowserWindow* native = BrowserWindow::FromBrowser(window)) {
++          fact.on_current_desktop = native->IsOnCurrentWorkspace();
++        }
++        if (SpacesWindowManager* spaces = SpacesWindowManager::From(window)) {
++          if (std::optional<SpaceId> space = spaces->GetActiveSpaceId(window)) {
++            fact.active_space = space->AsLowercaseString();
++          }
++        }
++        windows.push_back(window);
++        facts.push_back(std::move(fact));
++        return true;
++      },
++      BrowserCollection::Order::kActivation);
++  const ExpandTarget target = PickExpandTarget(profile, facts);
++
++  // Make the new window, if one is needed, before the page leaves: closing
++  // the last window first would start shutting the browser down (as in
++  // chrome::ConvertPopupToTabbedBrowser).
++  BrowserWindowInterface* into =
++      target.window ? windows[*target.window]
++                    : CreateBrowserWindow(BrowserWindowCreateParams(
++                          *profile, /*from_user_gesture=*/true));
++  if (!into) {
++    return true;
++  }
++  // The WebContents moves as it is: no reload, the same scroll position and
++  // form text. The tab can't move whole between window types
++  // (crbug.com/334281979), so its per-tab features start fresh, as with
++  // Chromium's Show as Tab. The window inserts it into the space it shows.
++  // Emptying the popup closes it.
++  std::unique_ptr<content::WebContents> contents =
++      tabs->DetachWebContentsAtForInsertion(tabs->active_index());
++  into->GetTabStripModel()->AppendWebContents(std::move(contents),
++                                              /*foreground=*/true);
++  if (BrowserWindow* native = BrowserWindow::FromBrowser(into)) {
++    native->Show();
++  }
++  return true;
++}
++
++void OpenLittleWindowAction(const action_table::ActionContext& context,
++                            const base::DictValue& /*args*/) {
++  if (context.browser) {
++    OpenEmpty(context.browser->GetProfile());
++  }
++}
++
++}  // namespace rac::little_window
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/little_window/little_window.h
+@@ -0,0 +1,66 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_LITTLE_WINDOW_LITTLE_WINDOW_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_LITTLE_WINDOW_LITTLE_WINDOW_H_
++
++#include "base/values.h"
++#include "build/build_config.h"
++#include "chrome/browser/rac/actions/rac_actions.h"
++#include "chrome/browser/ui/startup/startup_tab.h"
++
++class BrowserWindowInterface;
++class Profile;
++
++// The little window: a link from another app opens in a small window of its
++// own instead of a tab in the main window. It is a real tab in a Chromium
++// popup window, so permission prompts, downloads, find, and dialogs work and
++// name the page's own origin. Open as Tab (⌘O, or the toolbar button) moves
++// the page into the main window without reloading it. ⌥⌘N opens an empty
++// one.
++//
++// Nothing here runs or exists until a little window opens: the hooks below
++// are plain function calls that return at once, and the list of little
++// windows is made with the first one.
++//
++// Hooks into Chromium (rac/little-window/little-window.patch):
++//  - app_controller_mac.mm: OpenStartupTabsInBrowserWithProfile asks
++//    OpenLinksFromOtherApp first; ⌥⌘N with no window open.
++//  - browser_command_controller.cc: IDC_OPEN_FILE runs OpenAsTab in a little
++//    window.
++//  - toolbar_view.cc: a little window's address field can be edited.
++namespace rac::little_window {
++
++// Whether `browser` is a little window, or the popup CreateLittleWindow is
++// making right now (its toolbar asks while it is being built).
++bool IsLittleWindow(const BrowserWindowInterface* browser);
++
++// For the URLs macOS hands rac from another app, once Chromium has picked
++// `profile` (the last used one, never incognito unless policy forces it).
++// Opens them in a little window and returns true when they route to one;
++// returns false to leave them to Chromium.
++bool OpenLinksFromOtherApp(const StartupTabs& tabs, Profile* profile);
++
++// Opens an empty little window for `profile`, with its address field focused.
++// An incognito profile's little window is incognito.
++BrowserWindowInterface* OpenEmpty(Profile* profile);
++
++// Moves the little window's page into a normal window of its profile as the
++// active tab, without reloading it, and closes the little window. Returns
++// false when `browser` isn't a little window.
++bool OpenAsTab(BrowserWindowInterface* browser);
++
++// The action table's handler for the open_little_window row (⌥⌘N, File >
++// New Little Window, the command bar).
++void OpenLittleWindowAction(const action_table::ActionContext& context,
++                            const base::DictValue& args);
++
++#if BUILDFLAG(IS_MAC)
++// Retitles File > Open File… (⌘O) to Open as Tab while a little window is
++// the active window, and back. In little_window_mac.mm.
++void SetOpenFileItemOpensAsTab(bool as_tab);
++#endif
++
++}  // namespace rac::little_window
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_LITTLE_WINDOW_LITTLE_WINDOW_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/little_window/little_window_mac.mm
+@@ -0,0 +1,27 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/ui/views/rac/little_window/little_window.h"
++
++#import <Cocoa/Cocoa.h>
++
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/grit/generated_resources.h"
++#include "chrome/grit/rac_strings.h"
++#include "ui/base/l10n/l10n_util_mac.h"
++
++namespace rac::little_window {
++
++void SetOpenFileItemOpensAsTab(bool as_tab) {
++  NSMenu* file_menu = [NSApp.mainMenu itemWithTag:IDC_FILE_MENU].submenu;
++  NSMenuItem* item = [file_menu itemWithTag:IDC_OPEN_FILE];
++  if (!item) {
++    return;
++  }
++  // Same key (⌘O); browser_command_controller.cc sends IDC_OPEN_FILE to
++  // OpenAsTab in a little window.
++  item.title = l10n_util::GetNSStringWithFixup(
++      as_tab ? IDS_RAC_LITTLE_WINDOW_OPEN_AS_TAB : IDS_OPEN_FILE_MAC);
++}
++
++}  // namespace rac::little_window
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -104,6 +104,7 @@
+ #include "chrome/browser/ui/views/tabs/tab_strip.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip_controller.h"
+ #include "chrome/browser/ui/views/toolbar/app_menu.h"
++#include "chrome/browser/ui/views/rac/little_window/little_window.h"
+ #include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h"
+ #include "chrome/browser/ui/views/rac/sidebar_visibility.h"
+ #include "chrome/browser/ui/views/rac/top_bar.h"
+@@ -461,7 +462,9 @@ void ToolbarView::Init() {
+     location_bar_view = std::make_unique<LocationBarView>(
+         browser_, browser_->GetProfile(),
+         chrome::BrowserCommandController::From(browser_), this,
+-        display_mode_ != DisplayMode::kNormal);
++        // rac: a little window's address field can be edited.
++        display_mode_ != DisplayMode::kNormal &&
++            !rac::little_window::IsLittleWindow(browser_));
+   }
+ 
+   // Make sure the toolbar shows by default.
