@@ -189,11 +189,14 @@ UI-control WebSocket — with `--user-data-dir` at the clone's throwaway
   `--enable-logging=stderr`, `--vmodule=<spec>`,
   `--rac-force-color-mode=light|dark|system`.
 - `--window-size=W,H`, each 400 to 4000, for taller or wider windows.
-- `--test-type`, bare (no value), for PWA checks. Chromium's test mode
-  makes `AppShimCreationAndLaunchDisabledForTest()` true
+- `--test-type`, bare (no value). Every remote run launches with it
+  anyway, so passing it changes nothing; it's accepted so PWA scripts
+  can say what they rely on. Chromium's test mode makes
+  `AppShimCreationAndLaunchDisabledForTest()` true
   (`chrome/browser/web_applications/os_integration/mac/web_app_shortcut_mac.mm`),
-  so installing a PWA writes no app shim into the Pro's
-  `~/Applications`. It opens no debugging port and no file access.
+  so no PWA install, from a command or from a page's own install
+  button, writes an app shim into the Pro's `~/Applications`. It opens
+  no debugging port and no file access.
 - A bare arg is a URL and gets the same allowlist `open-urls` gets:
   loopback and test hosts, the named internal pages, `about:blank`, and
   `@SERVE@/<path>` with `--serve`.
@@ -214,8 +217,14 @@ Two `run` options change the clone before launch:
   refused without `--serve`. DIR must be relative, stay inside the
   clone once symlinks resolve, sit outside `build/`, and hold no
   symlinks. Responses carry a Content-Security-Policy that keeps the
-  page's fetches, scripts, frames and forms on that server. The server
-  stops when the run ends, however it ends.
+  page's network fetches, scripts, frames and forms on that server
+  (inline scripts, `data:` and `blob:` still work). A CSP can't stop a
+  page from navigating its own tab, so a `--serve` run's browser also
+  sends every request to a dead loopback proxy (`--proxy-server=
+  http://127.0.0.1:9`; loopback is bypassed, so the server still
+  answers) and keeps WebRTC from sending UDP around it. Nothing a served
+  page does reaches another host. The server stops when the run ends,
+  however it ends.
 
 The requests file a run feeds the screenshot harness is one checked
 line. Pages and command ids are allowlists. rac's own ids are limited to

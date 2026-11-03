@@ -31,7 +31,10 @@ page open-urls visits (the Air reads them back too: a run that opens
 chrome://setup needs an Arc import input in the same run), a
 `needs SWITCH` line per run switch the line depends on (the Air refuses
 the run unless SWITCH is among its args: `needs --test-type` for the PWA
-commands), then one line per path in it, REL
+commands), a `commands ID...` line with the ids of the line's command
+verbs (the Air reads it back: a settings page opened as a run arg allows
+only the zoom commands; the Air strips it before the Pro sees the
+stream), then one line per path in it, REL
 under build/shots/, so the Pro side never has to parse the line:
 `file REL` (a file it writes), `dir REL` (a folder it writes into) or
 `expect REL` (a screenshot the run waits for: bare PNG paths,
@@ -285,6 +288,8 @@ class Checker:
         self.serve = serve
         self.outputs = []
         self.verbs = []
+        # The ids of the command verbs the line validated, in order.
+        self.command_ids = []
         # Every character typed into the focused field, in order: pieces
         # typed one after another can join into a page name.
         self.typed = ''
@@ -445,6 +450,8 @@ class Checker:
         elif verb == 'command' and int(args[0]) not in COMMANDS_ALLOWED:
             raise Refused(f'command {args[0]} is not an allowed command id '
                           '(see COMMANDS_ALLOWED); ask Ship to allow it')
+        if verb == 'command':
+            self.command_ids.append(int(args[0]))
         if verb == 'key':
             self.events.append('return' if args[0] == 'return' else 'input')
         elif verb == 'wheel':
@@ -477,7 +484,7 @@ class Checker:
         return words
 
 
-def check_line(text, serve=False):
+def check_line(text, serve=False, command_ids=None):
     """The checked line and the paths it writes, as `file REL`/`dir REL`.
     `serve` says the run passes --serve, so `@SERVE@` URLs may open."""
     # A malformed RAC_REMOTE_ALLOWED_HOSTS refuses every line, not only one
@@ -545,6 +552,8 @@ def check_line(text, serve=False):
     if denied:
         raise Refused('typed text spells a page the browser may not open: '
                       + ', '.join(denied))
+    if command_ids is not None:
+        command_ids.extend(sorted(set(checker.command_ids)))
     return out, checker.outputs, sorted(checker.verbs)
 
 
@@ -569,7 +578,8 @@ def main(argv):
         sys.exit(__doc__)
     try:
         with open(argv[1], encoding='utf-8') as f:
-            line, outputs, verbs = check_line(f.read(), serve)
+            ids = []
+            line, outputs, verbs = check_line(f.read(), serve, ids)
     except (Refused, UnicodeDecodeError, OSError) as e:
         print(f'rac remote: refusing the requests file: {e}', file=sys.stderr)
         return 2
@@ -579,9 +589,6 @@ def main(argv):
     print('verbs ' + ' '.join(verbs))
     # The command ids, for a settings page passed as a run arg: such a run
     # may only zoom. The Air strips this line before the Pro sees it.
-    words = line.split()
-    ids = sorted({int(words[i + 1]) for i, w in enumerate(words[:-1])
-                  if w == 'command' and words[i + 1].isdigit()})
     if ids:
         print('commands ' + ' '.join(str(i) for i in ids))
     for output in outputs:

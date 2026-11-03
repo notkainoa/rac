@@ -59,9 +59,13 @@
 #                                     --disable-backgrounding-occluded-windows,
 #                                     --rac-force-color-mode=light|dark|
 #                                     system, --window-size=W,H (each 400
-#                                     to 4000), --test-type (Chromium test
-#                                     mode, bare: a PWA install writes no
-#                                     app shim to ~/Applications). A bare
+#                                     to 4000), --test-type (bare; every
+#                                     run launches with it anyway, so no
+#                                     PWA install writes an app shim to
+#                                     ~/Applications). A --serve run's
+#                                     browser also gets a dead loopback
+#                                     proxy, so served pages reach no
+#                                     other host. A bare
 #                                     arg is a URL and gets open-urls'
 #                                     allowlist. A run that opens
 #                                     chrome://setup (or setup?arc, the
@@ -1614,6 +1618,13 @@ except urllib.error.HTTPError:
     case "$arg" in @SERVE@*) arg="$serve_url${arg#@SERVE@}" ;; esac
     served_args+=("$arg")
   done
+  # Served pages are scripts the agent wrote, and a CSP can't stop a
+  # page from navigating its tab. So the browser itself gets no way out:
+  # every request goes to a dead loopback proxy (loopback is bypassed
+  # by default, so the server above still answers, and a proxied URL is
+  # never resolved locally), and WebRTC may not send UDP around it.
+  served_args+=(--proxy-server=http://127.0.0.1:9
+    --force-webrtc-ip-handling-policy=disable_non_proxied_udp)
   args=(${served_args[@]+"${served_args[@]}"})
   requests=${requests//@SERVE@/$serve_url}
 fi
@@ -1843,6 +1854,7 @@ python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
   nice -n 10 taskpolicy -c utility devutils/rac/build-queue.sh --run \
   "$app_bin" --user-data-dir="$clone/build/profile" --use-mock-keychain \
   --disable-features=DialMediaRouteProvider --rac-launch-in-background \
+  --test-type \
   ${args[@]+"${args[@]}"} &
 launcher=$!
 spawned=$launcher

@@ -460,6 +460,12 @@ class RemoteRequestsTest(unittest.TestCase):
             self.assertIn('a script that types may not move the caret or '
                           'click; ask Ship', str(e))
 
+    def test_commands_line_names_only_command_verbs(self):
+        # An argument that reads `command N` is not a command verb.
+        ids = []
+        self.rr.check_line('record command 100 ; command 38003', False, ids)
+        self.assertEqual(ids, [38003])
+
     def test_settings_pages_may_zoom(self):
         for line in ('open-urls chrome://settings/general ; command 38003 ; '
                      'burst shots 2 100',

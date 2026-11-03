@@ -1575,6 +1575,10 @@ class RunTest(RemoteBuildTest):
         self.assertIn('--use-mock-keychain', calls)
         self.assertIn('--disable-features=DialMediaRouteProvider', calls)
         self.assertIn('--rac-launch-in-background', calls)
+        # Always on, so no PWA install can write an app shim.
+        self.assertIn('--test-type', calls)
+        # Only --serve runs get the dead proxy.
+        self.assertNotIn('--proxy-server', calls)
         self.assertIn('BREAKPAD_DUMP_LOCATION='
                       f'{os.path.realpath(self.clone)}/build/profile/Crashpad',
                       calls)
@@ -1702,7 +1706,9 @@ class RunTest(RemoteBuildTest):
         self.run_rb('run', self.wt, '--requests-file', req, '--timeout', '5',
                     '--', 'chrome://settings/assistant', success=True)
         written = (self.clone / 'build/req/req.txt').read_text()
-        self.assertNotIn('\ncommand ', '\n' + written.split('\n', 1)[-1])
+        # The zoom command reaches the Pro; the commands line doesn't.
+        self.assertIn('command 38003', written)
+        self.assertNotIn('commands ', written)
 
     def test_run_opening_a_settings_page_is_screenshot_only(self):
         # A settings page as a run arg allows only capture verbs in the
@@ -1949,6 +1955,10 @@ class RunTest(RemoteBuildTest):
         # The browser reached the folder on 127.0.0.1, under a policy that
         # keeps the page's own requests on that server.
         self.assertIn(f'fetched {url}/index.html 200 hello pwa', calls)
+        # Served pages get no way out but loopback.
+        self.assertIn('--proxy-server=http://127.0.0.1:9', calls)
+        self.assertIn('--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+                      calls)
         self.assertIn("csp=default-src 'self'", calls)
         self.assertIn('(127.0.0.1 only)', result.stderr)
         # And the server is gone once the run ends.
