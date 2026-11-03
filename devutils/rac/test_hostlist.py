@@ -9,7 +9,9 @@ network capture workflow.
 Fixtures live in devutils/rac/fixtures/netlog/: basic.json covers one of each
 event shape hostlist reads, truncated.json is cut mid-event the way a killed
 browser leaves the file, and dev.json holds the loopback and .qjz9zk hosts a
-dev build can emit. Compare tests write their own ```hosts docs.
+dev build can emit, and startup-fresh-profile.json is a real capture's
+startup events (fresh profile, no consent). Never-sent cases build their
+logs in memory. Compare tests write their own ```hosts docs.
 
 Run from the repository root:
     python3 -m unittest devutils/rac/test_hostlist.py -v
@@ -27,6 +29,7 @@ REPO = Path(__file__).resolve().parents[2]
 HELPER = REPO / 'devutils' / 'rac' / 'hostlist.py'
 FIXTURES = REPO / 'devutils' / 'rac' / 'fixtures' / 'netlog'
 BASIC = FIXTURES / 'basic.json'
+STARTUP = FIXTURES / 'startup-fresh-profile.json'
 TRUNCATED = FIXTURES / 'truncated.json'
 DEV = FIXTURES / 'dev.json'
 
@@ -167,18 +170,19 @@ class DevHostsTest(unittest.TestCase):
         self.assertEqual(set(self.ignored),
                          {'127.0.0.1', 'localhost', '::1', '9oo91e.qjz9zk'})
         self.assertEqual(self.ignored['9oo91e.qjz9zk']['reason'],
-                         'dev-placeholder')
+                         'placeholder')
         self.assertEqual(self.ignored['::1']['reason'], 'loopback')
 
-    def test_ignore_dev_flag_hides_them(self):
-        result = run_helper('hosts', str(DEV), '--ignore-dev')
-        self.assertEqual(result.returncode, 0)
-        self.assertIn('public.test.org', result.stdout)
-        self.assertNotIn('9oo91e.qjz9zk', result.stdout)
-        self.assertNotIn('127.0.0.1', result.stdout)
+    def test_ignore_flags_hide_them(self):
+        for flag in ('--ignore-placeholder', '--ignore-dev'):
+            result = run_helper('hosts', str(DEV), flag)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn('public.test.org', result.stdout)
+            self.assertNotIn('9oo91e.qjz9zk', result.stdout)
+            self.assertNotIn('127.0.0.1', result.stdout)
         plain = run_helper('hosts', str(DEV))
         self.assertIn('9oo91e.qjz9zk', plain.stdout)
-        self.assertIn('loopback/dev', plain.stdout)
+        self.assertIn('loopback/placeholder', plain.stdout)
 
 
 class OutputTest(unittest.TestCase):
@@ -199,14 +203,159 @@ class OutputTest(unittest.TestCase):
         self.assertIn('example.com', hosts)
         self.assertIn('public.test.org', hosts)
         ignored = {h['host']: h for h in doc['ignored']}
-        self.assertEqual(ignored['9oo91e.qjz9zk']['reason'], 'dev-placeholder')
+        self.assertEqual(ignored['9oo91e.qjz9zk']['reason'], 'placeholder')
 
     def test_json_ignore_dev(self):
-        result = run_helper('hosts', str(DEV), '--json', '--ignore-dev')
+        result = run_helper('hosts', str(DEV), '--json',
+                            '--ignore-placeholder')
         doc = json.loads(result.stdout)
         self.assertNotIn('ignored', doc)
         self.assertEqual([h['host'] for h in doc['hosts']],
                          ['public.test.org', 'qjz9zk.example.com'])
+
+
+NET_CONSTANTS = {
+    'logEventTypes': {
+        'URL_REQUEST_START_JOB': 1, 'REQUEST_ALIVE': 2,
+        'SOCKET_ALIVE': 3, 'HTTP_TRANSACTION_SEND_REQUEST': 4,
+        'HOST_RESOLVER_MANAGER_REQUEST': 5,
+        'HOST_RESOLVER_MANAGER_JOB': 6, 'DNS_TRANSACTION': 7,
+    },
+    'logSourceType': {'URL_REQUEST': 1, 'NETWORK_QUALITY_ESTIMATOR': 2,
+                      'HOST_RESOLVER_IMPL_JOB': 3},
+}
+T = NET_CONSTANTS['logEventTypes']
+SRC = NET_CONSTANTS['logSourceType']
+
+
+def ev(name, sid, source, phase=0, **params):
+    return {'type': T[name], 'source': {'id': sid, 'type': SRC[source]},
+            'phase': phase, 'params': params}
+
+
+def request(sid, url, flags=0, error=None, extra=()):
+    """The events of one URL_REQUEST source."""
+    events = [ev('REQUEST_ALIVE', sid, 'URL_REQUEST', 1, url=url),
+              ev('URL_REQUEST_START_JOB', sid, 'URL_REQUEST', 1, url=url,
+                 load_flags=flags)]
+    events += list(extra)
+    if error is not None:
+        events.append(ev('URL_REQUEST_START_JOB', sid, 'URL_REQUEST', 2,
+                         net_error=error))
+    return events
+
+
+def nqe_lookup(sid, host):
+    return [ev('HOST_RESOLVER_MANAGER_REQUEST', sid,
+               'NETWORK_QUALITY_ESTIMATOR', 1, host=host),
+            ev('HOST_RESOLVER_MANAGER_REQUEST', sid,
+               'NETWORK_QUALITY_ESTIMATOR', 2, net_error=-105)]
+
+
+class NeverSentTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def capture(self, *events):
+        path = Path(self._tmp.name) / 'netlog.json'
+        path.write_text(json.dumps({'constants': NET_CONSTANTS,
+                                    'events': list(events)}))
+        return hostlist.collect_capture([str(path)])
+
+    def test_real_world_startup_capture(self):
+        contacted, never_sent = hostlist.collect_capture([str(STARTUP)])
+        self.assertEqual(contacted, {})
+        self.assertEqual(set(never_sent), {'services.helium.imput.net',
+                                           'helium-services-are-disabled.qjz9zk'})
+        self.assertEqual(never_sent['services.helium.imput.net']['reasons'],
+                         ['cache-only', 'local-only lookup'])
+        self.assertEqual(
+            never_sent['helium-services-are-disabled.qjz9zk']['reasons'],
+            ['blocked'])
+
+    def test_cache_only_request_is_never_sent(self):
+        contacted, never_sent = self.capture(
+            *request(1, 'https://a.test.org/x', flags=72, error=-400))
+        self.assertEqual(contacted, {})
+        self.assertEqual(never_sent['a.test.org']['reasons'], ['cache-only'])
+
+    def test_flags_without_cache_bit_are_contacted(self):
+        contacted, never_sent = self.capture(
+            *request(1, 'https://a.test.org/x', flags=80, error=-400))
+        self.assertIn('a.test.org', contacted)
+        self.assertEqual(never_sent, {})
+
+    def test_cache_only_then_normal_request_is_contacted(self):
+        contacted, never_sent = self.capture(
+            *request(1, 'https://a.test.org/x', flags=72, error=-400),
+            *request(2, 'https://a.test.org/x', flags=0, error=0))
+        self.assertIn('a.test.org', contacted)
+        self.assertEqual(never_sent, {})
+
+    def test_blocked_request_is_never_sent(self):
+        contacted, never_sent = self.capture(
+            *request(1, 'https://b.qjz9zk/', error=-20))
+        self.assertEqual(contacted, {})
+        self.assertEqual(never_sent['b.qjz9zk']['reasons'], ['blocked'])
+
+    def test_blocked_on_request_alive_end(self):
+        contacted, never_sent = self.capture(
+            *request(1, 'https://b.test.org/'),
+            ev('REQUEST_ALIVE', 1, 'URL_REQUEST', 2, net_error=-20))
+        self.assertEqual(contacted, {})
+        self.assertIn('b.test.org', never_sent)
+
+    def test_blocked_with_socket_event_is_contacted(self):
+        for name in ('SOCKET_ALIVE', 'HTTP_TRANSACTION_SEND_REQUEST'):
+            contacted, never_sent = self.capture(
+                *request(1, 'https://b.test.org/', error=-20,
+                         extra=[ev(name, 1, 'URL_REQUEST', 1)]))
+            self.assertIn('b.test.org', contacted, name)
+            self.assertEqual(never_sent, {})
+
+    def test_other_errors_are_contacted(self):
+        contacted, _ = self.capture(
+            *request(1, 'https://c.test.org/', error=-105))
+        self.assertIn('c.test.org', contacted)
+
+    def test_estimator_lookup_is_never_sent(self):
+        contacted, never_sent = self.capture(
+            *nqe_lookup(1, 'https://d.test.org'))
+        self.assertEqual(contacted, {})
+        self.assertEqual(never_sent['d.test.org']['reasons'],
+                         ['local-only lookup'])
+
+    def test_real_resolver_job_makes_lookup_contacted(self):
+        for name in ('HOST_RESOLVER_MANAGER_JOB', 'DNS_TRANSACTION'):
+            contacted, never_sent = self.capture(
+                *nqe_lookup(1, 'https://d.test.org'),
+                ev(name, 9, 'HOST_RESOLVER_IMPL_JOB', 1, host='d.test.org'))
+            self.assertIn('d.test.org', contacted, name)
+            self.assertEqual(never_sent, {})
+
+    def test_lookup_outside_estimator_is_contacted(self):
+        contacted, _ = self.capture(
+            ev('HOST_RESOLVER_MANAGER_REQUEST', 1, 'URL_REQUEST', 1,
+               host='e.test.org'))
+        self.assertIn('e.test.org', contacted)
+
+    def test_output_and_compare_ignore_never_sent(self):
+        text = run_helper('hosts', str(STARTUP))
+        self.assertEqual(text.returncode, 0)
+        self.assertIn('# 0 hosts', text.stdout)
+        self.assertIn('seen but never sent', text.stdout)
+        self.assertIn('cache-only, local-only lookup', text.stdout)
+        doc = json.loads(run_helper('hosts', str(STARTUP), '--json').stdout)
+        self.assertEqual(doc['hosts'], [])
+        never = {h['host']: h for h in doc['never_sent']}
+        self.assertEqual(never['helium-services-are-disabled.qjz9zk']
+                         ['reasons'], ['blocked'])
+        listed = Path(self._tmp.name) / 'network.md'
+        listed.write_text(doc_with_hosts('example.com'))
+        result = run_helper('compare', str(STARTUP), '--list', str(listed))
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('seen but never sent', result.stdout)
 
 
 class CompareTest(unittest.TestCase):
@@ -251,7 +400,7 @@ class CompareTest(unittest.TestCase):
         self.write_doc('public.test.org', 'qjz9zk.example.com')
         result = run_helper('compare', str(DEV), '--list', str(self.doc))
         self.assertEqual(result.returncode, 0)
-        self.assertIn('loopback/dev', result.stdout)
+        self.assertIn('loopback/placeholder', result.stdout)
 
     def test_missing_block_warns_and_fails_on_hosts(self):
         self.doc.write_text('# no hosts block here\n')
