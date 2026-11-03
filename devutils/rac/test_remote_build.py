@@ -1577,7 +1577,7 @@ class RunTest(RemoteBuildTest):
         self.assertIn('--rac-launch-in-background', calls)
         # Always on, so no PWA install can write an app shim.
         self.assertIn('--test-type', calls)
-        # Only --serve runs get the dead proxy.
+        # Only --serve and Arc import runs get the dead proxy.
         self.assertNotIn('--proxy-server', calls)
         self.assertIn('BREAKPAD_DUMP_LOCATION='
                       f'{os.path.realpath(self.clone)}/build/profile/Crashpad',
@@ -2138,7 +2138,14 @@ class RunTest(RemoteBuildTest):
         root = '--rac-import-source-root=build/arc-root'
         self.run_rb('run', self.wt, '--timeout', '3', '--', '--no-first-run',
                     root, '--rac-import-arc-now', success=True)
-        self.assertNotIn('--test-type', self.calls())
+        calls = self.calls()
+        self.assertNotIn('--test-type', calls)
+        # No network in its place: loopback included, nothing bypasses.
+        self.assertIn('--proxy-server=http://127.0.0.1:9', calls)
+        self.assertIn('--proxy-bypass-list=<-loopback>', calls)
+        self.assertNotIn('<-loopback>;', calls)
+        self.assertIn('--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+                      calls)
         req = self.folder / 'req.txt'
         for extra, line in ((['--test-type'], None),
                             ([], 'command 40002'),
@@ -2157,6 +2164,22 @@ class RunTest(RemoteBuildTest):
                              '--', root, success=False)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn('--serve', result.stderr)
+
+    def test_run_import_arc_undo_now_is_an_import_run(self):
+        # Bare only; needs no source root; launches without --test-type
+        # and gets the import run's refusals.
+        self.run_rb('run', self.wt, '--timeout', '3', '--', '--no-first-run',
+                    '--rac-import-arc-undo-now', success=True)
+        calls = self.calls()
+        self.assertIn('--rac-import-arc-undo-now', calls)
+        self.assertNotIn('--test-type', calls)
+        for bad in ('--rac-import-arc-undo-now=1', '-rac-import-arc-undo-now'):
+            result = self.run_rb('run', self.wt, '--', bad, success=False)
+            self.assertEqual(result.returncode, 2, bad)
+        result = self.run_rb('run', self.wt, '--', '--rac-import-arc-undo-now',
+                             'https://example.com/', success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('Arc import run', result.stderr)
 
     def test_run_import_arc_now_needs_a_source_root(self):
         # Without --rac-import-source-root the dev import reads the Pro's
