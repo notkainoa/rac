@@ -37,12 +37,37 @@ DMG from a build run or release the way the install smoke test does, then
 launches `rac.app/Contents/MacOS/rac` with:
 
 - `--user-data-dir=<temp>` — a throwaway profile, never a real one
-- `--no-first-run --no-default-browser-check`
+- `--no-default-browser-check`, plus `--no-first-run` unless `first-run`
+  asks for a real first launch (see below)
 - `--log-net-log=<dir>/netlog.json --net-log-capture-mode=Default`
 - `BREAKPAD_DUMP_LOCATION` pointed into the same temp profile
 
+The `first-run` input picks what the launch looks like:
+
+- `skip` (default): `--no-first-run`, which skips rac's welcome tour.
+- `onboarding-open`: no `--no-first-run`, so a real first launch shows the
+  tour, which stays open for the whole idle.
+- `onboarding-closed`: the same, then after about 30 seconds the tour is
+  closed without finishing it, as a user does with the red button, and the
+  browser idles on the window that opens.
+
+Closing the tour early writes no pref: `helium.completed_onboarding` and
+`helium.services.user_consented` stay false, and the tour returns next
+launch (only the tour's last step sets `completed_onboarding`). So seeding
+prefs cannot reproduce that state, since it would skip the tour. The
+tour is a views window that AppleScript can't see, so the capture asks the
+browser's DevTools HTTP endpoint (`--remote-debugging-port=0`, loopback
+only, reported separately like other loopback traffic) to close its page,
+the same path as the page closing itself. If that fails it tries System
+Events clicking the window's close button, which needs Accessibility
+permission the runner may not grant; if both fail the job records a FAIL
+and the run is effectively `onboarding-open`. The job summary names the
+mode and the method used. This was not verified on a runner when written.
+With `services: on` and a first-run mode, only the consent pref is seeded
+(not `completed_onboarding`) so the tour still appears.
+
 No URLs are opened. After `minutes` (default 10) the browser gets SIGTERM,
-then SIGKILL if it hasn't exited — a killed browser can leave the net-log
+then SIGKILL if it hasn't exited within 30 seconds (SIGTERM lets Chromium flush the buffered net-log tail) — a killed browser can leave the net-log
 truncated, which `devutils/rac/hostlist.py` tolerates by keeping every
 complete event. `hostlist.py hosts` turns the events into the sorted host
 list (request URLs, DNS lookups, connect jobs, HTTP/2 and QUIC sessions,
