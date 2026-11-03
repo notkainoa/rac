@@ -20,6 +20,7 @@ import re
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -162,6 +163,22 @@ STUB_APP = '''\
 echo "app BREAKPAD_DUMP_LOCATION=${BREAKPAD_DUMP_LOCATION:-} $*" >> "$RAC_FAKE_LOG"
 # A launch that never produces a browser-shaped process.
 [ -z "${NEVER_LAUNCH:-}" ] || exec sleep "$NEVER_LAUNCH"
+# --serve tests: fetch each loopback URL arg, as the browser would, and
+# log what came back (never through a proxy).
+if [ -n "${FETCH_SERVE:-}" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      http://127.0.0.1:*) python3 -I - "$arg" >> "$RAC_FAKE_LOG" 2>&1 <<'PY'
+import sys, urllib.request
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+with opener.open(sys.argv[1], timeout=5) as r:
+    print('fetched', sys.argv[1], r.status, r.read().decode().strip(),
+          'csp=' + r.headers.get('Content-Security-Policy', ''))
+PY
+      ;;
+    esac
+  done
+fi
 shot=
 for arg in "$@"; do
   case "$arg" in --rac-window-screenshot=*) shot="${arg#--rac-window-screenshot=}" ;; esac
@@ -1700,6 +1717,330 @@ class RunTest(RemoteBuildTest):
         result = self.run_rb('run', self.wt, '--requests-file', req,
                              success=False)
         self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_run_settings_page_may_scroll(self):
+        # `wheel` is the one input a settings run may send, alone or
+        # inside `after`; everything else stays refused.
+        req = self.folder / 'req.txt'
+        for line in ('wheel 100 200 -5\n', 'after 5 wheel 1 2 3 ; after 300 a.png\n'):
+            write(req, line)
+            self.run_rb('run', self.wt, '--requests-file', req, '--timeout', '3',
+                        '--', 'chrome://settings/assistant', success=True)
+        for line in ('wheel 1 2 3 ; click 1 2\n', 'wheel 1 2 3 ; key tab\n',
+                     'after 5 wheel 1 2 3 ; after 5 nspress tab\n',
+                     'wheel 1 2 3 ; swipe 1 2 end\n', 'wheel 1 2 3 ; move 1 2\n',
+                     'wheel 1 2 3 ; pointer 1 2\n', 'wheel 1 2 3 ; command 34000\n'):
+            write(req, line)
+            result = self.run_rb('run', self.wt, '--requests-file', req,
+                                 '--', 'rac://settings/privacy', success=False)
+            self.assertEqual(result.returncode, 2, line)
+            self.assertIn('screenshots and scroll', result.stderr, line)
+
+    def test_run_rac_command_bar_ids(self):
+        req = self.folder / 'req.txt'
+        for cid in ('40800', '40801', '40802', '40803'):
+            write(req, f'command {cid}\n')
+            self.run_rb('run', self.wt, '--requests-file', req, '--timeout', '3',
+                        success=True)
+            self.assertIn(f'command {cid}',
+                          (self.clone / 'build/req/req.txt').read_text())
+        for cid in ('40804', '40999'):
+            write(req, f'command {cid}\n')
+            result = self.run_rb('run', self.wt, '--requests-file', req,
+                                 success=False)
+            self.assertEqual(result.returncode, 2, cid)
+            self.assertIn('not an allowed command id', result.stderr, cid)
+
+    def test_run_window_size(self):
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    '--window-size=800,1800', '--window-size=400,4000',
+                    '--window-size=4000,400', success=True)
+        for arg in ('--window-size=800,1800', '--window-size=400,4000'):
+            self.assertIn(arg, self.calls(), arg)
+        for value in ('0,0', '5000,800', '800,5000', '800', '800x600',
+                      '-1,800', '', '399,800', '800,399', '0800,800',
+                      '800,0800', '800,800,800', '800,', ',800', '8e2,800',
+                      '800 ,800', '99999999999999999999,800', '1000,4001'):
+            result = self.run_rb('run', self.wt, '--', f'--window-size={value}',
+                                 success=False)
+            self.assertEqual(result.returncode, 2, value)
+            self.assertIn('--window-size takes W,H', result.stderr, value)
+        for args in (('--window-size',), ('--window-size', '800,600')):
+            result = self.run_rb('run', self.wt, '--', *args, success=False)
+            self.assertEqual(result.returncode, 2, args)
+
+    def test_run_pwa_commands_need_test_type(self):
+        # Installing a PWA (40002) or opening one in an app window (34055)
+        # needs --test-type in the same run, or an app shim lands in the
+        # Pro's ~/Applications.
+        req = self.folder / 'req.txt'
+        for line in ('command 40002\n', 'command 34055\n',
+                     'after 500 command 40002 ; after 900 a.png\n'):
+            write(req, line)
+            result = self.run_rb('run', self.wt, '--requests-file', req,
+                                 '--', '--no-first-run', success=False)
+            self.assertEqual(result.returncode, 2, line)
+            self.assertIn('--test-type', result.stderr, line)
+        self.assertEqual(self.calls(), '')
+        for line in ('command 40002\n', 'command 34055\n'):
+            write(req, line)
+            self.run_rb('run', self.wt, '--requests-file', req, '--timeout', '3',
+                        '--', '--test-type', success=True)
+            written = (self.clone / 'build/req/req.txt').read_text()
+            self.assertEqual(written, line)
+            # The needs line never reaches the Pro.
+            self.assertNotIn('needs', written)
+        self.assertIn('--test-type', self.calls())
+        # --test-type alone is fine, bare only.
+        self.run_rb('run', self.wt, '--timeout', '3', '--', '--test-type',
+                    success=True)
+        for arg in ('--test-type=webdriver', '--test-type=', '--test-type=gpu',
+                    '-test-type', '--TEST-TYPE'):
+            result = self.run_rb('run', self.wt, '--', arg, success=False)
+            self.assertEqual(result.returncode, 2, arg)
+            self.assertIn('ask Ship to allow it', result.stderr, arg)
+
+    def test_run_layout_seeds_the_profile(self):
+        prefs = self.clone / 'build/profile/Default/Preferences'
+        write(prefs, '{"rac": {"browser": {"other": 3}, "x": 1}, "ui": {"scale": 2}}\n')
+        for value, stored in (('top-bar', 1), ('sidebar', 0)):
+            self.run_rb('run', self.wt, '--layout', value, '--timeout', '3',
+                        success=True)
+            data = json.loads(prefs.read_text())
+            layout = data['rac']['browser']['layout']
+            self.assertIs(type(layout), int, value)
+            self.assertEqual(layout, stored, value)
+            self.assertIn(f'"layout": {stored}', prefs.read_text())
+            # Everything else survives, and downloads still land inside.
+            self.assertEqual(data['rac']['browser']['other'], 3)
+            self.assertEqual(data['rac']['x'], 1)
+            self.assertEqual(data['ui']['scale'], 2)
+            self.assertIn('default_directory', data['download'])
+        # Into a fresh profile too.
+        self.run_rb('run', self.wt, '--fresh-profile', '--layout', 'top-bar',
+                    '--timeout', '3', success=True)
+        self.assertEqual(json.loads(prefs.read_text())['rac']['browser']['layout'], 1)
+        # Without --layout nothing is written.
+        write(prefs, '{}')
+        self.run_rb('run', self.wt, '--timeout', '3', success=True)
+        self.assertNotIn('rac', json.loads(prefs.read_text()))
+        for args in (('--layout', 'tabs'), ('--layout', '1'), ('--layout', ''),
+                     ('--layout', 'Sidebar'), ('--layout', 'top_bar')):
+            result = self.run_rb('run', self.wt, *args, success=False)
+            self.assertEqual(result.returncode, 2, args)
+            self.assertIn('sidebar or top-bar', result.stderr, args)
+        result = self.run_rb('run', self.wt, '--layout', success=False)
+        self.assertIn('sidebar or top-bar', result.stderr)
+
+    def test_run_layout_refuses_a_symlinked_preferences(self):
+        prefs = self.clone / 'build/profile/Default/Preferences'
+        target = self.folder / 'outside-prefs.json'
+        write(target, '{"keep": true}')
+        prefs.parent.mkdir(parents=True, exist_ok=True)
+        prefs.symlink_to(target)
+        result = self.run_rb('run', self.wt, '--layout', 'top-bar',
+                             '--timeout', '3', success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('symlink', result.stderr)
+        self.assertEqual(target.read_text(), '{"keep": true}')
+
+    def test_run_layout_refuses_while_a_clone_browser_runs(self):
+        app = f'{self.clone}/build/src/out/Default/rac.app/'
+        rogue = subprocess.Popen(
+            ['bash', '-c', 'exec -a "$1" sleep 60', '_',
+             f'{app}Contents/MacOS/rac'])
+        self.addCleanup(lambda: (rogue.kill(), rogue.wait()))
+        time.sleep(0.3)
+        prefs = self.clone / 'build/profile/Default/Preferences'
+        write(prefs, '{"keep": true}')
+        result = self.run_rb('run', self.wt, '--layout', 'top-bar',
+                             '--timeout', '3', success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('--layout', result.stderr)
+        self.assertIn('a browser from this clone is running', result.stderr)
+        self.assertEqual(prefs.read_text(), '{"keep": true}')
+
+    def serve_dir(self):
+        site = self.clone / 'devutils/rac/fixtures/pwa'
+        write(site / 'index.html', 'hello pwa\n')
+        write(site / 'manifest.json', '{}\n')
+        return site
+
+    def served_port(self, stderr):
+        match = re.search(r'at http://127\.0\.0\.1:([0-9]+) ', stderr)
+        self.assertTrue(match, stderr)
+        return int(match.group(1))
+
+    def assert_port_closed(self, port):
+        def closed():
+            try:
+                socket.create_connection(('127.0.0.1', port), 0.5).close()
+                return False
+            except OSError:
+                return True
+        self.wait_for(closed, timeout=10)
+
+    def test_run_serve_placeholder_needs_serve(self):
+        self.serve_dir()
+        req = self.folder / 'req.txt'
+        write(req, 'open-urls @SERVE@/index.html\n')
+        result = self.run_rb('run', self.wt, '--requests-file', req, success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('--serve', result.stderr)
+        for arg in ('@SERVE@/', '@SERVE@/index.html'):
+            result = self.run_rb('run', self.wt, '--', arg, success=False)
+            self.assertEqual(result.returncode, 2, arg)
+            self.assertIn('may only open', result.stderr, arg)
+        self.assertEqual(self.calls(), '')
+        # And never a host or port of its own, even with --serve.
+        for arg in ('@SERVE@:22/', '@SERVE@.evil.com/', '@SERVE@@evil.com',
+                    '@SERVE@/../x', '@SERVE@/a?b', 'http://localhost/@SERVE@'):
+            result = self.run_rb('run', self.wt, '--serve', 'devutils/rac/fixtures/pwa',
+                                 '--', arg, success=False)
+            self.assertEqual(result.returncode, 2, arg)
+        for line in ('open-urls @SERVE@:8080/\n', 'open-urls x@SERVE@/\n'):
+            write(req, line)
+            result = self.run_rb('run', self.wt, '--serve', 'devutils/rac/fixtures/pwa',
+                                 '--requests-file', req, success=False)
+            self.assertEqual(result.returncode, 2, line)
+        self.assertEqual(self.calls(), '')
+
+    def test_run_serve_rewrites_the_placeholder(self):
+        self.serve_dir()
+        req = self.folder / 'req.txt'
+        write(req, 'open-urls @SERVE@/index.html ; after 300 a.png\n')
+        # --requests-file before --serve works too: the file is checked
+        # once every option is read.
+        result = self.run_rb('run', self.wt, '--requests-file', req,
+                             '--serve', 'devutils/rac/fixtures/pwa',
+                             '--timeout', '20', '--', '@SERVE@/index.html',
+                             '@SERVE@/', success=True, FETCH_SERVE='1')
+        port = self.served_port(result.stderr)
+        url = f'http://127.0.0.1:{port}'
+        written = (self.clone / 'build/req/req.txt').read_text()
+        self.assertIn(f'open-urls {url}/index.html ; after 300 ', written)
+        self.assertNotIn('@SERVE@', written)
+        calls = self.calls()
+        self.assertIn(f' {url}/index.html {url}/', calls)
+        self.assertNotIn('@SERVE@', calls)
+        # The browser reached the folder on 127.0.0.1, under a policy that
+        # keeps the page's own requests on that server.
+        self.assertIn(f'fetched {url}/index.html 200 hello pwa', calls)
+        self.assertIn("csp=default-src 'self'", calls)
+        self.assertIn('(127.0.0.1 only)', result.stderr)
+        # And the server is gone once the run ends.
+        self.assert_port_closed(port)
+
+    def test_run_serve_refuses_bad_folders(self):
+        self.serve_dir()
+        outside = self.folder / 'outside-site'
+        write(outside / 'index.html', 'secret\n')
+        (self.clone / 'escape').symlink_to(outside)
+        (self.clone / 'devutils/rac/fixtures/linked').mkdir(parents=True)
+        (self.clone / 'devutils/rac/fixtures/linked/x').symlink_to(outside / 'index.html')
+        (self.clone / 'build/shots').mkdir(parents=True)
+        for value, why in (('/tmp', 'relative'), ('~/x', 'relative'),
+                           ('..', 'relative'), ('a/../..', 'relative'),
+                           ('../x', 'relative'), ('.', 'relative'), ('-x', 'relative'),
+                           ('a b', 'relative'), ('', 'relative')):
+            result = self.run_rb('run', self.wt, '--serve', value, success=False)
+            self.assertEqual(result.returncode, 2, value)
+            self.assertIn(why, result.stderr, value)
+        self.assertEqual(self.calls(), '')
+        for value, why in (('missing', 'no folder'), ('escape', 'leaves the clone'),
+                           ('devutils/rac/fixtures/pwa/index.html', 'no folder'),
+                           ('devutils/rac/fixtures/linked', 'symlink'),
+                           ('build/shots', 'outside build/'),
+                           ('BUILD/shots', 'outside build/'),
+                           ('build', 'outside build/'),
+                           ('devutils/..x', 'no folder')):
+            result = self.run_rb('run', self.wt, '--serve', value, success=False)
+            self.assertEqual(result.returncode, 2, (value, result.stderr))
+            self.assertIn(why, result.stderr, value)
+            self.assertNotIn('app ', self.calls(), value)
+
+    def test_run_serve_stops_on_timeout_and_failure(self):
+        self.serve_dir()
+        # A run that ends at its timeout.
+        result = self.run_rb('run', self.wt, '--serve', 'devutils/rac/fixtures/pwa',
+                             '--timeout', '2', '--', '@SERVE@/', success=True)
+        self.assert_port_closed(self.served_port(result.stderr))
+        # A run that fails after the server started: a request line the
+        # clone's harness doesn't know.
+        self.seed_harness(without=('open-urls',))
+        req = self.folder / 'req.txt'
+        write(req, 'open-urls @SERVE@/\n')
+        result = self.run_rb('run', self.wt, '--serve', 'devutils/rac/fixtures/pwa',
+                             '--requests-file', req, success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assert_port_closed(self.served_port(result.stderr))
+
+    def serve_procs(self, port):
+        """(pid, parent pid) of each process listening on the port."""
+        out = subprocess.run(['lsof', '-nP', f'-iTCP@127.0.0.1:{port}',
+                              '-sTCP:LISTEN', '-t'],
+                             capture_output=True, text=True).stdout
+        found = []
+        for pid in out.split():
+            ppid = subprocess.run(['ps', '-o', 'ppid=', '-p', pid],
+                                  capture_output=True, text=True).stdout.strip()
+            found.append((int(pid), int(ppid or 0)))
+        return found
+
+    def start_serving_run(self):
+        app = f'{self.clone}/build/src/out/Default/rac.app/'
+        proc = subprocess.Popen(
+            ['/bin/bash', SCRIPT, 'run', str(self.wt), '--serve',
+             'devutils/rac/fixtures/pwa', '--timeout', '300', '--', '@SERVE@/'],
+            env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True)
+        self.addCleanup(self.reap_run, proc, app)
+        self.wait_for(lambda: self.procs_starting(app), timeout=30)
+        port = int((self.clone / 'build/serve.port').read_text())
+        procs = self.serve_procs(port)
+        self.assertEqual(len(procs), 1, procs)
+        # Bound to 127.0.0.1 alone: no wildcard or other address listens.
+        names = subprocess.run(['lsof', '-nP', f'-iTCP:{port}', '-sTCP:LISTEN',
+                                '-a', '-p', str(procs[0][0]), '-Fn'],
+                               capture_output=True, text=True).stdout.split()
+        self.assertEqual([n for n in names if n.startswith('n')],
+                         [f'n127.0.0.1:{port}'])
+        return proc, app, port, procs[0]
+
+    def reap_run(self, proc, app):
+        """Ends a backgrounded run whatever state the test left it in; the
+        browser stand-in holds the run's pipes, so it goes first."""
+        for pid in self.procs_starting(app):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate(timeout=30)
+
+    def test_run_serve_stops_on_interrupt(self):
+        self.serve_dir()
+        # SIGTERM to the Pro-side script alone (its trap stops the server)
+        # and SIGINT to the whole run, as Ctrl-C would send it.
+        for sig, group in ((signal.SIGTERM, False), (signal.SIGINT, True)):
+            proc, app, port, (_, script) = self.start_serving_run()
+            if group:
+                os.killpg(proc.pid, sig)
+            else:
+                os.kill(script, sig)
+            proc.communicate(timeout=60)
+            self.assert_port_closed(port)
+            self.wait_for(lambda: not self.procs_starting(app))
+
+    def test_run_serve_outlives_no_killed_run(self):
+        # Even a Pro-side script killed outright (no trap runs) leaves no
+        # server behind: it watches its parent.
+        self.serve_dir()
+        proc, app, port, (_, script) = self.start_serving_run()
+        os.kill(script, signal.SIGKILL)
+        self.assert_port_closed(port)
+        self.wait_for(lambda: not self.serve_procs(port))
 
     def test_run_opening_chrome_setup_needs_an_import_input(self):
         # The Arc import screen would read the Pro's real Arc data, so a

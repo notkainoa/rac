@@ -188,24 +188,55 @@ UI-control WebSocket — with `--user-data-dir` at the clone's throwaway
 - `--net-log-capture-mode=Default|IncludeSensitive|Everything`,
   `--enable-logging=stderr`, `--vmodule=<spec>`,
   `--rac-force-color-mode=light|dark|system`.
+- `--window-size=W,H`, each 400 to 4000, for taller or wider windows.
+- `--test-type`, bare (no value), for PWA checks. Chromium's test mode
+  makes `AppShimCreationAndLaunchDisabledForTest()` true
+  (`chrome/browser/web_applications/os_integration/mac/web_app_shortcut_mac.mm`),
+  so installing a PWA writes no app shim into the Pro's
+  `~/Applications`. It opens no debugging port and no file access.
 - A bare arg is a URL and gets the same allowlist `open-urls` gets:
-  loopback and test hosts, the named internal pages, `about:blank`.
+  loopback and test hosts, the named internal pages, `about:blank`, and
+  `@SERVE@/<path>` with `--serve`.
+
+Two `run` options change the clone before launch:
+
+- `--layout sidebar|top-bar` writes the clone profile's
+  `rac.browser.layout` (0 or 1) into `Default/Preferences`, with the
+  same symlink and inside-the-clone checks the downloads prefs get. It
+  refuses while a browser from the clone runs, since that browser
+  already read its prefs.
+- `--serve DIR` serves a folder in the clone on 127.0.0.1 at a port the
+  kernel picks, for this run only. `@SERVE@` at the start of a URL arg
+  or an `open-urls` URL becomes `http://127.0.0.1:PORT`; only a plain
+  path may follow it, so it can't name another host or port, and it's
+  refused without `--serve`. DIR must be relative, stay inside the
+  clone once symlinks resolve, sit outside `build/`, and hold no
+  symlinks. Responses carry a Content-Security-Policy that keeps the
+  page's fetches, scripts, frames and forms on that server. The server
+  stops when the run ends, however it ends.
 
 The requests file a run feeds the screenshot harness is one checked
-line. Pages and command ids are allowlists, and a run that opens
+line. Pages and command ids are allowlists. rac's own ids are limited to
+40800 to 40803 (the command bar, with and without the current URL,
+clear tabs, the little window); 40804, copy as Markdown, writes the
+Mac's clipboard. `command 40002` (install as a PWA) and `command 34055`
+(open in an app window) need `--test-type` in the same run. A run that opens
 `chrome://setup` (or `chrome://setup?arc`, the tour's Arc import step)
 needs an import input in the same run. Typed text is plain words only (ASCII letters, digits, spaces, `-`, `_`), and a script
 that types may not also move the caret or click — at most one
 `key return`, after the last `type`. A run that opens a settings page
 (the only allowed ones are `settings/assistant`, `settings/appearance`,
 `settings/privacy`, and `settings/general`, which also needs an import
-input because of its Arc import card) may take screenshots only, so its requests file
-may not send input.
+input because of its Arc import card) may take screenshots and scroll
+only, so its requests file may send no input except `wheel X Y DY`.
 
 Known limits: import-input paths are checked with `inside_clone`
 before launch, but a path swapped for a symlink between the check and the
 browser reading it isn't caught — accepted, since our own agents write
-the scripts. A `sandbox-exec` profile for remote runs is the planned
+the scripts. The same goes for a symlink added to a `--serve` folder
+after the check. The served pages' policy doesn't cover top-level
+navigation, so a page's own script could still navigate the tab
+elsewhere. A `sandbox-exec` profile for remote runs is the planned
 longer-term fix.
 
 ### Agent evals on the Pro

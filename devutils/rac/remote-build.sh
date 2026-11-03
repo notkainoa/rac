@@ -13,13 +13,24 @@
 #                                     updating its clone
 #   build <worktree> [-- targets...]  build the clone through the remote queue
 #   run <worktree> [--timeout S] [--requests-file F] [--fresh-profile]
-#       [-- args...]                  launch the clone's browser directly (no
+#       [--layout sidebar|top-bar] [--serve DIR] [-- args...]
+#                                     launch the clone's browser directly (no
 #                                     UI DevTools: worktree.sh run's
 #                                     --enable-ui-devtools is never passed),
 #                                     then stop it; --fresh-profile first
 #                                     deletes the clone's throwaway
 #                                     build/profile (never while a browser
-#                                     from the clone runs); F is a
+#                                     from the clone runs); --layout seeds
+#                                     the clone profile's rac.browser.layout
+#                                     (sidebar 0, top bar 1) before launch,
+#                                     and refuses while a browser from the
+#                                     clone runs; --serve serves DIR (a
+#                                     folder in the clone, outside build/,
+#                                     holding no symlink) on 127.0.0.1 at a
+#                                     free port for the run, and @SERVE@ at
+#                                     the start of a URL arg or open-urls
+#                                     URL becomes http://127.0.0.1:PORT
+#                                     (refused without --serve); F is a
 #                                     screenshot-requests line on the Air,
 #                                     checked by remote_requests.py. After
 #                                     --, args are a fixed allowlist:
@@ -47,16 +58,24 @@
 #                                     --rac-force-increased-contrast,
 #                                     --disable-backgrounding-occluded-windows,
 #                                     --rac-force-color-mode=light|dark|
-#                                     system. A bare arg is a URL and gets
-#                                     open-urls' allowlist. A run that opens
+#                                     system, --window-size=W,H (each 400
+#                                     to 4000), --test-type (Chromium test
+#                                     mode, bare: a PWA install writes no
+#                                     app shim to ~/Applications). A bare
+#                                     arg is a URL and gets open-urls'
+#                                     allowlist. A run that opens
 #                                     chrome://setup (or setup?arc, the
 #                                     tour's Arc import step) needs an
 #                                     import input; a
 #                                     run that opens a settings page may only
-#                                     take screenshots, so its requests file
-#                                     may not send input. In the requests
+#                                     take screenshots and scroll, so its
+#                                     requests file may send no input but
+#                                     `wheel X Y DY`. In the requests
 #                                     line, pages and command ids are
-#                                     allowlists, typed text is plain words
+#                                     allowlists (`command 40002`, the PWA
+#                                     install, and `command 34055`, open in
+#                                     an app window, only with
+#                                     --test-type), typed text is plain words
 #                                     only, and a script that types may not
 #                                     move the caret or click (at most one
 #                                     `key return`, after the last type).
@@ -1106,7 +1125,7 @@ EOS
 # through here: the Pro's launch adds the clone's --user-data-dir itself,
 # and --rac-window-screenshot-requests for a requests run.
 check_run_arg() {
-  local arg=$1 lower value
+  local arg=$1 lower value n
   lower=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
   case "$lower" in
     *"application support"* | *me.kainoa.rac* | *net.imput.helium*)
@@ -1116,6 +1135,41 @@ check_run_arg() {
     --no-first-run | --rac-launch-in-background | --rac-import-arc-now | \
       --force-prefers-reduced-motion | --rac-force-increased-contrast | \
       --disable-backgrounding-occluded-windows)
+      return 0 ;;
+    # Chromium's test mode, bare only (a value such as webdriver changes
+    # more). It makes AppShimCreationAndLaunchDisabledForTest() true
+    # (chrome/browser/web_applications/os_integration/mac/
+    # web_app_shortcut_mac.mm, lines 39-44), so a PWA install writes no
+    # app shim into ~/Applications, and skips shortcut updates in home
+    # folders (os_integration_manager.cc), Finder reveals
+    # (platform_util_mac.mm) and startup infobars. It weakens no guard
+    # here: of its non-test uses in Chromium 156 that reach macOS, none
+    # opens remote debugging or DevTools, file:// access, a sandbox or
+    # web-security exception, a port, or another profile. What it does
+    # loosen is extension-only (chrome.test, content_capabilities over
+    # http) and a run can load no extension; the shutdown watchdog it
+    # turns off is replaced by this script's own kill.
+    --test-type)
+      return 0 ;;
+    # A taller (or wider) window: W,H, each 400 to 4000 pixels, digits
+    # only with no leading zero, and nothing else.
+    --window-size=*)
+      value=${arg#*=}
+      case "$value" in
+        [1-9]*,[1-9]*) ;;
+        *) refuse "--window-size takes W,H, each 400 to 4000, not '$value'" ;;
+      esac
+      case "$value" in
+        *,*,* | *[!0-9,]*)
+          refuse "--window-size takes W,H, each 400 to 4000, not '$value'" ;;
+      esac
+      for n in "${value%,*}" "${value#*,}"; do
+        case "$n" in
+          ?????*) refuse "--window-size takes W,H, each 400 to 4000, not '$value'" ;;
+        esac
+        [ "$n" -ge 400 ] && [ "$n" -le 4000 ] \
+          || refuse "--window-size takes W,H, each 400 to 4000, not '$value'"
+      done
       return 0 ;;
     --rac-window-screenshot=?* | --rac-arc-import-fixture=?* | \
       --rac-import-source-root=?* | --log-net-log=?* | --rac-frame-log=?*)
@@ -1163,8 +1217,13 @@ check_run_arg() {
     *)
       # A bare argument is a URL Chromium opens: the same allowlist the
       # requests file's open-urls gets, including chrome://setup, which
-      # the run then has to pair with an Arc import input.
-      python3 "$here/remote_requests.py" --url "$arg" || exit 2
+      # the run then has to pair with an Arc import input, and @SERVE@/
+      # URLs only when the run passes --serve.
+      if [ -n "${serve:-}" ]; then
+        python3 "$here/remote_requests.py" --serve --url "$arg" || exit 2
+      else
+        python3 "$here/remote_requests.py" --url "$arg" || exit 2
+      fi
       return 0 ;;
   esac
   # Path values resolve in the clone, where the browser runs.
@@ -1190,39 +1249,71 @@ check_run_arg() {
 }
 
 cmd_run() {
-  local name=$1 timeout=90 requests='' outputs='' fresh=0 checked
-  local req_pages='' req_verbs='' import_input=0 setup_page=0 general_page=0 source_root=0
-  local arc_now=0 settings_page=0
+  local name=$1 timeout=90 requests='' outputs='' fresh=0 checked req_file=''
+  local req_pages='' req_verbs='' req_needs='' import_input=0 setup_page=0 general_page=0 source_root=0
+  local arc_now=0 settings_page=0 test_type=0 layout='' serve=''
   shift
   while [ $# -gt 0 ]; do
     case "$1" in
       --requests-file)
         [ $# -ge 2 ] || die "run: --requests-file needs a file on this Mac"
-        # The checked line, then `verbs VERB...`, a `pages URL` per
-        # internal page open-urls visits, and one `file REL` / `dir REL`
-        # / `expect REL` per path in it. The pages are read back here for
-        # the setup check and stripped from the stream the Pro gets.
-        checked=$(python3 "$here/remote_requests.py" "$2") || exit 2
-        requests=${checked%%$'\n'*}
-        outputs=
-        case "$checked" in *$'\n'*) outputs=${checked#*$'\n'} ;; esac
-        req_pages=$(printf '%s\n' "$outputs" | awk '$1 == "pages" { print $2 }')
-        req_verbs=$(printf '%s\n' "$outputs" | awk '$1 == "verbs" { $1=""; print }')
-        outputs=$(printf '%s\n' "$outputs" | awk '$1 != "pages"')
+        # Checked once every option is read: @SERVE@ URLs depend on --serve.
+        req_file=$2
         shift 2 ;;
       --fresh-profile) fresh=1; shift ;;
+      # Seeds the clone profile's rac.browser.layout before launch
+      # (layout-setting.patch: Layout::kSidebar = 0, kTopBar = 1).
+      --layout)
+        [ $# -ge 2 ] || die "run: --layout takes sidebar or top-bar"
+        case "$2" in
+          sidebar) layout=0 ;;
+          top-bar) layout=1 ;;
+          *) refuse "--layout takes sidebar or top-bar, not '$2'" ;;
+        esac
+        shift 2 ;;
+      # A folder in the clone the Pro serves on 127.0.0.1 for this run;
+      # @SERVE@ in URLs becomes its http://127.0.0.1:PORT. The Pro checks
+      # it exists and stays inside the clone.
+      --serve)
+        [ $# -ge 2 ] || die "run: --serve needs a folder in the clone"
+        case "$2" in
+          '' | /* | '~'* | -* | . | .. | ./* | ../* | */. | */.. | */./* | */../* | *//* | \
+            *[!A-Za-z0-9._/-]*)
+            refuse "--serve takes a folder relative to the clone, of letters, digits, '.', '_', '-' and '/', with no '..', not '$2'" ;;
+        esac
+        serve=$2
+        shift 2 ;;
       --timeout)
         [ $# -ge 2 ] || die "run: --timeout needs seconds"
         case "$2" in '' | *[!0-9]*) die "run: --timeout needs seconds" ;; esac
         timeout=$2
         shift 2 ;;
       --) shift; break ;;
-      *) die "usage: remote-build.sh run <worktree> [--timeout S] [--requests-file F] [--fresh-profile] [-- args...]" ;;
+      *) die "usage: remote-build.sh run <worktree> [--timeout S] [--requests-file F] [--fresh-profile] [--layout sidebar|top-bar] [--serve DIR] [-- args...]" ;;
     esac
   done
   case "$queue_wait" in
     '' | *[!0-9]*) die "RAC_REMOTE_QUEUE_WAIT must be whole seconds, not '$queue_wait'" ;;
   esac
+  if [ -n "$req_file" ]; then
+    # The checked line, then `verbs VERB...`, a `pages URL` per internal
+    # page open-urls visits, a `needs SWITCH` per run switch the line
+    # depends on, and one `file REL` / `dir REL` / `expect REL` per path
+    # in it. The pages and needs are read back here and stripped from the
+    # stream the Pro gets.
+    if [ -n "$serve" ]; then
+      checked=$(python3 "$here/remote_requests.py" --serve "$req_file") || exit 2
+    else
+      checked=$(python3 "$here/remote_requests.py" "$req_file") || exit 2
+    fi
+    requests=${checked%%$'\n'*}
+    outputs=
+    case "$checked" in *$'\n'*) outputs=${checked#*$'\n'} ;; esac
+    req_pages=$(printf '%s\n' "$outputs" | awk '$1 == "pages" { print $2 }')
+    req_verbs=$(printf '%s\n' "$outputs" | awk '$1 == "verbs" { $1=""; print }')
+    req_needs=$(printf '%s\n' "$outputs" | awk '$1 == "needs" { print $2 }')
+    outputs=$(printf '%s\n' "$outputs" | awk '$1 != "pages" && $1 != "needs"')
+  fi
   local arg lower
   for arg in "$@"; do
     check_run_arg "$arg"
@@ -1230,6 +1321,7 @@ cmd_run() {
       --rac-arc-import-fixture=*) import_input=1 ;;
       --rac-import-source-root=*) import_input=1; source_root=1 ;;
       --rac-import-arc-now) arc_now=1 ;;
+      --test-type) test_type=1 ;;
     esac
     lower=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
     case "$lower" in
@@ -1271,20 +1363,30 @@ cmd_run() {
   if [ "$arc_now" = 1 ] && [ "$source_root" = 0 ]; then
     refuse "--rac-import-arc-now needs --rac-import-source-root= in the same run, or it imports the Pro's real Arc data"
   fi
-  # A run that opens a settings page may only take screenshots. A script
-  # that opens settings itself was refused by the checker if it carries
-  # input; a settings page passed as a run arg is checked against the
-  # requests file's verbs here.
+  # The PWA commands (install, open in an app window) need --test-type,
+  # or the install writes an app shim into the Pro's ~/Applications.
+  for arg in $req_needs; do
+    case "$arg" in
+      --test-type)
+        [ "$test_type" = 1 ] \
+          || refuse "the requests file sends a PWA command (40002 install or 34055 open in app window); pass --test-type in the same run so no app shim lands in ~/Applications" ;;
+      *) refuse "the requests file needs an unknown run switch '$arg'" ;;
+    esac
+  done
+  # A run that opens a settings page may only take screenshots and
+  # scroll. A script that opens settings itself was refused by the
+  # checker if it carries other input; a settings page passed as a run
+  # arg is checked against the requests file's verbs here.
   if [ "$settings_page" = 1 ]; then
     for arg in $req_verbs; do
       case "$arg" in
         click | command | key | move | nspress | nsflags | nskey | nstype | \
-        pointer | pointer-path | swipe | type | wheel)
-          refuse "a run that opens a settings page may only take screenshots; the requests file may not send input" ;;
+        pointer | pointer-path | swipe | type)
+          refuse "a run that opens a settings page may only take screenshots and scroll (wheel); the requests file may not send other input" ;;
       esac
     done
   fi
-  remote "$name" "$timeout" "$queue_wait" "$requests" "$outputs" "$fresh" "$@" <<'EOS'
+  remote "$name" "$timeout" "$queue_wait" "$requests" "$outputs" "$fresh" "$layout" "$serve" "$@" <<'EOS'
 set -e
 safe_name "$1" || { echo "rac remote: bad clone name '$1'" >&2; exit 2; }
 clone="$HOME/rac-remote/wt/$1"
@@ -1293,7 +1395,9 @@ queue_wait=$3
 requests=$4
 outputs=$5
 fresh=$6
-shift 6
+layout=$7
+serve=$8
+shift 8
 [ -d "$clone" ] || {
   echo "rac remote: no clone at $clone; run push first" >&2
   exit 1
@@ -1381,6 +1485,124 @@ if [ "${#logfiles[@]}" -gt 0 ]; then
 fi
 # $app names the clone's app for clone_pids, from REMOTE_LIB.
 app="$clone/build/src/out/Default/rac.app/"
+case "$layout" in
+  '' | 0 | 1) ;;
+  *) echo "rac remote: refusing: bad layout '$layout'" >&2; exit 2 ;;
+esac
+# The run's file server (--serve DIR). The Air let @SERVE@ through only
+# with --serve; check again, since the placeholder must never reach the
+# browser unreplaced or without a server behind it.
+serve_pid=
+serve_url=
+stop_serve() {
+  [ -n "$serve_pid" ] || return 0
+  kill "$serve_pid" 2>/dev/null || true
+  wait "$serve_pid" 2>/dev/null || true
+  serve_pid=
+}
+if [ -z "$serve" ]; then
+  case "$requests $*" in
+    *@SERVE@*) echo "rac remote: refusing: @SERVE@ URLs need --serve" >&2; exit 2 ;;
+  esac
+else
+  # DIR is relative to the clone and, once symlinks resolve, a folder
+  # inside it but outside build/ (the profile, the logs, the Chromium
+  # tree). Nothing under it may be a symlink: the server follows them.
+  case "$serve" in
+    '' | /* | -* | . | .. | ./* | ../* | */. | */.. | */./* | */../* | *//* | *[!A-Za-z0-9._/-]*)
+      echo "rac remote: refusing: bad --serve folder '$serve'" >&2; exit 2 ;;
+  esac
+  served="$clone/$serve"
+  [ -d "$served" ] || { echo "rac remote: refusing --serve: no folder $served" >&2; exit 2; }
+  inside_clone "$clone" "$served" || { echo "rac remote: refusing --serve: $served leaves the clone" >&2; exit 2; }
+  served=$(cd "$served" && pwd -P)
+  # APFS ignores case, so build/ is matched without it.
+  case "$(printf '%s/' "$served" | tr '[:upper:]' '[:lower:]')" in
+    "$(printf '%s/' "$clone" | tr '[:upper:]' '[:lower:]')" | \
+      "$(printf '%s/build/' "$clone" | tr '[:upper:]' '[:lower:]')"*)
+      echo "rac remote: refusing --serve: serve a folder outside build/, not $served" >&2; exit 2 ;;
+  esac
+  link=$(find "$served" -type l -print 2>/dev/null | head -n 1)
+  [ -z "$link" ] || { echo "rac remote: refusing --serve: $link is a symlink" >&2; exit 2; }
+  # The server writes the port the kernel gave it here; a planted link is
+  # never followed.
+  port_file="$clone/build/serve.port"
+  for path in "$clone/build" "$port_file"; do
+    [ ! -L "$path" ] || { echo "rac remote: refusing: $path is a symlink" >&2; exit 2; }
+  done
+  mkdir -p "$clone/build"
+  inside_clone "$clone" "$port_file" || { echo "rac remote: refusing: $port_file leaves the clone" >&2; exit 2; }
+  rm -f "$port_file" "$port_file.tmp"
+  trap stop_serve EXIT
+  trap 'stop_serve; exit 130' INT TERM HUP
+  # 127.0.0.1 only, port 0 so the kernel picks a free one (no race), and
+  # a Content-Security-Policy that keeps the served pages' own fetches,
+  # scripts, frames and forms on this server. The server exits when this
+  # script does, even one killed outright: it watches its parent.
+  python3 -I -c '
+import functools, http.server, os, sys, threading, time
+root, port_file = sys.argv[1:3]
+parent = os.getppid()
+CSP = ("default-src '"'self' 'unsafe-inline' 'unsafe-eval'"' data: blob:; "
+       "form-action '"'self'"'; base-uri '"'self'"'")
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+server = http.server.ThreadingHTTPServer(
+    ("127.0.0.1", 0), functools.partial(Handler, directory=root))
+fd = os.open(port_file + ".tmp",
+             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write("%d\n" % server.server_address[1])
+os.replace(port_file + ".tmp", port_file)
+def watch():
+    while os.getppid() == parent:
+        time.sleep(0.5)
+    os._exit(0)
+threading.Thread(target=watch, daemon=True).start()
+server.serve_forever()
+' "$served" "$port_file" >/dev/null &
+  serve_pid=$!
+  port=
+  for _ in $(seq 1 40); do
+    [ -s "$port_file" ] && port=$(head -n 1 "$port_file") && break
+    kill -0 "$serve_pid" 2>/dev/null || break
+    sleep 0.25
+  done
+  case "$port" in
+    '' | *[!0-9]*) echo "rac remote: the --serve server never started" >&2; exit 1 ;;
+  esac
+  serve_url="http://127.0.0.1:$port"
+  # Wait until it answers (any HTTP status will do), never through a
+  # proxy.
+  answered=0
+  for _ in $(seq 1 40); do
+    if python3 -I -c '
+import sys, urllib.error, urllib.request
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    opener.open(sys.argv[1], timeout=2).close()
+except urllib.error.HTTPError:
+    pass
+' "$serve_url/" 2>/dev/null; then
+      answered=1
+      break
+    fi
+    sleep 0.25
+  done
+  [ "$answered" = 1 ] || { echo "rac remote: the --serve server at $serve_url never answered" >&2; exit 1; }
+  echo "rac remote: serving $served at $serve_url (127.0.0.1 only)" >&2
+  # Only a whole-word @SERVE@ prefix passed the Air's checks.
+  served_args=()
+  for arg in ${args[@]+"${args[@]}"}; do
+    case "$arg" in @SERVE@*) arg="$serve_url${arg#@SERVE@}" ;; esac
+    served_args+=("$arg")
+  done
+  args=(${served_args[@]+"${served_args[@]}"})
+  requests=${requests//@SERVE@/$serve_url}
+fi
 if [ -n "$requests" ]; then
   # A browser already running from this clone polls the same req.txt and
   # would take this line, under whatever profile settings it started with.
@@ -1513,6 +1735,12 @@ fi
 profile=$clone/build/profile
 downloads=$clone/build/downloads
 if [ -n "$(clone_pids)" ]; then
+  # That browser read its prefs at startup: a layout written now would
+  # never take effect, so --layout refuses rather than run without it.
+  [ -z "$layout" ] || {
+    echo "rac remote: refusing --layout: a browser from this clone is running" >&2
+    exit 2
+  }
   echo "rac remote: a browser from this clone is running; its profile already points downloads inside the clone" >&2
 else
   for path in "$clone/build" "$profile" "$profile/Default" "$downloads" \
@@ -1524,9 +1752,9 @@ else
   # Keep every other preference; a missing or unreadable file starts
   # empty. Write a new file beside each (never through a planted link)
   # and rename it over, so the browser never reads half a file.
-  python3 - "$profile" "$downloads" <<'PY'
+  python3 - "$profile" "$downloads" "$layout" <<'PY'
 import json, os, sys
-profile, downloads = sys.argv[1:3]
+profile, downloads, layout = sys.argv[1:4]
 
 def patch(path, values):
     try:
@@ -1537,10 +1765,13 @@ def patch(path, values):
     except (OSError, ValueError):
         data = {}
     for dotted, value in values.items():
-        section, key = dotted.split('.')
-        if not isinstance(data.get(section), dict):
-            data[section] = {}
-        data[section][key] = value
+        *sections, key = dotted.split('.')
+        node = data
+        for section in sections:
+            if not isinstance(node.get(section), dict):
+                node[section] = {}
+            node = node[section]
+        node[key] = value
     tmp = path + '.tmp'
     try:
         os.unlink(tmp)
@@ -1551,13 +1782,17 @@ def patch(path, values):
         json.dump(data, f)
     os.replace(tmp, path)
 
-patch(os.path.join(profile, 'Default', 'Preferences'), {
+prefs = {
     'download.default_directory': downloads,
     'download.prompt_for_download': False,
     'download.directory_upgrade': True,
     'savefile.default_directory': downloads,
     'selectfile.last_directory': downloads,
-})
+}
+# run --layout: rac::Layout as stored (kSidebar = 0, kTopBar = 1).
+if layout:
+    prefs['rac.browser.layout'] = int(layout)
+patch(os.path.join(profile, 'Default', 'Preferences'), prefs)
 patch(os.path.join(profile, 'Local State'), {
     'select_file_dialogs.allowed': False,
 })
@@ -1573,6 +1808,7 @@ cleanup() {
     launcher=
   fi
   stop_own
+  stop_serve
 }
 trap 'cleanup; exit 130' INT TERM HUP
 # The clone's own worktree.sh run would add --enable-ui-devtools: a
@@ -2251,7 +2487,7 @@ case "${1:-}" in
     shift 2
     cmd_build "$name" "$@" ;;
   run)
-    [ $# -ge 2 ] || die "usage: remote-build.sh run <worktree> [--timeout S] [--requests-file F] [--fresh-profile] [-- args...]"
+    [ $# -ge 2 ] || die "usage: remote-build.sh run <worktree> [--timeout S] [--requests-file F] [--fresh-profile] [--layout sidebar|top-bar] [--serve DIR] [-- args...]"
     name=$(clone_name "$2")
     shift 2
     cmd_run "$name" "$@" ;;

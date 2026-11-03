@@ -16,16 +16,22 @@ the Pro side fills it in). A request the harness wouldn't recognise is
 refused rather than passed on: inside `after`, the harness captures an
 unrecognised request to a file named after its text.
 
-usage: remote_requests.py <file>
-       remote_requests.py --url <url>   (exit 0 if a run may open it)
+usage: remote_requests.py [--serve] <file>
+       remote_requests.py [--serve] --url <url>   (exit 0 if a run may open it)
+
+--serve says the run passes `--serve DIR`, so `@SERVE@` URLs (the run's
+own loopback file server, see SERVE_URL) may open; without it they are
+refused.
 
 Prints the checked line, a `verbs VERB...` line listing every request
 verb it uses (the Pro checks each is a string literal in the clone's own
 harness sources, and the Air reads them back: a settings page opened as
 a run arg allows no input verb), a `pages URL` line per chrome:/rac:
 page open-urls visits (the Air reads them back too: a run that opens
-chrome://setup needs an Arc import input in the same run), then one line
-per path in it, REL
+chrome://setup needs an Arc import input in the same run), a
+`needs SWITCH` line per run switch the line depends on (the Air refuses
+the run unless SWITCH is among its args: `needs --test-type` for the PWA
+commands), then one line per path in it, REL
 under build/shots/, so the Pro side never has to parse the line:
 `file REL` (a file it writes), `dir REL` (a folder it writes into) or
 `expect REL` (a screenshot the run waits for: bare PNG paths,
@@ -74,6 +80,13 @@ SETUP_STEP = re.compile(r'setup/[A-Za-z0-9-]+')
 # The welcome tour opened straight at its Arc import step. The query must
 # be exactly "arc"; only the host's case is free.
 SETUP_ARC = re.compile(r'(?i:setup)\?arc')
+# The run's own file server (`run --serve DIR`): the Pro serves DIR on
+# 127.0.0.1 at a port it picks and replaces the placeholder with
+# http://127.0.0.1:PORT. Only a path may follow, starting with `/`, of
+# plain URL characters with no `..`, `%`, `@`, `:`, query or fragment:
+# nothing after the placeholder can name another host or port.
+SERVE = '@SERVE@'
+SERVE_URL = re.compile(r'@SERVE@(/[A-Za-z0-9._~/-]*)?', re.ASCII)
 TEST_HOSTS = {'localhost', '127.0.0.1', '[::1]',
               'example.com', 'example.org', 'example.net'}
 TEST_SUFFIXES = ('.test', '.localhost',
@@ -149,7 +162,23 @@ COMMANDS_ALLOWED = frozenset((
     40009,  # bookmark bar
     40701,  # rac assistant
     *range(40710, 40727),  # rac spaces, favorites, pinned tabs
+    # rac_action_ids.h (core/action-table.patch): the command bar, the
+    # command bar holding the current URL, clear tabs, little window.
+    # Not the rest of rac's 40800-40999 range: 40804
+    # (IDC_RAC_COPY_AS_MARKDOWN) writes the Mac's clipboard, and the later
+    # ids are unreviewed.
+    40800, 40801, 40802, 40803,
 ))
+# Commands a run may send only when it also passes --test-type (the Air
+# checks the run args; see `needs` in main): IDC_CREATE_SHORTCUT (40002,
+# the PWA install dialog) and IDC_OPEN_IN_PWA_WINDOW (34055). Installing
+# a PWA writes an app shim into ~/Applications, outside the clone, unless
+# --test-type makes AppShimCreationAndLaunchDisabledForTest() true
+# (chrome/browser/web_applications/os_integration/mac/
+# web_app_shortcut_mac.mm, lines 39-44); shim creation and launch then
+# skip (same file, 195 and 324; app_shim_launch.mm 259;
+# app_shim_manager_mac.cc 746 and 1955).
+COMMANDS_NEED_TEST_TYPE = frozenset((40002, 34055))
 
 
 class Refused(Exception):
@@ -208,10 +237,14 @@ def internal_page(word):
     return None
 
 
-def url_allowed(word):
+def url_allowed(word, serve=False):
     """True for a URL open-urls (or a run's URL argument) may open: an
-    allowlisted internal page, about:blank, or http(s) to an allowed
-    host and port."""
+    allowlisted internal page, about:blank, http(s) to an allowed host
+    and port, or (with `serve`) the run's own file server as
+    `@SERVE@/path`. A word holding `@SERVE@` anywhere else is refused,
+    so the Pro's substitution can only ever produce that server's URL."""
+    if SERVE in word:
+        return serve and bool(SERVE_URL.fullmatch(word)) and '..' not in word
     if internal_page(word) is not None or word.lower() == 'about:blank':
         return True
     match = HTTP_URL.fullmatch(word)
@@ -245,7 +278,8 @@ def harness_requests(line):
 
 class Checker:
 
-    def __init__(self):
+    def __init__(self, serve=False):
+        self.serve = serve
         self.outputs = []
         self.verbs = []
         # Every character typed into the focused field, in order: pieces
@@ -253,9 +287,9 @@ class Checker:
         self.typed = ''
         # Each input-ish request, in order: 'type' for type/nstype,
         # 'letter' for an unmodified nspress letter (which types too),
-        # 'return' for key return, and 'input' for everything else that
-        # moves the caret, the pointer or the app. Capture and state
-        # verbs record nothing.
+        # 'return' for key return, 'wheel' for a scroll, and 'input' for
+        # everything else that moves the caret, the pointer or the app.
+        # Capture and state verbs record nothing.
         self.events = []
         # A chrome:/rac: settings page the line opens.
         self.settings = False
@@ -353,14 +387,17 @@ class Checker:
         if verb == 'open-urls':
             need(n >= 1, 'URL...')
             for url in args:
-                if not url_allowed(url):
+                if SERVE in url and not self.serve:
+                    raise Refused(f'{SERVE} URLs need `run --serve DIR`: {url!r}')
+                if not url_allowed(url, self.serve):
                     raise Refused('open-urls may open the allowlisted '
                                   'internal pages (chrome://version, '
                                   'chrome://settings/appearance and its '
                                   'kin, chrome://setup, rac://..., '
                                   'about:blank) or http(s) to an allowed '
                                   'host (localhost, 127.0.0.1, [::1], '
-                                  f'example.*, *.test, *.localhost): {url!r}')
+                                  'example.*, *.test, *.localhost), or '
+                                  f'{SERVE}/<path> with --serve: {url!r}')
                 page = internal_page(url)
                 # The Air checks pages it opened against the run args: a
                 # chrome://setup run needs an Arc import input. A
@@ -398,12 +435,18 @@ class Checker:
         if verb not in simple:
             raise Refused(f'unknown request verb {verb!r}')
         need(simple[verb], 'other arguments (see window_screenshot.mm)')
-        if verb == 'command' and int(args[0]) not in COMMANDS_ALLOWED:
+        if verb == 'command' and int(args[0]) in COMMANDS_NEED_TEST_TYPE:
+            # The Air refuses the run unless it passes --test-type.
+            if 'needs --test-type' not in self.outputs:
+                self.outputs.append('needs --test-type')
+        elif verb == 'command' and int(args[0]) not in COMMANDS_ALLOWED:
             raise Refused(f'command {args[0]} is not an allowed command id '
                           '(see COMMANDS_ALLOWED); ask Ship to allow it')
         if verb == 'key':
             self.events.append('return' if args[0] == 'return' else 'input')
-        elif verb in ('click', 'move', 'swipe', 'wheel', 'pointer',
+        elif verb == 'wheel':
+            self.events.append('wheel')
+        elif verb in ('click', 'move', 'swipe', 'pointer',
                       'pointer-path', 'nskey', 'nsflags', 'command'):
             self.events.append('input')
         elif verb == 'nspress':
@@ -429,8 +472,9 @@ class Checker:
         return words
 
 
-def check_line(text):
-    """The checked line and the paths it writes, as `file REL`/`dir REL`."""
+def check_line(text, serve=False):
+    """The checked line and the paths it writes, as `file REL`/`dir REL`.
+    `serve` says the run passes --serve, so `@SERVE@` URLs may open."""
     # A malformed RAC_REMOTE_ALLOWED_HOSTS refuses every line, not only one
     # whose host would have needed it.
     extra_allowed_hosts()
@@ -446,7 +490,7 @@ def check_line(text):
     if MARK in line:
         raise Refused(f'the request line may not contain {MARK}')
     pieces = line.split(' ; ')
-    checker = Checker()
+    checker = Checker(serve)
     checked = [checker.check(harness_words(piece), top=len(pieces) == 1, after=False)
                for piece in pieces]
     out = ' ; '.join(' '.join(words) for words in checked)
@@ -461,7 +505,8 @@ def check_line(text):
     # piece; the rest stay capture and state verbs.
     events = checker.events
     if 'type' in events or 'letter' in events:
-        if 'input' in events or ('type' in events and 'letter' in events):
+        if ('input' in events or 'wheel' in events or
+                ('type' in events and 'letter' in events)):
             raise Refused('a script that types may not move the caret or '
                           'click; ask Ship')
         # A return between typed pieces would submit the first and start
@@ -471,11 +516,20 @@ def check_line(text):
         if events[:last].count('return') or events[last + 1:].count('return') > 1:
             raise Refused('a script that types may press return at most '
                           'once, after its last typed text; ask Ship')
-    # A run that opens a settings page may only take screenshots: every
-    # recorded event is an input the settings UI could be walked with.
-    if checker.settings and events:
+    # A run that opens a settings page may only take screenshots and
+    # scroll: every other recorded event is an input the settings UI could
+    # be walked with. `wheel X Y DY` sends an unmodified scroll (the
+    # harness's MouseWheelEvent carries EF_NONE), which only moves the
+    # page; nothing can focus a control for it to change.
+    if checker.settings and any(e != 'wheel' for e in events):
         raise Refused('a run that opens a settings page may only take '
-                      'screenshots; the script may not send input')
+                      'screenshots and scroll (wheel); the script may not '
+                      'send other input')
+    # Every placeholder sits at the start of an open-urls word that
+    # passed SERVE_URL; nothing else in the line may hold one.
+    if line.count(SERVE) != sum(word.startswith(SERVE) and bool(SERVE_URL.fullmatch(word))
+                                for words in checked for word in words):
+        raise Refused(f'{SERVE} may only start an open-urls URL')
     # The typed words themselves are checked against the denied page
     # names: pieces join in order, and a whole word naming a page the
     # browser may not open edits the open page's URL into it.
@@ -488,14 +542,18 @@ def check_line(text):
 
 
 def main(argv):
+    serve = len(argv) > 1 and argv[1] == '--serve'
+    if serve:
+        argv = argv[:1] + argv[2:]
     if len(argv) == 3 and argv[1] == '--url':
         try:
             extra_allowed_hosts()
-            if url_allowed(argv[2]):
+            if url_allowed(argv[2], serve):
                 return 0
             print('rac remote: refusing: a run may only open the '
-                  'allowlisted internal pages, about:blank or http(s) '
-                  f'URLs to an allowed host, not {argv[2]!r}',
+                  'allowlisted internal pages, about:blank, http(s) '
+                  'URLs to an allowed host, or @SERVE@/<path> with '
+                  f'--serve, not {argv[2]!r}',
                   file=sys.stderr)
         except Refused as e:
             print(f'rac remote: refusing: {e}', file=sys.stderr)
@@ -504,7 +562,7 @@ def main(argv):
         sys.exit(__doc__)
     try:
         with open(argv[1], encoding='utf-8') as f:
-            line, outputs, verbs = check_line(f.read())
+            line, outputs, verbs = check_line(f.read(), serve)
     except (Refused, UnicodeDecodeError, OSError) as e:
         print(f'rac remote: refusing the requests file: {e}', file=sys.stderr)
         return 2
