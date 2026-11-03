@@ -13,18 +13,23 @@ Index: src/chrome/browser/rac/import/BUILD.gn
 ===================================================================
 --- src.orig/chrome/browser/rac/import/BUILD.gn
 +++ src/chrome/browser/rac/import/BUILD.gn
-@@ -146,6 +146,47 @@ source_set("cookie_writer_profile") {
+@@ -146,6 +146,76 @@ source_set("cookie_writer_profile") {
    ]
  }
  
 +# The password protecting Arc's cookies: the "Arc Safe Storage" Keychain item
-+# on macOS, a test override everywhere.
++# on macOS in release builds. Dev builds never read the Keychain.
 +source_set("arc_key") {
 +  sources = [
 +    "arc_safe_storage_key.cc",
 +    "arc_safe_storage_key.h",
 +  ]
-+  public_deps = [ "//base" ]
++  public_deps = [
++    "//base",
++
++    # arc_safe_storage_key.h includes the dev switches flag.
++    "//chrome/browser/rac/dev:buildflags",
++  ]
 +  if (is_mac) {
 +    sources += [ "arc_safe_storage_key_mac.mm" ]
 +    deps = [
@@ -36,6 +41,30 @@ Index: src/chrome/browser/rac/import/BUILD.gn
 +      "Security.framework",
 +    ]
 +  }
++}
++
++# ScopedArcSafeStorageKeyForTesting. Test-only, so no production target can
++# swap the Keychain source.
++source_set("arc_key_test_support") {
++  testonly = true
++  sources = [
++    "arc_safe_storage_key_test_support.cc",
++    "arc_safe_storage_key_test_support.h",
++  ]
++  public_deps = [
++    ":arc_key",
++    "//base",
++  ]
++}
++
++# At most one Arc import, sign-ins retry, or Undo at a time
++# (ArcImportInProgress). Pure, so it tests without the browser.
++source_set("import_guard") {
++  sources = [
++    "arc_import_guard.cc",
++    "arc_import_guard.h",
++  ]
++  public_deps = [ "//base" ]
 +}
 +
 +# Reads one Arc profile's cookie database and decodes it into ImportedCookie
@@ -61,7 +90,7 @@ Index: src/chrome/browser/rac/import/BUILD.gn
  if (is_mac) {
    # Whether Arc is running, and a watcher that fires when it quits. Built with
    # ARC, which the observer token's lifetime relies on.
-@@ -160,6 +201,26 @@ if (is_mac) {
+@@ -160,6 +230,26 @@ if (is_mac) {
        "Foundation.framework",
      ]
    }
@@ -88,11 +117,12 @@ Index: src/chrome/browser/rac/import/BUILD.gn
  }
  
  # Build with `autoninja -C out/Default
-@@ -167,10 +228,12 @@ if (is_mac) {
+@@ -167,10 +257,13 @@ if (is_mac) {
  # Chromium's unit_tests, which takes hours to build.
  test("rac_import_unittests") {
    sources = [
 +    "arc_cookie_import_unittest.cc",
++    "arc_import_guard_unittest.cc",
      "arc_import_mapping_unittest.cc",
      "arc_import_record_unittest.cc",
      "arc_import_rerun_unittest.cc",
@@ -101,16 +131,24 @@ Index: src/chrome/browser/rac/import/BUILD.gn
      "arc_source_root_unittest.cc",
      "cookie_db_rows_unittest.cc",
      "cookie_test_vectors.inc",
-@@ -179,6 +242,8 @@ test("rac_import_unittests") {
+@@ -179,12 +272,16 @@ test("rac_import_unittests") {
    ]
    deps = [
      ":apply",
 +    ":arc_cookie_import",
 +    ":arc_key",
++    ":arc_key_test_support",
      ":arc_reader",
      ":arc_source",
      ":cookie_crypto",
-@@ -213,8 +278,14 @@ test("rac_import_unittests") {
+     ":cookie_db",
+     ":cookie_fixture_db",
+     ":cookie_writer",
++    ":import_guard",
+     "//base",
+     "//base/test:test_support",
+     "//chrome/browser/rac/dev:buildflags",
+@@ -213,8 +310,14 @@ test("rac_import_unittests") {
    data = [ "//chrome/test/data/rac/import/" ]
  
    if (is_mac) {
@@ -885,7 +923,7 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/arc_safe_storage_key.cc
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,169 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -893,18 +931,19 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key.cc
 +#include "chrome/browser/rac/import/arc_safe_storage_key.h"
 +
 +#include <memory>
-+#include <optional>
 +#include <string>
 +#include <utility>
 +
 +#include "base/check.h"
 +#include "base/command_line.h"
 +#include "base/functional/bind.h"
++#include "base/logging.h"
 +#include "base/memory/weak_ptr.h"
-+#include "base/no_destructor.h"
++#include "base/notreached.h"
 +#include "base/sequence_checker.h"
 +#include "base/task/sequenced_task_runner.h"
 +#include "build/build_config.h"
++#include "chrome/browser/rac/dev/buildflags.h"
 +
 +namespace rac::import {
 +
@@ -916,17 +955,37 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key.cc
 +constexpr char kTestTypeSwitch[] = "test-type";
 +#endif
 +
-+// The answer of the live ScopedArcSafeStorageKeyForTesting, if any. Set and
-+// read on the test's main thread only.
-+std::optional<base::expected<std::string, ArcKeyError>>& TestingAnswer() {
-+  static base::NoDestructor<
-+      std::optional<base::expected<std::string, ArcKeyError>>>
-+      answer;
-+  return *answer;
++// switches::kUseMockKeychain, which //components/os_crypt defines. It makes
++// os_crypt use a fake Keychain, but this file reads Arc's item through
++// crypto::apple::KeychainV2, which the switch doesn't cover.
++constexpr char kUseMockKeychainSwitch[] = "use-mock-keychain";
++
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++// The dev-only switch GetArcSourcePaths() reads (arc_source_root.h). Spelled
++// out so this target doesn't depend on the reader.
++constexpr char kImportSourceRootSwitch[] = "rac-import-source-root";
++#endif
++
++// The live ScopedArcSafeStorageKeyForTesting's factory, if any. Set and read
++// on the test's main thread only.
++internal::ArcKeySourceFactory g_factory_for_testing = nullptr;
++
++// Says once per process why the Keychain isn't read. Never the password.
++void LogNotReadingKeychainOnce(internal::ArcKeySourceKind kind) {
++  static bool logged = false;
++  if (logged) {
++    return;
++  }
++  logged = true;
++  LOG(WARNING) << "Not reading Arc's Keychain item in this "
++               << (kind == internal::ArcKeySourceKind::kFixturePassword
++                       ? "run: answering the fixture password"
++                       : "run: sign-ins will fail");
 +}
 +
-+// Replies a fixed answer from a posted task. Serves the test override, and
-+// the platforms without Arc's Keychain item.
++// Replies a fixed answer from a posted task. Serves the test override, the
++// runs that must not read the Keychain, and the platforms without Arc's
++// Keychain item.
 +class FixedAnswerSource : public ArcSafeStorageKeySource {
 + public:
 +  explicit FixedAnswerSource(base::expected<std::string, ArcKeyError> answer)
@@ -956,42 +1015,89 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key.cc
 +}  // namespace
 +
 +std::unique_ptr<ArcSafeStorageKeySource> CreateArcSafeStorageKeySource() {
-+  if (const auto& answer = TestingAnswer(); answer.has_value()) {
-+    return std::make_unique<FixedAnswerSource>(*answer);
++  if (g_factory_for_testing) {
++    return g_factory_for_testing();
 +  }
++  const base::CommandLine empty(base::CommandLine::NO_PROGRAM);
++  const base::CommandLine& command_line =
++      base::CommandLine::InitializedForCurrentProcess()
++          ? *base::CommandLine::ForCurrentProcess()
++          : empty;
 +#if BUILDFLAG(IS_MAC)
 +  // Browser tests run with --test-type. One that gets here without
-+  // ScopedArcSafeStorageKeyForTesting would show a real Keychain prompt for
++  // ScopedArcSafeStorageKeyForTesting could show a real Keychain prompt for
 +  // the machine's own Arc item, or hang on it on a bot, so it crashes
 +  // instead. This also covers anything else launched with --test-type.
-+  CHECK(!base::CommandLine::InitializedForCurrentProcess() ||
-+        !base::CommandLine::ForCurrentProcess()->HasSwitch(kTestTypeSwitch))
++  CHECK(!command_line.HasSwitch(kTestTypeSwitch))
 +      << "Tests must use ScopedArcSafeStorageKeyForTesting";
-+  return internal::CreateKeychainArcSafeStorageKey();
++#endif
++  const internal::ArcKeySourceKind kind =
++      internal::ChooseArcKeySource(command_line);
++  switch (kind) {
++    case internal::ArcKeySourceKind::kKeychain:
++#if BUILDFLAG(IS_MAC)
++      return internal::CreateKeychainArcSafeStorageKey();
 +#else
-+  return std::make_unique<FixedAnswerSource>(
-+      base::unexpected(ArcKeyError::kFailed));
++      return internal::CreateFixedAnswerArcKeySource(
++          base::unexpected(ArcKeyError::kFailed));
++#endif
++    case internal::ArcKeySourceKind::kFailed:
++      LogNotReadingKeychainOnce(kind);
++      return internal::CreateFixedAnswerArcKeySource(
++          base::unexpected(ArcKeyError::kFailed));
++    case internal::ArcKeySourceKind::kFixturePassword:
++      LogNotReadingKeychainOnce(kind);
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++      return internal::CreateFixedAnswerArcKeySource(
++          std::string(kArcFixtureSafeStoragePassword));
++#else
++      // ChooseArcKeySource() never answers this in release builds.
++      return internal::CreateFixedAnswerArcKeySource(
++          base::unexpected(ArcKeyError::kFailed));
++#endif
++  }
++  NOTREACHED();
++}
++
++namespace internal {
++
++ArcKeySourceKind ChooseArcKeySource(const base::CommandLine& command_line) {
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++  // A fixture brings its own password, so it wins over --use-mock-keychain:
++  // neither reaches the Keychain.
++  if (command_line.HasSwitch(kImportSourceRootSwitch)) {
++    return ArcKeySourceKind::kFixturePassword;
++  }
++#endif
++  if (command_line.HasSwitch(kUseMockKeychainSwitch)) {
++    return ArcKeySourceKind::kFailed;
++  }
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++  // A dev build never reads the real Keychain, so a dev run can't prompt
++  // for, or read, the maintainer's own Arc item.
++  return ArcKeySourceKind::kFailed;
++#else
++  return ArcKeySourceKind::kKeychain;
 +#endif
 +}
 +
-+ScopedArcSafeStorageKeyForTesting::ScopedArcSafeStorageKeyForTesting(
++std::unique_ptr<ArcSafeStorageKeySource> CreateFixedAnswerArcKeySource(
 +    base::expected<std::string, ArcKeyError> answer) {
-+  CHECK(!TestingAnswer().has_value())
-+      << "ScopedArcSafeStorageKeyForTesting can't nest";
-+  TestingAnswer().emplace(std::move(answer));
++  return std::make_unique<FixedAnswerSource>(std::move(answer));
 +}
 +
-+ScopedArcSafeStorageKeyForTesting::~ScopedArcSafeStorageKeyForTesting() {
-+  CHECK(TestingAnswer().has_value());
-+  TestingAnswer().reset();
++void SetArcKeySourceFactoryForTesting(ArcKeySourceFactory factory) {
++  g_factory_for_testing = factory;
 +}
++
++}  // namespace internal
 +
 +}  // namespace rac::import
 Index: src/chrome/browser/rac/import/arc_safe_storage_key.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/arc_safe_storage_key.h
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,119 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1005,6 +1111,7 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key.h
 +#include "base/functional/callback.h"
 +#include "base/types/expected.h"
 +#include "build/build_config.h"
++#include "chrome/browser/rac/dev/buildflags.h"
 +
 +#if BUILDFLAG(IS_MAC)
 +#include <MacTypes.h>
@@ -1017,6 +1124,10 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key.h
 +// bring sign-ins over, rac reads that password, which makes macOS show its own
 +// prompt asking the user to allow access. The read never adds, changes or
 +// deletes a Keychain item.
++
++namespace base {
++class CommandLine;
++}  // namespace base
 +
 +namespace rac::import {
 +
@@ -1042,32 +1153,59 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key.h
 +  virtual void GetPassword(ArcPasswordCallback done) = 0;
 +};
 +
-+// The real source (the "Arc Safe Storage" Keychain item), or the testing
-+// answer while a ScopedArcSafeStorageKeyForTesting is alive. Asking for the
-+// real source in a process run with --test-type is a CHECK failure, so no
-+// test can show a real Keychain prompt.
++// Where CreateArcSafeStorageKeySource() gets the password, in order:
++//
++// 1. While a ScopedArcSafeStorageKeyForTesting
++//    (arc_safe_storage_key_test_support.h) is alive: its answer.
++// 2. On macOS, a process run with --test-type is a CHECK failure, so no test
++//    can show a real Keychain prompt.
++// 3. A process run with --use-mock-keychain: kFailed, in every build. That
++//    switch doesn't cover the Keychain API this reads, so it's honored here.
++// 4. Dev builds (BUILDFLAG(RAC_DEV_SWITCHES), every non-official build) never
++//    read the real Keychain: kArcFixtureSafeStoragePassword when the import
++//    reads a fixture (--rac-import-source-root, which wins over
++//    --use-mock-keychain), else kFailed.
++// 5. Release builds: the real "Arc Safe Storage" Keychain item, on macOS.
++//    kFailed on every other platform.
++//
++// Logs once, without the password, when 3 or 4 keeps it from the Keychain.
 +std::unique_ptr<ArcSafeStorageKeySource> CreateArcSafeStorageKeySource();
 +
-+// Test seam. While alive, CreateArcSafeStorageKeySource() returns a source that
-+// replies `answer` and never touches the Keychain. Nesting is a CHECK failure.
-+// A source created while the override was alive keeps replying `answer` after
-+// the override is gone.
-+class ScopedArcSafeStorageKeyForTesting {
-+ public:
-+  explicit ScopedArcSafeStorageKeyForTesting(
-+      base::expected<std::string, ArcKeyError> answer);
-+  ScopedArcSafeStorageKeyForTesting(const ScopedArcSafeStorageKeyForTesting&) =
-+      delete;
-+  ScopedArcSafeStorageKeyForTesting& operator=(
-+      const ScopedArcSafeStorageKeyForTesting&) = delete;
-+  ~ScopedArcSafeStorageKeyForTesting();
-+};
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++// The Arc Safe Storage password of rac's fixture Arc folders, which dev builds
++// answer while --rac-import-source-root is set. Fixture generators encrypt
++// their cookies with it, and tests use it. Not a real secret.
++inline constexpr char kArcFixtureSafeStoragePassword[] =
++    "test-only-arc-safe-storage";
++#endif
 +
 +namespace internal {
 +
++// Which source CreateArcSafeStorageKeySource() makes for `command_line`, steps
++// 3 to 5 above. Never touches the Keychain.
++enum class ArcKeySourceKind {
++  // The real Keychain item. Release builds only.
++  kKeychain,
++  // A source that replies kFailed.
++  kFailed,
++  // A source that replies kArcFixtureSafeStoragePassword. Dev builds only.
++  kFixturePassword,
++};
++ArcKeySourceKind ChooseArcKeySource(const base::CommandLine& command_line);
++
++// A source that replies `answer` from a posted task.
++std::unique_ptr<ArcSafeStorageKeySource> CreateFixedAnswerArcKeySource(
++    base::expected<std::string, ArcKeyError> answer);
++
++// Test seam, for arc_safe_storage_key_test_support.h only. While set,
++// CreateArcSafeStorageKeySource() returns `factory()` and nothing else. Pass
++// null to unset. UI thread only.
++using ArcKeySourceFactory = std::unique_ptr<ArcSafeStorageKeySource> (*)();
++void SetArcKeySourceFactoryForTesting(ArcKeySourceFactory factory);
++
 +#if BUILDFLAG(IS_MAC)
 +// The Keychain-backed source. Use CreateArcSafeStorageKeySource() instead,
-+// which honors the test override.
++// which honors the test override and the switches above.
 +std::unique_ptr<ArcSafeStorageKeySource> CreateKeychainArcSafeStorageKey();
 +
 +// How a SecItemCopyMatching() status maps to an error. Not for errSecSuccess.
@@ -1263,24 +1401,29 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/arc_safe_storage_key_unittest.cc
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,279 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#include "chrome/browser/rac/import/arc_safe_storage_key.h"
 +
++#include <initializer_list>
 +#include <memory>
 +#include <optional>
 +#include <string>
 +#include <utility>
 +
++#include "base/command_line.h"
 +#include "base/run_loop.h"
 +#include "base/test/bind.h"
 +#include "base/test/gtest_util.h"
++#include "base/test/scoped_command_line.h"
 +#include "base/test/task_environment.h"
 +#include "base/test/test_future.h"
 +#include "build/build_config.h"
++#include "chrome/browser/rac/dev/buildflags.h"
++#include "chrome/browser/rac/import/arc_safe_storage_key_test_support.h"
 +#include "testing/gtest/include/gtest/gtest.h"
 +
 +#if BUILDFLAG(IS_MAC)
@@ -1288,14 +1431,55 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key_unittest.cc
 +#endif
 +
 +// Every test that creates a source holds a ScopedArcSafeStorageKeyForTesting
-+// while it does, so none of them reaches the Keychain.
++// while it does, or runs where CreateArcSafeStorageKeySource() never reads
++// the Keychain, so none of them reaches it.
 +
 +namespace rac::import {
 +namespace {
 +
 +using PasswordResult = base::expected<std::string, ArcKeyError>;
 +
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++constexpr const char* kTestPassword = kArcFixtureSafeStoragePassword;
++#else
 +constexpr char kTestPassword[] = "test-only-arc-safe-storage";
++#endif
++
++constexpr char kTestTypeSwitch[] = "test-type";
++constexpr char kUseMockKeychainSwitch[] = "use-mock-keychain";
++constexpr char kImportSourceRootSwitch[] = "rac-import-source-root";
++
++// A command line with `switches`, and nothing else.
++base::CommandLine CommandLineWith(std::initializer_list<const char*> switches) {
++  base::CommandLine command_line(base::CommandLine::NO_PROGRAM);
++  for (const char* name : switches) {
++    command_line.AppendSwitch(name);
++  }
++  return command_line;
++}
++
++// Takes the switches that pick the source off the process's command line,
++// and puts it back as it was when it goes.
++class ScopedCleanCommandLine {
++ public:
++  ScopedCleanCommandLine() {
++    for (const char* name :
++         {kTestTypeSwitch, kUseMockKeychainSwitch, kImportSourceRootSwitch}) {
++      Get().RemoveSwitch(name);
++    }
++  }
++
++  base::CommandLine& Get() { return *scoped_.GetProcessCommandLine(); }
++
++ private:
++  base::test::ScopedCommandLine scoped_;
++};
++
++PasswordResult AnswerOf(ArcSafeStorageKeySource& source) {
++  base::test::TestFuture<PasswordResult> future;
++  source.GetPassword(future.GetCallback());
++  return future.Take();
++}
 +
 +class ArcSafeStorageKeyTest : public testing::Test {
 + protected:
@@ -1392,7 +1576,95 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key_unittest.cc
 +  EXPECT_EQ(future.Take(), PasswordResult(kTestPassword));
 +}
 +
++// Which source the command line picks. Pure: nothing is created.
++
++TEST(ArcSafeStorageKeyChooseTest, MockKeychainFails) {
++  EXPECT_EQ(internal::ChooseArcKeySource(
++                CommandLineWith({kUseMockKeychainSwitch})),
++            internal::ArcKeySourceKind::kFailed);
++}
++
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++TEST(ArcSafeStorageKeyChooseTest, DevBuildNeverReadsTheKeychain) {
++  EXPECT_EQ(internal::ChooseArcKeySource(CommandLineWith({})),
++            internal::ArcKeySourceKind::kFailed);
++}
++
++TEST(ArcSafeStorageKeyChooseTest, DevBuildWithFixtureAnswersItsPassword) {
++  EXPECT_EQ(internal::ChooseArcKeySource(
++                CommandLineWith({kImportSourceRootSwitch})),
++            internal::ArcKeySourceKind::kFixturePassword);
++}
++
++// A fixture's password never comes from the Keychain either, so it wins.
++TEST(ArcSafeStorageKeyChooseTest, DevBuildFixtureWinsOverMockKeychain) {
++  EXPECT_EQ(internal::ChooseArcKeySource(CommandLineWith(
++                {kUseMockKeychainSwitch, kImportSourceRootSwitch})),
++            internal::ArcKeySourceKind::kFixturePassword);
++}
++#else
++TEST(ArcSafeStorageKeyChooseTest, ReleaseBuildReadsTheKeychain) {
++  EXPECT_EQ(internal::ChooseArcKeySource(CommandLineWith({})),
++            internal::ArcKeySourceKind::kKeychain);
++}
++
++// Release builds have no fixture switch: it changes nothing.
++TEST(ArcSafeStorageKeyChooseTest, ReleaseBuildIgnoresTheFixtureSwitch) {
++  EXPECT_EQ(internal::ChooseArcKeySource(
++                CommandLineWith({kImportSourceRootSwitch})),
++            internal::ArcKeySourceKind::kKeychain);
++}
++#endif  // BUILDFLAG(RAC_DEV_SWITCHES)
++
++// The source CreateArcSafeStorageKeySource() makes in this process, without
++// an override. Never the Keychain: the mock switch, or a dev build.
++
++TEST_F(ArcSafeStorageKeyTest, MockKeychainAnswersFailed) {
++  ScopedCleanCommandLine command_line;
++  command_line.Get().AppendSwitch(kUseMockKeychainSwitch);
++  std::unique_ptr<ArcSafeStorageKeySource> source =
++      CreateArcSafeStorageKeySource();
++  EXPECT_EQ(AnswerOf(*source),
++            PasswordResult(base::unexpected(ArcKeyError::kFailed)));
++}
++
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++TEST_F(ArcSafeStorageKeyTest, DevBuildAnswersFailed) {
++  ScopedCleanCommandLine command_line;
++  std::unique_ptr<ArcSafeStorageKeySource> source =
++      CreateArcSafeStorageKeySource();
++  EXPECT_EQ(AnswerOf(*source),
++            PasswordResult(base::unexpected(ArcKeyError::kFailed)));
++}
++
++TEST_F(ArcSafeStorageKeyTest, DevBuildWithFixtureAnswersItsPassword) {
++  ScopedCleanCommandLine command_line;
++  command_line.Get().AppendSwitchASCII(kImportSourceRootSwitch, "/fixture");
++  std::unique_ptr<ArcSafeStorageKeySource> source =
++      CreateArcSafeStorageKeySource();
++  EXPECT_EQ(AnswerOf(*source),
++            PasswordResult(std::string(kArcFixtureSafeStoragePassword)));
++}
++#endif  // BUILDFLAG(RAC_DEV_SWITCHES)
++
 +#if BUILDFLAG(IS_MAC)
++// A test that forgets the override crashes instead of reaching the Keychain.
++TEST_F(ArcSafeStorageKeyDeathTest, TestTypeWithoutOverrideChecks) {
++  ScopedCleanCommandLine command_line;
++  command_line.Get().AppendSwitch(kTestTypeSwitch);
++  EXPECT_CHECK_DEATH(CreateArcSafeStorageKeySource());
++}
++
++// The override still answers under --test-type.
++TEST_F(ArcSafeStorageKeyTest, OverrideAnswersUnderTestType) {
++  ScopedCleanCommandLine command_line;
++  command_line.Get().AppendSwitch(kTestTypeSwitch);
++  ScopedArcSafeStorageKeyForTesting key{PasswordResult(kTestPassword)};
++  std::unique_ptr<ArcSafeStorageKeySource> source =
++      CreateArcSafeStorageKeySource();
++  EXPECT_EQ(AnswerOf(*source), PasswordResult(kTestPassword));
++}
++
 +TEST(ArcSafeStorageKeyMacTest, MapsKeychainStatuses) {
 +  EXPECT_EQ(internal::ArcKeyErrorFromStatus(errSecUserCanceled),
 +            ArcKeyError::kDenied);
@@ -1413,7 +1685,7 @@ Index: src/chrome/browser/rac/import/arc_signins_core.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/arc_signins_core.cc
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,383 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1662,6 +1934,17 @@ Index: src/chrome/browser/rac/import/arc_signins_core.cc
 +  // request.
 +}
 +
++void ArcRunKeyCache::EndAll() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  // EndRun() posts its waiters' kFailed, so none of them runs in here and
++  // can start a new run meanwhile.
++  while (!runs_.empty()) {
++    // A copy: EndRun() erases the map's own.
++    const std::string run_id = runs_.begin()->first;
++    EndRun(run_id);
++  }
++}
++
 +void ArcRunKeyCache::OnPassword(
 +    const std::string& run_id,
 +    base::expected<std::string, ArcKeyError> password) {
@@ -1790,7 +2073,7 @@ Index: src/chrome/browser/rac/import/arc_signins_core.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/arc_signins_core.h
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,205 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1874,6 +2157,8 @@ Index: src/chrome/browser/rac/import/arc_signins_core.h
 +  // Zeroes and forgets `run_id`'s key, and drops a request still in flight.
 +  // Callers still waiting get kFailed.
 +  void EndRun(const std::string& run_id);
++  // EndRun() for every run, such as at shutdown.
++  void EndAll();
 +
 +  size_t run_count_for_testing() const { return runs_.size(); }
 +
@@ -1998,7 +2283,7 @@ Index: src/chrome/browser/rac/import/arc_signins_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/arc_signins_unittest.cc
-@@ -0,0 +1,650 @@
+@@ -0,0 +1,681 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -2336,6 +2621,37 @@ Index: src/chrome/browser/rac/import/arc_signins_unittest.cc
 +  task_environment_.RunUntilIdle();
 +  EXPECT_EQ(keys.run_count_for_testing(), 0u);
 +  EXPECT_FALSE(keys.HasAnswer(kRun));
++}
++
++TEST_F(ArcSignInsCoreTest, EndAllDropsEveryRun) {
++  ArcRunKeyCache keys(Keychain());
++  ASSERT_TRUE(GetKey(keys, kRun).has_value());
++  // kOtherRun is still asking when everything ends.
++  keychain_.answer.reset();
++  std::optional<ArcKeyResult> waiting;
++  keys.GetKey(kOtherRun, base::BindLambdaForTesting(
++                             [&](ArcKeyResult key) { waiting.emplace(key); }));
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(keychain_.held);
++  EXPECT_EQ(keys.run_count_for_testing(), 2u);
++
++  keys.EndAll();
++  EXPECT_EQ(keys.run_count_for_testing(), 0u);
++  EXPECT_FALSE(keys.HasAnswer(kRun));
++  EXPECT_FALSE(keys.HasAnswer(kOtherRun));
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(waiting);
++  ASSERT_FALSE(waiting->has_value());
++  EXPECT_EQ(waiting->error(), ArcKeyError::kFailed);
++
++  // A late answer finds no run, and isn't kept.
++  std::move(keychain_.held).Run(std::string(kPassword));
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(keys.run_count_for_testing(), 0u);
++
++  // Ending nothing is fine.
++  keys.EndAll();
++  EXPECT_EQ(keys.run_count_for_testing(), 0u);
 +}
 +
 +TEST_F(ArcSignInsCoreTest, KeyCopiesKeepTheirBytes) {
@@ -2677,19 +2993,19 @@ Index: src/chrome/browser/ui/BUILD.gn
        "rac/spaces/hidden_space.cc",
        "rac/spaces/hidden_space.h",
        "rac/spaces/move_tab_to_space_sub_menu_model.cc",
+@@ -3652,6 +3664,7 @@ static_library("ui") {
+       "//chrome/browser/rac/dev:buildflags",
+       "//chrome/browser/rac/import:apply",
+       "//chrome/browser/rac/import:arc_source",
++      "//chrome/browser/rac/import:import_guard",
+       "//chrome/browser/rac/spaces:browser",
+       "//chrome/browser/rac/storage:browser",
+       "//chrome/browser/ui/views/rac:space_switcher_layout",
 Index: src/chrome/browser/ui/rac/import/arc_importer.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/rac/import/arc_importer.cc
 +++ src/chrome/browser/ui/rac/import/arc_importer.cc
-@@ -22,6 +22,7 @@
- #include "base/functional/bind.h"
- #include "base/functional/callback_helpers.h"
- #include "base/hash/hash.h"
-+#include "base/memory/ptr_util.h"
- #include "base/memory/raw_ptr.h"
- #include "base/memory/weak_ptr.h"
- #include "base/scoped_observation.h"
-@@ -48,6 +49,7 @@
+@@ -48,6 +48,7 @@
  #include "chrome/browser/rac/import/arc_import_mapping.h"
  #include "chrome/browser/rac/import/arc_import_record.h"
  #include "chrome/browser/rac/import/arc_reader.h"
@@ -2697,17 +3013,15 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
  #include "chrome/browser/rac/spaces/space.h"
  #include "chrome/browser/rac/spaces/spaces_service.h"
  #include "chrome/browser/rac/spaces/spaces_service_factory.h"
-@@ -89,6 +91,9 @@ namespace {
+@@ -89,6 +90,7 @@ namespace {
  using ItemKind = ArcImportRecord::ItemKind;
  
  ArcProfileMaker* g_profile_maker = nullptr;
 +ArcSignInsStep* g_sign_ins_step = nullptr;
-+// Whether an ArcImportInProgress is held.
-+bool g_arc_import_in_progress = false;
  
  constexpr char kSnapshotReason[] = "import-arc";
  // Arc's favicon cache holds small images. Anything larger isn't one.
-@@ -717,6 +722,18 @@ class ArcProfileImport : public ProfileO
+@@ -717,6 +719,18 @@ class ArcProfileImport : public ProfileO
          ArcImportRecord::Interrupted::kNone) {
        record_dirty_ = true;
      }
@@ -2726,7 +3040,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
      plan_ = MapArcProfile(source_, record_, GatherLive(profile_, services_),
                            run_info_.options);
      result_.counts = plan_.counts;
-@@ -1214,6 +1231,12 @@ class ArcProfileImport : public ProfileO
+@@ -1214,6 +1228,12 @@ class ArcProfileImport : public ProfileO
    // ProfileObserver:
    void OnProfileWillBeDestroyed(Profile* profile) override {
      profile_observation_.Reset();
@@ -2739,7 +3053,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
      Fail(ArcImportFailure::kProfileGone);
    }
  
-@@ -1245,11 +1268,41 @@ class ArcProfileImport : public ProfileO
+@@ -1245,11 +1265,41 @@ class ArcProfileImport : public ProfileO
  
    void Finish() {
      // Releasing the token lets DataBackups refresh its daily backup soon.
@@ -2781,7 +3095,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
    const raw_ptr<Profile> profile_;
    const Services services_;
    const ImportProfile source_;
-@@ -1276,12 +1329,14 @@ class ArcProfileImport : public ProfileO
+@@ -1276,12 +1326,14 @@ class ArcProfileImport : public ProfileO
    std::unique_ptr<ArcFaviconWriter> favicon_writer_;
    raw_ptr<BraveExternalProcessImporterHost> history_host_ = nullptr;
    bool history_ok_ = false;
@@ -2797,7 +3111,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
  // sign-ins step makes, then the default one into the profile the import
  // started from. That order lets the starting profile's record name every
  // profile the import touched, in one write, while it holds its token.
-@@ -1291,10 +1346,12 @@ class ArcImportCoordinator {
+@@ -1291,10 +1343,12 @@ class ArcImportCoordinator {
                      ImportPlan plan,
                      ArcImportOptions options,
                      ArcImportProgressCallback progress,
@@ -2813,7 +3127,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
    }
  
   private:
-@@ -1302,11 +1359,13 @@ class ArcImportCoordinator {
+@@ -1302,12 +1356,25 @@ class ArcImportCoordinator {
                         ImportPlan plan,
                         ArcImportOptions options,
                         ArcImportProgressCallback progress,
@@ -2827,9 +3141,21 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
 +        done_(std::move(done)),
 +        in_progress_(std::move(in_progress)) {
      run_.id = base::Uuid::GenerateRandomV4().AsLowercaseString();
++    // Lets the sign-ins step drop the run's key however the coordinator
++    // ends: Finish() runs it before `done_`, and anything else that
++    // destroys the coordinator runs it then. At shutdown the coordinator is
++    // left behind, and the step drops every key itself.
++    end_sign_ins_run_ = base::ScopedClosureRunner(base::BindOnce(
++        [](const std::string& run_id, const base::FilePath& origin_path) {
++          if (g_sign_ins_step) {
++            g_sign_ins_step->EndRun(run_id, origin_path);
++          }
++        },
++        run_.id, origin_path_));
      // The plan carries the folder it was read from (ImportPlan::source_dir),
      // so history comes from the same copy, such as a dev fixture. ReadArc()
-@@ -1342,18 +1401,74 @@ class ArcImportCoordinator {
+     // always sets it. Without it there's no history: finding Arc's folder
+@@ -1342,18 +1409,74 @@ class ArcImportCoordinator {
          origin_path_);
    }
  
@@ -2911,7 +3237,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
        return;
      }
      if (!origin_started_) {
-@@ -1367,6 +1482,7 @@ class ArcImportCoordinator {
+@@ -1367,6 +1490,7 @@ class ArcImportCoordinator {
        run.origin = true;
        run.other_profiles = other_profiles_;
        run.others_undo_until = others_undo_until_;
@@ -2919,7 +3245,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
        run.spaces_before = spaces_done_;
        // With the default profile unchecked, the starting profile still
        // records the run, for Undo and the hand-offs.
-@@ -1384,12 +1500,60 @@ class ArcImportCoordinator {
+@@ -1384,12 +1508,60 @@ class ArcImportCoordinator {
      Finish(ArcImportFailure::kNone);
    }
  
@@ -2980,7 +3306,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
      ArcImportRun run = run_;
      run.spaces_before = spaces_done_;
      ImportArcProfileInto(
-@@ -1402,6 +1566,8 @@ class ArcImportCoordinator {
+@@ -1402,6 +1574,8 @@ class ArcImportCoordinator {
    void OnProfileDone(std::optional<size_t> index,
                       bool new_profile,
                       const ArcProfileResult& result) {
@@ -2989,15 +3315,13 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
      if (index) {
        spaces_done_ += static_cast<int>(plan_.profiles[*index].spaces.size());
        results_[*index] = result;
-@@ -1418,18 +1584,18 @@ class ArcImportCoordinator {
+@@ -1418,18 +1592,16 @@ class ArcImportCoordinator {
    }
  
    void Finish(ArcImportFailure failure) {
 +    keep_alive_.reset();
-+    // Lets the step drop the run's key.
-+    if (g_sign_ins_step) {
-+      g_sign_ins_step->EndRun(run_.id, origin_path_);
-+    }
++    // Before `done_`, so a retry started from it finds this run's profiles.
++    end_sign_ins_run_.RunAndReset();
      if (failure == ArcImportFailure::kNone && origin_result_ &&
          origin_result_->status == ArcProfileResult::Status::kFailed) {
        failure = origin_result_->failure;
@@ -3013,7 +3337,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
        if (result.undo_until) {
          result_.undo_until =
              std::max(result_.undo_until.value_or(base::Time()),
-@@ -1438,13 +1604,9 @@ class ArcImportCoordinator {
+@@ -1438,13 +1610,9 @@ class ArcImportCoordinator {
      }
      result_.profiles = results_;
      result_.failure = failure;
@@ -3030,7 +3354,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
      // Hand-offs live only in the starting profile's record. A nothing-new
      // run writes that record only when other profiles' names had to go
      // into it for Undo.
-@@ -1455,6 +1617,8 @@ class ArcImportCoordinator {
+@@ -1455,6 +1623,8 @@ class ArcImportCoordinator {
            !other_profiles_.empty())) &&
          (!plan_.handoffs.routing_rules_json.empty() ||
           !plan_.handoffs.auto_archive_raw.empty());
@@ -3039,11 +3363,13 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
      std::move(done_).Run(result_);
      delete this;
    }
-@@ -1463,6 +1627,11 @@ class ArcImportCoordinator {
+@@ -1463,6 +1633,13 @@ class ArcImportCoordinator {
    const ImportPlan plan_;
    ArcImportProgressCallback progress_;
    ArcImportDoneCallback done_;
 +  std::unique_ptr<ArcImportInProgress> in_progress_;
++  // Ends the run with the sign-ins step (ArcSignInsStep::EndRun()).
++  base::ScopedClosureRunner end_sign_ins_run_;
 +  // From the starting profile's record, plus the profiles this import made.
 +  ArcImportRecord::MadeProfiles made_profiles_;
 +  // Keeps the other profile being imported into loaded until it's done.
@@ -3051,7 +3377,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
    ArcImportRun run_;
    std::optional<size_t> default_index_;
    std::vector<size_t> others_;
-@@ -1693,8 +1862,10 @@ class ArcProfileUndo : public ProfileObs
+@@ -1693,8 +1870,10 @@ class ArcProfileUndo : public ProfileObs
  class ArcUndoCoordinator {
   public:
    static void Start(Profile* profile,
@@ -3064,7 +3390,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
      ArcProfileUndo::Start(
          profile, std::string(),
          base::BindOnce(&ArcUndoCoordinator::OnOriginDone,
-@@ -1703,8 +1874,11 @@ class ArcUndoCoordinator {
+@@ -1703,8 +1882,11 @@ class ArcUndoCoordinator {
  
   private:
    ArcUndoCoordinator(base::FilePath origin_path,
@@ -3078,7 +3404,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
  
    void OnOriginDone(ArcUndoOutcome outcome, const ArcImportRecord::Run* run) {
      outcome_ = std::move(outcome);
-@@ -1781,12 +1955,14 @@ class ArcUndoCoordinator {
+@@ -1781,12 +1963,14 @@ class ArcUndoCoordinator {
  
    void Finish() {
      keep_alive_.reset();
@@ -3093,29 +3419,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
    ArcUndoOutcome outcome_;
    std::string run_id_;
    std::vector<std::string> others_;
-@@ -1879,6 +2055,21 @@ void PutKeptPinsBack(SidebarItems* items
-   }
- }
- 
-+// static
-+std::unique_ptr<ArcImportInProgress> ArcImportInProgress::TryBegin() {
-+  if (g_arc_import_in_progress) {
-+    return nullptr;
-+  }
-+  g_arc_import_in_progress = true;
-+  return base::WrapUnique(new ArcImportInProgress());
-+}
-+
-+ArcImportInProgress::ArcImportInProgress() = default;
-+
-+ArcImportInProgress::~ArcImportInProgress() {
-+  g_arc_import_in_progress = false;
-+}
-+
- ArcImportRun::ArcImportRun() = default;
- ArcImportRun::ArcImportRun(const ArcImportRun&) = default;
- ArcImportRun& ArcImportRun::operator=(const ArcImportRun&) = default;
-@@ -1888,6 +2079,10 @@ void SetArcProfileMaker(ArcProfileMaker*
+@@ -1888,6 +2072,10 @@ void SetArcProfileMaker(ArcProfileMaker*
    g_profile_maker = maker;
  }
  
@@ -3126,7 +3430,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
  void StartArcImport(Profile* profile,
                      ImportPlan plan,
                      ArcImportOptions options,
-@@ -1904,8 +2099,21 @@ void StartArcImport(Profile* profile,
+@@ -1904,8 +2092,21 @@ void StartArcImport(Profile* profile,
          FROM_HERE, base::BindOnce(std::move(done), std::move(result)));
      return;
    }
@@ -3149,7 +3453,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
  }
  
  void ImportArcProfileInto(Profile* target,
-@@ -1956,7 +2164,16 @@ void UndoArcImport(Profile* profile,
+@@ -1956,7 +2157,16 @@ void UndoArcImport(Profile* profile,
          FROM_HERE, base::BindOnce(std::move(done), std::move(outcome)));
      return;
    }
@@ -3171,7 +3475,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.h
 ===================================================================
 --- src.orig/chrome/browser/ui/rac/import/arc_importer.h
 +++ src/chrome/browser/ui/rac/import/arc_importer.h
-@@ -6,6 +6,7 @@
+@@ -6,13 +6,16 @@
  #define CHROME_BROWSER_UI_RAC_IMPORT_ARC_IMPORTER_H_
  
  #include <cstddef>
@@ -3179,15 +3483,16 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.h
  #include <string>
  #include <vector>
  
-@@ -13,6 +14,7 @@
+ #include "base/files/file_path.h"
  #include "base/functional/callback.h"
  #include "base/time/time.h"
++#include "chrome/browser/rac/import/arc_import_guard.h"
  #include "chrome/browser/rac/import/arc_import_mapping.h"
 +#include "chrome/browser/rac/import/arc_import_record.h"
  #include "chrome/browser/rac/import/arc_import_types.h"
  #include "chrome/browser/rac/import/import_plan.h"
  
-@@ -51,6 +53,9 @@ using ArcProfileDoneCallback =
+@@ -51,6 +54,9 @@ using ArcProfileDoneCallback =
  //    data decoder's sandbox. Nothing is fetched.
  // 8. Runs Helium's importer for history only, if asked and not done before.
  // 9. Operation::MarkDataChanged(), and releases the token.
@@ -3197,25 +3502,14 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.h
  //
  // An import cut short between steps 4 and 6 (a crash, a power cut) leaves
  // a record whose run is in progress. The next import or Undo in that
-@@ -62,9 +67,28 @@ using ArcProfileDoneCallback =
+@@ -62,9 +68,17 @@ using ArcProfileDoneCallback =
  // Nothing here makes a network request, installs an extension, or touches
  // AI data. Profiles are imported one at a time.
  
 +// At most one Arc import, sign-ins retry, or Undo runs at a time in the
-+// whole browser, whichever page or window starts it. Each holds one of these
-+// from its start until just before it reports. UI thread only.
-+class ArcImportInProgress {
-+ public:
-+  // Null while another is held: the caller reports kBusy.
-+  static std::unique_ptr<ArcImportInProgress> TryBegin();
-+
-+  ArcImportInProgress(const ArcImportInProgress&) = delete;
-+  ArcImportInProgress& operator=(const ArcImportInProgress&) = delete;
-+  ~ArcImportInProgress();
-+
-+ private:
-+  ArcImportInProgress();
-+};
++// whole browser: each holds an ArcImportInProgress
++// (chrome/browser/rac/import/arc_import_guard.h) from its start until just
++// before it reports.
 +
  // For the sign-ins step, which owns profile creation. It makes
  // the rac profile for an Arc profile that isn't the default one. Until it's
@@ -3226,7 +3520,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.h
  class ArcProfileMaker {
   public:
    virtual ~ArcProfileMaker() = default;
-@@ -77,6 +101,34 @@ class ArcProfileMaker {
+@@ -77,6 +91,34 @@ class ArcProfileMaker {
  // Called once at startup by the sign-ins step. Not owned.
  void SetArcProfileMaker(ArcProfileMaker* maker);
  
@@ -3261,7 +3555,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.h
  // What every profile of one import shares.
  struct ArcImportRun {
    ArcImportRun();
-@@ -100,6 +152,9 @@ struct ArcImportRun {
+@@ -100,6 +142,9 @@ struct ArcImportRun {
    // starting profile's record leads Undo to them.
    std::vector<std::string> other_profiles;
    base::Time others_undo_until;
@@ -3271,7 +3565,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.h
    // For progress across profiles: Arc spaces handled before this profile,
    // and in all.
    int spaces_before = 0;
-@@ -107,10 +162,12 @@ struct ArcImportRun {
+@@ -107,10 +152,12 @@ struct ArcImportRun {
  };
  
  // The import screens' entry point. `profile` receives the default Arc
@@ -3288,7 +3582,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.h
  void StartArcImport(Profile* profile,
                      ImportPlan plan,
                      ArcImportOptions options,
-@@ -119,7 +176,8 @@ void StartArcImport(Profile* profile,
+@@ -119,7 +166,8 @@ void StartArcImport(Profile* profile,
  
  // The per-profile entry point, for the sign-ins step when it drives
  // profiles itself: imports `source` into `target`, which must be a regular
@@ -3298,7 +3592,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.h
  void ImportArcProfileInto(Profile* target,
                            ImportProfile source,
                            ArcImportRun run,
-@@ -144,7 +202,8 @@ void GetArcImportState(Profile* profile,
+@@ -144,7 +192,8 @@ void GetArcImportState(Profile* profile,
  // imported space move to a space that stays, or stay where they are if a
  // page keeps that space open (kPartlyUndone). `done` also says which spaces
  // stayed and which profiles still have a newer import to undo
@@ -3312,7 +3606,7 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/rac/import/arc_signins.cc
-@@ -0,0 +1,495 @@
+@@ -0,0 +1,512 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -3335,6 +3629,7 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +
 +#include "base/check.h"
 +#include "base/files/file_path.h"
++#include "base/functional/callback_helpers.h"
 +#include "base/memory/weak_ptr.h"
 +#include "base/no_destructor.h"
 +#include "base/scoped_observation.h"
@@ -3583,7 +3878,12 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +        progress_(std::move(progress)),
 +        done_(std::move(done)),
 +        in_progress_(std::move(in_progress)),
-+        run_id_(base::Uuid::GenerateRandomV4().AsLowercaseString()) {
++        run_id_(base::Uuid::GenerateRandomV4().AsLowercaseString()),
++        end_run_(base::BindOnce(
++            [](const std::string& run_id) {
++              ArcSignIns::Get().EndRetry(run_id);
++            },
++            run_id_)) {
 +    for (const SignInsTarget& target : targets_) {
 +      ArcProfileResult result;
 +      result.source_key = target.source_key;
@@ -3694,7 +3994,7 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +  }
 +
 +  void Finish() {
-+    ArcSignIns::Get().EndRetry(run_id_);
++    end_run_.RunAndReset();
 +    ArcImportResult result;
 +    bool any_written = false;
 +    bool any_failed = targets_.empty();
@@ -3721,6 +4021,9 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +  std::unique_ptr<ArcImportInProgress> in_progress_;
 +  // Its own key run: the import's ended, and its key with it.
 +  const std::string run_id_;
++  // Ends `run_id_` with the key cache however the retry goes: in Finish(),
++  // or when it's destroyed, such as at shutdown.
++  base::ScopedClosureRunner end_run_;
 +  ImportPlan plan_;
 +  std::vector<ArcProfileResult> results_;
 +  size_t next_ = 0;
@@ -3764,9 +4067,17 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +void ArcSignIns::OnProfileManagerDestroying() {
 +  observation_.Reset();
 +  // Whatever still waits, such as on a Keychain prompt left open, goes now
-+  // and never reports. Every profile is still there.
++  // and never reports. Every profile is still there. The retry ends its own
++  // key run as it goes.
 +  retry_.reset();
 +  runs_.clear();
++  // Then every key still held, such as an import's whose coordinator never
++  // finished, is zeroed. After the runs, so none of them is still waiting to
++  // be told kFailed; they hold the cache by reference, and it stays. A
++  // Keychain read still on the thread pool finds its source gone, and wipes
++  // the password it read.
++  keys_.EndAll();
++  pending_targets_.clear();
 +}
 +
 +}  // namespace
@@ -4403,3 +4714,234 @@ Index: src/chrome/browser/rac/import/arc_import_record_unittest.cc
 +
  }  // namespace
  }  // namespace rac
+Index: src/chrome/browser/rac/import/arc_import_guard.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/import/arc_import_guard.cc
+@@ -0,0 +1,38 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/arc_import_guard.h"
++
++#include <memory>
++
++#include "base/check.h"
++#include "base/memory/ptr_util.h"
++
++namespace rac {
++
++namespace {
++
++// Whether an ArcImportInProgress is held.
++bool g_arc_import_in_progress = false;
++
++}  // namespace
++
++// static
++std::unique_ptr<ArcImportInProgress> ArcImportInProgress::TryBegin() {
++  if (g_arc_import_in_progress) {
++    return nullptr;
++  }
++  g_arc_import_in_progress = true;
++  return base::WrapUnique(new ArcImportInProgress());
++}
++
++ArcImportInProgress::ArcImportInProgress() = default;
++
++ArcImportInProgress::~ArcImportInProgress() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  DCHECK(g_arc_import_in_progress);
++  g_arc_import_in_progress = false;
++}
++
++}  // namespace rac
+Index: src/chrome/browser/rac/import/arc_import_guard.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/import/arc_import_guard.h
+@@ -0,0 +1,36 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_IMPORT_ARC_IMPORT_GUARD_H_
++#define CHROME_BROWSER_RAC_IMPORT_ARC_IMPORT_GUARD_H_
++
++#include <memory>
++
++#include "base/sequence_checker.h"
++
++namespace rac {
++
++// At most one Arc import, sign-ins retry, or Undo runs at a time in the
++// whole browser, whichever page or window starts it. Each holds one of these
++// from its start until just before it reports
++// (chrome/browser/ui/rac/import/arc_importer.h). UI thread only: each one is
++// released on the sequence that took it.
++class ArcImportInProgress {
++ public:
++  // Null while another is held: the caller reports kBusy.
++  static std::unique_ptr<ArcImportInProgress> TryBegin();
++
++  ArcImportInProgress(const ArcImportInProgress&) = delete;
++  ArcImportInProgress& operator=(const ArcImportInProgress&) = delete;
++  ~ArcImportInProgress();
++
++ private:
++  ArcImportInProgress();
++
++  SEQUENCE_CHECKER(sequence_checker_);
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_IMPORT_ARC_IMPORT_GUARD_H_
+Index: src/chrome/browser/rac/import/arc_import_guard_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/import/arc_import_guard_unittest.cc
+@@ -0,0 +1,50 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/arc_import_guard.h"
++
++#include <memory>
++
++#include "base/location.h"
++#include "base/run_loop.h"
++#include "base/task/thread_pool.h"
++#include "base/test/bind.h"
++#include "base/test/gtest_util.h"
++#include "base/test/task_environment.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++TEST(ArcImportInProgressTest, SecondBeginFailsWhileTheFirstIsHeld) {
++  std::unique_ptr<ArcImportInProgress> first = ArcImportInProgress::TryBegin();
++  ASSERT_TRUE(first);
++  EXPECT_FALSE(ArcImportInProgress::TryBegin());
++  EXPECT_FALSE(ArcImportInProgress::TryBegin());
++}
++
++TEST(ArcImportInProgressTest, ReleasingAllowsANewOne) {
++  std::unique_ptr<ArcImportInProgress> first = ArcImportInProgress::TryBegin();
++  ASSERT_TRUE(first);
++  first.reset();
++
++  std::unique_ptr<ArcImportInProgress> second = ArcImportInProgress::TryBegin();
++  ASSERT_TRUE(second);
++  EXPECT_FALSE(ArcImportInProgress::TryBegin());
++}
++
++TEST(ArcImportInProgressDeathTest, ReleasingOnAnotherSequenceDchecks) {
++  EXPECT_DCHECK_DEATH({
++    base::test::TaskEnvironment task_environment;
++    std::unique_ptr<ArcImportInProgress> held = ArcImportInProgress::TryBegin();
++    base::RunLoop loop;
++    base::ThreadPool::PostTaskAndReply(
++        FROM_HERE, base::BindLambdaForTesting([&held] { held.reset(); }),
++        loop.QuitClosure());
++    loop.Run();
++  });
++}
++
++}  // namespace
++}  // namespace rac
+Index: src/chrome/browser/rac/import/arc_safe_storage_key_test_support.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/import/arc_safe_storage_key_test_support.cc
+@@ -0,0 +1,50 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/import/arc_safe_storage_key_test_support.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "base/check.h"
++#include "base/no_destructor.h"
++
++namespace rac::import {
++
++namespace {
++
++// The answer of the live ScopedArcSafeStorageKeyForTesting, if any. Set and
++// read on the test's main thread only.
++std::optional<base::expected<std::string, ArcKeyError>>& TestingAnswer() {
++  static base::NoDestructor<
++      std::optional<base::expected<std::string, ArcKeyError>>>
++      answer;
++  return *answer;
++}
++
++std::unique_ptr<ArcSafeStorageKeySource> CreateTestingSource() {
++  CHECK(TestingAnswer().has_value());
++  // The source keeps its own copy, so it outlives the override.
++  return internal::CreateFixedAnswerArcKeySource(*TestingAnswer());
++}
++
++}  // namespace
++
++ScopedArcSafeStorageKeyForTesting::ScopedArcSafeStorageKeyForTesting(
++    base::expected<std::string, ArcKeyError> answer) {
++  CHECK(!TestingAnswer().has_value())
++      << "ScopedArcSafeStorageKeyForTesting can't nest";
++  TestingAnswer().emplace(std::move(answer));
++  internal::SetArcKeySourceFactoryForTesting(&CreateTestingSource);
++}
++
++ScopedArcSafeStorageKeyForTesting::~ScopedArcSafeStorageKeyForTesting() {
++  CHECK(TestingAnswer().has_value());
++  internal::SetArcKeySourceFactoryForTesting(nullptr);
++  TestingAnswer().reset();
++}
++
++}  // namespace rac::import
+Index: src/chrome/browser/rac/import/arc_safe_storage_key_test_support.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/import/arc_safe_storage_key_test_support.h
+@@ -0,0 +1,32 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_IMPORT_ARC_SAFE_STORAGE_KEY_TEST_SUPPORT_H_
++#define CHROME_BROWSER_RAC_IMPORT_ARC_SAFE_STORAGE_KEY_TEST_SUPPORT_H_
++
++#include <string>
++
++#include "base/types/expected.h"
++#include "chrome/browser/rac/import/arc_safe_storage_key.h"
++
++namespace rac::import {
++
++// While alive, CreateArcSafeStorageKeySource() returns a source that replies
++// `answer` and never touches the Keychain. Nesting is a CHECK failure. A
++// source created while the override was alive keeps replying `answer` after
++// the override is gone. Test's main thread only.
++class ScopedArcSafeStorageKeyForTesting {
++ public:
++  explicit ScopedArcSafeStorageKeyForTesting(
++      base::expected<std::string, ArcKeyError> answer);
++  ScopedArcSafeStorageKeyForTesting(const ScopedArcSafeStorageKeyForTesting&) =
++      delete;
++  ScopedArcSafeStorageKeyForTesting& operator=(
++      const ScopedArcSafeStorageKeyForTesting&) = delete;
++  ~ScopedArcSafeStorageKeyForTesting();
++};
++
++}  // namespace rac::import
++
++#endif  // CHROME_BROWSER_RAC_IMPORT_ARC_SAFE_STORAGE_KEY_TEST_SUPPORT_H_

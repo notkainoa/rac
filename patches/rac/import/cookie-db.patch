@@ -67,7 +67,7 @@ Index: src/chrome/browser/rac/import/cookie_db_rows.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/cookie_db_rows.cc
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,305 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -214,13 +214,19 @@ Index: src/chrome/browser/rac/import/cookie_db_rows.cc
 +                                           base::FILE_PERMISSION_WRITE_BY_USER);
 +}
 +
-+// Copies `from` like CopyPrivate(), unless it's larger than `max_bytes`. The
-+// copy is measured too, in case the source grew while it was copied (for
-+// example, while Arc is open).
++// Copies `from` like CopyPrivate(), unless it's a symbolic link or larger
++// than `max_bytes`. The copy is measured too, in case the source grew while
++// it was copied (for example, while Arc is open).
 +base::expected<void, CookieDbReadError> CopyPrivateCapped(
 +    const base::FilePath& from,
 +    const base::FilePath& to,
 +    int64_t max_bytes) {
++  // The caller checks only that the database's own path stays inside the
++  // source folder. A link, to the database or a sidecar, could point
++  // anywhere, so it's never followed.
++  if (base::IsLink(from)) {
++    return base::unexpected(CookieDbReadError::kCopyFailed);
++  }
 +  std::optional<int64_t> size = base::GetFileSize(from);
 +  if (!size) {
 +    return base::unexpected(CookieDbReadError::kCopyFailed);
@@ -300,7 +306,9 @@ Index: src/chrome/browser/rac/import/cookie_db_rows.cc
 +  RETURN_IF_ERROR(CopyPrivateCapped(cookies_db, copy, limits.max_file_bytes));
 +  for (const base::FilePath::CharType* suffix : kSidecarSuffixes) {
 +    const base::FilePath from = WithSuffix(cookies_db, suffix);
-+    if (base::PathExists(from)) {
++    // PathExists() follows links, so a link is looked for first: a dangling
++    // one refuses the read too, instead of being skipped.
++    if (base::IsLink(from) || base::PathExists(from)) {
 +      RETURN_IF_ERROR(CopyPrivateCapped(from, WithSuffix(copy, suffix),
 +                                        limits.max_file_bytes));
 +    }
@@ -369,7 +377,7 @@ Index: src/chrome/browser/rac/import/cookie_db_rows.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/cookie_db_rows.h
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,115 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -459,6 +467,8 @@ Index: src/chrome/browser/rac/import/cookie_db_rows.h
 +  // CookieDbReadLimits::max_file_bytes. Nothing is read.
 +  kSourceTooLarge,
 +  kTempDirFailed,
++  // A file couldn't be copied, or the DB, its -wal, or its -shm is a symbolic
++  // link, which is never followed.
 +  kCopyFailed,
 +  kOpenFailed,
 +  kNoCookiesTable,
@@ -469,7 +479,8 @@ Index: src/chrome/browser/rac/import/cookie_db_rows.h
 +// Copies `cookies_db` and any `-wal` / `-shm` siblings into a fresh private
 +// (0700) temp directory, opens the copy read-only, and returns its rows, up
 +// to `limits`. The source files are only ever opened for reading, by the copy.
-+// The temp directory is deleted before returning.
++// None of them may be a symbolic link: kCopyFailed. The temp directory is
++// deleted before returning.
 +//
 +// Required columns: host_key, name, value, encrypted_value, path. Every other
 +// column is optional and looked up by name.
@@ -486,7 +497,7 @@ Index: src/chrome/browser/rac/import/cookie_db_rows_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/cookie_db_rows_unittest.cc
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,454 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -505,6 +516,7 @@ Index: src/chrome/browser/rac/import/cookie_db_rows_unittest.cc
 +#include "base/files/scoped_temp_dir.h"
 +#include "base/notreached.h"
 +#include "base/strings/string_number_conversions.h"
++#include "build/build_config.h"
 +#include "chrome/browser/rac/import/cookie_fixture_db.h"
 +#include "sql/database.h"
 +#include "sql/test/test_helpers.h"
@@ -858,6 +870,80 @@ Index: src/chrome/browser/rac/import/cookie_db_rows_unittest.cc
 +      CookieDbReadError::kSourceTooLarge,
 +      ReadCookieDbRows(db_path_, {.max_file_bytes = *wal_size - 1}).error());
 +}
++
++#if BUILDFLAG(IS_POSIX)
++// A file outside the folder the DB is in, for links to point at.
++base::FilePath OutsideFile(const base::ScopedTempDir& temp_dir,
++                           std::string_view name) {
++  return temp_dir.GetPath().AppendASCII("outside").AppendASCII(name);
++}
++
++// The caller checks only the DB's own path, so a -wal that links elsewhere
++// must not pull that file in.
++TEST_F(CookieDbRowsFileTest, RefusesSymlinkedWal) {
++  {
++    auto fixture = CookieFixtureDb::Create(db_path_, {});
++    ASSERT_TRUE(fixture);
++    ASSERT_TRUE(fixture->AddRow(FullRow()));
++  }
++  const base::FilePath outside = OutsideFile(temp_dir_, "secret");
++  ASSERT_TRUE(base::CreateDirectory(outside.DirName()));
++  ASSERT_TRUE(base::WriteFile(outside, "not a write-ahead log"));
++  ASSERT_TRUE(base::CreateSymbolicLink(
++      outside, base::FilePath(db_path_.value() + FILE_PATH_LITERAL("-wal"))));
++
++  EXPECT_EQ(CookieDbReadError::kCopyFailed,
++            ReadCookieDbRows(db_path_).error());
++}
++
++TEST_F(CookieDbRowsFileTest, RefusesSymlinkedShm) {
++  {
++    auto fixture = CookieFixtureDb::Create(db_path_, {});
++    ASSERT_TRUE(fixture);
++    ASSERT_TRUE(fixture->AddRow(FullRow()));
++  }
++  const base::FilePath outside = OutsideFile(temp_dir_, "secret");
++  ASSERT_TRUE(base::CreateDirectory(outside.DirName()));
++  ASSERT_TRUE(base::WriteFile(outside, "not shared memory"));
++  ASSERT_TRUE(base::CreateSymbolicLink(
++      outside, base::FilePath(db_path_.value() + FILE_PATH_LITERAL("-shm"))));
++
++  EXPECT_EQ(CookieDbReadError::kCopyFailed,
++            ReadCookieDbRows(db_path_).error());
++}
++
++// PathExists() follows links, so a dangling -wal link would look absent.
++// It's refused like any other link.
++TEST_F(CookieDbRowsFileTest, RefusesDanglingWalLink) {
++  {
++    auto fixture = CookieFixtureDb::Create(db_path_, {});
++    ASSERT_TRUE(fixture);
++    ASSERT_TRUE(fixture->AddRow(FullRow()));
++  }
++  const base::FilePath wal(db_path_.value() + FILE_PATH_LITERAL("-wal"));
++  ASSERT_TRUE(base::CreateSymbolicLink(OutsideFile(temp_dir_, "missing"), wal));
++  ASSERT_FALSE(base::PathExists(wal));
++
++  EXPECT_EQ(CookieDbReadError::kCopyFailed,
++            ReadCookieDbRows(db_path_).error());
++}
++
++TEST_F(CookieDbRowsFileTest, RefusesSymlinkedDb) {
++  const base::FilePath outside = OutsideFile(temp_dir_, "Cookies");
++  ASSERT_TRUE(base::CreateDirectory(outside.DirName()));
++  {
++    auto fixture = CookieFixtureDb::Create(outside, {});
++    ASSERT_TRUE(fixture);
++    ASSERT_TRUE(fixture->AddRow(FullRow()));
++  }
++  // The same database reads fine where it is.
++  ASSERT_TRUE(ReadCookieDbRows(outside).has_value());
++  ASSERT_TRUE(base::CreateSymbolicLink(outside, db_path_));
++
++  EXPECT_EQ(CookieDbReadError::kCopyFailed,
++            ReadCookieDbRows(db_path_).error());
++}
++#endif  // BUILDFLAG(IS_POSIX)
 +
 +TEST_F(CookieDbRowsFileTest, FixtureRejectsUnsupportedVersion) {
 +  EXPECT_FALSE(CookieFixtureDb::Create(db_path_, {.meta_version = 22}));
