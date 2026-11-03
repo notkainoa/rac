@@ -48,7 +48,9 @@ class Hit:
 
 def bad_name(name):
     """Whether a file name in a header is quoted or has a space."""
-    name = name.split('\t')[0].rstrip()
+    # Only the tab-separated timestamp and the line ending go: a trailing
+    # space is part of the name, and Apple's patch would lose it too.
+    name = name.split('\t')[0].rstrip('\r\n')
     if name == '/dev/null':
         return False
     return '"' in name or ' ' in name

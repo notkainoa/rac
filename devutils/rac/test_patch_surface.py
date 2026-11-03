@@ -429,29 +429,41 @@ class AppleOutputTest(unittest.TestCase):
 
     def test_clean_output(self):
         result = self.parse("patching file f.cc\npatching file 'sub/new.cc'\n",
-                            {'f.cc', 'sub/new.cc'})
+                            [('f.cc', 'f.cc'), (None, 'sub/new.cc')])
         self.assertEqual((result.trouble, result.failed), ([], []))
 
     def test_name_cut_at_a_space(self):
-        result = self.parse("patching file 'x/User'\n", {'x/User Data/Prefs'})
+        result = self.parse("patching file 'x/User'\n",
+                            [('x/User Data/Prefs', 'x/User Data/Prefs')])
         self.assertEqual(len(result.trouble), 1)
         self.assertIn("wrote 'x/User'", result.trouble[0])
         self.assertIn('issues/74', result.trouble[0])
 
     def test_rejects(self):
         result = self.parse('patching file f.cc\nIgnoring previously applied (or reversed) patch.\n'
-                            '1 out of 2 hunks ignored--saving rejects to f.cc.rej\n', {'f.cc'})
+                            '1 out of 2 hunks ignored--saving rejects to f.cc.rej\n',
+                            [('f.cc', 'f.cc')])
         self.assertEqual(len(result.trouble), 2)
         result = self.parse('patching file f.cc\n1 out of 1 hunks failed--saving rejects to '
-                            'f.cc.rej\n', {'f.cc'})
+                            'f.cc.rej\n', [('f.cc', 'f.cc')])
         self.assertEqual(result.trouble, ['1 out of 1 hunks failed--saving rejects to f.cc.rej'])
 
     def test_skipped_missing_file_is_left_to_the_missing_list(self):
         output = ('File to patch: \nNo file found--skip this patch? [y] \n'
                   '1 out of 1 hunks ignored--saving rejects to Oops.rej\n'
                   'patching file f.cc\n1 out of 1 hunks failed--saving rejects to f.cc.rej\n')
-        result = self.parse(output, {'gone.cc', 'f.cc'})
+        result = self.parse(output, [('gone.cc', 'gone.cc'), ('f.cc', 'f.cc')])
         self.assertEqual(result.trouble, ['1 out of 1 hunks failed--saving rejects to f.cc.rej'])
+
+    def test_a_cut_name_that_is_another_file_of_the_patch_still_fails(self):
+        # x/User Data/a cut at the space is x/User, which the same patch
+        # also names: only the order shows the wrong file was written.
+        files = [('x/User Data/a', 'x/User Data/a'), ('x/User', 'x/User')]
+        result = self.parse("patching file 'x/User'\npatching file 'x/User'\n", files)
+        self.assertEqual(len(result.trouble), 1)
+        self.assertIn('x/User Data/a', result.trouble[0])
+        result = self.parse("patching file 'x/User Data/a'\npatching file 'x/User'\n", files)
+        self.assertEqual(result.trouble, [])
 
     def test_runs_the_release_builds_exact_command(self):
         with tempfile.TemporaryDirectory() as folder:

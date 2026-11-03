@@ -505,23 +505,30 @@ def parse_patch_output(output, result):
             result.trouble.append(line.strip())
 
 
-def parse_apple_output(output, result, names):
-    """Apple's patch output. names are the files the patch gives (-p1)."""
+def parse_apple_output(output, result, files):
+    """Apple's patch output. files are the patch's (old, new) names (-p1), in
+    order: each "patching file" line, or each skipped missing file, takes the
+    next one, so a name cut at a space can't pass as another file the same
+    patch names."""
+    expected = iter(files)
     skipped = False
     for line in output.split('\n'):
         match = PATCHING_FILE.match(line)
         if match:
             skipped = False
+            names = next(expected, ())
             if match.group(1) not in names:
                 result.trouble.append(
-                    f"wrote '{match.group(1)}', which the patch doesn't name (Apple's patch "
+                    f"wrote '{match.group(1)}', not the file the patch names there "
+                    f"({' or '.join(n for n in names if n) or 'none'}); Apple's patch "
                     "cuts names at a space and doesn't read quotes; see "
-                    'https://github.com/notkainoa/rac/issues/74)')
+                    'https://github.com/notkainoa/rac/issues/74')
             continue
         if APPLE_SKIPPED.search(line):
             # A file the tree lacks: patch prompts, reads nothing from
             # /dev/null, skips it, and saves its hunks to Oops.rej. The
             # caller already listed it as missing.
+            next(expected, None)
             skipped = True
             continue
         if APPLE_REJECTS.search(line):
@@ -544,8 +551,8 @@ def run_apple_patch(patch_bin, tree, ref):
     done = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                           errors='surrogateescape', env=env, check=False)
     result = PatchResult(ref, done.returncode, done.stdout + done.stderr)
-    names = {name for f in read_patch(ref.path) for name in (f.old, f.new) if name}
-    parse_apple_output(result.output, result, names)
+    files = [(f.old, f.new) for f in read_patch(ref.path)]
+    parse_apple_output(result.output, result, files)
     return result
 
 
@@ -625,6 +632,9 @@ def apply_all(plan, pristine, work, scratch, patch_bin, ignore_whitespace=False,
             target, exists = resolve_target(work, file_patch)
             if target is None:
                 missing.append(file_patch.old or file_patch.new)
+            elif apple:
+                # The Apple run reports only whether each patch applies.
+                continue
             elif ref.layer != RAC:
                 surface.base_touched.add(target)
             elif target not in origin:
@@ -634,7 +644,7 @@ def apply_all(plan, pristine, work, scratch, patch_bin, ignore_whitespace=False,
                     saved = before_rac / target
                     saved.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(work / target, saved)
-        if ref.layer == RAC:
+        if ref.layer == RAC and not apple:
             group = ref.group
             if group not in surface.groups:
                 surface.groups.append(group)

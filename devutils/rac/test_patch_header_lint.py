@@ -53,6 +53,14 @@ class LintTest(unittest.TestCase):
         text = edit('a/x/User Data/Prefs', 'b/x/User Data/Prefs')
         self.assertEqual(self.headers(text), ['--- a/x/User Data/Prefs', '+++ b/x/User Data/Prefs'])
 
+    def test_trailing_space_is_part_of_the_name(self):
+        text = edit('a/x/trailing ', 'b/x/trailing ')
+        self.assertEqual(self.headers(text), ['--- a/x/trailing ', '+++ b/x/trailing '])
+        # A trailing space before a tab timestamp counts too; the tab and
+        # timestamp alone don't.
+        text = edit(f'a/x/trailing {STAMP}', f'b/x/trailing {STAMP}')
+        self.assertEqual(len(self.headers(text)), 2)
+
     def test_index_with_space(self):
         text = edit(f'src.orig/x/a.cc{STAMP}', f'src/x/a.cc{STAMP}', index='src/x/a b.cc')
         self.assertEqual(self.headers(text), ['Index: src/x/a b.cc'])
