@@ -197,6 +197,7 @@ class DialogTrigger:
     def __init__(self, hold=60):
         self.hold, self.requested, self.released = hold, threading.Event(), threading.Event()
         self.fired = False
+        self.answer = None  # what the page's dialog returned, read after the turns
 
     def on_chat(self, _body):
         if not self.requested.is_set():
@@ -1008,6 +1009,8 @@ def run_browser(variant, args):
         downloads = os.listdir(download_dir)
         record = rig.record("browser", turns, answers, downloads)
         record["dialogs"] = dialogs
+        if trigger is not None:
+            record["dialog_answer"] = trigger.answer
         if shots is not None:
             record["screenshots"] = shots.taken
         try:
@@ -1266,6 +1269,11 @@ def drive(variant, rig, browser, proc, shots=None, trigger=None):
             # — a turn that never sent reads as a timeout without it.
             record["send"] = sent
         turns.append(record)
+    if trigger is not None and variant["turns"]:
+        # A dialog still open blocks the page and the bounded eval gives
+        # None: unanswered. An answered one left window.__racDialogAnswer.
+        trigger.answer = _try_eval(agent_page(pages, variant["turns"][-1]),
+                                   "window.__racDialogAnswer || null")
     dialogs = [e.get("params", {}) for e in browser.drain_events()
                if e.get("method") == "Page.javascriptDialogOpening"]
     return turns, answers, dialogs

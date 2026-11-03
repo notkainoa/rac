@@ -1086,6 +1086,7 @@ class DialogTriggerTest(unittest.TestCase):
         js = eval_js.EVAL_JS
         self.assertIn("'manual'", js)
         self.assertIn("window.__racOpenDialog = open", js)
+        self.assertIn("window.__racDialogAnswer = {answer:", js)
         # manual returns before the timer is armed; the timer mode stays
         self.assertLess(js.index("window.__racOpenDialog"), js.index("setTimeout(open"))
 

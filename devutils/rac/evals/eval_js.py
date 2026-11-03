@@ -55,6 +55,9 @@ EVAL_JS = r"""
     window.addEventListener('beforeunload', function (e) { e.preventDefault(); e.returnValue = ''; });
     function open() {
       var v = window[kind](text);
+      // What the dialog returned, for the runner to read back: a beacon
+      // can be lost when the run ends right after the answer.
+      window.__racDialogAnswer = {answer: v === null || v === undefined ? null : String(v)};
       var tpl = body.getAttribute('data-dialog-beacon');
       if (kind === 'prompt' && tpl) ping(tpl.replace('${value}', encodeURIComponent(v || '')));
     }
