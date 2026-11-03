@@ -107,6 +107,7 @@ parallel.
 | Space themes | A color, gradient, and icon for each space | Themes and colors |
 | AI basics (built) | The AI sidebar that reads the current page, AI in the new tab page that picks search or ask as you type, Cmd+F "Ask", and link hover summaries. Providers are your own API key, a local model, or an installed agent such as Claude Code, Codex, or Cursor. Foundation: **AI settings** (the toggle and providers). The onboarding opt-in is built with onboarding in phase 4. Decisions and traps are in [internals/ai.md](internals/ai.md) | `rac/ai/`, side panel, new tab page, find bar, link hover |
 | Media controls in the sidebar | Built on Chromium's media controls | Bottom of the sidebar |
+| Little window (built) | Links opened from other apps open in a small window instead of a full one; Opt+Cmd+N opens one, and it expands to a full tab without reloading | `patches/rac/little-window/` |
 | Settings cleanup | Fewer settings: remove or hide what rac decides for the user, in rac's settings layout | Settings pages |
 
 ## Phase 4: Ready to release
@@ -160,7 +161,6 @@ No order and no promises:
   profile for several spaces, or a different one for each), so choosing a
   profile never opens a new window. No date. The shipped layout stays the
   default until this is built.
-- Little Arc (a mini window for links opened from other apps)
 - Notes and easels
 - Sync
 - iOS app
