@@ -357,6 +357,9 @@ def collect_capture(paths):
     contacted = {}
     local = {}
     real_resolved = set()
+    # A real resolver job whose params name no host could be for any host,
+    # so then no estimator lookup counts as local-only (fail closed).
+    unnamed_real_resolve = False
     pending = []  # (host, event name, reason or None) for NQE lookups
     for path in paths:
         try:
@@ -374,10 +377,12 @@ def collect_capture(paths):
             name = names.get(event.get('type'), f'type {event.get("type")}')
             params = event.get('params')
             hosts = iter_event_hosts(name, params)
-            if not hosts:
-                continue
             if name in _REAL_RESOLVE_EVENTS:
                 real_resolved |= hosts
+                if not hosts:
+                    unnamed_real_resolve = True
+            if not hosts:
+                continue
             source = event.get('source')
             reason = reasons.get(_source_id(event))
             if (reason is None and name == 'HOST_RESOLVER_MANAGER_REQUEST' and
@@ -399,7 +404,7 @@ def collect_capture(paths):
                     entry['count'] += 1
                     entry['reasons'].add(reason)
     for host, name in pending:
-        if host in real_resolved:
+        if host in real_resolved or unnamed_real_resolve:
             entry = contacted.setdefault(host, {'count': 0,
                                                 'first_seen': name})
             entry['count'] += 1

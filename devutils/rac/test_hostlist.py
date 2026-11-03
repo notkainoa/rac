@@ -334,6 +334,15 @@ class NeverSentTest(unittest.TestCase):
             self.assertIn('d.test.org', contacted, name)
             self.assertEqual(never_sent, {})
 
+    def test_resolver_job_without_a_host_fails_closed(self):
+        # A real job that names no host could be for any host, so the
+        # estimator's lookup can't be called local-only.
+        contacted, never_sent = self.capture(
+            *nqe_lookup(1, 'https://f.test.org'),
+            ev('HOST_RESOLVER_MANAGER_JOB', 9, 'HOST_RESOLVER_IMPL_JOB', 1))
+        self.assertIn('f.test.org', contacted)
+        self.assertEqual(never_sent, {})
+
     def test_lookup_outside_estimator_is_contacted(self):
         contacted, _ = self.capture(
             ev('HOST_RESOLVER_MANAGER_REQUEST', 1, 'URL_REQUEST', 1,
