@@ -1,0 +1,125 @@
+name: Speed bench
+
+# Advisory launch-gate bench (G11): rac vs a Helium release on the same
+# runner. Mounts both DMGs, copies the apps out, and drives them over
+# DevTools with throwaway profiles — cold launch, new tab, tab switch,
+# scroll and typing latency, memory at 1/10/20 tabs, idle CPU and wakeups.
+# Rounds alternate which app goes first, after one untimed warm-up launch; the report is medians with
+# min/max. Free runners are noisy, so the numbers are advisory: the release
+# gate is one run on an idle real Mac (see devutils/rac/bench/README.md).
+
+on:
+  workflow_dispatch:
+    inputs:
+      run-id:
+        required: true
+        type: string
+        description: "Build run whose DMG artifact holds rac"
+      helium-tag:
+        required: true
+        type: string
+        description: "helium-macos release tag to compare against, e.g. 0.20.1.1"
+      rounds:
+        required: false
+        type: string
+        description: "Rounds per app (interleaved)"
+        default: "10"
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bench:
+    name: rac vs Helium
+    runs-on: macos-latest
+    timeout-minutes: 120
+    env:
+      RUN_ID: ${{ inputs.run-id }}
+      HELIUM_TAG: ${{ inputs.helium-tag }}
+      ROUNDS: ${{ inputs.rounds }}
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check inputs
+        run: |
+          if [ -z "$RUN_ID" ] || [ -z "$HELIUM_TAG" ]; then
+            echo "::error::Give both run-id and helium-tag."
+            exit 1
+          fi
+          case "$ROUNDS" in
+            ''|*[!0-9]*) echo "::error::rounds must be a positive integer, got '$ROUNDS'"; exit 1 ;;
+          esac
+      - name: Download the rac disk image from the build run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "$RUN_ID" -R '${{ github.repository }}' -p 'rac_*-macos.dmg' -D bench-rac
+      # Read-only: the Helium release's own assets, same pattern the site uses.
+      - name: Download the Helium disk image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$HELIUM_TAG" -R imputnet/helium-macos -p 'helium_*_arm64-macos.dmg' -D bench-helium --clobber
+      - name: Mount both disk images and copy the apps out
+        run: |
+          mkdir -p bench-apps
+          rac_dmg=$(find bench-rac -type f -name 'rac_*_arm64-macos.dmg' -print -quit)
+          helium_dmg=$(find bench-helium -type f -name 'helium_*_arm64-macos.dmg' -print -quit)
+          if [ -z "$rac_dmg" ]; then
+            echo "::error::No rac_*_arm64-macos.dmg in the run's artifacts:"
+            find bench-rac
+            exit 1
+          fi
+          if [ -z "$helium_dmg" ]; then
+            echo "::error::No helium_*_arm64-macos.dmg in release $HELIUM_TAG:"
+            find bench-helium
+            exit 1
+          fi
+          copy_app() {  # copy_app <dmg> <out-name>
+            local dmg="$1" name="$2" mnt app
+            mnt=$(mktemp -d "${TMPDIR:-/tmp}/bench-mnt.XXXXXX")
+            hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg" >/dev/null
+            app=$(find "$mnt" -maxdepth 1 -type d -name '*.app' -print -quit)
+            if [ -z "$app" ]; then
+              echo "::error::no .app inside $(basename "$dmg")"
+              hdiutil detach "$mnt" -force -quiet || true
+              exit 1
+            fi
+            ditto "$app" "bench-apps/$name.app"
+            hdiutil detach "$mnt" -quiet || hdiutil detach "$mnt" -force -quiet || true
+            xattr -dr com.apple.quarantine "bench-apps/$name.app" >/dev/null 2>&1 || true
+          }
+          copy_app "$rac_dmg" rac
+          copy_app "$helium_dmg" helium
+          ls -la bench-apps
+      - name: Run the bench
+        run: |
+          mkdir -p bench-out
+          python3 devutils/rac/bench/bench.py run \
+            --app rac=bench-apps/rac.app \
+            --app helium=bench-apps/helium.app \
+            --rounds "$ROUNDS" \
+            --out bench-out/results.json
+      - name: Add the summary
+        if: ${{ always() }}
+        run: |
+          {
+            echo "## Speed bench (advisory)"
+            echo
+            echo "rac run \`$RUN_ID\` vs helium-macos \`$HELIUM_TAG\`, $ROUNDS interleaved rounds on a shared free runner."
+            echo
+            python3 devutils/rac/bench/bench.py report bench-out/results.json --markdown
+          } >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Upload the results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: speed-bench
+          path: |
+            bench-out/
+          if-no-files-found: warn
