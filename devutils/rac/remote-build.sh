@@ -1398,7 +1398,35 @@ cmd_run() {
       esac
     done
   fi
-  remote "$name" "$timeout" "$queue_wait" "$requests" "$outputs" "$fresh" "$layout" "$serve" "$@" <<'EOS'
+  # Every run launches with --test-type, so no PWA install writes an app
+  # shim to ~/Applications, except an Arc import run: the sign-ins step
+  # CHECKs that --test-type is absent (patches/rac/import/
+  # signins-step.patch, CreateArcSafeStorageKeySource). Such a run gets no
+  # way to reach a page that could offer an install: no --serve, no PWA
+  # command, no http(s) URL at all, only the internal import pages.
+  local test_type_on=1 lower_req
+  if [ "$import_input" = 1 ] || [ "$arc_now" = 1 ]; then
+    test_type_on=0
+    [ "$test_type" = 0 ] \
+      || refuse "an Arc import run can't pass --test-type: the sign-ins import CHECKs that it is absent"
+    [ -z "$serve" ] \
+      || refuse "an Arc import run can't use --serve: it runs without --test-type, so a served page could install a PWA"
+    [ -z "$req_needs" ] \
+      || refuse "an Arc import run can't send the PWA commands (40002, 34055): it runs without --test-type"
+    lower_req=$(printf '%s' "$requests" | tr '[:upper:]' '[:lower:]')
+    case "$lower_req" in
+      *http://* | *https://*)
+        refuse "an Arc import run may open only internal pages, not http(s) URLs: it runs without --test-type" ;;
+    esac
+    for arg in "$@"; do
+      lower=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
+      case "$lower" in
+        http://* | https://*)
+          refuse "an Arc import run may open only internal pages, not '$arg': it runs without --test-type" ;;
+      esac
+    done
+  fi
+  remote "$name" "$timeout" "$queue_wait" "$requests" "$outputs" "$fresh" "$layout" "$serve" "$test_type_on" "$@" <<'EOS'
 set -e
 safe_name "$1" || { echo "rac remote: bad clone name '$1'" >&2; exit 2; }
 clone="$HOME/rac-remote/wt/$1"
@@ -1409,7 +1437,8 @@ outputs=$5
 fresh=$6
 layout=$7
 serve=$8
-shift 8
+test_type_on=$9
+shift 9
 [ -d "$clone" ] || {
   echo "rac remote: no clone at $clone; run push first" >&2
   exit 1
@@ -1623,7 +1652,11 @@ except urllib.error.HTTPError:
   # every request goes to a dead loopback proxy (loopback is bypassed
   # by default, so the server above still answers, and a proxied URL is
   # never resolved locally), and WebRTC may not send UDP around it.
+  # <-loopback> drops Chromium's implicit loopback bypass, so this server
+  # is the one thing on the Mac a served page reaches; every other local
+  # port goes to the dead proxy too.
   served_args+=(--proxy-server=http://127.0.0.1:9
+    "--proxy-bypass-list=<-loopback>;127.0.0.1:$port"
     --force-webrtc-ip-handling-policy=disable_non_proxied_udp)
   args=(${served_args[@]+"${served_args[@]}"})
   requests=${requests//@SERVE@/$serve_url}
@@ -1846,6 +1879,11 @@ app_bin="$clone/build/src/out/Default/rac.app/Contents/MacOS/rac"
   echo "rac remote: no built browser at $app_bin; run build first" >&2
   exit 1
 }
+# --test-type on every run but an Arc import run (the Air decided).
+test_type_args=()
+if [ "$test_type_on" = 1 ]; then
+  test_type_args=(--test-type)
+fi
 # setsid gives the launcher its own session, so a signal that hits this
 # script's process group can't take the tree down before the trap can
 # choose what to stop.
@@ -1854,7 +1892,7 @@ python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
   nice -n 10 taskpolicy -c utility devutils/rac/build-queue.sh --run \
   "$app_bin" --user-data-dir="$clone/build/profile" --use-mock-keychain \
   --disable-features=DialMediaRouteProvider --rac-launch-in-background \
-  --test-type \
+  ${test_type_args[@]+"${test_type_args[@]}"} \
   ${args[@]+"${args[@]}"} &
 launcher=$!
 spawned=$launcher

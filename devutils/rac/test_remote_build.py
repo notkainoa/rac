@@ -1957,6 +1957,9 @@ class RunTest(RemoteBuildTest):
         self.assertIn(f'fetched {url}/index.html 200 hello pwa', calls)
         # Served pages get no way out but loopback.
         self.assertIn('--proxy-server=http://127.0.0.1:9', calls)
+        # Only this run's own server is bypassed, not all of loopback.
+        port = url.rsplit(':', 1)[1]
+        self.assertIn(f'--proxy-bypass-list=<-loopback>;127.0.0.1:{port}', calls)
         self.assertIn('--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
                       calls)
         self.assertIn("csp=default-src 'self'", calls)
@@ -2126,6 +2129,34 @@ class RunTest(RemoteBuildTest):
         # The pages lines never reach the Pro's path list.
         written = (self.clone / 'build/req/req.txt').read_text()
         self.assertNotIn('pages', written)
+
+    def test_run_arc_import_runs_without_test_type_and_nothing_to_install(self):
+        # The sign-ins import CHECKs that --test-type is absent, so an
+        # import run launches without it and gets no route to a page that
+        # could offer a PWA install.
+        (self.clone / 'build/arc-root').mkdir(parents=True, exist_ok=True)
+        root = '--rac-import-source-root=build/arc-root'
+        self.run_rb('run', self.wt, '--timeout', '3', '--', '--no-first-run',
+                    root, '--rac-import-arc-now', success=True)
+        self.assertNotIn('--test-type', self.calls())
+        req = self.folder / 'req.txt'
+        for extra, line in ((['--test-type'], None),
+                            ([], 'command 40002'),
+                            ([], 'open-urls http://localhost:8000/'),
+                            (['https://example.com/'], None)):
+            args = ['run', self.wt]
+            if line:
+                write(req, line + '\n')
+                args += ['--requests-file', req]
+            result = self.run_rb(*args, '--', root, *extra, success=False)
+            self.assertEqual(result.returncode, 2, (extra, line, result.stderr))
+            self.assertRegex(result.stderr, 'Arc import run|--test-type',
+                             (extra, line))
+        write(self.clone / 'devutils/rac/fixtures/pwa/index.html', 'hi\n')
+        result = self.run_rb('run', self.wt, '--serve', 'devutils/rac/fixtures/pwa',
+                             '--', root, success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('--serve', result.stderr)
 
     def test_run_import_arc_now_needs_a_source_root(self):
         # Without --rac-import-source-root the dev import reads the Pro's
