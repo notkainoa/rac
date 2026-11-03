@@ -1,0 +1,106 @@
+name: Network host capture
+
+# Launch gate G10: the published host list in docs/network.md comes from a
+# recording, not a promise. This mounts the DMG the way install smoke does,
+# launches rac on a throwaway profile with --log-net-log, lets it sit on a
+# fresh window for the given minutes, then diffs every host it touched
+# against docs/network.md. Seen-but-unlisted hosts fail the job, so the doc
+# can never quietly drift from what the build really does. With
+# services: on the profile is seeded with Helium services consent first, so
+# that run records what a consenting user reaches instead.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run-id:
+        required: false
+        type: string
+        description: "Build run whose DMG artifact to capture (alternative to release-tag)"
+      release-tag:
+        required: false
+        type: string
+        description: "Published release tag to capture, such as 0.1.1 (alternative to run-id)"
+      minutes:
+        required: false
+        type: number
+        description: "How long the browser idles before shutdown"
+        default: 10
+      services:
+        required: false
+        type: choice
+        description: "Seed Helium services consent into the profile first"
+        options: [off, on]
+        default: off
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  net-capture:
+    name: Network host capture
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      RUN_ID: ${{ inputs.run-id }}
+      RELEASE_TAG: ${{ inputs.release-tag }}
+      MINUTES: ${{ inputs.minutes }}
+      SERVICES: ${{ inputs.services }}
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check inputs
+        run: |
+          if [ -n "$RUN_ID" ] && [ -n "$RELEASE_TAG" ]; then
+            echo "::error::Give either run-id or release-tag, not both."
+            exit 1
+          fi
+          if [ -z "$RUN_ID" ] && [ -z "$RELEASE_TAG" ]; then
+            echo "::error::Nothing to capture: give run-id or release-tag."
+            exit 1
+          fi
+      # Same DMG handling as the smoke tests: fetch every rac macOS DMG in
+      # the run or release, then pick arm64.
+      - name: Download the disk image from the build run
+        if: ${{ inputs.run-id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "$RUN_ID" -R '${{ github.repository }}' -p 'rac_*-macos.dmg' -D net-capture-in
+      - name: Download the disk image from the release
+        if: ${{ inputs.release-tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$RELEASE_TAG" -R '${{ github.repository }}' -p 'rac_*-macos.dmg' -D net-capture-in --clobber
+      - name: Run the network capture
+        run: |
+          mkdir -p net-capture-out
+          dmg=$(find net-capture-in -type f -name 'rac_*_arm64-macos.dmg' -print -quit)
+          if [ -z "$dmg" ]; then
+            intel=$(find net-capture-in -type f -name 'rac_*_x86_64-macos.dmg' -print -quit)
+            if [ -n "$intel" ]; then
+              echo "::notice::No arm64 DMG in the downloaded files (found $(basename "$intel") only); Intel capture needs an Intel runner. Skipping."
+              echo "**SKIP** no arm64 DMG in the downloaded files; Intel capture needs an Intel runner." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::error::No rac_*_arm64-macos.dmg in the downloaded files:"
+            find net-capture-in
+            exit 1
+          fi
+          .github/scripts/github_net_capture.sh "$dmg" net-capture-out \
+            --minutes "$MINUTES" --services "$SERVICES" --list docs/network.md
+      - name: Upload the capture
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: net-capture-${{ inputs.services }}
+          path: net-capture-out/
+          if-no-files-found: warn
+      - name: Add the summary
+        if: ${{ always() }}
+        run: cat net-capture-out/net-capture.md >> "$GITHUB_STEP_SUMMARY" || true
