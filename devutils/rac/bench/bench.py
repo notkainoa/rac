@@ -482,10 +482,12 @@ def measure_typing(page):
     t0 = time.monotonic()
     page.call("Input.dispatchKeyEvent",
               {"type": "keyDown", "key": "x", "code": "KeyX", "text": "x"})
+    # The clock stops at the input event; key release isn't part of it.
+    page.eval(TYPE_WAIT_JS, timeout=RAF_TIMEOUT)
+    elapsed = (time.monotonic() - t0) * 1000
     page.call("Input.dispatchKeyEvent",
               {"type": "keyUp", "key": "x", "code": "KeyX"})
-    page.eval(TYPE_WAIT_JS, timeout=RAF_TIMEOUT)
-    return (time.monotonic() - t0) * 1000
+    return elapsed
 
 
 # --- one round --------------------------------------------------------------
@@ -524,6 +526,13 @@ def measure_round(app, page_base, settle_s, idle_s, log_dir=None):
         page0.wait_loaded(PORT_TIMEOUT)
         m["cold_launch_ms"] = (time.monotonic() - t0) * 1000
 
+        # New tab, with only the startup tab open: about:blank createTarget
+        # -> load, then close it, before the memory ladder adds tabs.
+        t = time.monotonic()
+        nt = open_tab(browser, "about:blank")
+        m["new_tab_ms"] = (time.monotonic() - t) * 1000
+        browser.call("Target.closeTarget", {"targetId": nt.target_id})
+
         # Memory ladder: tab 1 is the startup page navigated to our local
         # index; 9 and 10 more cycle the three pages. Navigating a loaded
         # page can't reuse the readyState trick — the old document is already
@@ -538,12 +547,6 @@ def measure_round(app, page_base, settle_s, idle_s, log_dir=None):
                 tabs.append(open_tab(browser, url))
             time.sleep(settle_s)
             m[f"mem_{count}tab_mb"] = tree_rss_kb(proc.pid) / 1024
-
-        # New tab: about:blank createTarget -> load, then close it.
-        t = time.monotonic()
-        nt = open_tab(browser, "about:blank")
-        m["new_tab_ms"] = (time.monotonic() - t) * 1000
-        browser.call("Target.closeTarget", {"targetId": nt.target_id})
 
         # Tab switch between the two first local pages.
         try:
@@ -621,8 +624,17 @@ def ratio_pair(app_names):
     """(numerator, denominator) for the ratio column: the first rac* app
     over the first non-rac* app — rac/Helium on the usual pair."""
     rac = next((n for n in app_names if n.startswith("rac")), None)
-    other = next((n for n in app_names if n != rac), None)
+    other = next((n for n in app_names if not n.startswith("rac")), None)
     return (rac, other) if rac and other else None
+
+
+def missing_core(doc):
+    """Apps with no successful cold launch: their rounds all failed, so the
+    run measured nothing for them and must not pass as a comparison."""
+    return [a["name"] for a in doc["apps"]
+            if not any(s["app"] == a["name"] and
+                       s.get("metrics", {}).get("cold_launch_ms") is not None
+                       for s in doc["samples"])]
 
 
 def format_report(doc, markdown=False):
@@ -640,7 +652,8 @@ def format_report(doc, markdown=False):
             stats[n] = s
             cells.append(fmt_cell(s))
         ratio = "—"
-        if pair and stats.get(pair[0]) and stats.get(pair[1]):
+        if pair and stats.get(pair[0]) and stats.get(pair[1]) \
+                and stats[pair[1]]["median"]:
             ratio = f"{stats[pair[0]]['median'] / stats[pair[1]]['median']:.3f}"
         rows.append((metric, cells, ratio))
 
@@ -797,7 +810,13 @@ def main(argv=None):
     except RuntimeError as e:
         parser.error(str(e))
     print(f"wrote {args.out}", flush=True)
-    print(format_report(load_results(args.out)))
+    doc = load_results(args.out)
+    print(format_report(doc))
+    failed = missing_core(doc)
+    if failed:
+        print("bench failed: no successful cold_launch_ms for " + ", ".join(failed),
+              file=sys.stderr, flush=True)
+        return 1
     return 0
 
 

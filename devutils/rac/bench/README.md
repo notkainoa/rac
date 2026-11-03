@@ -71,7 +71,10 @@ binary": the number is not a first-launch-after-reboot measurement.
 | `idle_wakeups` | idle wakeups in the window | Sum of the tree's `IDLEW` column in `top -l 2 -s 30`'s second sample (in `-l` mode, samples after the first are deltas). `powermetrics` would be better but needs root, so it isn't used. |
 
 The report gives, per metric per app: **median (min–max, n)** and the
-rac/Helium ratio on medians.
+rac/Helium ratio on medians (the first `rac*` app over the first other app;
+`—` when the denominator's median is 0). `run` exits 1 when an app has no
+successful cold launch, so a bench where every round failed can't pass as a
+comparison.
 
 ## Interpreting results
 

@@ -86,6 +86,28 @@ class ReportTest(unittest.TestCase):
         out = bench.format_report(doc)
         self.assertNotIn("rac/helium", out)
 
+    def test_ratio_is_over_helium_even_with_two_rac_builds(self):
+        self.assertEqual(bench.ratio_pair(["rac", "rac-next", "helium"]),
+                         ("rac", "helium"))
+        self.assertIsNone(bench.ratio_pair(["rac", "rac-next"]))
+
+    def test_zero_helium_median_gives_no_ratio_not_a_crash(self):
+        doc = sample_doc()
+        for s in doc["samples"]:
+            if s["app"] == "helium":
+                s["metrics"]["idle_wakeups"] = 0
+        out = bench.format_report(doc)
+        line = next(l for l in out.splitlines() if l.startswith("idle_wakeups"))
+        self.assertTrue(line.rstrip().endswith("—"), line)
+
+    def test_an_app_with_no_cold_launch_is_a_failed_bench(self):
+        doc = sample_doc()
+        self.assertEqual(bench.missing_core(doc), [])
+        for s in doc["samples"]:
+            if s["app"] == "helium":
+                s["metrics"] = {}
+        self.assertEqual(bench.missing_core(doc), ["helium"])
+
     def test_report_cli_reads_the_file(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "results.json")
@@ -284,3 +306,19 @@ class ParseCliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TypingTest(unittest.TestCase):
+    def test_clock_stops_at_the_input_event_before_key_release(self):
+        calls = []
+
+        class FakePage:
+            def eval(self, js, **kw):
+                calls.append("eval-wait" if "timeout" in kw else "eval-arm")
+                return "armed"
+
+            def call(self, method, params):
+                calls.append(params["type"])
+
+        bench.measure_typing(FakePage())
+        self.assertEqual(calls, ["eval-arm", "keyDown", "eval-wait", "keyUp"])
