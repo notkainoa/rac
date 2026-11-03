@@ -39,6 +39,8 @@
 #                                     activate the browser),
 #                                     --rac-import-arc-now (import at startup,
 #                                     only with --rac-import-source-root=),
+#                                     --rac-import-arc-undo-now (undo the
+#                                     profile's Arc import at startup),
 #                                     --rac-arc-import-fixture=<path> and
 #                                     --rac-import-source-root=<path> (Arc
 #                                     import inputs, relative to the clone,
@@ -1138,6 +1140,7 @@ check_run_arg() {
   esac
   case "$arg" in
     --no-first-run | --rac-launch-in-background | --rac-import-arc-now | \
+      --rac-import-arc-undo-now | \
       --force-prefers-reduced-motion | --rac-force-increased-contrast | \
       --disable-backgrounding-occluded-windows)
       return 0 ;;
@@ -1256,7 +1259,7 @@ check_run_arg() {
 cmd_run() {
   local name=$1 timeout=90 requests='' outputs='' fresh=0 checked req_file=''
   local req_pages='' req_verbs='' req_needs='' req_commands='' import_input=0 setup_page=0 general_page=0 source_root=0
-  local arc_now=0 settings_page=0 test_type=0 layout='' serve=''
+  local arc_now=0 undo_now=0 settings_page=0 test_type=0 layout='' serve=''
   shift
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1327,6 +1330,9 @@ cmd_run() {
       --rac-arc-import-fixture=*) import_input=1 ;;
       --rac-import-source-root=*) import_input=1; source_root=1 ;;
       --rac-import-arc-now) arc_now=1 ;;
+      # Undoes the clone profile's own Arc import record; reads no Arc data,
+      # so it needs no source root, but it is an import run.
+      --rac-import-arc-undo-now) undo_now=1 ;;
       --test-type) test_type=1 ;;
     esac
     lower=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
@@ -1405,7 +1411,7 @@ cmd_run() {
   # way to reach a page that could offer an install: no --serve, no PWA
   # command, no http(s) URL at all, only the internal import pages.
   local test_type_on=1 lower_req
-  if [ "$import_input" = 1 ] || [ "$arc_now" = 1 ]; then
+  if [ "$import_input" = 1 ] || [ "$arc_now" = 1 ] || [ "$undo_now" = 1 ]; then
     test_type_on=0
     [ "$test_type" = 0 ] \
       || refuse "an Arc import run can't pass --test-type: the sign-ins import CHECKs that it is absent"
@@ -1879,10 +1885,19 @@ app_bin="$clone/build/src/out/Default/rac.app/Contents/MacOS/rac"
   echo "rac remote: no built browser at $app_bin; run build first" >&2
   exit 1
 }
-# --test-type on every run but an Arc import run (the Air decided).
+# --test-type on every run but an Arc import run (the Air decided). An
+# import run has no network instead: every request, loopback included,
+# goes to a dead proxy and WebRTC may not send UDP around it. With no page
+# from the network reachable, nothing it opens or clicks (an imported
+# sidebar item, a new-tab shortcut, a search) can offer a PWA install, and
+# the import needs no network: it reads only local files.
 test_type_args=()
 if [ "$test_type_on" = 1 ]; then
   test_type_args=(--test-type)
+else
+  test_type_args=(--proxy-server=http://127.0.0.1:9
+    "--proxy-bypass-list=<-loopback>"
+    --force-webrtc-ip-handling-policy=disable_non_proxied_udp)
 fi
 # setsid gives the launcher its own session, so a signal that hits this
 # script's process group can't take the tree down before the trap can

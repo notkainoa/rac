@@ -178,8 +178,16 @@ UI-control WebSocket — with `--user-data-dir` at the clone's throwaway
   `--force-prefers-reduced-motion`, `--rac-force-increased-contrast`,
   `--disable-backgrounding-occluded-windows`.
 - `--rac-import-arc-now` (only with `--rac-import-source-root=`),
+  `--rac-import-arc-undo-now` (undoes the clone profile's own Arc import
+  at startup, reading no Arc data),
   `--rac-arc-import-fixture=<path>` and `--rac-import-source-root=<path>`,
-  Arc import inputs that must exist inside the clone.
+  Arc import inputs that must exist inside the clone. Any of these four
+  makes it an Arc import run: it launches without `--test-type` (the
+  sign-ins import `CHECK`s that the switch is absent), and in its place
+  gets no network at all. Every request, loopback included, goes to a
+  dead proxy, so nothing an import run opens or clicks can reach a page
+  that offers a PWA install. It also refuses `--test-type`, `--serve`,
+  the PWA commands and http(s) URLs.
 - `--rac-window-screenshot=<name>.png` and
   `--rac-window-screenshot-delay=<1-4 digits>`; the shot lands in
   `build/shots/`.
