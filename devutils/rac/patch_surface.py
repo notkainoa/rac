@@ -21,6 +21,14 @@ counted in net-diff hunks in upstream files: the hunks of the diff between the
 tree after Helium's patches and the tree after rac's, so a final edit counts
 once however many patches stack on it.
 
+`apply --apple-patch` instead applies every patch the way the release build
+does: Apple's /usr/bin/patch with exactly helium-chromium/utils/patches.py's
+flags (fuzz allowed, whitespace ignored). Apple's patch cuts file names at a
+space and doesn't read git's quoted names, which GNU patch and quilt take
+(https://github.com/notkainoa/rac/issues/74). Any reject, any non-zero exit,
+or a file name other than the one the patch gives fails the run. It needs
+macOS, and it leaves the patch surface to the GNU run.
+
 Layers, in the order the build applies them (patches/series after Helium's):
     helium    Helium core's patches (helium-chromium/patches/series)
     platform  helium-macos's own patches (patches/series, outside rac/)
@@ -409,15 +417,31 @@ def extract_sources(wanted, out_dir, sources, cache_dir=None):
 # Applying patches
 
 
+APPLE_PATCH = '/usr/bin/patch'
+
+
+def patch_version(path):
+    done = subprocess.run([path, '--version'], stdin=subprocess.DEVNULL, capture_output=True,
+                          text=True, check=False)
+    return done.stdout + done.stderr
+
+
+def find_apple_patch(requested=None):
+    """Apple's patch, which the release build uses on macOS."""
+    path = shutil.which(requested or APPLE_PATCH)
+    if path and 'Apple' in patch_version(path):
+        return path
+    raise SurfaceError(f"Apple's patch not found at {requested or APPLE_PATCH} (it ships with "
+                       'macOS; this check needs a macOS runner)')
+
+
 def find_patch_bin(requested=None):
     """GNU patch: gpatch on macOS, patch on Linux."""
     for candidate in [requested] if requested else ['gpatch', 'patch']:
         path = shutil.which(candidate)
         if not path:
             continue
-        version = subprocess.run([path, '--version'], capture_output=True, text=True,
-                                 check=False).stdout
-        if 'GNU patch' in version:
+        if 'GNU patch' in patch_version(path):
             return path
     raise SurfaceError('GNU patch not found (macOS: brew install gpatch)')
 
@@ -429,6 +453,9 @@ HUNK_FAILED = re.compile(r'^Hunk #(\d+) FAILED at (\d+)')
 TROUBLE = re.compile(r'(?i)^(?:patch: \*\*\*\* |.*(?:malformed patch|only garbage was found'
                      r'|reversed \(or previously applied\)|which already exists'
                      r'|can\'t create|permission denied|no such file))')
+# Apple's patch says nothing per hunk; it sums up rejects per file.
+APPLE_REJECTS = re.compile(r'(?i)hunks? (?:failed|ignored)|saving rejects|\.rej\b')
+APPLE_SKIPPED = re.compile(r'(?i)no file found--skip')
 
 
 @dataclass
@@ -476,6 +503,50 @@ def parse_patch_output(output, result):
             continue
         if TROUBLE.match(line):
             result.trouble.append(line.strip())
+
+
+def parse_apple_output(output, result, names):
+    """Apple's patch output. names are the files the patch gives (-p1)."""
+    skipped = False
+    for line in output.split('\n'):
+        match = PATCHING_FILE.match(line)
+        if match:
+            skipped = False
+            if match.group(1) not in names:
+                result.trouble.append(
+                    f"wrote '{match.group(1)}', which the patch doesn't name (Apple's patch "
+                    "cuts names at a space and doesn't read quotes; see "
+                    'https://github.com/notkainoa/rac/issues/74)')
+            continue
+        if APPLE_SKIPPED.search(line):
+            # A file the tree lacks: patch prompts, reads nothing from
+            # /dev/null, skips it, and saves its hunks to Oops.rej. The
+            # caller already listed it as missing.
+            skipped = True
+            continue
+        if APPLE_REJECTS.search(line):
+            if not skipped:
+                result.trouble.append(line.strip())
+            skipped = False
+            continue
+        if TROUBLE.match(line) or 'previously applied (or reversed)' in line:
+            result.trouble.append(line.strip())
+
+
+def run_apple_patch(patch_bin, tree, ref):
+    """Applies one patch as helium-chromium/utils/patches.py does on macOS."""
+    command = [
+        patch_bin, '-p1', '--ignore-whitespace', '-i',
+        str(ref.path.resolve()), '-d',
+        str(tree), '--no-backup-if-mismatch', '--forward'
+    ]
+    env = dict(os.environ, LC_ALL='C', LANG='C')
+    done = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          errors='surrogateescape', env=env, check=False)
+    result = PatchResult(ref, done.returncode, done.stdout + done.stderr)
+    names = {name for f in read_patch(ref.path) for name in (f.old, f.new) if name}
+    parse_apple_output(result.output, result, names)
+    return result
 
 
 def run_patch(patch_bin, tree, ref, fuzz_zero, ignore_whitespace):
@@ -538,7 +609,7 @@ class Run:
         return [result for result in self.results if result.bad]
 
 
-def apply_all(plan, pristine, work, scratch, patch_bin, ignore_whitespace=False):
+def apply_all(plan, pristine, work, scratch, patch_bin, ignore_whitespace=False, apple=False):
     """Applies the whole plan to a copy of pristine, measuring rac's surface."""
     work, scratch = Path(work), Path(scratch)
     shutil.copytree(pristine, work, symlinks=True)
@@ -578,7 +649,10 @@ def apply_all(plan, pristine, work, scratch, patch_bin, ignore_whitespace=False)
                         surface.shared.add(target)
                     surface.last_group[target] = group
                     surface.files[group].add(target)
-        result = run_patch(patch_bin, work, ref, ref.layer == RAC, ignore_whitespace)
+        if apple:
+            result = run_apple_patch(patch_bin, work, ref)
+        else:
+            result = run_patch(patch_bin, work, ref, ref.layer == RAC, ignore_whitespace)
         result.missing = missing
         results.append(result)
     for target, kind in origin.items():
@@ -610,13 +684,16 @@ def annotate(level, title, message, path=None):
     print(f'::{level} title={title}{where}::{message}')
 
 
-def render_report(run, plan):
+def render_report(run, plan, apple=False):
     """Markdown for the job summary; it reads fine in a terminal too."""
     surface = run.surface
-    lines = ['## Patch apply', '']
     rows = []
     for layer in (HELIUM, PLATFORM, RAC):
         results = [result for result in run.results if result.ref.layer == layer]
+        if apple:
+            rows.append([LAYER_TITLES[layer], len(results), sum(1 for r in results if r.bad),
+                         sum(len(result.missing) for result in results)])
+            continue
         rows.append([
             LAYER_TITLES[layer] + (' (fuzz 0)' if layer == RAC else ' (fuzz up to 2)'),
             len(results),
@@ -625,8 +702,15 @@ def render_report(run, plan):
             sum(result.offsets for result in results),
             sum(len(result.missing) for result in results),
         ])
-    lines.append(table(['Layer', 'Patches', 'Failed hunks', 'Hunks with fuzz',
-                        'Hunks with offset', 'Files not found'], rows))
+    if apple:
+        lines = ["## Patch apply with Apple's patch", '',
+                 f'`{APPLE_PATCH} -p1 --ignore-whitespace -i <patch> -d <tree> '
+                 '--no-backup-if-mismatch --forward`, as the release build runs it.', '']
+        lines.append(table(['Layer', 'Patches', 'Patches with problems', 'Files not found'], rows))
+    else:
+        lines = ['## Patch apply', '']
+        lines.append(table(['Layer', 'Patches', 'Failed hunks', 'Hunks with fuzz',
+                            'Hunks with offset', 'Files not found'], rows))
     lines.append('')
     bad = run.bad
     lines.append(f'**{len(bad)} patch(es) broke the run.**' if bad else 'No patch broke the run.')
@@ -644,6 +728,9 @@ def render_report(run, plan):
         for result in warnings:
             lines.append(f'- `{result.ref.name}`: ' + ', '.join(f'`{m}`' for m in result.missing))
         lines += ['', '</details>']
+    if apple:
+        # Apple's patch leaves deleted files empty, so the GNU run counts.
+        return '\n'.join(lines) + '\n'
 
     lines += ['', '## Patch surface', '']
     rows = []
@@ -741,14 +828,18 @@ def cmd_extract(args):
 
 def cmd_apply(args):
     plan = build_plan(args.helium_patches, args.platform_patches)
-    patch_bin = find_patch_bin(args.patch_bin)
+    if args.apple_patch:
+        patch_bin = find_apple_patch(args.patch_bin)
+    else:
+        patch_bin = find_patch_bin(args.patch_bin)
     with tempfile.TemporaryDirectory(prefix='rac-surface-') as scratch:
         work = Path(args.work) if args.work else Path(scratch) / 'tree'
         if work.exists():
             raise SurfaceError(f'{work} already exists')
-        run = apply_all(plan, args.pristine, work, scratch, patch_bin, args.ignore_whitespace)
+        run = apply_all(plan, args.pristine, work, scratch, patch_bin, args.ignore_whitespace,
+                        args.apple_patch)
     report_failures(run)
-    report = render_report(run, plan)
+    report = render_report(run, plan, args.apple_patch)
     print('\n' + report)
     summary = args.summary or os.environ.get('GITHUB_STEP_SUMMARY')
     if summary:
@@ -786,9 +877,13 @@ def main(argv=None):
     patch_dirs(sub)
     sub.add_argument('--pristine', required=True, help='the extracted Chromium files')
     sub.add_argument('--work', help='where to apply (default: a temporary folder)')
-    sub.add_argument('--patch-bin', help='GNU patch (default: gpatch, then patch)')
+    sub.add_argument('--patch-bin', help='GNU patch (default: gpatch, then patch), or with '
+                     f"--apple-patch, Apple's (default: {APPLE_PATCH})")
     sub.add_argument('--ignore-whitespace', action='store_true',
                      help='like the release build (quilt does not)')
+    sub.add_argument('--apple-patch', action='store_true',
+                     help="apply with Apple's patch and the release build's exact flags "
+                     '(macOS only; no patch surface)')
     sub.add_argument('--summary', help='append the report here (default: $GITHUB_STEP_SUMMARY)')
     sub.set_defaults(func=cmd_apply)
 
