@@ -25,10 +25,30 @@ One line per host, or `*.example.com`, which covers `example.com` itself and
 every subdomain (but not `example.com.evil.net`). The IP addresses sockets
 resolve to are not listed; the hostname that produced them is.
 
-Loopback (`localhost`, `127.0.0.1`, `::1`) and Helium's dev-build placeholder
-(`*.qjz9zk`, the dead TLD ungoogled-chromium points Google endpoints at) are
-recorded by the capture but reported separately — they never belong in this
-list.
+Loopback (`localhost`, `127.0.0.1`, `::1`) and Helium's placeholder
+(`*.qjz9zk`, the dead TLD ungoogled-chromium points Google endpoints at, in
+release builds too) are recorded by the capture but reported separately —
+they never belong in this list.
+
+## Seen but never sent
+
+`hostlist.py` lists a host as contacted only if something actually left the
+browser for it. A request that stays on the machine goes in a separate
+"seen but never sent" section, with the reason, and never fails the diff. A
+host that also shows up in an ordinary event counts as contacted.
+
+Before you consent to Helium services, nothing is sent to them. Two entries
+still appear in a capture and neither leaves the browser:
+
+- `services.helium.imput.net/bangs.json`, which rac only looks up in its own
+  disk cache at startup (`ERR_CACHE_MISS` on a fresh profile), with a
+  network-quality check beside it that only reads the in-memory DNS cache.
+  Reasons: `cache-only`, `local-only lookup`.
+- `helium-services-are-disabled.qjz9zk`, the address Helium gives the
+  component updater, extension updates and spellcheck downloads until you
+  consent, in release builds too. The browser rewrites it to `trk:` and
+  blocks it (`ERR_BLOCKED_BY_CLIENT`) before any DNS lookup or connection.
+  Reason: `blocked`.
 
 ## How it's captured
 

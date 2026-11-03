@@ -12,7 +12,7 @@ JSON document: {"constants": {"logEventTypes": {<name>: <id>, ...},
 so the file may end mid-event or mid-list — parse_netlog keeps every
 complete event and drops only the torn tail.
 
-  hostlist.py hosts <netlog.json> [more.json ...] [--json] [--ignore-dev]
+  hostlist.py hosts <netlog.json> [more.json ...] [--json] [--ignore-placeholder]
       Prints each distinct host the browser tried to reach, sorted, with the
       number of events that mentioned it and the event type where it was
       first seen. Hosts come from every place a net-log records one: request
@@ -22,16 +22,24 @@ complete event and drops only the torn tail.
       session params, the Host header on sent requests, and proxy resolution
       (pac_url, PAC-style proxy lists). Hosts are normalized to lowercase
       without a port; punycode stays punycode.
-      Loopback (localhost, 127.0.0.1, ::1) and Helium's dev-build placeholder
+      Only hosts that left the browser count. Requests that never reach the
+      network are listed apart, in "seen but never sent", with the reason:
+      cache-only (load_flags has LOAD_ONLY_FROM_CACHE), blocked (ended with
+      ERR_BLOCKED_BY_CLIENT and never opened a socket or stream), and
+      local-only lookup (the network quality estimator's DNS-cache-only
+      check). A host also seen in any ordinary event is contacted. When in
+      doubt, a host counts as contacted.
+      Loopback (localhost, 127.0.0.1, ::1) and Helium's placeholder
       (*.qjz9zk) are reported in their own section, or hidden entirely with
-      --ignore-dev.
+      --ignore-placeholder (--ignore-dev is the old name and still works).
 
   hostlist.py compare <netlog.json> [...] --list <doc.md>
       Compares what the capture saw with the list published in <doc.md>
       (docs/network.md), which carries a fenced ```hosts block: one host or
       wildcard (*.example.com, which also matches example.com itself) per
       line, with # comments. Prints hosts seen but not listed and exits 1;
-      listed-but-unseen entries and loopback/dev hosts are informational.
+      listed-but-unseen entries, never-sent hosts and loopback/placeholder
+      hosts are informational.
 
 Every command exits 0 on success, 1 when compare finds unlisted hosts, and
 2 on bad arguments or unreadable input.
@@ -80,8 +88,9 @@ _PROXY_WORDS = {'direct', 'proxy', 'http', 'https', 'socks', 'socks4',
                 'socks5', 'quic', 'pac'}
 
 # ungoogled-chromium's domain substitution points Google endpoints at the
-# nonexistent .qjz9zk TLD in dev builds; release builds never emit it.
-_DEV_TLD = 'qjz9zk'
+# nonexistent .qjz9zk TLD, and Helium uses it as the address of services
+# the user hasn't consented to. Release builds use it too.
+_PLACEHOLDER_TLD = 'qjz9zk'
 
 
 def _is_ip(host):
@@ -259,16 +268,99 @@ def is_loopback(host):
             or host in ('::1', '0:0:0:0:0:0:0:1', '0.0.0.0'))
 
 
-def is_dev_placeholder(host):
-    """Helium's dev-build placeholder TLD: qjz9zk or any *.qjz9zk."""
-    return host == _DEV_TLD or host.endswith('.' + _DEV_TLD)
+def is_placeholder(host):
+    """Helium's placeholder TLD: qjz9zk or any *.qjz9zk."""
+    return host == _PLACEHOLDER_TLD or host.endswith('.' + _PLACEHOLDER_TLD)
 
 
-def collect_hosts(paths):
-    """{host: {count, first_seen}} over every net-log, in argument order.
-    count is the number of events that mentioned the host; first_seen is the
-    event type of the first that did."""
-    found = {}
+# net-log event names that show a request got as far as a socket, a stream
+# or a sent transaction. A request that carries one of these was not
+# stopped locally.
+_SENT_PREFIXES = ('SOCKET', 'TCP_', 'SSL_', 'HTTP2_', 'QUIC_',
+                  'HTTP_STREAM', 'HTTP_TRANSACTION', 'HTTP3_')
+
+# Events that prove the resolver really went to DNS or the OS for a host.
+_REAL_RESOLVE_EVENTS = {'HOST_RESOLVER_MANAGER_JOB',
+                        'HOST_RESOLVER_DNS_TASK',
+                        'HOST_RESOLVER_SYSTEM_TASK', 'DNS_TRANSACTION'}
+
+_LOAD_ONLY_FROM_CACHE = 8
+_ERR_BLOCKED_BY_CLIENT = -20
+_PHASE_BEGIN = 1
+_PHASE_END = 2
+
+
+def _source_type_names(constants):
+    """{id: name} from constants.logSourceType (name to id in real logs)."""
+    types = {}
+    mapping = constants.get('logSourceType') if isinstance(constants, dict) \
+        else None
+    for key, value in (mapping or {}).items():
+        if isinstance(value, int):
+            types[value] = key
+        elif isinstance(value, str):
+            try:
+                types[int(key)] = value
+            except (TypeError, ValueError):
+                continue
+    return types
+
+
+def _source_id(event):
+    source = event.get('source')
+    return source.get('id') if isinstance(source, dict) else None
+
+
+def _classify_sources(events, names, source_types):
+    """{source id: reason} for URL_REQUEST sources that never reached the
+    network: 'cache-only' or 'blocked'."""
+    cache_only, blocked, sent = set(), set(), set()
+    url_requests = set()
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        sid = _source_id(event)
+        source = event.get('source')
+        if (isinstance(source, dict) and
+                source_types.get(source.get('type')) == 'URL_REQUEST'):
+            url_requests.add(sid)
+        name = names.get(event.get('type'), '')
+        params = event.get('params')
+        params = params if isinstance(params, dict) else {}
+        phase = event.get('phase')
+        if name.startswith(_SENT_PREFIXES) or 'SEND_REQUEST' in name:
+            sent.add(sid)
+        if name == 'URL_REQUEST_START_JOB' and phase == _PHASE_BEGIN:
+            flags = params.get('load_flags')
+            if isinstance(flags, int) and flags & _LOAD_ONLY_FROM_CACHE:
+                cache_only.add(sid)
+        if (name in ('URL_REQUEST_START_JOB', 'REQUEST_ALIVE') and
+                phase == _PHASE_END and
+                params.get('net_error') == _ERR_BLOCKED_BY_CLIENT):
+            blocked.add(sid)
+    reasons = {}
+    for sid in url_requests:
+        if sid in cache_only:
+            reasons[sid] = 'cache-only'
+        elif sid in blocked and sid not in sent:
+            reasons[sid] = 'blocked'
+    return reasons
+
+
+def collect_capture(paths):
+    """(contacted, never_sent) over every net-log, in argument order.
+    contacted is {host: {count, first_seen}}: count is the number of events
+    that mentioned the host, first_seen the event type of the first that did.
+    never_sent is {host: {count, first_seen, reasons}} for hosts whose every
+    mention came from a request that stayed on the machine; a host with any
+    ordinary mention is contacted instead."""
+    contacted = {}
+    local = {}
+    real_resolved = set()
+    # A real resolver job whose params name no host could be for any host,
+    # so then no estimator lookup counts as local-only (fail closed).
+    unnamed_real_resolve = False
+    pending = []  # (host, event name, reason or None) for NQE lookups
     for path in paths:
         try:
             with open(path, encoding='utf-8') as stream:
@@ -277,26 +369,69 @@ def collect_hosts(paths):
             raise ValueError(f'cannot read {path}: {error}')
         constants, events = parse_netlog(text)
         names = event_type_names(constants)
+        source_types = _source_type_names(constants)
+        reasons = _classify_sources(events, names, source_types)
         for event in events:
             if not isinstance(event, dict):
                 continue
-            type_id = event.get('type')
-            name = names.get(type_id, f'type {type_id}')
-            for host in iter_event_hosts(name, event.get('params')):
-                entry = found.setdefault(host, {'count': 0, 'first_seen': name})
-                entry['count'] += 1
-    return found
+            name = names.get(event.get('type'), f'type {event.get("type")}')
+            params = event.get('params')
+            hosts = iter_event_hosts(name, params)
+            if name in _REAL_RESOLVE_EVENTS:
+                real_resolved |= hosts
+                if not hosts:
+                    unnamed_real_resolve = True
+            if not hosts:
+                continue
+            source = event.get('source')
+            reason = reasons.get(_source_id(event))
+            if (reason is None and name == 'HOST_RESOLVER_MANAGER_REQUEST' and
+                    isinstance(source, dict) and source_types.get(
+                        source.get('type')) == 'NETWORK_QUALITY_ESTIMATOR'):
+                reason = 'local-only lookup'
+                for host in hosts:
+                    pending.append((host, name))
+                continue
+            for host in hosts:
+                if reason is None:
+                    entry = contacted.setdefault(
+                        host, {'count': 0, 'first_seen': name})
+                    entry['count'] += 1
+                else:
+                    entry = local.setdefault(
+                        host, {'count': 0, 'first_seen': name,
+                               'reasons': set()})
+                    entry['count'] += 1
+                    entry['reasons'].add(reason)
+    for host, name in pending:
+        if host in real_resolved or unnamed_real_resolve:
+            entry = contacted.setdefault(host, {'count': 0,
+                                                'first_seen': name})
+            entry['count'] += 1
+        else:
+            entry = local.setdefault(host, {'count': 0, 'first_seen': name,
+                                            'reasons': set()})
+            entry['count'] += 1
+            entry['reasons'].add('local-only lookup')
+    never_sent = {host: {**entry, 'reasons': sorted(entry['reasons'])}
+                  for host, entry in local.items() if host not in contacted}
+    return contacted, never_sent
+
+
+def collect_hosts(paths):
+    """{host: {count, first_seen}}: the hosts that were contacted."""
+    return collect_capture(paths)[0]
 
 
 def split_hosts(found):
     """(public, ignored): ignored hosts get a 'reason' of loopback or
-    dev-placeholder."""
+    placeholder."""
     public, ignored = {}, {}
     for host, entry in found.items():
         if is_loopback(host):
             ignored[host] = {**entry, 'reason': 'loopback'}
-        elif is_dev_placeholder(host):
-            ignored[host] = {**entry, 'reason': 'dev-placeholder'}
+        elif is_placeholder(host):
+            ignored[host] = {**entry, 'reason': 'placeholder'}
         else:
             public[host] = entry
     return public, ignored
@@ -309,21 +444,34 @@ def _print_host_lines(hosts, stream):
               file=stream)
 
 
-def cmd_hosts(found, as_json, ignore_dev):
+def _print_never_sent(never_sent):
+    print(f'\n# {len(never_sent)} seen but never sent '
+          f'(stayed on this machine, not contacted)')
+    for host in sorted(never_sent):
+        entry = never_sent[host]
+        print(f'{host:<45} {entry["count"]:>5}  '
+              f'{", ".join(entry["reasons"])}')
+
+
+def cmd_hosts(found, never_sent, as_json, ignore_placeholder):
     public, ignored = split_hosts(found)
     if as_json:
         doc = {'hosts': [{'host': host, **public[host]}
-                         for host in sorted(public)]}
-        if not ignore_dev:
+                         for host in sorted(public)],
+               'never_sent': [{'host': host, **never_sent[host]}
+                              for host in sorted(never_sent)]}
+        if not ignore_placeholder:
             doc['ignored'] = [{'host': host, **ignored[host]}
                               for host in sorted(ignored)]
         print(json.dumps(doc, indent=2))
         return 0
     print(f'# {len(public)} host{"s" if len(public) != 1 else ""}')
     _print_host_lines(public, sys.stdout)
-    if not ignore_dev and ignored:
-        print(f'\n# {len(ignored)} loopback/dev hosts '
-              f'(excluded above; --ignore-dev hides them)')
+    if never_sent:
+        _print_never_sent(never_sent)
+    if not ignore_placeholder and ignored:
+        print(f'\n# {len(ignored)} loopback/placeholder hosts '
+              f'(excluded above; --ignore-placeholder hides them)')
         _print_host_lines(ignored, sys.stdout)
     return 0
 
@@ -363,7 +511,7 @@ def host_listed(host, patterns):
     return False
 
 
-def cmd_compare(found, list_path, ignore_dev):
+def cmd_compare(found, never_sent, list_path, ignore_placeholder):
     try:
         with open(list_path, encoding='utf-8') as stream:
             text = stream.read()
@@ -390,20 +538,26 @@ def cmd_compare(found, list_path, ignore_dev):
         print('info: listed but never seen in this capture:')
         for pattern in unseen:
             print(f'  {pattern}')
-    if ignored and not ignore_dev:
-        print('info: loopback/dev hosts seen (never part of the published '
-              'list):')
+    if never_sent:
+        print('info: seen but never sent (not part of the published list):')
+        for host in sorted(never_sent):
+            print(f'  {host} ({", ".join(never_sent[host]["reasons"])})')
+    if ignored and not ignore_placeholder:
+        print('info: loopback/placeholder hosts seen (never part of the '
+              'published list):')
         for host in sorted(ignored):
             print(f'  {host} ({ignored[host]["reason"]})')
     return 1 if unlisted else 0
 
 
 def _run(arguments):
-    found = collect_hosts(arguments.netlogs)
+    found, never_sent = collect_capture(arguments.netlogs)
     if arguments.command == 'hosts':
-        return cmd_hosts(found, arguments.json, arguments.ignore_dev)
+        return cmd_hosts(found, never_sent, arguments.json,
+                         arguments.ignore_placeholder)
     if arguments.command == 'compare':
-        return cmd_compare(found, arguments.list, arguments.ignore_dev)
+        return cmd_compare(found, never_sent, arguments.list,
+                           arguments.ignore_placeholder)
     return 2
 
 
@@ -417,16 +571,20 @@ def main(argv=None):
     hosts.add_argument('netlogs', nargs='+', metavar='netlog.json')
     hosts.add_argument('--json', action='store_true',
                        help='emit JSON instead of aligned text')
-    hosts.add_argument('--ignore-dev', action='store_true',
-                       help='hide loopback and *.qjz9zk dev-placeholder hosts')
+    hosts.add_argument('--ignore-placeholder', '--ignore-dev',
+                       dest='ignore_placeholder', action='store_true',
+                       help='hide loopback and *.qjz9zk placeholder hosts '
+                       '(--ignore-dev is the old name)')
 
     compare = commands.add_parser('compare',
                                   help='check a capture against a published list')
     compare.add_argument('netlogs', nargs='+', metavar='netlog.json')
     compare.add_argument('--list', required=True, metavar='doc.md',
                          help='docs page carrying the ```hosts block')
-    compare.add_argument('--ignore-dev', action='store_true',
-                         help='hide loopback and *.qjz9zk dev-placeholder hosts')
+    compare.add_argument('--ignore-placeholder', '--ignore-dev',
+                         dest='ignore_placeholder', action='store_true',
+                         help='hide loopback and *.qjz9zk placeholder hosts '
+                         '(--ignore-dev is the old name)')
 
     arguments = parser.parse_args(argv)
     try:
