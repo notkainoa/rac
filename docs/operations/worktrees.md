@@ -201,7 +201,9 @@ UI-control WebSocket — with `--user-data-dir` at the clone's throwaway
 Two `run` options change the clone before launch:
 
 - `--layout sidebar|top-bar` writes the clone profile's
-  `rac.browser.layout` (0 or 1) into `Default/Preferences`, with the
+  `rac.browser.layout` (0 or 1) into `Default/Preferences`. A fresh
+  profile starts with the top bar (`top-bar-default.patch`), so
+  `--layout sidebar` is the one to pass for the other half. It gets the
   same symlink and inside-the-clone checks the downloads prefs get. It
   refuses while a browser from the clone runs, since that browser
   already read its prefs.
@@ -227,8 +229,11 @@ that types may not also move the caret or click — at most one
 `key return`, after the last `type`. A run that opens a settings page
 (the only allowed ones are `settings/assistant`, `settings/appearance`,
 `settings/privacy`, and `settings/general`, which also needs an import
-input because of its Arc import card) may take screenshots and scroll
-only, so its requests file may send no input except `wheel X Y DY`.
+input because of its Arc import card) may take screenshots, scroll and
+zoom only, so its requests file may send no input except `wheel X Y DY`
+and the zoom commands (`command 38001`, `38002`, `38003`). Zoom out to
+fit a card the window is too short for: macOS caps the window at the
+screen's height.
 
 Known limits: import-input paths are checked with `inside_clone`
 before launch, but a path swapped for a symlink between the check and the

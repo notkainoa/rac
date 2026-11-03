@@ -149,6 +149,9 @@ CMD_CHORDS_DENIED = (('y', set()), ('l', {'alt'}), ('b', {'alt'}),
 # like the run args: a denylist of ~300 ids always misses one that opens
 # an internal page (history, downloads, settings, extensions, passwords),
 # a dialog, another app, the clipboard or DevTools.
+# Zoom in, reset and out (IDC_ZOOM_PLUS/NORMAL/MINUS): drawing only, so a
+# settings run may use them.
+COMMANDS_ZOOM = frozenset((38001, 38002, 38003))
 COMMANDS_ALLOWED = frozenset((
     33000, 33001, 33002, 33003, 33006, 33007,  # back, forward, reload, home, stop
     34000, 34001, 34012, 34014, 34015, 34016, 34017,  # windows and tabs
@@ -446,6 +449,8 @@ class Checker:
             self.events.append('return' if args[0] == 'return' else 'input')
         elif verb == 'wheel':
             self.events.append('wheel')
+        elif verb == 'command' and int(args[0]) in COMMANDS_ZOOM:
+            self.events.append('zoom')
         elif verb in ('click', 'move', 'swipe', 'pointer',
                       'pointer-path', 'nskey', 'nsflags', 'command'):
             self.events.append('input')
@@ -505,7 +510,7 @@ def check_line(text, serve=False):
     # piece; the rest stay capture and state verbs.
     events = checker.events
     if 'type' in events or 'letter' in events:
-        if ('input' in events or 'wheel' in events or
+        if ('input' in events or 'wheel' in events or 'zoom' in events or
                 ('type' in events and 'letter' in events)):
             raise Refused('a script that types may not move the caret or '
                           'click; ask Ship')
@@ -521,10 +526,12 @@ def check_line(text, serve=False):
     # be walked with. `wheel X Y DY` sends an unmodified scroll (the
     # harness's MouseWheelEvent carries EF_NONE), which only moves the
     # page; nothing can focus a control for it to change.
-    if checker.settings and any(e != 'wheel' for e in events):
+    # Zoom only changes how the page is drawn, so a settings run may also
+    # zoom out to fit a card the window is too short for.
+    if checker.settings and any(e not in ('wheel', 'zoom') for e in events):
         raise Refused('a run that opens a settings page may only take '
-                      'screenshots and scroll (wheel); the script may not '
-                      'send other input')
+                      'screenshots, scroll (wheel) and zoom (command '
+                      '38001-38003); the script may not send other input')
     # Every placeholder sits at the start of an open-urls word that
     # passed SERVE_URL; nothing else in the line may hold one.
     if line.count(SERVE) != sum(word.startswith(SERVE) and bool(SERVE_URL.fullmatch(word))
@@ -570,6 +577,13 @@ def main(argv):
     # The Pro checks each verb is a string literal in the clone's own
     # harness sources before it sends the line, without parsing it again.
     print('verbs ' + ' '.join(verbs))
+    # The command ids, for a settings page passed as a run arg: such a run
+    # may only zoom. The Air strips this line before the Pro sees it.
+    words = line.split()
+    ids = sorted({int(words[i + 1]) for i, w in enumerate(words[:-1])
+                  if w == 'command' and words[i + 1].isdigit()})
+    if ids:
+        print('commands ' + ' '.join(str(i) for i in ids))
     for output in outputs:
         print(output)
     return 0

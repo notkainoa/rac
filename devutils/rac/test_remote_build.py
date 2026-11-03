@@ -27,6 +27,8 @@ import tempfile
 import textwrap
 import time
 import unittest
+import urllib.error
+import urllib.request
 
 HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / 'remote-build.sh'
@@ -1689,6 +1691,19 @@ class RunTest(RemoteBuildTest):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn('screenshots', result.stderr)
 
+    def test_run_settings_url_arg_allows_only_zoom_commands(self):
+        req = self.folder / 'req.txt'
+        write(req, 'command 40800 ; burst shots 2 100\n')
+        result = self.run_rb('run', self.wt, '--requests-file', req,
+                             '--', 'chrome://settings/assistant', success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('zoom', result.stderr)
+        write(req, 'command 38003 ; burst shots 2 100\n')
+        self.run_rb('run', self.wt, '--requests-file', req, '--timeout', '5',
+                    '--', 'chrome://settings/assistant', success=True)
+        written = (self.clone / 'build/req/req.txt').read_text()
+        self.assertNotIn('\ncommand ', '\n' + written.split('\n', 1)[-1])
+
     def test_run_opening_a_settings_page_is_screenshot_only(self):
         # A settings page as a run arg allows only capture verbs in the
         # requests file: the Air refuses input before anything launches.
@@ -1734,7 +1749,8 @@ class RunTest(RemoteBuildTest):
             result = self.run_rb('run', self.wt, '--requests-file', req,
                                  '--', 'rac://settings/privacy', success=False)
             self.assertEqual(result.returncode, 2, line)
-            self.assertIn('screenshots and scroll', result.stderr, line)
+            self.assertIn('a run that opens a settings page may only',
+                          result.stderr, line)
 
     def test_run_rac_command_bar_ids(self):
         req = self.folder / 'req.txt'
@@ -1880,6 +1896,13 @@ class RunTest(RemoteBuildTest):
                 return True
         self.wait_for(closed, timeout=10)
 
+    def test_run_refuses_an_empty_requests_file_name(self):
+        result = self.run_rb('run', self.wt, '--requests-file', '',
+                             success=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('--requests-file needs a file', result.stderr)
+        self.assertEqual(self.calls(), '')
+
     def test_run_serve_placeholder_needs_serve(self):
         self.serve_dir()
         req = self.folder / 'req.txt'
@@ -1996,7 +2019,9 @@ class RunTest(RemoteBuildTest):
             text=True, start_new_session=True)
         self.addCleanup(self.reap_run, proc, app)
         self.wait_for(lambda: self.procs_starting(app), timeout=30)
-        port = int((self.clone / 'build/serve.port').read_text())
+        ports = sorted((self.clone / 'build').glob('serve.*.port'))
+        self.assertEqual(len(ports), 1, ports)
+        port = int(ports[0].read_text())
         procs = self.serve_procs(port)
         self.assertEqual(len(procs), 1, procs)
         # Bound to 127.0.0.1 alone: no wildcard or other address listens.
@@ -2018,6 +2043,17 @@ class RunTest(RemoteBuildTest):
         if proc.poll() is None:
             os.killpg(proc.pid, signal.SIGKILL)
         proc.communicate(timeout=30)
+
+    def test_run_serve_lists_no_folders(self):
+        served = self.clone / 'devutils/rac/fixtures/pwa'
+        (served / 'sub').mkdir(parents=True, exist_ok=True)
+        (served / 'sub' / 'secret.txt').write_text('x\n')
+        proc, app, port, _ = self.start_serving_run()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        for path in ('/sub/', '/sub'):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                opener.open(f'http://127.0.0.1:{port}{path}', timeout=5)
+            self.assertEqual(caught.exception.code, 404, path)
 
     def test_run_serve_stops_on_interrupt(self):
         self.serve_dir()

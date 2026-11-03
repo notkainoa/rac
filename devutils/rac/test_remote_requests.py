@@ -460,6 +460,18 @@ class RemoteRequestsTest(unittest.TestCase):
             self.assertIn('a script that types may not move the caret or '
                           'click; ask Ship', str(e))
 
+    def test_settings_pages_may_zoom(self):
+        for line in ('open-urls chrome://settings/general ; command 38003 ; '
+                     'burst shots 2 100',
+                     'open-urls chrome://settings/privacy ; command 38001 ; '
+                     'command 38002'):
+            self.ok(line)
+        for line in ('open-urls chrome://settings/general ; command 38003 ; '
+                     'click 1 2',
+                     'open-urls chrome://settings/general ; command 40800',
+                     'command 38003 ; type hello'):
+            self.refused(line)
+
     def test_settings_pages_take_screenshots_only(self):
         # The three settings pages that may open take shots only: any
         # input verb in the same script refuses, on top of the typing

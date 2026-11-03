@@ -68,9 +68,10 @@
 #                                     tour's Arc import step) needs an
 #                                     import input; a
 #                                     run that opens a settings page may only
-#                                     take screenshots and scroll, so its
-#                                     requests file may send no input but
-#                                     `wheel X Y DY`. In the requests
+#                                     take screenshots, scroll and zoom, so
+#                                     its requests file may send no input
+#                                     but `wheel X Y DY` and the zoom
+#                                     commands 38001-38003. In the requests
 #                                     line, pages and command ids are
 #                                     allowlists (`command 40002`, the PWA
 #                                     install, and `command 34055`, open in
@@ -1250,13 +1251,13 @@ check_run_arg() {
 
 cmd_run() {
   local name=$1 timeout=90 requests='' outputs='' fresh=0 checked req_file=''
-  local req_pages='' req_verbs='' req_needs='' import_input=0 setup_page=0 general_page=0 source_root=0
+  local req_pages='' req_verbs='' req_needs='' req_commands='' import_input=0 setup_page=0 general_page=0 source_root=0
   local arc_now=0 settings_page=0 test_type=0 layout='' serve=''
   shift
   while [ $# -gt 0 ]; do
     case "$1" in
       --requests-file)
-        [ $# -ge 2 ] || die "run: --requests-file needs a file on this Mac"
+        [ $# -ge 2 ] && [ -n "$2" ] || die "run: --requests-file needs a file on this Mac"
         # Checked once every option is read: @SERVE@ URLs depend on --serve.
         req_file=$2
         shift 2 ;;
@@ -1312,7 +1313,8 @@ cmd_run() {
     req_pages=$(printf '%s\n' "$outputs" | awk '$1 == "pages" { print $2 }')
     req_verbs=$(printf '%s\n' "$outputs" | awk '$1 == "verbs" { $1=""; print }')
     req_needs=$(printf '%s\n' "$outputs" | awk '$1 == "needs" { print $2 }')
-    outputs=$(printf '%s\n' "$outputs" | awk '$1 != "pages" && $1 != "needs"')
+    req_commands=$(printf '%s\n' "$outputs" | awk '$1 == "commands" { $1=""; print }')
+    outputs=$(printf '%s\n' "$outputs" | awk '$1 != "pages" && $1 != "needs" && $1 != "commands"')
   fi
   local arg lower
   for arg in "$@"; do
@@ -1373,16 +1375,22 @@ cmd_run() {
       *) refuse "the requests file needs an unknown run switch '$arg'" ;;
     esac
   done
-  # A run that opens a settings page may only take screenshots and
-  # scroll. A script that opens settings itself was refused by the
+  # A run that opens a settings page may only take screenshots, scroll
+  # and zoom. A script that opens settings itself was refused by the
   # checker if it carries other input; a settings page passed as a run
   # arg is checked against the requests file's verbs here.
   if [ "$settings_page" = 1 ]; then
     for arg in $req_verbs; do
       case "$arg" in
-        click | command | key | move | nspress | nsflags | nskey | nstype | \
+        click | key | move | nspress | nsflags | nskey | nstype | \
         pointer | pointer-path | swipe | type)
-          refuse "a run that opens a settings page may only take screenshots and scroll (wheel); the requests file may not send other input" ;;
+          refuse "a run that opens a settings page may only take screenshots, scroll (wheel) and zoom (command 38001-38003); the requests file may not send other input" ;;
+      esac
+    done
+    for arg in $req_commands; do
+      case "$arg" in
+        38001 | 38002 | 38003) ;;
+        *) refuse "a run that opens a settings page may only command zoom (38001-38003), not $arg" ;;
       esac
     done
   fi
@@ -1499,6 +1507,7 @@ stop_serve() {
   kill "$serve_pid" 2>/dev/null || true
   wait "$serve_pid" 2>/dev/null || true
   serve_pid=
+  [ -z "${port_file:-}" ] || rm -f "$port_file" "$port_file.tmp"
 }
 if [ -z "$serve" ]; then
   case "$requests $*" in
@@ -1524,9 +1533,10 @@ else
   esac
   link=$(find "$served" -type l -print 2>/dev/null | head -n 1)
   [ -z "$link" ] || { echo "rac remote: refusing --serve: $link is a symlink" >&2; exit 2; }
-  # The server writes the port the kernel gave it here; a planted link is
-  # never followed.
-  port_file="$clone/build/serve.port"
+  # The server writes the port the kernel gave it here, in a file of this
+  # run's own, so two runs on one clone can't read each other's port; a
+  # planted link is never followed.
+  port_file="$clone/build/serve.$$.port"
   for path in "$clone/build" "$port_file"; do
     [ ! -L "$path" ] || { echo "rac remote: refusing: $path is a symlink" >&2; exit 2; }
   done
@@ -1546,6 +1556,10 @@ parent = os.getppid()
 CSP = ("default-src '"'self' 'unsafe-inline' 'unsafe-eval'"' data: blob:; "
        "form-action '"'self'"'; base-uri '"'self'"'")
 class Handler(http.server.SimpleHTTPRequestHandler):
+    # Pages only: a folder without index.html is a 404, never a listing.
+    def list_directory(self, path):
+        self.send_error(404)
+        return None
     def end_headers(self):
         self.send_header("Content-Security-Policy", CSP)
         self.send_header("Cache-Control", "no-store")
