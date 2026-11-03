@@ -164,6 +164,28 @@ OPEN_DIALOG_JS = ("(function () { var f = window.__racOpenDialog;"
                   " setTimeout(f, 0); return true; })()")
 
 
+LOG_QUIET = 2.0  # seconds the fixture log must stay unchanged before grading
+LOG_SETTLE_CAP = 6.0  # longest wait for it
+
+
+def settle_log(fixtures, quiet=LOG_QUIET, cap=LOG_SETTLE_CAP, clock=time.time,
+               sleep=time.sleep):
+    """Waits until the fixture servers' request log has been unchanged for
+    `quiet` seconds, at most `cap`. A page's beacon can still be in flight
+    when the last turn ends (a prompt() answered a moment before), and the
+    log is graded and the browser closed right after; without this wait a
+    late leak is never seen and the variant passes vacuously."""
+    start = clock()
+    count, changed = len(fixtures.snapshot_log()), start
+    while clock() - start < cap:
+        sleep(0.2)
+        now = len(fixtures.snapshot_log())
+        if now != count:
+            count, changed = now, clock()
+        elif clock() - changed >= quiet:
+            return
+
+
 class DialogTrigger:
     """Opens a variant's dialog after rac has attached the page ("dialog":
     "after_attach"). The fake model calls on_chat from its server thread on
@@ -982,6 +1004,7 @@ def run_browser(variant, args):
         trigger = DialogTrigger() if variant.get("dialog") == "after_attach" else None
         rig.model_state.before_chat = trigger.on_chat if trigger else None
         turns, answers, dialogs = drive(variant, rig, browser, proc, shots, trigger)
+        settle_log(rig.fixtures)
         downloads = os.listdir(download_dir)
         record = rig.record("browser", turns, answers, downloads)
         record["dialogs"] = dialogs

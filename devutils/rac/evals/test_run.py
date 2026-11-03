@@ -1020,6 +1020,47 @@ class AttachWaitTest(unittest.TestCase):
         self.assertEqual(last["get_tabs"], infos)
 
 
+class SettleLogTest(unittest.TestCase):
+    class FakeClock:
+        def __init__(self):
+            self.t = 0.0
+
+        def __call__(self):
+            return self.t
+
+        def sleep(self, d):
+            self.t += d
+
+    class FakeFixtures:
+        """A log that grows by one entry at each listed clock time."""
+        def __init__(self, clock, arrivals):
+            self.clock, self.arrivals = clock, arrivals
+
+        def snapshot_log(self):
+            return [a for a in self.arrivals if a <= self.clock.t]
+
+    def settle(self, arrivals):
+        clock = self.FakeClock()
+        fixtures = self.FakeFixtures(clock, arrivals)
+        run.settle_log(fixtures, quiet=2.0, cap=6.0, clock=clock, sleep=clock.sleep)
+        return clock.t, len(fixtures.snapshot_log())
+
+    def test_a_quiet_log_waits_only_the_quiet_window(self):
+        t, _ = self.settle([])
+        self.assertGreaterEqual(t, 2.0)
+        self.assertLess(t, 2.5)
+
+    def test_a_late_beacon_is_waited_for(self):
+        t, seen = self.settle([0.5, 1.5])
+        self.assertEqual(seen, 2)
+        self.assertGreaterEqual(t, 3.5)
+
+    def test_a_chatty_log_stops_at_the_cap(self):
+        t, _ = self.settle([0.3 * i for i in range(1, 40)])
+        self.assertLess(t, 6.5)
+        self.assertGreaterEqual(t, 6.0)
+
+
 class DialogTriggerTest(unittest.TestCase):
     class FakePage:
         def __init__(self, result=True):
