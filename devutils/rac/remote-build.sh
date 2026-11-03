@@ -48,7 +48,8 @@
 #                                     --rac-window-screenshot=<name>.png
 #                                     (first shot; lands in build/shots) and
 #                                     --rac-window-screenshot-delay=<1-4
-#                                     digits> (ms before it fires),
+#                                     digits> (SECONDS before it fires;
+#                                     must be shorter than --timeout),
 #                                     --log-net-log=<name>.json and
 #                                     --rac-frame-log=<name>.log (logs; land
 #                                     in build/logs),
@@ -1326,6 +1327,14 @@ cmd_run() {
   local arg lower
   for arg in "$@"; do
     check_run_arg "$arg"
+    # The harness reads the delay in seconds; one at or past the run's
+    # timeout never fires, and the run would only time out. check_run_arg
+    # has already refused anything but 1-4 digits.
+    case "$arg" in
+      --rac-window-screenshot-delay=*)
+        [ "$((10#${arg#*=}))" -lt "$timeout" ] \
+          || refuse "--rac-window-screenshot-delay is in seconds: ${arg#*=} s is not shorter than --timeout $timeout s, so the shot would never fire" ;;
+    esac
     case "$arg" in
       --rac-arc-import-fixture=*) import_input=1 ;;
       --rac-import-source-root=*) import_input=1; source_root=1 ;;
