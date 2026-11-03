@@ -130,8 +130,16 @@ class ProfileTest(unittest.TestCase):
     def test_application_support_paths_are_refused(self):
         for base in ("/Users/someone/Library/Application Support/me.kainoa.rac",
                      os.path.expanduser("~/Library/Application Support")):
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(RuntimeError):
                 bench.make_profile(base)
+
+    def test_the_refusal_survives_python_dash_O(self):
+        import subprocess, sys
+        code = ("import bench\ntry:\n bench.make_profile('/x/Application Support/y')\n"
+                "except RuntimeError: print('refused')")
+        out = subprocess.run([sys.executable, "-O", "-c", code], cwd=os.path.dirname(
+            os.path.abspath(__file__)), capture_output=True, text=True).stdout
+        self.assertEqual(out.strip(), "refused")
 
 
 class ArgsTest(unittest.TestCase):
@@ -213,8 +221,15 @@ class ProcessTreeTest(unittest.TestCase):
         self.assertEqual(bench.parse_cputime("junk"), 0.0)
 
     def test_tree_cputime_sums_rows(self):
-        self.ps_output = " 0:01.00\n 0:02.50\n"
+        self.ps_output = " 100 0:01.00\n 101 0:02.50\n"
         self.assertEqual(bench.tree_cputime_s(100, self.run_tree), 3.5)
+
+    def test_cputimes_follow_the_pid_column_when_a_process_vanishes(self):
+        # 101 exited between pgrep and ps: its row is missing, and 102's
+        # time must not be credited to 101.
+        self.ps_output = " 100 0:01.00\n 102 0:09.00\n"
+        self.assertEqual(bench.tree_cputimes(100, self.run_tree),
+                         {100: 1.0, 102: 9.0})
 
 
 TOP_OUTPUT = """Processes: 10 total, 1 running
@@ -243,8 +258,8 @@ class CpuDeltaTest(unittest.TestCase):
                 state["after"] = True
                 return FakeProc("")
             if cmd[0] == "ps":
-                rows = (" 0:11.00\n 0:21.00\n 0:50.00\n" if state["after"]
-                        else " 0:10.00\n 0:20.00\n")
+                rows = (" 100 0:11.00\n 101 0:21.00\n 102 0:50.00\n" if state["after"]
+                        else " 100 0:10.00\n 101 0:20.00\n")
                 return FakeProc(rows)
             return FakeProc("")
         cpu, _ = bench.idle_sample(100, 30, run)
@@ -262,7 +277,7 @@ class TopTest(unittest.TestCase):
     def test_idle_sample_combines_cputime_delta_and_top_wakeups(self):
         # pgrep reports no children, so the tree is {100} alone: top rows for
         # 101 and 999 don't count toward wakeups.
-        calls = iter([" 0:10.00\n", " 0:11.50\n"])
+        calls = iter([" 100 0:10.00\n", " 100 0:11.50\n"])
 
         def run(cmd):
             if cmd[0] == "ps":
@@ -304,10 +319,6 @@ class ParseCliTest(unittest.TestCase):
                         "--out", "/tmp/rac-bench-test.json"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TypingTest(unittest.TestCase):
     def test_clock_stops_at_the_input_event_before_key_release(self):
         calls = []
@@ -322,3 +333,37 @@ class TypingTest(unittest.TestCase):
 
         bench.measure_typing(FakePage())
         self.assertEqual(calls, ["eval-arm", "keyDown", "eval-wait", "keyUp"])
+
+
+class TabSwitchTest(unittest.TestCase):
+    def test_one_failed_switch_does_not_drop_the_other_four(self):
+        results = iter([10.0, bench.cdp.CdpError("rAF never fired"), 30.0, 20.0, 40.0])
+
+        def measure(browser, a, b):
+            r = next(results)
+            if isinstance(r, Exception):
+                raise r
+            return r
+        median, errors = bench.tab_switch_median(None, ["a", "b"], measure)
+        self.assertEqual(median, 25.0)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("1 of 5", errors[0]["error"])
+
+    def test_all_failing_gives_no_median(self):
+        def measure(browser, a, b):
+            raise bench.cdp.CdpError("x")
+        median, errors = bench.tab_switch_median(None, ["a", "b"], measure)
+        self.assertIsNone(median)
+        self.assertIn("5 of 5", errors[0]["error"])
+
+
+class LogNameTest(unittest.TestCase):
+    def test_app_names_cannot_escape_the_log_dir(self):
+        name = bench.log_file_name("../../etc/x", 2)
+        self.assertNotIn("/", name)
+        self.assertTrue(name.endswith("-2.log"))
+        self.assertEqual(bench.log_file_name("rac", 1), "rac-1.log")
+
+
+if __name__ == "__main__":
+    unittest.main()

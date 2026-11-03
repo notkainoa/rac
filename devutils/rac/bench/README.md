@@ -28,7 +28,8 @@ python3 devutils/rac/bench/bench.py report results.json --markdown
 - `--idle-seconds` (default 30) is the idle-CPU window; `--settle-seconds`
   (default 2) the quiet time after each memory level.
 - Results append to `--out` after every app-round, so an interrupted run
-  still has data. A round's browser stderr log is kept in `<out>-logs/`
+  still has data. A round's browser output log (stdout and stderr together)
+  is kept in `<out stem>-logs/` (`results.json` gives `results-logs/`)
   whenever the round reported an error.
 
 Never point the bench at a real profile or an installed copy's app: every
@@ -40,7 +41,7 @@ from a build `run-id` and a `helium-tag`.
 
 ## What happens in a round
 
-One untimed warm-up launch per app comes first, so a freshly copied app's
+One untimed warm-up launch per app comes first (`--warmup`, default 1), so a freshly copied app's
 one-time costs (signature checks, cold disk cache) aren't charged to the
 app that happens to launch first. Then each round launches every app once,
 alternating who goes first (rac, helium; helium, rac; ...) so drift on the
@@ -60,21 +61,22 @@ binary": the number is not a first-launch-after-reboot measurement.
 
 | metric | what it is | how it's measured |
 | --- | --- | --- |
-| `cold_launch_ms` | exec → first page loaded and usable | Time from just before spawning the process until the first page target reports `document.readyState === "complete"` — i.e. `Page.loadEventFired` has fired (a page-side promise resolves on `'load'` if it hasn't yet). Includes up to ~100 ms of the bench's own polling, equal for both apps. Each app's startup page URL is listed in the report: if the two apps start on different pages, the cold-launch numbers compare different work. |
+| `cold_launch_ms` | exec → first page loaded and usable | Time from just before spawning the process until the first page target reports `document.readyState === "complete"` — i.e. `Page.loadEventFired` has fired (a page-side promise resolves on `'load'` if it hasn't yet). Includes the bench's own polling (0.1 s steps for the port file, the endpoint and the first page target, so up to roughly 300 ms in total), equal for both apps. Each app's startup page URL is listed in the report: if the two apps start on different pages, the cold-launch numbers compare different work. |
 | `devtools_port_ms` | exec → DevTools up | Time until `<profile>/DevToolsActivePort` is readable. A strict subset of cold launch; useful for telling browser-start cost from page-load cost. |
-| `new_tab_ms` | Cmd+T → new tab ready | `Target.createTarget about:blank` → its load event. Measures tab creation plus an empty page, taken at one tab; it is not the New Tab page. |
-| `tab_switch_ms` | click another tab → it paints | `Target.activateTarget` between two loaded local pages → the shown tab's `requestAnimationFrame` resolves through `Runtime.evaluate`. Median of 5 alternating switches per round. One method for every app: if rAF never fires, the sample is dropped and noted, never swapped for a different method. |
+| `new_tab_ms` | CDP target creation → blank tab ready | `Target.createTarget about:blank` → its load event. Measures tab creation plus an empty page, taken at one tab; it is not Cmd+T and not the New Tab page. |
+| `tab_switch_ms` | target activation → it paints | `Target.activateTarget` between two loaded local pages (not a user click on the tab strip) → the shown tab's `requestAnimationFrame` resolves through `Runtime.evaluate`. Median of the 5 alternating switches per round. One method for every app: a switch whose rAF never fires is dropped and noted (the median covers the rest; the round has none if all fail), never swapped for a different method. |
 | `scroll_ms` | wheel step → scrolled frame | `Input.dispatchMouseEvent` wheel on `long.html` → the page's `scroll` listener ran and painted a frame via rAF. |
-| `type_latency_ms` | keypress → input event | `Input.dispatchKeyEvent` `x` into `#t` on `input.html` → the element's `input` listener ran. Timed from the bench's side (dispatch to the result of a poll for the in-page flag), so it includes one CDP round trip; that overhead is the same for both apps. |
+| `type_latency_ms` | keypress → input event | `Input.dispatchKeyEvent` `x` into `#t` on `input.html` → the element's `input` listener ran. Timed from the bench's side, from just before the `keyDown` call to the return of the `Runtime.evaluate` that waits for the in-page flag, so it includes the `keyDown` round trip and the evaluate round trip (two CDP calls, not one); that overhead is the same for both apps. |
 | `mem_1tab_mb`, `mem_10tab_mb`, `mem_20tab_mb` | RSS with 1/10/20 tabs | Sum of `ps -o rss=` over the whole process tree (`pgrep -P` recursion), which counts pages shared between processes more than once (macOS has no cheap PSS); the same bias applies to both apps. Measured after that level's tabs all loaded plus a settle. Tabs cycle `index.html`/`long.html`/`input.html` on the local server. |
-| `idle_cpu_pct` | CPU% while idle | `(cputime_after − cputime_before) / 30 s` summed per process over the tree via `ps -o cputime=`, counting only processes alive at both ends, measured with all 20 tabs open and nothing happening. |
-| `idle_wakeups` | idle wakeups in the window | Sum of the tree's `IDLEW` column in `top -l 2 -s 30`'s second sample (in `-l` mode, samples after the first are deltas). `powermetrics` would be better but needs root, so it isn't used. |
+| `idle_cpu_pct` | CPU% while idle | `(cputime_after − cputime_before) / idle window` (`--idle-seconds`, default 30) summed per process over the tree via `ps -o cputime=`, counting only processes alive at both ends, measured with all 20 tabs open and nothing happening. |
+| `idle_wakeups` | idle wakeups in the window | Sum of the tree's `IDLEW` column in `top -l 2 -s <idle window>`'s second sample (in `-l` mode, samples after the first are deltas). `powermetrics` would be better but needs root, so it isn't used. |
 
 The report gives, per metric per app: **median (min–max, n)** and the
 rac/Helium ratio on medians (the first `rac*` app over the first other app;
 `—` when the denominator's median is 0). `run` exits 1 when an app has no
 successful cold launch, so a bench where every round failed can't pass as a
-comparison.
+comparison. If an app's process tree survives SIGKILL, that round's numbers
+are discarded and the run stops, so leftovers can't skew later rounds.
 
 ## Interpreting results
 

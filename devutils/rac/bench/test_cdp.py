@@ -25,7 +25,7 @@ def server_frame(text, opcode=0x1, fin=True):
     return head + data
 
 
-def read_client_frame(conn):
+def read_client_raw(conn):
     def need(n):
         buf = b""
         while len(buf) < n:
@@ -42,8 +42,13 @@ def read_client_frame(conn):
         n = struct.unpack(">Q", need(8))[0]
     assert b1 & 0x80, "client frames must be masked"
     mask = need(4)
-    text = bytes(b ^ mask[i % 4] for i, b in enumerate(need(n))).decode()
-    return text if b0 & 0x0F == 0x1 else None  # control frames carry no message
+    payload = bytes(b ^ mask[i % 4] for i, b in enumerate(need(n)))
+    return b0 & 0x0F, payload
+
+
+def read_client_frame(conn):
+    opcode, payload = read_client_raw(conn)
+    return payload.decode() if opcode == 0x1 else None  # control frames carry no message
 
 
 class FakeBrowser:
@@ -55,6 +60,7 @@ class FakeBrowser:
         self.sock.listen(1)
         self.port = self.sock.getsockname()[1]
         self.handler = handler
+        self.controls = []
         threading.Thread(target=self.run, daemon=True).start()
 
     def run(self):
@@ -71,9 +77,11 @@ class FakeBrowser:
                      b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
         try:
             while True:
-                text = read_client_frame(conn)
-                if text is not None:
-                    self.handler(conn, json.loads(text))
+                opcode, payload = read_client_raw(conn)
+                if opcode == 0x1:
+                    self.handler(conn, json.loads(payload.decode()))
+                else:
+                    self.controls.append((opcode, payload))
         except (EOFError, OSError):
             pass
         finally:
@@ -137,13 +145,27 @@ class CdpTest(unittest.TestCase):
         big = "x" * 70000
 
         def handler(conn, msg):
-            conn.sendall(server_frame(b"", opcode=0x9))  # ping: client must pong
+            conn.sendall(server_frame(b"hi", opcode=0x9))  # ping: client must pong
             payload = json.dumps({"id": msg["id"], "result": {"big": big}})
             half = len(payload) // 2
             conn.sendall(server_frame(payload[:half], 0x1, fin=False) +
                          server_frame(payload[half:], 0x0))
         client = self.connect(handler)
         self.assertEqual(client.call("Big")["big"], big)
+        deadline = time.time() + 3
+        while not self.browser.controls and time.time() < deadline:
+            time.sleep(0.01)
+        # read_client_raw already asserted the pong was masked.
+        self.assertEqual(self.browser.controls, [(0xA, b"hi")])
+
+    def test_host_header_brackets_ipv6_and_empty_path_is_slash(self):
+        import urllib.parse
+        u = urllib.parse.urlsplit("ws://[::1]:9222")
+        self.assertEqual(cdp.host_header(u), "[::1]:9222")
+        self.assertEqual(cdp.request_target(u), "/")
+        v = urllib.parse.urlsplit("ws://127.0.0.1:9/devtools/x?a=1")
+        self.assertEqual(cdp.host_header(v), "127.0.0.1:9")
+        self.assertEqual(cdp.request_target(v), "/devtools/x?a=1")
 
     def test_handshake_sends_no_origin_header(self):
         def handler(conn, msg):

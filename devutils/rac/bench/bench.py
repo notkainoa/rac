@@ -127,10 +127,13 @@ def make_profile(base=None):
     containing "Application Support" — a real browser profile's home on
     macOS — is refused outright."""
     root = os.path.realpath(base or tempfile.gettempdir())
-    assert "Application Support" not in root, f"refusing profile folder {root}"
+    if "Application Support" in root:
+        raise RuntimeError(f"refusing profile folder {root}")
     path = tempfile.mkdtemp(prefix=PROFILE_PREFIX, dir=root)
     real = os.path.realpath(path)
-    assert "Application Support" not in real, f"refusing profile folder {real}"
+    if "Application Support" in real:
+        shutil.rmtree(path, ignore_errors=True)
+        raise RuntimeError(f"refusing profile folder {real}")
     return real
 
 
@@ -247,6 +250,8 @@ def kill_tree(proc, profile, grace=20):
     deadline = time.time() + grace
     while time.time() < deadline and _alive(pids):
         time.sleep(0.25)
+    # A helper spawned during the grace period carries the profile too.
+    pids |= _profile_pids(profile)
     for pid in _alive(pids):
         try:
             os.kill(pid, signal.SIGKILL)
@@ -258,7 +263,7 @@ def kill_tree(proc, profile, grace=20):
         pass
     deadline = time.time() + 10
     while time.time() < deadline:
-        if not _alive(pids):
+        if not _alive(pids | _profile_pids(profile)):
             return True
         time.sleep(0.25)
     return False
@@ -297,7 +302,7 @@ def tree_pids(root_pid, run=_run):
 
 
 def _ps_field(pids, field, run):
-    out = run(["ps", "-o", f"{field}=", "-p", ",".join(str(p) for p in pids)])
+    out = run(["ps", "-o", field if "=" in field else f"{field}=", "-p", ",".join(str(p) for p in pids)])
     return out.stdout
 
 
@@ -324,11 +329,16 @@ def parse_cputime(text):
 
 
 def tree_cputimes(root_pid, run=_run):
-    """{pid: cumulative cpu seconds} for the process tree. `ps` prints rows
-    in pid order, so the pids are asked for sorted and zipped back."""
+    """{pid: cumulative cpu seconds} for the process tree. `ps` is asked for
+    the pid next to each value, so a process that exits between pgrep and ps
+    (its row is simply missing) can't shift the others onto the wrong pids."""
     pids = sorted(tree_pids(root_pid, run))
-    rows = [w for w in _ps_field(pids, "cputime", run).split("\n") if w.strip()]
-    return dict(zip(pids, (parse_cputime(w) for w in rows)))
+    out = {}
+    for line in _ps_field(pids, "pid=,cputime=", run).split("\n"):
+        words = line.split()
+        if len(words) == 2 and words[0].isdigit():
+            out[int(words[0])] = parse_cputime(words[1])
+    return out
 
 
 def tree_cputime_s(root_pid, run=_run):
@@ -433,6 +443,26 @@ def activate(browser, page):
     browser.call("Target.activateTarget", {"targetId": page.target_id})
 
 
+def tab_switch_median(browser, tabs, measure=None):
+    """Five alternating switches between the first two tabs. Each switch
+    that fails is noted and skipped; the median is over those that finished.
+    Returns (median or None, errors)."""
+    measure = measure or measure_tab_switch
+    pairs = ((tabs[0], tabs[1]), (tabs[1], tabs[0])) * 2 + ((tabs[0], tabs[1]),)
+    samples, failures = [], []
+    for pair in pairs:
+        try:
+            samples.append(measure(browser, *pair))
+        except (cdp.CdpError, OSError) as e:
+            failures.append(str(e))
+    errors = []
+    if failures:
+        errors.append({"metric": "tab_switch_ms",
+                       "error": f"{len(failures)} of {len(pairs)} switches "
+                                f"failed (kept {len(samples)}): {failures[0]}"})
+    return (statistics.median(samples) if samples else None), errors
+
+
 def measure_tab_switch(browser, a, b):
     """activateTarget B -> B paints a frame (rAF through Runtime.evaluate),
     after activating A so B starts hidden. One method for every app; raises
@@ -488,6 +518,12 @@ def measure_typing(page):
     page.call("Input.dispatchKeyEvent",
               {"type": "keyUp", "key": "x", "code": "KeyX"})
     return elapsed
+
+
+def log_file_name(name, round_no):
+    """A log file name that stays inside the log dir whatever the app is
+    called."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", f"{name}-{round_no}") + ".log"
 
 
 # --- one round --------------------------------------------------------------
@@ -549,14 +585,10 @@ def measure_round(app, page_base, settle_s, idle_s, log_dir=None):
             m[f"mem_{count}tab_mb"] = tree_rss_kb(proc.pid) / 1024
 
         # Tab switch between the two first local pages.
-        try:
-            # Five alternating switches; the round keeps their median.
-            samples = [measure_tab_switch(browser, *pair) for pair in
-                       ((tabs[0], tabs[1]), (tabs[1], tabs[0])) * 2 +
-                       ((tabs[0], tabs[1]),)]
-            m["tab_switch_ms"] = statistics.median(samples)
-        except (cdp.CdpError, OSError) as e:
-            errors.append({"metric": "tab_switch_ms", "error": str(e)})
+        median, switch_errors = tab_switch_median(browser, tabs)
+        errors += switch_errors
+        if median is not None:
+            m["tab_switch_ms"] = median
 
         # Scroll on tab 2 (long.html), typing on tab 3 (input.html).
         for metric, index, fn in (("scroll_ms", 1, measure_scroll),
@@ -591,14 +623,18 @@ def measure_round(app, page_base, settle_s, idle_s, log_dir=None):
             browser.close()
         if proc is not None:
             if not kill_tree(proc, profile):
+                # Leftover processes would load the machine for every later
+                # round, so this round's numbers are void and the run stops.
                 errors.append({"metric": "round",
                                "error": "process tree survived SIGKILL"})
+                m.clear()
+                info["tree_survived"] = True
         log.close()
         if errors and log_dir:
             os.makedirs(log_dir, exist_ok=True)
             try:
                 shutil.copy(log_path, os.path.join(
-                    log_dir, f"{app['name']}-{app.get('round', 0)}.log"))
+                    log_dir, log_file_name(app["name"], app.get("round", 0))))
             except OSError:
                 pass
         if os.path.basename(profile).startswith(PROFILE_PREFIX):
@@ -740,12 +776,15 @@ def run_bench(apps, rounds, pages_dir, idle_s, settle_s, log_dir=None,
                 for e in errors:
                     print(f"  note: {e['metric']}: {e['error']}", flush=True)
                 print(f"  {len(metrics)} metrics ok", flush=True)
-                if r < 1:
-                    continue
-                doc["samples"].append({"app": app["name"], "round": r,
-                                       "metrics": metrics, "errors": errors,
-                                       **info})
-                yield doc
+                if r >= 1:
+                    doc["samples"].append({"app": app["name"], "round": r,
+                                           "metrics": metrics, "errors": errors,
+                                           **info})
+                    yield doc
+                if info.get("tree_survived"):
+                    raise RuntimeError(
+                        f"{app['name']}: its process tree survived SIGKILL; "
+                        "stopping so leftovers can't skew later rounds")
     finally:
         server.shutdown()
         server.server_close()

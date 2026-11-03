@@ -23,6 +23,17 @@ class CdpError(Exception):
     pass
 
 
+def request_target(u):
+    """Path plus query of a split URL; an empty path is "/"."""
+    return (u.path or "/") + ("?" + u.query if u.query else "")
+
+
+def host_header(u):
+    """host:port, with an IPv6 literal in brackets."""
+    host = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
+    return f"{host}:{u.port}"
+
+
 class WebSocket:
     def __init__(self, url, timeout=15):
         u = urllib.parse.urlsplit(url)
@@ -30,9 +41,15 @@ class WebSocket:
             raise CdpError("only ws:// to loopback is allowed")
         self._taken = []
         self.sock = socket.create_connection((u.hostname, u.port), timeout=timeout)
+        try:
+            self._handshake(u)
+        except BaseException:
+            self.sock.close()
+            raise
+
+    def _handshake(self, u):
         key = base64.b64encode(os.urandom(16)).decode()
-        path = u.path + ("?" + u.query if u.query else "")
-        self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\nUpgrade: websocket\r\n"
+        self.sock.sendall((f"GET {request_target(u)} HTTP/1.1\r\nHost: {host_header(u)}\r\nUpgrade: websocket\r\n"
                            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
                            f"Sec-WebSocket-Version: 13\r\n\r\n").encode())
         head = b""
@@ -97,7 +114,9 @@ class WebSocket:
             if opcode == 0x8:
                 raise CdpError("connection closed by the browser")
             if opcode == 0x9:
-                self.sock.sendall(bytes([0x8A, 0x80]) + os.urandom(4))
+                mask = os.urandom(4)  # the pong echoes the ping's data, masked
+                self.sock.sendall(bytes([0x8A, 0x80 | len(payload)]) + mask +
+                                  bytes(x ^ mask[i % 4] for i, x in enumerate(payload)))
                 continue
             if opcode == 0xA:
                 continue
