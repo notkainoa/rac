@@ -67,12 +67,15 @@ Index: src/chrome/browser/rac/import/cookie_db_rows.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/cookie_db_rows.cc
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,338 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#include "chrome/browser/rac/import/cookie_db_rows.h"
++
++#include <fcntl.h>
++#include <sys/stat.h>
 +
 +#include <optional>
 +#include <string>
@@ -80,10 +83,15 @@ Index: src/chrome/browser/rac/import/cookie_db_rows.cc
 +#include <utility>
 +#include <vector>
 +
++#include "base/containers/span.h"
 +#include "base/containers/to_vector.h"
++#include "base/files/file.h"
 +#include "base/files/file_path.h"
 +#include "base/files/file_util.h"
++#include "base/files/scoped_file.h"
 +#include "base/files/scoped_temp_dir.h"
++#include "base/numerics/safe_conversions.h"
++#include "base/posix/eintr_wrapper.h"
 +#include "base/strings/cstring_view.h"
 +#include "base/strings/strcat.h"
 +#include "base/strings/string_util.h"
@@ -205,46 +213,71 @@ Index: src/chrome/browser/rac/import/cookie_db_rows.cc
 +  return base::FilePath(base::StrCat({path.value(), suffix}));
 +}
 +
-+// Copies one file and narrows it to 0600. The directory is already 0700, so
-+// this is belt and braces.
-+bool CopyPrivate(const base::FilePath& from, const base::FilePath& to) {
-+  return base::CopyFile(from, to) &&
-+         base::SetPosixFilePermissions(to,
-+                                       base::FILE_PERMISSION_READ_BY_USER |
-+                                           base::FILE_PERMISSION_WRITE_BY_USER);
-+}
++// How much of a source file is read at a time while it's copied.
++constexpr size_t kCopyChunkBytes = 64 * 1024;
 +
-+// Copies `from` like CopyPrivate(), unless it's a symbolic link or larger
-+// than `max_bytes`. The copy is measured too, in case the source grew while
-+// it was copied (for example, while Arc is open).
++// Copies `from` to a new 0600 file at `to`, unless `from` is a symbolic link,
++// isn't a regular file, or is larger than `max_bytes`.
++//
++// This file is POSIX-only already (SetPosixFilePermissions() and friends);
++// rac ships on macOS.
 +base::expected<void, CookieDbReadError> CopyPrivateCapped(
 +    const base::FilePath& from,
 +    const base::FilePath& to,
 +    int64_t max_bytes) {
 +  // The caller checks only that the database's own path stays inside the
 +  // source folder. A link, to the database or a sidecar, could point
-+  // anywhere, so it's never followed.
-+  if (base::IsLink(from)) {
++  // anywhere, so it's never followed: O_NOFOLLOW fails with ELOOP on one.
++  // The source is opened once and everything below looks only at that open
++  // file, so a link swapped in after a check can't be copied instead.
++  // O_NONBLOCK keeps a FIFO from waiting for a writer before it's refused,
++  // and doesn't change reads from a regular file. O_NOCTTY keeps a terminal
++  // from becoming this process's.
++  base::ScopedFD in_fd(HANDLE_EINTR(
++      open(from.value().c_str(),
++           O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC)));
++  if (!in_fd.is_valid()) {
 +    return base::unexpected(CookieDbReadError::kCopyFailed);
 +  }
-+  std::optional<int64_t> size = base::GetFileSize(from);
-+  if (!size) {
++  base::stat_wrapper_t info;
++  if (base::File::Fstat(in_fd.get(), &info) != 0 || !S_ISREG(info.st_mode)) {
 +    return base::unexpected(CookieDbReadError::kCopyFailed);
 +  }
-+  if (*size > max_bytes) {
++  if (info.st_size > max_bytes) {
 +    return base::unexpected(CookieDbReadError::kSourceTooLarge);
 +  }
-+  if (!CopyPrivate(from, to)) {
++  base::File in(std::move(in_fd));
++
++  // A new file only: O_EXCL never opens an existing file or link. The
++  // directory is already 0700, so 0600 is belt and braces.
++  base::ScopedFD out_fd(HANDLE_EINTR(open(
++      to.value().c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
++      S_IRUSR | S_IWUSR)));
++  if (!out_fd.is_valid()) {
 +    return base::unexpected(CookieDbReadError::kCopyFailed);
 +  }
-+  size = base::GetFileSize(to);
-+  if (!size) {
-+    return base::unexpected(CookieDbReadError::kCopyFailed);
++  base::File out(std::move(out_fd));
++
++  // The source can grow while it's copied (for example, while Arc is open),
++  // so the cap holds for the bytes actually read, too.
++  std::vector<uint8_t> buffer(kCopyChunkBytes);
++  int64_t copied = 0;
++  for (;;) {
++    std::optional<size_t> bytes_read = in.ReadAtCurrentPos(buffer);
++    if (!bytes_read) {
++      return base::unexpected(CookieDbReadError::kCopyFailed);
++    }
++    if (*bytes_read == 0) {
++      return base::ok();
++    }
++    copied += base::checked_cast<int64_t>(*bytes_read);
++    if (copied > max_bytes) {
++      return base::unexpected(CookieDbReadError::kSourceTooLarge);
++    }
++    if (!out.WriteAtCurrentPosAndCheck(base::span(buffer).first(*bytes_read))) {
++      return base::unexpected(CookieDbReadError::kCopyFailed);
++    }
 +  }
-+  if (*size > max_bytes) {
-+    return base::unexpected(CookieDbReadError::kSourceTooLarge);
-+  }
-+  return base::ok();
 +}
 +
 +bool MakePrivateDir(base::ScopedTempDir& dir) {
@@ -468,7 +501,7 @@ Index: src/chrome/browser/rac/import/cookie_db_rows.h
 +  kSourceTooLarge,
 +  kTempDirFailed,
 +  // A file couldn't be copied, or the DB, its -wal, or its -shm is a symbolic
-+  // link, which is never followed.
++  // link, which is never followed, or isn't a regular file.
 +  kCopyFailed,
 +  kOpenFailed,
 +  kNoCookiesTable,
@@ -479,8 +512,8 @@ Index: src/chrome/browser/rac/import/cookie_db_rows.h
 +// Copies `cookies_db` and any `-wal` / `-shm` siblings into a fresh private
 +// (0700) temp directory, opens the copy read-only, and returns its rows, up
 +// to `limits`. The source files are only ever opened for reading, by the copy.
-+// None of them may be a symbolic link: kCopyFailed. The temp directory is
-+// deleted before returning.
++// Each must be a regular file, not a symbolic link: kCopyFailed. The temp
++// directory is deleted before returning.
 +//
 +// Required columns: host_key, name, value, encrypted_value, path. Every other
 +// column is optional and looked up by name.
@@ -497,7 +530,7 @@ Index: src/chrome/browser/rac/import/cookie_db_rows_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/cookie_db_rows_unittest.cc
-@@ -0,0 +1,454 @@
+@@ -0,0 +1,508 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -521,6 +554,10 @@ Index: src/chrome/browser/rac/import/cookie_db_rows_unittest.cc
 +#include "sql/database.h"
 +#include "sql/test/test_helpers.h"
 +#include "testing/gtest/include/gtest/gtest.h"
++
++#if BUILDFLAG(IS_POSIX)
++#include <sys/stat.h>
++#endif
 +
 +namespace rac::import {
 +namespace {
@@ -926,6 +963,56 @@ Index: src/chrome/browser/rac/import/cookie_db_rows_unittest.cc
 +
 +  EXPECT_EQ(CookieDbReadError::kCopyFailed,
 +            ReadCookieDbRows(db_path_).error());
++}
++
++// Anything but a regular file is refused. Opening a FIFO for reading would
++// otherwise wait for a writer.
++TEST_F(CookieDbRowsFileTest, RefusesFifoWal) {
++  {
++    auto fixture = CookieFixtureDb::Create(db_path_, {});
++    ASSERT_TRUE(fixture);
++    ASSERT_TRUE(fixture->AddRow(FullRow()));
++  }
++  const base::FilePath wal(db_path_.value() + FILE_PATH_LITERAL("-wal"));
++  ASSERT_EQ(0, mkfifo(wal.value().c_str(), 0600));
++
++  EXPECT_EQ(CookieDbReadError::kCopyFailed,
++            ReadCookieDbRows(db_path_).error());
++}
++
++TEST_F(CookieDbRowsFileTest, RefusesDirectoryWal) {
++  {
++    auto fixture = CookieFixtureDb::Create(db_path_, {});
++    ASSERT_TRUE(fixture);
++    ASSERT_TRUE(fixture->AddRow(FullRow()));
++  }
++  const base::FilePath wal(db_path_.value() + FILE_PATH_LITERAL("-wal"));
++  ASSERT_TRUE(base::CreateDirectory(wal));
++
++  EXPECT_EQ(CookieDbReadError::kCopyFailed,
++            ReadCookieDbRows(db_path_).error());
++}
++
++// A regular -wal, not a link, is copied, also when it's exactly at the size
++// cap.
++TEST_F(CookieDbRowsFileTest, CopiesRegularWalAtSizeCap) {
++  auto fixture = CookieFixtureDb::Create(db_path_, {.wal_mode = true});
++  ASSERT_TRUE(fixture);
++  ASSERT_TRUE(fixture->AddRows(NumberedRows(2000)));
++  const base::FilePath wal(db_path_.value() + FILE_PATH_LITERAL("-wal"));
++  const base::FilePath shm(db_path_.value() + FILE_PATH_LITERAL("-shm"));
++  ASSERT_FALSE(base::IsLink(wal));
++  std::optional<int64_t> db_size = base::GetFileSize(db_path_);
++  std::optional<int64_t> wal_size = base::GetFileSize(wal);
++  std::optional<int64_t> shm_size = base::GetFileSize(shm);
++  ASSERT_TRUE(db_size && wal_size && shm_size);
++  // The -wal is the largest file, so it alone meets the cap below.
++  ASSERT_LT(*db_size, *wal_size);
++  ASSERT_LT(*shm_size, *wal_size);
++
++  auto result = ReadCookieDbRows(db_path_, {.max_file_bytes = *wal_size});
++  ASSERT_TRUE(result.has_value());
++  EXPECT_EQ(2000u, result->rows.size());
 +}
 +
 +TEST_F(CookieDbRowsFileTest, RefusesSymlinkedDb) {
