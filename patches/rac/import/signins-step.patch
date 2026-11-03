@@ -3,8 +3,11 @@ sidebar import, it reads a copy of that Arc profile's cookie database, decodes
 it with the key derived from Arc's "Arc Safe Storage" Keychain item (asked for
 once per import, only after the user chose to bring sign-ins over), and writes
 the cookies into the rac profile through the cookie writer. Non-default Arc
-profiles become new rac profiles. Arc must be quit first. Turns on the import
-screens' sign-ins row, Arc-running gate and retry.
+profiles become new rac profiles, reused on later imports. Arc must be quit
+first. Only one Arc import, Undo or retry runs at a time. The import screens'
+backend reports the step on macOS and uses the real Arc-running check, quit
+watcher and sign-ins retry; the page still has to show the sign-ins result,
+the quit-Arc gate and the retry button (UI).
 
 Index: src/chrome/browser/rac/import/BUILD.gn
 ===================================================================
@@ -863,7 +866,14 @@ Index: src/chrome/browser/rac/import/arc_import_types.h
  // One Arc profile's part of an import.
  struct ArcProfileResult {
    enum class Status {
-@@ -174,6 +208,7 @@ struct ArcProfileResult {
+@@ -170,10 +204,13 @@ struct ArcProfileResult {
+   ArcImportFailure failure = ArcImportFailure::kNone;
+   // The rac profile it went into. Empty when nothing went anywhere.
+   base::FilePath profile_path;
+-  // True if the sign-ins step made that profile for this import.
++  // True if the sign-ins step made that profile, for this import or an
++  // earlier one whose profile a rerun imported into again: not the profile
++  // the import started from.
    bool new_profile = false;
    ArcImportCounts counts;
    History history = History::kNotRequested;
@@ -875,7 +885,7 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/arc_safe_storage_key.cc
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,101 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -888,6 +898,7 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key.cc
 +#include <utility>
 +
 +#include "base/check.h"
++#include "base/command_line.h"
 +#include "base/functional/bind.h"
 +#include "base/memory/weak_ptr.h"
 +#include "base/no_destructor.h"
@@ -898,6 +909,12 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key.cc
 +namespace rac::import {
 +
 +namespace {
++
++#if BUILDFLAG(IS_MAC)
++// switches::kTestType, which //content defines. Spelled out so this target
++// doesn't depend on //content for one string.
++constexpr char kTestTypeSwitch[] = "test-type";
++#endif
 +
 +// The answer of the live ScopedArcSafeStorageKeyForTesting, if any. Set and
 +// read on the test's main thread only.
@@ -943,6 +960,13 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key.cc
 +    return std::make_unique<FixedAnswerSource>(*answer);
 +  }
 +#if BUILDFLAG(IS_MAC)
++  // Browser tests run with --test-type. One that gets here without
++  // ScopedArcSafeStorageKeyForTesting would show a real Keychain prompt for
++  // the machine's own Arc item, or hang on it on a bot, so it crashes
++  // instead. This also covers anything else launched with --test-type.
++  CHECK(!base::CommandLine::InitializedForCurrentProcess() ||
++        !base::CommandLine::ForCurrentProcess()->HasSwitch(kTestTypeSwitch))
++      << "Tests must use ScopedArcSafeStorageKeyForTesting";
 +  return internal::CreateKeychainArcSafeStorageKey();
 +#else
 +  return std::make_unique<FixedAnswerSource>(
@@ -967,7 +991,7 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/arc_safe_storage_key.h
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,87 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1019,7 +1043,9 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key.h
 +};
 +
 +// The real source (the "Arc Safe Storage" Keychain item), or the testing
-+// answer while a ScopedArcSafeStorageKeyForTesting is alive.
++// answer while a ScopedArcSafeStorageKeyForTesting is alive. Asking for the
++// real source in a process run with --test-type is a CHECK failure, so no
++// test can show a real Keychain prompt.
 +std::unique_ptr<ArcSafeStorageKeySource> CreateArcSafeStorageKeySource();
 +
 +// Test seam. While alive, CreateArcSafeStorageKeySource() returns a source that
@@ -1057,7 +1083,7 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key_mac.mm
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/arc_safe_storage_key_mac.mm
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,175 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1102,9 +1128,39 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key_mac.mm
 +  }
 +}
 +
++// The password on its way from the Keychain read to the reply. Wipes it
++// when it goes, the way ArcCookieKey zeroes itself, so it's wiped even when
++// the reply never runs: the read is CONTINUE_ON_SHUTDOWN, and a reply
++// dropped at shutdown frees the result without running.
++class ScopedPassword {
++ public:
++  explicit ScopedPassword(PasswordResult result) : result_(std::move(result)) {}
++  ScopedPassword(ScopedPassword&& other) : result_(other.Take()) {}
++  ScopedPassword& operator=(ScopedPassword&& other) {
++    if (this != &other) {
++      Wipe(result_);
++      result_ = other.Take();
++    }
++    return *this;
++  }
++  ~ScopedPassword() { Wipe(result_); }
++
++  // Hands the password over and wipes this copy. A copy, not a move: a
++  // moved-from string may keep the bytes in its own buffer.
++  PasswordResult Take() {
++    PasswordResult out = result_;
++    Wipe(result_);
++    result_ = base::unexpected(ArcKeyError::kFailed);
++    return out;
++  }
++
++ private:
++  PasswordResult result_;
++};
++
 +// Reads the password. Blocks while macOS shows its access prompt, so it runs
 +// on the thread pool. Read only: it never adds, updates or deletes an item.
-+PasswordResult ReadArcPasswordFromKeychain() {
++ScopedPassword ReadArcPasswordFromKeychain() {
 +  @autoreleasepool {
 +    // No kSecUseDataProtectionKeychain: Arc's item is in the file-based login
 +    // Keychain, which a data protection query would never search.
@@ -1124,17 +1180,18 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key_mac.mm
 +      if (error == ArcKeyError::kFailed) {
 +        OSSTATUS_DLOG(WARNING, status) << "Reading Arc Safe Storage failed";
 +      }
-+      return base::unexpected(error);
++      return ScopedPassword(base::unexpected(error));
 +    }
 +
 +    CFDataRef data = base::apple::CFCast<CFDataRef>(result.get());
 +    if (!data || CFDataGetLength(data) == 0) {
-+      return base::unexpected(ArcKeyError::kFailed);
++      return ScopedPassword(base::unexpected(ArcKeyError::kFailed));
 +    }
 +    // The password goes straight into the string handed to the caller. The
 +    // CFData belongs to the Security framework and is immutable, so it is
 +    // released, not overwritten.
-+    return std::string(base::as_string_view(base::apple::CFDataToSpan(data)));
++    return ScopedPassword(
++        std::string(base::as_string_view(base::apple::CFDataToSpan(data))));
 +  }
 +}
 +
@@ -1163,16 +1220,16 @@ Index: src/chrome/browser/rac/import/arc_safe_storage_key_mac.mm
 +  }
 +
 + private:
-+  // Static so the password is wiped even when the source is gone.
++  // Static so it runs even when the source is gone; `password` then wipes
++  // itself.
 +  static void OnRead(base::WeakPtr<KeychainArcSafeStorageKeySource> source,
 +                     ArcPasswordCallback done,
-+                     PasswordResult result) {
++                     ScopedPassword password) {
 +    if (!source) {
-+      Wipe(result);
 +      return;
 +    }
 +    DCHECK_CALLED_ON_VALID_SEQUENCE(source->sequence_checker_);
-+    std::move(done).Run(std::move(result));
++    std::move(done).Run(password.Take());
 +  }
 +
 +  SEQUENCE_CHECKER(sequence_checker_);
@@ -1356,7 +1413,7 @@ Index: src/chrome/browser/rac/import/arc_signins_core.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/arc_signins_core.cc
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,372 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1392,18 +1449,20 @@ Index: src/chrome/browser/rac/import/arc_signins_core.cc
 +      FROM_HERE, base::BindOnce(std::move(done), std::move(key)));
 +}
 +
-+// One profile's sign-ins. Owns itself from Start() until it posts `done`.
-+class SignInsRun {
++// One profile's sign-ins. Its owner keeps it from RunArcSignIns() until
++// `done`, or cancels it by destroying it.
++class SignInsRun : public ArcSignInsRun {
 + public:
 +  SignInsRun(ArcRunKeyCache& keys, ArcSignInsJob job, ArcSignInsCallback done)
 +      : keys_(keys), job_(std::move(job)), done_(std::move(done)) {
 +    CHECK(job_.is_arc_running);
++    CHECK(job_.has_cookie_db);
 +    CHECK(job_.read_cookies);
 +    CHECK(job_.make_sink);
 +  }
 +  SignInsRun(const SignInsRun&) = delete;
 +  SignInsRun& operator=(const SignInsRun&) = delete;
-+  ~SignInsRun() = default;
++  ~SignInsRun() override = default;
 +
 +  void Start() {
 +    // Arc keeps its cookie store open while it runs, so a copy could be torn
@@ -1417,6 +1476,24 @@ Index: src/chrome/browser/rac/import/arc_signins_core.cc
 +      Finish(WithStatus(ArcSignInsResult::Status::kNoCookies));
 +      return;
 +    }
++    // Looked for before the key, so a profile without a database never
++    // shows macOS's prompt.
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE,
++        {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
++         base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
++        base::BindOnce(job_.has_cookie_db, job_.arc_support_dir,
++                       job_.profile_directory),
++        base::BindOnce(&SignInsRun::OnCookieDbChecked,
++                       weak_factory_.GetWeakPtr()));
++  }
++
++ private:
++  void OnCookieDbChecked(bool found) {
++    if (!found) {
++      Finish(WithStatus(ArcSignInsResult::Status::kNoCookies));
++      return;
++    }
 +    if (!keys_->HasAnswer(job_.run_id)) {
 +      Progress(ArcImportProgress::Step::kWaitingForMac);
 +    }
@@ -1424,10 +1501,14 @@ Index: src/chrome/browser/rac/import/arc_signins_core.cc
 +                                              weak_factory_.GetWeakPtr()));
 +  }
 +
-+ private:
 +  void OnKey(ArcKeyResult key) {
 +    if (!key.has_value()) {
 +      Finish(WithStatus(SignInsStatusFor(key.error())));
++      return;
++    }
++    // The user may have opened Arc while macOS showed its prompt.
++    if (job_.is_arc_running.Run()) {
++      Finish(WithStatus(ArcSignInsResult::Status::kArcRunning));
 +      return;
 +    }
 +    Progress(ArcImportProgress::Step::kSignIns);
@@ -1476,10 +1557,19 @@ Index: src/chrome/browser/rac/import/arc_signins_core.cc
 +  }
 +
 +  void Finish(const ArcSignInsResult& result) {
++    // The writer allows deleting the sink from its `done`.
++    sink_.reset();
++    // Through a weak pointer, so destroying the run before the task runs
++    // still cancels `done`.
 +    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
-+        FROM_HERE, base::BindOnce(std::move(done_), result));
-+    // Also deletes the sink, which the writer allows from its `done`.
-+    delete this;
++        FROM_HERE, base::BindOnce(&SignInsRun::Report,
++                                  weak_factory_.GetWeakPtr(), result));
++  }
++
++  void Report(const ArcSignInsResult& result) {
++    // The owner may destroy this run from `done`; nothing here touches it
++    // after.
++    std::move(done_).Run(result);
 +  }
 +
 +  const raw_ref<ArcRunKeyCache> keys_;
@@ -1615,10 +1705,13 @@ Index: src/chrome/browser/rac/import/arc_signins_core.cc
 +ArcSignInsJob& ArcSignInsJob::operator=(ArcSignInsJob&&) = default;
 +ArcSignInsJob::~ArcSignInsJob() = default;
 +
-+void RunArcSignIns(ArcRunKeyCache& keys,
-+                   ArcSignInsJob job,
-+                   ArcSignInsCallback done) {
-+  (new SignInsRun(keys, std::move(job), std::move(done)))->Start();
++std::unique_ptr<ArcSignInsRun> RunArcSignIns(ArcRunKeyCache& keys,
++                                             ArcSignInsJob job,
++                                             ArcSignInsCallback done) {
++  auto run =
++      std::make_unique<SignInsRun>(keys, std::move(job), std::move(done));
++  run->Start();
++  return run;
 +}
 +
 +ArcSignInsResult FoldArcSignIns(int undecodable,
@@ -1671,12 +1764,33 @@ Index: src/chrome/browser/rac/import/arc_signins_core.cc
 +  NOTREACHED();
 +}
 +
++ArcImportResult::Status FoldArcImportStatus(
++    const std::vector<ArcProfileResult>& profiles,
++    ArcImportFailure failure) {
++  bool any_done = false;
++  bool any_failed = false;
++  for (const ArcProfileResult& profile : profiles) {
++    const bool failed = profile.status == ArcProfileResult::Status::kFailed;
++    any_done |= profile.status == ArcProfileResult::Status::kDone ||
++                profile.history == ArcProfileResult::History::kImported ||
++                (!failed && profile.sign_ins.written > 0);
++    any_failed |= failed;
++  }
++  if (any_done) {
++    return ArcImportResult::Status::kDone;
++  }
++  if (any_failed || failure != ArcImportFailure::kNone) {
++    return ArcImportResult::Status::kFailed;
++  }
++  return ArcImportResult::Status::kNothingNew;
++}
++
 +}  // namespace rac::import
 Index: src/chrome/browser/rac/import/arc_signins_core.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/arc_signins_core.h
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,203 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1776,6 +1890,12 @@ Index: src/chrome/browser/rac/import/arc_signins_core.h
 +  base::WeakPtrFactory<ArcRunKeyCache> weak_factory_{this};
 +};
 +
++// Whether Arc has a cookie database for the profile: ArcCookieDbPath() isn't
++// empty. Blocking; runs on the thread pool.
++using ArcCookieDbFinder =
++    base::RepeatingCallback<bool(const base::FilePath& arc_support_dir,
++                                 const std::string& profile_directory)>;
++
 +// Reads one Arc profile's cookies: ArcCookieDbPath(), then ReadArcCookies().
 +// Blocking; runs on the thread pool. kSourceMissing when Arc has no cookie
 +// database for the profile.
@@ -1815,6 +1935,8 @@ Index: src/chrome/browser/rac/import/arc_signins_core.h
 +  // IsArcRunning(). Must be set.
 +  base::RepeatingCallback<bool()> is_arc_running;
 +  // Must be set.
++  ArcCookieDbFinder has_cookie_db;
++  // Must be set.
 +  ArcCookieReader read_cookies;
 +  // Makes the target's sink right before the write. Null if the target is
 +  // gone or can't take cookies. Must be set.
@@ -1823,20 +1945,32 @@ Index: src/chrome/browser/rac/import/arc_signins_core.h
 +  ArcSignInsProgressCallback progress;
 +};
 +
++// One ArcSignInsJob while it runs. Destroying it cancels the job: its `done`
++// then never runs. It may be destroyed from `done`.
++class ArcSignInsRun {
++ public:
++  virtual ~ArcSignInsRun() = default;
++};
++
 +// Runs `job`, in order:
 +//
 +// 1. Arc is running: kArcRunning. Nothing is read or asked for.
 +// 2. No Arc folder or profile folder: kNoCookies, without asking for the key.
-+// 3. The run's key from `keys`; kWaitingForMac first if it has to ask. A
++// 3. `has_cookie_db` on a MayBlock thread pool task. No database:
++//    kNoCookies, without asking for the key.
++// 4. The run's key from `keys`; kWaitingForMac first if it has to ask. A
 +//    refusal is kDenied; any other key error is kFailed.
-+// 4. kSignIns, then `read_cookies` on a MayBlock thread pool task.
-+// 5. The cookies go into `make_sink()`, which is kept until it reports.
-+// 6. FoldArcSignIns().
++// 5. Arc started while the key was asked for: kArcRunning. Nothing is read.
++// 6. kSignIns, then `read_cookies` on a MayBlock thread pool task.
++// 7. The cookies go into `make_sink()`, which is kept until it reports.
++// 8. FoldArcSignIns().
 +//
-+// `done` runs once, always from a posted task. `keys` must outlive the job.
-+void RunArcSignIns(ArcRunKeyCache& keys,
-+                   ArcSignInsJob job,
-+                   ArcSignInsCallback done);
++// `done` runs once, always from a posted task, unless the returned run is
++// destroyed first. `keys` must outlive the run.
++[[nodiscard]] std::unique_ptr<ArcSignInsRun> RunArcSignIns(
++    ArcRunKeyCache& keys,
++    ArcSignInsJob job,
++    ArcSignInsCallback done);
 +
 +// The outcome of a read that found cookies, or found none (an empty
 +// `written`): kDone with the counts, kNoCookies when there were none, or
@@ -1847,6 +1981,16 @@ Index: src/chrome/browser/rac/import/arc_signins_core.h
 +ArcSignInsResult::Status SignInsStatusFor(ArcKeyError error);
 +ArcSignInsResult::Status SignInsStatusFor(CookieDbReadError error);
 +
++// The whole import's status from its profiles' results and `failure`, the
++// starting profile's. kDone when a profile's sidebar part or history brought
++// something, or its sign-ins did and its sidebar part didn't fail: sign-ins
++// never make a failed profile count as done. That profile keeps both its
++// kFailed and its ArcSignInsResult. Otherwise kFailed if a profile failed or
++// `failure` is set, else kNothingNew.
++ArcImportResult::Status FoldArcImportStatus(
++    const std::vector<ArcProfileResult>& profiles,
++    ArcImportFailure failure);
++
 +}  // namespace rac::import
 +
 +#endif  // CHROME_BROWSER_RAC_IMPORT_ARC_SIGNINS_CORE_H_
@@ -1854,7 +1998,7 @@ Index: src/chrome/browser/rac/import/arc_signins_unittest.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/rac/import/arc_signins_unittest.cc
-@@ -0,0 +1,510 @@
+@@ -0,0 +1,650 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -2004,7 +2148,13 @@ Index: src/chrome/browser/rac/import/arc_signins_unittest.cc
 +    job.profile_directory = "Default";
 +    job.is_arc_running =
 +        base::BindLambdaForTesting([this] { return arc_running_; });
-+    // Runs on the thread pool.
++    // Both run on the thread pool.
++    job.has_cookie_db = base::BindLambdaForTesting(
++        [this](const base::FilePath& arc_support_dir,
++               const std::string& profile_directory) {
++          ++db_checks_;
++          return has_db_.load();
++        });
 +    job.read_cookies = base::BindLambdaForTesting(
 +        [this](const base::FilePath& arc_support_dir,
 +               const std::string& profile_directory, const ArcCookieKey& key) {
@@ -2030,13 +2180,25 @@ Index: src/chrome/browser/rac/import/arc_signins_unittest.cc
 +  ArcSignInsResult Run(ArcRunKeyCache& keys, ArcSignInsJob job) {
 +    base::RunLoop loop;
 +    ArcSignInsResult out;
-+    RunArcSignIns(keys, std::move(job),
-+                  base::BindLambdaForTesting([&](const ArcSignInsResult& r) {
-+                    out = r;
-+                    loop.Quit();
-+                  }));
++    std::unique_ptr<ArcSignInsRun> run = RunArcSignIns(
++        keys, std::move(job),
++        base::BindLambdaForTesting([&](const ArcSignInsResult& r) {
++          out = r;
++          loop.Quit();
++        }));
 +    loop.Run();
 +    return out;
++  }
++
++  // Starts `job` without waiting. `result` is set once it reports.
++  std::unique_ptr<ArcSignInsRun> Start(
++      ArcRunKeyCache& keys,
++      ArcSignInsJob job,
++      std::optional<ArcSignInsResult>& result) {
++    return RunArcSignIns(
++        keys, std::move(job),
++        base::BindLambdaForTesting(
++            [&result](const ArcSignInsResult& r) { result = r; }));
 +  }
 +
 +  void SetCookies(int count, int undecodable) {
@@ -2052,6 +2214,8 @@ Index: src/chrome/browser/rac/import/arc_signins_unittest.cc
 +  FakeKeychain keychain_;
 +  FakeStore store_;
 +  bool arc_running_ = false;
++  std::atomic<bool> has_db_ = true;
++  std::atomic<int> db_checks_ = 0;
 +  std::atomic<int> reads_ = 0;
 +  std::atomic<bool> read_with_expected_key_ = false;
 +  base::expected<ArcCookieReadResult, CookieDbReadError> read_result_ =
@@ -2363,6 +2527,126 @@ Index: src/chrome/browser/rac/import/arc_signins_unittest.cc
 +  EXPECT_TRUE(store_.written.empty());
 +}
 +
++TEST_F(ArcSignInsCoreTest, NoCookieDatabaseDoesntAsk) {
++  has_db_ = false;
++  SetCookies(1, 0);
++  ArcRunKeyCache keys(Keychain());
++  EXPECT_EQ(Run(keys, Job(kRun)).status, Status::kNoCookies);
++  EXPECT_EQ(db_checks_.load(), 1);
++  // No prompt, and no wait for one.
++  EXPECT_EQ(keychain_.requests, 0);
++  EXPECT_FALSE(keys.HasAnswer(kRun));
++  EXPECT_TRUE(steps_.empty());
++  EXPECT_EQ(reads_.load(), 0);
++  EXPECT_EQ(store_.sinks_made, 0);
++}
++
++TEST_F(ArcSignInsCoreTest, ArcStartedDuringThePromptReadsNothing) {
++  keychain_.answer.reset();
++  SetCookies(1, 0);
++  ArcRunKeyCache keys(Keychain());
++  std::optional<ArcSignInsResult> result;
++  std::unique_ptr<ArcSignInsRun> run = Start(keys, Job(kRun), result);
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(keychain_.held);
++  EXPECT_FALSE(result);
++
++  // Arc opens while macOS shows its prompt, which the user then allows.
++  arc_running_ = true;
++  std::move(keychain_.held).Run(std::string(kPassword));
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(result);
++  EXPECT_EQ(result->status, Status::kArcRunning);
++  EXPECT_EQ(reads_.load(), 0);
++  EXPECT_EQ(store_.sinks_made, 0);
++  EXPECT_EQ(steps_, std::vector<Step>{Step::kWaitingForMac});
++}
++
++TEST_F(ArcSignInsCoreTest, DestroyingTheRunCancelsIt) {
++  keychain_.answer.reset();
++  SetCookies(1, 0);
++  ArcRunKeyCache keys(Keychain());
++  std::optional<ArcSignInsResult> result;
++  std::unique_ptr<ArcSignInsRun> run = Start(keys, Job(kRun), result);
++  task_environment_.RunUntilIdle();
++  ASSERT_TRUE(keychain_.held);
++
++  // As at shutdown with the prompt still open.
++  run.reset();
++  std::move(keychain_.held).Run(std::string(kPassword));
++  task_environment_.RunUntilIdle();
++  EXPECT_FALSE(result);
++  EXPECT_EQ(reads_.load(), 0);
++  EXPECT_EQ(store_.sinks_made, 0);
++}
++
++TEST_F(ArcSignInsCoreTest, DestroyingTheRunAfterItFinishedDropsItsReport) {
++  ArcRunKeyCache keys(Keychain());
++  ArcSignInsJob job = Job(kRun);
++  job.profile_directory.clear();
++  std::optional<ArcSignInsResult> result;
++  std::unique_ptr<ArcSignInsRun> run = Start(keys, std::move(job), result);
++  // Its report is posted, not yet run.
++  run.reset();
++  task_environment_.RunUntilIdle();
++  EXPECT_FALSE(result);
++}
++
++// The whole import's status.
++
++ArcProfileResult ProfileWith(ArcProfileResult::Status status,
++                             int sign_ins_written) {
++  ArcProfileResult profile;
++  profile.status = status;
++  if (sign_ins_written > 0) {
++    profile.sign_ins.status = Status::kDone;
++    profile.sign_ins.written = sign_ins_written;
++  }
++  return profile;
++}
++
++TEST_F(ArcSignInsCoreTest, SignInsDontHideAFailedSidebar) {
++  ArcProfileResult failed =
++      ProfileWith(ArcProfileResult::Status::kFailed, /*sign_ins_written=*/3);
++  failed.failure = ArcImportFailure::kRecordNotSaved;
++  EXPECT_EQ(FoldArcImportStatus({failed}, ArcImportFailure::kRecordNotSaved),
++            ArcImportResult::Status::kFailed);
++  // Even with no failure reported for the whole import.
++  EXPECT_EQ(FoldArcImportStatus({failed}, ArcImportFailure::kNone),
++            ArcImportResult::Status::kFailed);
++}
++
++TEST_F(ArcSignInsCoreTest, SignInsCountWhenTheSidebarHadNothingNew) {
++  EXPECT_EQ(FoldArcImportStatus(
++                {ProfileWith(ArcProfileResult::Status::kNothingNew, 2)},
++                ArcImportFailure::kNone),
++            ArcImportResult::Status::kDone);
++  EXPECT_EQ(FoldArcImportStatus(
++                {ProfileWith(ArcProfileResult::Status::kNothingNew, 0)},
++                ArcImportFailure::kNone),
++            ArcImportResult::Status::kNothingNew);
++}
++
++TEST_F(ArcSignInsCoreTest, AnyDoneProfileMakesTheImportDone) {
++  EXPECT_EQ(
++      FoldArcImportStatus({ProfileWith(ArcProfileResult::Status::kFailed, 3),
++                           ProfileWith(ArcProfileResult::Status::kDone, 0)},
++                          ArcImportFailure::kNone),
++      ArcImportResult::Status::kDone);
++  ArcProfileResult history;
++  history.status = ArcProfileResult::Status::kNothingNew;
++  history.history = ArcProfileResult::History::kImported;
++  EXPECT_EQ(FoldArcImportStatus({history}, ArcImportFailure::kNone),
++            ArcImportResult::Status::kDone);
++}
++
++TEST_F(ArcSignInsCoreTest, FailureWithoutProfilesFails) {
++  EXPECT_EQ(FoldArcImportStatus({}, ArcImportFailure::kBusy),
++            ArcImportResult::Status::kFailed);
++  EXPECT_EQ(FoldArcImportStatus({}, ArcImportFailure::kNone),
++            ArcImportResult::Status::kNothingNew);
++}
++
 +}  // namespace
 +}  // namespace rac::import
 Index: src/chrome/browser/ui/BUILD.gn
@@ -2397,15 +2681,52 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
 ===================================================================
 --- src.orig/chrome/browser/ui/rac/import/arc_importer.cc
 +++ src/chrome/browser/ui/rac/import/arc_importer.cc
-@@ -89,6 +89,7 @@ namespace {
+@@ -22,6 +22,7 @@
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/hash/hash.h"
++#include "base/memory/ptr_util.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
+@@ -48,6 +49,7 @@
+ #include "chrome/browser/rac/import/arc_import_mapping.h"
+ #include "chrome/browser/rac/import/arc_import_record.h"
+ #include "chrome/browser/rac/import/arc_reader.h"
++#include "chrome/browser/rac/import/arc_signins_core.h"
+ #include "chrome/browser/rac/spaces/space.h"
+ #include "chrome/browser/rac/spaces/spaces_service.h"
+ #include "chrome/browser/rac/spaces/spaces_service_factory.h"
+@@ -89,6 +91,9 @@ namespace {
  using ItemKind = ArcImportRecord::ItemKind;
  
  ArcProfileMaker* g_profile_maker = nullptr;
 +ArcSignInsStep* g_sign_ins_step = nullptr;
++// Whether an ArcImportInProgress is held.
++bool g_arc_import_in_progress = false;
  
  constexpr char kSnapshotReason[] = "import-arc";
  // Arc's favicon cache holds small images. Anything larger isn't one.
-@@ -1214,6 +1215,12 @@ class ArcProfileImport : public ProfileO
+@@ -717,6 +722,18 @@ class ArcProfileImport : public ProfileO
+         ArcImportRecord::Interrupted::kNone) {
+       record_dirty_ = true;
+     }
++    // The profiles made for Arc's other profiles, so a rerun imports into
++    // them again. Saved even when nothing else is new.
++    if (run_info_.origin) {
++      for (const auto& [source_key, folder] : run_info_.made_profiles) {
++        auto [it, added] =
++            record_.made_profiles.try_emplace(source_key, folder);
++        if (added || it->second != folder) {
++          it->second = folder;
++          record_dirty_ = true;
++        }
++      }
++    }
+     plan_ = MapArcProfile(source_, record_, GatherLive(profile_, services_),
+                           run_info_.options);
+     result_.counts = plan_.counts;
+@@ -1214,6 +1231,12 @@ class ArcProfileImport : public ProfileO
    // ProfileObserver:
    void OnProfileWillBeDestroyed(Profile* profile) override {
      profile_observation_.Reset();
@@ -2418,7 +2739,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
      Fail(ArcImportFailure::kProfileGone);
    }
  
-@@ -1245,11 +1252,41 @@ class ArcProfileImport : public ProfileO
+@@ -1245,11 +1268,41 @@ class ArcProfileImport : public ProfileO
  
    void Finish() {
      // Releasing the token lets DataBackups refresh its daily backup soon.
@@ -2460,7 +2781,7 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
    const raw_ptr<Profile> profile_;
    const Services services_;
    const ImportProfile source_;
-@@ -1276,6 +1313,7 @@ class ArcProfileImport : public ProfileO
+@@ -1276,12 +1329,14 @@ class ArcProfileImport : public ProfileO
    std::unique_ptr<ArcFaviconWriter> favicon_writer_;
    raw_ptr<BraveExternalProcessImporterHost> history_host_ = nullptr;
    bool history_ok_ = false;
@@ -2468,10 +2789,211 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
  
    base::ScopedObservation<Profile, ProfileObserver> profile_observation_{this};
    base::WeakPtrFactory<ArcProfileImport> weak_factory_{this};
-@@ -1418,6 +1456,10 @@ class ArcImportCoordinator {
+ };
+ 
+-// The whole import: other Arc profiles first, each into the profile the
++// The whole import: other Arc profiles first, each into the profile an
++// earlier import made for it if it's still there, else into one the
+ // sign-ins step makes, then the default one into the profile the import
+ // started from. That order lets the starting profile's record name every
+ // profile the import touched, in one write, while it holds its token.
+@@ -1291,10 +1346,12 @@ class ArcImportCoordinator {
+                     ImportPlan plan,
+                     ArcImportOptions options,
+                     ArcImportProgressCallback progress,
+-                    ArcImportDoneCallback done) {
++                    ArcImportDoneCallback done,
++                    std::unique_ptr<ArcImportInProgress> in_progress) {
+     (new ArcImportCoordinator(profile, std::move(plan), std::move(options),
+-                              std::move(progress), std::move(done)))
+-        ->Next();
++                              std::move(progress), std::move(done),
++                              std::move(in_progress)))
++        ->ReadOriginRecord();
+   }
+ 
+  private:
+@@ -1302,11 +1359,13 @@ class ArcImportCoordinator {
+                        ImportPlan plan,
+                        ArcImportOptions options,
+                        ArcImportProgressCallback progress,
+-                       ArcImportDoneCallback done)
++                       ArcImportDoneCallback done,
++                       std::unique_ptr<ArcImportInProgress> in_progress)
+       : origin_path_(profile->GetPath()),
+         plan_(std::move(plan)),
+         progress_(std::move(progress)),
+-        done_(std::move(done)) {
++        done_(std::move(done)),
++        in_progress_(std::move(in_progress)) {
+     run_.id = base::Uuid::GenerateRandomV4().AsLowercaseString();
+     // The plan carries the folder it was read from (ImportPlan::source_dir),
+     // so history comes from the same copy, such as a dev fixture. ReadArc()
+@@ -1342,18 +1401,74 @@ class ArcImportCoordinator {
+         origin_path_);
+   }
+ 
++  // The starting profile's record says which rac profiles earlier imports
++  // made, so it's read before any profile is made.
++  void ReadOriginRecord() {
++    CreateFileTaskRunner()->PostTaskAndReplyWithResult(
++        FROM_HERE, base::BindOnce(&ArcImportRecord::Read, origin_path_),
++        base::BindOnce(&ArcImportCoordinator::OnOriginRecordRead,
++                       base::Unretained(this)));
++  }
++
++  void OnOriginRecordRead(ArcImportRecord::ReadResult read) {
++    switch (read.status) {
++      // The starting profile's import would refuse to run. Without the
++      // record there's no knowing which profiles exist already, so none is
++      // made either.
++      case ArcImportRecord::ReadStatus::kTooNew:
++        Finish(ArcImportFailure::kRecordTooNew);
++        return;
++      case ArcImportRecord::ReadStatus::kUnreadable:
++        Finish(ArcImportFailure::kRecordUnreadable);
++        return;
++      case ArcImportRecord::ReadStatus::kOk:
++        made_profiles_ = std::move(read.record.made_profiles);
++        break;
++      case ArcImportRecord::ReadStatus::kMissing:
++      case ArcImportRecord::ReadStatus::kCorrupt:
++        break;
++    }
++    Next();
++  }
++
++  // Folder base names of the profiles in the profile list, other than the
++  // starting one.
++  base::flat_set<std::string> OtherProfileFolders() const {
++    base::flat_set<std::string> folders;
++    ProfileManager* manager = g_browser_process->profile_manager();
++    if (!manager) {
++      return folders;
++    }
++    for (const ProfileAttributesEntry* entry :
++         manager->GetProfileAttributesStorage().GetAllProfilesAttributes()) {
++      const base::FilePath& path = entry->GetPath();
++      if (path.DirName() == origin_path_.DirName() && path != origin_path_) {
++        folders.insert(path.BaseName().AsUTF8Unsafe());
++      }
++    }
++    return folders;
++  }
++
+   void Next() {
+     if (next_other_ < others_.size()) {
+       const size_t index = others_[next_other_++];
+-      if (!g_profile_maker) {
+-        results_[index].status = ArcProfileResult::Status::kNeedsProfile;
+-        Next();
++      const std::string reuse = ArcImportRecord::ReusableProfile(
++          made_profiles_, plan_.profiles[index].source_key,
++          OtherProfileFolders());
++      if (!reuse.empty()) {
++        const base::FilePath path = origin_path_.DirName().Append(
++            base::FilePath::FromUTF8Unsafe(reuse));
++        ProfileManager* manager = g_browser_process->profile_manager();
++        const bool was_loaded = manager->GetProfileByPath(path) != nullptr;
++        // Runs the callback with null, maybe right away, if the profile is
++        // gone after all.
++        manager->LoadProfileByPath(
++            path, /*incognito=*/false,
++            base::BindOnce(&ArcImportCoordinator::OnMadeProfileLoaded,
++                           base::Unretained(this), index, was_loaded));
+         return;
+       }
+-      g_profile_maker->MakeProfile(
+-          plan_.profiles[index], ArcProfileName(plan_, index),
+-          base::BindOnce(&ArcImportCoordinator::OnProfileMade,
+-                         base::Unretained(this), index));
++      MakeProfile(index);
+       return;
+     }
+     if (!origin_started_) {
+@@ -1367,6 +1482,7 @@ class ArcImportCoordinator {
+       run.origin = true;
+       run.other_profiles = other_profiles_;
+       run.others_undo_until = others_undo_until_;
++      run.made_profiles = made_profiles_;
+       run.spaces_before = spaces_done_;
+       // With the default profile unchecked, the starting profile still
+       // records the run, for Undo and the hand-offs.
+@@ -1384,12 +1500,60 @@ class ArcImportCoordinator {
+     Finish(ArcImportFailure::kNone);
+   }
+ 
++  void MakeProfile(size_t index) {
++    if (!g_profile_maker) {
++      results_[index].status = ArcProfileResult::Status::kNeedsProfile;
++      Next();
++      return;
++    }
++    g_profile_maker->MakeProfile(
++        plan_.profiles[index], ArcProfileName(plan_, index),
++        base::BindOnce(&ArcImportCoordinator::OnProfileMade,
++                       base::Unretained(this), index));
++  }
++
++  void OnMadeProfileLoaded(size_t index, bool was_loaded, Profile* profile) {
++    if (!profile) {
++      // Deleted since, or being deleted: a new one.
++      MakeProfile(index);
++      return;
++    }
++    // Loaded only for this import, it'd otherwise stay loaded for the
++    // session, waiting for a first window.
++    StartOther(index, profile, /*release_first_window=*/!was_loaded);
++  }
++
+   void OnProfileMade(size_t index, Profile* profile) {
+     if (!profile) {
+       results_[index].status = ArcProfileResult::Status::kFailed;
+       Next();
+       return;
+     }
++    made_profiles_[plan_.profiles[index].source_key] =
++        profile->GetPath().BaseName().AsUTF8Unsafe();
++    StartOther(index, profile, /*release_first_window=*/true);
++  }
++
++  // Imports Arc's profile `index` into `profile`, which an import made.
++  void StartOther(size_t index, Profile* profile, bool release_first_window) {
++    // Holds the profile through its import, and only that long.
++    keep_alive_ = ScopedProfileKeepAlive::TryAcquire(
++        profile,
++        ProfileKeepAliveOrigin::kWaitingForBookmarksImportOnFirstRun);
++    if (!keep_alive_) {
++      // Being deleted.
++      results_[index].status = ArcProfileResult::Status::kFailed;
++      results_[index].failure = ArcImportFailure::kProfileGone;
++      Next();
++      return;
++    }
++    if (release_first_window) {
++      // ProfileManager keeps a profile it loads until its first window
++      // closes. Nobody may open this one, so the keep-alive above is the
++      // only one the import needs.
++      g_browser_process->profile_manager()->ClearFirstBrowserWindowKeepAlive(
++          profile);
++    }
+     ArcImportRun run = run_;
+     run.spaces_before = spaces_done_;
+     ImportArcProfileInto(
+@@ -1402,6 +1566,8 @@ class ArcImportCoordinator {
+   void OnProfileDone(std::optional<size_t> index,
+                      bool new_profile,
+                      const ArcProfileResult& result) {
++    // The profile's import is over, sign-ins included.
++    keep_alive_.reset();
+     if (index) {
+       spaces_done_ += static_cast<int>(plan_.profiles[*index].spaces.size());
+       results_[*index] = result;
+@@ -1418,18 +1584,18 @@ class ArcImportCoordinator {
    }
  
    void Finish(ArcImportFailure failure) {
++    keep_alive_.reset();
 +    // Lets the step drop the run's key.
 +    if (g_sign_ins_step) {
 +      g_sign_ins_step->EndRun(run_.id, origin_path_);
@@ -2479,17 +3001,121 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
      if (failure == ArcImportFailure::kNone && origin_result_ &&
          origin_result_->status == ArcProfileResult::Status::kFailed) {
        failure = origin_result_->failure;
-@@ -1428,7 +1470,8 @@ class ArcImportCoordinator {
+     }
+-    bool any_done = false;
+-    bool any_failed = false;
+     for (const ArcProfileResult& result : results_) {
        result_.counts += result.counts;
        result_.pinned_extensions += result.pinned_extensions;
-       any_done |= result.status == ArcProfileResult::Status::kDone ||
+-      any_done |= result.status == ArcProfileResult::Status::kDone ||
 -                  result.history == ArcProfileResult::History::kImported;
-+                  result.history == ArcProfileResult::History::kImported ||
-+                  result.sign_ins.written > 0;
-       any_failed |= result.status == ArcProfileResult::Status::kFailed;
+-      any_failed |= result.status == ArcProfileResult::Status::kFailed;
        if (result.undo_until) {
          result_.undo_until =
-@@ -1888,6 +1931,10 @@ void SetArcProfileMaker(ArcProfileMaker*
+             std::max(result_.undo_until.value_or(base::Time()),
+@@ -1438,13 +1604,9 @@ class ArcImportCoordinator {
+     }
+     result_.profiles = results_;
+     result_.failure = failure;
+-    if (any_done) {
+-      result_.status = ArcImportResult::Status::kDone;
+-    } else if (any_failed || failure != ArcImportFailure::kNone) {
+-      result_.status = ArcImportResult::Status::kFailed;
+-    } else {
+-      result_.status = ArcImportResult::Status::kNothingNew;
+-    }
++    // Sign-ins brought into a profile whose sidebar part failed don't make
++    // the import done; that profile's result reports both.
++    result_.status = import::FoldArcImportStatus(results_, failure);
+     // Hand-offs live only in the starting profile's record. A nothing-new
+     // run writes that record only when other profiles' names had to go
+     // into it for Undo.
+@@ -1455,6 +1617,8 @@ class ArcImportCoordinator {
+           !other_profiles_.empty())) &&
+         (!plan_.handoffs.routing_rules_json.empty() ||
+          !plan_.handoffs.auto_archive_raw.empty());
++    // Before `done_`, which may start the next one.
++    in_progress_.reset();
+     std::move(done_).Run(result_);
+     delete this;
+   }
+@@ -1463,6 +1627,11 @@ class ArcImportCoordinator {
+   const ImportPlan plan_;
+   ArcImportProgressCallback progress_;
+   ArcImportDoneCallback done_;
++  std::unique_ptr<ArcImportInProgress> in_progress_;
++  // From the starting profile's record, plus the profiles this import made.
++  ArcImportRecord::MadeProfiles made_profiles_;
++  // Keeps the other profile being imported into loaded until it's done.
++  std::unique_ptr<ScopedProfileKeepAlive> keep_alive_;
+   ArcImportRun run_;
+   std::optional<size_t> default_index_;
+   std::vector<size_t> others_;
+@@ -1693,8 +1862,10 @@ class ArcProfileUndo : public ProfileObs
+ class ArcUndoCoordinator {
+  public:
+   static void Start(Profile* profile,
+-                    base::OnceCallback<void(ArcUndoOutcome)> done) {
+-    auto* self = new ArcUndoCoordinator(profile->GetPath(), std::move(done));
++                    base::OnceCallback<void(ArcUndoOutcome)> done,
++                    std::unique_ptr<ArcImportInProgress> in_progress) {
++    auto* self = new ArcUndoCoordinator(profile->GetPath(), std::move(done),
++                                        std::move(in_progress));
+     ArcProfileUndo::Start(
+         profile, std::string(),
+         base::BindOnce(&ArcUndoCoordinator::OnOriginDone,
+@@ -1703,8 +1874,11 @@ class ArcUndoCoordinator {
+ 
+  private:
+   ArcUndoCoordinator(base::FilePath origin_path,
+-                     base::OnceCallback<void(ArcUndoOutcome)> done)
+-      : user_data_dir_(origin_path.DirName()), done_(std::move(done)) {}
++                     base::OnceCallback<void(ArcUndoOutcome)> done,
++                     std::unique_ptr<ArcImportInProgress> in_progress)
++      : user_data_dir_(origin_path.DirName()),
++        done_(std::move(done)),
++        in_progress_(std::move(in_progress)) {}
+ 
+   void OnOriginDone(ArcUndoOutcome outcome, const ArcImportRecord::Run* run) {
+     outcome_ = std::move(outcome);
+@@ -1781,12 +1955,14 @@ class ArcUndoCoordinator {
+ 
+   void Finish() {
+     keep_alive_.reset();
++    in_progress_.reset();
+     std::move(done_).Run(std::move(outcome_));
+     delete this;
+   }
+ 
+   const base::FilePath user_data_dir_;
+   base::OnceCallback<void(ArcUndoOutcome)> done_;
++  std::unique_ptr<ArcImportInProgress> in_progress_;
+   ArcUndoOutcome outcome_;
+   std::string run_id_;
+   std::vector<std::string> others_;
+@@ -1879,6 +2055,21 @@ void PutKeptPinsBack(SidebarItems* items
+   }
+ }
+ 
++// static
++std::unique_ptr<ArcImportInProgress> ArcImportInProgress::TryBegin() {
++  if (g_arc_import_in_progress) {
++    return nullptr;
++  }
++  g_arc_import_in_progress = true;
++  return base::WrapUnique(new ArcImportInProgress());
++}
++
++ArcImportInProgress::ArcImportInProgress() = default;
++
++ArcImportInProgress::~ArcImportInProgress() {
++  g_arc_import_in_progress = false;
++}
++
+ ArcImportRun::ArcImportRun() = default;
+ ArcImportRun::ArcImportRun(const ArcImportRun&) = default;
+ ArcImportRun& ArcImportRun::operator=(const ArcImportRun&) = default;
+@@ -1888,6 +2079,10 @@ void SetArcProfileMaker(ArcProfileMaker*
    g_profile_maker = maker;
  }
  
@@ -2500,11 +3126,68 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.cc
  void StartArcImport(Profile* profile,
                      ImportPlan plan,
                      ArcImportOptions options,
+@@ -1904,8 +2099,21 @@ void StartArcImport(Profile* profile,
+         FROM_HERE, base::BindOnce(std::move(done), std::move(result)));
+     return;
+   }
++  // A reload of the import page or a second window can't run a second
++  // import alongside this one.
++  std::unique_ptr<ArcImportInProgress> in_progress =
++      ArcImportInProgress::TryBegin();
++  if (!in_progress) {
++    ArcImportResult result;
++    result.status = ArcImportResult::Status::kFailed;
++    result.failure = ArcImportFailure::kBusy;
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(done), std::move(result)));
++    return;
++  }
+   ArcImportCoordinator::Start(profile, std::move(plan), std::move(options),
+-                              std::move(progress), std::move(done));
++                              std::move(progress), std::move(done),
++                              std::move(in_progress));
+ }
+ 
+ void ImportArcProfileInto(Profile* target,
+@@ -1956,7 +2164,16 @@ void UndoArcImport(Profile* profile,
+         FROM_HERE, base::BindOnce(std::move(done), std::move(outcome)));
+     return;
+   }
+-  ArcUndoCoordinator::Start(profile, std::move(done));
++  std::unique_ptr<ArcImportInProgress> in_progress =
++      ArcImportInProgress::TryBegin();
++  if (!in_progress) {
++    ArcUndoOutcome outcome;
++    outcome.result = ArcUndoResult::kBusy;
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(done), std::move(outcome)));
++    return;
++  }
++  ArcUndoCoordinator::Start(profile, std::move(done), std::move(in_progress));
+ }
+ 
+ std::u16string ImportedSpaceTitle(const ImportSpace& space, size_t position) {
 Index: src/chrome/browser/ui/rac/import/arc_importer.h
 ===================================================================
 --- src.orig/chrome/browser/ui/rac/import/arc_importer.h
 +++ src/chrome/browser/ui/rac/import/arc_importer.h
-@@ -51,6 +51,9 @@ using ArcProfileDoneCallback =
+@@ -6,6 +6,7 @@
+ #define CHROME_BROWSER_UI_RAC_IMPORT_ARC_IMPORTER_H_
+ 
+ #include <cstddef>
++#include <memory>
+ #include <string>
+ #include <vector>
+ 
+@@ -13,6 +14,7 @@
+ #include "base/functional/callback.h"
+ #include "base/time/time.h"
+ #include "chrome/browser/rac/import/arc_import_mapping.h"
++#include "chrome/browser/rac/import/arc_import_record.h"
+ #include "chrome/browser/rac/import/arc_import_types.h"
+ #include "chrome/browser/rac/import/import_plan.h"
+ 
+@@ -51,6 +53,9 @@ using ArcProfileDoneCallback =
  //    data decoder's sandbox. Nothing is fetched.
  // 8. Runs Helium's importer for history only, if asked and not done before.
  // 9. Operation::MarkDataChanged(), and releases the token.
@@ -2514,7 +3197,36 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.h
  //
  // An import cut short between steps 4 and 6 (a crash, a power cut) leaves
  // a record whose run is in progress. The next import or Undo in that
-@@ -77,6 +80,34 @@ class ArcProfileMaker {
+@@ -62,9 +67,28 @@ using ArcProfileDoneCallback =
+ // Nothing here makes a network request, installs an extension, or touches
+ // AI data. Profiles are imported one at a time.
+ 
++// At most one Arc import, sign-ins retry, or Undo runs at a time in the
++// whole browser, whichever page or window starts it. Each holds one of these
++// from its start until just before it reports. UI thread only.
++class ArcImportInProgress {
++ public:
++  // Null while another is held: the caller reports kBusy.
++  static std::unique_ptr<ArcImportInProgress> TryBegin();
++
++  ArcImportInProgress(const ArcImportInProgress&) = delete;
++  ArcImportInProgress& operator=(const ArcImportInProgress&) = delete;
++  ~ArcImportInProgress();
++
++ private:
++  ArcImportInProgress();
++};
++
+ // For the sign-ins step, which owns profile creation. It makes
+ // the rac profile for an Arc profile that isn't the default one. Until it's
+ // registered, those Arc profiles end as ArcProfileResult::kNeedsProfile.
++// The importer asks only when no earlier import made one that is still
++// there (ArcImportRecord::made_profiles), keeps the new profile loaded while
++// it imports into it, and then lets it unload like any other.
+ class ArcProfileMaker {
+  public:
+   virtual ~ArcProfileMaker() = default;
+@@ -77,6 +101,34 @@ class ArcProfileMaker {
  // Called once at startup by the sign-ins step. Not owned.
  void SetArcProfileMaker(ArcProfileMaker* maker);
  
@@ -2549,7 +3261,34 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.h
  // What every profile of one import shares.
  struct ArcImportRun {
    ArcImportRun();
-@@ -119,7 +150,8 @@ void StartArcImport(Profile* profile,
+@@ -100,6 +152,9 @@ struct ArcImportRun {
+   // starting profile's record leads Undo to them.
+   std::vector<std::string> other_profiles;
+   base::Time others_undo_until;
++  // Origin only: the profiles this import and earlier ones made for Arc's
++  // other profiles, for its record (ArcImportRecord::made_profiles).
++  ArcImportRecord::MadeProfiles made_profiles;
+   // For progress across profiles: Arc spaces handled before this profile,
+   // and in all.
+   int spaces_before = 0;
+@@ -107,10 +162,12 @@ struct ArcImportRun {
+ };
+ 
+ // The import screens' entry point. `profile` receives the default Arc
+-// profile; the other checked ones go through ArcProfileMaker. `progress`
+-// runs on the UI thread, in bursts; `done` runs once. History comes from
+-// `plan.source_dir`, which ReadArc() always sets; a plan without one
+-// imports no history.
++// profile; each other checked one goes into the rac profile an earlier
++// import from `profile` made for it, if it's still there, or else into a new
++// one from ArcProfileMaker. `progress` runs on the UI thread, in bursts;
++// `done` runs once. kFailed with kBusy while another Arc import, retry, or
++// Undo runs (ArcImportInProgress). History comes from `plan.source_dir`,
++// which ReadArc() always sets; a plan without one imports no history.
+ void StartArcImport(Profile* profile,
+                     ImportPlan plan,
+                     ArcImportOptions options,
+@@ -119,7 +176,8 @@ void StartArcImport(Profile* profile,
  
  // The per-profile entry point, for the sign-ins step when it drives
  // profiles itself: imports `source` into `target`, which must be a regular
@@ -2559,11 +3298,21 @@ Index: src/chrome/browser/ui/rac/import/arc_importer.h
  void ImportArcProfileInto(Profile* target,
                            ImportProfile source,
                            ArcImportRun run,
+@@ -144,7 +202,8 @@ void GetArcImportState(Profile* profile,
+ // imported space move to a space that stays, or stay where they are if a
+ // page keeps that space open (kPartlyUndone). `done` also says which spaces
+ // stayed and which profiles still have a newer import to undo
+-// (ArcUndoOutcome).
++// (ArcUndoOutcome). kBusy while another Arc import, retry, or Undo runs
++// (ArcImportInProgress).
+ void UndoArcImport(Profile* profile,
+                    base::OnceCallback<void(ArcUndoOutcome)> done);
+ 
 Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/rac/import/arc_signins.cc
-@@ -0,0 +1,402 @@
+@@ -0,0 +1,495 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -2584,9 +3333,11 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +#include <string>
 +#include <vector>
 +
++#include "base/check.h"
 +#include "base/files/file_path.h"
 +#include "base/memory/weak_ptr.h"
 +#include "base/no_destructor.h"
++#include "base/scoped_observation.h"
 +#include "base/task/thread_pool.h"
 +#include "base/types/expected.h"
 +#include "base/uuid.h"
@@ -2596,6 +3347,7 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/profiles/profile_avatar_icon_util.h"
 +#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/profiles/profile_manager_observer.h"
 +#include "chrome/browser/rac/import/arc_app_state_mac.h"
 +#include "chrome/browser/rac/import/arc_cookie_import.h"
 +#include "chrome/browser/rac/import/arc_reader.h"
@@ -2612,6 +3364,12 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +#if BUILDFLAG(IS_MAC)
 +
 +namespace {
++
++// Blocking: runs on the thread pool.
++bool HasProfileCookieDb(const base::FilePath& arc_support_dir,
++                        const std::string& profile_directory) {
++  return !import::ArcCookieDbPath(arc_support_dir, profile_directory).empty();
++}
 +
 +// Blocking: runs on the thread pool.
 +base::expected<import::ArcCookieReadResult, import::CookieDbReadError>
@@ -2659,9 +3417,15 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +  std::string source_key;
 +};
 +
++class ArcSignInsRetry;
++
 +// The profile maker and the sign-ins step, for the whole browser. Made the
-+// first time an import screen opens; never destroyed.
-+class ArcSignIns : public ArcProfileMaker, public ArcSignInsStep {
++// first time an import screen opens; never destroyed. It owns the sign-ins
++// runs and the retry under way, and drops them when ProfileManager goes at
++// shutdown, such as with a Keychain prompt still open.
++class ArcSignIns : public ArcProfileMaker,
++                   public ArcSignInsStep,
++                   public ProfileManagerObserver {
 + public:
 +  static ArcSignIns& Get() {
 +    static base::NoDestructor<ArcSignIns> instance;
@@ -2670,6 +3434,13 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +
 +  ArcSignIns(const ArcSignIns&) = delete;
 +  ArcSignIns& operator=(const ArcSignIns&) = delete;
++
++  void ObserveProfileManager() {
++    ProfileManager* manager = g_browser_process->profile_manager();
++    if (manager && !observation_.IsObserving()) {
++      observation_.Observe(manager);
++    }
++  }
 +
 +  // ArcProfileMaker:
 +  void MakeProfile(const ImportProfile& source,
@@ -2684,9 +3455,10 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +                         std::move(done)));
 +      return;
 +    }
-+    // `done` gets the profile once it's initialized, or null. A new profile
-+    // holds ProfileManager's kWaitingForFirstBrowserWindow keep-alive until
-+    // its first window closes, so it stays loaded through the import.
++    // `done` gets the profile once it's initialized, or null. The importer
++    // keeps it loaded through its import, and lets go of ProfileManager's
++    // kWaitingForFirstBrowserWindow keep-alive, so a profile nobody opens
++    // doesn't stay loaded for the session.
 +    ProfileManager::CreateMultiProfileAsync(
 +        name, profiles::GetPlaceholderAvatarIndex(), /*is_hidden=*/false,
 +        std::move(done));
@@ -2721,7 +3493,8 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +    }
 +  }
 +
-+  // One profile's sign-ins, under `run_id`'s key.
++  // One profile's sign-ins, under `run_id`'s key. Kept until it reports;
++  // dropped at shutdown if it never does, and `done` then never runs.
 +  void Run(Profile* target,
 +           const std::string& profile_directory,
 +           const std::string& run_id,
@@ -2733,11 +3506,25 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +    job.arc_support_dir = arc_support_dir;
 +    job.profile_directory = profile_directory;
 +    job.is_arc_running = base::BindRepeating(&import::IsArcRunning);
++    job.has_cookie_db = base::BindRepeating(&HasProfileCookieDb);
 +    job.read_cookies = base::BindRepeating(&ReadProfileCookies);
 +    job.make_sink = base::BindOnce(&MakeProfileSink, target->GetWeakPtr());
 +    job.progress = std::move(progress);
-+    import::RunArcSignIns(keys_, std::move(job), std::move(done));
++    const int id = next_run_id_++;
++    // Unretained: never destroyed. `done` is always posted, so the run is
++    // in `runs_` by then.
++    runs_[id] = import::RunArcSignIns(
++        keys_, std::move(job),
++        base::BindOnce(&ArcSignIns::OnRunDone, base::Unretained(this), id,
++                       std::move(done)));
 +  }
++
++  // RetryArcSignIns(). Defined after ArcSignInsRetry.
++  void StartRetry(base::FilePath origin_path,
++                  ArcImportProgressCallback progress,
++                  ArcImportDoneCallback done);
++  // Destroys the retry, which calls it last, then runs `done`.
++  void OnRetryDone(ArcImportDoneCallback done, const ArcImportResult& result);
 +
 +  // A retry's own run, which no importer ends.
 +  void EndRetry(const std::string& run_id) { keys_.EndRun(run_id); }
@@ -2749,11 +3536,23 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +                                     : std::vector<SignInsTarget>();
 +  }
 +
++  // ProfileManagerObserver:
++  void OnProfileManagerDestroying() override;
++
 + private:
 +  friend class base::NoDestructor<ArcSignIns>;
 +
-+  ArcSignIns() = default;
-+  ~ArcSignIns() override = default;
++  // Out of line: ArcSignInsRetry isn't complete yet.
++  ArcSignIns();
++  ~ArcSignIns() override;
++
++  void OnRunDone(int id,
++                 ArcSignInsDoneCallback done,
++                 const ArcSignInsResult& result) {
++    const ArcSignInsResult copy = result;
++    runs_.erase(id);
++    std::move(done).Run(copy);
++  }
 +
 +  import::ArcRunKeyCache keys_{
 +      base::BindRepeating(&import::CreateArcSafeStorageKeySource)};
@@ -2761,32 +3560,29 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +  std::map<std::string, std::vector<SignInsTarget>> pending_targets_;
 +  // The newest finished run's profiles, by the profile it started from.
 +  std::map<base::FilePath, std::vector<SignInsTarget>> last_targets_;
++  // Each profile's sign-ins still going.
++  std::map<int, std::unique_ptr<import::ArcSignInsRun>> runs_;
++  int next_run_id_ = 0;
++  // At most one: it holds ArcImportInProgress.
++  std::unique_ptr<ArcSignInsRetry> retry_;
++  base::ScopedObservation<ProfileManager, ProfileManagerObserver>
++      observation_{this};
 +};
 +
-+// RetryArcSignIns(). Owns itself from Start() until it runs `done`.
++// RetryArcSignIns(). ArcSignIns owns it from StartRetry() until it reports,
++// or until shutdown.
 +class ArcSignInsRetry {
 + public:
-+  static void Start(base::FilePath origin_path,
-+                    std::vector<SignInsTarget> targets,
-+                    ArcImportProgressCallback progress,
-+                    ArcImportDoneCallback done) {
-+    (new ArcSignInsRetry(std::move(origin_path), std::move(targets),
-+                         std::move(progress), std::move(done)))
-+        ->ReadPlan();
-+  }
-+
-+  ArcSignInsRetry(const ArcSignInsRetry&) = delete;
-+  ArcSignInsRetry& operator=(const ArcSignInsRetry&) = delete;
-+
-+ private:
 +  ArcSignInsRetry(base::FilePath origin_path,
 +                  std::vector<SignInsTarget> targets,
 +                  ArcImportProgressCallback progress,
-+                  ArcImportDoneCallback done)
++                  ArcImportDoneCallback done,
++                  std::unique_ptr<ArcImportInProgress> in_progress)
 +      : origin_path_(std::move(origin_path)),
 +        targets_(std::move(targets)),
 +        progress_(std::move(progress)),
 +        done_(std::move(done)),
++        in_progress_(std::move(in_progress)),
 +        run_id_(base::Uuid::GenerateRandomV4().AsLowercaseString()) {
 +    for (const SignInsTarget& target : targets_) {
 +      ArcProfileResult result;
@@ -2799,6 +3595,8 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +    }
 +  }
 +
++  ArcSignInsRetry(const ArcSignInsRetry&) = delete;
++  ArcSignInsRetry& operator=(const ArcSignInsRetry&) = delete;
 +  ~ArcSignInsRetry() = default;
 +
 +  void ReadPlan() {
@@ -2814,6 +3612,7 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +                       weak_factory_.GetWeakPtr()));
 +  }
 +
++ private:
 +  void OnPlanRead(base::expected<ImportPlan, ArcReadError> plan) {
 +    if (!plan.has_value()) {
 +      for (ArcProfileResult& result : results_) {
@@ -2910,14 +3709,16 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +                    : any_failed ? ArcImportResult::Status::kFailed
 +                                 : ArcImportResult::Status::kNothingNew;
 +    result.profiles = std::move(results_);
-+    std::move(done_).Run(result);
-+    delete this;
++    // Destroys this.
++    ArcSignIns::Get().OnRetryDone(std::move(done_), result);
 +  }
 +
 +  const base::FilePath origin_path_;
 +  const std::vector<SignInsTarget> targets_;
 +  ArcImportProgressCallback progress_;
 +  ArcImportDoneCallback done_;
++  // Released just before `done_` runs.
++  std::unique_ptr<ArcImportInProgress> in_progress_;
 +  // Its own key run: the import's ended, and its key with it.
 +  const std::string run_id_;
 +  ImportPlan plan_;
@@ -2926,6 +3727,47 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +  std::unique_ptr<ScopedProfileKeepAlive> keep_alive_;
 +  base::WeakPtrFactory<ArcSignInsRetry> weak_factory_{this};
 +};
++
++ArcSignIns::ArcSignIns() = default;
++ArcSignIns::~ArcSignIns() = default;
++
++void ArcSignIns::StartRetry(base::FilePath origin_path,
++                            ArcImportProgressCallback progress,
++                            ArcImportDoneCallback done) {
++  std::unique_ptr<ArcImportInProgress> in_progress =
++      ArcImportInProgress::TryBegin();
++  if (!in_progress) {
++    // ArcImportResult starts as kFailed.
++    ArcImportResult busy;
++    busy.failure = ArcImportFailure::kBusy;
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(done), std::move(busy)));
++    return;
++  }
++  // The last retry let go of ArcImportInProgress as it went.
++  CHECK(!retry_);
++  std::vector<SignInsTarget> targets = LastTargets(origin_path);
++  retry_ = std::make_unique<ArcSignInsRetry>(
++      std::move(origin_path), std::move(targets), std::move(progress),
++      std::move(done), std::move(in_progress));
++  // Never finishes from inside this call.
++  retry_->ReadPlan();
++}
++
++void ArcSignIns::OnRetryDone(ArcImportDoneCallback done,
++                             const ArcImportResult& result) {
++  // `result` lives on the retry's stack, not in it.
++  retry_.reset();
++  std::move(done).Run(result);
++}
++
++void ArcSignIns::OnProfileManagerDestroying() {
++  observation_.Reset();
++  // Whatever still waits, such as on a Keychain prompt left open, goes now
++  // and never reports. Every profile is still there.
++  retry_.reset();
++  runs_.clear();
++}
 +
 +}  // namespace
 +
@@ -2937,14 +3779,14 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.cc
 +  ArcSignIns& sign_ins = ArcSignIns::Get();
 +  SetArcProfileMaker(&sign_ins);
 +  SetArcSignInsStep(&sign_ins);
++  sign_ins.ObserveProfileManager();
 +}
 +
 +void RetryArcSignIns(Profile* profile,
 +                     ArcImportProgressCallback progress,
 +                     ArcImportDoneCallback done) {
-+  ArcSignInsRetry::Start(profile->GetPath(),
-+                         ArcSignIns::Get().LastTargets(profile->GetPath()),
-+                         std::move(progress), std::move(done));
++  ArcSignIns::Get().StartRetry(profile->GetPath(), std::move(progress),
++                               std::move(done));
 +}
 +
 +#else  // BUILDFLAG(IS_MAC)
@@ -2970,7 +3812,7 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.h
 ===================================================================
 --- /dev/null
 +++ src/chrome/browser/ui/rac/import/arc_signins.h
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,50 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -2987,12 +3829,13 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.h
 +// and ArcSignInsStep; the pure parts are in
 +// chrome/browser/rac/import/arc_signins_core.h.
 +//
-+// For each profile, after its sidebar part: nothing while Arc runs; Arc's
-+// password once per import run (macOS may show its Keychain prompt), kept in
-+// memory only until the run's last profile finishes, then zeroed; Arc's
-+// cookie database copied and read on the thread pool; the cookies written
-+// through CreateCookieWriterForImport(). Nothing is sent anywhere. Undo
-+// never removes cookies.
++// For each profile, after its sidebar part: nothing while Arc runs, or
++// without a cookie database to read; Arc's password once per import run
++// (macOS may show its Keychain prompt), kept in memory only until the run's
++// last profile finishes, then zeroed; nothing if Arc started meanwhile;
++// Arc's cookie database copied and read on the thread pool; the cookies
++// written through CreateCookieWriterForImport(). Nothing is sent anywhere.
++// Undo never removes cookies.
 +
 +namespace rac {
 +
@@ -3011,7 +3854,8 @@ Index: src/chrome/browser/ui/rac/import/arc_signins.h
 +// again, off the UI thread, and asks for Arc's key again, once. `done` runs
 +// once, from a posted task, with each profile's ArcProfileResult::sign_ins;
 +// their sidebar parts read kNothingNew. kFailed when there is nothing to
-+// retry.
++// retry, and kFailed with kBusy while another Arc import, retry, or Undo
++// runs (ArcImportInProgress).
 +void RetryArcSignIns(Profile* profile,
 +                     ArcImportProgressCallback progress,
 +                     ArcImportDoneCallback done);
@@ -3204,3 +4048,358 @@ Index: src/chrome/browser/ui/rac/onboarding/real_arc_import_backend.h
  class RealArcImportBackend : public ArcImportBackend,
                               public DataBackups::Observer {
   public:
+Index: src/chrome/browser/rac/import/arc_import_record.cc
+===================================================================
+--- src.orig/chrome/browser/rac/import/arc_import_record.cc
++++ src/chrome/browser/rac/import/arc_import_record.cc
+@@ -32,6 +32,7 @@ constexpr char kItemsKey[] = "items";
+ constexpr char kRunsKey[] = "runs";
+ constexpr char kHandoffsKey[] = "handoffs";
+ constexpr char kPinnedExtensionsKey[] = "pinned_extensions";
++constexpr char kMadeProfilesKey[] = "made_profiles";
+ 
+ constexpr char kRacKey[] = "rac";
+ constexpr char kRunKey[] = "run";
+@@ -62,7 +63,15 @@ constexpr const char* kKnownKeys[] = {
+     kVersionKey,       kMinReaderVersionKey, kSourceKey,   kArcProfileKey,
+     kFirstImportKey,   kLastImportKey,       kHistoryImportedKey,
+     kSpacesKey,        kItemsKey,            kRunsKey,     kHandoffsKey,
+-    kPinnedExtensionsKey};
++    kPinnedExtensionsKey, kMadeProfilesKey};
++
++// A profile name must be one folder name. Anything else is dropped so the
++// record can never point outside the user data folder.
++bool IsProfileFolderName(std::string_view name) {
++  return !name.empty() && name != "." && name != ".." &&
++         name.find('/') == std::string_view::npos &&
++         name.find('\\') == std::string_view::npos;
++}
+ 
+ const char* KindToString(ArcImportRecord::ItemKind kind) {
+   switch (kind) {
+@@ -160,12 +169,8 @@ std::optional<ArcImportRecord::Run> RunF
+   run.undo_until = GetTime(dict, kRunUndoUntilKey);
+   run.replaced_blank_space = GetString(dict, kRunReplacedBlankKey);
+   run.other_profiles = ListToStrings(dict.FindList(kRunProfilesKey));
+-  // A profile name must be one folder name. Anything else is dropped so
+-  // Undo can never be pointed outside the user data folder.
+   std::erase_if(run.other_profiles, [](const std::string& name) {
+-    return name.empty() || name == "." || name == ".." ||
+-           name.find('/') != std::string::npos ||
+-           name.find('\\') != std::string::npos;
++    return !IsProfileFolderName(name);
+   });
+   run.undone = dict.FindBool(kRunUndoneKey).value_or(false);
+   run.undone_at = GetTime(dict, kRunUndoneAtKey);
+@@ -227,6 +232,7 @@ ArcImportRecord::ArcImportRecord(const A
+       history_imported(other.history_imported),
+       handoffs(other.handoffs),
+       pinned_extension_ids(other.pinned_extension_ids),
++      made_profiles(other.made_profiles),
+       spaces_(other.spaces_),
+       items_(other.items_),
+       runs_(other.runs_),
+@@ -358,6 +364,14 @@ ArcImportRecord::ReadResult ArcImportRec
+   record.handoffs = HandoffsFromDict(dict->FindDict(kHandoffsKey));
+   record.pinned_extension_ids =
+       ListToStrings(dict->FindList(kPinnedExtensionsKey));
++  if (const base::DictValue* made = dict->FindDict(kMadeProfilesKey)) {
++    for (const auto [source_key, value] : *made) {
++      if (!source_key.empty() && value.is_string() &&
++          IsProfileFolderName(value.GetString())) {
++        record.made_profiles[source_key] = value.GetString();
++      }
++    }
++  }
+ 
+   record.unknown_fields_ = std::move(*dict);
+   for (const char* key : kKnownKeys) {
+@@ -409,6 +423,14 @@ std::string ArcImportRecord::Serialize()
+   if (!pinned_extension_ids.empty()) {
+     dict.Set(kPinnedExtensionsKey, StringsToList(pinned_extension_ids));
+   }
++  if (!made_profiles.empty()) {
++    base::DictValue made;
++    for (const auto& [source_key, folder] : made_profiles) {
++      // Set() never splits a key, as for Arc ids.
++      made.Set(source_key, folder);
++    }
++    dict.Set(kMadeProfilesKey, std::move(made));
++  }
+ 
+   // Fails only on binary values or too deep a nesting, which this record
+   // never holds. Write() refuses to write an empty result anyway.
+@@ -417,6 +439,19 @@ std::string ArcImportRecord::Serialize()
+       .value_or(std::string());
+ }
+ 
++// static
++std::string ArcImportRecord::ReusableProfile(
++    const MadeProfiles& made,
++    std::string_view source_key,
++    const base::flat_set<std::string>& live_profiles) {
++  const auto it = made.find(source_key);
++  if (it == made.end() || !IsProfileFolderName(it->second) ||
++      !live_profiles.contains(it->second)) {
++    return std::string();
++  }
++  return it->second;
++}
++
+ const ArcImportRecord::SpaceMapping* ArcImportRecord::FindSpace(
+     std::string_view arc_id) const {
+   auto it = spaces_.find(arc_id);
+Index: src/chrome/browser/rac/import/arc_import_record.h
+===================================================================
+--- src.orig/chrome/browser/rac/import/arc_import_record.h
++++ src/chrome/browser/rac/import/arc_import_record.h
+@@ -30,7 +30,7 @@ namespace rac {
+ // No URLs or titles of tabs: those are in the sidebar itself, and in the
+ // pre-import snapshot for its 7 days.
+ //
+-//   { "version": 1, "min_reader_version": 1, "source": "arc",
++//   { "version": 2, "min_reader_version": 1, "source": "arc",
+ //     "arc_profile": "default",
+ //     "first_import": <time>, "last_import": <time>,
+ //     "history_imported": <time>,
+@@ -45,7 +45,8 @@ namespace rac {
+ //     "handoffs": { "routing_rules": ["<json>"], "routing_default": "<json>",
+ //                   "auto_archive": "sevenDays", "auto_archive_after": <delta>,
+ //                   "archive_path": "<path>" },
+-//     "pinned_extensions": ["<extension id>"] }
++//     "pinned_extensions": ["<extension id>"],
++//     "made_profiles": { "<arc profile key>": "Profile 2" } }
+ //
+ // Times use base::TimeToValue. Top-level keys this build doesn't know are
+ // kept and written back; unknown keys inside an entry are not. Pure: reading
+@@ -57,7 +58,10 @@ class ArcImportRecord {
+   // it. Builds only ever raise them. A record whose `min_reader_version` is
+   // above kVersion isn't read, and the import refuses to run rather than
+   // overwrite it.
+-  static constexpr int kVersion = 1;
++  //
++  // Version 2 added `made_profiles`. Version 1 builds still read it, and
++  // keep that key as an unknown one; version 1 records have none.
++  static constexpr int kVersion = 2;
+   static constexpr int kMinReaderVersion = 1;
+ 
+   static constexpr char kDirName[] = "rac imports";
+@@ -72,6 +76,9 @@ class ArcImportRecord {
+ 
+   enum class ItemKind { kPinnedTab, kFolder, kFavorite };
+ 
++  // ImportProfile::source_key to a rac profile's folder base name.
++  using MadeProfiles = std::map<std::string, std::string, std::less<>>;
++
+   struct SpaceMapping {
+     // SpaceId::AsLowercaseString().
+     std::string rac_id;
+@@ -162,6 +169,15 @@ class ArcImportRecord {
+   static ReadResult Parse(std::string_view json);
+   std::string Serialize() const;
+ 
++  // The rac profile to import the Arc profile `source_key` into again: the
++  // folder `made` names for it, if that is one plain folder name and in
++  // `live_profiles`, the folder base names of the profiles there are now.
++  // Empty: there's none, or it's gone, and a new profile is made.
++  static std::string ReusableProfile(
++      const MadeProfiles& made,
++      std::string_view source_key,
++      const base::flat_set<std::string>& live_profiles);
++
+   // Lookups by Arc id. Null if not mapped.
+   const SpaceMapping* FindSpace(std::string_view arc_id) const;
+   const ItemMapping* FindItem(std::string_view arc_id) const;
+@@ -256,6 +272,11 @@ class ArcImportRecord {
+   ImportHandoffs handoffs;
+   // ImportProfile::pinned_extension_ids, kept, never installed.
+   std::vector<std::string> pinned_extension_ids;
++  // The rac profile an import made for each Arc profile that isn't the
++  // default one, so a rerun imports into it again instead of making
++  // another. Only in the record of the profile the import started from.
++  // Folder names that aren't one plain folder name are dropped on read.
++  MadeProfiles made_profiles;
+ 
+  private:
+   std::map<std::string, SpaceMapping, std::less<>> spaces_;
+Index: src/chrome/browser/rac/import/arc_import_record_unittest.cc
+===================================================================
+--- src.orig/chrome/browser/rac/import/arc_import_record_unittest.cc
++++ src/chrome/browser/rac/import/arc_import_record_unittest.cc
+@@ -26,6 +26,7 @@ namespace {
+ 
+ using ::testing::ElementsAre;
+ using ::testing::IsEmpty;
++using ::testing::Pair;
+ 
+ using ItemKind = ArcImportRecord::ItemKind;
+ using ReadStatus = ArcImportRecord::ReadStatus;
+@@ -83,6 +84,8 @@ ArcImportRecord MakeFullRecord() {
+ 
+   record.pinned_extension_ids = {"aaaabbbbccccddddeeeeffffgggghhhh",
+                                  "ppppoooonnnnmmmmllllkkkkjjjjiiii"};
++  record.made_profiles = {{"custom:Profile 2", "Profile 2"},
++                          {"custom:Work.Stuff", "Profile 3"}};
+   return record;
+ }
+ 
+@@ -148,6 +151,9 @@ void ExpectFullRecord(const ArcImportRec
+   EXPECT_THAT(record.pinned_extension_ids,
+               ElementsAre("aaaabbbbccccddddeeeeffffgggghhhh",
+                           "ppppoooonnnnmmmmllllkkkkjjjjiiii"));
++  EXPECT_THAT(record.made_profiles,
++              ElementsAre(Pair("custom:Profile 2", "Profile 2"),
++                          Pair("custom:Work.Stuff", "Profile 3")));
+ }
+ 
+ // Parses `json` and expects kOk.
+@@ -217,6 +223,8 @@ TEST(ArcImportRecordTest, EmptyRecordRou
+   EXPECT_FALSE(parsed.handoffs.auto_archive_after.has_value());
+   EXPECT_TRUE(parsed.handoffs.archive_path.empty());
+   EXPECT_THAT(parsed.pinned_extension_ids, IsEmpty());
++  EXPECT_THAT(parsed.made_profiles, IsEmpty());
++  EXPECT_FALSE(SerializedDict(record).Find("made_profiles"));
+ }
+ 
+ TEST(ArcImportRecordTest, WritesVersionFields) {
+@@ -224,11 +232,12 @@ TEST(ArcImportRecordTest, WritesVersionF
+   std::optional<base::DictValue> dict =
+       base::JSONReader::ReadDict(record.Serialize(), base::JSON_PARSE_RFC);
+   ASSERT_TRUE(dict.has_value());
+-  EXPECT_EQ(dict->FindInt("version"), std::optional<int>(1));
++  EXPECT_EQ(dict->FindInt("version"), std::optional<int>(2));
++  // Version 1 builds can still read it.
+   EXPECT_EQ(dict->FindInt("min_reader_version"), std::optional<int>(1));
+   ASSERT_TRUE(dict->FindString("source"));
+   EXPECT_EQ(*dict->FindString("source"), "arc");
+-  EXPECT_EQ(ArcImportRecord::kVersion, 1);
++  EXPECT_EQ(ArcImportRecord::kVersion, 2);
+   EXPECT_EQ(ArcImportRecord::kMinReaderVersion, 1);
+ }
+ 
+@@ -253,13 +262,13 @@ TEST(ArcImportRecordTest, VersionOfWrong
+ 
+ TEST(ArcImportRecordTest, TooNewMinReaderVersion) {
+   EXPECT_EQ(
+-      ArcImportRecord::Parse(R"({"version":3,"min_reader_version":2})").status,
++      ArcImportRecord::Parse(R"({"version":4,"min_reader_version":3})").status,
+       ReadStatus::kTooNew);
+ }
+ 
+ TEST(ArcImportRecordTest, NewerVersionWithoutMinReaderVersionIsTooNew) {
+   // `min_reader_version` defaults to `version`.
+-  EXPECT_EQ(ArcImportRecord::Parse(R"({"version":2})").status,
++  EXPECT_EQ(ArcImportRecord::Parse(R"({"version":3})").status,
+             ReadStatus::kTooNew);
+ }
+ 
+@@ -270,7 +279,7 @@ TEST(ArcImportRecordTest, VersionOneWith
+ 
+ TEST(ArcImportRecordTest, NewerVersionStillReadable) {
+   constexpr char kJson[] = R"({
+-    "version": 2,
++    "version": 3,
+     "min_reader_version": 1,
+     "source": "arc",
+     "arc_profile": "default",
+@@ -296,7 +305,7 @@ TEST(ArcImportRecordTest, NewerVersionSt
+   ASSERT_TRUE(future);
+   EXPECT_EQ(*future, *expected_future);
+   // The version is rewritten to what this build writes.
+-  EXPECT_EQ(written.FindInt("version"), std::optional<int>(1));
++  EXPECT_EQ(written.FindInt("version"), std::optional<int>(2));
+   EXPECT_EQ(written.FindInt("min_reader_version"), std::optional<int>(1));
+ }
+ 
+@@ -641,11 +650,12 @@ TEST(ArcImportRecordTest, ClearMappings)
+   EXPECT_FALSE(record.FindSpace("arc-space-1"));
+   EXPECT_FALSE(record.FindItem("arc-pin-1"));
+   EXPECT_THAT(record.SpacesOfRun("run-1"), IsEmpty());
+-  // Runs and hand-offs stay.
++  // Runs, hand-offs and the profiles imports made stay.
+   EXPECT_EQ(record.runs().size(), 2u);
+   EXPECT_TRUE(record.FindRun("run-1"));
+   EXPECT_EQ(record.handoffs.auto_archive_raw, "sevenDays");
+   EXPECT_EQ(record.pinned_extension_ids.size(), 2u);
++  EXPECT_EQ(record.made_profiles.size(), 2u);
+ 
+   ArcImportRecord parsed = ParseOk(record.Serialize());
+   EXPECT_FALSE(parsed.has_mappings());
+@@ -1352,5 +1362,77 @@ TEST(ArcImportRecordTest, RemapItemFollo
+   EXPECT_FALSE(parsed.FindItem("arc-folder"));
+ }
+ 
++// The rac profiles imports made, which a rerun imports into again.
++
++TEST(ArcImportRecordTest, MadeProfilesRoundTripAndCopy) {
++  ArcImportRecord record;
++  record.made_profiles = {{"custom:Profile 2", "Profile 2"},
++                          {"custom:a.b", "Profile 5"}};
++
++  const base::DictValue written = SerializedDict(record);
++  const base::DictValue* made = written.FindDict("made_profiles");
++  ASSERT_TRUE(made);
++  // Dots in Arc's keys don't nest.
++  ASSERT_TRUE(made->FindString("custom:a.b"));
++  EXPECT_EQ(*made->FindString("custom:a.b"), "Profile 5");
++
++  ArcImportRecord parsed = ParseOk(record.Serialize());
++  EXPECT_EQ(parsed.made_profiles, record.made_profiles);
++  const ArcImportRecord copy(parsed);
++  EXPECT_EQ(copy.made_profiles, record.made_profiles);
++  ArcImportRecord assigned;
++  assigned = parsed;
++  EXPECT_EQ(assigned.made_profiles, record.made_profiles);
++}
++
++TEST(ArcImportRecordTest, VersionOneRecordHasNoMadeProfiles) {
++  ArcImportRecord record = ParseOk(R"({
++    "version": 1,
++    "min_reader_version": 1,
++    "source": "arc",
++    "arc_profile": "default"
++  })");
++  EXPECT_THAT(record.made_profiles, IsEmpty());
++  EXPECT_EQ(ArcImportRecord::ReusableProfile(record.made_profiles,
++                                             "custom:Profile 2", {"Profile 2"}),
++            "");
++}
++
++TEST(ArcImportRecordTest, MadeProfilesMustBeFolderNames) {
++  ArcImportRecord record = ParseOk(R"({
++    "version": 2,
++    "made_profiles": {
++      "good": "Profile 2",
++      "parent": "..",
++      "dot": ".",
++      "nested": "a/b",
++      "outside": "../Profile 3",
++      "backslash": "x\\y",
++      "empty": "",
++      "": "Profile 4",
++      "not-a-string": 5
++    }
++  })");
++  EXPECT_THAT(record.made_profiles, ElementsAre(Pair("good", "Profile 2")));
++}
++
++TEST(ArcImportRecordTest, ReusableProfileOnlyWhenStillThere) {
++  const ArcImportRecord::MadeProfiles made = {
++      {"custom:Work", "Profile 2"}, {"custom:Old", "Profile 3"},
++      {"custom:Bad", "../Profile 4"}};
++  const base::flat_set<std::string> live = {"Default", "Profile 2",
++                                            "../Profile 4"};
++  // Made before and still there: imported into again.
++  EXPECT_EQ(ArcImportRecord::ReusableProfile(made, "custom:Work", live),
++            "Profile 2");
++  // Made before, then deleted: a new one.
++  EXPECT_EQ(ArcImportRecord::ReusableProfile(made, "custom:Old", live), "");
++  // Never made: a new one.
++  EXPECT_EQ(ArcImportRecord::ReusableProfile(made, "custom:New", live), "");
++  // Not one folder name, whatever the profile list says.
++  EXPECT_EQ(ArcImportRecord::ReusableProfile(made, "custom:Bad", live), "");
++  EXPECT_EQ(ArcImportRecord::ReusableProfile({}, "custom:Work", live), "");
++}
++
+ }  // namespace
+ }  // namespace rac
