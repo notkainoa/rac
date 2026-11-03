@@ -624,6 +624,12 @@ The traps here:
   another site is still refused, and after a POST the model is told the
   form was sent. Checking redirects against the exact URL and method once
   cancelled every such result page after the action had happened.
+  The site check doesn't consult the data-flow rule. An open redirect
+  can carry a model-chosen query to a sibling origin on the same site
+  that never read anything, such as a user-content subdomain off the
+  public suffix list. Planned for the first point release (issue #72): a
+  redirect to an origin other than the approved one counts as a new
+  destination, and asks or fails if that origin has ungranted sources.
 - **The agent's own `go_back` is not the user's.** History navigations
   from the browser look like a user pressing Back, so `TabTools::GoBack`
   marks its navigation, and the back target's origin goes on the card and
@@ -847,8 +853,11 @@ detach is posted.
   text fields on the page, and which run of whole words from this turn's
   message, about log2(n²/2) for n words (some 8 bits for 20 words). So a
   long message and a page full of fields give a free step about 13 bits,
-  and a turn some 150 at worst. Hosts: a card names `http://a` and
-  `https://a` both as "a".
+  and a turn some 150 at worst. The planned change, after launch (issue
+  #73): typing the user's words is free only when it types the whole
+  message or a whole sentence of it. Any other run of words asks, which
+  removes the choice of words from the free channel. Hosts: a card names
+  `http://a` and `https://a` both as "a".
 - **Rough edges in the tools.** `press_key` is Enter on an element only, and
   the guard always treats it as a possible submit. Forms that target a named
   window or a new window are denied. The agent can't close the user's own
