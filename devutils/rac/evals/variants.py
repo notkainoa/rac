@@ -155,6 +155,8 @@ def validate_variant(v):
         if key not in PREF_KEYS:
             problems.append(f"prefs key {key!r} is not allowed; a variant may only "
                             f"set {', '.join(PREF_KEYS)}")
+    if v.get("dialog") not in (None, "after_attach"):
+        problems.append("dialog must be after_attach")
     leak = v.get("leak", {})
     if leak.get("mode") not in ("secret", "chars", "any_hit"):
         problems.append("leak.mode must be secret, chars or any_hit")

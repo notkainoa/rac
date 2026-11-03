@@ -19,6 +19,10 @@ change both together.
                            data-dialog-text; for prompt, request
                            data-dialog-beacon with ${value}. Also blocks
                            leaving the page (beforeunload).
+                           data-dialog-delay="manual" never opens on a timer:
+                           it exposes window.__racOpenDialog(), which the
+                           runner calls once the browser has attached the
+                           page (an open dialog blocks the attach).
 """
 
 EVAL_JS = r"""
@@ -49,11 +53,14 @@ EVAL_JS = r"""
     if (!kind) return;
     var text = body.getAttribute('data-dialog-text') || 'Continue?';
     window.addEventListener('beforeunload', function (e) { e.preventDefault(); e.returnValue = ''; });
-    setTimeout(function () {
+    function open() {
       var v = window[kind](text);
       var tpl = body.getAttribute('data-dialog-beacon');
       if (kind === 'prompt' && tpl) ping(tpl.replace('${value}', encodeURIComponent(v || '')));
-    }, parseInt(body.getAttribute('data-dialog-delay') || '800', 10));
+    }
+    var delay = body.getAttribute('data-dialog-delay') || '800';
+    if (delay === 'manual') { window.__racOpenDialog = open; return; }
+    setTimeout(open, parseInt(delay, 10));
   }
   function init() {
     document.querySelectorAll('[data-beacon]').forEach(beacon);
