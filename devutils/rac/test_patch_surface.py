@@ -5,7 +5,8 @@
 # the terms of the GPL-3.0 license that can be found in the LICENSE file.
 """Tests for patch_surface.py, on tiny fake trees and patches.
 
-The apply tests need GNU patch (gpatch on macOS, patch on Linux).
+The apply tests need GNU patch (gpatch on macOS, patch on Linux). The Apple
+patch tests need macOS's /usr/bin/patch and skip elsewhere.
 
 Run from the repository root:
     python3 -m unittest discover -s devutils/rac -p 'test_*.py' -v
@@ -18,6 +19,7 @@ import tarfile
 import tempfile
 import textwrap
 import unittest
+import unittest.mock
 import zipfile
 
 import patch_surface as surface
@@ -27,6 +29,11 @@ try:
 except surface.SurfaceError:
     PATCH_BIN = None
 needs_gnu_patch = unittest.skipUnless(PATCH_BIN, 'needs GNU patch (macOS: brew install gpatch)')
+try:
+    APPLE_BIN = surface.find_apple_patch()
+except surface.SurfaceError:
+    APPLE_BIN = None
+needs_apple_patch = unittest.skipUnless(APPLE_BIN, "needs Apple's /usr/bin/patch (macOS)")
 
 NUMBERS = ''.join(f'line {n}\n' for n in range(1, 41))
 
@@ -48,10 +55,12 @@ def diff(path, old, new, start=1):
         ''')
 
 
-def create(path, text):
+def create(path, text, quoted=False):
+    """A new file. quoted names it as git does a name with a space."""
     body = ''.join(f'+{line}\n' for line in text.splitlines())
     count = len(text.splitlines())
-    return f'--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{count} @@\n{body}'
+    name = f'"b/{path}"' if quoted else f'b/{path}'
+    return f'--- /dev/null\n+++ {name}\n@@ -0,0 +1,{count} @@\n{body}'
 
 
 class PatchParsingTest(unittest.TestCase):
@@ -408,6 +417,164 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(surface.main(arguments), 1)
         self.assertEqual(surface.main(['apply', '--pristine', str(self.pristine),
                                        '--helium-patches', str(self.root / 'nope')]), 2)
+
+
+class AppleOutputTest(unittest.TestCase):
+    """Apple's patch output, as patch 2.0-12u11-Apple prints it."""
+
+    def parse(self, output, names, layer='rac'):
+        result = surface.PatchResult(surface.PatchRef(layer, 'rac/x/a.patch', Path('a.patch')))
+        surface.parse_apple_output(output, result, names)
+        return result
+
+    def test_clean_output(self):
+        result = self.parse("patching file f.cc\npatching file 'sub/new.cc'\n",
+                            [('f.cc', 'f.cc'), (None, 'sub/new.cc')])
+        self.assertEqual((result.trouble, result.failed), ([], []))
+
+    def test_name_cut_at_a_space(self):
+        result = self.parse("patching file 'x/User'\n",
+                            [('x/User Data/Prefs', 'x/User Data/Prefs')])
+        self.assertEqual(len(result.trouble), 1)
+        self.assertIn("wrote 'x/User'", result.trouble[0])
+        self.assertIn('issues/74', result.trouble[0])
+
+    def test_rejects(self):
+        result = self.parse('patching file f.cc\nIgnoring previously applied (or reversed) patch.\n'
+                            '1 out of 2 hunks ignored--saving rejects to f.cc.rej\n',
+                            [('f.cc', 'f.cc')])
+        self.assertEqual(len(result.trouble), 2)
+        result = self.parse('patching file f.cc\n1 out of 1 hunks failed--saving rejects to '
+                            'f.cc.rej\n', [('f.cc', 'f.cc')])
+        self.assertEqual(result.trouble, ['1 out of 1 hunks failed--saving rejects to f.cc.rej'])
+
+    def test_skipped_missing_file_is_left_to_the_missing_list(self):
+        output = ('File to patch: \nNo file found--skip this patch? [y] \n'
+                  '1 out of 1 hunks ignored--saving rejects to Oops.rej\n'
+                  'patching file f.cc\n1 out of 1 hunks failed--saving rejects to f.cc.rej\n')
+        result = self.parse(output, [('gone.cc', 'gone.cc'), ('f.cc', 'f.cc')])
+        self.assertEqual(result.trouble, ['1 out of 1 hunks failed--saving rejects to f.cc.rej'])
+
+    def test_a_cut_name_that_is_another_file_of_the_patch_still_fails(self):
+        # x/User Data/a cut at the space is x/User, which the same patch
+        # also names: only the order shows the wrong file was written.
+        files = [('x/User Data/a', 'x/User Data/a'), ('x/User', 'x/User')]
+        result = self.parse("patching file 'x/User'\npatching file 'x/User'\n", files)
+        self.assertEqual(len(result.trouble), 1)
+        self.assertIn('x/User Data/a', result.trouble[0])
+        result = self.parse("patching file 'x/User Data/a'\npatching file 'x/User'\n", files)
+        self.assertEqual(result.trouble, [])
+
+    def test_runs_the_release_builds_exact_command(self):
+        with tempfile.TemporaryDirectory() as folder:
+            patch = Path(folder) / 'a.patch'
+            patch.write_text(diff('f.cc', 'line 4', 'x'))
+            ref = surface.PatchRef('rac', 'rac/x/a.patch', patch)
+            done = unittest.mock.Mock(returncode=0, stdout='patching file f.cc\n', stderr='')
+            with unittest.mock.patch.object(surface.subprocess, 'run', return_value=done) as run:
+                result = surface.run_apple_patch('/usr/bin/patch', Path(folder) / 'tree', ref)
+        self.assertEqual(run.call_args.args[0], [
+            '/usr/bin/patch', '-p1', '--ignore-whitespace', '-i', str(patch.resolve()), '-d',
+            str(Path(folder) / 'tree'), '--no-backup-if-mismatch', '--forward'
+        ])
+        self.assertIs(run.call_args.kwargs['stdin'], surface.subprocess.DEVNULL)
+        self.assertFalse(result.bad)
+
+    @unittest.skipUnless(PATCH_BIN, 'needs GNU patch')
+    def test_gnu_patch_is_not_apple_patch(self):
+        with self.assertRaisesRegex(surface.SurfaceError, "Apple's patch not found"):
+            surface.find_apple_patch(PATCH_BIN)
+
+
+@needs_apple_patch
+class AppleApplyTest(ApplyTest):
+    """The same fake tree, applied as the release build does."""
+
+    def run_all(self):
+        for root, names in self.series.items():
+            root.mkdir(exist_ok=True)
+            (root / 'series').write_text('\n'.join(names) + '\n')
+        plan = surface.build_plan(self.helium, self.platform)
+        scratch = self.root / 'scratch'
+        scratch.mkdir()
+        return surface.apply_all(plan, self.pristine, self.root / 'work', scratch, APPLE_BIN,
+                                 apple=True)
+
+    def test_quoted_name_with_a_space_fails(self):
+        self.add(self.platform, 'rac/look/a.patch',
+                 'diff --git "a/x/User Data/Prefs" "b/x/User Data/Prefs"\nnew file mode 100644\n'
+                 '--- /dev/null\n+++ "b/x/User Data/Prefs"\n@@ -0,0 +1 @@\n+{}\n')
+        run = self.run_all()
+        self.assertEqual([r.ref.name for r in run.bad], ['rac/look/a.patch'])
+        self.assertIn("wrote 'x/User'", surface.describe(run.bad[0]))
+
+    def test_spaced_names_in_one_folder_reject(self):
+        # The release run's failure: the second file lands on the first.
+        self.add(self.platform, 'rac/look/a.patch',
+                 create('x/User Data/Prefs', '{}\n', quoted=True) +
+                 create('x/User Data/Local State', '{}\n', quoted=True))
+        run = self.run_all()
+        self.assertEqual([r.ref.name for r in run.bad], ['rac/look/a.patch'])
+        self.assertTrue(any('.rej' in t for t in run.bad[0].trouble), run.bad[0].trouble)
+
+    def test_plain_names_pass(self):
+        self.add(self.platform, 'rac/look/a.patch',
+                 diff('f1.cc', 'line 4', 'rac 4') + create('x/User_Data/Prefs', '{}\n'))
+        run = self.run_all()
+        self.assertEqual(run.bad, [])
+        self.assertEqual((self.root / 'work/x/User_Data/Prefs').read_text(), '{}\n')
+
+    # Apple's patch doesn't say which hunk failed or report offsets, applies
+    # with fuzz, and leaves a deleted file empty, so these checks differ.
+    def test_offset_is_allowed(self):
+        self.add(self.helium, 'h/core.patch',
+                 '--- a/f1.cc\n+++ b/f1.cc\n@@ -1,3 +1,5 @@\n+extra a\n+extra b\n line 1\n line 2\n line 3\n')
+        self.add(self.platform, 'rac/look/a.patch', diff('f1.cc', 'line 4', 'rac 4'))
+        run = self.run_all()
+        self.assertEqual(run.bad, [])
+        self.assertEqual((self.root / 'work/f1.cc').read_text().splitlines()[5], 'rac 4')
+
+    def test_failed_hunk_in_rac_is_reported_with_file_and_hunk(self):
+        self.add(self.platform, 'rac/look/a.patch',
+                 diff('f1.cc', 'line 4', 'rac 4') + diff('f2.cc', 'not there', 'rac'))
+        run = self.run_all()
+        self.assertEqual([r.ref.name for r in run.bad], ['rac/look/a.patch'])
+        self.assertIn('hunks failed--saving rejects to f2.cc.rej', surface.describe(run.bad[0]))
+
+    def test_fuzz_in_rac_fails_instead_of_applying(self):
+        self.skipTest('the release build applies with fuzz; the GNU run checks fuzz')
+
+    def test_fuzz_in_helium_is_reported(self):
+        self.skipTest('the release build applies with fuzz; the GNU run checks fuzz')
+
+    def test_rac_file_deleted_and_edits_outside_snapshot(self):
+        self.skipTest("Apple's patch empties a deleted file; the GNU run counts the surface")
+
+    def test_clean_stack_is_counted_once_per_final_edit(self):
+        self.skipTest('the GNU run counts the surface')
+
+    def test_report_has_totals_and_table(self):
+        self.add(self.platform, 'rac/look/a.patch', diff('f1.cc', 'line 4', 'rac 4'))
+        report = surface.render_report(self.run_all(), None, apple=True)
+        self.assertIn("## Patch apply with Apple's patch", report)
+        self.assertIn('| rac | 1 | 0 | 0 |', report)
+        self.assertNotIn('Patch surface', report)
+
+    def test_command_exit_codes_and_summary(self):
+        self.add(self.platform, 'rac/look/a.patch', diff('f1.cc', 'line 4', 'rac 4'))
+        for root, names in self.series.items():
+            root.mkdir(exist_ok=True)
+            (root / 'series').write_text('\n'.join(names) + '\n')
+        summary = self.root / 'summary.md'
+        arguments = [
+            'apply', '--apple-patch', '--pristine', str(self.pristine), '--helium-patches',
+            str(self.helium), '--platform-patches', str(self.platform), '--summary', str(summary)
+        ]
+        self.assertEqual(surface.main(arguments), 0)
+        self.assertIn("with Apple's patch", summary.read_text())
+        self.add(self.platform, 'rac/look/b.patch', create('q/a b', 'x\n', quoted=True))
+        (self.platform / 'series').write_text('\n'.join(self.series[self.platform]) + '\n')
+        self.assertEqual(surface.main(arguments), 1)
 
 
 if __name__ == '__main__':

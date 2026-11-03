@@ -34,6 +34,15 @@ directory's `series` file sets the order. Blank lines are ignored. Lines
 starting with `#` are skipped when patches are applied, but Helium's lint
 fails on them, so rac's series has none.
 
+On macOS, `patches.py` applies every patch with Apple's `/usr/bin/patch`, not
+the GNU patch that quilt uses in dev trees. Apple's patch cuts a file name at
+the first space and can't read git's quoted names, so a patch whose files
+have spaces or quotes in their names passes quilt and fails the release build
+([#74](https://github.com/notkainoa/rac/issues/74)). Name new files without
+them. CI checks both: `devutils/rac/patch_header_lint.py` reads the headers,
+and the "Patches apply with Apple's patch" job applies the whole stack the
+way the release build does.
+
 After patching, Helium runs name and domain substitution and applies its
 translations. Then rac's name pass runs (see
 [Branding](#branding-and-helium-services)), and resources are copied into the
