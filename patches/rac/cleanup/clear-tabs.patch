@@ -1,6 +1,6 @@
 --- a/chrome/app/rac_strings.grd
 +++ b/chrome/app/rac_strings.grd
-@@ -283,6 +283,52 @@
+@@ -283,6 +283,55 @@
        <message name="IDS_RAC_ARC_SIGNINS_RETRYING" desc="The Retry button's label while the sign-ins (cookies) are being brought over again.">
          Retrying…
        </message>
@@ -25,6 +25,9 @@
 +      </message>
 +      <message name="IDS_RAC_CLEAR_TOAST_UNDO" desc="Button in the toast after the user cleared a space's open tabs. Reopens the tabs that were closed, in the same order.">
 +        Undo
++      </message>
++      <message name="IDS_RAC_CLEAR_KEPT_LOADING" desc="Short note under a tab in the sidebar, shown for a few seconds after Clear closed the space's other open tabs. Says why Clear left this tab open: its first page is still loading, so the recently closed list couldn't bring it back.">
++        Kept: still loading
 +      </message>
 +      <message name="IDS_RAC_CLEAR_KEPT_AGENT" desc="Short note under a tab in the sidebar, shown for a few seconds after Clear closed the space's other open tabs. Says why Clear left this tab open: an agent (the browser assistant) is acting in the tab.">
 +        Kept: an agent is using it
@@ -520,7 +523,7 @@
 +}  // namespace rac::cleanup
 --- /dev/null
 +++ b/chrome/browser/ui/rac/cleanup/clear_tabs.cc
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,413 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -613,6 +616,22 @@
 +  if (g_kept_tabs) {
 +    g_kept_tabs->erase(window);
 +  }
++}
++
++// Hands the sidebar the tabs this Clear keeps, for the rest of this task.
++void StoreKeptTabs(BrowserWindowInterface* browser,
++                   std::vector<std::pair<tabs::TabHandle, int>> kept) {
++  if (kept.empty()) {
++    return;
++  }
++  // The sidebar takes them while the tabs close (or, when none does, right
++  // after its Clear button ran this); nobody may later.
++  if (!g_kept_tabs) {
++    g_kept_tabs = new KeptTabs();
++  }
++  (*g_kept_tabs)[browser->GetSessionID()] = std::move(kept);
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&ForgetKeptTabs, browser->GetSessionID()));
 +}
 +
 +int KeptMessageId(ClearReason reason) {
@@ -755,37 +774,52 @@
 +      kept.emplace_back(tab->GetHandle(), message_id);
 +    }
 +  }
-+  if (!kept.empty()) {
-+    // The sidebar takes them while the tabs close (or, when none does,
-+    // right after its Clear button ran this); nobody may later.
-+    if (!g_kept_tabs) {
-+      g_kept_tabs = new KeptTabs();
-+    }
-+    (*g_kept_tabs)[browser->GetSessionID()] = std::move(kept);
-+    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
-+        FROM_HERE, base::BindOnce(&ForgetKeptTabs, browser->GetSessionID()));
-+  }
 +  if (clearing.empty()) {
++    StoreKeptTabs(browser, std::move(kept));
 +    return;
 +  }
 +
 +  // Record the Clear as one entry while every tab is still where it was.
 +  ClearedTabsContext context(*window, indices, SpaceTitle(manager, *space));
 +  service->CreateHistoricalGroup(&context, context.group_id());
++  service->GroupClosed(context.group_id());
 +  const sessions::TabRestoreService::Entries& entries = service->entries();
-+  const bool recorded =
++  const sessions::tab_restore::Group* entry =
 +      !entries.empty() &&
-+      entries.front()->type == sessions::tab_restore::Type::GROUP &&
-+      static_cast<const sessions::tab_restore::Group&>(*entries.front())
-+              .group_id == context.group_id();
++              entries.front()->type == sessions::tab_restore::Type::GROUP &&
++              static_cast<const sessions::tab_restore::Group&>(
++                  *entries.front())
++                      .group_id == context.group_id()
++          ? &static_cast<const sessions::tab_restore::Group&>(*entries.front())
++          : nullptr;
++
++  // Recently closed leaves out a tab it can't bring back, such as one whose
++  // first page is still loading. Closing it would lose it, so it stays, and
++  // Undo counts and places only the tabs the entry holds.
++  const std::vector<int> recorded =
++      entry ? RecordedIndices(*entry) : std::vector<int>();
++  std::vector<tabs::TabInterface*> closing;
++  size_t k = 0;
++  for (int index : indices) {
++    tabs::TabInterface* tab = clearing[k++];
++    if (std::ranges::binary_search(recorded, index)) {
++      closing.push_back(tab);
++    } else {
++      kept.emplace_back(tab->GetHandle(), IDS_RAC_CLEAR_KEPT_LOADING);
++    }
++  }
++  StoreKeptTabs(browser, std::move(kept));
++  if (closing.empty()) {
++    return;
++  }
 +
 +  PendingUndo pending;
-+  pending.entry_id = recorded ? entries.front()->id : SessionID::InvalidValue();
-+  pending.indices.assign(indices.begin(), indices.end());
++  pending.entry_id = entry->id;
++  pending.indices = recorded;
 +  tabs::TabInterface* selected = model->GetActiveTab();
-+  if (auto it = std::ranges::find(clearing, selected); it != clearing.end()) {
-+    pending.selected = it - clearing.begin();
-+    LeaveSelectedTab(model, clearing);
++  if (auto it = std::ranges::find(closing, selected); it != closing.end()) {
++    pending.selected = it - closing.begin();
++    LeaveSelectedTab(model, closing);
 +  } else if (selected) {
 +    pending.kept_selected = selected->GetHandle();
 +  }
@@ -793,24 +827,22 @@
 +  const SessionID window_id = browser->GetSessionID();
 +  const SessionID entry_id = pending.entry_id;
 +  ToastController* toasts = ToastController::From(browser);
-+  const bool offer_undo = recorded && toasts;
 +  SetUndoClearHandler(&UndoClear);
-+  if (offer_undo) {
++  if (toasts) {
 +    PendingUndos()[window_id] = std::move(pending);
 +  }
 +
 +  // Close from the bottom up. Not CLOSE_CREATE_HISTORICAL_TAB: the entry
 +  // above already holds them.
-+  const int count = clearing.size();
-+  for (tabs::TabInterface* tab : base::Reversed(clearing)) {
++  const int count = closing.size();
++  for (tabs::TabInterface* tab : base::Reversed(closing)) {
 +    const int index = model->GetIndexOfTab(tab);
 +    if (index != TabStripModel::kNoTab) {
 +      model->CloseWebContentsAt(index, TabCloseTypes::CLOSE_USER_GESTURE);
 +    }
 +  }
-+  service->GroupClosed(context.group_id());
 +
-+  if (!offer_undo) {
++  if (!toasts) {
 +    return;
 +  }
 +  // The toast's lifetime is Undo's: closing it, by timeout, its button, or
@@ -1045,7 +1077,7 @@
 +#endif  // CHROME_BROWSER_UI_RAC_CLEANUP_CLEAR_TOAST_H_
 --- /dev/null
 +++ b/chrome/browser/ui/rac/cleanup/cleared_tabs_context.cc
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,185 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1065,6 +1097,15 @@
 +
 +bool IsClearedTab(const sessions::tab_restore::Tab& tab) {
 +  return tab.extra_data.contains(kClearedTabExtraDataKey);
++}
++
++std::vector<int> RecordedIndices(const sessions::tab_restore::Group& entry) {
++  std::vector<int> indices;
++  indices.reserve(entry.tabs.size());
++  for (const auto& tab : entry.tabs) {
++    indices.push_back(tab->tabstrip_index);
++  }
++  return indices;
 +}
 +
 +ClearedTabsContext::ClearedTabsContext(sessions::LiveTabContext& window,
@@ -1224,7 +1265,7 @@
 +}  // namespace rac::cleanup
 --- /dev/null
 +++ b/chrome/browser/ui/rac/cleanup/cleared_tabs_context.h
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,116 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1236,6 +1277,7 @@
 +#include <optional>
 +#include <set>
 +#include <string>
++#include <vector>
 +
 +#include "base/memory/raw_ref.h"
 +#include "components/sessions/core/live_tab_context.h"
@@ -1250,6 +1292,12 @@
 +inline constexpr char kClearedTabExtraDataKey[] = "rac.cleared";
 +
 +bool IsClearedTab(const sessions::tab_restore::Tab& tab);
++
++// The tab strip indices of the tabs a Clear's entry holds, in order.
++// Recently closed drops a tab that has no page to bring back (a first load
++// still pending, say), so this can be fewer than the tabs given to
++// ClearedTabsContext; Clear keeps those open rather than lose them.
++std::vector<int> RecordedIndices(const sessions::tab_restore::Group& entry);
 +
 +// Closing N tabs records N recently-closed entries, one per tab, and the list
 +// keeps only 25. So a Clear shows TabRestoreService its tabs as one stand-in
@@ -1336,7 +1384,7 @@
 +#endif  // CHROME_BROWSER_UI_RAC_CLEANUP_CLEARED_TABS_CONTEXT_H_
 --- /dev/null
 +++ b/chrome/browser/ui/rac/cleanup/cleared_tabs_context_unittest.cc
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,411 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1392,6 +1440,7 @@
 +
 +class FakeLiveTab : public sessions::LiveTab {
 + public:
++  // An empty `url` is a tab whose first page hasn't committed yet.
 +  explicit FakeLiveTab(GURL url) : url_(std::move(url)) {}
 +  ~FakeLiveTab() override = default;
 +
@@ -1399,8 +1448,8 @@
 +
 +  // sessions::LiveTab:
 +  SessionID GetSessionID() const override { return id_; }
-+  bool IsInitialBlankNavigation() override { return false; }
-+  int GetCurrentEntryIndex() override { return 0; }
++  bool IsInitialBlankNavigation() override { return url_.is_empty(); }
++  int GetCurrentEntryIndex() override { return url_.is_empty() ? -1 : 0; }
 +  int GetPendingEntryIndex() override { return -1; }
 +  sessions::SerializedNavigationEntry GetEntryAtIndex(int index) override {
 +    sessions::SerializedNavigationEntry entry = sessions::
@@ -1411,7 +1460,7 @@
 +  sessions::SerializedNavigationEntry GetPendingEntry() override {
 +    return sessions::SerializedNavigationEntry();
 +  }
-+  int GetEntryCount() override { return 1; }
++  int GetEntryCount() override { return url_.is_empty() ? 0 : 1; }
 +  sessions::SerializedUserAgentOverride GetUserAgentOverride() override {
 +    return sessions::SerializedUserAgentOverride();
 +  }
@@ -1436,9 +1485,11 @@
 +    std::map<std::string, std::string> extra_data;
 +  };
 +
-+  explicit FakeWindow(int tab_count) {
++  // `pending` tabs have no committed page yet.
++  explicit FakeWindow(int tab_count, std::set<int> pending = {}) {
 +    for (int i = 0; i < tab_count; ++i) {
-+      tabs_.push_back(std::make_unique<FakeLiveTab>(UrlFor(i)));
++      tabs_.push_back(std::make_unique<FakeLiveTab>(
++          pending.contains(i) ? GURL() : UrlFor(i)));
 +    }
 +  }
 +  ~FakeWindow() override = default;
@@ -1581,8 +1632,8 @@
 +
 +class ClearedTabsContextTest : public testing::Test {
 + protected:
-+  explicit ClearedTabsContextTest(int tab_count = 6)
-+      : window_(tab_count),
++  explicit ClearedTabsContextTest(int tab_count = 6, std::set<int> pending = {})
++      : window_(tab_count, std::move(pending)),
 +        client_(window_),
 +        helper_(&service_, &client_, /*time_factory=*/nullptr) {}
 +
@@ -1691,6 +1742,32 @@
 +  // The rest of the Clear is still one entry.
 +  ASSERT_EQ(helper_.entries().size(), 1u);
 +  EXPECT_EQ(helper_.entries().front()->id, id);
++}
++
++class ClearedTabsContextPendingTest : public ClearedTabsContextTest {
++ protected:
++  ClearedTabsContextPendingTest()
++      : ClearedTabsContextTest(/*tab_count=*/6, /*pending=*/{2}) {}
++};
++
++// A tab whose first load hasn't committed has nothing recently closed can
++// bring back, so the entry leaves it out. Clear keeps exactly those tabs
++// open, and pairs saved positions only with the tabs the entry holds.
++TEST_F(ClearedTabsContextPendingTest, ATabStillLoadingIsLeftOut) {
++  Clear({1, 2, 3});
++
++  ASSERT_EQ(helper_.entries().size(), 1u);
++  const auto& group = static_cast<const Group&>(*helper_.entries().front());
++  EXPECT_EQ(RecordedIndices(group), (std::vector<int>{1, 3}));
++  EXPECT_EQ(group.tabs[0]->navigations.at(0).virtual_url(), UrlFor(1));
++  EXPECT_EQ(group.tabs[1]->navigations.at(0).virtual_url(), UrlFor(3));
++}
++
++TEST_F(ClearedTabsContextPendingTest, NothingRecordedWhenEveryTabIsLoading) {
++  ClearedTabsContext context(window_, {2}, u"Personal");
++  helper_.CreateHistoricalGroup(&context, context.group_id());
++  helper_.GroupClosed(context.group_id());
++  EXPECT_TRUE(helper_.entries().empty());
 +}
 +
 +class ClearedTabsContextManyTabsTest : public ClearedTabsContextTest {
