@@ -1,0 +1,279 @@
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -1258,6 +1258,8 @@ class AppControllerProfileObserver : pub
+ 
+ - (void)openStartupUrls {
+   CHECK(_startupComplete);
++  // rac: links queued while rac launched came with the launch.
++  rac::little_window::NoteLinksCameWithLaunch(_startupTabs);
+   [self openStartupTabsReplacingNTP:std::move(_startupTabs)];
+   _startupTabs.clear();
+ }
+--- a/chrome/browser/ui/rac/little_window/little_window_routing.cc
++++ b/chrome/browser/ui/rac/little_window/little_window_routing.cc
+@@ -40,6 +40,14 @@ ExpandTarget PickExpandTarget(
+   return {};
+ }
+ 
++bool ShouldCloseStartupWindow(bool link_came_with_launch,
++                              LinkRoute route,
++                              const StartupWindowFacts& window) {
++  return link_came_with_launch && route == LinkRoute::kLittleWindow &&
++         !window.restored_from_session && window.tab_count == 1 &&
++         window.only_new_tab_page;
++}
++
+ gfx::Rect LittleWindowBounds(const gfx::Rect& work_area) {
+   gfx::Rect room = work_area;
+   room.Inset(rac::tokens::kSpacing24);
+--- a/chrome/browser/ui/rac/little_window/little_window_routing.h
++++ b/chrome/browser/ui/rac/little_window/little_window_routing.h
+@@ -60,6 +60,24 @@ ExpandTarget PickExpandTarget(
+     const void* profile,
+     base::span<const WindowFacts> windows_by_activation);
+ 
++// A window that was open when a link arrived with rac's launch: a link
++// clicked in another app while rac wasn't running.
++struct StartupWindowFacts {
++  // Brought back by session restore: the user's own windows.
++  bool restored_from_session = false;
++  int tab_count = 0;
++  // Its tab is the New Tab page and has never been anywhere else.
++  bool only_new_tab_page = false;
++};
++
++// Whether that window closes once the link's little window is open. A launch
++// whose only work was a link that became a little window shouldn't also leave
++// the empty window Chromium opens at every launch. Restored windows, windows
++// with anything in them, and launches that opened tabs stay as they are.
++bool ShouldCloseStartupWindow(bool link_came_with_launch,
++                              LinkRoute route,
++                              const StartupWindowFacts& window);
++
+ // A new little window's bounds on a display with `work_area`: a fixed size,
+ // shrunk to fit inside the work area's margin, centered. A closed little
+ // window keeps nothing, so there is no remembered placement.
+--- a/chrome/browser/ui/rac/little_window/little_window_routing_unittest.cc
++++ b/chrome/browser/ui/rac/little_window/little_window_routing_unittest.cc
+@@ -96,6 +96,49 @@ TEST(LittleWindowRoutingTest, NoWindowMe
+   EXPECT_TRUE(target.space.empty());
+ }
+ 
++constexpr StartupWindowFacts kEmptyStartupWindow{.restored_from_session = false,
++                                                 .tab_count = 1,
++                                                 .only_new_tab_page = true};
++
++TEST(LittleWindowRoutingTest, ColdLaunchByALinkClosesTheEmptyStartupWindow) {
++  EXPECT_TRUE(ShouldCloseStartupWindow(/*link_came_with_launch=*/true,
++                                       LinkRoute::kLittleWindow,
++                                       kEmptyStartupWindow));
++}
++
++TEST(LittleWindowRoutingTest, ALinkWhileRacRunsClosesNothing) {
++  // rac was already open: its empty window is one the user opened.
++  EXPECT_FALSE(ShouldCloseStartupWindow(/*link_came_with_launch=*/false,
++                                        LinkRoute::kLittleWindow,
++                                        kEmptyStartupWindow));
++}
++
++TEST(LittleWindowRoutingTest, ALaunchThatOpensTabsKeepsItsWindow) {
++  // Several links, files, other schemes: Chromium puts them in that window.
++  EXPECT_FALSE(ShouldCloseStartupWindow(/*link_came_with_launch=*/true,
++                                        LinkRoute::kTabs, kEmptyStartupWindow));
++}
++
++TEST(LittleWindowRoutingTest, RestoredSessionWindowsStay) {
++  StartupWindowFacts restored = kEmptyStartupWindow;
++  restored.restored_from_session = true;
++  EXPECT_FALSE(ShouldCloseStartupWindow(/*link_came_with_launch=*/true,
++                                        LinkRoute::kLittleWindow, restored));
++}
++
++TEST(LittleWindowRoutingTest, AWindowWithAnythingInItStays) {
++  StartupWindowFacts two_tabs = kEmptyStartupWindow;
++  two_tabs.tab_count = 2;
++  StartupWindowFacts navigated = kEmptyStartupWindow;
++  navigated.only_new_tab_page = false;
++  StartupWindowFacts no_tabs = kEmptyStartupWindow;
++  no_tabs.tab_count = 0;
++  for (const StartupWindowFacts& window : {two_tabs, navigated, no_tabs}) {
++    EXPECT_FALSE(ShouldCloseStartupWindow(/*link_came_with_launch=*/true,
++                                          LinkRoute::kLittleWindow, window));
++  }
++}
++
+ TEST(LittleWindowRoutingTest, BoundsAreCenteredAtTheirSize) {
+   const gfx::Rect work_area(0, 25, 1440, 875);
+   const gfx::Rect bounds = LittleWindowBounds(work_area);
+--- a/chrome/browser/ui/views/rac/little_window/little_window.cc
++++ b/chrome/browser/ui/views/rac/little_window/little_window.cc
+@@ -16,7 +16,9 @@
+ #include "base/no_destructor.h"
+ #include "chrome/app/vector_icons/vector_icons.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/sessions/session_restore.h"
+ #include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_init_state.h"
+ #include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_collection.h"
+@@ -33,7 +35,9 @@
+ #include "chrome/browser/ui/views/rac/rac_tokens.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_button.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
++#include "chrome/common/webui_url_constants.h"
+ #include "chrome/grit/rac_strings.h"
++#include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/page_transition_types.h"
+@@ -51,6 +55,18 @@ namespace {
+ // can tell it apart from other popups before the window is listed.
+ bool g_creating_little_window = false;
+ 
++// Set by NoteLinksCameWithLaunch, read and cleared by the next
++// OpenLinksFromOtherApp.
++bool g_links_came_with_launch = false;
++
++// While a launch's session restore is still running for the little window's
++// profile: brings the little window back to the front once the restore has
++// shown its windows.
++base::CallbackListSubscription& RestoreWatch() {
++  static base::NoDestructor<base::CallbackListSubscription> watch;
++  return *watch;
++}
++
+ // The open little windows. Made with the first one; a window leaves the list
+ // when it closes.
+ class LittleWindows {
+@@ -178,6 +194,86 @@ BrowserWindowInterface* CreateLittleWind
+   return browser;
+ }
+ 
++// After a launch whose only work was a link that became `little`: closes the
++// empty window Chromium opened at launch, so the little window is the only
++// one. Restored session windows and anything with content stay.
++void CloseEmptyStartupWindows(Profile* profile,
++                              BrowserWindowInterface* little) {
++  std::vector<BrowserWindowInterface*> to_close;
++  GlobalBrowserCollection::GetInstance()->ForEach(
++      [&](BrowserWindowInterface* window) {
++        if (window == little || window->GetProfile() != profile ||
++            window->GetType() != BrowserWindowInterface::TYPE_NORMAL ||
++            window->IsDeleteScheduled()) {
++          return true;
++        }
++        TabStripModel* tabs = window->GetTabStripModel();
++        StartupWindowFacts facts{
++            .restored_from_session =
++                BrowserInitState::From(window)->is_session_restore(),
++            .tab_count = tabs->count()};
++        if (tabs->count() == 1) {
++          content::WebContents* contents = tabs->GetWebContentsAt(0);
++          const GURL& url = contents->GetVisibleURL();
++          facts.only_new_tab_page =
++              contents->GetController().GetEntryCount() <= 1 &&
++              (url == GURL(chrome::kChromeUINewTabURL) ||
++               url == GURL(chrome::kChromeUINewTabPageURL));
++        }
++        if (ShouldCloseStartupWindow(/*link_came_with_launch=*/true,
++                                     LinkRoute::kLittleWindow, facts)) {
++          to_close.push_back(window);
++        }
++        return true;
++      });
++  for (BrowserWindowInterface* window : to_close) {
++    if (BrowserWindow* native = BrowserWindow::FromBrowser(window)) {
++      native->Close();
++    }
++  }
++}
++
++std::vector<GURL> UrlsOf(const StartupTabs& tabs) {
++  std::vector<GURL> urls;
++  urls.reserve(tabs.size());
++  for (const StartupTab& tab : tabs) {
++    urls.push_back(tab.url);
++  }
++  return urls;
++}
++
++}  // namespace
++
++void NoteLinksCameWithLaunch(const StartupTabs& tabs) {
++  g_links_came_with_launch = !tabs.empty();
++}
++
++namespace {
++
++// Once the launch's restore has shown its windows (and activated one), the
++// little window takes the front and focus back. It runs in the same task as
++// the restore, so the windows never visibly jump.
++void WatchLaunchRestore(Profile* profile, BrowserWindowInterface* little) {
++  RestoreWatch() =
++      SessionRestore::RegisterOnSessionRestoredCallback(base::BindRepeating(
++          [](Profile* profile, base::WeakPtr<BrowserWindowInterface> little,
++             Profile* restored, int /*tab_count*/) {
++            if (restored != profile) {
++              return;
++            }
++            if (little) {
++              CloseEmptyStartupWindows(profile, little.get());
++              if (BrowserWindow* native =
++                      BrowserWindow::FromBrowser(little.get())) {
++                native->Activate();
++              }
++            }
++            // Destroys this callback; nothing after this line.
++            RestoreWatch() = {};
++          },
++          profile, little->GetWeakPtr()));
++}
++
+ }  // namespace
+ 
+ bool IsLittleWindow(const BrowserWindowInterface* browser) {
+@@ -192,12 +288,8 @@ bool IsLittleWindow(const BrowserWindowI
+ }
+ 
+ bool OpenLinksFromOtherApp(const StartupTabs& tabs, Profile* profile) {
+-  std::vector<GURL> urls;
+-  urls.reserve(tabs.size());
+-  for (const StartupTab& tab : tabs) {
+-    urls.push_back(tab.url);
+-  }
+-  if (RouteLinksFromOtherApp(urls) != LinkRoute::kLittleWindow) {
++  const bool came_with_launch = std::exchange(g_links_came_with_launch, false);
++  if (RouteLinksFromOtherApp(UrlsOf(tabs)) != LinkRoute::kLittleWindow) {
+     return false;
+   }
+   BrowserWindowInterface* browser = CreateLittleWindow(profile);
+@@ -216,6 +308,12 @@ bool OpenLinksFromOtherApp(const Startup
+   navigate.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
+   navigate.window_action = NavigateParams::WindowAction::kShowWindow;
+   Navigate(&navigate);
++  if (came_with_launch) {
++    CloseEmptyStartupWindows(profile, browser);
++    if (SessionRestore::IsRestoring(profile)) {
++      WatchLaunchRestore(profile, browser);
++    }
++  }
+   return true;
+ }
+ 
+--- a/chrome/browser/ui/views/rac/little_window/little_window.h
++++ b/chrome/browser/ui/views/rac/little_window/little_window.h
+@@ -41,6 +41,13 @@ bool IsLittleWindow(const BrowserWindowI
+ // returns false to leave them to Chromium.
+ bool OpenLinksFromOtherApp(const StartupTabs& tabs, Profile* profile);
+ 
++// Called once when rac finishes launching, with the links that arrived while
++// it launched (a link clicked in another app started rac; usually none). If
++// the next OpenLinksFromOtherApp turns them into a little window, the empty
++// window Chromium opens at launch closes, now or when the launch's session
++// restore finishes, and the little window stays in front.
++void NoteLinksCameWithLaunch(const StartupTabs& tabs);
++
+ // Opens an empty little window for `profile`, with its address field focused.
+ // An incognito profile's little window is incognito.
+ BrowserWindowInterface* OpenEmpty(Profile* profile);
