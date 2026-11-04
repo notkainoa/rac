@@ -588,7 +588,7 @@
 +}  // namespace rac::cleanup
 --- /dev/null
 +++ b/chrome/browser/ui/rac/cleanup/clear_tabs.cc
-@@ -0,0 +1,524 @@
+@@ -0,0 +1,550 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -606,6 +606,7 @@
 +#include "base/containers/adapters.h"
 +#include "base/functional/bind.h"
 +#include "base/functional/callback_helpers.h"
++#include "base/functional/function_ref.h"
 +#include "base/memory/raw_ptr.h"
 +#include "base/no_destructor.h"
 +#include "base/notreached.h"
@@ -657,6 +658,8 @@
 +  std::optional<size_t> selected;
 +  // Otherwise the tab that was selected, which Clear kept.
 +  tabs::TabHandle kept_selected;
++  // The cleared tabs' ids in the entry, as `indices`.
++  std::vector<SessionID> entry_tabs;
 +  // The cleared tabs themselves, as `indices`. One that still exists and is
 +  // no longer closing when Undo runs or the toast closes stayed open: a page
 +  // asked before closing and the user stayed (TabStayedOpen).
@@ -664,17 +667,53 @@
 +  raw_ptr<Profile> profile = nullptr;
 +};
 +
++// Keeps the cleared tabs for which `keep(k)` is true, in order.
++void KeepOnly(PendingUndo& pending, base::FunctionRef<bool(size_t)> keep) {
++  PendingUndo left;
++  left.entry_id = pending.entry_id;
++  left.kept_selected = pending.kept_selected;
++  left.profile = pending.profile;
++  for (size_t k = 0; k < pending.tabs.size(); ++k) {
++    if (!keep(k)) {
++      continue;
++    }
++    if (pending.selected == k) {
++      left.selected = left.indices.size();
++    }
++    left.indices.push_back(pending.indices[k]);
++    left.entry_tabs.push_back(pending.entry_tabs[k]);
++    left.tabs.push_back(pending.tabs[k]);
++  }
++  pending = std::move(left);
++}
++
++// The Clear's entry, while recently closed still holds it.
++const sessions::tab_restore::Group* FindClear(
++    sessions::TabRestoreService* service,
++    SessionID entry_id) {
++  if (!service) {
++    return nullptr;
++  }
++  for (const auto& entry : service->entries()) {
++    if (entry->id == entry_id &&
++        entry->type == sessions::tab_restore::Type::GROUP) {
++      return static_cast<const sessions::tab_restore::Group*>(entry.get());
++    }
++  }
++  return nullptr;
++}
++
 +// Takes the cleared tabs that stayed open out of the Clear's entry, so
 +// neither Undo nor Cmd+Shift+T opens a second copy, and out of `pending`.
 +// Returns the one that was selected, if it stayed.
 +tabs::TabInterface* DropTabsThatStayed(PendingUndo& pending) {
-+  std::set<int> stayed;
++  std::set<SessionID> stayed;
 +  tabs::TabInterface* selected = nullptr;
 +  for (size_t k = 0; k < pending.tabs.size(); ++k) {
 +    tabs::TabInterface* tab = pending.tabs[k].Get();
 +    if (tab && TabStayedOpen(/*exists=*/true,
 +                             tab->GetContents()->GetClosedByUserGesture())) {
-+      stayed.insert(pending.indices[k]);
++      stayed.insert(pending.entry_tabs[k]);
 +      if (pending.selected == k) {
 +        selected = tab;
 +      }
@@ -687,31 +726,12 @@
 +      pending.profile
 +          ? TabRestoreServiceFactory::GetForProfileIfExisting(pending.profile)
 +          : nullptr;
-+  if (service) {
-+    for (const auto& entry : service->entries()) {
-+      if (entry->id == pending.entry_id &&
-+          entry->type == sessions::tab_restore::Type::GROUP) {
-+        service->DeleteNavigationEntries(PagesOfTabs(
-+            static_cast<const sessions::tab_restore::Group&>(*entry), stayed));
-+        break;
-+      }
-+    }
++  if (const sessions::tab_restore::Group* entry =
++          FindClear(service, pending.entry_id)) {
++    service->DeleteNavigationEntries(PagesOfTabs(*entry, stayed));
 +  }
-+  PendingUndo left;
-+  left.entry_id = pending.entry_id;
-+  left.kept_selected = pending.kept_selected;
-+  left.profile = pending.profile;
-+  for (size_t k = 0; k < pending.tabs.size(); ++k) {
-+    if (stayed.contains(pending.indices[k])) {
-+      continue;
-+    }
-+    if (pending.selected == k) {
-+      left.selected = left.indices.size();
-+    }
-+    left.indices.push_back(pending.indices[k]);
-+    left.tabs.push_back(pending.tabs[k]);
-+  }
-+  pending = std::move(left);
++  KeepOnly(pending,
++           [&](size_t k) { return !stayed.contains(pending.entry_tabs[k]); });
 +  return selected;
 +}
 +
@@ -980,6 +1000,7 @@
 +  pending.entry_id = entry->id;
 +  pending.indices = recorded;
 +  pending.profile = browser->GetProfile();
++  pending.entry_tabs = RecordedTabIds(*entry);
 +  for (tabs::TabInterface* tab : closing) {
 +    pending.tabs.push_back(tab->GetHandle());
 +  }
@@ -1067,12 +1088,17 @@
 +  sessions::TabRestoreService* service =
 +      TabRestoreServiceFactory::GetForProfile(browser->GetProfile());
 +  BrowserLiveTabContext* window = BrowserLiveTabContext::From(browser);
-+  if (!service || !window ||
-+      std::ranges::none_of(service->entries(), [&](const auto& entry) {
-+        return entry->id == pending.entry_id;
-+      })) {
++  const sessions::tab_restore::Group* entry =
++      FindClear(service, pending.entry_id);
++  if (!window || !entry) {
 +    return;
 +  }
++  // Only the tabs still in the entry come back: one may have been restored
++  // alone from History, or its page deleted from history, meanwhile.
++  const std::vector<SessionID> in_entry = RecordedTabIds(*entry);
++  KeepOnly(pending, [&](size_t k) {
++    return std::ranges::find(in_entry, pending.entry_tabs[k]) != in_entry.end();
++  });
 +  std::optional<std::vector<sessions::LiveTab*>> restored =
 +      service->RestoreEntryById(window, pending.entry_id,
 +                                WindowOpenDisposition::UNKNOWN);
@@ -1272,7 +1298,7 @@
 +#endif  // CHROME_BROWSER_UI_RAC_CLEANUP_CLEAR_TOAST_H_
 --- /dev/null
 +++ b/chrome/browser/ui/rac/cleanup/cleared_tabs_context.cc
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,240 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1309,14 +1335,24 @@
 +  return exists && !closing;
 +}
 +
++std::vector<SessionID> RecordedTabIds(
++    const sessions::tab_restore::Group& entry) {
++  std::vector<SessionID> ids;
++  ids.reserve(entry.tabs.size());
++  for (const auto& tab : entry.tabs) {
++    ids.push_back(tab->id);
++  }
++  return ids;
++}
++
 +sessions::TabRestoreService::DeletionPredicate PagesOfTabs(
 +    const sessions::tab_restore::Group& entry,
-+    const std::set<int>& tabstrip_indices) {
++    const std::set<SessionID>& tab_ids) {
 +  // Navigation unique ids are unique in the process, so these match no page
 +  // of any other entry.
 +  std::set<int> pages;
 +  for (const auto& tab : entry.tabs) {
-+    if (!tabstrip_indices.contains(tab->tabstrip_index)) {
++    if (!tab_ids.contains(tab->id)) {
 +      continue;
 +    }
 +    for (const sessions::SerializedNavigationEntry& page : tab->navigations) {
@@ -1505,7 +1541,7 @@
 +}  // namespace rac::cleanup
 --- /dev/null
 +++ b/chrome/browser/ui/rac/cleanup/cleared_tabs_context.h
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,152 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1548,14 +1584,20 @@
 +// when the user chooses to stay on the page.
 +bool TabStayedOpen(bool exists, bool closing);
 +
-+// Matches the pages of the tabs at `tabstrip_indices` in a Clear's entry,
++// The ids of the tabs a Clear's entry holds, in the order of
++// RecordedIndices(). An id stays with its tab when other tabs leave the
++// entry; a strip index doesn't describe the entry once that happens.
++std::vector<SessionID> RecordedTabIds(
++    const sessions::tab_restore::Group& entry);
++
++// Matches the pages of the tabs with `tab_ids` in a Clear's entry,
 +// for TabRestoreService::DeleteNavigationEntries(), which then takes those
 +// tabs out of the entry. For tabs that stayed open after Clear recorded
 +// them: a page asked before closing and the user chose to stay. Without
 +// this, Undo would open a second copy.
 +sessions::TabRestoreService::DeletionPredicate PagesOfTabs(
 +    const sessions::tab_restore::Group& entry,
-+    const std::set<int>& tabstrip_indices);
++    const std::set<SessionID>& tab_ids);
 +
 +// The window a restored tab goes into. Cmd+Shift+T and History restore into
 +// the window in front, `current`. A Clear's tab goes back to the window it
@@ -1654,7 +1696,7 @@
 +#endif  // CHROME_BROWSER_UI_RAC_CLEANUP_CLEARED_TABS_CONTEXT_H_
 --- /dev/null
 +++ b/chrome/browser/ui/rac/cleanup/cleared_tabs_context_unittest.cc
-@@ -0,0 +1,508 @@
+@@ -0,0 +1,530 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -2062,7 +2104,7 @@
 +  const SessionID id = Clear({1, 2, 3});
 +  const auto& group = static_cast<const Group&>(*helper_.entries().front());
 +
-+  helper_.DeleteNavigationEntries(PagesOfTabs(group, {2}));
++  helper_.DeleteNavigationEntries(PagesOfTabs(group, {group.tabs[1]->id}));
 +
 +  ASSERT_EQ(helper_.entries().size(), 2u);
 +  const auto& left = static_cast<const Group&>(*helper_.entries().front());
@@ -2099,7 +2141,7 @@
 +  const auto& earlier = static_cast<const Group&>(*helper_.entries().back());
 +  ASSERT_EQ(earlier.id, first);
 +
-+  helper_.DeleteNavigationEntries(PagesOfTabs(earlier, {2}));
++  helper_.DeleteNavigationEntries(PagesOfTabs(earlier, {earlier.tabs[1]->id}));
 +
 +  ASSERT_EQ(helper_.entries().size(), 2u);
 +  const auto& later = static_cast<const Group&>(*helper_.entries().front());
@@ -2109,6 +2151,28 @@
 +  EXPECT_EQ(left.id, first);
 +  ASSERT_EQ(left.tabs.size(), 1u);
 +  EXPECT_EQ(left.tabs[0]->navigations.at(0).virtual_url(), UrlFor(1));
++}
++
++// Tabs are matched by their id in the entry, not their strip index, which
++// no longer lines up once a tab has left the entry (restored alone from
++// History, or its page deleted from history).
++TEST_F(ClearedTabsContextTest, TabsAreMatchedByIdAfterOneLeaves) {
++  const SessionID id = Clear({1, 2, 3});
++  const auto& group = static_cast<const Group&>(*helper_.entries().front());
++  const std::vector<SessionID> ids = RecordedTabIds(group);
++  ASSERT_EQ(ids.size(), 3u);
++
++  // The first tab comes back alone, from History.
++  helper_.RestoreEntryById(&window_, ids[0], WindowOpenDisposition::UNKNOWN);
++  const auto& left = static_cast<const Group&>(*helper_.entries().front());
++  ASSERT_EQ(left.id, id);
++  EXPECT_EQ(RecordedTabIds(left), (std::vector<SessionID>{ids[1], ids[2]}));
++
++  // The third tab stayed open: matched by id, it's the one that leaves.
++  helper_.DeleteNavigationEntries(PagesOfTabs(left, {ids[2]}));
++  const auto& last = static_cast<const Group&>(*helper_.entries().front());
++  EXPECT_EQ(RecordedTabIds(last), (std::vector<SessionID>{ids[1]}));
++  EXPECT_EQ(last.tabs[0]->navigations.at(0).virtual_url(), UrlFor(2));
 +}
 +
 +class ClearedTabsContextPendingTest : public ClearedTabsContextTest {
