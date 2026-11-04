@@ -1,0 +1,344 @@
+--- a/chrome/app/chrome_main_delegate.cc
++++ b/chrome/app/chrome_main_delegate.cc
+@@ -196,6 +196,7 @@
+ #include "chrome/browser/lifetime/browser_shutdown.h"  // nogncheck
+ #include "chrome/browser/metrics/chrome_feature_list_creator.h"  // nogncheck
+ #include "chrome/browser/rac/devtools/default_dir.h"  // nogncheck
++#include "chrome/browser/rac/devtools/release_switches.h"  // nogncheck
+ #include "chrome/browser/startup_data.h"  // nogncheck
+ #include "chrome/gpu/chrome_content_gpu_client.h"  // nogncheck
+ #include "chrome/utility/chrome_content_utility_client.h"  // nogncheck
+@@ -876,6 +877,10 @@ std::optional<int> ChromeMainDelegate::P
+   }
+ 
+ #if !defined(BUILDING_CHROME_RENDERER)
++  // rac: release builds drop switches that read a planted profile (#65),
++  // before the process singleton forwards the command line.
++  rac::RefuseProfileReadSwitchesInBrowserProcess();
++
+ #if BUILDFLAG(ENABLE_PROCESS_SINGLETON)
+   // The User Data dir is guaranteed to be valid as per InitializeUserDataDir.
+   base::FilePath user_data_dir =
+--- a/chrome/browser/rac/devtools/BUILD.gn
++++ b/chrome/browser/rac/devtools/BUILD.gn
+@@ -3,23 +3,30 @@
+ 
+ import("//testing/test.gni")
+ 
+-# Refuses Chromium's debug doors on the real profile (decision D20).
++# Refuses Chromium's debug doors on the real profile (decision D20), and in
++# release builds the switches that read a planted profile (issue #65).
+ source_set("devtools") {
+   sources = [
+     "default_dir.cc",
+     "default_dir.h",
++    "release_switches.cc",
++    "release_switches.h",
+   ]
+   deps = [
+     "//base",
++    "//chrome/browser/rac/dev:buildflags",
+     "//chrome/common:constants",
+     "//components/os_crypt/common:switches",
+     "//content/public/common",
++    "//extensions/common",
++    "//services/network/public/cpp:flags_and_switches",
+   ]
+ }
+ 
+ test("rac_devtools_unittests") {
+   sources = [
+     "default_dir_unittest.cc",
++    "release_switches_unittest.cc",
+ 
+     # Compiled in here, not linked from //chrome/browser/devtools, so the test
+     # checks the feature default that rac ships without that whole library.
+@@ -31,9 +38,12 @@ test("rac_devtools_unittests") {
+     "//base",
+     "//base/test:run_all_unittests",
+     "//base/test:test_support",
++    "//chrome/browser/rac/dev:buildflags",
+     "//chrome/common:constants",
+     "//components/os_crypt/common:switches",
+     "//content/public/common",
++    "//extensions/common",
++    "//services/network/public/cpp:flags_and_switches",
+     "//testing/gtest",
+   ]
+ }
+--- a/chrome/browser/rac/devtools/default_dir.h
++++ b/chrome/browser/rac/devtools/default_dir.h
+@@ -53,10 +53,9 @@ namespace rac {
+ // those doors. The files' other contents (history, bookmarks, and anything
+ // else stored in the clear) stay readable through them.
+ //
+-// Other switches still read a planted profile with the real Keychain key:
+-// --load-extension (blocked only in Google builds), and --log-net-log with
+-// --net-log-capture-mode=Everything. That is a known gap, tracked in issue
+-// #65 ("G5b: other switches that read a planted profile").
++// Release builds refuse the other switches that would read a planted
++// profile with the real Keychain key, such as --load-extension and a
++// full-capture net log; see release_switches.h. Dev builds keep them.
+ //
+ // The mock keychain makes a new random key each launch, so a debug-door
+ // session loses its cookies and saved logins between runs; nothing is
+--- /dev/null
++++ b/chrome/browser/rac/devtools/release_switches.cc
+@@ -0,0 +1,60 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/devtools/release_switches.h"
++
++#include <string>
++#include <string_view>
++
++#include "base/command_line.h"
++#include "base/logging.h"
++#include "chrome/browser/rac/dev/buildflags.h"
++#include "extensions/common/switches.h"
++#include "services/network/public/cpp/network_switches.h"
++
++namespace rac {
++
++namespace {
++
++void Refuse(base::CommandLine* command_line, std::string_view name) {
++  LOG(WARNING) << "--" << name
++               << " isn't allowed in rac's release builds; ignoring it.";
++  command_line->RemoveSwitch(name);
++}
++
++// The capture modes that leave cookies and credentials out of the log.
++bool IsRedactedCaptureMode(std::string_view mode) {
++  return mode == "Default" || mode == "HeavilyRedacted";
++}
++
++}  // namespace
++
++void RefuseProfileReadSwitches(base::CommandLine* command_line,
++                               bool dev_switches) {
++  if (dev_switches) {
++    return;
++  }
++
++  for (std::string_view name :
++       {extensions::switches::kLoadExtension,
++        extensions::switches::kDisableExtensionsExcept}) {
++    if (command_line->HasSwitch(name)) {
++      Refuse(command_line, name);
++    }
++  }
++
++  // Content's parser treats a missing switch, and any value it doesn't know,
++  // as Default.
++  const std::string_view capture_mode = network::switches::kNetLogCaptureMode;
++  if (command_line->HasSwitch(capture_mode) &&
++      !IsRedactedCaptureMode(command_line->GetSwitchValueASCII(capture_mode))) {
++    Refuse(command_line, capture_mode);
++  }
++}
++
++void RefuseProfileReadSwitchesInBrowserProcess() {
++  RefuseProfileReadSwitches(base::CommandLine::ForCurrentProcess(),
++                            BUILDFLAG(RAC_DEV_SWITCHES));
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/devtools/release_switches.h
+@@ -0,0 +1,42 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#ifndef CHROME_BROWSER_RAC_DEVTOOLS_RELEASE_SWITCHES_H_
++#define CHROME_BROWSER_RAC_DEVTOOLS_RELEASE_SWITCHES_H_
++
++namespace base {
++class CommandLine;
++}  // namespace base
++
++namespace rac {
++
++// Every rac user data dir shares one Keychain key, so a launch with
++// --user-data-dir=<throwaway> decrypts the real profile's cookies and logins
++// when links to its files, or copies of them, are planted there. Release
++// builds refuse the launch switches that hand that decrypted data to another
++// program (issue #65):
++// - --load-extension and --disable-extensions-except. Both load an unpacked
++//   extension, which can read every cookie through chrome.cookies. Google
++//   Chrome refuses both too. Unpacked extensions still load from
++//   chrome://extensions.
++// - --net-log-capture-mode, unless it's Default or HeavilyRedacted.
++//   IncludeSensitive and Everything (and their old names) write cookies and
++//   credentials into the --log-net-log file. Without the switch the log uses
++//   Default, which strips them, so --log-net-log keeps working.
++//
++// Dev builds, where BUILDFLAG(RAC_DEV_SWITCHES) is on, keep all of them.
++
++// Removes the refused switches from `command_line` unless `dev_switches`,
++// logging a warning for each one.
++void RefuseProfileReadSwitches(base::CommandLine* command_line,
++                               bool dev_switches);
++
++// RefuseProfileReadSwitches() on the browser process's command line, with
++// BUILDFLAG(RAC_DEV_SWITCHES). ChromeMainDelegate calls it before the process
++// singleton forwards the command line to a running rac, and before
++// extensions, the network service, or any child process reads it.
++void RefuseProfileReadSwitchesInBrowserProcess();
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_DEVTOOLS_RELEASE_SWITCHES_H_
+--- /dev/null
++++ b/chrome/browser/rac/devtools/release_switches_unittest.cc
+@@ -0,0 +1,149 @@
++// Copyright 2026 The rac Authors
++// Use of this source code is governed by a GPL-3.0 license.
++
++#include "chrome/browser/rac/devtools/release_switches.h"
++
++#include <string>
++#include <vector>
++
++#include "base/command_line.h"
++#include "base/test/scoped_command_line.h"
++#include "chrome/browser/rac/dev/buildflags.h"
++#include "extensions/common/switches.h"
++#include "services/network/public/cpp/network_switches.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++using Argv = std::vector<std::string>;
++
++base::CommandLine Launch(const Argv& switches) {
++  Argv argv = {"/Applications/rac.app/Contents/MacOS/rac"};
++  argv.insert(argv.end(), switches.begin(), switches.end());
++  return base::CommandLine(argv);
++}
++
++// Refuses in a release build and returns what's left after the program name.
++Argv RefusedInRelease(const Argv& switches) {
++  base::CommandLine command_line = Launch(switches);
++  RefuseProfileReadSwitches(&command_line, /*dev_switches=*/false);
++  const Argv& argv = command_line.argv();
++  return Argv(argv.begin() + 1, argv.end());
++}
++
++TEST(RacReleaseSwitchesTest, ReleaseRemovesLoadExtension) {
++  base::CommandLine command_line =
++      Launch({"--user-data-dir=/tmp/x", "--load-extension=/x"});
++  RefuseProfileReadSwitches(&command_line, /*dev_switches=*/false);
++  EXPECT_FALSE(command_line.HasSwitch(extensions::switches::kLoadExtension));
++  EXPECT_EQ(Argv({"--user-data-dir=/tmp/x"}),
++            Argv(command_line.argv().begin() + 1, command_line.argv().end()));
++}
++
++TEST(RacReleaseSwitchesTest, ReleaseRemovesEveryCopyOfLoadExtension) {
++  EXPECT_EQ(Argv(),
++            RefusedInRelease({"--load-extension=/a", "-load-extension=/b",
++                              "--load-extension=/c,/d"}));
++}
++
++TEST(RacReleaseSwitchesTest, ReleaseRemovesDisableExtensionsExcept) {
++  base::CommandLine command_line = Launch({"--disable-extensions-except=/x"});
++  RefuseProfileReadSwitches(&command_line, /*dev_switches=*/false);
++  EXPECT_FALSE(
++      command_line.HasSwitch(extensions::switches::kDisableExtensionsExcept));
++  EXPECT_EQ(1u, command_line.argv().size());
++}
++
++TEST(RacReleaseSwitchesTest, ReleaseRemovesFullCaptureModes) {
++  for (const char* mode :
++       {"Everything", "IncludeSensitive", "IncludeCookiesAndCredentials",
++        "IncludeSocketBytes", "everything", ""}) {
++    SCOPED_TRACE(mode);
++    base::CommandLine command_line =
++        Launch({"--log-net-log=/x.json",
++                std::string("--net-log-capture-mode=") + mode});
++    RefuseProfileReadSwitches(&command_line, /*dev_switches=*/false);
++    EXPECT_FALSE(command_line.HasSwitch(network::switches::kNetLogCaptureMode));
++    EXPECT_EQ(Argv({"--log-net-log=/x.json"}),
++              Argv(command_line.argv().begin() + 1, command_line.argv().end()));
++  }
++}
++
++TEST(RacReleaseSwitchesTest, ReleaseKeepsRedactedCaptureModes) {
++  for (const char* mode : {"Default", "HeavilyRedacted"}) {
++    SCOPED_TRACE(mode);
++    const Argv switches = {"--log-net-log=/x.json",
++                           std::string("--net-log-capture-mode=") + mode};
++    EXPECT_EQ(switches, RefusedInRelease(switches));
++  }
++}
++
++TEST(RacReleaseSwitchesTest, ReleaseKeepsNetLogWithoutCaptureMode) {
++  EXPECT_EQ(Argv({"--log-net-log=/x.json"}),
++            RefusedInRelease({"--log-net-log=/x.json"}));
++}
++
++TEST(RacReleaseSwitchesTest, ReleaseRemovesTheModeWhenTheLastCopyIsFull) {
++  // base::CommandLine keeps the last value, which is the one content reads.
++  EXPECT_EQ(Argv({"--log-net-log=/x.json"}),
++            RefusedInRelease({"--log-net-log=/x.json",
++                              "--net-log-capture-mode=Default",
++                              "--net-log-capture-mode=Everything"}));
++}
++
++TEST(RacReleaseSwitchesTest, ReleaseLeavesOtherSwitchesAndArgs) {
++  const Argv untouched = {"--user-data-dir=/tmp/x",
++                          "--no-first-run",
++                          "--disable-extensions",
++                          "--log-net-log=/x.json",
++                          "--net-log-capture-mode=Default",
++                          "--enable-logging=stderr",
++                          "https://example.com/"};
++  EXPECT_EQ(untouched, RefusedInRelease(untouched));
++
++  // Only the refused switches go; everything else keeps its order.
++  EXPECT_EQ(untouched,
++            RefusedInRelease(
++                {"--user-data-dir=/tmp/x", "--load-extension=/x",
++                 "--no-first-run", "--disable-extensions",
++                 "--log-net-log=/x.json", "--net-log-capture-mode=Default",
++                 "--enable-logging=stderr", "https://example.com/"}));
++}
++
++TEST(RacReleaseSwitchesTest, ReleaseKeepsArgsThatOnlyLookLikeTheSwitches) {
++  // After the "--" terminator, arguments aren't switches.
++  const Argv args = {"--", "--load-extension=/x",
++                     "--net-log-capture-mode=Everything"};
++  EXPECT_EQ(args, RefusedInRelease(args));
++}
++
++TEST(RacReleaseSwitchesTest, DevBuildsKeepEverything) {
++  const Argv switches = {"--user-data-dir=/tmp/x", "--load-extension=/x",
++                         "--disable-extensions-except=/y",
++                         "--log-net-log=/x.json",
++                         "--net-log-capture-mode=Everything"};
++  base::CommandLine command_line = Launch(switches);
++  const Argv before = command_line.argv();
++  RefuseProfileReadSwitches(&command_line, /*dev_switches=*/true);
++  EXPECT_EQ(before, command_line.argv());
++  EXPECT_EQ("Everything", command_line.GetSwitchValueASCII(
++                              network::switches::kNetLogCaptureMode));
++}
++
++TEST(RacReleaseSwitchesTest, BrowserProcessHookFollowsTheBuildFlag) {
++  constexpr bool kDevSwitches = BUILDFLAG(RAC_DEV_SWITCHES);
++  base::test::ScopedCommandLine scoped_command_line;
++  base::CommandLine* command_line = scoped_command_line.GetProcessCommandLine();
++  command_line->AppendSwitchASCII(extensions::switches::kLoadExtension, "/x");
++  command_line->AppendSwitchASCII(network::switches::kNetLogCaptureMode,
++                                  "Everything");
++  RefuseProfileReadSwitchesInBrowserProcess();
++  EXPECT_EQ(kDevSwitches,
++            command_line->HasSwitch(extensions::switches::kLoadExtension));
++  EXPECT_EQ(kDevSwitches,
++            command_line->HasSwitch(network::switches::kNetLogCaptureMode));
++}
++
++}  // namespace
++}  // namespace rac
