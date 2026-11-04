@@ -1,0 +1,683 @@
+--- a/chrome/browser/rac/actions/rac_action_ids.h
++++ b/chrome/browser/rac/actions/rac_action_ids.h
+@@ -4,10 +4,11 @@
+ #ifndef CHROME_BROWSER_RAC_ACTIONS_RAC_ACTION_IDS_H_
+ #define CHROME_BROWSER_RAC_ACTIONS_RAC_ACTION_IDS_H_
+ 
+-// Command ids for the table's own rows. Stable forever: users' shortcut
+-// rebinds are saved under them (kCustomAccelerators), so never renumber or
+-// reuse one. rac_actions_unittest pins them to a committed list. They sit in
+-// IDC_RAC_ACTION_FIRST..LAST, which the command controller hands to the table.
++// Command ids for the table's own kBrowser rows. Stable forever: users'
++// shortcut rebinds are saved under them (kCustomAccelerators), so never
++// renumber or reuse one. rac_actions_unittest pins each value, so a
++// renumber fails a test. The ids sit in IDC_RAC_ACTION_FIRST..LAST, the
++// only range the command controller hands to the table.
+ //
+ // The range lives here, not in chrome_command_ids.h: nearly every file in
+ // Chrome includes that header, so one line there rebuilds the whole tree.
+--- a/chrome/browser/rac/actions/rac_actions.cc
++++ b/chrome/browser/rac/actions/rac_actions.cc
+@@ -53,6 +53,14 @@ base::span<const Action> All() {
+   return *kAll;
+ }
+ 
++void ForEachAction(base::FunctionRef<void(const Action&)> fn) {
++  for (GroupFn group : kGroups) {
++    for (const Action& action : group()) {
++      fn(action);
++    }
++  }
++}
++
+ const Action* Find(std::string_view id) {
+   for (const Action& action : All()) {
+     if (action.id == id) {
+@@ -63,18 +71,26 @@ const Action* Find(std::string_view id)
+ }
+ 
+ const Action* FindByCommand(int command_id) {
++  return FindByCommand(All(), command_id);
++}
++
++const Action* FindByCommand(base::span<const Action> rows, int command_id) {
+   if (command_id == 0) {
+     return nullptr;
+   }
+-  for (const Action& action : All()) {
++  const Action* found = nullptr;
++  for (const Action& action : rows) {
+     const int last =
+         action.command_id_last ? action.command_id_last : action.command_id;
+     if (action.command_id && command_id >= action.command_id &&
+         command_id <= last) {
+-      return &action;
++      CHECK(!found) << "command id " << command_id
++                    << " is in two rows' ranges: " << found->id << " and "
++                    << action.id;
++      found = &action;
+     }
+   }
+-  return nullptr;
++  return found;
+ }
+ 
+ std::vector<const Action*> ForSurface(Surface surface,
+@@ -101,6 +117,31 @@ std::vector<const Action*> ForSurface(ba
+   return result;
+ }
+ 
++namespace {
++
++// How many keys after the first a row's shortcut spans: a numbered row
++// (Show Space 1-9) takes one key more per command id, so its shortcut is
++// key, key + 1, ... key + count.
++int ExtraShortcutKeys(const Action& action) {
++  return action.command_id_last > action.command_id
++             ? action.command_id_last - action.command_id
++             : 0;
++}
++
++// Whether the two rows' shortcuts share a key, with every key of a numbered
++// row counted.
++bool ShortcutsOverlap(const Action& a, const Action& b) {
++  if (a.default_shortcut.modifiers != b.default_shortcut.modifiers) {
++    return false;
++  }
++  const int a_first = a.default_shortcut.key;
++  const int b_first = b.default_shortcut.key;
++  return a_first <= b_first + ExtraShortcutKeys(b) &&
++         b_first <= a_first + ExtraShortcutKeys(a);
++}
++
++}  // namespace
++
+ std::optional<std::string_view> FirstShortcutCollision(
+     base::span<const Action> rows) {
+   for (size_t i = 0; i < rows.size(); ++i) {
+@@ -110,7 +151,8 @@ std::optional<std::string_view> FirstSho
+     }
+     for (size_t j = i + 1; j < rows.size(); ++j) {
+       if (rows[j].surfaces.Has(Surface::kShortcut) &&
+-          rows[j].default_shortcut.SameKeys(rows[i].default_shortcut)) {
++          !rows[j].default_shortcut.empty() &&
++          ShortcutsOverlap(rows[i], rows[j])) {
+         return rows[j].id;
+       }
+     }
+--- a/chrome/browser/rac/actions/rac_actions.h
++++ b/chrome/browser/rac/actions/rac_actions.h
+@@ -11,6 +11,7 @@
+ 
+ #include "base/containers/enum_set.h"
+ #include "base/containers/span.h"
++#include "base/functional/function_ref.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/values.h"
+ #include "ui/events/keycodes/keyboard_codes.h"
+@@ -20,10 +21,9 @@ namespace gfx {
+ struct VectorIcon;
+ }
+ 
+-// rac's single action table: one static list of everything rac can do. See
+-// docs/internals/action-table.md for the rules about who may edit which field.
+-// Compiled-in data with no service and no startup cost: the table is built on
+-// first use.
++// rac's single action table: one static list of everything rac can do.
++// Compiled-in data with no service and no startup cost: the rows live in
++// constexpr group arrays, so walking them allocates nothing.
+ namespace rac::action_table {
+ 
+ enum class Surface {
+@@ -38,7 +38,7 @@ enum class Surface {
+ };
+ using Surfaces = base::EnumSet<Surface, Surface::kSidebar, Surface::kMaxValue>;
+ 
+-// What an action needs before it can run (plan 07's "availability").
++// What an action needs the window to have before a UI surface may offer it.
+ enum class Need {
+   kTab,
+   kWebPage,  // The active tab shows an http(s) page.
+@@ -56,8 +56,8 @@ enum class RiskClass {
+   kConsequential,  // Submit/buy/delete/password/cross-origin/etc.
+ };
+ 
+-// How an outside client is treated (plan 05's non-page table). The guard
+-// applies each client's own level on top of this later.
++// How an outside client (MCP) may use the row. The guard applies each
++// client's own level on top of this later.
+ enum class OutsideClass {
+   kNotOffered,  // Never reaches an outside client's tools/list.
+   kRead,
+@@ -131,10 +131,12 @@ struct Action {
+   // Stable forever, never reused. Also the MCP tool name.
+   std::string_view id;
+   // The IDC_ id menus, accelerators, and the shortcut page use. Stable
+-  // forever: users' rebinds are saved under it (kCustomAccelerators). Either
+-  // an existing Chromium/rac id (IDC_COPY_URL, IDC_RAC_SHOW_SPACE_0) or one
+-  // from rac_action_ids.h inside IDC_RAC_ACTION_FIRST..LAST, which the
+-  // command controller dispatches to the table. 0 = no command.
++  // forever: users' rebinds are saved under it (kCustomAccelerators). A
++  // kBrowser row must use an id from rac_action_ids.h inside
++  // IDC_RAC_ACTION_FIRST..LAST: the command controller only hands that
++  // range to the table, so an id outside it never reaches the handler. A
++  // kCommand row uses an existing Chromium/rac id outside the range
++  // (IDC_COPY_URL, IDC_RAC_SHOW_SPACE_0). 0 = no command.
+   int command_id = 0;
+   // For a row that is a numbered set (Show Space 1-9): the last id. The label
+   // takes the ordinal (command_id - first + 1) as $1. 0 = a single command.
+@@ -145,19 +147,20 @@ struct Action {
+   // UI. The argument that receives the command bar's typed text ("prompt"
+   // for `ask`). "" = none.
+   std::string_view query_arg;
+-  int menu_label_id = 0;  // Plan 07. 0 = same as label_id.
++  int menu_label_id = 0;  // 0 = same as label_id.
+   // English text for tools/list. Not localized.
+   std::string_view description;
+   // JSON Schema for the arguments, written out in full (including the empty
+   // object schema for an action with no arguments).
+   std::string_view args_json;
+-  ShortcutSpec default_shortcut;  // Plan 07.
+-  // UI. A boolean pref that turns the shortcut and menu item on (D13's
+-  // "Cmd+T opens the command bar"). While it is false the row has no default
+-  // shortcut and no menu item, and a replaced command keeps its key. Power's
+-  // shortcut hook and Core's menu hook both read it. "" = always on.
++  ShortcutSpec default_shortcut;  // The shipped binding; empty() = unbound.
++  // UI. A boolean pref that turns the shortcut and menu item on (for a
++  // feature whose shortcut some users want off). While it is false the row
++  // has no default shortcut and no menu item, and a replaced command keeps
++  // its key. The shortcut service's defaults hook and the menu builder
++  // both read it. "" = always on.
+   std::string_view shortcut_pref;
+-  Availability availability;  // Plan 07.
++  Availability availability;
+   Surfaces surfaces;
+   Menu menu = Menu::kNone;  // UI. Only read for rows with kMenu.
+   int menu_after = 0;       // UI. An IDC_ id in `menu`; 0 = the menu's end.
+@@ -176,11 +179,19 @@ struct Action {
+ bool IsAvailable(const Action& action, const ActionContext& context);
+ 
+ // Every row, in a stable order: the order of the group list in rac_actions.cc,
+-// then the order inside each group's file.
++// then the order inside each group's file. Merges the groups into a vector on
++// first call; use ForEachAction on paths where even that allocation is too
++// much (startup, per-event work).
+ base::span<const Action> All();
++// Runs `fn` on every row, in All() order, straight over the group lists, with
++// no allocation.
++void ForEachAction(base::FunctionRef<void(const Action&)> fn);
+ const Action* Find(std::string_view id);
+ // The row whose command id range holds `command_id`, or null.
+ const Action* FindByCommand(int command_id);
++// Same lookup over any list of rows (tests use it with made-up rows). CHECKs
++// when two rows' ranges both hold `command_id`: ranges may never overlap.
++const Action* FindByCommand(base::span<const Action> rows, int command_id);
+ 
+ // The only way UI code walks the table. Drops ai_only rows when AI is off and
+ // rows whose availability the context doesn't meet, so no caller checks the AI
+@@ -194,7 +205,9 @@ std::vector<const Action*> ForSurface(ba
+                                       const ActionContext& context);
+ 
+ // The id of the first row whose default shortcut another row also uses, or
+-// nullopt. Rows that don't have the kShortcut surface are ignored.
++// nullopt. Rows that don't have the kShortcut surface are ignored. A numbered
++// row (command_id..command_id_last) takes one key more per id, starting at its
++// default key (Cmd+1..Cmd+9), and every one of those keys is checked.
+ std::optional<std::string_view> FirstShortcutCollision(
+     base::span<const Action> rows);
+ 
+--- a/chrome/browser/rac/actions/rac_actions_agent.cc
++++ b/chrome/browser/rac/actions/rac_actions_agent.cc
+@@ -11,8 +11,8 @@ namespace {
+ // test in rac_actions_unittest.cc fails on any difference. Row order is the
+ // order tools/list has always used.
+ //
+-// "hints" is what each tool really is (plan 05 confirms). The wire sends only
+-// readOnlyHint on read tools (kReadOnlyOnly), as before.
++// "hints" is what each tool really is. The wire sends only readOnlyHint on
++// read tools (kReadOnlyOnly), as before.
+ constexpr Action kAgentActions[] = {
+     {
+         .id = "snapshot",
+--- a/chrome/browser/rac/actions/rac_actions_groups.h
++++ b/chrome/browser/rac/actions/rac_actions_groups.h
+@@ -12,7 +12,7 @@
+ // rac_actions.cc. Nobody else's rows are touched.
+ namespace rac::action_table {
+ 
+-// Today's page tools, handled by AgentController (plan 05 owns these rows).
++// The built-in agent's page tools; AgentController handles them.
+ base::span<const Action> AgentActions();
+ 
+ // The command bar's rows (rac_actions_command_bar.cc).
+--- a/chrome/browser/rac/actions/rac_actions_unittest.cc
++++ b/chrome/browser/rac/actions/rac_actions_unittest.cc
+@@ -3,10 +3,12 @@
+ 
+ #include "chrome/browser/rac/actions/rac_actions.h"
+ 
++#include <algorithm>
+ #include <set>
+ #include <string>
+ #include <string_view>
+ #include <utility>
++#include <vector>
+ 
+ #include "base/base_paths.h"
+ #include "base/files/file_path.h"
+@@ -14,7 +16,9 @@
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
+ #include "base/path_service.h"
++#include "base/test/gtest_util.h"
+ #include "base/values.h"
++#include "chrome/browser/rac/actions/rac_action_ids.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ #include "ui/events/event_constants.h"
+ #include "ui/events/keycodes/keyboard_codes.h"
+@@ -59,7 +63,8 @@ constexpr std::string_view kCommittedIds
+     "clear_tabs",
+ };
+ 
+-// Plan 05's "Never" class. None of these may have an outside surface.
++// Rows that must never reach an outside client. None may have an outside
++// surface.
+ constexpr std::string_view kNeverForOutsideClients[] = {
+     "change_setting",    "set_site_rule", "set_agent_level",
+     "install_extension", "clear_history", "clear_browsing_data",
+@@ -67,6 +72,7 @@ constexpr std::string_view kNeverForOuts
+ };
+ 
+ constexpr Surface kUiSurfaces[] = {Surface::kSidebar, Surface::kCommandBar,
++                                   Surface::kCommandBarSuggested,
+                                    Surface::kMenu, Surface::kShortcut};
+ 
+ constexpr Action MadeUp(std::string_view id,
+@@ -117,11 +123,103 @@ TEST(RacActionsTest, IdsAreUniqueAndNeve
+   EXPECT_EQ(Find("no_such_action"), nullptr);
+ }
+ 
++TEST(RacActionsTest, CommandIdsArePinned) {
++  // The values sit on disk in users' rebinds (kCustomAccelerators): a
++  // renumber must fail here, not slip into a release.
++  EXPECT_EQ(IDC_RAC_OPEN_COMMAND_BAR, 40800);
++  EXPECT_EQ(IDC_RAC_OPEN_COMMAND_BAR_WITH_URL, 40801);
++  EXPECT_EQ(IDC_RAC_CLEAR_TABS, 40802);
++  EXPECT_EQ(IDC_RAC_OPEN_LITTLE_WINDOW, 40803);
++  EXPECT_EQ(IDC_RAC_COPY_AS_MARKDOWN, 40804);
++  EXPECT_EQ(IDC_RAC_ACTION_FIRST, 40800);
++  EXPECT_EQ(IDC_RAC_ACTION_LAST, 40999);
++}
++
++TEST(RacActionsTest, ActionIdsSitInTheDispatchRange) {
++  // Clear Tabs has an id but no row yet.
++  const int ids[] = {IDC_RAC_OPEN_COMMAND_BAR,
++                     IDC_RAC_OPEN_COMMAND_BAR_WITH_URL,
++                     IDC_RAC_CLEAR_TABS,
++                     IDC_RAC_OPEN_LITTLE_WINDOW,
++                     IDC_RAC_COPY_AS_MARKDOWN};
++  for (int id : ids) {
++    EXPECT_GE(id, IDC_RAC_ACTION_FIRST);
++    EXPECT_LE(id, IDC_RAC_ACTION_LAST);
++  }
++  // Power's Copy as Markdown row keeps the id it ships with and sits in
++  // the range as a kBrowser row.
++  const Action* markdown = Find("copy_as_markdown");
++  ASSERT_TRUE(markdown);
++  EXPECT_EQ(markdown->command_id, IDC_RAC_COPY_AS_MARKDOWN);
++  EXPECT_EQ(markdown->dispatch, Dispatch::kBrowser);
++  EXPECT_EQ(FindByCommand(IDC_RAC_COPY_AS_MARKDOWN), markdown);
++}
++
++TEST(RacActionsTest, CommandIdsRespectTheDispatchRange) {
++  // A kBrowser row reaches its handler only through the table's dispatch
++  // range, so its ids must sit inside it. A kCommand row keeps Chromium's
++  // own dispatch, so its ids must stay outside.
++  std::vector<std::pair<int, int>> ranges;
++  for (const Action& action : All()) {
++    SCOPED_TRACE(std::string(action.id));
++    if (!action.command_id) {
++      continue;
++    }
++    const int last =
++        action.command_id_last ? action.command_id_last : action.command_id;
++    switch (action.dispatch) {
++      case Dispatch::kBrowser:
++        EXPECT_GE(action.command_id, IDC_RAC_ACTION_FIRST);
++        EXPECT_LE(last, IDC_RAC_ACTION_LAST);
++        break;
++      case Dispatch::kCommand:
++        EXPECT_TRUE(last < IDC_RAC_ACTION_FIRST ||
++                    action.command_id > IDC_RAC_ACTION_LAST);
++        break;
++      case Dispatch::kAgentController:
++        break;
++    }
++    ranges.emplace_back(action.command_id, last);
++  }
++  // No two rows may claim the same command id: sorted, each range must start
++  // after the one before it ends.
++  std::ranges::sort(ranges);
++  for (size_t i = 1; i < ranges.size(); ++i) {
++    EXPECT_GT(ranges[i].first, ranges[i - 1].second)
++        << "overlapping command id ranges";
++  }
++}
++
++TEST(RacActionsTest, FindByCommandMatchesRanges) {
++  const Action rows[] = {
++      {.id = "single", .command_id = 40800},
++      {.id = "range", .command_id = 40810, .command_id_last = 40819},
++      {.id = "no_command"},
++  };
++  EXPECT_EQ(FindByCommand(rows, 40800)->id, "single");
++  EXPECT_EQ(FindByCommand(rows, 40810)->id, "range");
++  // The last id of a numbered range is in it.
++  EXPECT_EQ(FindByCommand(rows, 40819)->id, "range");
++  EXPECT_EQ(FindByCommand(rows, 40820), nullptr);
++  EXPECT_EQ(FindByCommand(rows, 40799), nullptr);
++  EXPECT_EQ(FindByCommand(rows, 0), nullptr);
++}
++
++TEST(RacActionsTest, FindByCommandDiesOnOverlappingRanges) {
++  // Two rows must never claim the same id: an overlap is a table bug, not a
++  // first-match tie.
++  const Action rows[] = {
++      {.id = "a", .command_id = 40800, .command_id_last = 40810},
++      {.id = "b", .command_id = 40805},
++  };
++  // No message: official builds strip CHECK text, so match only the death.
++  EXPECT_CHECK_DEATH(FindByCommand(rows, 40805));
++}
++
+ // The wire bytes of tools/list for the 15 current tools must never change. The
+ // golden file is made by testdata/gen_tools_list_golden.py from the original
+-// tool_registry.cc. This test assembles the reply the way McpToolSpecToDict
+-// does; tools_list_golden_unittest.cc in the agent directory runs the same
+-// file through the real MCP handler.
++// tool_registry.cc; this test assembles the reply the way McpToolSpecToDict
++// does.
+ TEST(RacActionsTest, ToolsListMatchesGoldenBytes) {
+   base::ListValue tools;
+   for (const Action& action : All()) {
+@@ -229,6 +327,60 @@ TEST(RacActionsTest, AvailabilityFilters
+   EXPECT_TRUE(ForSurface(rows, Surface::kCommandBar, context).empty());
+ }
+ 
++TEST(RacActionsTest, IsAvailableChecksAiAndEachNeed) {
++  Action row = MadeUp("row", {Surface::kCommandBar});
++  const Action ai_row =
++      MadeUp("ai_row", {Surface::kCommandBar}, /*ai_only=*/true);
++
++  // A context that offers everything a Need can ask for.
++  ActionContext full;
++  full.ai_enabled = true;
++  full.has_tab = true;
++  full.has_web_page = true;
++  full.has_spaces = true;
++
++  // ai_only follows the AI switch and nothing else.
++  EXPECT_TRUE(IsAvailable(row, full));
++  EXPECT_TRUE(IsAvailable(ai_row, full));
++  ActionContext ai_off = full;
++  ai_off.ai_enabled = false;
++  EXPECT_TRUE(IsAvailable(row, ai_off));
++  EXPECT_FALSE(IsAvailable(ai_row, ai_off));
++
++  const Need needs[] = {Need::kTab, Need::kWebPage, Need::kNotIncognito,
++                        Need::kSpaces};
++  for (Need need : needs) {
++    row.availability = {need};
++    EXPECT_TRUE(IsAvailable(row, full));
++  }
++
++  // Each Need reads its own context field. A context per Need, missing
++  // only that Need's field: the row that needs it is the only one
++  // IsAvailable drops, so a Need wired to the wrong field fails here.
++  ActionContext no_tab = full;
++  no_tab.has_tab = false;
++  ActionContext no_web_page = full;
++  no_web_page.has_web_page = false;
++  ActionContext incognito = full;
++  incognito.incognito = true;
++  ActionContext no_spaces = full;
++  no_spaces.has_spaces = false;
++  const std::pair<Need, const ActionContext*> cases[] = {
++      {Need::kTab, &no_tab},
++      {Need::kWebPage, &no_web_page},
++      {Need::kNotIncognito, &incognito},
++      {Need::kSpaces, &no_spaces},
++  };
++  for (const auto& [missing, context] : cases) {
++    for (Need need : needs) {
++      row.availability = {need};
++      EXPECT_EQ(IsAvailable(row, *context), need != missing)
++          << "need " << static_cast<int>(need) << ", context missing "
++          << static_cast<int>(missing);
++    }
++  }
++}
++
+ TEST(RacActionsTest, NeverActionsHaveNoOutsideSurface) {
+   for (std::string_view id : kNeverForOutsideClients) {
+     const Action* action = Find(id);
+@@ -236,6 +388,17 @@ TEST(RacActionsTest, NeverActionsHaveNoO
+   }
+ }
+ 
++constexpr Action MadeUpRange(std::string_view id,
++                             int first,
++                             int last,
++                             ShortcutSpec shortcut) {
++  return {.id = id,
++          .command_id = first,
++          .command_id_last = last,
++          .default_shortcut = shortcut,
++          .surfaces = {Surface::kShortcut}};
++}
++
+ TEST(RacActionsTest, ShortcutsDoNotCollide) {
+   EXPECT_EQ(FirstShortcutCollision(All()), std::nullopt);
+ 
+@@ -253,6 +416,35 @@ TEST(RacActionsTest, ShortcutsDoNotColli
+              {ui::VKEY_K, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN}),
+   };
+   EXPECT_EQ(FirstShortcutCollision(no_shortcut_surface), std::nullopt);
++  // A numbered row takes a key per id (Cmd+1..Cmd+9). Another row on its
++  // 3rd key is a collision, whichever row comes first.
++  const ShortcutSpec cmd_1 = {ui::VKEY_1, ui::EF_COMMAND_DOWN};
++  const ShortcutSpec cmd_3 = {ui::VKEY_3, ui::EF_COMMAND_DOWN};
++  const Action range_then_single[] = {
++      MadeUpRange("range", 40810, 40818, cmd_1),
++      MadeUp("single", {Surface::kShortcut}, false, cmd_3),
++  };
++  EXPECT_EQ(FirstShortcutCollision(range_then_single), "single");
++  const Action single_then_range[] = {
++      MadeUp("single", {Surface::kShortcut}, false, cmd_3),
++      MadeUpRange("range", 40810, 40818, cmd_1),
++  };
++  EXPECT_EQ(FirstShortcutCollision(single_then_range), "range");
++  // Two ranges that overlap on a middle key collide too.
++  const Action two_ranges[] = {
++      MadeUpRange("first", 40810, 40814, cmd_1),
++      MadeUpRange("second", 40820, 40824, cmd_3),
++  };
++  EXPECT_EQ(FirstShortcutCollision(two_ranges), "second");
++  // Past its last key, or with other modifiers, a single row is clear.
++  const Action clear[] = {
++      MadeUpRange("range", 40810, 40812, cmd_1),
++      MadeUp("past_end", {Surface::kShortcut}, false,
++             {ui::VKEY_4, ui::EF_COMMAND_DOWN}),
++      MadeUp("other_modifiers", {Surface::kShortcut}, false,
++             {ui::VKEY_2, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN}),
++  };
++  EXPECT_EQ(FirstShortcutCollision(clear), std::nullopt);
+   // Collisions with Chromium's and Helium's own shortcut tables are checked
+   // when the first shortcut row lands (needs the accelerator list).
+ }
+--- a/chrome/browser/rac/actions/testdata/check_rows_against_golden.py
++++ /dev/null
+@@ -1,30 +0,0 @@
+-#!/usr/bin/env python3
+-"""Second, independent check: reads rac_actions_agent.cc as text, rebuilds the
+-tools/list reply from the string literals in the rows (concatenating adjacent
+-literals the way the C++ compiler does), and compares it to the golden file.
+-Also checks the row order and the kReadOnlyOnly rule. Stdlib only.
+-
+-    check_rows_against_golden.py rac_actions_agent.cc tools_list_legacy.json
+-"""
+-import json, re, sys
+-src, golden = open(sys.argv[1]).read(), open(sys.argv[2]).read()
+-sys.path.insert(0, __file__.rsplit("/", 1)[0])
+-import importlib.util
+-spec = importlib.util.spec_from_file_location("g", __file__.rsplit("/", 1)[0] + "/gen_tools_list_golden.py")
+-g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
+-
+-STR = g.STR
+-tools = []
+-for row in re.split(r'\n    \{\n        \.id = ', src)[1:]:
+-    name = g.unquote_all(re.match(STR, row).group(0))
+-    desc = g.unquote_all(re.search(rf'\.description =({g.STRS}),\n', row).group(1))
+-    schema = json.loads(re.search(r'R"json\((.*)\)json"', row).group(1))
+-    read_only = re.search(r'\.read_only = (true|false)', row).group(1) == "true"
+-    assert "WireHints::kReadOnlyOnly" in row and "Dispatch::kAgentController" in row, name
+-    e = {"name": name, "description": desc, "inputSchema": schema}
+-    if read_only:
+-        e["annotations"] = {"readOnlyHint": True}
+-    tools.append(e)
+-line = g.dump({"id": 1, "jsonrpc": "2.0", "result": {"tools": tools}})
+-print(len(tools), "rows;", "MATCH" if line == golden else "MISMATCH")
+-sys.exit(0 if line == golden else 1)
+--- a/chrome/browser/rac/actions/testdata/gen_tools_list_golden.py
++++ b/chrome/browser/rac/actions/testdata/gen_tools_list_golden.py
+@@ -119,7 +119,8 @@ def tools_list_line(tools):
+ 
+ 
+ # What each legacy tool really is: (read_only, destructive, idempotent, open_world).
+-# See docs/internals/action-table.md. Not on the wire for the 15 (kReadOnlyOnly).
++# The agreed classification for the table; not on the wire for the 15
++# (kReadOnlyOnly).
+ HINTS = {
+     "snapshot": "TFTF", "get_page_text": "TFTF", "list_tabs": "TFTF", "find_in_page": "TFTF",
+     "click": "FTFT", "type": "FTFT", "press_key": "FTFT", "select_option": "FTTT",
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -684,14 +684,14 @@ bool BrowserCommandController::ExecuteCo
+     WindowOpenDisposition disposition,
+     std::optional<actions::ActionInvocationContext> context,
+     base::TimeTicks time_stamp) {
+-  // rac: commands in the action-table range run through the table's kBrowser
+-  // handler, not the command updater.
+-  if (rac::action_table::ExecuteBrowserCommand(browser_, id)) {
+-    return true;
+-  }
+   if (!SupportsCommand(id) || !IsCommandEnabled(id)) {
+     return false;
+   }
++  // rac: a supported and enabled command in the action-table range runs
++  // through the table's kBrowser handler, not the command updater.
++  if (rac::action_table::ExecuteBrowserCommand(browser_, id)) {
++    return true;
++  }
+ 
+   // No commands are enabled if there is not yet any selected tab.
+   // TODO(pkasting): It seems like we should not need this, because either
+--- a/chrome/browser/ui/rac/rac_action_handlers.cc
++++ b/chrome/browser/ui/rac/rac_action_handlers.cc
+@@ -13,7 +13,6 @@
+ 
+ #include "base/check.h"
+ #include "base/no_destructor.h"
+-#include "base/uuid.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/rac/actions/rac_action_handler_ids.h"
+ #include "chrome/browser/rac/actions/rac_action_ids.h"
+@@ -120,7 +119,8 @@ ActionContext ContextForWindow(BrowserWi
+   }
+ 
+   Profile* profile = browser->GetProfile();
+-  context.incognito = profile->IsIncognitoProfile();
++  // Incognito, Guest, and any other off-the-record profile.
++  context.incognito = profile->IsOffTheRecord();
+   context.ai_enabled = rac::ai::IsAiEnabled(profile->GetPrefs());
+ 
+   TabStripModel* tabs = browser->GetTabStripModel();
+--- a/chrome/browser/ui/rac/rac_action_menu_items.mm
++++ b/chrome/browser/ui/rac/rac_action_menu_items.mm
+@@ -5,9 +5,11 @@
+ 
+ #import <Cocoa/Cocoa.h>
+ 
++#include <map>
++#include <utility>
++
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/rac/actions/rac_actions.h"
+-#include "ui/base/l10n/l10n_util.h"
+ #import "ui/base/l10n/l10n_util_mac.h"
+ 
+ // The item of a row with a shortcut_pref (the command bar's Cmd+T, D13).
+@@ -65,17 +67,26 @@ NSMenu* MenuForActionMenu(NSMenu* main_m
+ }  // namespace
+ 
+ void InsertActionMenuItems(NSMenu* main_menu) {
+-  for (const Action& action : All()) {
++  // The item each (menu, anchor) pair places its next row after: the last
++  // row it placed, or the anchor itself. Holding items rather than indexes
++  // keeps each anchor's rows in table order even when inserts under one
++  // anchor shift another's. An anchor the menu doesn't have maps to nil;
++  // its rows append at the end.
++  // ForEachAction, not All(): this runs at startup, before anything may
++  // allocate for the table.
++  std::map<std::pair<NSMenu*, int>, NSMenuItem*> place_after;
++  ForEachAction([&](const Action& action) {
+     if (!action.surfaces.Has(Surface::kMenu) || !action.command_id) {
+-      continue;
++      return;
+     }
+     const int label_id =
+         action.menu_label_id ? action.menu_label_id : action.label_id;
+     NSMenu* menu = MenuForActionMenu(main_menu, action.menu);
+     if (!label_id || !menu) {
+-      continue;
++      return;
+     }
+     const bool pref_gated = !action.shortcut_pref.empty();
++    // Under ARC the menu owns the item once it is inserted below.
+     NSMenuItem* item = [[(pref_gated ? [RacPrefGatedMenuItem class]
+                                      : [NSMenuItem class]) alloc]
+         initWithTitle:l10n_util::GetNSStringWithFixup(label_id)
+@@ -83,12 +94,27 @@ void InsertActionMenuItems(NSMenu* main_
+         keyEquivalent:@""];
+     item.tag = action.command_id;
+     item.hidden = pref_gated;
+-    const NSInteger after = action.menu_after
+-                                ? [menu indexOfItemWithTag:action.menu_after]
+-                                : NSNotFound;
+-    [menu insertItem:item
+-             atIndex:(after != NSNotFound) ? after + 1 : menu.numberOfItems];
+-  }
++    NSInteger index = menu.numberOfItems;
++    if (action.menu_after) {
++      auto [it, is_new] = place_after.try_emplace(
++          std::make_pair(menu, action.menu_after), nil);
++      if (is_new) {
++        // indexOfItemWithTag: returns -1, not NSNotFound, when the menu
++        // has no such item; the slot stays nil and rows for it append.
++        if (const NSInteger anchor =
++                [menu indexOfItemWithTag:action.menu_after];
++            anchor >= 0) {
++          it->second = [menu itemAtIndex:anchor];
++        }
++      }
++      if (it->second) {
++        index = [menu indexOfItem:it->second] + 1;
++        // The next row for this anchor goes after this one.
++        it->second = item;
++      }
++    }
++    [menu insertItem:item atIndex:index];
++  });
+ }
+ 
+ }  // namespace rac::action_table
