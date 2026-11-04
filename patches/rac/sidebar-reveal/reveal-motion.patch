@@ -1,0 +1,516 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3751,6 +3751,8 @@ static_library("ui") {
+       "views/rac/sidebar_address_bar/sidebar_header_view.h",
+       "views/rac/sidebar_reveal/sidebar_overshoot.h",
+       "views/rac/sidebar_reveal/sidebar_overshoot.mm",
++      "views/rac/sidebar_reveal/sidebar_reveal_motion.h",
++      "views/rac/sidebar_reveal/sidebar_reveal_motion.mm",
+       "views/rac/sidebar_visibility.cc",
+       "views/rac/sidebar_visibility.h",
+     ]
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -213,6 +213,7 @@
+ #include "chrome/browser/ui/views/rac/ai/assistant_edge_handle.h"
+ #include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h"
+ #include "chrome/browser/ui/views/rac/sidebar_reveal/sidebar_overshoot.h"
++#include "chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.h"
+ #include "chrome/browser/ui/views/rac/window_screenshot.h"
+ #include "chrome/browser/ui/views/send_tab_to_self/send_tab_to_self_bubble_view.h"
+ #include "chrome/browser/ui/views/send_tab_to_self/send_tab_to_self_device_picker_bubble_view.h"
+@@ -1052,8 +1053,8 @@ BrowserView::BrowserView(BrowserWindowIn
+       gfx::Animation::RichAnimationDuration(kZenModeRevealAnimationDuration));
+   zen_top_chrome_animation_.SetTweenType(gfx::Tween::FAST_OUT_SLOW_IN_3);
+   zen_top_chrome_animation_.Reset(1);
+-  zen_side_chrome_animation_.SetSlideDuration(
+-      gfx::Animation::RichAnimationDuration(kZenModeRevealAnimationDuration));
++  // rac: the reveal changes at once; rac slides the sidebar's layer.
++  zen_side_chrome_animation_.SetSlideDuration(base::TimeDelta());
+   zen_side_chrome_animation_.SetTweenType(gfx::Tween::FAST_OUT_SLOW_IN_3);
+   zen_side_chrome_animation_.Reset(1);
+ 
+@@ -1741,7 +1742,8 @@ float BrowserView::GetSideChromeRevealRa
+   if (!ShouldDrawVerticalTabStrip()) {
+     return 0.f;
+   }
+-  return zen_side_chrome_animation_.GetCurrentValue();
++  return rac::SidebarLayoutRatio(this,
++                                 zen_side_chrome_animation_.GetCurrentValue());
+ }
+ 
+ bool BrowserView::IsZenModeSideChromePinned() const {
+@@ -2062,7 +2064,7 @@ void BrowserView::UpdateZenModeRevealFro
+ 
+   if (!reveal_side) {
+     zen_side_reveal_timer_.Stop();
+-  } else if (zen_side_chrome_animation_.GetCurrentValue() == 0.0 &&
++  } else if (GetSideChromeRevealRatio() == 0.0f &&
+              !IsZenModeSideChromePinned() && !zen_side_reveal_dwell_elapsed_) {
+     if (!zen_side_reveal_timer_.IsRunning()) {
+       zen_side_reveal_timer_.Start(
+@@ -2140,10 +2142,6 @@ void BrowserView::UpdateZenModeReveal(bo
+     }
+   }
+ 
+-  // Reduce Motion can change while the browser runs, so read it per reveal.
+-  zen_side_chrome_animation_.SetSlideDuration(
+-      gfx::Animation::RichAnimationDuration(kZenModeRevealAnimationDuration));
+-
+   if (reveal_top) {
+     if (!zen_top_chrome_animation_.IsShowing()) {
+       zen_top_chrome_animation_.Show();
+@@ -2317,18 +2315,6 @@ bool BrowserView::IsPointInZenSideChrome
+   gfx::Rect bounds = views::View::ConvertRectToTarget(
+       vertical_tab_strip_region_view_->parent(), this,
+       vertical_tab_strip_region_view_->bounds());
+-  // While the sidebar slides in, also count where it will come to rest, so
+-  // small moves away from the edge don't turn the reveal around.
+-  if (zen_side_chrome_animation_.IsShowing() && !bounds.IsEmpty()) {
+-    const int remaining = base::ClampRound(
+-        bounds.width() * (1.0 - zen_side_chrome_animation_.GetCurrentValue()));
+-    auto* controller = tabs::VerticalTabStripStateController::From(browser_);
+-    const bool right_aligned =
+-        controller && controller->IsTabStripRightAligned();
+-    gfx::Rect resting = bounds;
+-    resting.Offset(right_aligned ? -remaining : remaining, 0);
+-    bounds.Union(resting);
+-  }
+   bounds.Outset(
+       gfx::Outsets::VH(kZenModeChromeHoverLeeway, kZenModeChromeHoverLeeway));
+   return bounds.Contains(point);
+@@ -7031,6 +7017,11 @@ void BrowserView::AnimationProgressed(co
+             rac::GetWindowButtonsRevealRatio(this));
+       }
+     }
++    if (!top_chrome_animation) {
++      rac::OnSidebarRevealChanged(this, vertical_tab_strip_region_view_,
++                                  zen_side_chrome_animation_.GetCurrentValue(),
++                                  IsZenModeSideChromePinned());
++    }
+   }
+ }
+ 
+--- a/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.cc
++++ b/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.cc
+@@ -23,6 +23,7 @@
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/location_bar/location_bar_view.h"
+ #include "chrome/browser/ui/views/rac/rac_look.h"
++#include "chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.h"
+ #include "chrome/browser/ui/views/rac/sidebar_visibility.h"
+ #include "chrome/browser/ui/views/rac/top_bar.h"
+ #include "chrome/browser/ui/views/omnibox/omnibox_view_views.h"
+@@ -1060,7 +1061,7 @@ views::BubbleBorder::Arrow GetSidebarBub
+ 
+ float GetWindowButtonsRevealRatio(const BrowserView* browser_view) {
+   return IsAddressBarInSidebar(browser_view)
+-             ? browser_view->GetSideChromeRevealRatio()
++             ? SidebarWindowButtonsRatio(browser_view)
+              : browser_view->GetTopChromeRevealRatio();
+ }
+ 
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.h
+@@ -0,0 +1,45 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_SIDEBAR_REVEAL_MOTION_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_SIDEBAR_REVEAL_MOTION_H_
++
++class BrowserView;
++
++namespace views {
++class View;
++}
++
++namespace rac {
++
++// The hidden sidebar's reveal, moved on the compositor (plan 02, S1 and S2).
++//
++// Helium's reveal value now changes at once, so the sidebar is laid out a
++// single time, where it rests. This slides its layer there instead: in on
++// tokens::kSpringReveal, out on tokens::kSpringExit, and on tokens::kSpringDock
++// when Cmd+S docks or hides it. A turn mid-slide starts the next spring from
++// the layer's place and speed. Under Reduce Motion the sidebar fades in over
++// tokens::kReducedFade and out over tokens::kFade.
++//
++// Nothing here exists between slides: a slide's state lives on the browser
++// view only while its layer animation runs.
++
++// The reveal Helium's layout should use. `reveal` is Helium's value, 0 or 1;
++// while the sidebar slides out it stays laid out at rest, so this is 1.
++float SidebarLayoutRatio(const BrowserView* browser_view, float reveal);
++
++// The traffic lights' opacity, with the address bar in the sidebar: where a
++// slide is headed, so Helium's direct sets never undo their fade.
++float SidebarWindowButtonsRatio(const BrowserView* browser_view);
++
++// Helium's reveal value became `reveal`. Slides `sidebar` toward it, or puts it
++// there at once when `pinned`.
++void OnSidebarRevealChanged(BrowserView* browser_view,
++                            views::View* sidebar,
++                            float reveal,
++                            bool pinned);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_SIDEBAR_REVEAL_MOTION_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.mm
+@@ -0,0 +1,353 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.h"
++
++#import <AppKit/AppKit.h>
++#import <QuartzCore/QuartzCore.h>
++
++#include <memory>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/rac/dev/frame_log.h"
++#include "chrome/browser/ui/views/rac/motion/rac_motion.h"
++#include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h"
++#include "chrome/browser/ui/views/rac/rac_tokens.h"
++#include "ui/base/class_property.h"
++#include "ui/compositor/layer.h"
++#include "ui/compositor/layer_animation_observer.h"
++#include "ui/compositor/layer_animation_sequence.h"
++#include "ui/compositor/layer_animator.h"
++#include "ui/gfx/geometry/transform.h"
++#include "ui/gfx/geometry/vector2d_f.h"
++#include "ui/views/view.h"
++#include "ui/views/view_tracker.h"
++#include "ui/views/widget/widget.h"
++
++namespace rac {
++class SidebarSlide;
++}
++
++DEFINE_UI_CLASS_PROPERTY_TYPE(rac::SidebarSlide*)
++
++namespace rac {
++
++namespace {
++
++// One layer moving along x on a spring, and where it's headed.
++struct Track {
++  raw_ptr<ui::LayerAnimationSequence> sequence = nullptr;
++  // The layer's x where the running spring rests.
++  float rest_x = 0;
++
++  // Where the layer is now along x, and how fast it moves.
++  float X(const ui::Layer* layer) const {
++    if (!sequence) {
++      return layer ? layer->transform().To2dTranslation().x() : 0;
++    }
++    return rest_x +
++           static_cast<SpringTransformElement*>(sequence->FirstElement())
++               ->GetOffset();
++  }
++  float Velocity() const {
++    return sequence
++               ? static_cast<SpringTransformElement*>(sequence->FirstElement())
++                     ->GetVelocity()
++               : 0;
++  }
++};
++
++constexpr NSWindowButton kTypes[] = {
++    NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton};
++
++// With the address bar in the sidebar the traffic lights sit on it, so they
++// fade with its slide instead of popping when it starts. `fresh` starts the
++// fade from the far end; otherwise it turns around from where it is.
++void FadeWindowButtons(BrowserView* browser_view, bool show, bool fresh) {
++  NSWindow* window =
++      browser_view->GetWidget()->GetNativeWindow().GetNativeNSWindow();
++  if (!window || !IsAddressBarInSidebar(browser_view) ||
++      browser_view->IsFullscreen()) {
++    return;
++  }
++  const Timing& timing = show ? tokens::kReducedFade : tokens::kFade;
++  for (NSWindowButton type : kTypes) {
++    NSButton* button = [window standardWindowButton:type];
++    CALayer* shown = button.layer.presentationLayer;
++    button.alphaValue =
++        fresh ? (show ? 0 : 1) : (shown ? shown.opacity : button.alphaValue);
++  }
++  [NSAnimationContext runAnimationGroup:^(NSAnimationContext* context) {
++    context.duration = timing.duration.InSecondsF();
++    context.timingFunction = [CAMediaTimingFunction
++        functionWithControlPoints:timing.curve.x1
++                                 :timing.curve.y1
++                                 :timing.curve.x2
++                                 :timing.curve.y2];
++    for (NSWindowButton type : kTypes) {
++      [window standardWindowButton:type].animator.alphaValue = show ? 1 : 0;
++    }
++  }];
++}
++
++}  // namespace
++
++// One slide of the sidebar, in or out. It lives on the browser view only
++// while its layer animation runs.
++class SidebarSlide : public ui::LayerAnimationObserver {
++ public:
++  SidebarSlide(BrowserView* browser_view, views::View* sidebar)
++      : browser_view_(browser_view), sidebar_view_(sidebar) {}
++  SidebarSlide(const SidebarSlide&) = delete;
++  SidebarSlide& operator=(const SidebarSlide&) = delete;
++  ~SidebarSlide() override { StopObserving(); }
++
++  bool showing() const { return showing_; }
++  void set_showing(bool showing) { showing_ = showing; }
++
++  // Heads in or out from the layer's place and speed now. A new slide starts
++  // from rest: in from hidden, or out from where the sidebar sits. `dock` is
++  // Cmd+S, which moves on tokens::kSpringDock both ways.
++  void Start(bool dock);
++
++  // Stops where everything rests, as when the sidebar is pinned.
++  void Snap() {
++    StopObserving();
++    if (ui::Layer* layer = SidebarLayer()) {
++      layer->GetAnimator()->AbortAllAnimations();
++      layer->SetTransform(gfx::Transform());
++      layer->SetOpacity(1.0f);
++    }
++  }
++
++ private:
++  // ui::LayerAnimationObserver:
++  void OnLayerAnimationEnded(ui::LayerAnimationSequence* sequence) override {
++    if (sequence != sidebar_.sequence) {
++      return;
++    }
++    StopObserving();
++    FinishLater();
++  }
++  void OnLayerAnimationAborted(ui::LayerAnimationSequence* sequence) override {
++    // Something else took a layer over. Rest.
++    OnLayerAnimationEnded(sequence);
++  }
++  void OnLayerAnimationScheduled(
++      ui::LayerAnimationSequence* sequence) override {}
++
++  ui::Layer* SidebarLayer() {
++    views::View* sidebar = sidebar_view_.view();
++    return sidebar ? sidebar->layer() : nullptr;
++  }
++
++  // Where the layer's x has the sidebar fully out of the window.
++  float HiddenX() const {
++    const views::View* sidebar = sidebar_view_.view();
++    if (!sidebar || !sidebar->parent()) {
++      return 0;
++    }
++    return browser_view_->IsVerticalTabStripRightAligned()
++               ? sidebar->parent()->width() - sidebar->x()
++               : -sidebar->bounds().right();
++  }
++
++  void StopObserving() {
++    if (sidebar_.sequence) {
++      sidebar_.sequence->RemoveObserver(this);
++      sidebar_.sequence = nullptr;
++    }
++  }
++
++  // Later, so the animator has let go of the sequence first.
++  void FinishLater() {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(&SidebarSlide::Finish, weak_factory_.GetWeakPtr()));
++  }
++
++  void Run(ui::Layer* layer,
++           Track& track,
++           std::unique_ptr<ui::LayerAnimationElement> element) {
++    auto sequence =
++        std::make_unique<ui::LayerAnimationSequence>(std::move(element));
++    sequence->AddObserver(this);
++    track.sequence = sequence.get();
++    layer->GetAnimator()->StartAnimation(sequence.release());
++  }
++
++  // Slides `layer` from `x` at `velocity` to rest at `rest_x`.
++  void Spring(ui::Layer* layer,
++              Track& track,
++              const rac::Spring& spring,
++              float x,
++              float velocity,
++              float rest_x) {
++    track.rest_x = rest_x;
++    const SpringMotion motion{spring, x - rest_x, velocity};
++    if (motion.RestTime(tokens::kSpringRest).is_zero()) {
++      layer->SetTransform(gfx::Transform::MakeTranslation(rest_x, 0));
++      return;
++    }
++    Run(layer, track,
++        std::make_unique<SpringTransformElement>(
++            motion, gfx::Vector2dF(rest_x, 0),
++            SpringTransformElement::Axis::kX));
++  }
++
++  // At rest. Deletes this. A sidebar that slid out is now laid out hidden.
++  void Finish();
++
++  const raw_ptr<BrowserView> browser_view_;
++  views::ViewTracker sidebar_view_;
++  Track sidebar_;
++  bool showing_ = false;
++  bool started_ = false;
++  bool fading_ = false;
++  base::WeakPtrFactory<SidebarSlide> weak_factory_{this};
++};
++
++namespace {
++
++DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(SidebarSlide, kSidebarSlideKey)
++// What Helium's reveal and layout last had: the sidebar shown, and docked
++// beside the page rather than hidden or floating. Kept on the view, so
++// nothing is allocated for them.
++DEFINE_UI_CLASS_PROPERTY_KEY(bool, kSidebarShownKey, true)
++DEFINE_UI_CLASS_PROPERTY_KEY(bool, kSidebarDockedKey, true)
++
++}  // namespace
++
++void SidebarSlide::Start(bool dock) {
++  ui::Layer* layer = SidebarLayer();
++  if (!layer) {
++    return;
++  }
++  const bool show = showing_;
++  const bool fade = motion::ReducedMotion();
++  FadeWindowButtons(browser_view_, show, /*fresh=*/!started_);
++  // Where the sidebar's layer is and how fast it moves.
++  float x = 0;
++  float velocity = 0;
++  if (!started_) {
++    x = show ? HiddenX() : 0;
++  } else if (!fading_) {
++    x = sidebar_.X(layer);
++    velocity = sidebar_.Velocity();
++  }
++  StopObserving();
++  layer->GetAnimator()->AbortAllAnimations();
++  started_ = true;
++  fading_ = fade;
++
++  if (fade) {
++    // Fades where it rests. A fresh fade in starts clear.
++    layer->SetTransform(gfx::Transform());
++    if (show && x != 0) {
++      layer->SetOpacity(0.0f);
++    }
++    Run(layer, sidebar_,
++        CurveElement::CreateOpacity(show ? 1.0f : 0.0f,
++                                    show || dock ? tokens::kReducedFade
++                                                 : tokens::kFade));
++    return;
++  }
++
++  layer->SetOpacity(1.0f);
++  const rac::Spring& spring =
++      dock ? tokens::kSpringDock
++           : (show ? tokens::kSpringReveal : tokens::kSpringExit);
++  const float rest_x = show ? 0 : HiddenX();
++  dev::LogAnimationStep(show ? "sidebar.slide.in" : "sidebar.slide.out",
++                        x - rest_x);
++  dev::LogAnimationStep("sidebar.slide.velocity", velocity);
++  dev::LogAnimationStep("sidebar.slide.dock", dock ? 1 : 0);
++  Spring(layer, sidebar_, spring, x, velocity, rest_x);
++  if (!sidebar_.sequence) {
++    FinishLater();
++  }
++}
++
++void SidebarSlide::Finish() {
++  BrowserView* const browser_view = browser_view_;
++  views::View* const sidebar = sidebar_view_.view();
++  const bool hidden = !showing_;
++  browser_view->ClearProperty(kSidebarSlideKey);
++  // `this` is gone. Lay the sidebar out hidden before its layer comes back,
++  // so it never shows at rest for a frame.
++  if (hidden) {
++    browser_view->InvalidateLayout();
++    if (views::Widget* widget = browser_view->GetWidget()) {
++      widget->LayoutRootViewIfNecessary();
++    }
++  }
++  if (sidebar && sidebar->layer()) {
++    sidebar->layer()->SetTransform(gfx::Transform());
++    sidebar->layer()->SetOpacity(1.0f);
++  }
++  dev::LogAnimationStep("sidebar.slide.rest", hidden ? 0 : 1);
++}
++
++float SidebarLayoutRatio(const BrowserView* browser_view, float reveal) {
++  const SidebarSlide* slide = browser_view->GetProperty(kSidebarSlideKey);
++  return slide && !slide->showing() ? 1.0f : reveal;
++}
++
++float SidebarWindowButtonsRatio(const BrowserView* browser_view) {
++  const SidebarSlide* slide = browser_view->GetProperty(kSidebarSlideKey);
++  if (!slide) {
++    return browser_view->GetSideChromeRevealRatio();
++  }
++  return slide->showing() ? 1.0f : 0.0f;
++}
++
++void OnSidebarRevealChanged(BrowserView* browser_view,
++                            views::View* sidebar,
++                            float reveal,
++                            bool pinned) {
++  const bool show = reveal > 0.0f;
++  const bool docked = !browser_view->IsZenModeEnabledForLayout();
++  const bool was_shown = browser_view->GetProperty(kSidebarShownKey);
++  const bool was_docked = browser_view->GetProperty(kSidebarDockedKey);
++  browser_view->SetProperty(kSidebarShownKey, show);
++  browser_view->SetProperty(kSidebarDockedKey, docked);
++  const bool dock = docked != was_docked;
++
++  SidebarSlide* slide = browser_view->GetProperty(kSidebarSlideKey);
++  views::Widget* widget = browser_view->GetWidget();
++  if (pinned || !widget || !widget->IsVisible() || !sidebar ||
++      !sidebar->layer()) {
++    if (slide) {
++      slide->Snap();
++      browser_view->ClearProperty(kSidebarSlideKey);
++    }
++    return;
++  }
++  if (slide ? slide->showing() == show : show == was_shown) {
++    return;
++  }
++
++  if (!slide) {
++    slide = browser_view->SetProperty(
++        kSidebarSlideKey,
++        std::make_unique<SidebarSlide>(browser_view, sidebar));
++  }
++  slide->set_showing(show);
++  // Lay out once, at rest: the sidebar where it ends up or, sliding out,
++  // where it is. On Cmd+S the page takes its new width here, once.
++  widget->LayoutRootViewIfNecessary();
++  if (!sidebar->GetVisible()) {
++    slide->Snap();
++    browser_view->ClearProperty(kSidebarSlideKey);
++    return;
++  }
++  slide->Start(dock);
++}
++
++}  // namespace rac
