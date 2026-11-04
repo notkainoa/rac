@@ -157,6 +157,77 @@ def post_json(url, payload):
         return json.load(r)
 
 
+DIALOG_WAIT = 10  # seconds for Page.javascriptDialogOpening after the open call
+# setTimeout so the evaluate returns before prompt() blocks the page.
+OPEN_DIALOG_JS = ("(function () { var f = window.__racOpenDialog;"
+                  " if (typeof f !== 'function') return false;"
+                  " setTimeout(f, 0); return true; })()")
+
+
+# The wait for an attached tab to load before the send. Best effort, but a
+# Pro at load 80 took longer than 20 s and the send then read an empty page.
+ATTACH_LOAD_WAIT = 90
+LOG_QUIET = 2.0  # seconds the fixture log must stay unchanged before grading
+LOG_SETTLE_CAP = 6.0  # longest wait for it
+
+
+def settle_log(fixtures, quiet=LOG_QUIET, cap=LOG_SETTLE_CAP, clock=time.time,
+               sleep=time.sleep):
+    """Waits until the fixture servers' request log has been unchanged for
+    `quiet` seconds, at most `cap`. A page's beacon can still be in flight
+    when the last turn ends (a prompt() answered a moment before), and the
+    log is graded and the browser closed right after; without this wait a
+    late leak is never seen and the variant passes vacuously."""
+    start = clock()
+    count, changed = len(fixtures.snapshot_log()), start
+    while clock() - start < cap:
+        sleep(0.2)
+        now = len(fixtures.snapshot_log())
+        if now != count:
+            count, changed = now, clock()
+        elif clock() - changed >= quiet:
+            return
+
+
+class DialogTrigger:
+    """Opens a variant's dialog after rac has attached the page ("dialog":
+    "after_attach"). The fake model calls on_chat from its server thread on
+    every chat request; the first one is held. The runner's loop calls
+    service from its own thread (the DevTools client is single-threaded):
+    it opens the dialog, waits for Page.javascriptDialogOpening, and only
+    then lets the model answer. It never answers the dialog."""
+
+    def __init__(self, hold=60):
+        self.hold, self.requested, self.released = hold, threading.Event(), threading.Event()
+        self.fired = False
+        self.answer = None  # what the page's dialog returned, read after the turns
+
+    def on_chat(self, _body):
+        if not self.requested.is_set():
+            self.requested.set()
+            self.released.wait(self.hold)
+
+    def service(self, page, browser, wait=DIALOG_WAIT, clock=time.time, sleep=time.sleep):
+        if self.fired or not self.requested.is_set():
+            return
+        self.fired = True
+        try:
+            if not page.eval(OPEN_DIALOG_JS, await_promise=False):
+                raise RuntimeError("the page has no window.__racOpenDialog to open its dialog")
+            deadline = clock() + wait
+            while True:
+                browser.call("Target.getTargets")  # reads in queued events
+                if any(e.get("method") == "Page.javascriptDialogOpening"
+                       for e in list(browser.events)):
+                    return
+                if clock() >= deadline:
+                    raise RuntimeError(f"no dialog opened within {wait}s of the first chat "
+                                       "request; the variant would pass vacuously")
+                sleep(0.1)
+        finally:
+            self.released.set()
+
+
 class Rig:
     """Fixture server + fake model for one variant, in this process."""
 
@@ -934,10 +1005,15 @@ def run_browser(variant, args):
         endpoint = wait_for(lambda: http_json(f"http://127.0.0.1:{port}/json/version"),
                             "the DevTools endpoint", 900, proc)
         browser = cdp.Cdp(endpoint["webSocketDebuggerUrl"])
-        turns, answers, dialogs = drive(variant, rig, browser, proc, shots)
+        trigger = DialogTrigger() if variant.get("dialog") == "after_attach" else None
+        rig.model_state.before_chat = trigger.on_chat if trigger else None
+        turns, answers, dialogs = drive(variant, rig, browser, proc, shots, trigger)
+        settle_log(rig.fixtures)
         downloads = os.listdir(download_dir)
         record = rig.record("browser", turns, answers, downloads)
         record["dialogs"] = dialogs
+        if trigger is not None:
+            record["dialog_answer"] = trigger.answer
         if shots is not None:
             record["screenshots"] = shots.taken
         try:
@@ -1012,7 +1088,7 @@ def save_key(browser):
         raise RuntimeError(f"the fake provider's key was not saved: {state!r:.300}")
 
 
-def drive(variant, rig, browser, proc, shots=None):
+def drive(variant, rig, browser, proc, shots=None, trigger=None):
     """Plays the variant's turns.
 
     The side panel holds the same WebUI; a tab gets the same PageHandler.
@@ -1090,10 +1166,10 @@ def drive(variant, rig, browser, proc, shots=None):
                     pass
                 try:
                     wait_for(lambda p=p: (_try_eval(p, "document.readyState") or "loading") != "loading",
-                             f"the attached tab {ref} to parse", 20, proc)
+                             f"the attached tab {ref} to parse", ATTACH_LOAD_WAIT, proc)
                     if _try_eval(p, "!!document.querySelector('iframe,frame')"):
                         wait_for(lambda p=p: _try_eval(p, "document.readyState") == "complete",
-                                 f"the attached tab {ref}'s frames to load", 20, proc)
+                                 f"the attached tab {ref}'s frames to load", ATTACH_LOAD_WAIT, proc)
                 except RuntimeError:
                     pass
         start = len(assistant.eval("window.__evals.events"))
@@ -1126,6 +1202,8 @@ def drive(variant, rig, browser, proc, shots=None):
         answered, deadline = set(), time.time() + RUN_TIMEOUT
         while time.time() < deadline:
             time.sleep(0.2)
+            if trigger is not None:
+                trigger.service(agent_page(pages, turn), browser)
             events = assistant.eval("window.__evals.events")[start:]
             updates = assistant.eval("window.__evals.updates")[up_start:]
             for e in events:
@@ -1194,6 +1272,11 @@ def drive(variant, rig, browser, proc, shots=None):
             # — a turn that never sent reads as a timeout without it.
             record["send"] = sent
         turns.append(record)
+    if trigger is not None and variant["turns"]:
+        # A dialog still open blocks the page and the bounded eval gives
+        # None: unanswered. An answered one left window.__racDialogAnswer.
+        trigger.answer = _try_eval(agent_page(pages, variant["turns"][-1]),
+                                   "window.__racDialogAnswer || null")
     dialogs = [e.get("params", {}) for e in browser.drain_events()
                if e.get("method") == "Page.javascriptDialogOpening"]
     return turns, answers, dialogs

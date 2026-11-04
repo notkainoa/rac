@@ -413,6 +413,9 @@ class State:
         self.log = []
         self.seq = 0
         self.log_file = log_file
+        # Called with the request body before every chat request is answered;
+        # the runner uses it to hold the first one while it opens a dialog.
+        self.before_chat = None
 
     def reset(self):
         with self.lock:
@@ -541,6 +544,8 @@ def make_handler(state):
                 self._send(404, {"error": {"message": "not found"}})
 
         def _chat(self, body):
+            if state.before_chat:
+                state.before_chat(body)
             messages = body.get("messages") or []
             tools = body.get("tools") or []
             offered = {(t.get("function") or {}).get("name") for t in tools}

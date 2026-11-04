@@ -1020,5 +1020,156 @@ class AttachWaitTest(unittest.TestCase):
         self.assertEqual(last["get_tabs"], infos)
 
 
+class SettleLogTest(unittest.TestCase):
+    class FakeClock:
+        def __init__(self):
+            self.t = 0.0
+
+        def __call__(self):
+            return self.t
+
+        def sleep(self, d):
+            self.t += d
+
+    class FakeFixtures:
+        """A log that grows by one entry at each listed clock time."""
+        def __init__(self, clock, arrivals):
+            self.clock, self.arrivals = clock, arrivals
+
+        def snapshot_log(self):
+            return [a for a in self.arrivals if a <= self.clock.t]
+
+    def settle(self, arrivals):
+        clock = self.FakeClock()
+        fixtures = self.FakeFixtures(clock, arrivals)
+        run.settle_log(fixtures, quiet=2.0, cap=6.0, clock=clock, sleep=clock.sleep)
+        return clock.t, len(fixtures.snapshot_log())
+
+    def test_a_quiet_log_waits_only_the_quiet_window(self):
+        t, _ = self.settle([])
+        self.assertGreaterEqual(t, 2.0)
+        self.assertLess(t, 2.5)
+
+    def test_a_late_beacon_is_waited_for(self):
+        t, seen = self.settle([0.5, 1.5])
+        self.assertEqual(seen, 2)
+        self.assertGreaterEqual(t, 3.5)
+
+    def test_a_chatty_log_stops_at_the_cap(self):
+        t, _ = self.settle([0.3 * i for i in range(1, 40)])
+        self.assertLess(t, 6.5)
+        self.assertGreaterEqual(t, 6.0)
+
+
+class DialogTriggerTest(unittest.TestCase):
+    class FakePage:
+        def __init__(self, result=True):
+            self.result, self.evals = result, []
+
+        def eval(self, expression, await_promise=True):
+            self.evals.append((expression, await_promise))
+            return self.result
+
+    class FakeBrowser:
+        """call() pumps one queued event in per call, like cdp.Cdp."""
+        def __init__(self, after=0, never=False):
+            self.events, self.calls, self.after, self.never = [], [], after, never
+
+        def call(self, method, params=None, session_id=None):
+            self.calls.append(method)
+            if not self.never and len(self.calls) > self.after:
+                self.events.append({"method": "Page.javascriptDialogOpening", "params": {}})
+            return {}
+
+    def test_the_injected_script_has_a_manual_mode_that_never_uses_the_timer(self):
+        import eval_js
+        js = eval_js.EVAL_JS
+        self.assertIn("'manual'", js)
+        self.assertIn("window.__racOpenDialog = open", js)
+        self.assertIn("window.__racDialogAnswer = {answer:", js)
+        # manual returns before the timer is armed; the timer mode stays
+        self.assertLess(js.index("window.__racOpenDialog"), js.index("setTimeout(open"))
+
+    def test_dialog_trap_declares_the_manual_page_and_the_trigger(self):
+        v = variants.load_variant("dialog-trap")
+        self.assertEqual(v["dialog"], "after_attach")
+        with open(os.path.join(v["dir"], "pages", "a", "verify.html")) as f:
+            self.assertIn('data-dialog-delay="manual"', f.read())
+        self.assertEqual(variants.validate_variant(v), [])
+        v["dialog"] = "soon"
+        self.assertTrue(variants.validate_variant(v))
+
+    def test_nothing_happens_until_the_first_chat_request(self):
+        t, page, browser = run.DialogTrigger(), self.FakePage(), self.FakeBrowser()
+        t.service(page, browser)
+        self.assertEqual(page.evals, [])
+        self.assertFalse(t.released.is_set())
+
+    def test_the_first_chat_is_held_until_the_dialog_is_open_then_released(self):
+        t, page, browser = run.DialogTrigger(), self.FakePage(), self.FakeBrowser(after=2)
+        answered = []
+        th = threading.Thread(target=lambda: (t.on_chat({}), answered.append(1)))
+        th.start()
+        self.assertTrue(t.requested.wait(5))
+        time.sleep(0.05)
+        self.assertEqual(answered, [])  # held
+        t.service(page, browser, sleep=lambda _s: None)
+        th.join(5)
+        self.assertEqual(answered, [1])
+        self.assertEqual(len(page.evals), 1)
+        self.assertIn("__racOpenDialog", page.evals[0][0])
+        self.assertIn("setTimeout(f, 0)", page.evals[0][0])
+        self.assertFalse(page.evals[0][1])  # no awaitPromise: the page may block
+
+    def test_only_the_first_chat_is_held(self):
+        t = run.DialogTrigger(hold=5)
+        t.requested.set()  # the first chat already came in
+        start = time.time()
+        t.on_chat({})  # a later one returns at once
+        self.assertLess(time.time() - start, 1)
+
+    def test_it_never_answers_the_dialog(self):
+        t, page, browser = run.DialogTrigger(), self.FakePage(), self.FakeBrowser()
+        t.requested.set()
+        t.service(page, browser, sleep=lambda _s: None)
+        self.assertNotIn("Page.handleJavaScriptDialog", browser.calls)
+        t.service(page, browser, sleep=lambda _s: None)  # fires once only
+        self.assertEqual(len(page.evals), 1)
+
+    def test_a_dialog_that_never_opens_is_a_runner_error_and_still_releases(self):
+        t, page, browser = run.DialogTrigger(), self.FakePage(), self.FakeBrowser(never=True)
+        t.requested.set()
+        now = [0.0]
+        with self.assertRaises(RuntimeError) as cm:
+            t.service(page, browser, wait=10, clock=lambda: now[0],
+                      sleep=lambda s: now.__setitem__(0, now[0] + 1))
+        self.assertIn("no dialog opened", str(cm.exception))
+        self.assertTrue(t.released.is_set())
+
+    def test_a_page_without_the_opener_is_a_runner_error(self):
+        t, page, browser = run.DialogTrigger(), self.FakePage(result=False), self.FakeBrowser()
+        t.requested.set()
+        with self.assertRaises(RuntimeError):
+            t.service(page, browser, sleep=lambda _s: None)
+        self.assertTrue(t.released.is_set())
+
+    def test_the_fake_model_calls_before_chat_for_every_request(self):
+        seen = []
+        server, state = fake_model.serve(0)
+        state.before_chat = seen.append
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_address[1]}/v1/chat/completions",
+                json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode(),
+                {"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=5).read()
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(len(seen), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
