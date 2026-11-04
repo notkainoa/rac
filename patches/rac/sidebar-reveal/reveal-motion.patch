@@ -4,8 +4,8 @@
        "views/rac/sidebar_address_bar/sidebar_header_view.h",
        "views/rac/sidebar_reveal/sidebar_overshoot.h",
        "views/rac/sidebar_reveal/sidebar_overshoot.mm",
-+      "views/rac/sidebar_reveal/sidebar_reveal_motion.cc",
 +      "views/rac/sidebar_reveal/sidebar_reveal_motion.h",
++      "views/rac/sidebar_reveal/sidebar_reveal_motion.mm",
        "views/rac/sidebar_visibility.cc",
        "views/rac/sidebar_visibility.h",
      ]
@@ -91,14 +91,84 @@
    }
  }
  
+--- a/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.cc
++++ b/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.cc
+@@ -23,6 +23,7 @@
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/location_bar/location_bar_view.h"
+ #include "chrome/browser/ui/views/rac/rac_look.h"
++#include "chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.h"
+ #include "chrome/browser/ui/views/rac/sidebar_visibility.h"
+ #include "chrome/browser/ui/views/rac/top_bar.h"
+ #include "chrome/browser/ui/views/omnibox/omnibox_view_views.h"
+@@ -1060,7 +1061,7 @@ views::BubbleBorder::Arrow GetSidebarBub
+ 
+ float GetWindowButtonsRevealRatio(const BrowserView* browser_view) {
+   return IsAddressBarInSidebar(browser_view)
+-             ? browser_view->GetSideChromeRevealRatio()
++             ? SidebarWindowButtonsRatio(browser_view)
+              : browser_view->GetTopChromeRevealRatio();
+ }
+ 
 --- /dev/null
-+++ b/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.cc
-@@ -0,0 +1,307 @@
++++ b/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.h
+@@ -0,0 +1,45 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_SIDEBAR_REVEAL_MOTION_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_SIDEBAR_REVEAL_MOTION_H_
++
++class BrowserView;
++
++namespace views {
++class View;
++}
++
++namespace rac {
++
++// The hidden sidebar's reveal, moved on the compositor (plan 02, S1 and S2).
++//
++// Helium's reveal value now changes at once, so the sidebar is laid out a
++// single time, where it rests. This slides its layer there instead: in on
++// tokens::kSpringReveal, out on tokens::kSpringExit, and on tokens::kSpringDock
++// when Cmd+S docks or hides it. A turn mid-slide starts the next spring from
++// the layer's place and speed. Under Reduce Motion the sidebar fades in over
++// tokens::kReducedFade and out over tokens::kFade.
++//
++// Nothing here exists between slides: a slide's state lives on the browser
++// view only while its layer animation runs.
++
++// The reveal Helium's layout should use. `reveal` is Helium's value, 0 or 1;
++// while the sidebar slides out it stays laid out at rest, so this is 1.
++float SidebarLayoutRatio(const BrowserView* browser_view, float reveal);
++
++// The traffic lights' opacity, with the address bar in the sidebar: where a
++// slide is headed, so Helium's direct sets never undo their fade.
++float SidebarWindowButtonsRatio(const BrowserView* browser_view);
++
++// Helium's reveal value became `reveal`. Slides `sidebar` toward it, or puts it
++// there at once when `pinned`.
++void OnSidebarRevealChanged(BrowserView* browser_view,
++                            views::View* sidebar,
++                            float reveal,
++                            bool pinned);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_SIDEBAR_REVEAL_MOTION_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.mm
+@@ -0,0 +1,353 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#include "chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.h"
++
++#import <AppKit/AppKit.h>
++#import <QuartzCore/QuartzCore.h>
 +
 +#include <memory>
 +#include <utility>
@@ -110,6 +180,7 @@
 +#include "chrome/browser/ui/views/frame/browser_view.h"
 +#include "chrome/browser/ui/views/rac/dev/frame_log.h"
 +#include "chrome/browser/ui/views/rac/motion/rac_motion.h"
++#include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h"
 +#include "chrome/browser/ui/views/rac/rac_tokens.h"
 +#include "ui/base/class_property.h"
 +#include "ui/compositor/layer.h"
@@ -154,6 +225,39 @@
 +               : 0;
 +  }
 +};
++
++constexpr NSWindowButton kTypes[] = {
++    NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton};
++
++// With the address bar in the sidebar the traffic lights sit on it, so they
++// fade with its slide instead of popping when it starts. `fresh` starts the
++// fade from the far end; otherwise it turns around from where it is.
++void FadeWindowButtons(BrowserView* browser_view, bool show, bool fresh) {
++  NSWindow* window =
++      browser_view->GetWidget()->GetNativeWindow().GetNativeNSWindow();
++  if (!window || !IsAddressBarInSidebar(browser_view) ||
++      browser_view->IsFullscreen()) {
++    return;
++  }
++  const Timing& timing = show ? tokens::kReducedFade : tokens::kFade;
++  for (NSWindowButton type : kTypes) {
++    NSButton* button = [window standardWindowButton:type];
++    CALayer* shown = button.layer.presentationLayer;
++    button.alphaValue =
++        fresh ? (show ? 0 : 1) : (shown ? shown.opacity : button.alphaValue);
++  }
++  [NSAnimationContext runAnimationGroup:^(NSAnimationContext* context) {
++    context.duration = timing.duration.InSecondsF();
++    context.timingFunction = [CAMediaTimingFunction
++        functionWithControlPoints:timing.curve.x1
++                                 :timing.curve.y1
++                                 :timing.curve.x2
++                                 :timing.curve.y2];
++    for (NSWindowButton type : kTypes) {
++      [window standardWindowButton:type].animator.alphaValue = show ? 1 : 0;
++    }
++  }];
++}
 +
 +}  // namespace
 +
@@ -290,6 +394,7 @@
 +  }
 +  const bool show = showing_;
 +  const bool fade = motion::ReducedMotion();
++  FadeWindowButtons(browser_view_, show, /*fresh=*/!started_);
 +  // Where the sidebar's layer is and how fast it moves.
 +  float x = 0;
 +  float velocity = 0;
@@ -357,6 +462,14 @@
 +  return slide && !slide->showing() ? 1.0f : reveal;
 +}
 +
++float SidebarWindowButtonsRatio(const BrowserView* browser_view) {
++  const SidebarSlide* slide = browser_view->GetProperty(kSidebarSlideKey);
++  if (!slide) {
++    return browser_view->GetSideChromeRevealRatio();
++  }
++  return slide->showing() ? 1.0f : 0.0f;
++}
++
 +void OnSidebarRevealChanged(BrowserView* browser_view,
 +                            views::View* sidebar,
 +                            float reveal,
@@ -401,47 +514,3 @@
 +}
 +
 +}  // namespace rac
---- /dev/null
-+++ b/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.h
-@@ -0,0 +1,41 @@
-+// Copyright 2026 The rac Authors
-+// You can use, redistribute, and/or modify this source code under
-+// the terms of the GPL-3.0 license that can be found in the LICENSE file.
-+
-+#ifndef CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_SIDEBAR_REVEAL_MOTION_H_
-+#define CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_SIDEBAR_REVEAL_MOTION_H_
-+
-+class BrowserView;
-+
-+namespace views {
-+class View;
-+}
-+
-+namespace rac {
-+
-+// The hidden sidebar's reveal, moved on the compositor (plan 02, S1 and S2).
-+//
-+// Helium's reveal value now changes at once, so the sidebar is laid out a
-+// single time, where it rests. This slides its layer there instead: in on
-+// tokens::kSpringReveal, out on tokens::kSpringExit, and on tokens::kSpringDock
-+// when Cmd+S docks or hides it. A turn mid-slide starts the next spring from
-+// the layer's place and speed. Under Reduce Motion the sidebar fades in over
-+// tokens::kReducedFade and out over tokens::kFade.
-+//
-+// Nothing here exists between slides: a slide's state lives on the browser
-+// view only while its layer animation runs.
-+
-+// The reveal Helium's layout should use. `reveal` is Helium's value, 0 or 1;
-+// while the sidebar slides out it stays laid out at rest, so this is 1.
-+float SidebarLayoutRatio(const BrowserView* browser_view, float reveal);
-+
-+// Helium's reveal value became `reveal`. Slides `sidebar` toward it, or puts it
-+// there at once when `pinned`.
-+void OnSidebarRevealChanged(BrowserView* browser_view,
-+                            views::View* sidebar,
-+                            float reveal,
-+                            bool pinned);
-+
-+}  // namespace rac
-+
-+#endif  // CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_SIDEBAR_REVEAL_MOTION_H_
