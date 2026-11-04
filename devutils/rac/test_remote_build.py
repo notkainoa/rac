@@ -1864,6 +1864,22 @@ class RunTest(RemoteBuildTest):
         result = self.run_rb('run', self.wt, '--layout', success=False)
         self.assertIn('sidebar or top-bar', result.stderr)
 
+    def test_run_no_profile_picker_seeds_only_that_local_state_pref(self):
+        local_state = self.clone / 'build/profile/Local State'
+        write(local_state, '{"profile": {"info_cache": {"Default": {}}}, "x": 1}\n')
+        self.run_rb('run', self.wt, '--no-profile-picker', '--timeout', '3',
+                    success=True)
+        data = json.loads(local_state.read_text())
+        self.assertIs(data['profile']['show_picker_on_startup'], False)
+        # Everything else in Local State survives.
+        self.assertEqual(data['profile']['info_cache'], {'Default': {}})
+        self.assertEqual(data['x'], 1)
+        self.assertIs(data['select_file_dialogs']['allowed'], False)
+        # Without the option the pref isn't written.
+        write(local_state, '{}')
+        self.run_rb('run', self.wt, '--timeout', '3', success=True)
+        self.assertNotIn('show_picker_on_startup', local_state.read_text())
+
     def test_run_layout_refuses_a_symlinked_preferences(self):
         prefs = self.clone / 'build/profile/Default/Preferences'
         target = self.folder / 'outside-prefs.json'

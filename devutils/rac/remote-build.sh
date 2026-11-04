@@ -13,7 +13,7 @@
 #                                     updating its clone
 #   build <worktree> [-- targets...]  build the clone through the remote queue
 #   run <worktree> [--timeout S] [--requests-file F] [--fresh-profile]
-#       [--layout sidebar|top-bar] [--serve DIR] [-- args...]
+#       [--layout sidebar|top-bar] [--no-profile-picker] [--serve DIR] [-- args...]
 #                                     launch the clone's browser directly (no
 #                                     UI DevTools: worktree.sh run's
 #                                     --enable-ui-devtools is never passed),
@@ -24,7 +24,12 @@
 #                                     the clone profile's rac.browser.layout
 #                                     (sidebar 0, top bar 1) before launch,
 #                                     and refuses while a browser from the
-#                                     clone runs; --serve serves DIR (a
+#                                     clone runs; --no-profile-picker seeds
+#                                     Local State's
+#                                     profile.show_picker_on_startup =
+#                                     false, so several profiles restore
+#                                     without the picker (same refusal);
+#                                     --serve serves DIR (a
 #                                     folder in the clone, outside build/,
 #                                     holding no symlink) on 127.0.0.1 at a
 #                                     free port for the run, and @SERVE@ at
@@ -1260,7 +1265,7 @@ check_run_arg() {
 cmd_run() {
   local name=$1 timeout=90 requests='' outputs='' fresh=0 checked req_file=''
   local req_pages='' req_verbs='' req_needs='' req_commands='' import_input=0 setup_page=0 general_page=0 source_root=0
-  local arc_now=0 undo_now=0 settings_page=0 test_type=0 layout='' serve=''
+  local arc_now=0 undo_now=0 settings_page=0 test_type=0 layout='' serve='' no_picker=0
   shift
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1270,6 +1275,11 @@ cmd_run() {
         req_file=$2
         shift 2 ;;
       --fresh-profile) fresh=1; shift ;;
+      # Seeds Local State's profile.show_picker_on_startup = false (the
+      # profile picker's "Show on startup" checkbox, profile_picker.cc), so
+      # a clone with several profiles restores them instead of waiting on
+      # the picker. Nothing else in Local State changes.
+      --no-profile-picker) no_picker=1; shift ;;
       # Seeds the clone profile's rac.browser.layout before launch
       # (layout-setting.patch: Layout::kSidebar = 0, kTopBar = 1).
       --layout)
@@ -1298,7 +1308,7 @@ cmd_run() {
         timeout=$2
         shift 2 ;;
       --) shift; break ;;
-      *) die "usage: remote-build.sh run <worktree> [--timeout S] [--requests-file F] [--fresh-profile] [--layout sidebar|top-bar] [--serve DIR] [-- args...]" ;;
+      *) die "usage: remote-build.sh run <worktree> [--timeout S] [--requests-file F] [--fresh-profile] [--layout sidebar|top-bar] [--no-profile-picker] [--serve DIR] [-- args...]" ;;
     esac
   done
   case "$queue_wait" in
@@ -1441,7 +1451,7 @@ cmd_run() {
       esac
     done
   fi
-  remote "$name" "$timeout" "$queue_wait" "$requests" "$outputs" "$fresh" "$layout" "$serve" "$test_type_on" "$@" <<'EOS'
+  remote "$name" "$timeout" "$queue_wait" "$requests" "$outputs" "$fresh" "$layout" "$serve" "$test_type_on" "$no_picker" "$@" <<'EOS'
 set -e
 safe_name "$1" || { echo "rac remote: bad clone name '$1'" >&2; exit 2; }
 clone="$HOME/rac-remote/wt/$1"
@@ -1453,7 +1463,8 @@ fresh=$6
 layout=$7
 serve=$8
 test_type_on=$9
-shift 9
+no_picker=${10}
+shift 10
 [ -d "$clone" ] || {
   echo "rac remote: no clone at $clone; run push first" >&2
   exit 1
@@ -1814,6 +1825,10 @@ if [ -n "$(clone_pids)" ]; then
     echo "rac remote: refusing --layout: a browser from this clone is running" >&2
     exit 2
   }
+  [ "$no_picker" = 0 ] || {
+    echo "rac remote: refusing --no-profile-picker: a browser from this clone is running" >&2
+    exit 2
+  }
   echo "rac remote: a browser from this clone is running; its profile already points downloads inside the clone" >&2
 else
   for path in "$clone/build" "$profile" "$profile/Default" "$downloads" \
@@ -1825,9 +1840,9 @@ else
   # Keep every other preference; a missing or unreadable file starts
   # empty. Write a new file beside each (never through a planted link)
   # and rename it over, so the browser never reads half a file.
-  python3 - "$profile" "$downloads" "$layout" <<'PY'
+  python3 - "$profile" "$downloads" "$layout" "$no_picker" <<'PY'
 import json, os, sys
-profile, downloads, layout = sys.argv[1:4]
+profile, downloads, layout, no_picker = sys.argv[1:5]
 
 def patch(path, values):
     try:
@@ -1866,9 +1881,11 @@ prefs = {
 if layout:
     prefs['rac.browser.layout'] = int(layout)
 patch(os.path.join(profile, 'Default', 'Preferences'), prefs)
-patch(os.path.join(profile, 'Local State'), {
-    'select_file_dialogs.allowed': False,
-})
+local_state = {'select_file_dialogs.allowed': False}
+# run --no-profile-picker: the picker's "Show on startup" checkbox, off.
+if no_picker == '1':
+    local_state['profile.show_picker_on_startup'] = False
+patch(os.path.join(profile, 'Local State'), local_state)
 PY
 fi
 launcher=
@@ -2575,7 +2592,7 @@ case "${1:-}" in
     shift 2
     cmd_build "$name" "$@" ;;
   run)
-    [ $# -ge 2 ] || die "usage: remote-build.sh run <worktree> [--timeout S] [--requests-file F] [--fresh-profile] [--layout sidebar|top-bar] [--serve DIR] [-- args...]"
+    [ $# -ge 2 ] || die "usage: remote-build.sh run <worktree> [--timeout S] [--requests-file F] [--fresh-profile] [--layout sidebar|top-bar] [--no-profile-picker] [--serve DIR] [-- args...]"
     name=$(clone_name "$2")
     shift 2
     cmd_run "$name" "$@" ;;

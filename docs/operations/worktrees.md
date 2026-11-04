@@ -213,7 +213,7 @@ UI-control WebSocket — with `--user-data-dir` at the clone's throwaway
   Open internal pages with the requests file's `open-urls` verb, which
   always opens a new tab.
 
-Two `run` options change the clone before launch:
+Three `run` options change the clone before launch:
 
 - `--layout sidebar|top-bar` writes the clone profile's
   `rac.browser.layout` (0 or 1) into `Default/Preferences`. A fresh
@@ -222,6 +222,12 @@ Two `run` options change the clone before launch:
   same symlink and inside-the-clone checks the downloads prefs get. It
   refuses while a browser from the clone runs, since that browser
   already read its prefs.
+- `--no-profile-picker` writes `profile.show_picker_on_startup = false`
+  into the clone profile's `Local State`: the profile picker's "Show on
+  startup" checkbox, off (`chrome/browser/ui/profiles/profile_picker.cc`).
+  A clone with several profiles then restores them at launch instead of
+  waiting on the picker, which a run can't click. Nothing else in Local
+  State changes, and it refuses while a browser from the clone runs.
 - `--serve DIR` serves a folder in the clone on 127.0.0.1 at a port the
   kernel picks, for this run only. `@SERVE@` at the start of a URL arg
   or an `open-urls` URL becomes `http://127.0.0.1:PORT`; only a plain
