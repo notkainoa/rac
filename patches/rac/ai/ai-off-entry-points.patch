@@ -1,0 +1,319 @@
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -1671,6 +1671,12 @@ class AppControllerProfileObserver : pub
+       NSMenuItem* menuItem = base::apple::ObjCCast<NSMenuItem>(item);
+       [menuItem setHidden:YES];
+     }
++    // rac: the Assistant needs a window, and with AI off it must not show
++    // at all, so with no browser window it hides too. A browser window shows
++    // it again while AI is on (BrowserNativeWidgetMac).
++    if (tag == IDC_RAC_ASSISTANT_TOGGLE) {
++      [base::apple::ObjCCast<NSMenuItem>(item) setHidden:YES];
++    }
+   } else if (action == @selector(terminate:)) {
+     enable = YES;
+   } else if (action == @selector(showPreferences:)) {
+--- a/chrome/browser/rac/actions/rac_actions.cc
++++ b/chrome/browser/rac/actions/rac_actions.cc
+@@ -41,6 +41,11 @@ bool IsAvailable(const Action& action, c
+   return (!action.ai_only || context.ai_enabled) && MeetsNeeds(action, context);
+ }
+ 
++bool IsBuiltIntoMainMenu(const Action& action) {
++  return action.surfaces.Has(Surface::kMenu) && action.command_id &&
++         !action.ai_only;
++}
++
+ base::span<const Action> All() {
+   static const base::NoDestructor<std::vector<Action>> kAll([] {
+     std::vector<Action> all;
+--- a/chrome/browser/rac/actions/rac_actions.h
++++ b/chrome/browser/rac/actions/rac_actions.h
+@@ -178,6 +178,12 @@ struct Action {
+ // sidebar and menus, which show or disable a single row.
+ bool IsAvailable(const Action& action, const ActionContext& context);
+ 
++// Whether the main menu gets an item for `action` when it is built: a kMenu
++// row with a command id that isn't ai_only. The Mac menu is built before any
++// profile loads and is shared by every profile, so nothing can hide an
++// ai_only row's item while AI is off; it gets none.
++bool IsBuiltIntoMainMenu(const Action& action);
++
+ // Every row, in a stable order: the order of the group list in rac_actions.cc,
+ // then the order inside each group's file. Merges the groups into a vector on
+ // first call; use ForEachAction on paths where even that allocation is too
+--- a/chrome/browser/rac/actions/rac_actions_unittest.cc
++++ b/chrome/browser/rac/actions/rac_actions_unittest.cc
+@@ -313,6 +313,39 @@ TEST(RacActionsTest, AiOnlyRowsNeverShow
+   }
+ }
+ 
++TEST(RacActionsTest, AiOnlyRowsAreNeverBuiltIntoTheMenu) {
++  Action menu = MadeUp("menu", {Surface::kMenu});
++  menu.command_id = 1;
++  EXPECT_TRUE(IsBuiltIntoMainMenu(menu));
++
++  // A pref-gated row still gets its item; Power's hooks show and hide it.
++  Action pref_gated = menu;
++  pref_gated.shortcut_pref = "rac.some_pref";
++  EXPECT_TRUE(IsBuiltIntoMainMenu(pref_gated));
++
++  Action no_command = menu;
++  no_command.command_id = 0;
++  EXPECT_FALSE(IsBuiltIntoMainMenu(no_command));
++
++  Action not_menu = MadeUp("not_menu", {Surface::kCommandBar});
++  not_menu.command_id = 1;
++  EXPECT_FALSE(IsBuiltIntoMainMenu(not_menu));
++
++  // The menu is shared by every profile and built before any loads, so
++  // nothing could hide an ai_only row's item while AI is off.
++  Action ai_only =
++      MadeUp("ai_only", {Surface::kMenu, Surface::kShortcut}, /*ai_only=*/true);
++  ai_only.command_id = 1;
++  EXPECT_FALSE(IsBuiltIntoMainMenu(ai_only));
++
++  // The real table too.
++  for (const Action& action : All()) {
++    if (action.ai_only) {
++      EXPECT_FALSE(IsBuiltIntoMainMenu(action)) << action.id;
++    }
++  }
++}
++
+ TEST(RacActionsTest, AvailabilityFiltersUiSurfacesOnly) {
+   Action needs_tab =
+       MadeUp("needs_tab", {Surface::kCommandBar, Surface::kBuiltInAgent});
+--- a/chrome/browser/rac/power/shortcuts/table_shortcuts.cc
++++ b/chrome/browser/rac/power/shortcuts/table_shortcuts.cc
+@@ -256,6 +256,9 @@ void ObserveTableShortcutPrefs(base::spa
+ void ObserveTableShortcutPrefs(PrefChangeRegistrar& registrar,
+                                const base::RepeatingClosure& callback) {
+   ObserveTableShortcutPrefs(action_table::All(), registrar, callback);
++  if (!registrar.IsObserved(rac::ai::kEnabled)) {
++    registrar.Add(rac::ai::kEnabled, callback);
++  }
+ }
+ 
+ bool IsShortcutPrefOn(const PrefService* prefs, std::string_view pref) {
+--- a/chrome/browser/rac/power/shortcuts/table_shortcuts.h
++++ b/chrome/browser/rac/power/shortcuts/table_shortcuts.h
+@@ -168,7 +168,11 @@ void ObserveTableShortcutPrefs(base::spa
+                                PrefChangeRegistrar& registrar,
+                                const base::RepeatingClosure& callback);
+ 
+-// ObserveTableShortcutPrefs() on the whole action table.
++// ObserveTableShortcutPrefs() on the whole action table, plus rac.ai.enabled
++// always: the Assistant command (IDC_RAC_ASSISTANT_TOGGLE) is no table row,
++// but its label goes while AI is off too (browser_shortcut_metadata.cc), so
++// the shortcut page has to hear the switch. Watching a pref costs nothing
++// until it changes.
+ void ObserveTableShortcutPrefs(PrefChangeRegistrar& registrar,
+                                const base::RepeatingClosure& callback);
+ 
+--- a/chrome/browser/rac/power/shortcuts/table_shortcuts_prefs_unittest.cc
++++ b/chrome/browser/rac/power/shortcuts/table_shortcuts_prefs_unittest.cc
+@@ -175,6 +175,39 @@ TEST(ObserveTableShortcutPrefsTest, AnAl
+   EXPECT_EQ(0, rac_calls);
+ }
+ 
++// The shortcut page names the Assistant (no table row) only while AI is on,
++// so the whole-table call watches the switch whatever the table holds.
++TEST(ObserveTableShortcutPrefsTest, TheWholeTableAlwaysWatchesAi) {
++  TestingPrefServiceSimple prefs;
++  rac::ai::RegisterProfilePrefs(prefs.registry());
++  PrefChangeRegistrar registrar;
++  registrar.Init(&prefs);
++  int calls = 0;
++  ObserveTableShortcutPrefs(registrar,
++                            base::BindRepeating([](int* n) { ++*n; }, &calls));
++  EXPECT_TRUE(registrar.IsObserved(rac::ai::kEnabled));
++  prefs.SetBoolean(rac::ai::kEnabled, true);
++  EXPECT_EQ(1, calls);
++  prefs.SetBoolean(rac::ai::kEnabled, false);
++  EXPECT_EQ(2, calls);
++}
++
++TEST(ObserveTableShortcutPrefsTest, TheWholeTableKeepsAnObservedAiPref) {
++  TestingPrefServiceSimple prefs;
++  rac::ai::RegisterProfilePrefs(prefs.registry());
++  PrefChangeRegistrar registrar;
++  registrar.Init(&prefs);
++  int other_calls = 0;
++  int rac_calls = 0;
++  registrar.Add(rac::ai::kEnabled,
++                base::BindRepeating([](int* n) { ++*n; }, &other_calls));
++  ObserveTableShortcutPrefs(
++      registrar, base::BindRepeating([](int* n) { ++*n; }, &rac_calls));
++  prefs.SetBoolean(rac::ai::kEnabled, true);
++  EXPECT_EQ(1, other_calls);
++  EXPECT_EQ(0, rac_calls);
++}
++
+ TEST(IsTableAiOnTest, ReadsTheAiSwitch) {
+   TestingPrefServiceSimple prefs;
+   rac::ai::RegisterProfilePrefs(prefs.registry());
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -403,6 +403,9 @@ BrowserCommandController::BrowserCommand
+       prefs::kVerticalCollapseShortcut,
+       base::BindRepeating(&rac::ShowSidebarIfCollapseShortcutDisabled,
+                           base::Unretained(browser_.get())));
++  // rac: the Assistant command follows the AI switch in every window.
++  rac::ai::ObserveAssistantCommand(profile_pref_registrar_, browser_,
++                                   command_updater_.get());
+ #if BUILDFLAG(ENABLE_PRINTING)
+   profile_pref_registrar_.Add(
+       prefs::kPrintingEnabled,
+@@ -2189,9 +2192,7 @@ void BrowserCommandController::InitComma
+   command_updater_->UpdateCommandEnabled(IDC_NEW_TAB_TO_RIGHT, supports_tabs);
+   command_updater_->UpdateCommandEnabled(IDC_TAB_SCROLL_BUTTONS_TOGGLE_PIN,
+                                          supports_tabs);
+-  command_updater_->UpdateCommandEnabled(
+-      IDC_RAC_ASSISTANT_TOGGLE,
+-      supports_tabs && browser_->GetProfile()->IsRegularProfile());
++  rac::ai::UpdateAssistantCommand(browser_, command_updater_.get());
+ 
+   // These are always enabled; the menu determines their menu item visibility.
+   command_updater_->UpdateCommandEnabled(IDC_UPGRADE_DIALOG, true);
+--- a/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
++++ b/chrome/browser/ui/browser_shortcuts/browser_shortcut_metadata.cc
+@@ -298,6 +298,11 @@ std::optional<BrowserShortcutCommandLabe
+     case IDC_RAC_NEW_SPACE:
+       return Label(IDS_RAC_SPACES_NEW_SPACE);
+     case IDC_RAC_ASSISTANT_TOGGLE:
++      // rac: no Assistant row while AI is off. Without `prefs` (asking only
++      // whether its default can be rebound) the label stays.
++      if (prefs && !rac::power::IsTableAiOn(prefs)) {
++        return std::nullopt;
++      }
+       return Label(IDS_RAC_ASSISTANT_TOOLTIP);
+     case IDC_OPTIONS:
+       return Label(IDS_SETTINGS);
+--- a/chrome/browser/ui/rac/rac_action_menu_items.mm
++++ b/chrome/browser/ui/rac/rac_action_menu_items.mm
+@@ -76,7 +76,7 @@ void InsertActionMenuItems(NSMenu* main_
+   // allocate for the table.
+   std::map<std::pair<NSMenu*, int>, NSMenuItem*> place_after;
+   ForEachAction([&](const Action& action) {
+-    if (!action.surfaces.Has(Surface::kMenu) || !action.command_id) {
++    if (!IsBuiltIntoMainMenu(action)) {
+       return;
+     }
+     const int label_id =
+--- a/chrome/browser/ui/views/frame/browser_native_widget_mac.mm
++++ b/chrome/browser/ui/views/frame/browser_native_widget_mac.mm
+@@ -39,6 +39,7 @@
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_metrics.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/views/frame/browser_frame_view.h"
++#include "chrome/browser/ui/views/rac/ai/assistant_actions.h"
+ #include "chrome/browser/ui/views/rac/sidebar_visibility.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/browser_widget.h"
+@@ -377,6 +378,12 @@ void BrowserNativeWidgetMac::ValidateUse
+       result->enable &= ![AppController.sharedController keyWindowIsModal];
+       break;
+     }
++    case IDC_RAC_ASSISTANT_TOGGLE: {
++      // rac: no Assistant item while AI is off.
++      result->set_hidden_state = true;
++      result->new_hidden_state = rac::ai::HidesAssistantMenuItem(browser);
++      break;
++    }
+     default:
+       break;
+   }
+--- a/chrome/browser/ui/views/rac/ai/assistant_actions.cc
++++ b/chrome/browser/ui/views/rac/ai/assistant_actions.cc
+@@ -9,6 +9,8 @@
+ 
+ #include "base/callback_list.h"
+ #include "base/functional/bind.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/command_updater.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/ui/actions/chrome_action_id.h"
+@@ -19,6 +21,7 @@
+ #include "chrome/browser/ui/side_panel/side_panel_enums.h"
+ #include "chrome/browser/ui/side_panel/side_panel_ui.h"
+ #include "chrome/browser/ui/singleton_tabs.h"
++#include "chrome/browser/ui/window_feature_controller/window_feature_controller.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "components/prefs/pref_service.h"
+ #include "ui/actions/actions.h"
+@@ -111,6 +114,32 @@ void ToggleAssistant(BrowserWindowInterf
+   }
+ }
+ 
++bool CanRunAssistantCommand(BrowserWindowInterface* browser) {
++  Profile* profile = browser->GetProfile();
++  return profile->IsRegularProfile() && IsAiEnabled(profile->GetPrefs()) &&
++         WindowFeatureController::From(browser)->SupportsWindowFeature(
++             WindowFeatureController::WindowFeature::kFeatureTabStrip);
++}
++
++void UpdateAssistantCommand(BrowserWindowInterface* browser,
++                            CommandUpdater* updater) {
++  updater->UpdateCommandEnabled(IDC_RAC_ASSISTANT_TOGGLE,
++                                CanRunAssistantCommand(browser));
++}
++
++void ObserveAssistantCommand(PrefChangeRegistrar& registrar,
++                             BrowserWindowInterface* browser,
++                             CommandUpdater* updater) {
++  registrar.Add(kEnabled,
++                base::BindRepeating(&UpdateAssistantCommand,
++                                    base::Unretained(browser),
++                                    base::Unretained(updater)));
++}
++
++bool HidesAssistantMenuItem(BrowserWindowInterface* browser) {
++  return !IsAiEnabled(browser->GetProfile()->GetPrefs());
++}
++
+ actions::ActionItem* CreateAssistantAction(actions::ActionItem* root,
+                                            BrowserWindowInterface* browser) {
+   return root->AddChild(
+--- a/chrome/browser/ui/views/rac/ai/assistant_actions.h
++++ b/chrome/browser/ui/views/rac/ai/assistant_actions.h
+@@ -6,6 +6,8 @@
+ #define CHROME_BROWSER_UI_VIEWS_RAC_AI_ASSISTANT_ACTIONS_H_
+ 
+ class BrowserWindowInterface;
++class CommandUpdater;
++class PrefChangeRegistrar;
+ 
+ namespace actions {
+ class ActionItem;
+@@ -18,6 +20,29 @@ namespace rac::ai {
+ // button always leads somewhere.
+ void ToggleAssistant(BrowserWindowInterface* browser);
+ 
++// The Assistant command (IDC_RAC_ASSISTANT_TOGGLE: the View menu's Assistant
++// item, its key, and the top bar's Chat button) runs only while AI is on, in
++// a regular profile's window with a tab strip. While AI is off the View menu
++// item hides and the key does nothing; the tour's assistant step and
++// Settings > Assistant are the ways in.
++bool CanRunAssistantCommand(BrowserWindowInterface* browser);
++
++// Sets the command's enabled state in the window's `updater` from
++// CanRunAssistantCommand().
++void UpdateAssistantCommand(BrowserWindowInterface* browser,
++                            CommandUpdater* updater);
++
++// Has `registrar` (the window's command controller's, on the profile's prefs)
++// run UpdateAssistantCommand() whenever rac.ai.enabled changes. `browser` and
++// `updater` must outlive the registration.
++void ObserveAssistantCommand(PrefChangeRegistrar& registrar,
++                             BrowserWindowInterface* browser,
++                             CommandUpdater* updater);
++
++// Whether the Mac View menu hides its Assistant item for `browser`: while AI
++// is off, so no AI label shows.
++bool HidesAssistantMenuItem(BrowserWindowInterface* browser);
++
+ // Adds the action the side panel header reads its title and icon from. It's
+ // added for every normal window, whether or not the assistant is on, since an
+ // action item costs next to nothing.
