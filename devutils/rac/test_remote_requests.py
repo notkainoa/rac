@@ -466,6 +466,19 @@ class RemoteRequestsTest(unittest.TestCase):
         self.rr.check_line('record command 100 ; command 38003', False, ids)
         self.assertEqual(ids, [38003])
 
+    def test_shortcuts_page_is_a_screenshot_only_settings_page(self):
+        for line in ('open-urls chrome://settings/system/shortcuts ; '
+                     'burst shots 2 100',
+                     'open-urls rac://settings/system/shortcuts ; command 38003 ; '
+                     'wheel 10 10 3'):
+            self.ok(line)
+        for line in ('open-urls chrome://settings/system/shortcuts ; click 1 2',
+                     'open-urls chrome://settings/system/shortcuts ; key return',
+                     'open-urls chrome://settings/system/shortcuts ; type x',
+                     'open-urls chrome://settings/system',
+                     'open-urls chrome://settings/system/shortcuts/x'):
+            self.refused(line)
+
     def test_settings_pages_may_zoom(self):
         for line in ('open-urls chrome://settings/general ; command 38003 ; '
                      'burst shots 2 100',

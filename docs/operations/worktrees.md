@@ -246,7 +246,8 @@ needs an import input in the same run. Typed text is plain words only (ASCII let
 that types may not also move the caret or click — at most one
 `key return`, after the last `type`. A run that opens a settings page
 (the only allowed ones are `settings/assistant`, `settings/appearance`,
-`settings/privacy`, and `settings/general`, which also needs an import
+`settings/privacy`, `settings/system/shortcuts`, and `settings/general`,
+which also needs an import
 input because of its Arc import card) may take screenshots, scroll and
 zoom only, so its requests file may send no input except `wheel X Y DY`
 and the zoom commands (`command 38001`, `38002`, `38003`). Zoom out to
