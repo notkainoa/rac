@@ -371,6 +371,13 @@ class Checker:
         if verb == 'windows':
             need(n == 1, 'OUT')
             return [verb, self.path(args[0])]
+        # Lists the open menu, or with main:TITLE a main-menu submenu. It
+        # runs in HandleInput, so `after MS` may delay it until a click has
+        # opened the menu.
+        if verb == 'menu-dump':
+            need(n == 1 or (n == 2 and re.fullmatch(r'main:[A-Za-z0-9._-]+', args[1])),
+                 'OUT [main:TITLE]')
+            return [verb, self.path(args[0]), *args[1:]]
         if verb == 'target':
             need(n == 1 and selector(args[0]), 'SELECTOR')
             return words
@@ -417,7 +424,9 @@ class Checker:
                         self.settings = True
             return words
         simple = {
-            'command': n == 1 and ints(*args),
+            # `command ID [SELECTOR]`: SELECTOR is capture-window's.
+            'command': (n == 1 and ints(args[0])) or (
+                n == 2 and ints(args[0]) and selector(args[1])),
             'move': n == 2 and ints(*args),
             'click': n == 2 and ints(*args),
             'wheel': n == 3 and ints(*args),

@@ -1,0 +1,333 @@
+--- a/chrome/browser/ui/views/rac/BUILD.gn
++++ b/chrome/browser/ui/views/rac/BUILD.gn
+@@ -55,6 +55,8 @@ source_set("look") {
+       "dev/forced_appearance.h",
+       "dev/forced_appearance.mm",
+       "dev/frame_log.cc",
++      "dev/menu_dump.h",
++      "dev/menu_dump.mm",
+       "dev/native_keys.h",
+       "dev/native_keys.mm",
+       "dev/window_record.cc",
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/dev/menu_dump.h
+@@ -0,0 +1,37 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_DEV_MENU_DUMP_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_DEV_MENU_DUMP_H_
++
++#include <string>
++#include <vector>
++
++namespace rac::dev {
++
++// Starts remembering the native NSMenu that is open, from AppKit's
++// NSMenuDidBeginTracking / NSMenuDidEndTracking notifications. Call it once
++// at startup: a menu that opened earlier is not seen. Does nothing the
++// second time. Views menus need no setup.
++void ObserveMenus();
++
++// Handles `menu-dump OUT.txt`: writes the open menu (a views menu, else a native one), one item per
++// line, tab separated:
++//   INDEX  LABEL  enabled|disabled  checked|-  separator|-  submenu|-
++//          [name=SPOKEN]
++// The last column appears only for a views menu item whose accessible name
++// differs from its label, such as a space list's current space.
++// A submenu's items follow it with dotted indexes (2.0, 2.1). Writes
++// "no open menu" when none is open.
++// `menu-dump OUT main:TITLE` writes instead the submenu of the main menu
++// bar's top-level item titled TITLE (one word of [A-Za-z0-9._-]), after its
++// delegate's menuNeedsUpdate:, with two more columns: hidden|- and the key
++// equivalent (such as ⇧⌘N, or none). Hidden items are listed. Writes
++// "no menu TITLE" if there is none.
++// Returns false for other requests.
++bool HandleMenuRequest(const std::vector<std::string>& words);
++
++}  // namespace rac::dev
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_DEV_MENU_DUMP_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/dev/menu_dump.mm
+@@ -0,0 +1,250 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/dev/menu_dump.h"
++
++#import <Cocoa/Cocoa.h>
++
++#include <string>
++#include <utility>
++
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
++#include "base/strings/sys_string_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/thread_pool.h"
++#include "ui/gfx/native_ui_types.h"
++#include "ui/views/controls/menu/menu_delegate.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/controls/menu/menu_item_view.h"
++#include "ui/views/controls/menu/menu_separator.h"
++#include "ui/views/controls/menu/submenu_view.h"
++#include "ui/views/view.h"
++#include "ui/views/view_utils.h"
++#include "ui/views/widget/widget.h"
++
++namespace rac::dev {
++namespace {
++
++// The outermost menu AppKit is tracking. Weak: the menu belongs to whoever
++// opened it and may go away without an end notification.
++NSMenu* __weak g_open_menu = nil;
++
++std::string Label(NSString* title) {
++  std::string label = base::SysNSStringToUTF8(title);
++  // One line per item, tab separated.
++  base::ReplaceChars(label, "\t\r\n", " ", &label);
++  return label;
++}
++
++void Dump(NSMenu* menu, const std::string& prefix, std::string& out) {
++  NSInteger index = 0;
++  for (NSMenuItem* item in menu.itemArray) {
++    const std::string id = prefix + base::NumberToString(index++);
++    out += base::StringPrintf(
++        "%s\t%s\t%s\t%s\t%s\t%s\n", id.c_str(),
++        item.separatorItem ? "" : Label(item.title).c_str(),
++        item.enabled ? "enabled" : "disabled",
++        item.state == NSControlStateValueOn ? "checked" : "-",
++        item.separatorItem ? "separator" : "-",
++        item.submenu ? "submenu" : "-");
++    if (item.submenu) {
++      Dump(item.submenu, id + ".", out);
++    }
++  }
++}
++
++// Views menus (a MenuRunner without CONTEXT_MENU) live in their own widgets,
++// so the first SubmenuView of a root menu item is the open menu.
++views::SubmenuView* FindViewsMenu(views::View* view) {
++  if (auto* submenu = views::AsViewClass<views::SubmenuView>(view)) {
++    const views::MenuItemView* item = submenu->GetMenuItem();
++    if (item && !item->GetParentMenuItem()) {
++      return submenu;
++    }
++  }
++  for (views::View* child : view->children()) {
++    if (views::SubmenuView* found = FindViewsMenu(child)) {
++      return found;
++    }
++  }
++  return nullptr;
++}
++
++void DumpViews(views::SubmenuView* submenu,
++               const std::string& prefix,
++               std::string& out) {
++  size_t index = 0;
++  for (views::View* child : submenu->children()) {
++    auto* item = views::AsViewClass<views::MenuItemView>(child);
++    const bool separator =
++        views::AsViewClass<views::MenuSeparator>(child) ||
++        (item && item->GetType() == views::MenuItemView::Type::kSeparator);
++    if (!item && !separator) {
++      continue;
++    }
++    const std::string id = prefix + base::NumberToString(index++);
++    if (separator) {
++      out += id + "\t\tenabled\t-\tseparator\t-\n";
++      continue;
++    }
++    const views::MenuItemView::Type type = item->GetType();
++    const views::MenuDelegate* delegate = item->GetDelegate();
++    const bool checked =
++        (type == views::MenuItemView::Type::kCheckbox ||
++         type == views::MenuItemView::Type::kRadio) &&
++        delegate && delegate->IsItemChecked(item->GetCommand());
++    const bool has_submenu = item->HasSubmenu();
++    std::string label = base::UTF16ToUTF8(item->title());
++    base::ReplaceChars(label, "\t\r\n", " ", &label);
++    // What a screen reader says, when it differs: how a menu marks the
++    // current choice without a check.
++    std::string name =
++        base::UTF16ToUTF8(item->GetViewAccessibility().GetCachedName());
++    base::ReplaceChars(name, "\t\r\n", " ", &name);
++    out += base::StringPrintf(
++        "%s\t%s\t%s\t%s\t-\t%s", id.c_str(), label.c_str(),
++        item->GetEnabled() ? "enabled" : "disabled", checked ? "checked" : "-",
++        has_submenu ? "submenu" : "-");
++    if (!name.empty() && name != label) {
++      out += "\tname=" + name;
++    }
++    out += "\n";
++    if (has_submenu) {
++      DumpViews(item->GetSubmenu(), id + ".", out);
++    }
++  }
++}
++
++views::SubmenuView* OpenViewsMenu() {
++  for (NSWindow* window in NSApp.windows) {
++    views::Widget* widget =
++        views::Widget::GetWidgetForNativeWindow(gfx::NativeWindow(window));
++    if (widget && !widget->IsClosed() && widget->GetRootView()) {
++      if (views::SubmenuView* menu = FindViewsMenu(widget->GetRootView())) {
++        return menu;
++      }
++    }
++  }
++  return nullptr;
++}
++
++// The key equivalent as the menu shows it, such as "⇧⌘N", or "none".
++std::string KeyText(NSMenuItem* item) {
++  if (item.keyEquivalent.length == 0) {
++    return "none";
++  }
++  NSEventModifierFlags mask = item.keyEquivalentModifierMask;
++  // AppKit reads an upper case letter as Shift held.
++  if (![item.keyEquivalent isEqualToString:item.keyEquivalent.lowercaseString]) {
++    mask |= NSEventModifierFlagShift;
++  }
++  std::string text;
++  if (mask & NSEventModifierFlagControl) {
++    text += "\u2303";
++  }
++  if (mask & NSEventModifierFlagOption) {
++    text += "\u2325";
++  }
++  if (mask & NSEventModifierFlagShift) {
++    text += "\u21E7";
++  }
++  if (mask & NSEventModifierFlagCommand) {
++    text += "\u2318";
++  }
++  return text + base::SysNSStringToUTF8(item.keyEquivalent.uppercaseString);
++}
++
++// Like Dump, with two more columns: hidden|- and the key equivalent. Hidden
++// items are listed. A menu's delegate updates it first, as AppKit does just
++// before it opens.
++void DumpMain(NSMenu* menu, const std::string& prefix, std::string& out) {
++  if ([menu.delegate respondsToSelector:@selector(menuNeedsUpdate:)]) {
++    [menu.delegate menuNeedsUpdate:menu];
++  }
++  NSInteger index = 0;
++  for (NSMenuItem* item in menu.itemArray) {
++    const std::string id = prefix + base::NumberToString(index++);
++    out += base::StringPrintf(
++        "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", id.c_str(),
++        item.separatorItem ? "" : Label(item.title).c_str(),
++        item.enabled ? "enabled" : "disabled",
++        item.state == NSControlStateValueOn ? "checked" : "-",
++        item.separatorItem ? "separator" : "-",
++        item.submenu ? "submenu" : "-", item.hidden ? "hidden" : "-",
++        KeyText(item).c_str());
++    if (item.submenu) {
++      DumpMain(item.submenu, id + ".", out);
++    }
++  }
++}
++
++}  // namespace
++
++void ObserveMenus() {
++  static bool observing = false;
++  if (observing) {
++    return;
++  }
++  observing = true;
++  NSNotificationCenter* center = NSNotificationCenter.defaultCenter;
++  [center addObserverForName:NSMenuDidBeginTrackingNotification
++                      object:nil
++                       queue:nil
++                  usingBlock:^(NSNotification* note) {
++                    if (!g_open_menu) {
++                      g_open_menu = note.object;
++                    }
++                  }];
++  [center addObserverForName:NSMenuDidEndTrackingNotification
++                      object:nil
++                       queue:nil
++                  usingBlock:^(NSNotification* note) {
++                    if (note.object == g_open_menu) {
++                      g_open_menu = nil;
++                    }
++                  }];
++}
++
++bool HandleMenuRequest(const std::vector<std::string>& words) {
++  if ((words.size() != 2 && words.size() != 3) || words[0] != "menu-dump") {
++    return false;
++  }
++  std::string out;
++  if (words.size() == 3) {
++    if (!words[2].starts_with("main:")) {
++      return false;
++    }
++    const std::string title = words[2].substr(5);
++    bool found = false;
++    for (NSMenuItem* top in NSApp.mainMenu.itemArray) {
++      if (top.submenu && Label(top.title) == title) {
++        DumpMain(top.submenu, "", out);
++        found = true;
++        break;
++      }
++    }
++    if (!found) {
++      out = "no menu " + title + "\n";
++    }
++  } else if (views::SubmenuView* submenu = OpenViewsMenu()) {
++    DumpViews(submenu, "", out);
++  } else if (NSMenu* menu = g_open_menu) {
++    Dump(menu, "", out);
++  }
++  if (out.empty() && words.size() == 2) {
++    out = "no open menu\n";
++  }
++  base::ThreadPool::PostTask(
++      FROM_HERE, {base::MayBlock()},
++      base::BindOnce([](base::FilePath path,
++                        std::string out) { base::WriteFile(path, out); },
++                     base::FilePath(words[1]), std::move(out)));
++  return true;
++}
++
++}  // namespace rac::dev
+--- a/chrome/browser/ui/views/rac/window_screenshot.mm
++++ b/chrome/browser/ui/views/rac/window_screenshot.mm
+@@ -36,6 +36,7 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/rac/dev/forced_appearance.h"
+ #include "chrome/browser/ui/views/rac/dev/frame_log.h"
++#include "chrome/browser/ui/views/rac/dev/menu_dump.h"
+ #include "chrome/browser/ui/views/rac/dev/window_record.h"
+ #include "chrome/browser/ui/views/rac/dev/window_select.h"
+ #include "chrome/browser/ui/views/rac/dev/window_state.h"
+@@ -593,6 +594,10 @@ bool HandleInput(views::Widget* widget,
+   if (dev::HandleStateRequest(widget, words)) {
+     return true;
+   }
++  //   menu-dump OUT  lists the open native menu: see menu_dump.h
++  if (dev::HandleMenuRequest(words)) {
++    return true;
++  }
+   //   capture-window SEL OUT  captures another window, e.g. an app's
+   if (words[0] == "capture-window" && words.size() == 3) {
+     if (views::Widget* window = dev::FindWindow(words[1])) {
+@@ -961,6 +966,7 @@ void MaybeKeepInBackground(views::Widget
+ 
+ void MaybeScheduleWindowScreenshot(views::Widget* widget) {
+   dev::MaybeLogFrames(widget);
++  dev::ObserveMenus();
+   const base::FilePath path =
+       base::CommandLine::ForCurrentProcess()->GetSwitchValuePath(
+           kWindowScreenshotSwitch);

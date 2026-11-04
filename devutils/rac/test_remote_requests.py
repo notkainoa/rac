@@ -41,6 +41,11 @@ class RemoteRequestsTest(unittest.TestCase):
             ('a/b.png', '@SHOTS@/a/b.png', ['expect a/b.png']),
             ('hit 10 20 views.txt', 'hit 10 20 @SHOTS@/views.txt', ['file views.txt']),
             ('windows list', 'windows @SHOTS@/list', ['file list']),
+            ('menu-dump m.txt', 'menu-dump @SHOTS@/m.txt', ['file m.txt']),
+            ('menu-dump m.txt main:File', 'menu-dump @SHOTS@/m.txt main:File',
+             ['file m.txt']),
+            ('click 1 2 ; after 9 menu-dump m.txt',
+             'click 1 2 ; after 9 menu-dump @SHOTS@/m.txt', ['file m.txt']),
             ('record rec 500 0.5', 'record @SHOTS@/rec 500 0.5', ['dir rec']),
             ('burst b 3 100', 'burst @SHOTS@/b 3 100',
              ['dir b', 'expect b/f00.png', 'expect b/f01.png', 'expect b/f02.png']),
@@ -54,7 +59,7 @@ class RemoteRequestsTest(unittest.TestCase):
             self.assertEqual(self.ok(line), (out, outputs), line)
 
     def test_passes_input_verbs_unchanged(self):
-        for line in ('command 34000', 'move 1 2', 'click -1 2', 'wheel 1 2 -3',
+        for line in ('command 34000', 'command 34000 incognito', 'command 34000 #1', 'move 1 2', 'click -1 2', 'wheel 1 2 -3',
                      'key escape', 'nspress t cmd,shift', 'nspress pagedown',
                      'nskey tab down ctrl', 'nsflags none', 'swipe 1 2 end',
                      'swipe 1 2 -4.5 10 hold', 'appearance dark', 'contrast on',
@@ -82,7 +87,12 @@ class RemoteRequestsTest(unittest.TestCase):
             'after 5 unknown words', 'after 5 click a b', 'after 5 windows x',
             'after 5 hit 1 2 x', 'after 99999999999 x.png', 'after \u00b2 x.png',
             # Paths in every verb that writes one.
-            'hit 1 2 /tmp/x', 'windows /tmp/x', 'windows ../x', 'record /tmp 5',
+            'hit 1 2 /tmp/x', 'windows /tmp/x', 'windows ../x',
+            'menu-dump /tmp/x', 'menu-dump ../x', 'menu-dump', 'menu-dump a b',
+            'menu-dump m main:', 'menu-dump m main:a/b', 'menu-dump m File',
+            'menu-dump m main:A;B', 'menu-dump m main:A main:B',
+            'after 5 menu-dump /tmp/x', 'command 34000 /tmp/x',
+            'command 34000 incognito extra', 'record /tmp 5',
             'record ../x 5', 'burst ~/x 1 1', 'capture-window app ../x.png',
             'capture-window app x.txt', 'x.PNG', 'a//b.png', './a.png',
             # Downloads and external schemes land outside the clone.
