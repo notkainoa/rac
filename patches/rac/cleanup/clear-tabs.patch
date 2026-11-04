@@ -236,8 +236,28 @@
        "//chrome/browser/ui/shared_highlighting",
 --- a/chrome/browser/ui/browser_live_tab_context.cc
 +++ b/chrome/browser/ui/browser_live_tab_context.cc
-@@ -389,12 +389,18 @@ sessions::LiveTab* BrowserLiveTabContext
+@@ -32,6 +32,7 @@
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/rac/cleanup/clear_tabs.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
+ #include "chrome/browser/ui/rac/sidebar/sidebar_tab_tag.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+@@ -387,14 +388,30 @@ sessions::LiveTab* BrowserLiveTabContext
+                 ->session_storage_namespace()
+           : nullptr;
  
++  // rac: Cmd+Shift+T and History put a Clear's tab back in the window it was
++  // cleared from while that window is open.
++  if (sessions::LiveTabContext* target = rac::cleanup::RouteRestoredTab(
++          tab, this, &profile_.get(), select);
++      target != this) {
++    return target->AddRestoredTab(tab, target->GetTabCount(), select,
++                                  is_restoring_group_or_window,
++                                  original_session_type);
++  }
++
    // If the browser does not support tabs groups, restore the grouped tab as a
    // normal tab instead. See crbug.com/368139715.
 +  // rac: a Clear is recorded as a stand-in group. Its tabs come back as open
@@ -523,7 +543,7 @@
 +}  // namespace rac::cleanup
 --- /dev/null
 +++ b/chrome/browser/ui/rac/cleanup/clear_tabs.cc
-@@ -0,0 +1,413 @@
+@@ -0,0 +1,447 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -552,6 +572,7 @@
 +#include "chrome/browser/rac/spaces/spaces_service.h"
 +#include "chrome/browser/sessions/tab_restore_service_factory.h"
 +#include "chrome/browser/ui/browser_live_tab_context.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 +#include "chrome/browser/ui/rac/cleanup/clear_toast.h"
 +#include "chrome/browser/ui/rac/cleanup/cleared_tabs_context.h"
@@ -718,6 +739,39 @@
 +}
 +
 +}  // namespace
++
++sessions::LiveTabContext* RouteRestoredTab(
++    const sessions::tab_restore::Tab& tab,
++    BrowserLiveTabContext* current,
++    Profile* profile,
++    bool select) {
++  sessions::LiveTabContext* target = WindowForRestoredTab(
++      tab, current, [profile](SessionID id) -> sessions::LiveTabContext* {
++        BrowserWindowInterface* browser =
++            GlobalBrowserCollection::GetInstance()->FindBrowserWithID(id);
++        // Only a window of the same profile that has spaces.
++        if (!browser || browser->GetProfile() != profile ||
++            !SpacesWindowManager::From(browser)) {
++          return nullptr;
++        }
++        return BrowserLiveTabContext::From(browser);
++      });
++  if (target != current && select) {
++    // After Chromium shows the window the restore began in.
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(
++            [](SessionID id) {
++              if (BrowserWindowInterface* browser =
++                      GlobalBrowserCollection::GetInstance()
++                          ->FindBrowserWithID(id)) {
++                BrowserLiveTabContext::From(browser)->ShowBrowserWindow();
++              }
++            },
++            target->GetSessionID()));
++  }
++  return target;
++}
 +
 +bool HasOpenTabs(BrowserWindowInterface* browser) {
 +  SidebarWindowSync* sync =
@@ -939,7 +993,7 @@
 +}  // namespace rac::cleanup
 --- /dev/null
 +++ b/chrome/browser/ui/rac/cleanup/clear_tabs.h
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,74 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -953,7 +1007,16 @@
 +#include "base/time/time.h"
 +#include "components/tabs/public/tab_interface.h"
 +
++class BrowserLiveTabContext;
 +class BrowserWindowInterface;
++class Profile;
++
++namespace sessions {
++class LiveTabContext;
++namespace tab_restore {
++struct Tab;
++}  // namespace tab_restore
++}  // namespace sessions
 +
 +// Clear: closes the open tabs of the space a window shows, keeping the ones
 +// MayClear() spares, and offers Undo. Plan 01, "Clear and archive".
@@ -986,6 +1049,16 @@
 +// Whether `browser`'s last Clear can still be undone from its toast (and
 +// the sidebar's Undo, which shows for as long).
 +bool HasPendingUndo(BrowserWindowInterface* browser);
++
++// For BrowserLiveTabContext::AddRestoredTab: the window a restored tab goes
++// into, `current` unless it's a Clear's tab whose own window is still open
++// (WindowForRestoredTab). When it goes to that other window and is the tab
++// to select, that window comes to the front.
++sessions::LiveTabContext* RouteRestoredTab(
++    const sessions::tab_restore::Tab& tab,
++    BrowserLiveTabContext* current,
++    Profile* profile,
++    bool select);
 +
 +// The toast's Undo: brings the window's last Clear back, the same tabs in
 +// the same order and space, and selects the tab that was selected. Does
@@ -1077,7 +1150,7 @@
 +#endif  // CHROME_BROWSER_UI_RAC_CLEANUP_CLEAR_TOAST_H_
 --- /dev/null
 +++ b/chrome/browser/ui/rac/cleanup/cleared_tabs_context.cc
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,201 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1106,6 +1179,22 @@
 +    indices.push_back(tab->tabstrip_index);
 +  }
 +  return indices;
++}
++
++sessions::LiveTabContext* WindowForRestoredTab(
++    const sessions::tab_restore::Tab& tab,
++    sessions::LiveTabContext* current,
++    base::FunctionRef<sessions::LiveTabContext*(SessionID)> find_window) {
++  if (!IsClearedTab(tab)) {
++    return current;
++  }
++  const SessionID origin = SessionID::FromSerializedValue(tab.browser_id);
++  if (!origin.is_valid() ||
++      (current && current->GetSessionID() == origin)) {
++    return current;
++  }
++  sessions::LiveTabContext* window = find_window(origin);
++  return window ? window : current;
 +}
 +
 +ClearedTabsContext::ClearedTabsContext(sessions::LiveTabContext& window,
@@ -1265,7 +1354,7 @@
 +}  // namespace rac::cleanup
 --- /dev/null
 +++ b/chrome/browser/ui/rac/cleanup/cleared_tabs_context.h
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,129 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1279,6 +1368,7 @@
 +#include <string>
 +#include <vector>
 +
++#include "base/functional/function_ref.h"
 +#include "base/memory/raw_ref.h"
 +#include "components/sessions/core/live_tab_context.h"
 +#include "components/tab_groups/tab_group_id.h"
@@ -1298,6 +1388,18 @@
 +// still pending, say), so this can be fewer than the tabs given to
 +// ClearedTabsContext; Clear keeps those open rather than lose them.
 +std::vector<int> RecordedIndices(const sessions::tab_restore::Group& entry);
++
++// The window a restored tab goes into. Cmd+Shift+T and History restore into
++// the window in front, `current`. A Clear's tab goes back to the window it
++// was cleared from instead, while that window is open (`find_window` looks
++// it up by its session id), so it lands in its own space. Once that window
++// has closed, it goes into `current`, whose window then shows the tab's
++// space when it still exists (selecting a tab shows its space) or takes the
++// tab into the space it shows.
++sessions::LiveTabContext* WindowForRestoredTab(
++    const sessions::tab_restore::Tab& tab,
++    sessions::LiveTabContext* current,
++    base::FunctionRef<sessions::LiveTabContext*(SessionID)> find_window);
 +
 +// Closing N tabs records N recently-closed entries, one per tab, and the list
 +// keeps only 25. So a Clear shows TabRestoreService its tabs as one stand-in
@@ -1384,7 +1486,7 @@
 +#endif  // CHROME_BROWSER_UI_RAC_CLEANUP_CLEARED_TABS_CONTEXT_H_
 --- /dev/null
 +++ b/chrome/browser/ui/rac/cleanup/cleared_tabs_context_unittest.cc
-@@ -0,0 +1,411 @@
+@@ -0,0 +1,447 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1742,6 +1844,42 @@
 +  // The rest of the Clear is still one entry.
 +  ASSERT_EQ(helper_.entries().size(), 1u);
 +  EXPECT_EQ(helper_.entries().front()->id, id);
++}
++
++// Cmd+Shift+T and History restore into the window in front. A Clear's tabs
++// go back to the window they were cleared from while it's open.
++TEST_F(ClearedTabsContextTest, RestoringAClearReturnsToItsWindow) {
++  Clear({1, 2});
++  const auto& group = static_cast<const Group&>(*helper_.entries().front());
++  FakeWindow other(1);
++  auto find = [&](SessionID id) -> sessions::LiveTabContext* {
++    return id == window_.GetSessionID() ? &window_ : nullptr;
++  };
++  for (const auto& tab : group.tabs) {
++    EXPECT_EQ(WindowForRestoredTab(*tab, &other, find), &window_);
++    EXPECT_EQ(WindowForRestoredTab(*tab, &window_, find), &window_);
++  }
++}
++
++// Once the window it came from has closed, a Clear's tab goes into the
++// window in front (which then shows the tab's space, if it still exists).
++TEST_F(ClearedTabsContextTest, RestoringAClearWhoseWindowClosed) {
++  Clear({1, 2});
++  const auto& group = static_cast<const Group&>(*helper_.entries().front());
++  FakeWindow other(1);
++  auto find = [](SessionID) -> sessions::LiveTabContext* { return nullptr; };
++  for (const auto& tab : group.tabs) {
++    EXPECT_EQ(WindowForRestoredTab(*tab, &other, find), &other);
++  }
++}
++
++// Every other tab restores where Chromium puts it.
++TEST_F(ClearedTabsContextTest, OtherTabsRestoreIntoTheWindowInFront) {
++  helper_.CreateHistoricalTab(window_.tab(0), 0);
++  const auto& tab = static_cast<const Tab&>(*helper_.entries().front());
++  FakeWindow other(1);
++  auto find = [&](SessionID) -> sessions::LiveTabContext* { return &window_; };
++  EXPECT_EQ(WindowForRestoredTab(tab, &other, find), &other);
 +}
 +
 +class ClearedTabsContextPendingTest : public ClearedTabsContextTest {
