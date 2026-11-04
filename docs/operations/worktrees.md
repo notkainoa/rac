@@ -208,7 +208,10 @@ UI-control WebSocket — with `--user-data-dir` at the clone's throwaway
   no debugging port and no file access.
 - A bare arg is a URL and gets the same allowlist `open-urls` gets:
   loopback and test hosts, the named internal pages, `about:blank`, and
-  `@SERVE@/<path>` with `--serve`.
+  `@SERVE@/<path>` with `--serve`. A `chrome://` or `rac://` page given
+  this way may not open: a profile that has tabs restores them instead.
+  Open internal pages with the requests file's `open-urls` verb, which
+  always opens a new tab.
 
 Two `run` options change the clone before launch:
 
