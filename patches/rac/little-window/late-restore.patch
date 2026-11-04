@@ -1,0 +1,188 @@
+--- a/chrome/browser/ui/rac/little_window/little_window_routing.cc
++++ b/chrome/browser/ui/rac/little_window/little_window_routing.cc
+@@ -48,6 +48,22 @@ bool ShouldCloseStartupWindow(bool link_
+          window.only_new_tab_page;
+ }
+ 
++bool ShouldWatchLaunchRestore(bool link_came_with_launch,
++                              bool restore_running,
++                              bool profile_has_tabbed_window) {
++  return link_came_with_launch &&
++         (restore_running || !profile_has_tabbed_window);
++}
++
++LaunchRestoreStep StepForFinishedRestore(bool restored_link_profile,
++                                         bool little_window_open) {
++  if (!little_window_open) {
++    return LaunchRestoreStep::kStopWatching;
++  }
++  return restored_link_profile ? LaunchRestoreStep::kRaiseLittleWindow
++                               : LaunchRestoreStep::kKeepWatching;
++}
++
+ gfx::Rect LittleWindowBounds(const gfx::Rect& work_area) {
+   gfx::Rect room = work_area;
+   room.Inset(rac::tokens::kSpacing24);
+--- a/chrome/browser/ui/rac/little_window/little_window_routing.h
++++ b/chrome/browser/ui/rac/little_window/little_window_routing.h
+@@ -78,6 +78,28 @@ bool ShouldCloseStartupWindow(bool link_
+                               LinkRoute route,
+                               const StartupWindowFacts& window);
+ 
++// Whether a little window opened by a link that started rac watches its
++// profile's session restore: while the restore runs, or before it has started
++// (the profile has no tabbed window yet, as when several profiles restore one
++// after another). Once the profile has windows and no restore runs, startup is
++// over for it and there is nothing to watch.
++bool ShouldWatchLaunchRestore(bool link_came_with_launch,
++                              bool restore_running,
++                              bool profile_has_tabbed_window);
++
++// What the watch does when a session restore finishes.
++enum class LaunchRestoreStep {
++  // Another profile's restore: keep waiting for the link's profile.
++  kKeepWatching,
++  // The link's profile restored (its windows, or one empty window): close the
++  // empty one and bring the little window back to the front, then stop.
++  kRaiseLittleWindow,
++  // The little window closed first: nothing left to do.
++  kStopWatching,
++};
++LaunchRestoreStep StepForFinishedRestore(bool restored_link_profile,
++                                         bool little_window_open);
++
+ // A new little window's bounds on a display with `work_area`: a fixed size,
+ // shrunk to fit inside the work area's margin, centered. A closed little
+ // window keeps nothing, so there is no remembered placement.
+--- a/chrome/browser/ui/rac/little_window/little_window_routing_unittest.cc
++++ b/chrome/browser/ui/rac/little_window/little_window_routing_unittest.cc
+@@ -139,6 +139,50 @@ TEST(LittleWindowRoutingTest, AWindowWit
+   }
+ }
+ 
++TEST(LittleWindowRoutingTest, WatchesARestoreThatIsRunning) {
++  EXPECT_TRUE(ShouldWatchLaunchRestore(/*link_came_with_launch=*/true,
++                                       /*restore_running=*/true,
++                                       /*profile_has_tabbed_window=*/false));
++  EXPECT_TRUE(ShouldWatchLaunchRestore(true, true, true));
++}
++
++TEST(LittleWindowRoutingTest, WatchesARestoreThatHasNotStarted) {
++  // Several profiles restore one after another; the link's profile is later
++  // in line, so it has no window and no restore yet.
++  EXPECT_TRUE(ShouldWatchLaunchRestore(/*link_came_with_launch=*/true,
++                                       /*restore_running=*/false,
++                                       /*profile_has_tabbed_window=*/false));
++}
++
++TEST(LittleWindowRoutingTest, NoWatchOnceTheProfileHasStartedUp) {
++  // Its windows are open and no restore runs: nothing more will come.
++  EXPECT_FALSE(ShouldWatchLaunchRestore(true, false, true));
++  // A link while rac runs never watches.
++  EXPECT_FALSE(ShouldWatchLaunchRestore(false, true, false));
++  EXPECT_FALSE(ShouldWatchLaunchRestore(false, false, false));
++}
++
++TEST(LittleWindowRoutingTest, RaisesTheLittleWindowWhenItsProfileRestores) {
++  // Restored windows, or nothing to restore (one empty window): either way
++  // the little window comes back to the front.
++  EXPECT_EQ(StepForFinishedRestore(/*restored_link_profile=*/true,
++                                   /*little_window_open=*/true),
++            LaunchRestoreStep::kRaiseLittleWindow);
++}
++
++TEST(LittleWindowRoutingTest, KeepsWatchingThroughOtherProfilesRestores) {
++  EXPECT_EQ(StepForFinishedRestore(/*restored_link_profile=*/false,
++                                   /*little_window_open=*/true),
++            LaunchRestoreStep::kKeepWatching);
++}
++
++TEST(LittleWindowRoutingTest, StopsWhenTheLittleWindowClosedFirst) {
++  EXPECT_EQ(StepForFinishedRestore(true, /*little_window_open=*/false),
++            LaunchRestoreStep::kStopWatching);
++  EXPECT_EQ(StepForFinishedRestore(false, /*little_window_open=*/false),
++            LaunchRestoreStep::kStopWatching);
++}
++
+ TEST(LittleWindowRoutingTest, BoundsAreCenteredAtTheirSize) {
+   const gfx::Rect work_area(0, 25, 1440, 875);
+   const gfx::Rect bounds = LittleWindowBounds(work_area);
+--- a/chrome/browser/ui/views/rac/little_window/little_window.cc
++++ b/chrome/browser/ui/views/rac/little_window/little_window.cc
+@@ -27,6 +27,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+ #include "chrome/browser/ui/rac/little_window/little_window_routing.h"
+@@ -69,6 +70,9 @@ base::CallbackListSubscription& RestoreW
+   return *watch;
+ }
+ 
++// The little window RestoreWatch() is for; its closing drops the watch.
++const BrowserWindowInterface* g_watched_little_window = nullptr;
++
+ // The open little windows. Made with the first one; a window leaves the list
+ // when it closes.
+ class LittleWindows {
+@@ -119,6 +123,10 @@ class LittleWindows {
+ 
+   void OnClosed(BrowserWindowInterface* browser) {
+     windows_.erase(browser);
++    if (browser == g_watched_little_window) {
++      g_watched_little_window = nullptr;
++      RestoreWatch() = {};
++    }
+ #if BUILDFLAG(IS_MAC)
+     UpdateOpenFileItem(browser);
+ #endif
+@@ -256,20 +264,24 @@ namespace {
+ // little window takes the front and focus back. It runs in the same task as
+ // the restore, so the windows never visibly jump.
+ void WatchLaunchRestore(Profile* profile, BrowserWindowInterface* little) {
++  g_watched_little_window = little;
+   RestoreWatch() =
+       SessionRestore::RegisterOnSessionRestoredCallback(base::BindRepeating(
+           [](Profile* profile, base::WeakPtr<BrowserWindowInterface> little,
+              Profile* restored, int /*tab_count*/) {
+-            if (restored != profile) {
++            const LaunchRestoreStep step =
++                StepForFinishedRestore(restored == profile, !!little);
++            if (step == LaunchRestoreStep::kKeepWatching) {
+               return;
+             }
+-            if (little) {
++            if (step == LaunchRestoreStep::kRaiseLittleWindow) {
+               CloseEmptyStartupWindows(profile, little.get());
+               if (BrowserWindow* native =
+                       BrowserWindow::FromBrowser(little.get())) {
+                 native->Activate();
+               }
+             }
++            g_watched_little_window = nullptr;
+             // Destroys this callback; nothing after this line.
+             RestoreWatch() = {};
+           },
+@@ -310,11 +322,17 @@ bool OpenLinksFromOtherApp(const Startup
+   navigate.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
+   navigate.window_action = NavigateParams::WindowAction::kShowWindow;
+   Navigate(&navigate);
++  // Asked before the empty launch window closes: a window counts here until it
++  // is gone.
++  const bool profile_has_tabbed_window =
++      ProfileBrowserCollection::GetForProfile(profile)->FindTabbedBrowser();
+   if (came_with_launch) {
+     CloseEmptyStartupWindows(profile, browser);
+-    if (SessionRestore::IsRestoring(profile)) {
+-      WatchLaunchRestore(profile, browser);
+-    }
++  }
++  if (ShouldWatchLaunchRestore(came_with_launch,
++                               SessionRestore::IsRestoring(profile),
++                               profile_has_tabbed_window)) {
++    WatchLaunchRestore(profile, browser);
+   }
+   return true;
+ }
