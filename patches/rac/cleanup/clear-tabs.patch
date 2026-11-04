@@ -222,11 +222,12 @@
        "rac/power/group_namer.cc",
        "rac/power/group_namer.h",
        "rac/rac_action_handlers.cc",
-@@ -2420,6 +2424,7 @@ static_library("ui") {
+@@ -2420,6 +2424,8 @@ static_library("ui") {
        "//chrome/browser/ui/passwords/settings:impl",
        "//chrome/browser/ui/performance_controls",
        "//chrome/browser/ui/performance_controls:impl",
 +      "//chrome/browser/ui/rac/cleanup:logic",
++      "//chrome/browser/ui/rac/cleanup:toast",
        "//chrome/browser/ui/search_engine_choice",
        "//chrome/browser/ui/search_engine_choice:impl",
        "//chrome/browser/ui/shared_highlighting",
@@ -255,7 +256,7 @@
            : chrome::RestoredTabLoadPolicy::kLoadIfVisible;
 --- /dev/null
 +++ b/chrome/browser/ui/rac/cleanup/BUILD.gn
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,63 @@
 +# Copyright 2026 The rac Authors
 +# You can use, redistribute, and/or modify this source code under
 +# the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -280,6 +281,22 @@
 +    "//base",
 +    "//ui/base",
 +    "//ui/gfx/geometry",
++  ]
++}
++
++# The Undo toast's registration, for the toast service
++# (//chrome/browser/ui/toasts:impl), which can't depend on
++# //chrome/browser/ui.
++source_set("toast") {
++  sources = [
++    "clear_toast.cc",
++    "clear_toast.h",
++  ]
++  deps = [
++    "//base",
++    "//chrome/app:rac_strings",
++    "//chrome/app/vector_icons",
++    "//chrome/browser/ui/toasts/api:toasts",
 +  ]
 +}
 +
@@ -503,7 +520,7 @@
 +}  // namespace rac::cleanup
 --- /dev/null
 +++ b/chrome/browser/ui/rac/cleanup/clear_tabs.cc
-@@ -0,0 +1,415 @@
+@@ -0,0 +1,384 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -526,7 +543,6 @@
 +#include "base/strings/string_number_conversions.h"
 +#include "base/strings/utf_string_conversions.h"
 +#include "base/task/single_thread_task_runner.h"
-+#include "chrome/app/vector_icons/vector_icons.h"
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/rac/spaces/space.h"
 +#include "chrome/browser/rac/spaces/space_tab_tag.h"
@@ -534,6 +550,7 @@
 +#include "chrome/browser/sessions/tab_restore_service_factory.h"
 +#include "chrome/browser/ui/browser_live_tab_context.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/rac/cleanup/clear_toast.h"
 +#include "chrome/browser/ui/rac/cleanup/cleared_tabs_context.h"
 +#include "chrome/browser/ui/rac/cleanup/may_clear.h"
 +#include "chrome/browser/ui/rac/sidebar/sidebar_actions.h"
@@ -543,10 +560,7 @@
 +#include "chrome/browser/ui/tabs/tab_strip_model.h"
 +#include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
 +#include "chrome/browser/ui/toasts/api/toast_id.h"
-+#include "chrome/browser/ui/toasts/api/toast_registry.h"
-+#include "chrome/browser/ui/toasts/api/toast_specification.h"
 +#include "chrome/browser/ui/toasts/toast_controller.h"
-+#include "chrome/browser/ui/toasts/toast_service.h"
 +#include "chrome/grit/generated_resources.h"
 +#include "chrome/grit/rac_strings.h"
 +#include "components/sessions/content/content_live_tab.h"
@@ -585,34 +599,6 @@
 +    g_pending_undos = new std::map<SessionID, PendingUndo>();
 +  }
 +  return *g_pending_undos;
-+}
-+
-+// Registers the Undo toast with `browser`'s toasts on its first Clear, so a
-+// window that never clears never holds it. Windows are told apart by
-+// SessionID, which is never reused, unlike an address.
-+bool EnsureToastRegistered(BrowserWindowInterface* browser) {
-+  ToastService* service = ToastService::From(browser);
-+  if (!service || !service->toast_registry()) {
-+    return false;
-+  }
-+  static base::NoDestructor<std::set<SessionID>> registered;
-+  if (registered->insert(browser->GetSessionID()).second) {
-+    // ToastService hands out its registry as const because Chromium
-+    // registers every toast up front; adding one later is safe, since the
-+    // controller looks a toast up only when it shows.
-+    const_cast<ToastRegistry*>(service->toast_registry())
-+        ->RegisterToast(
-+            ToastId::kRacTabsCleared,
-+            ToastSpecification::Builder(kTabIcon, IDS_RAC_CLEAR_TOAST_BODY)
-+                .AddCloseButton()
-+                // About the space, not a tab: Clear itself selects another
-+                // tab, and Undo stays offered if the user switches tabs.
-+                .AddGlobalScoped()
-+                .AddActionButton(IDS_RAC_CLEAR_TOAST_UNDO,
-+                                 base::BindRepeating(&UndoClear, browser))
-+                .Build());
-+  }
-+  return true;
 +}
 +
 +// The tabs the running Clear keeps, by window. Made by the first Clear that
@@ -807,8 +793,8 @@
 +  const SessionID window_id = browser->GetSessionID();
 +  const SessionID entry_id = pending.entry_id;
 +  ToastController* toasts = ToastController::From(browser);
-+  const bool offer_undo =
-+      recorded && toasts && EnsureToastRegistered(browser);
++  const bool offer_undo = recorded && toasts;
++  SetUndoClearHandler(&UndoClear);
 +  if (offer_undo) {
 +    PendingUndos()[window_id] = std::move(pending);
 +  }
@@ -977,6 +963,86 @@
 +}  // namespace rac::cleanup
 +
 +#endif  // CHROME_BROWSER_UI_RAC_CLEANUP_CLEAR_TABS_H_
+--- /dev/null
++++ b/chrome/browser/ui/rac/cleanup/clear_toast.cc
+@@ -0,0 +1,46 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/cleanup/clear_toast.h"
++
++#include "base/functional/bind.h"
++#include "chrome/app/vector_icons/vector_icons.h"
++#include "chrome/browser/ui/toasts/api/toast_id.h"
++#include "chrome/browser/ui/toasts/api/toast_registry.h"
++#include "chrome/browser/ui/toasts/api/toast_specification.h"
++#include "chrome/grit/rac_strings.h"
++
++namespace rac::cleanup {
++
++namespace {
++
++UndoClearHandler g_undo_clear = nullptr;
++
++void RunUndoClear(BrowserWindowInterface* browser) {
++  if (g_undo_clear) {
++    g_undo_clear(browser);
++  }
++}
++
++}  // namespace
++
++void SetUndoClearHandler(UndoClearHandler handler) {
++  g_undo_clear = handler;
++}
++
++void RegisterClearToast(ToastRegistry& registry,
++                        BrowserWindowInterface* browser) {
++  registry.RegisterToast(
++      ToastId::kRacTabsCleared,
++      ToastSpecification::Builder(kTabIcon, IDS_RAC_CLEAR_TOAST_BODY)
++          .AddCloseButton()
++          // About the space, not a tab: Clear itself selects another tab,
++          // and Undo stays offered if the user switches tabs.
++          .AddGlobalScoped()
++          .AddActionButton(IDS_RAC_CLEAR_TOAST_UNDO,
++                           base::BindRepeating(&RunUndoClear, browser))
++          .Build());
++}
++
++}  // namespace rac::cleanup
+--- /dev/null
++++ b/chrome/browser/ui/rac/cleanup/clear_toast.h
+@@ -0,0 +1,28 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_CLEANUP_CLEAR_TOAST_H_
++#define CHROME_BROWSER_UI_RAC_CLEANUP_CLEAR_TOAST_H_
++
++class BrowserWindowInterface;
++class ToastRegistry;
++
++// Clear's Undo toast, registered with each window's toasts like every
++// Chromium toast (toast_service.cc). Kept apart from clear_tabs.cc because
++// the toast service can't depend on //chrome/browser/ui, where Clear lives.
++namespace rac::cleanup {
++
++using UndoClearHandler = void (*)(BrowserWindowInterface*);
++
++// The toast's Undo calls `handler`. The first Clear sets it (to UndoClear),
++// and the toast only ever shows after a Clear.
++void SetUndoClearHandler(UndoClearHandler handler);
++
++// Registers ToastId::kRacTabsCleared for `browser`'s toasts.
++void RegisterClearToast(ToastRegistry& registry,
++                        BrowserWindowInterface* browser);
++
++}  // namespace rac::cleanup
++
++#endif  // CHROME_BROWSER_UI_RAC_CLEANUP_CLEAR_TOAST_H_
 --- /dev/null
 +++ b/chrome/browser/ui/rac/cleanup/cleared_tabs_context.cc
 @@ -0,0 +1,176 @@
@@ -1843,6 +1909,16 @@
          {"open_command_bar", &command_bar::OpenCommandBar},
          {"open_command_bar_with_url", &command_bar::OpenCommandBarWithUrl},
      }};
+--- a/chrome/browser/ui/toasts/BUILD.gn
++++ b/chrome/browser/ui/toasts/BUILD.gn
+@@ -65,6 +65,7 @@ source_set("impl") {
+     "//chrome/browser/ui:browser_element_identifiers",
+     "//chrome/browser/ui:chrome_pages",
+     "//chrome/browser/ui/fullscreen",
++    "//chrome/browser/ui/rac/cleanup:toast",
+     "//chrome/browser/ui/send_tab_to_self",
+     "//chrome/browser/ui/side_panel",
+     "//chrome/browser/ui/side_panel:side_panel_views_dependent",
 --- a/chrome/browser/ui/toasts/api/toast_id.cc
 +++ b/chrome/browser/ui/toasts/api/toast_id.cc
 @@ -75,6 +75,8 @@ std::string_view GetToastName(ToastId to
@@ -1866,3 +1942,23 @@
  };
  // LINT.ThenChange(/tools/metrics/histograms/metadata/toasts/enums.xml:ToastId)
  
+--- a/chrome/browser/ui/toasts/toast_service.cc
++++ b/chrome/browser/ui/toasts/toast_service.cc
+@@ -23,6 +23,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/chrome_pages.h"
++#include "chrome/browser/ui/rac/cleanup/clear_toast.h"
+ #include "chrome/browser/ui/commerce/commerce_ui_tab_helper.h"
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_toolbar_icon_controller.h"
+ #include "chrome/browser/ui/side_panel/side_panel_entry_id.h"
+@@ -103,6 +104,9 @@ void ToastService::RegisterToasts(
+                                   IDS_ZEN_MODE_NEW_TAB_CREATED_TOAST_BODY)
+           .Build());
+ 
++  // rac: Clear's Undo toast.
++  rac::cleanup::RegisterClearToast(*toast_registry_, browser_window_interface);
++
+   toast_registry_->RegisterToast(
+       ToastId::kImageCopied,
+       ToastSpecification::Builder(features::IsRoundedIconsEnabled()
