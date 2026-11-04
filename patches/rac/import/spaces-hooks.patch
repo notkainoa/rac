@@ -347,7 +347,7 @@ Index: src/chrome/browser/rac/spaces/spaces_store.cc
  #include "base/task/thread_pool.h"
  #include "base/token.h"
  
-@@ -236,11 +238,34 @@ void SpacesStore::Load() {
+@@ -236,11 +238,36 @@ void SpacesStore::Load() {
    DidLoad(base::OnceClosure(), ReadData(dir_));
  }
  
@@ -358,17 +358,11 @@ Index: src/chrome/browser/rac/spaces/spaces_store.cc
    loading_ = true;
 -  write_task_runner_->PostTaskAndReplyWithResult(
 -      FROM_HERE, base::BindOnce(&SpacesStore::ReadData, dir_),
-+  if (priority == base::TaskPriority::BEST_EFFORT) {
-+    write_task_runner_->PostTaskAndReplyWithResult(
-+        FROM_HERE, base::BindOnce(&SpacesStore::ReadData, dir_),
-+        base::BindOnce(&SpacesStore::DidLoad, weak_factory_.GetWeakPtr(),
-+                       std::move(ready)));
-+    return;
-+  }
-+  // The read starts from a later task on this sequence, not from here: it
-+  // decodes stored tabs with the session navigation driver, which Chrome
-+  // installs after the profile (and so this store) is created, and a read
-+  // that decodes first leaves the browser with the wrong driver.
++  // The read starts from a later task on this sequence, not from here, at
++  // every priority: it decodes stored tabs with the session navigation
++  // driver, which Chrome installs after the profile (and so this store) is
++  // created. A read that decodes first leaves the browser with the wrong
++  // driver, and DCHECKs when Chrome installs its own.
 +  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
 +      FROM_HERE, base::BindOnce(&SpacesStore::StartRead,
 +                                weak_factory_.GetWeakPtr(), std::move(ready),
@@ -377,6 +371,14 @@ Index: src/chrome/browser/rac/spaces/spaces_store.cc
 +
 +void SpacesStore::StartRead(base::OnceClosure ready,
 +                            base::TaskPriority priority) {
++  if (priority == base::TaskPriority::BEST_EFFORT) {
++    // The default: read on the write sequence, at its priority.
++    write_task_runner_->PostTaskAndReplyWithResult(
++        FROM_HERE, base::BindOnce(&SpacesStore::ReadData, dir_),
++        base::BindOnce(&SpacesStore::DidLoad, weak_factory_.GetWeakPtr(),
++                       std::move(ready)));
++    return;
++  }
 +  // Reading on a different sequence from the writer is safe: Put and Remove
 +  // CHECK `!loading_`, so no write can be pending before the load finishes.
 +  base::ThreadPool::PostTaskAndReplyWithResult(
@@ -385,7 +387,7 @@ Index: src/chrome/browser/rac/spaces/spaces_store.cc
        base::BindOnce(&SpacesStore::DidLoad, weak_factory_.GetWeakPtr(),
                       std::move(ready)));
  }
-@@ -335,6 +360,14 @@ void SpacesStore::SaveNow() {
+@@ -335,6 +362,14 @@ void SpacesStore::SaveNow() {
    write_pending_ = false;
  }
  
@@ -412,21 +414,22 @@ Index: src/chrome/browser/rac/spaces/spaces_store.h
  #include "base/time/time.h"
  #include "base/timer/timer.h"
  #include "base/uuid.h"
-@@ -81,8 +82,11 @@ class SpacesStore {
+@@ -81,8 +82,12 @@ class SpacesStore {
    // Reads the file. Call once, early.
    void Load();
    // Reads and decodes on the storage sequence. Do not mutate the store until
 -  // `ready` runs. Destroying the store safely cancels the reply.
 -  void LoadAsync(base::OnceClosure ready);
-+  // `ready` runs. Destroying the store safely cancels the reply. `priority`
-+  // is the read's task priority; the default shares the write sequence's
-+  // BEST_EFFORT priority.
++  // `ready` runs. Destroying the store safely cancels the reply. The read
++  // always starts from a later task, never inside this call. With the
++  // default `priority`, it runs on the write sequence at that sequence's
++  // priority; any other `priority` reads on its own task at that priority.
 +  void LoadAsync(base::OnceClosure ready,
 +                 base::TaskPriority priority = base::TaskPriority::BEST_EFFORT);
  
    // The stored space, or null. Doesn't remove it; call Remove once the tabs
    // are live again.
-@@ -95,10 +99,16 @@ class SpacesStore {
+@@ -95,10 +100,16 @@ class SpacesStore {
    bool HasPendingWrite() const;
    // Posts the pending snapshot for writing without blocking the caller.
    void SaveNow();
@@ -447,7 +450,7 @@ Index: src/chrome/browser/rac/spaces/spaces_store_unittest.cc
 ===================================================================
 --- src.orig/chrome/browser/rac/spaces/spaces_store_unittest.cc
 +++ src/chrome/browser/rac/spaces/spaces_store_unittest.cc
-@@ -218,6 +218,28 @@ TEST_F(SpacesStoreTest, AsyncLoadDoesNot
+@@ -218,6 +218,58 @@ TEST_F(SpacesStoreTest, AsyncLoadDoesNot
    EXPECT_FALSE(store.HasPendingWrite());
  }
  
@@ -473,10 +476,40 @@ Index: src/chrome/browser/rac/spaces/spaces_store_unittest.cc
 +  EXPECT_FALSE(store.HasPendingWrite());
 +}
 +
++// Stored tabs decode with the session navigation driver, which Chrome
++// installs only after the profile, and so the store, exists. So no read may
++// start inside LoadAsync(), at any priority: the only thing it may queue is
++// a later task on this thread.
++TEST_F(SpacesStoreTest, AsyncLoadStartsTheReadFromALaterTask) {
++  const auto id = base::Uuid::GenerateRandomV4();
++  {
++    SpacesStore initial(dir_.GetPath());
++    initial.Put(MakeSpace(id, "retained"));
++  }
++  task_environment_.RunUntilIdle();
++
++  for (const base::TaskPriority priority :
++       {base::TaskPriority::BEST_EFFORT, base::TaskPriority::USER_VISIBLE}) {
++    SCOPED_TRACE(static_cast<int>(priority));
++    SpacesStore store(dir_.GetPath());
++    base::test::TestFuture<void> ready;
++    ASSERT_EQ(task_environment_.GetPendingMainThreadTaskCount(), 0u);
++    store.LoadAsync(ready.GetCallback(), priority);
++    // The thread pool is queued, so a read posted from inside LoadAsync()
++    // would leave nothing on this thread.
++    EXPECT_EQ(task_environment_.GetPendingMainThreadTaskCount(), 1u);
++    task_environment_.RunUntilIdle();
++    ASSERT_TRUE(ready.IsReady());
++    ASSERT_TRUE(store.Find(id));
++    EXPECT_EQ(*store.Find(id)->unknown_fields.FindString("marker"),
++              "retained");
++  }
++}
++
  TEST_F(SpacesStoreTest, AsyncLoadCanOutliveStoreWithoutCallingClient) {
    base::test::TestFuture<void> ready;
    {
-@@ -231,6 +253,36 @@ TEST_F(SpacesStoreTest, AsyncLoadCanOutl
+@@ -231,6 +283,36 @@ TEST_F(SpacesStoreTest, AsyncLoadCanOutl
    EXPECT_FALSE(base::PathExists(dir_.GetPath().AppendASCII("rac spaces")));
  }
  
