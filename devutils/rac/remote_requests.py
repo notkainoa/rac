@@ -375,8 +375,9 @@ class Checker:
         # runs in HandleInput, so `after MS` may delay it until a click has
         # opened the menu.
         if verb == 'menu-dump':
-            need(n == 1 or (n == 2 and re.fullmatch(r'main:[A-Za-z0-9._-]+', args[1])),
-                 'OUT [main:TITLE]')
+            need(n == 1 or (n in (2, 3) and re.fullmatch(r'main:[A-Za-z0-9._-]+', args[1])
+                            and (n == 2 or args[2] == 'validate')),
+                 'OUT [main:TITLE [validate]]')
             return [verb, self.path(args[0]), *args[1:]]
         if verb == 'target':
             need(n == 1 and selector(args[0]), 'SELECTOR')
