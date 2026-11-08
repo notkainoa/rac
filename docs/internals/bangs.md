@@ -1,10 +1,5 @@
 # Bangs (work in progress)
 
-**Status: nothing on this page is a design.** It records what the maintainer
-wants and what's wrong today, so it isn't lost. When this work starts,
-rethink the whole experience from scratch, deeper than the notes below, and
-rewrite this page as decisions get made.
-
 ## How bangs work today
 
 Bangs come from Helium (`helium/core/add-native-bangs.patch` and
@@ -21,52 +16,80 @@ Wikipedia for "cats".
 - A bang works at the start of the query (`!w cats`), and in the middle or
   at the end (`cats !w`) once a space or Return follows it.
 
-## What the maintainer wants
+## What's built
 
-### Editable bangs
+### The Bangs settings page (patches/rac/power/)
 
-Implemented in `rac/power/bangs-deleted.patch` and
-`rac/power/bangs-editor.patch`:
+`chrome://settings/bangs`, a subpage of the General settings page. A "Bangs"
+row on the General page's search engine card opens it, and a row on the
+site-search page points back to it. Three sections, top to bottom:
 
-- The "Manage search engines and site search" page
-  (`chrome://settings/searchEngines`) has a **Bangs** section listing the
-  downloaded bangs, searchable through the page's search field (the list is
-  capped at the first 100 matches). A **Deleted bangs** section appears once
-  something is deleted, with a Restore button.
-- Users can edit any bang, delete it, and add their own. Editing a
-  downloaded bang opens the site-search edit dialog; saving removes the
-  downloaded entry and creates the user's own `!trigger` site-search entry,
-  which already beats the downloaded list and works with services off.
-- Deleting records the trigger in the `rac.bangs.deleted` pref, which
-  `TemplateURLService::BangsLoadedCallback` checks, so a deleted bang stays
-  deleted when a new `bangs.json` arrives. Restore clears the mark and
-  re-adds the bang on the spot.
-- Bangs the user adds or edits appear under Site search, not in the Bangs
-  section: they are the user's own entries.
+- **Yours**: the user's own bangs — site-search entries whose keyword starts
+  with `!`. Adding and editing go through the usual search-engine dialog,
+  which the page puts in bang mode (`isBang`): the title says "bang" and the
+  keyword is normalized to carry the `!` marker.
+- **Bangs**: the downloaded list, searchable and capped at 100 rows (the
+  full list has thousands of entries). Editing a downloaded bang replaces
+  it: the original is marked deleted and the edited copy becomes the
+  user's own entry, so it lands under Yours.
+- **Deleted bangs**: triggers removed from the downloaded list, with a
+  Restore button.
 
-Still open: the dedicated searchable Bangs page from plan 07 task M4 item 3
-(the section above is the interim surface), and the address-bar rework
-below.
+The page reuses `SearchEnginesHandler`: `getSearchEnginesList` already
+carries `bangs` and `deletedBangs`, and `removeBang`, `restoreBang`, and the
+edit callbacks handle the rows. When the page is closed it costs nothing.
 
-### A better address bar experience
+### Edits that survive list updates (bangs-deleted.patch)
+
+`rac.bangs.deleted`, a profile pref, holds the triggers of downloaded bangs
+the user deleted. `TemplateURLService` skips them when it applies a fresh
+`bangs.json`, and `RestoreDeletedBang` un-marks and re-adds one. `Remove`
+records the trigger when the removed engine is a bang, so deleting in the
+page (or anywhere else) sticks.
+
+- A **deleted** bang stays deleted across updates.
+- An **edited** bang is deleted-then-added: the downloaded trigger is marked
+  deleted, and the user's version is a normal site-search entry that keeps
+  working without the list.
+- The user's **own** bangs are plain TemplateURLs; a user keyword shadows a
+  downloaded bang with the same `!trigger`, so adding `!w` overrides the
+  downloaded `w` without touching the list. Deleting the user's entry lets
+  the downloaded one return on the next list update.
+
+### Design answers, so far
+
+- **Edits as deltas.** Yes: the deleted-trigger set is the delta, and
+  user entries shadow the list by keyword. When an update changes a bang
+  the user edited, the user's version wins — the downloaded trigger is
+  either deleted or shadowed.
+- **Its own page.** The editor is its own subpage, not a section inside
+  site search: the downloaded list is far too long to share a page, and
+  bangs deserve a single place that owns "your bangs + the list + deleted".
+- **Helium services off.** The user's own bangs still work — they are
+  ordinary keyword search engines and never needed the network.
+- **Cost when unused.** Nothing: the pref is only read when the downloaded
+  list is applied, and the page only exists while it's open.
+
+### What the address bar should do (M5, not built)
 
 Today, typing a bang at the end of a query (`cats !w`) still shows "Google
 search" in the address bar, plus a badge for the bang. That's wrong: when a
-bang is there, the search isn't a Google search. The fix isn't just the
-label. Rethink how bangs look and behave in the address bar as a whole.
+bang is there, the search isn't a Google search.
 
-## Questions for the design
+Direction: a recognized `!x` token should make the whole input a search on
+that engine — the same end state as keyword activation (pressing Tab on a
+site-search keyword): the site's name and icon become the search target,
+the bang token is consumed, and the rest of the input is the query. Position
+of the token (start, middle, end) shouldn't matter once it's unambiguous.
+The pieces already exist: bangs are keyword `TemplateURL`s, so matching can
+reuse the keyword engine path rather than a parallel bang badge mechanism.
+Open questions for M5: what to show while the user is mid-token (`!` alone,
+or a partial trigger that matches nothing), how this interacts with the
+command bar (phase 5), and whether a nonexistent trigger should hint that
+the bang can be created on the Bangs page.
 
-- Should the user's edits be stored as changes on top of the downloaded
-  list (added, changed, deleted, keyed by the bang's trigger), so updates
-  merge cleanly? What happens when an update changes a bang the user edited?
-- Should the editor build on Chromium's existing site search settings, which
-  already add, edit, and delete shortcuts, or be its own page?
-- What should the address bar show at each moment: while typing a bang, with
-  the bang at the start versus the end, and when the bang doesn't exist?
-- How should bangs relate to the command bar (phase 5) and to Chromium's
-  keyword search, which also uses the address bar?
-- What happens with Helium services off: are the user's own bangs still
-  available? (They should be; they don't need the network.)
-- Does it cost anything when nobody uses bangs? Loading and matching the
-  list must not slow typing in the address bar.
+## Open questions
+
+- Should the Bangs page live somewhere more prominent than the General
+  page's search card? For now it sits next to site search, which is where
+  Chromium puts keyword engines.
