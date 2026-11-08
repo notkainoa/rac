@@ -1,0 +1,866 @@
+Index: src/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+===================================================================
+--- src.orig/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc	2026-11-07 23:12:50.451268000 -0800
++++ src/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc	2026-11-07 23:12:50.501674389 -0800
+@@ -660,6 +660,7 @@
+ #if defined(TOOLKIT_VIEWS)
+ #include "chrome/browser/bookmarks/bookmark_merged_surface_service_factory.h"
+ #include "chrome/browser/ui/browser_shortcuts/browser_shortcut_service_factory.h"
++#include "chrome/browser/ui/rac/media/rac_media_controls_factory.h"
+ #include "chrome/browser/ui/rac/sidebar/sidebar_items_factory.h"
+ #endif
+ 
+@@ -857,6 +858,7 @@
+ #if defined(TOOLKIT_VIEWS)
+   browser_shortcuts::BrowserShortcutServiceFactory::GetInstance();
+   rac::SidebarItemsFactory::GetInstance();
++  rac::RacMediaControlsFactory::GetInstance();
+ #endif
+ #if !BUILDFLAG(IS_ANDROID)
+   BrowserManagerServiceFactory::GetInstance();
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn	2026-11-07 23:12:50.414167000 -0800
++++ src/chrome/browser/ui/BUILD.gn	2026-11-07 23:12:50.501206391 -0800
+@@ -2319,6 +2319,10 @@
+       "rac/cleanup/clear_tabs.h",
+       "rac/cleanup/may_clear.cc",
+       "rac/cleanup/may_clear.h",
++      "rac/media/rac_media_controls.cc",
++      "rac/media/rac_media_controls.h",
++      "rac/media/rac_media_controls_factory.cc",
++      "rac/media/rac_media_controls_factory.h",
+       "rac/power/group_namer.cc",
+       "rac/power/group_namer.h",
+       "rac/rac_action_copy_markdown.cc",
+@@ -3747,6 +3751,8 @@
+       "views/helium/frame_corner_radius.h",
+       "views/helium/native_frame_materials.cc",
+       "views/helium/native_frame_materials.h",
++      "views/rac/media/rac_media_controls_view.cc",
++      "views/rac/media/rac_media_controls_view.h",
+       "views/rac/sidebar_address_bar/sidebar_header_view.cc",
+       "views/rac/sidebar_address_bar/sidebar_header_view.h",
+       "views/rac/sidebar_reveal/sidebar_overshoot.h",
+Index: src/chrome/browser/ui/rac/media/rac_media_controls.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/rac/media/rac_media_controls.cc	2026-11-07 23:46:13.680255223 -0800
+@@ -0,0 +1,198 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/media/rac_media_controls.h"
++
++#include "base/task/single_thread_task_runner.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/global_media_controls/media_notification_service.h"
++#include "chrome/browser/ui/global_media_controls/media_notification_service_factory.h"
++#include "components/global_media_controls/public/media_item_manager.h"
++
++namespace rac {
++
++RacMediaControls::RacMediaControls(Profile* profile) : profile_(profile) {}
++
++RacMediaControls::~RacMediaControls() = default;
++
++void RacMediaControls::AddDisplay(Display* display) {
++  if (displays_.empty() && !manager_observation_.IsObserving()) {
++    manager_observation_.Observe(manager());
++  }
++  displays_.insert(display);
++  if (!active_display_) {
++    active_display_ = display;
++    RepopulateActiveDisplay();
++  }
++  MaybeUpdateRegistration();
++}
++
++void RacMediaControls::RemoveDisplay(Display* display) {
++  const bool was_active = active_display_ == display;
++  displays_.erase(display);
++  if (was_active) {
++    active_display_ = displays_.empty() ? nullptr : *displays_.begin();
++    if (active_display_) {
++      RepopulateActiveDisplay();
++    }
++  }
++  if (displays_.empty()) {
++    manager_observation_.Reset();
++  }
++  MaybeUpdateRegistration();
++}
++
++void RacMediaControls::SetActiveDisplay(Display* display) {
++  if (active_display_ == display || !displays_.contains(display)) {
++    return;
++  }
++  // The old display's views hold the item bindings, so they must go before
++  // the new display's are built.
++  ClearActiveDisplay();
++  active_display_ = display;
++  RepopulateActiveDisplay();
++}
++
++void RacMediaControls::Shutdown() {
++  shutting_down_ = true;
++  ClearActiveDisplay();
++  displays_.clear();
++  active_display_ = nullptr;
++  items_.clear();
++  manager_observation_.Reset();
++  if (delegate_registered_) {
++    // Direct unregister: no more updates after this.
++    in_set_delegate_ = true;
++    manager_->SetDialogDelegate(nullptr);
++    in_set_delegate_ = false;
++    delegate_registered_ = false;
++  }
++  manager_ = nullptr;
++}
++
++global_media_controls::MediaItemUI* RacMediaControls::ShowMediaItem(
++    const std::string& id,
++    base::WeakPtr<media_message_center::MediaNotificationItem> item) {
++  items_[id] = item;
++  if (!active_display_) {
++    return nullptr;
++  }
++  return active_display_->ShowMediaItem(id, item);
++}
++
++void RacMediaControls::HideMediaItem(const std::string& id) {
++  items_.erase(id);
++  if (active_display_) {
++    active_display_->HideMediaItem(id);
++  }
++  if (items_.empty()) {
++    MaybeUpdateRegistration();
++  }
++}
++
++void RacMediaControls::RefreshMediaItem(
++    const std::string& id,
++    base::WeakPtr<media_message_center::MediaNotificationItem> item) {
++  items_[id] = item;
++  if (active_display_) {
++    active_display_->RefreshMediaItem(id, item);
++  }
++}
++
++void RacMediaControls::HideMediaDialog() {
++  // Another surface (the toolbar dialog, a cast handoff) wants the items'
++  // one display. Drop ours until the item list next changes.
++  hidden_until_items_change_ = true;
++  items_.clear();
++  ClearActiveDisplay();
++  MaybeUpdateRegistration();
++}
++
++void RacMediaControls::Focus() {}
++
++void RacMediaControls::OnItemListChanged() {
++  hidden_until_items_change_ = false;
++  MaybeUpdateRegistration();
++}
++
++void RacMediaControls::OnMediaDialogOpened() {
++  // The media toolbar's bubble or a presentation dialog took the delegate
++  // slot. The display keeps its last views; a refresh on close restores
++  // them.
++  if (!in_set_delegate_) {
++    delegate_registered_ = false;
++  }
++}
++
++void RacMediaControls::OnMediaDialogClosed() {
++  MaybeUpdateRegistration();
++}
++
++global_media_controls::MediaItemManager* RacMediaControls::manager() {
++  if (!manager_ && !shutting_down_) {
++    manager_ = MediaNotificationServiceFactory::GetForProfile(profile_)
++                   ->media_item_manager();
++  }
++  return manager_;
++}
++
++void RacMediaControls::MaybeUpdateRegistration() {
++  if (update_pending_ || shutting_down_) {
++    return;
++  }
++  update_pending_ = true;
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&RacMediaControls::UpdateRegistration,
++                                weak_factory_.GetWeakPtr()));
++}
++
++void RacMediaControls::UpdateRegistration() {
++  update_pending_ = false;
++  if (shutting_down_) {
++    return;
++  }
++  const bool want = active_display_ && manager() &&
++                    manager_->HasActiveItems() && !hidden_until_items_change_;
++  if (want && !delegate_registered_ && !manager_->HasOpenDialog()) {
++    RegisterDelegate();
++  } else if (!want && delegate_registered_) {
++    UnregisterDelegate();
++  }
++}
++
++void RacMediaControls::RegisterDelegate() {
++  // Drop stale item views before the manager re-sends ShowMediaItem.
++  items_.clear();
++  ClearActiveDisplay();
++  in_set_delegate_ = true;
++  manager_->SetDialogDelegate(this);
++  in_set_delegate_ = false;
++  delegate_registered_ = true;
++}
++
++void RacMediaControls::UnregisterDelegate() {
++  in_set_delegate_ = true;
++  manager_->SetDialogDelegate(nullptr);
++  in_set_delegate_ = false;
++  delegate_registered_ = false;
++}
++
++void RacMediaControls::RepopulateActiveDisplay() {
++  if (!active_display_ || !delegate_registered_) {
++    return;
++  }
++  for (const auto& [id, item] : items_) {
++    if (item) {
++      active_display_->ShowMediaItem(id, item);
++    }
++  }
++}
++
++void RacMediaControls::ClearActiveDisplay() {
++  if (active_display_) {
++    active_display_->ClearMediaItems();
++  }
++}
++
++}  // namespace rac
+Index: src/chrome/browser/ui/rac/media/rac_media_controls.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/rac/media/rac_media_controls.h	2026-11-07 23:52:02.441254793 -0800
+@@ -0,0 +1,140 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_MEDIA_RAC_MEDIA_CONTROLS_H_
++#define CHROME_BROWSER_UI_RAC_MEDIA_RAC_MEDIA_CONTROLS_H_
++
++#include <map>
++#include <string>
++
++#include "base/containers/flat_set.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "components/global_media_controls/public/media_dialog_delegate.h"
++#include "components/global_media_controls/public/media_item_manager.h"
++#include "components/global_media_controls/public/media_item_manager_observer.h"
++#include "components/keyed_service/core/keyed_service.h"
++
++class Profile;
++
++namespace media_message_center {
++class MediaNotificationItem;
++}
++
++namespace rac {
++
++// The profile's end of the sidebar media controls. Chromium's
++// MediaItemManager has room for exactly one MediaDialogDelegate -- the media
++// toolbar's bubble takes it while open -- and every media item binds exactly
++// one view, so this service holds the delegate slot and hands items to the
++// display in whichever window's sidebar was activated most recently. It
++// registers only while the manager reports active items, so a browser with
++// nothing playing costs the same as stock Chromium.
++class RacMediaControls
++    : public KeyedService,
++      public global_media_controls::MediaDialogDelegate,
++      public global_media_controls::MediaItemManagerObserver {
++ public:
++  // One window's view of the shared media items, implemented by
++  // RacMediaControlsView.
++  class Display {
++   public:
++    virtual global_media_controls::MediaItemUI* ShowMediaItem(
++        const std::string& id,
++        base::WeakPtr<media_message_center::MediaNotificationItem> item) = 0;
++    virtual void HideMediaItem(const std::string& id) = 0;
++    virtual void RefreshMediaItem(
++        const std::string& id,
++        base::WeakPtr<media_message_center::MediaNotificationItem> item) = 0;
++    virtual void ClearMediaItems() = 0;
++
++   protected:
++    virtual ~Display() = default;
++  };
++
++  explicit RacMediaControls(Profile* profile);
++  RacMediaControls(const RacMediaControls&) = delete;
++  RacMediaControls& operator=(const RacMediaControls&) = delete;
++  ~RacMediaControls() override;
++
++  void AddDisplay(Display* display);
++  void RemoveDisplay(Display* display);
++  // Makes |display| the one holding the item views. Called by the display
++  // when its window activates.
++  void SetActiveDisplay(Display* display);
++
++  // KeyedService:
++  void Shutdown() override;
++
++  // global_media_controls::MediaDialogDelegate:
++  global_media_controls::MediaItemUI* ShowMediaItem(
++      const std::string& id,
++      base::WeakPtr<media_message_center::MediaNotificationItem> item)
++      override;
++  void HideMediaItem(const std::string& id) override;
++  void RefreshMediaItem(
++      const std::string& id,
++      base::WeakPtr<media_message_center::MediaNotificationItem> item)
++      override;
++  void HideMediaDialog() override;
++  void Focus() override;
++
++  // global_media_controls::MediaItemManagerObserver:
++  void OnItemListChanged() override;
++  void OnMediaDialogOpened() override;
++  void OnMediaDialogClosed() override;
++
++ private:
++  global_media_controls::MediaItemManager* manager();
++
++  // Queues the delegate re-check. Called from inside the manager's own
++  // callbacks, so the check itself always runs in a posted task.
++  void MaybeUpdateRegistration();
++  void UpdateRegistration();
++  void RegisterDelegate();
++  void UnregisterDelegate();
++
++  // Rebuilds the active display's item views from |items_|. The old views
++  // are destroyed first because each media item binds a single view.
++  void RepopulateActiveDisplay();
++  void ClearActiveDisplay();
++
++  const raw_ptr<Profile> profile_;
++
++  // Resolved on first use so the keyed service never builds
++  // MediaNotificationService during shutdown.
++  raw_ptr<global_media_controls::MediaItemManager> manager_ = nullptr;
++
++  base::flat_set<raw_ptr<Display>> displays_;
++  raw_ptr<Display> active_display_ = nullptr;
++
++  // The items the manager last showed, keyed by id. Kept across delegate
++  // changes so a display switch or a returned delegate can rebuild views.
++  std::map<std::string,
++           base::WeakPtr<media_message_center::MediaNotificationItem>>
++      items_;
++
++  bool delegate_registered_ = false;
++  // Set while this object is inside a SetDialogDelegate call, so observer
++  // notifications raised by that call aren't mistaken for another dialog
++  // taking the delegate.
++  bool in_set_delegate_ = false;
++  bool update_pending_ = false;
++  // Set when the manager asks the delegate to close; cleared on the next
++  // item list change. Keeps the sidebar from flickering items back on
++  // during a handoff such as a cast taking over the item.
++  bool hidden_until_items_change_ = false;
++  bool shutting_down_ = false;
++
++  base::ScopedObservation<global_media_controls::MediaItemManager,
++                          global_media_controls::MediaItemManagerObserver>
++      manager_observation_{this};
++
++  base::WeakPtrFactory<RacMediaControls> weak_factory_{this};
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_RAC_MEDIA_RAC_MEDIA_CONTROLS_H_
+Index: src/chrome/browser/ui/rac/media/rac_media_controls_factory.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/rac/media/rac_media_controls_factory.cc	2026-11-07 23:46:09.166364474 -0800
+@@ -0,0 +1,58 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/media/rac_media_controls_factory.h"
++
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/global_media_controls/media_notification_service_factory.h"
++#include "chrome/browser/ui/rac/media/rac_media_controls.h"
++
++namespace rac {
++
++// static
++RacMediaControls* RacMediaControlsFactory::GetForProfile(Profile* profile) {
++  return static_cast<RacMediaControls*>(
++      GetInstance()->GetServiceForBrowserContext(profile, true));
++}
++
++// static
++RacMediaControlsFactory* RacMediaControlsFactory::GetInstance() {
++  static base::NoDestructor<RacMediaControlsFactory> instance;
++  return instance.get();
++}
++
++RacMediaControlsFactory::RacMediaControlsFactory()
++    : ProfileKeyedServiceFactory(
++          "RacMediaControls",
++          ProfileSelections::Builder()
++              .WithRegular(ProfileSelection::kOwnInstance)
++              .WithGuest(ProfileSelection::kOwnInstance)
++              .WithSystem(ProfileSelection::kNone)
++              .WithAshInternals(ProfileSelection::kNone)
++              .Build()) {
++  // The service reads MediaNotificationService's item manager during
++  // Shutdown, so the notification service must still be alive then.
++  DependsOn(MediaNotificationServiceFactory::GetInstance());
++}
++
++RacMediaControlsFactory::~RacMediaControlsFactory() = default;
++
++std::unique_ptr<KeyedService>
++RacMediaControlsFactory::BuildServiceInstanceForBrowserContext(
++    content::BrowserContext* context) const {
++  return std::make_unique<RacMediaControls>(
++      Profile::FromBrowserContext(context));
++}
++
++// Nothing registers until a window's sidebar asks, so the service only
++// exists once a sidebar does.
++bool RacMediaControlsFactory::ServiceIsCreatedWithBrowserContext() const {
++  return false;
++}
++
++bool RacMediaControlsFactory::ServiceIsNULLWhileTesting() const {
++  return true;
++}
++
++}  // namespace rac
+Index: src/chrome/browser/ui/rac/media/rac_media_controls_factory.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/rac/media/rac_media_controls_factory.h	2026-11-07 23:46:09.164864559 -0800
+@@ -0,0 +1,42 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_MEDIA_RAC_MEDIA_CONTROLS_FACTORY_H_
++#define CHROME_BROWSER_UI_RAC_MEDIA_RAC_MEDIA_CONTROLS_FACTORY_H_
++
++#include <memory>
++
++#include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile_keyed_service_factory.h"
++
++class Profile;
++
++namespace rac {
++
++class RacMediaControls;
++
++// Lazy per-profile service: incognito windows get their own, matching
++// MediaNotificationService's own-instance selection, so an incognito
++// sidebar shows only incognito media.
++class RacMediaControlsFactory : public ProfileKeyedServiceFactory {
++ public:
++  static RacMediaControls* GetForProfile(Profile* profile);
++  static RacMediaControlsFactory* GetInstance();
++
++ private:
++  friend base::NoDestructor<RacMediaControlsFactory>;
++
++  RacMediaControlsFactory();
++  ~RacMediaControlsFactory() override;
++
++  // ProfileKeyedServiceFactory:
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override;
++  bool ServiceIsCreatedWithBrowserContext() const override;
++  bool ServiceIsNULLWhileTesting() const override;
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_RAC_MEDIA_RAC_MEDIA_CONTROLS_FACTORY_H_
+Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc	2026-11-07 23:12:50.343003000 -0800
++++ src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc	2026-11-07 23:13:15.318413361 -0800
+@@ -36,15 +36,16 @@
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/ui_features.h"
++#include "chrome/browser/ui/view_ids.h"
+ #include "chrome/browser/ui/views/animations/tab_strip_animations.h"
+ #include "chrome/browser/ui/views/frame/base_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+-#include "chrome/browser/ui/view_ids.h"
+ #include "chrome/browser/ui/views/frame/custom_corners_background.h"
+ #include "chrome/browser/ui/views/frame/frame_separator.h"
+ #include "chrome/browser/ui/views/frame/safe_invoke/safe_invoke.h"
+ #include "chrome/browser/ui/views/frame/shadow_frame_view.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
++#include "chrome/browser/ui/views/rac/media/rac_media_controls_view.h"
+ #include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h"
+ #include "chrome/browser/ui/views/rac/spaces/space_tint_background.h"
+ #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
+@@ -169,6 +170,14 @@
+   gemini_button_ =
+       content_area_view_->AddChildView(std::make_unique<views::View>());
+ 
++  // rac: the media controls sit at the bottom of the strip, above the
++  // footer, and show only while media is playing.
++  media_controls_ = content_area_view_->AddChildView(
++      std::make_unique<rac::RacMediaControlsView>(browser_view->browser()));
++  media_controls_->SetProperty(
++      views::kMarginsKey, gfx::Insets::TLBR(0, region_horizontal_padding, 0,
++                                            region_horizontal_padding));
++
+   auto* footer = content_area_view_->AddChildView(
+       std::make_unique<RacSidebarFooterView>(region_horizontal_padding));
+   // Profile, space dots, and the app menu share the last row of the sidebar.
+Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h	2026-11-07 23:12:50.379685000 -0800
++++ src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h	2026-11-07 23:12:50.500686227 -0800
+@@ -40,6 +40,7 @@
+ class VerticalTabStripFocusSwipeController;
+ 
+ namespace rac {
++class RacMediaControlsView;
+ class SpaceSwitcherView;
+ class SpaceSwipeController;
+ }  // namespace rac
+@@ -277,6 +278,8 @@
+   raw_ptr<views::View> gemini_button_ = nullptr;
+   // rac: the space switcher at the bottom of the strip.
+   raw_ptr<rac::SpaceSwitcherView> space_switcher_ = nullptr;
++  // rac: the media controls above the footer, shown while media plays.
++  raw_ptr<rac::RacMediaControlsView> media_controls_ = nullptr;
+   raw_ptr<views::ResizeArea> resize_area_ = nullptr;
+   raw_ptr<ShadowFrameView> shadow_frame_ = nullptr;
+   int resize_area_width_;
+Index: src/chrome/browser/ui/views/rac/media/rac_media_controls_view.cc
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/views/rac/media/rac_media_controls_view.cc	2026-11-08 00:02:27.666772676 -0800
+@@ -0,0 +1,170 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/media/rac_media_controls_view.h"
++
++#include <memory>
++#include <utility>
++
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/global_media_controls/media_notification_service.h"
++#include "chrome/browser/ui/global_media_controls/media_notification_service_factory.h"
++#include "chrome/browser/ui/rac/media/rac_media_controls_factory.h"
++#include "chrome/browser/ui/views/global_media_controls/media_item_ui_helper.h"
++#include "components/global_media_controls/public/constants.h"
++#include "components/global_media_controls/public/views/media_item_ui_list_view.h"
++#include "components/global_media_controls/public/views/media_item_ui_updated_view.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/views/layout/fill_layout.h"
++#include "ui/views/widget/widget.h"
++
++namespace rac {
++
++namespace {
++
++// One full card plus a peek of the next when several sessions are active.
++constexpr int kMaxListHeight = 280;
++
++}  // namespace
++
++RacMediaControlsView::RacMediaControlsView(BrowserWindowInterface* browser)
++    : profile_(browser->GetProfile()),
++      service_(MediaNotificationServiceFactory::GetForProfile(profile_)),
++      controls_(RacMediaControlsFactory::GetForProfile(profile_)),
++      media_color_theme_(GetMediaColorTheme()) {
++  SetVisible(false);
++  SetLayoutManager(std::make_unique<views::FillLayout>());
++
++  list_view_ = AddChildView(
++      std::make_unique<global_media_controls::MediaItemUIListView>());
++  list_view_->ClipHeightTo(0, kMaxListHeight);
++}
++
++RacMediaControlsView::~RacMediaControlsView() {
++  if (registered_ && controls_) {
++    registered_ = false;
++    controls_->RemoveDisplay(this);
++  }
++  // The item views must die while |items_| is still alive: each one reports
++  // OnMediaItemUIDestroyed on its way out.
++  ClearMediaItems();
++}
++
++global_media_controls::MediaItemUI* RacMediaControlsView::ShowMediaItem(
++    const std::string& id,
++    base::WeakPtr<media_message_center::MediaNotificationItem> item) {
++  if (items_.contains(id)) {
++    HideMediaItem(id);
++  }
++  if (!item) {
++    return nullptr;
++  }
++
++  auto view = std::make_unique<global_media_controls::MediaItemUIUpdatedView>(
++      id, item, media_color_theme_,
++      BuildDeviceSelector(
++          id, item, service_, service_, profile_->GetOriginalProfile(),
++          global_media_controls::GlobalMediaControlsEntryPoint::kToolbarIcon,
++          media_color_theme_, /*show_devices=*/false),
++      BuildFooter(id, item,
++                                         profile_->GetOriginalProfile(),
++                                         media_color_theme_));
++  view->AddObserver(this);
++  auto* view_ptr = view.get();
++  items_[id] = view_ptr;
++  list_view_->ShowUpdatedItem(id, std::move(view));
++
++  UpdateVisibility();
++  return view_ptr;
++}
++
++void RacMediaControlsView::HideMediaItem(const std::string& id) {
++  const auto it = items_.find(id);
++  if (it == items_.end()) {
++    return;
++  }
++  it->second->RemoveObserver(this);
++  items_.erase(it);
++  list_view_->HideUpdatedItem(id);
++  UpdateVisibility();
++}
++
++void RacMediaControlsView::RefreshMediaItem(
++    const std::string& id,
++    base::WeakPtr<media_message_center::MediaNotificationItem> item) {
++  const auto it = items_.find(id);
++  if (it == items_.end() || !item) {
++    return;
++  }
++  Profile* const original = profile_->GetOriginalProfile();
++  it->second->UpdateFooterView(
++      BuildFooter(id, item, original,
++                                         media_color_theme_));
++  it->second->UpdateDeviceSelectorView(
++      BuildDeviceSelector(
++          id, item, service_, service_, original,
++          global_media_controls::GlobalMediaControlsEntryPoint::kToolbarIcon,
++          media_color_theme_, /*show_devices=*/false));
++}
++
++void RacMediaControlsView::ClearMediaItems() {
++  for (const auto& [id, view] : items_) {
++    view->RemoveObserver(this);
++    list_view_->HideUpdatedItem(id);
++  }
++  items_.clear();
++  UpdateVisibility();
++}
++
++void RacMediaControlsView::OnMediaItemUISizeChanged() {
++  PreferredSizeChanged();
++}
++
++void RacMediaControlsView::OnMediaItemUIDestroyed(const std::string& id) {
++  // The view is already gone; drop only the bookkeeping entry.
++  items_.erase(id);
++}
++
++void RacMediaControlsView::AddedToWidget() {
++  views::View::AddedToWidget();
++  widget_observation_.Observe(GetWidget());
++  if (controls_ && !registered_) {
++    registered_ = true;
++    controls_->AddDisplay(this);
++  }
++  if (GetWidget()->IsActive() && controls_) {
++    controls_->SetActiveDisplay(this);
++  }
++}
++
++void RacMediaControlsView::RemovedFromWidget() {
++  widget_observation_.Reset();
++  if (registered_ && controls_) {
++    registered_ = false;
++    controls_->RemoveDisplay(this);
++  }
++  views::View::RemovedFromWidget();
++}
++
++void RacMediaControlsView::OnWidgetActivationChanged(views::Widget* widget,
++                                                     bool active) {
++  if (active && controls_) {
++    controls_->SetActiveDisplay(this);
++  }
++}
++
++void RacMediaControlsView::UpdateVisibility() {
++  const bool show = !items_.empty();
++  if (show == GetVisible()) {
++    return;
++  }
++  SetVisible(show);
++  PreferredSizeChanged();
++}
++
++BEGIN_METADATA(RacMediaControlsView)
++END_METADATA
++
++}  // namespace rac
+Index: src/chrome/browser/ui/views/rac/media/rac_media_controls_view.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ src/chrome/browser/ui/views/rac/media/rac_media_controls_view.h	2026-11-07 23:46:13.766835039 -0800
+@@ -0,0 +1,91 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_MEDIA_RAC_MEDIA_CONTROLS_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_MEDIA_RAC_MEDIA_CONTROLS_VIEW_H_
++
++#include <map>
++#include <string>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/ui/rac/media/rac_media_controls.h"
++#include "components/global_media_controls/public/media_item_ui_observer.h"
++#include "components/media_message_center/notification_theme.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/view.h"
++#include "ui/views/widget/widget_observer.h"
++
++class BrowserWindowInterface;
++class MediaNotificationService;
++class Profile;
++
++namespace global_media_controls {
++class MediaItemUIListView;
++class MediaItemUIUpdatedView;
++}  // namespace global_media_controls
++
++namespace rac {
++
++// The media controls at the bottom of the sidebar, just above the footer.
++// Shows Chromium's own media item views (artwork, source, title, transport
++// controls, progress) while the profile has controllable media, and is
++// hidden -- taking no space -- when there's nothing to control. The shared
++// item views live here only while this window's sidebar is the profile's
++// active display; see RacMediaControls.
++class RacMediaControlsView : public views::View,
++                             public RacMediaControls::Display,
++                             public global_media_controls::MediaItemUIObserver,
++                             public views::WidgetObserver {
++  METADATA_HEADER(RacMediaControlsView, views::View)
++
++ public:
++  explicit RacMediaControlsView(BrowserWindowInterface* browser);
++  RacMediaControlsView(const RacMediaControlsView&) = delete;
++  RacMediaControlsView& operator=(const RacMediaControlsView&) = delete;
++  ~RacMediaControlsView() override;
++
++  // RacMediaControls::Display:
++  global_media_controls::MediaItemUI* ShowMediaItem(
++      const std::string& id,
++      base::WeakPtr<media_message_center::MediaNotificationItem> item) override;
++  void HideMediaItem(const std::string& id) override;
++  void RefreshMediaItem(
++      const std::string& id,
++      base::WeakPtr<media_message_center::MediaNotificationItem> item) override;
++  void ClearMediaItems() override;
++
++  // global_media_controls::MediaItemUIObserver:
++  void OnMediaItemUISizeChanged() override;
++  void OnMediaItemUIDestroyed(const std::string& id) override;
++
++  // views::View:
++  void AddedToWidget() override;
++  void RemovedFromWidget() override;
++
++  // views::WidgetObserver:
++  void OnWidgetActivationChanged(views::Widget* widget, bool active) override;
++
++ private:
++  void UpdateVisibility();
++
++  const raw_ptr<Profile> profile_;
++  const raw_ptr<MediaNotificationService> service_;
++  const raw_ptr<RacMediaControls> controls_;
++  media_message_center::MediaColorTheme media_color_theme_;
++
++  raw_ptr<global_media_controls::MediaItemUIListView> list_view_ = nullptr;
++  std::map<std::string, raw_ptr<global_media_controls::MediaItemUIUpdatedView>>
++      items_;
++
++  bool registered_ = false;
++
++  base::ScopedObservation<views::Widget, views::WidgetObserver>
++      widget_observation_{this};
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_MEDIA_RAC_MEDIA_CONTROLS_VIEW_H_
+Index: src/components/global_media_controls/public/views/media_item_ui_updated_view.cc
+===================================================================
+--- src.orig/components/global_media_controls/public/views/media_item_ui_updated_view.cc	2026-11-07 23:12:50.304532000 -0800
++++ src/components/global_media_controls/public/views/media_item_ui_updated_view.cc	2026-11-07 23:12:50.499637856 -0800
+@@ -353,8 +353,11 @@
+ 
+ gfx::Size MediaItemUIUpdatedView::CalculatePreferredSize(
+     const views::SizeBounds& available_size) const {
+-  auto size = GetLayoutManager()->GetPreferredSize(this, {kFixedWidth, {}});
+-  return gfx::Size(kFixedWidth, size.height());
++  // rac: let narrower containers, such as rac's sidebar, shrink the card.
++  const int width =
++      std::min(available_size.width().value_or(kFixedWidth), kFixedWidth);
++  auto size = GetLayoutManager()->GetPreferredSize(this, {width, {}});
++  return gfx::Size(width, size.height());
+ }
+ 
+ void MediaItemUIUpdatedView::AddedToWidget() {
+Index: src/components/global_media_controls/media_item_manager_impl.cc
+===================================================================
+--- src.orig/components/global_media_controls/media_item_manager_impl.cc	2026-10-19 13:07:21.000000000 -0700
++++ src/components/global_media_controls/media_item_manager_impl.cc	2026-11-07 23:46:09.155839398 -0800
+@@ -193,7 +193,11 @@
+ 
+ void MediaItemManagerImpl::SetDialogDelegateCommon(
+     MediaDialogDelegate* delegate) {
+-  DCHECK(!delegate || !dialog_delegate_);
++  // rac: the sidebar's media controls hold the delegate between dialogs, so
++  // a newly opened dialog replaces them rather than tripping this check.
++  if (dialog_delegate_ == delegate) {
++    return;
++  }
+   dialog_delegate_ = delegate;
+ 
+   if (dialog_delegate_) {
