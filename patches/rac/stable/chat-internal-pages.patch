@@ -1,0 +1,307 @@
+--- a/chrome/browser/ui/views/rac/ai/assistant_side_panel.h
++++ b/chrome/browser/ui/views/rac/ai/assistant_side_panel.h
+@@ -44,6 +44,16 @@ bool AskAssistant(BrowserWindowInterface
+ // True if AskAssistant() would work in `browser`.
+ bool CanAskAssistant(BrowserWindowInterface* browser);
+ 
++// True when the assistant may be offered on `browser`'s active tab: not on
++// internal pages (rac://, which is chrome:// inside).
++bool IsAssistantPageAllowed(BrowserWindowInterface* browser);
++
++// Runs `callback` when the active tab's page may have changed whether the
++// assistant is allowed, so views that gate on it can refresh.
++base::CallbackListSubscription AddAssistantPageAllowedCallback(
++    BrowserWindowInterface* browser,
++    base::RepeatingClosure callback);
++
+ // The prompt AskAssistant() left for `browser`'s panel, if it was left a
+ // moment ago. Taking it clears it, so only one page sends it.
+ std::optional<std::string> TakeAssistantPrompt(BrowserWindowInterface* browser);
+--- a/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
++++ b/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
+@@ -15,6 +15,7 @@
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
+ #include "cc/paint/paint_flags.h"
++#include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/file_select_helper.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+@@ -22,5 +23,6 @@
+ #include "chrome/browser/rac/ai/ai_service_factory.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/side_panel/side_panel_entry.h"
+ #include "chrome/browser/ui/side_panel/side_panel_entry_id.h"
+ #include "chrome/browser/ui/side_panel/side_panel_entry_key.h"
+@@ -30,5 +32,8 @@
+ #include "chrome/browser/ui/side_panel/side_panel_registry.h"
+ #include "chrome/browser/ui/side_panel/side_panel_ui.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "chrome/browser/ui/views/rac/ai/assistant_actions.h"
++#include "content/public/common/url_constants.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/custom_corners_background.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_background_view.h"
+@@ -106,7 +111,14 @@ class AssistantPanelState {
+   base::CallbackListSubscription AddPromptCallback(
+       base::RepeatingClosure callback) {
+     return prompt_callbacks_.Add(std::move(callback));
+   }
++
++  void NotifyPageChanged() { page_callbacks_.Notify(); }
++
++  base::CallbackListSubscription AddPageAllowedCallback(
++      base::RepeatingClosure callback) {
++    return page_callbacks_.Add(std::move(callback));
++  }
+ 
+  private:
+   // A panel that never loads must not send the prompt much later, when the
+@@ -123,6 +136,7 @@ class AssistantPanelState {
+   bool open_ = false;
+   base::RepeatingClosureList callbacks_;
+   base::RepeatingClosureList prompt_callbacks_;
++  base::RepeatingClosureList page_callbacks_;
+   std::optional<std::string> prompt_;
+   base::TimeTicks prompt_time_;
+   base::CallbackListSubscription close_subscription_;
+@@ -401,13 +417,106 @@ class EntryRegistrar : public SidePanelE
+ 
+ }  // namespace
+ 
++namespace {
++
++// The assistant is page-scoped: internal pages (rac://, chrome:// inside)
++// have nothing for it to read and must not show it.
++bool AssistantAllowedOnActiveTab(BrowserWindowInterface* browser) {
++  content::WebContents* contents =
++      browser->GetTabStripModel()->GetActiveWebContents();
++  return !contents ||
++         !contents->GetLastCommittedURL().SchemeIs(content::kChromeUIScheme);
++}
++
++// Applies the internal-page rule for `browser`: an open panel closes on a
++// rac:// page, and the views that gate on the page refresh. Owns itself; it
++// lives as long as the window.
++class PageGate : public TabStripModelObserver,
++                 public content::WebContentsObserver {
++ public:
++  DECLARE_USER_DATA(PageGate);
++
++  static PageGate* From(BrowserWindowInterface* browser) {
++    return Get(browser->GetUnownedUserDataHost());
++  }
++
++  static PageGate* GetOrCreate(BrowserWindowInterface* browser) {
++    if (PageGate* gate = From(browser)) {
++      return gate;
++    }
++    return new PageGate(browser);
++  }
++
++  PageGate(const PageGate&) = delete;
++  PageGate& operator=(const PageGate&) = delete;
++
++ private:
++  explicit PageGate(BrowserWindowInterface* browser)
++      : browser_(browser),
++        scoped_data_(browser->GetUnownedUserDataHost(), *this) {
++    browser_->GetTabStripModel()->AddObserver(this);
++    Update();
++  }
++
++  ~PageGate() override {
++    browser_->GetTabStripModel()->RemoveObserver(this);
++  }
++
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(TabStripModel*,
++                              const TabStripModelChange&,
++                              const TabStripSelectionChange&) override {
++    Update();
++  }
++
++  void OnTabChangedAt(tabs::TabInterface* tab, TabChangeType) override {
++    if (tab == browser_->GetActiveTabInterface()) {
++      Update();
++    }
++  }
++
++  // content::WebContentsObserver:
++  void PrimaryPageChanged(content::Page&) override { Update(); }
++
++  void Update() {
++    content::WebContents* contents =
++        browser_->GetTabStripModel()->GetActiveWebContents();
++    if (contents != web_contents()) {
++      Observe(contents);
++    }
++    const bool allowed = AssistantAllowedOnActiveTab(browser_);
++    if (AssistantPanelState* state = AssistantPanelState::From(browser_)) {
++      state->NotifyPageChanged();
++      if (!allowed) {
++        if (SidePanelUI* ui = SidePanelUI::From(browser_);
++            ui && ui->IsSidePanelEntryShowing(
++                      SidePanelEntry::Key(SidePanelEntry::Id::kRacAi))) {
++          ui->Close();
++        }
++      }
++    }
++    // Menus and shortcuts follow the active page.
++    chrome::BrowserCommandController::From(browser_)
++        ->UpdateCommandEnabled(IDC_RAC_ASSISTANT_TOGGLE,
++                               CanRunAssistantCommand(browser_));
++  }
++
++  const raw_ptr<BrowserWindowInterface> browser_;
++  ui::ScopedUnownedUserData<PageGate> scoped_data_;
++};
++
++DEFINE_USER_DATA(PageGate);
++
++}  // namespace
++
+ void RegisterAssistantSidePanelForTab(tabs::TabInterface* tab,
+                                       SidePanelRegistry* registry) {
+   BrowserWindowInterface* browser = tab->GetBrowserWindowInterface();
+   if (!browser || !browser->GetProfile()->IsRegularProfile() ||
+       browser->GetType() != BrowserWindowInterface::Type::TYPE_NORMAL) {
+     return;
+   }
++  PageGate::GetOrCreate(browser);
+   // Owns itself; see EntryRegistrar.
+   new EntryRegistrar(tab, registry);
+ }
+@@ -447,7 +549,10 @@ bool CanAskAssistant(BrowserWindowInterf
+   if (!profile->IsRegularProfile() ||
+       browser->GetType() != BrowserWindowInterface::Type::TYPE_NORMAL) {
+     return false;
+   }
++  if (!IsAssistantPageAllowed(browser)) {
++    return false;
++  }
+   AiService* service = AiServiceFactory::GetForProfile(profile);
+   return service && service->HasUsableProvider();
+ }
+@@ -456,6 +560,18 @@ bool CanAskAssistant(BrowserWindowInterf
+   return state ? state->TakePrompt() : std::nullopt;
+ }
+ 
++bool IsAssistantPageAllowed(BrowserWindowInterface* browser) {
++  return AssistantAllowedOnActiveTab(browser);
++}
++
++base::CallbackListSubscription AddAssistantPageAllowedCallback(
++    BrowserWindowInterface* browser,
++    base::RepeatingClosure callback) {
++  PageGate::GetOrCreate(browser);
++  return AssistantPanelState::GetOrCreate(browser)->AddPageAllowedCallback(
++      std::move(callback));
++}
++
+ base::CallbackListSubscription AddAssistantPromptCallback(
+     BrowserWindowInterface* browser,
+     base::RepeatingClosure callback) {
+--- a/chrome/browser/ui/views/rac/ai/assistant_actions.cc
++++ b/chrome/browser/ui/views/rac/ai/assistant_actions.cc
+@@ -22,5 +22,6 @@
+ #include "chrome/browser/ui/side_panel/side_panel_ui.h"
+ #include "chrome/browser/ui/singleton_tabs.h"
++#include "chrome/browser/ui/views/rac/ai/assistant_side_panel.h"
+ #include "chrome/browser/ui/window_feature_controller/window_feature_controller.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "components/prefs/pref_service.h"
+@@ -61,7 +62,10 @@ void ToggleAssistant(BrowserWindowInterf
+   Profile* profile = browser->GetProfile();
+   if (!profile->IsRegularProfile()) {
+     return;
+   }
++  if (!IsAssistantPageAllowed(browser)) {
++    return;
++  }
+   if (!IsAiEnabled(profile->GetPrefs())) {
+     ShowSingletonTab(browser, GURL("chrome://settings/assistant"));
+     return;
+@@ -76,7 +80,8 @@ bool CanRunAssistantCommand(BrowserWindo
+   Profile* profile = browser->GetProfile();
+   return profile->IsRegularProfile() && IsAiEnabled(profile->GetPrefs()) &&
+          WindowFeatureController::From(browser)->SupportsWindowFeature(
+-             WindowFeatureController::WindowFeature::kFeatureTabStrip);
++             WindowFeatureController::WindowFeature::kFeatureTabStrip) &&
++         IsAssistantPageAllowed(browser);
+ }
+ 
+ void UpdateAssistantCommand(BrowserWindowInterface* browser,
+@@ -136,7 +141,17 @@ actions::ActionItem* CreateAssistantActi
+                                            BrowserWindowInterface* browser) {
+   return root->AddChild(
+       actions::ActionItem::Builder(
+-          CreateToggleSidePanelActionCallback(
+-              SidePanelEntryKey(SidePanelEntryId::kRacAi), browser))
++          base::BindRepeating(
++              [](BrowserWindowInterface* bwi, actions::ActionItem*,
++                 actions::ActionInvocationContext context) {
++                if (!IsAssistantPageAllowed(bwi)) {
++                  return;
++                }
++                SidePanelUI::From(bwi)->Toggle(
++                    SidePanelEntryKey(SidePanelEntryId::kRacAi),
++                    static_cast<SidePanelOpenTrigger>(
++                        context.GetProperty(kSidePanelOpenTriggerKey)));
++              },
++              browser))
+           .SetActionId(kActionSidePanelShowRacAi)
+           .SetText(u"Assistant")
+--- a/chrome/browser/ui/views/rac/top_bar.cc
++++ b/chrome/browser/ui/views/rac/top_bar.cc
+@@ -180,9 +180,13 @@ class ChatButtonHost : public views::Vie
+     if (enabled && !panel_subscription_) {
+       panel_subscription_ = ai::AddAssistantPanelOpenCallback(
+           browser_, base::BindRepeating(&ChatButtonHost::OnLayoutChanged,
+                                         base::Unretained(this)));
++      page_subscription_ = ai::AddAssistantPageAllowedCallback(
++          browser_, base::BindRepeating(&ChatButtonHost::OnLayoutChanged,
++                                        base::Unretained(this)));
+     } else if (!enabled) {
+       panel_subscription_ = {};
++      page_subscription_ = {};
+     }
+     if (enabled && IsTopBar(browser_)) {
+       if (children().empty()) {
+@@ -196,7 +199,8 @@ class ChatButtonHost : public views::Vie
+     } else if (!children().empty()) {
+       RemoveChildViewT(children().front());
+     }
+-    SetVisible(!children().empty() && !ai::IsAssistantPanelOpen(browser_));
++    SetVisible(!children().empty() && !ai::IsAssistantPanelOpen(browser_) &&
++               ai::IsAssistantPageAllowed(browser_));
+     PreferredSizeChanged();
+     if (parent()) {
+       parent()->InvalidateLayout();
+@@ -206,4 +210,5 @@ class ChatButtonHost : public views::Vie
+   raw_ptr<BrowserWindowInterface> browser_;
+   PrefChangeRegistrar pref_change_registrar_;
+   base::CallbackListSubscription panel_subscription_;
++  base::CallbackListSubscription page_subscription_;
+ };
+--- a/chrome/browser/ui/views/rac/ai/assistant_edge_handle.cc
++++ b/chrome/browser/ui/views/rac/ai/assistant_edge_handle.cc
+@@ -21,6 +21,7 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/contents_container_view.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_view.h"
++#include "chrome/browser/ui/views/rac/ai/assistant_side_panel.h"
+ #include "chrome/browser/ui/views/rac/ai/assistant_actions.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel.h"
+ #include "components/prefs/pref_change_registrar.h"
+@@ -154,6 +155,7 @@ class AssistantEdgeHandle : public views
+     // The top bar layout has the Chat button instead.
+     const PrefService* prefs =
+         browser_view_->browser()->GetProfile()->GetPrefs();
+-    if (rac::GetLayout(prefs) == rac::Layout::kTopBar || !IsAiEnabled(prefs)) {
++    if (rac::GetLayout(prefs) == rac::Layout::kTopBar || !IsAiEnabled(prefs) ||
++        !IsAssistantPageAllowed(browser_view_->browser())) {
+       return gfx::Rect();
+     }
