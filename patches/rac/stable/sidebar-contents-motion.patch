@@ -1,0 +1,245 @@
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn
++++ src/chrome/browser/ui/BUILD.gn
+@@ -3751,4 +3751,6 @@
+       "views/rac/sidebar_address_bar/sidebar_header_view.h",
++      "views/rac/sidebar_reveal/sidebar_contents_motion.cc",
++      "views/rac/sidebar_reveal/sidebar_contents_motion.h",
+       "views/rac/sidebar_reveal/sidebar_overshoot.h",
+       "views/rac/sidebar_reveal/sidebar_overshoot.mm",
+       "views/rac/sidebar_reveal/sidebar_reveal_motion.h",
+Index: src/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ src/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -47,5 +47,6 @@
+ #include "chrome/browser/ui/views/rac/infobar_card.h"
+ #include "chrome/browser/ui/views/rac/rac_look.h"
+ #include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h"
++#include "chrome/browser/ui/views/rac/sidebar_reveal/sidebar_contents_motion.h"
+ #include "chrome/browser/ui/views/rac/spaces/space_tint_background.h"
+ #include "chrome/browser/ui/views/rac/top_bar.h"
+@@ -1542,8 +1542,11 @@
+   const bool is_origin_changing =
+       (side_panel_is_animating && !views().side_panel->IsRightAligned()) ||
+       (vertical_tab_strip_animation.current_motion && !base::i18n::IsRTL());
+   views().multi_contents_view->SetIsAnimatingContent(
+-      side_panel_is_animating || vertical_tab_strip_animation.current_motion,
++      side_panel_is_animating ||
++          vertical_tab_strip_animation.current_motion ||
++          rac::SidebarContentsMotionRunning(
++              views::AsViewClass<BrowserView>(views().browser_view.get())),
+       is_origin_changing);
+ 
+   // Lay out contents container. The contents container contains the multi-
+@@ -1567,9 +1570,12 @@
+     content_right =
+         std::min(content_right, browser_params.visual_client_area.right());
+   }
+   auto& contents_layout =
+       layout.AddChild(views().multi_contents_view,
+-                      gfx::Rect(content_left, params.visual_client_area.y(),
+-                                content_right - content_left,
+-                                params.visual_client_area.height()));
++                      rac::SidebarContentsBounds(
++                          views::AsViewClass<BrowserView>(
++                              views().browser_view.get()),
++                          gfx::Rect(content_left, params.visual_client_area.y(),
++                                    content_right - content_left,
++                                    params.visual_client_area.height())));
+ 
+   // Maybe expand and clip the web contents to avoid issues during animation.
+   if (features::UseSidePanelFlyoverAnimation()) {
+Index: src/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_contents_motion.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_contents_motion.cc
+@@ -0,0 +1,140 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/sidebar_reveal/sidebar_contents_motion.h"
++
++#include <memory>
++
++#include "base/memory/raw_ptr.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/rac/motion/rac_motion.h"
++#include "chrome/browser/ui/views/rac/rac_tokens.h"
++#include "ui/base/class_property.h"
++#include "ui/gfx/animation/linear_animation.h"
++#include "ui/gfx/animation/tween.h"
++#include "ui/views/view.h"
++#include "ui/views/widget/widget.h"
++
++namespace rac {
++class SidebarContentsMotion;
++}
++
++DEFINE_UI_CLASS_PROPERTY_TYPE(rac::SidebarContentsMotion*)
++
++namespace rac {
++
++namespace {
++
++// One resize of the page when the sidebar docks or hides, from the bounds
++// the contents had before the toggle to what each layout now computes.
++// The sidebar itself moves as a layer (SidebarSlide); this moves the page
++// alongside it so sites relayout per frame instead of teleporting to the
++// new width. Lives on the browser view only while its animation runs, so
++// it costs nothing between toggles.
++class SidebarContentsMotion : public gfx::AnimationDelegate {
++ public:
++  explicit SidebarContentsMotion(BrowserView* browser_view)
++      : browser_view_(browser_view),
++        animation_(tokens::kCard.duration,
++                   gfx::LinearAnimation::kDefaultFrameRate,
++                   this) {
++    animation_.SetTweenType(gfx::Tween::EASE_IN_OUT);
++  }
++  SidebarContentsMotion(const SidebarContentsMotion&) = delete;
++  SidebarContentsMotion& operator=(const SidebarContentsMotion&) = delete;
++  // No callbacks while dying: animation_'s teardown could otherwise report
++  // a cancel into this object, and its ClearProperty would free whatever
++  // newer motion already took the key.
++  ~SidebarContentsMotion() override { animation_.set_delegate(nullptr); }
++
++  void Begin(const gfx::Rect& from) {
++    from_ = from;
++    animation_.Start();
++  }
++
++  gfx::Rect Bounds(const gfx::Rect& target) const {
++    return gfx::Tween::RectValueBetween(animation_.GetCurrentValue(), from_,
++                                        target);
++  }
++
++ private:
++  // gfx::AnimationDelegate:
++  void AnimationProgressed(const gfx::Animation* animation) override {
++    Relayout(browser_view_);
++  }
++  void AnimationEnded(const gfx::Animation* animation) override {
++    BrowserView* browser_view = browser_view_;
++    // Deletes this. Only `browser_view` may be used from here on.
++    browser_view->ClearProperty(kSidebarContentsMotionKey);
++    Relayout(browser_view);
++  }
++  void AnimationCanceled(const gfx::Animation* animation) override {
++    AnimationEnded(animation);
++  }
++
++  // Lays out right away, so every tick lands on its own frame rather than
++  // whenever the next paint happens to arrive.
++  static void Relayout(BrowserView* browser_view) {
++    if (!browser_view) {
++      return;
++    }
++    browser_view->InvalidateLayout();
++    if (views::Widget* widget = browser_view->GetWidget()) {
++      widget->LayoutRootViewIfNecessary();
++    }
++  }
++
++  const raw_ptr<BrowserView> browser_view_;
++  gfx::Rect from_;
++  gfx::LinearAnimation animation_;
++};
++
++DEFINE_OWNED_UI_CLASS_PROPERTY_KEY(SidebarContentsMotion,
++                                   kSidebarContentsMotionKey)
++
++}  // namespace
++
++void BeginSidebarContentsMotion(BrowserView* browser_view) {
++  if (!browser_view || motion::ReducedMotion()) {
++    return;
++  }
++  views::View* contents = browser_view->multi_contents_view();
++  if (!contents) {
++    return;
++  }
++  auto* motion = browser_view->SetProperty(
++      kSidebarContentsMotionKey,
++      std::make_unique<SidebarContentsMotion>(browser_view));
++  motion->Begin(contents->bounds());
++}
++
++gfx::Rect SidebarContentsBounds(BrowserView* browser_view,
++                                const gfx::Rect& target) {
++  auto* motion = browser_view
++                     ? browser_view->GetProperty(kSidebarContentsMotionKey)
++                     : nullptr;
++  return motion ? motion->Bounds(target) : target;
++}
++
++bool SidebarContentsMotionRunning(BrowserView* browser_view) {
++  return browser_view &&
++         browser_view->GetProperty(kSidebarContentsMotionKey) != nullptr;
++}
++
++}  // namespace rac
+Index: src/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_contents_motion.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_contents_motion.h
+@@ -0,0 +1,38 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_SIDEBAR_CONTENTS_MOTION_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_SIDEBAR_CONTENTS_MOTION_H_
++
++#include "ui/gfx/geometry/rect.h"
++
++class BrowserView;
++
++namespace rac {
++
++// Call just before a docked<->hidden sidebar toggle's layout runs, while
++// the contents still have their old bounds. Starts a bounds animation so
++// the page reaches its new width over tokens::kCard instead of jumping
++// there in one frame. No-op under reduced motion.
++void BeginSidebarContentsMotion(BrowserView* browser_view);
++
++// The contents bounds the layout should use this frame: `target` lerped
++// from the pre-toggle bounds by the running animation, or `target`
++// unchanged when no motion runs.
++gfx::Rect SidebarContentsBounds(BrowserView* browser_view,
++                                const gfx::Rect& target);
++
++// True while a bounds animation runs, so the contents can treat itself as
++// animating.
++bool SidebarContentsMotionRunning(BrowserView* browser_view);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_SIDEBAR_CONTENTS_MOTION_H_
+Index: src/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.mm
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.mm
++++ src/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.mm
+@@ -19,4 +19,5 @@
+ #include "chrome/browser/ui/views/rac/motion/rac_motion.h"
+ #include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h"
++#include "chrome/browser/ui/views/rac/sidebar_reveal/sidebar_contents_motion.h"
+ #include "chrome/browser/ui/views/rac/rac_tokens.h"
+ #include "ui/base/class_property.h"
+@@ -340,7 +341,12 @@
+         std::make_unique<SidebarSlide>(browser_view, sidebar));
+   }
+   slide->set_showing(show);
+   // Lay out once, at rest: the sidebar where it ends up or, sliding out,
+-  // where it is. On Cmd+S the page takes its new width here, once.
++  // where it is. On Cmd+S the page starts moving to its new width here.
++  if (dock) {
++    // The sidebar slides on its layer; this walks the page's bounds over
++    // the same span so it relayouts per frame instead of teleporting.
++    BeginSidebarContentsMotion(browser_view);
++  }
+   widget->LayoutRootViewIfNecessary();
+   if (!sidebar->GetVisible()) {
+     slide->Snap();
