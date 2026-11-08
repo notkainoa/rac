@@ -264,3 +264,8 @@ rac includes Helium's GPL-3.0 code and patches, so rac is GPL-3.0. Keep
 `LICENSE`, `LICENSE.ungoogled_chromium`, and upstream credits intact. Before
 copying code from another project, check that its license is compatible and
 credit it.
+
+A feature that ports, copies, or substantially references code from another
+project must add a credits entry so `rac://credits` lists it. See
+[docs/internals/credits.md](docs/internals/credits.md) for where the data
+lives.

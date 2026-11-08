@@ -1,0 +1,217 @@
+Index: src/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ src/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -1220,9 +1220,11 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+ 
+     // Infobars float over the top of the page as cards, so the page card and
+     // its top bar keep their place and rounded top. Without a top bar, the
+-    // card is placed with the infobar container below.
++    // card is placed with the infobar container below. The default-browser
++    // prompt anchors to the bottom of the window instead (below).
+     if (infobar_visible && rac::IsTopBarOnPageCard(views().browser_view) &&
+-        IsParentedTo(views().infobar_container, views().browser_view)) {
++        IsParentedTo(views().infobar_container, views().browser_view) &&
++        !views().infobar_container->HasDefaultBrowserInfoBar()) {
+       // Center on the top bar, which spans the page card only. The top
+       // container also reaches over a chat panel beside the card.
+       gfx::Rect top_bar = top_container_layout.bounds;
+@@ -1475,13 +1477,21 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+         trailing_side_chrome_attached);
+     gfx::Rect infobar_bounds;
+     if (!rac_infobar_bounds && infobar_visible) {
+-      // rac: without a top bar, the card floats over the top of the page
+-      // card, which spans the client area here.
+-      gfx::Rect page_top = params.visual_client_area;
+-      page_top.set_height(should_use_rounded_frame ? rac::kContentCardInset
+-                                                   : 0);
+-      rac_infobar_bounds = rac::GetInfoBarCardBounds(
+-          page_top, views().infobar_container->GetPreferredSize());
++      if (views().infobar_container->HasDefaultBrowserInfoBar()) {
++        // rac: the default-browser prompt floats at the bottom of the
++        // window, bigger than the other cards and without the shadow.
++        rac_infobar_bounds = rac::GetInfoBarBottomCardBounds(
++            params.visual_client_area,
++            views().infobar_container->GetPreferredSize());
++      } else {
++        // rac: without a top bar, the card floats over the top of the page
++        // card, which spans the client area here.
++        gfx::Rect page_top = params.visual_client_area;
++        page_top.set_height(should_use_rounded_frame ? rac::kContentCardInset
++                                                     : 0);
++        rac_infobar_bounds = rac::GetInfoBarCardBounds(
++            page_top, views().infobar_container->GetPreferredSize());
++      }
+     }
+     if (rac_infobar_bounds) {
+       infobar_bounds = *rac_infobar_bounds;
+Index: src/chrome/browser/ui/views/infobars/infobar_container_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/infobars/infobar_container_view.cc
++++ src/chrome/browser/ui/views/infobars/infobar_container_view.cc
+@@ -179,6 +179,12 @@ bool InfoBarContainerView::DoesIntersect
+   });
+ }
+ 
++bool InfoBarContainerView::HasDefaultBrowserInfoBar() const {
++  return std::ranges::any_of(children(), [](const View* child) {
++    return rac::IsDefaultBrowserInfoBar(child);
++  });
++}
++
+ void InfoBarContainerView::Layout(PassKey) {
+   DCHECK_EQ(chrome_border_, children().back());
+   if (rac_card_) {
+Index: src/chrome/browser/ui/views/infobars/infobar_container_view.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/infobars/infobar_container_view.h
++++ src/chrome/browser/ui/views/infobars/infobar_container_view.h
+@@ -35,6 +35,10 @@ class InfoBarContainerView : public view
+   // rac/infobar_card.h.
+   void SetRacCardStyle(bool card);
+ 
++  // True when a visible infobar is the default-browser prompt, which the
++  // layout anchors to the bottom of the window instead of the top.
++  bool HasDefaultBrowserInfoBar() const;
++
+   // views::ViewTargeterDelegate:
+   bool DoesIntersectRect(const views::View* target,
+                          const gfx::Rect& rect) const override;
+Index: src/chrome/browser/ui/views/infobars/infobar_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/infobars/infobar_view.cc
++++ src/chrome/browser/ui/views/infobars/infobar_view.cc
+@@ -491,7 +491,12 @@ void InfoBarView::SetRacCardStyle(bool c
+         views::kMarginsKey,
+         gfx::Insets::TLBR(0, card ? rac::kInfoBarCardCloseGap : margin, 0, 0));
+   }
+-  SetInteriorMargin(card ? rac::GetInfoBarCardInteriorMargin()
++  const bool default_browser_prompt =
++      delegate() && delegate()->GetIdentifier() ==
++                        infobars::InfoBarDelegate::
++                            DEFAULT_BROWSER_INFOBAR_DELEGATE;
++  SetInteriorMargin(card ? rac::GetInfoBarCardInteriorMargin(
++                               default_browser_prompt)
+                          : gfx::Insets::VH(0, margin));
+   layer()->SetRoundedCornerRadius(
+       gfx::RoundedCornersF(card ? rac::kInfoBarCardRadius : 0));
+Index: src/chrome/browser/ui/views/rac/infobar_card.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/infobar_card.cc
++++ src/chrome/browser/ui/views/rac/infobar_card.cc
+@@ -10,6 +10,7 @@
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/views/infobars/infobar_view.h"
+ #include "chrome/browser/ui/views/rac/rac_look.h"
++#include "components/infobars/core/infobar.h"
+ #include "ui/color/color_provider.h"
+ #include "ui/gfx/canvas.h"
+ #include "ui/gfx/geometry/rect_f.h"
+@@ -51,9 +52,12 @@ class InfoBarCardsBackground : public vi
+       cc::PaintFlags fill;
+       fill.setAntiAlias(true);
+       fill.setColor(GetInfoBarCardColor(colors));
+-      fill.setLooper(gfx::CreateShadowDrawLooper(
+-          {gfx::ShadowValue(gfx::Vector2d(0, 2), kCardShadowBlur,
+-                            colors->GetColor(kColorRacTabSelectedShadow))}));
++      // The default-browser prompt draws flat: no drop shadow.
++      if (!IsDefaultBrowserInfoBar(child)) {
++        fill.setLooper(gfx::CreateShadowDrawLooper(
++            {gfx::ShadowValue(gfx::Vector2d(0, 2), kCardShadowBlur,
++                              colors->GetColor(kColorRacTabSelectedShadow))}));
++      }
+       canvas->DrawRoundRect(gfx::RectF(child->bounds()), kInfoBarCardRadius,
+                             fill);
+     }
+@@ -62,8 +66,13 @@ class InfoBarCardsBackground : public vi
+ 
+ }  // namespace
+ 
+-gfx::Insets GetInfoBarCardInteriorMargin() {
+-  return gfx::Insets::TLBR(0, kCardLeadingPadding, 0, kCardTrailingPadding);
++gfx::Insets GetInfoBarCardInteriorMargin(bool default_browser_prompt) {
++  // The default-browser prompt is the one card a user should stop and
++  // read, so it gets more room than the strip infobars.
++  return default_browser_prompt
++             ? gfx::Insets::TLBR(10, 16, 10, kCardTrailingPadding)
++             : gfx::Insets::TLBR(0, kCardLeadingPadding, 0,
++                                 kCardTrailingPadding);
+ }
+ 
+ gfx::Rect GetInfoBarCardBounds(const gfx::Rect& top_bar,
+@@ -75,6 +84,15 @@ gfx::Rect GetInfoBarCardBounds(const gfx
+                    top_bar.bottom(), width, preferred.height());
+ }
+ 
++gfx::Rect GetInfoBarBottomCardBounds(const gfx::Rect& area,
++                                     const gfx::Size& preferred) {
++  const int width =
++      std::min(preferred.width(), area.width() - 2 * kInfoBarCardMargin);
++  return gfx::Rect(area.x() + (area.width() - width) / 2,
++                   area.bottom() - kInfoBarCardMargin - preferred.height(),
++                   width, preferred.height());
++}
++
+ std::unique_ptr<views::Background> CreateInfoBarCardsBackground() {
+   return std::make_unique<InfoBarCardsBackground>();
+ }
+@@ -88,4 +106,14 @@ SkColor GetInfoBarCardColor(const ui::Co
+   return color_provider->GetColor(kColorRacTabBackgroundSelected);
+ }
+ 
++bool IsDefaultBrowserInfoBar(const views::View* view) {
++  if (!views::IsViewClass<InfoBarView>(view)) {
++    return false;
++  }
++  const auto* infobar = static_cast<const InfoBarView*>(view);
++  return infobar->delegate() &&
++         infobar->delegate()->GetIdentifier() ==
++             infobars::InfoBarDelegate::DEFAULT_BROWSER_INFOBAR_DELEGATE;
++}
++
+ }  // namespace rac
+Index: src/chrome/browser/ui/views/rac/infobar_card.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/infobar_card.h
++++ src/chrome/browser/ui/views/rac/infobar_card.h
+@@ -19,6 +19,7 @@ class ColorProvider;
+ namespace views {
+ class Background;
+ class Border;
++class View;
+ }  // namespace views
+ 
+ // In the Top bar layout, infobars float over the top of the page as cards
+@@ -35,14 +36,20 @@ inline constexpr int kInfoBarCardCloseGa
+ // Corner radius of a card, matching the address bar's pill.
+ inline constexpr int kInfoBarCardRadius = 10;
+ 
+-// The infobar's padding inside its card.
+-gfx::Insets GetInfoBarCardInteriorMargin();
++// The infobar's padding inside its card. The default-browser prompt gets
++// a bigger card than the rest.
++gfx::Insets GetInfoBarCardInteriorMargin(bool default_browser_prompt);
+ 
+ // Where the infobar container goes: centered just below `top_bar`, as wide
+ // as its cards but no wider than the bar.
+ gfx::Rect GetInfoBarCardBounds(const gfx::Rect& top_bar,
+                                const gfx::Size& preferred);
+ 
++// Where the default-browser prompt goes: centered along the bottom of
++// `area`, as wide as its card but no wider than the area.
++gfx::Rect GetInfoBarBottomCardBounds(const gfx::Rect& area,
++                                     const gfx::Size& preferred);
++
+ // Paints the shadow of each infobar's card in the container. The infobar
+ // fills its card itself, so its labels draw on an opaque color.
+ std::unique_ptr<views::Background> CreateInfoBarCardsBackground();
+@@ -53,6 +60,9 @@ std::unique_ptr<views::Border> CreateInf
+ // The card's fill, for the labels drawn on it.
+ SkColor GetInfoBarCardColor(const ui::ColorProvider* color_provider);
+ 
++// True when `view` is the default-browser prompt's infobar.
++bool IsDefaultBrowserInfoBar(const views::View* view);
++
+ }  // namespace rac
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_RAC_INFOBAR_CARD_H_
