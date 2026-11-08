@@ -66,7 +66,7 @@ class RemoteRequestsTest(unittest.TestCase):
                      'space-theme 3 dark', 'space-theme -', 'space-new',
                      'pointer off', 'pointer 1.5 2', 'pointer-path 0 0 10 10 200',
                      'target name:x', 'target #2', 'profile-window Profile_2',
-                     'type hello world', 'nstype plain-words_ok'):
+                     'type hello world', 'type cats !w', 'nstype plain-words_ok'):
             self.assertEqual(self.ok(line), (line, []), line)
         # Internal pages also report themselves so the Air can check a
         # chrome://setup run carries an import input.

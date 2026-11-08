@@ -116,9 +116,10 @@ WINDOW_KINDS = {'first', 'normal', 'incognito', 'app', 'popup', 'devtools',
 KEYS = {'return', 'escape', 'tab', 'backspace', 'up', 'down', 'left', 'right'}
 NSPRESS_KEYS = KEYS | {'space', 'home', 'end', 'pageup', 'pagedown'}
 # Typed text is plain words only: ASCII letters, digits, spaces, '-'
-# and '_'. Without dots, colons or slashes it can't spell a URL, a host
+# and '_', plus '!' so bangs (`cats !w`) can be typed into the omnibox.
+# Without dots, colons or slashes it can't spell a URL, a host
 # name or a path, however the pieces join or whatever submits it.
-TYPED_TEXT = re.compile(r'[A-Za-z0-9 _-]+')
+TYPED_TEXT = re.compile(r'[A-Za-z0-9 _!-]+')
 # Whole words the typed text may never spell: the denied page names,
 # checked against every run of letters and digits in the joined typed
 # text (spaces, '-' and '_' separate words; case is folded). `type my
@@ -267,7 +268,7 @@ def check_typed(text):
     full-width look-alike mapping stays out.)"""
     if not TYPED_TEXT.fullmatch(text):
         raise Refused('typed text is plain words only: ASCII letters, '
-                      'digits, spaces, "-" and "_": ' + repr(text))
+                      'digits, spaces, "!", "-" and "_": ' + repr(text))
 
 
 def harness_words(request):
