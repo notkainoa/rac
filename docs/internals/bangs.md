@@ -25,11 +25,28 @@ Wikipedia for "cats".
 
 ### Editable bangs
 
-- A settings page that lists the bangs rac is using.
-- Users can edit any bang, delete it, and add their own.
-- Edits survive updates to the downloaded list. A deleted bang stays
-  deleted, an edited one keeps the user's version, and the user's own bangs
-  stay, even when a new `bangs.json` arrives.
+Implemented in `rac/power/bangs-deleted.patch` and
+`rac/power/bangs-editor.patch`:
+
+- The "Manage search engines and site search" page
+  (`chrome://settings/searchEngines`) has a **Bangs** section listing the
+  downloaded bangs, searchable through the page's search field (the list is
+  capped at the first 100 matches). A **Deleted bangs** section appears once
+  something is deleted, with a Restore button.
+- Users can edit any bang, delete it, and add their own. Editing a
+  downloaded bang opens the site-search edit dialog; saving removes the
+  downloaded entry and creates the user's own `!trigger` site-search entry,
+  which already beats the downloaded list and works with services off.
+- Deleting records the trigger in the `rac.bangs.deleted` pref, which
+  `TemplateURLService::BangsLoadedCallback` checks, so a deleted bang stays
+  deleted when a new `bangs.json` arrives. Restore clears the mark and
+  re-adds the bang on the spot.
+- Bangs the user adds or edits appear under Site search, not in the Bangs
+  section: they are the user's own entries.
+
+Still open: the dedicated searchable Bangs page from plan 07 task M4 item 3
+(the section above is the interim surface), and the address-bar rework
+below.
 
 ### A better address bar experience
 

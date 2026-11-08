@@ -1,0 +1,487 @@
+--- a/chrome/browser/ui/webui/settings/search_engines_handler.cc
++++ b/chrome/browser/ui/webui/settings/search_engines_handler.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/webui/settings/search_engines_handler.h"
+ 
++#include <algorithm>
+ #include <string>
+ #include <utility>
+ 
+@@ -39,6 +40,7 @@
+ #include "components/optimization_guide/core/feature_registry/feature_registration.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/regional_capabilities/regional_capabilities_service.h"
++#include "components/search_engines/rac_deleted_bangs.h"
+ #include "components/search_engines/search_engine_choice/search_engine_choice_service.h"
+ #include "components/search_engines/search_engine_choice/search_engine_choice_utils.h"
+ #include "components/search_engines/search_engine_split_metrics.h"
+@@ -141,6 +143,14 @@
+       base::BindRepeating(&SearchEnginesHandler::HandleRemoveSearchEngine,
+                           base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
++      "removeBang",
++      base::BindRepeating(&SearchEnginesHandler::HandleRemoveBang,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "restoreBang",
++      base::BindRepeating(&SearchEnginesHandler::HandleRestoreBang,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
+       "validateSearchEngineInput",
+       base::BindRepeating(
+           &SearchEnginesHandler::HandleValidateSearchEngineInput,
+@@ -292,6 +302,34 @@
+   search_engines_info.Set("actives", std::move(actives));
+   search_engines_info.Set("others", std::move(others));
+   search_engines_info.Set("extensions", std::move(extensions));
++
++  // rac: the downloaded bangs, and the triggers the user deleted, for the
++  // "Bangs" section of the page.
++  TemplateURLService* template_url_service =
++      TemplateURLServiceFactory::GetForProfile(profile_);
++  CHECK(template_url_service);
++
++  TemplateURL::TemplateURLVector bang_urls;
++  for (TemplateURL* turl : template_url_service->GetTemplateURLs()) {
++    if (turl->bang_id() > 0) {
++      bang_urls.push_back(turl);
++    }
++  }
++  std::ranges::sort(bang_urls,
++                    internal::OrderTemplateUrlsByManagedAndAlphabetically());
++  base::ListValue bangs;
++  for (TemplateURL* turl : bang_urls) {
++    bangs.Append(CreateDictionaryForEngine(turl));
++  }
++  search_engines_info.Set("bangs", std::move(bangs));
++
++  base::ListValue deleted_bangs;
++  for (const std::string& trigger :
++       rac::ReadDeletedBangs(profile_->GetPrefs())) {
++    deleted_bangs.Append(trigger);
++  }
++  search_engines_info.Set("deletedBangs", std::move(deleted_bangs));
++
+   return search_engines_info;
+ }
+ 
+@@ -538,6 +576,33 @@
+   }
+ }
+ 
++void SearchEnginesHandler::HandleRemoveBang(const base::ListValue& args) {
++  CHECK_EQ(1U, args.size());
++  TemplateURLID id = args[0].GetInt();
++
++  // Bangs are LOCAL engines, so CanRemove() does not cover them; bang_id()
++  // is the check here. Remove() records the trigger in rac.bangs.deleted.
++  TemplateURL* template_url = list_controller_.GetTemplateURL(id);
++  if (template_url && template_url->bang_id() > 0) {
++    list_controller_.RemoveTemplateURL(id);
++  }
++}
++
++void SearchEnginesHandler::HandleRestoreBang(const base::ListValue& args) {
++  CHECK_EQ(1U, args.size());
++  const std::string& trigger = args[0].GetString();
++
++  TemplateURLService* template_url_service =
++      TemplateURLServiceFactory::GetForProfile(profile_);
++  if (template_url_service) {
++    template_url_service->RestoreDeletedBang(trigger);
++  }
++
++  // Refresh the page even when nothing was re-added: clearing the deleted
++  // list alone already changes it.
++  OnTemplateURLServiceChanged();
++}
++
+ void SearchEnginesHandler::HandleSearchEngineEditStarted(
+     const base::ListValue& args) {
+   CHECK_EQ(1U, args.size());
+@@ -559,7 +624,15 @@
+                                            const std::string& fixed_up_url,
+                                            const std::string& suggestions_url) {
+   CHECK(!fixed_up_url.empty());
+-  if (template_url) {
++  if (template_url && template_url->bang_id() > 0) {
++    // rac: editing a downloaded bang replaces it. Remove it, which records
++    // its trigger in rac.bangs.deleted so the downloaded list does not bring
++    // the original back, and add the edited version as the user's own
++    // site-search entry.
++    list_controller_.RemoveTemplateURL(template_url->id());
++    list_controller_.AddTemplateURL(title, keyword, fixed_up_url,
++                                    suggestions_url);
++  } else if (template_url) {
+     list_controller_.ModifyTemplateURL(template_url, title, keyword,
+                                        fixed_up_url, suggestions_url);
+   } else {
+--- a/chrome/browser/ui/webui/settings/search_engines_handler.h
++++ b/chrome/browser/ui/webui/settings/search_engines_handler.h
+@@ -70,6 +70,13 @@
+   // Removes the search engine at the given index. Called from WebUI.
+   void HandleRemoveSearchEngine(const base::ListValue& args);
+ 
++  // rac: removes the downloaded bang with the given id, so it stays deleted
++  // across updates of the downloaded bangs list. Called from WebUI.
++  void HandleRemoveBang(const base::ListValue& args);
++
++  // rac: restores the deleted bang with the given trigger. Called from WebUI.
++  void HandleRestoreBang(const base::ListValue& args);
++
+   // Sets the search engine at the given index to be default. Called from WebUI.
+   void HandleSetDefaultSearchEngine(const base::ListValue& args);
+ 
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -3365,6 +3365,17 @@
+        IDS_SETTINGS_SEARCH_ENGINES_INACTIVE_SHORTCUTS},
+       {"searchEnginesNoOtherEngines",
+        IDS_SETTINGS_SEARCH_ENGINES_NO_OTHER_ENGINES},
++      {"bangsSectionTitle", IDS_SETTINGS_BANGS_SECTION_TITLE},
++      {"bangsSectionExplanation", IDS_SETTINGS_BANGS_SECTION_EXPLANATION},
++      {"bangsNone", IDS_SETTINGS_BANGS_NONE},
++      {"bangsTruncated", IDS_SETTINGS_BANGS_TRUNCATED},
++      {"bangsDeletedTitle", IDS_SETTINGS_BANGS_DELETED_TITLE},
++      {"bangsDeletedExplanation", IDS_SETTINGS_BANGS_DELETED_EXPLANATION},
++      {"bangsRestore", IDS_SETTINGS_BANGS_RESTORE},
++      {"bangsEditButtonAriaLabel",
++       IDS_SETTINGS_BANGS_EDIT_BUTTON_ARIA_LABEL},
++      {"bangsDeleteButtonAriaLabel",
++       IDS_SETTINGS_BANGS_DELETE_BUTTON_ARIA_LABEL},
+       {"searchEnginesExtension", IDS_SETTINGS_SEARCH_ENGINES_EXTENSION_ENGINES},
+       {"searchEnginesExtensionExplanation",
+        IDS_SETTINGS_SEARCH_ENGINES_EXTENSION_ENGINES_EXPLANATION},
+--- a/chrome/browser/resources/settings/search_page/search_engines_browser_proxy.ts
++++ b/chrome/browser/resources/settings/search_page/search_engines_browser_proxy.ts
+@@ -44,7 +44,9 @@
+   actives: SearchEngine[];
+   others: SearchEngine[];
+   extensions: SearchEngine[];
+-  [key: string]: SearchEngine[];
++  bangs: SearchEngine[];
++  deletedBangs: string[];
++  [key: string]: SearchEngine[]|string[];
+ }
+ 
+ export interface CategorizedTemplateUrls {
+@@ -125,6 +127,10 @@
+ 
+   removeSearchEngine(id: number): void;
+ 
++  removeBang(id: number): void;
++
++  restoreBang(trigger: string): void;
++
+   searchEngineEditStarted(id: number): void;
+ 
+   searchEngineEditCancelled(): void;
+@@ -170,6 +176,14 @@
+     chrome.send('removeSearchEngine', [id]);
+   }
+ 
++  removeBang(id: number) {
++    chrome.send('removeBang', [id]);
++  }
++
++  restoreBang(trigger: string) {
++    chrome.send('restoreBang', [trigger]);
++  }
++
+   searchEngineEditStarted(id: number) {
+     chrome.send('searchEngineEditStarted', [id]);
+   }
+--- a/chrome/browser/resources/settings/search_page/search_engines_page.ts
++++ b/chrome/browser/resources/settings/search_page/search_engines_page.ts
+@@ -7,9 +7,12 @@
+  * containing search engines settings.
+  */
+ import 'chrome://resources/cr_elements/cr_button/cr_button.js';
++import 'chrome://resources/cr_elements/cr_icon_button/cr_icon_button.js';
++import 'chrome://resources/cr_elements/icons.html.js';
+ import '../controls/controlled_radio_button.js';
+ import '../controls/settings_radio_group.js';
+ import '../simple_confirmation_dialog.js';
++import './search_engine_icon.js';
+ import './search_engine_edit_dialog.js';
+ import './search_engines_list.js';
+ import './omnibox_extension_entry.js';
+@@ -40,6 +43,10 @@
+   anchorElement: HTMLElement,
+ }>;
+ 
++// The downloaded bangs list has thousands of entries. Only this many rows
++// render at once; the page's search field narrows the list.
++const kMaxVisibleBangs = 100;
++
+ export interface SettingsSearchEnginesPageElement {
+   $: {
+     keyboardShortcutSettingGroup: SettingsRadioGroupElement,
+@@ -69,12 +76,16 @@
+       activeEngines: {type: Array},
+       otherEngines: {type: Array},
+       extensions: {type: Array},
++      bangs: {type: Array},
++      deletedBangs: {type: Array},
+ 
+       showExtensionsList_: {type: Boolean},
+ 
+       /** Filters out all search engines that do not match. */
+       filter_: {type: String},
+ 
++      matchingBangs_: {type: Array},
++      matchingDeletedBangs_: {type: Array},
+       matchingDefaultEngines_: {type: Array},
+       matchingActiveEngines_: {type: Array},
+       matchingOtherEngines_: {type: Array},
+@@ -92,8 +103,12 @@
+   accessor activeEngines: SearchEngine[] = [];
+   accessor otherEngines: SearchEngine[] = [];
+   accessor extensions: SearchEngine[] = [];
++  accessor bangs: SearchEngine[] = [];
++  accessor deletedBangs: string[] = [];
+   protected accessor showExtensionsList_: boolean = false;
+   protected accessor filter_: string = '';
++  protected accessor matchingBangs_: SearchEngine[] = [];
++  protected accessor matchingDeletedBangs_: string[] = [];
+   protected accessor matchingDefaultEngines_: SearchEngine[] = [];
+   protected accessor matchingActiveEngines_: SearchEngine[] = [];
+   protected accessor matchingOtherEngines_: SearchEngine[] = [];
+@@ -136,6 +151,16 @@
+       this.matchingExtensions_ = this.computeMatchingEngines_(this.extensions);
+     }
+ 
++    if (changedProperties.has('bangs') ||
++        changedPrivateProperties.has('filter_')) {
++      this.matchingBangs_ = this.computeMatchingBangs_();
++    }
++
++    if (changedProperties.has('deletedBangs') ||
++        changedPrivateProperties.has('filter_')) {
++      this.matchingDeletedBangs_ = this.computeMatchingDeletedBangs_();
++    }
++
+     if (changedProperties.has('extensions')) {
+       this.showExtensionsList_ = this.extensions.length > 0;
+     }
+@@ -247,6 +272,8 @@
+     this.activeEngines = searchEnginesInfo.actives;
+     this.otherEngines = searchEnginesInfo.others;
+     this.extensions = searchEnginesInfo.extensions;
++    this.bangs = searchEnginesInfo.bangs || [];
++    this.deletedBangs = searchEnginesInfo.deletedBangs || [];
+   }
+ 
+   protected onAddPrimarySearchEngineClick_(e: Event) {
+@@ -279,6 +306,52 @@
+   }
+ 
+   /**
++   * Filters the bangs list and caps it at kMaxVisibleBangs rows.
++   */
++  private computeMatchingBangs_(): SearchEngine[] {
++    return this.computeMatchingEngines_(this.bangs).slice(
++        0, kMaxVisibleBangs);
++  }
++
++  /**
++   * @return Whether more bangs match the filter than are rendered.
++   */
++  protected bangsTruncated_(): boolean {
++    return this.computeMatchingEngines_(this.bangs).length >
++        this.matchingBangs_.length;
++  }
++
++  /**
++   * Filters the deleted bang triggers based on the filter string.
++   */
++  private computeMatchingDeletedBangs_(): string[] {
++    if (this.filter_ === '') {
++      return this.deletedBangs;
++    }
++
++    const filter = this.filter_.toLowerCase();
++    return this.deletedBangs.filter(
++        trigger => trigger.toLowerCase().includes(filter));
++  }
++
++  protected onAddBangClick_(e: Event) {
++    e.preventDefault();
++    this.openEditDialog_(null, e.currentTarget as HTMLElement);
++  }
++
++  protected onEditBangClick_(engine: SearchEngine, e: Event) {
++    this.openEditDialog_(engine, e.currentTarget as HTMLElement);
++  }
++
++  protected onDeleteBangClick_(engine: SearchEngine) {
++    this.browserProxy_.removeBang(engine.id);
++  }
++
++  protected onRestoreBangClick_(trigger: string) {
++    this.browserProxy_.restoreBang(trigger);
++  }
++
++  /**
+    * @param list The original list.
+    * @param filteredList The filtered list.
+    * @return Whether to show the "no results" message.
+--- a/chrome/browser/resources/settings/search_page/search_engines_page.html.ts
++++ b/chrome/browser/resources/settings/search_page/search_engines_page.html.ts
+@@ -131,6 +131,86 @@
+     $i18n{searchNoResults}
+   </div>
+ 
++  <div class="cr-row first">
++    <div class="flex cr-padded-text">
++      <h2>$i18n{bangsSectionTitle}</h2>
++      <div class="secondary">$i18n{bangsSectionExplanation}</div>
++    </div>
++    <cr-button class="secondary-button header-aligned-button"
++        aria-label="$i18n{searchEnginesAddButtonAriaLabel}"
++        @click="${this.onAddBangClick_}" id="addBang">
++      $i18n{add}
++    </cr-button>
++  </div>
++  <div id="noBangs" class="list-frame"
++      ?hidden="${this.bangs.length > 0 || this.deletedBangs.length > 0}">
++    $i18n{bangsNone}
++  </div>
++  <div class="no-search-results list-frame"
++      ?hidden="${!this.showNoResultsMessage_(
++          this.bangs, this.matchingBangs_)}">
++    $i18n{searchNoResults}
++  </div>
++  <div class="list-frame" role="table"
++      ?hidden="${!this.matchingBangs_.length}">
++    ${this.matchingBangs_.map(item => html`
++      <div class="list-item cr-row bang-row" role="row">
++        <span role="cell" class="bang-name">
++          <settings-search-engine-icon .engine="${item}">
++          </settings-search-engine-icon>
++          <div class="text-elide">${item.displayName}</div>
++        </span>
++        <span role="cell" class="bang-keyword">
++          <div class="text-elide">${item.keyword}</div>
++        </span>
++        <span role="cell" class="bang-controls">
++          <cr-icon-button class="icon-edit" title="$i18n{edit}"
++              aria-label="$i18n{bangsEditButtonAriaLabel}"
++              @click="${(e: Event) => this.onEditBangClick_(item, e)}">
++          </cr-icon-button>
++          <cr-icon-button class="icon-delete-gray" title="$i18n{delete}"
++              aria-label="$i18n{bangsDeleteButtonAriaLabel}"
++              @click="${() => this.onDeleteBangClick_(item)}">
++          </cr-icon-button>
++        </span>
++      </div>
++    `)}
++  </div>
++  <div class="secondary bangs-truncated"
++      ?hidden="${!this.bangsTruncated_()}">
++    $i18n{bangsTruncated}
++  </div>
++
++  ${this.deletedBangs.length ? html`
++    <div class="cr-row first">
++      <div class="flex cr-padded-text">
++        <h2>$i18n{bangsDeletedTitle}</h2>
++        <div class="secondary">$i18n{bangsDeletedExplanation}</div>
++      </div>
++    </div>
++    <div class="no-search-results list-frame"
++        ?hidden="${this.matchingDeletedBangs_.length > 0 ||
++            this.filter_ === ''}">
++      $i18n{searchNoResults}
++    </div>
++    <div class="list-frame" role="table"
++        ?hidden="${!this.matchingDeletedBangs_.length}">
++      ${this.matchingDeletedBangs_.map(trigger => html`
++        <div class="list-item cr-row bang-row" role="row">
++          <span role="cell" class="bang-keyword">
++            <div class="text-elide">!${trigger}</div>
++          </span>
++          <span role="cell" class="bang-controls">
++            <cr-button class="secondary-button"
++                @click="${() => this.onRestoreBangClick_(trigger)}">
++              $i18n{bangsRestore}
++            </cr-button>
++          </span>
++        </div>
++      `)}
++    </div>
++  ` : ''}
++
+   ${this.showExtensionsList_ ? html`
+     <div class="cr-row first">
+       <div class="flex cr-padded-text">
+--- a/chrome/browser/resources/settings/search_page/search_engines_page.css
++++ b/chrome/browser/resources/settings/search_page/search_engines_page.css
+@@ -13,3 +13,30 @@
+ settings-omnibox-extension-entry {
+   border-top: var(--cr-separator-line);
+ }
++
++.bang-row {
++  gap: 16px;
++}
++
++.bang-name {
++  align-items: center;
++  display: flex;
++  flex: 2;
++  gap: 8px;
++  min-width: 0;
++}
++
++.bang-keyword {
++  flex: 1;
++  min-width: 0;
++}
++
++.bang-controls {
++  align-items: center;
++  display: flex;
++  flex-shrink: 0;
++}
++
++.bangs-truncated {
++  padding: 0 var(--cr-section-padding) var(--cr-section-vertical-padding);
++}
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -2472,6 +2472,33 @@
+     <message name="IDS_SETTINGS_SEARCH_ENGINES_NO_OTHER_ENGINES" desc="Label shown when the 'other' Search engines section is empty">
+       Other saved search engines will appear here
+     </message>
++    <message name="IDS_SETTINGS_BANGS_SECTION_TITLE" desc="Label for the 'Bangs' section">
++      Bangs
++    </message>
++    <message name="IDS_SETTINGS_BANGS_SECTION_EXPLANATION" desc="Explanation for the 'Bangs' section">
++      Shortcuts like !w that search a site directly. Bangs you add or edit appear under Site search, so they keep working without the downloaded list.
++    </message>
++    <message name="IDS_SETTINGS_BANGS_NONE" desc="Text shown when there are no bangs to display">
++      No bangs yet
++    </message>
++    <message name="IDS_SETTINGS_BANGS_TRUNCATED" desc="Shown under the bangs list when only the first entries are displayed">
++      Showing the first 100 bangs. Type above to narrow the list.
++    </message>
++    <message name="IDS_SETTINGS_BANGS_DELETED_TITLE" desc="Label for the 'Deleted bangs' section">
++      Deleted bangs
++    </message>
++    <message name="IDS_SETTINGS_BANGS_DELETED_EXPLANATION" desc="Explanation for the 'Deleted bangs' section">
++      These stay deleted when the bangs list updates. Restore one to get it back.
++    </message>
++    <message name="IDS_SETTINGS_BANGS_RESTORE" desc="Button label that restores a deleted bang">
++      Restore
++    </message>
++    <message name="IDS_SETTINGS_BANGS_EDIT_BUTTON_ARIA_LABEL" desc="Aria label for the button that edits a bang">
++      Edit bang
++    </message>
++    <message name="IDS_SETTINGS_BANGS_DELETE_BUTTON_ARIA_LABEL" desc="Aria label for the button that deletes a bang">
++      Delete bang
++    </message>
+     <message name="IDS_SETTINGS_SEARCH_ENGINES_EXTENSION_ENGINES" desc="Label for a section that displays search engines added by extensions">
+       Extensions
+     </message>

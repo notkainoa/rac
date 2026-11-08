@@ -1,6 +1,6 @@
 --- a/components/search_engines/BUILD.gn
 +++ b/components/search_engines/BUILD.gn
-@@ -30,6 +30,8 @@ static_library("search_engines") {
+@@ -30,6 +30,8 @@
      "keyword_table.h",
      "keyword_web_data_service.cc",
      "keyword_web_data_service.h",
@@ -279,15 +279,15 @@
 +}  // namespace rac
 --- a/components/search_engines/template_url_service.cc
 +++ b/components/search_engines/template_url_service.cc
-@@ -65,6 +65,7 @@
- #include "components/search_engines/template_url.h"
- #include "components/search_engines/template_url_bang_manager.h"
- #include "components/search_engines/template_url_data.h"
+@@ -53,6 +53,7 @@
+ #include "components/search_engines/choice_made_location.h"
+ #include "components/search_engines/enterprise/enterprise_search_manager.h"
+ #include "components/search_engines/keyword_web_data_service.h"
 +#include "components/search_engines/rac_deleted_bangs.h"
- #include "components/search_engines/template_url_data_util.h"
- #include "components/search_engines/template_url_prepopulate_data.h"
- #include "components/search_engines/template_url_prepopulate_data_resolver.h"
-@@ -673,6 +674,7 @@ void TemplateURLService::RegisterProfile
+ #include "components/search_engines/regulatory_extension_type.h"
+ #include "components/search_engines/search_engine_choice/search_engine_choice_service.h"
+ #include "components/search_engines/search_engine_choice/search_engine_choice_utils.h"
+@@ -683,6 +684,7 @@
    registry->RegisterBooleanPref(prefs::kDefaultSearchProviderEnabled, true);
    registry->RegisterBooleanPref(
        prefs::kDefaultSearchProviderContextMenuAccessAllowed, true);
@@ -295,15 +295,126 @@
  }
  
  #if BUILDFLAG(IS_ANDROID)
-@@ -1676,7 +1678,11 @@ void TemplateURLService::LoadBangs() {
+@@ -954,6 +956,13 @@
+     client_->DeleteAllSearchTermsForKeyword(template_url->id());
+   }
+ 
++  // A deleted bang should stay deleted: remember its trigger, so the next
++  // update of the downloaded list does not add it back.
++  if (template_url->bang_id() > 0 && keyword.starts_with(u'!')) {
++    rac::AddDeletedBang(&prefs_.get(),
++                        base::UTF16ToUTF8(keyword.substr(1)));
++  }
++
+   // To ensure that policy engines are not added again on next
+   // policy fetch, mark the keyword as overridden in the pref.
+   if (can_policy_be_overridden && enterprise_search_manager_) {
+@@ -1695,7 +1704,10 @@
+             template_url_starter_pack_data::StarterPackId::kNone &&
+         turl->policy_origin() == TemplateURLData::PolicyOrigin::kNoPolicy &&
+         turl->type() != TemplateURL::Type::OMNIBOX_API_EXTENSION &&
+-        turl->type() != TemplateURL::Type::NORMAL_CONTROLLED_BY_EXTENSION) {
++        turl->type() != TemplateURL::Type::NORMAL_CONTROLLED_BY_EXTENSION &&
++        // Bangs come from the downloaded list, not from the user. Keep them
++        // out of a profile reset's "remove user added" sweep.
++        turl->bang_id() == 0) {
+       to_remove.push_back(turl.get());
+     }
+   }
+@@ -1737,20 +1749,53 @@
  void TemplateURLService::BangsLoadedCallback() {
    VLOG(2) << "BangsLoadedCallback() called";
  
-+  const auto deleted_bangs = rac::ReadDeletedBangs(prefs_.get());
++  const auto deleted_bangs = rac::ReadDeletedBangs(&prefs_.get());
    for (const auto& bang : bang_manager_->GetBangs()) {
+-    auto template_data = TemplateURLDataFromBang(bang);
 +    if (rac::IsDeletedBang(bang.bang, deleted_bangs)) {
 +      continue;
 +    }
-     auto template_data = TemplateURLDataFromBang(bang);
++    MaybeAddBang(bang);
++  }
++}
  
-     if (!GetTemplateURLForKeyword(template_data.keyword())) {
+-    if (!GetTemplateURLForKeyword(template_data.keyword())) {
+-      template_data.id = ++next_id_;
++bool TemplateURLService::MaybeAddBang(const Bangs::Bang& bang) {
++  auto template_data = TemplateURLDataFromBang(bang);
++  if (GetTemplateURLForKeyword(template_data.keyword())) {
++    return false;
++  }
+ 
+-      auto t_url = std::make_unique<TemplateURL>(
+-        std::move(template_data), TemplateURL::Type::LOCAL);
+-      auto t_ptr = t_url.get();
++  template_data.id = ++next_id_;
+ 
+-      template_urls_.push_back(std::move(t_url));
+-      AddToMaps(t_ptr);
++  auto t_url = std::make_unique<TemplateURL>(std::move(template_data),
++                                             TemplateURL::Type::LOCAL);
++  auto t_ptr = t_url.get();
++
++  template_urls_.push_back(std::move(t_url));
++  AddToMaps(t_ptr);
++  return true;
++}
++
++bool TemplateURLService::RestoreDeletedBang(std::string_view trigger) {
++  // Clearing the mark is what matters; when the downloaded list no longer
++  // carries the trigger there is nothing to re-add.
++  rac::RemoveDeletedBang(&prefs_.get(), trigger);
++
++  const std::string lower = base::ToLowerASCII(trigger);
++  for (const auto& bang : bang_manager_->GetBangs()) {
++    if (base::ToLowerASCII(bang.bang) != lower) {
++      continue;
+     }
++    if (!MaybeAddBang(bang)) {
++      // The trigger is in the list, but the user's own entry claims the
++      // keyword already.
++      return true;
++    }
++
++    Scoper scoper(this);
++    model_mutated_notification_pending_ = true;
++    return true;
+   }
++  return false;
+ }
+ 
+ base::CallbackListSubscription TemplateURLService::RegisterOnLoadedCallback(
+--- a/components/search_engines/template_url_service.h
++++ b/components/search_engines/template_url_service.h
+@@ -11,6 +11,7 @@
+ #include <memory>
+ #include <set>
+ #include <string>
++#include <string_view>
+ #include <utility>
+ #include <vector>
+ 
+@@ -576,6 +577,12 @@
+ 
+   void LoadBangs();
+ 
++  // rac: clears |trigger| (without the "!") from the deleted bangs list and
++  // re-adds the bang from the downloaded list when it is still there and no
++  // TemplateURL already claims its keyword. Returns whether the downloaded
++  // list holds the trigger.
++  bool RestoreDeletedBang(std::string_view trigger);
++
+   // Registers a callback to be called when the service has loaded.
+   //
+   // If the service has already loaded, this function does nothing.
+@@ -811,6 +818,11 @@
+ 
+   void BangsLoadedCallback();
+ 
++  // rac: adds |bang| as a TemplateURL unless a TemplateURL already claims
++  // its keyword, the way BangsLoadedCallback adds the downloaded list.
++  // Returns whether it was added.
++  bool MaybeAddBang(const Bangs::Bang& bang);
++
+   // Simulate a loaded `TemplateURLService`.
+   void ApplyInitializersForTesting(
+       base::span<const TemplateURLService::Initializer> initializers);
