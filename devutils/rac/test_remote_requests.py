@@ -176,10 +176,12 @@ class RemoteRequestsTest(unittest.TestCase):
                 ('open-urls chrome://version', ['pages chrome://version']),
                 ('open-urls chrome://newtab', ['pages chrome://newtab']),
                 ('open-urls chrome://settings/assistant '
-                 'chrome://settings/privacy chrome://settings/appearance',
+                 'chrome://settings/privacy chrome://settings/appearance '
+                 'chrome://settings/searchEngines',
                  ['pages chrome://settings/assistant',
                   'pages chrome://settings/privacy',
-                  'pages chrome://settings/appearance']),
+                  'pages chrome://settings/appearance',
+                  'pages chrome://settings/searchEngines']),
                 ('open-urls chrome://rac-ai', ['pages chrome://rac-ai']),
                 ('open-urls rac://version rac://settings/privacy rac://rac-ai',
                  ['pages rac://version', 'pages rac://settings/privacy',
@@ -502,12 +504,13 @@ class RemoteRequestsTest(unittest.TestCase):
             self.refused(line)
 
     def test_settings_pages_take_screenshots_only(self):
-        # The three settings pages that may open take shots only: any
-        # input verb in the same script refuses, on top of the typing
+        # The settings pages that may open take shots only: any input
+        # verb in the same script refuses, on top of the typing
         # rule's own restrictions.
         for line in ('open-urls chrome://settings/privacy ; click 10 10',
                      'open-urls chrome://settings/assistant ; key tab',
                      'open-urls chrome://settings/appearance ; type x',
+                     'open-urls chrome://settings/searchEngines ; click 10 10',
                      'open-urls chrome://settings/privacy ; nspress a',
                      'open-urls chrome://settings/appearance ; move 1 2',
                      'open-urls chrome://settings/assistant ; command 34000',
