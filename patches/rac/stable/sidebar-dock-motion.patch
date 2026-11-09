@@ -1,0 +1,269 @@
+Index: src/chrome/browser/ui/views/frame/browser_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/browser_view.cc
++++ src/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1873,6 +1873,10 @@ void BrowserView::OnZenModeSideChromePin
+     AnimationProgressed(&zen_side_chrome_animation_);
+   } else {
+     UpdateZenModeRevealFromCursor();
++    // Unpinning docks nothing, but the page still takes the sidebar's space
++    // back: run the reveal-changed path so the contents motion picks the
++    // dock flip up whether or not the reveal moved.
++    AnimationProgressed(&zen_side_chrome_animation_);
+   }
+ 
+   if (vertical_tab_strip_region_view_) {
+Index: src/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_contents_motion.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_contents_motion.cc
++++ src/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_contents_motion.cc
+@@ -12,7 +12,6 @@
+ #include "chrome/browser/ui/views/rac/motion/rac_motion.h"
+ #include "chrome/browser/ui/views/rac/rac_tokens.h"
+ #include "ui/base/class_property.h"
+-#include "ui/gfx/animation/linear_animation.h"
+ #include "ui/gfx/animation/tween.h"
+ #include "ui/views/view.h"
+ #include "ui/views/widget/widget.h"
+@@ -33,17 +32,16 @@ void EndSidebarContentsMotion(BrowserVie
+ 
+ // One resize of the page when the sidebar docks or hides, from the bounds
+ // the contents had before the toggle to what each layout now computes.
+-// The sidebar itself moves as a layer (SidebarSlide); this moves the page
+-// alongside it so sites relayout per frame instead of teleporting to the
+-// new width. Lives on the browser view only while its animation runs, so
+-// it costs nothing between toggles.
++// The sidebar itself moves as a layer (SidebarSlide) on tokens::kSpringDock;
++// this runs the same spring on the UI thread and moves the page alongside
++// it, so both surfaces share one clock and overshoot together. Lives on
++// the browser view only while its animation runs, so it costs nothing
++// between toggles.
+ class SidebarContentsMotion : public gfx::AnimationDelegate {
+  public:
+-  explicit SidebarContentsMotion(BrowserView* browser_view)
++  SidebarContentsMotion(BrowserView* browser_view, float distance)
+       : browser_view_(browser_view),
+-        animation_(tokens::kCard.duration,
+-                   gfx::LinearAnimation::kDefaultFrameRate,
+-                   this) {}
++        animation_(this, tokens::kSpringDock, distance) {}
+   SidebarContentsMotion(const SidebarContentsMotion&) = delete;
+   SidebarContentsMotion& operator=(const SidebarContentsMotion&) = delete;
+   // No callbacks while dying: animation_'s teardown could otherwise report
+@@ -53,13 +51,12 @@ class SidebarContentsMotion : public gfx
+ 
+   void Begin(const gfx::Rect& from) {
+     from_ = from;
+-    animation_.Start();
++    animation_.Show();
+   }
+ 
+   gfx::Rect Bounds(const gfx::Rect& target) const {
+-    const double eased = gfx::Tween::CalculateValue(
+-        gfx::Tween::EASE_IN_OUT, animation_.GetCurrentValue());
+-    return gfx::Tween::RectValueBetween(eased, from_, target);
++    return gfx::Tween::RectValueBetween(animation_.GetCurrentValue(), from_,
++                                        target);
+   }
+ 
+  private:
+@@ -88,7 +85,7 @@ class SidebarContentsMotion : public gfx
+ 
+   const raw_ptr<BrowserView> browser_view_;
+   gfx::Rect from_;
+-  gfx::LinearAnimation animation_;
++  SpringAnimation animation_;
+ };
+ 
+ namespace {
+@@ -112,8 +109,8 @@ void EndSidebarContentsMotion(BrowserVie
+ 
+ }  // namespace
+ 
+-void BeginSidebarContentsMotion(BrowserView* browser_view) {
+-  if (!browser_view || motion::ReducedMotion()) {
++void BeginSidebarContentsMotion(BrowserView* browser_view, float distance) {
++  if (!browser_view || motion::ReducedMotion() || distance <= 0) {
+     return;
+   }
+   views::View* contents = browser_view->multi_contents_view();
+@@ -122,7 +119,7 @@ void BeginSidebarContentsMotion(BrowserV
+   }
+   auto* motion = browser_view->SetProperty(
+       kSidebarContentsMotionKey,
+-      std::make_unique<SidebarContentsMotion>(browser_view));
++      std::make_unique<SidebarContentsMotion>(browser_view, distance));
+   motion->Begin(contents->bounds());
+ }
+ 
+Index: src/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_contents_motion.h
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_contents_motion.h
++++ src/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_contents_motion.h
+@@ -12,10 +12,12 @@ class BrowserView;
+ namespace rac {
+ 
+ // Call just before a docked<->hidden sidebar toggle's layout runs, while
+-// the contents still have their old bounds. Starts a bounds animation so
+-// the page reaches its new width over tokens::kCard instead of jumping
+-// there in one frame. No-op under reduced motion.
+-void BeginSidebarContentsMotion(BrowserView* browser_view);
++// the contents still have their old bounds. Starts a bounds animation on
++// tokens::kSpringDock, the sidebar slide's own spring, so the page and the
++// sidebar move on one clock. `distance` is the toggle's travel in DIPs, so
++// rest is judged like the slide's. No-op under reduced motion or when
++// `distance` is not positive.
++void BeginSidebarContentsMotion(BrowserView* browser_view, float distance);
+ 
+ // The contents bounds the layout should use this frame: `target` lerped
+ // from the pre-toggle bounds by the running animation, or `target`
+Index: src/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.mm
+===================================================================
+--- src.orig/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.mm
++++ src/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.mm
+@@ -7,6 +7,7 @@
+ #import <AppKit/AppKit.h>
+ #import <QuartzCore/QuartzCore.h>
+ 
++#include <cmath>
+ #include <memory>
+ #include <utility>
+ 
+@@ -77,7 +78,7 @@ void FadeWindowButtons(BrowserView* brow
+       browser_view->IsFullscreen()) {
+     return;
+   }
+-  const Timing& timing = show ? tokens::kReducedFade : tokens::kFade;
++  const Timing& timing = show ? tokens::kFadeIn : tokens::kFade;
+   for (NSWindowButton type : kTypes) {
+     NSButton* button = [window standardWindowButton:type];
+     CALayer* shown = button.layer.presentationLayer;
+@@ -97,6 +98,17 @@ void FadeWindowButtons(BrowserView* brow
+   }];
+ }
+ 
++// The sidebar's layer x with it fully out of the window: also the distance
++// a dock toggle's slide and contents travel, so both keep one clock.
++float SidebarHiddenX(BrowserView* browser_view, const views::View* sidebar) {
++  if (!sidebar || !sidebar->parent()) {
++    return 0;
++  }
++  return browser_view->IsVerticalTabStripRightAligned()
++             ? sidebar->parent()->width() - sidebar->x()
++             : -sidebar->bounds().right();
++}
++
+ }  // namespace
+ 
+ // One slide of the sidebar, in or out. It lives on the browser view only
+@@ -113,9 +125,11 @@ class SidebarSlide : public ui::LayerAni
+   void set_showing(bool showing) { showing_ = showing; }
+ 
+   // Heads in or out from the layer's place and speed now. A new slide starts
+-  // from rest: in from hidden, or out from where the sidebar sits. `dock` is
+-  // Cmd+S, which moves on tokens::kSpringDock both ways.
+-  void Start(bool dock);
++  // from rest: in from hidden, out from where the sidebar sits, or from rest
++  // when `emerging` is false because only the dock state flipped. `dock` is
++  // Cmd+S or a pin<->float flip, which moves on tokens::kSpringDock both
++  // ways.
++  void Start(bool dock, bool emerging);
+ 
+   // Stops where everything rests, as when the sidebar is pinned.
+   void Snap() {
+@@ -150,13 +164,7 @@ class SidebarSlide : public ui::LayerAni
+ 
+   // Where the layer's x has the sidebar fully out of the window.
+   float HiddenX() const {
+-    const views::View* sidebar = sidebar_view_.view();
+-    if (!sidebar || !sidebar->parent()) {
+-      return 0;
+-    }
+-    return browser_view_->IsVerticalTabStripRightAligned()
+-               ? sidebar->parent()->width() - sidebar->x()
+-               : -sidebar->bounds().right();
++    return SidebarHiddenX(browser_view_, sidebar_view_.view());
+   }
+ 
+   void StopObserving() {
+@@ -225,7 +233,7 @@ DEFINE_UI_CLASS_PROPERTY_KEY(bool, kSide
+ 
+ }  // namespace
+ 
+-void SidebarSlide::Start(bool dock) {
++void SidebarSlide::Start(bool dock, bool emerging) {
+   ui::Layer* layer = SidebarLayer();
+   if (!layer) {
+     return;
+@@ -237,7 +245,7 @@ void SidebarSlide::Start(bool dock) {
+   float x = 0;
+   float velocity = 0;
+   if (!started_) {
+-    x = show ? HiddenX() : 0;
++    x = emerging ? HiddenX() : 0;
+   } else if (!fading_) {
+     x = sidebar_.X(layer);
+     velocity = sidebar_.Velocity();
+@@ -313,7 +321,10 @@ void OnSidebarRevealChanged(BrowserView*
+                             float reveal,
+                             bool pinned) {
+   const bool show = reveal > 0.0f;
+-  const bool docked = !browser_view->IsZenModeEnabledForLayout();
++  // The sidebar holds space beside the page unless zen mode lets it float
++  // over the contents; pinning in zen mode docks it again. Flipping that is
++  // a dock transition even though the sidebar itself does not travel.
++  const bool docked = !browser_view->IsZenModeEnabledForLayout() || pinned;
+   const bool was_shown = browser_view->GetProperty(kSidebarShownKey);
+   const bool was_docked = browser_view->GetProperty(kSidebarDockedKey);
+   browser_view->SetProperty(kSidebarShownKey, show);
+@@ -322,18 +333,20 @@ void OnSidebarRevealChanged(BrowserView*
+ 
+   SidebarSlide* slide = browser_view->GetProperty(kSidebarSlideKey);
+   views::Widget* widget = browser_view->GetWidget();
+-  if (pinned || !widget || !widget->IsVisible() || !sidebar ||
+-      !sidebar->layer()) {
++  if (!widget || !widget->IsVisible() || !sidebar || !sidebar->layer()) {
+     if (slide) {
+       slide->Snap();
+       browser_view->ClearProperty(kSidebarSlideKey);
+     }
+     return;
+   }
+-  if (slide ? slide->showing() == show : show == was_shown) {
++  if (!dock && (slide ? slide->showing() == show : show == was_shown)) {
+     return;
+   }
+ 
++  // A fresh slide heads in from off-screen only when the sidebar emerges:
++  // on a dock flip it is already where it rests, so it starts from x = 0.
++  const bool emerging = slide ? show != slide->showing() : show && !was_shown;
+   if (!slide) {
+     slide = browser_view->SetProperty(
+         kSidebarSlideKey,
+@@ -341,11 +354,13 @@ void OnSidebarRevealChanged(BrowserView*
+   }
+   slide->set_showing(show);
+   // Lay out once, at rest: the sidebar where it ends up or, sliding out,
+-  // where it is. On Cmd+S the page starts moving to its new width here.
++  // where it is. On a dock flip the page starts moving to its new width
++  // here.
+   if (dock) {
+-    // The sidebar slides on its layer; this walks the page bounds over
+-    // the same span so it relayouts per frame instead of teleporting.
+-    BeginSidebarContentsMotion(browser_view);
++    // The sidebar slides on its layer; this walks the page bounds over the
++    // same spring and the same span so the two stay on one clock.
++    BeginSidebarContentsMotion(
++        browser_view, std::abs(SidebarHiddenX(browser_view, sidebar)));
+   }
+   widget->LayoutRootViewIfNecessary();
+   if (!sidebar->GetVisible()) {
+@@ -353,7 +368,7 @@ void OnSidebarRevealChanged(BrowserView*
+     browser_view->ClearProperty(kSidebarSlideKey);
+     return;
+   }
+-  slide->Start(dock);
++  slide->Start(dock, emerging);
+ }
+ 
+ }  // namespace rac
