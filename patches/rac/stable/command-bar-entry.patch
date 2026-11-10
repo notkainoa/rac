@@ -1,0 +1,369 @@
+--- a/chrome/app/rac_strings.grdp
++++ b/chrome/app/rac_strings.grdp
+@@ -412,6 +412,6 @@
+     Command bar
+   </message>
+   <message name="IDS_RAC_SETTINGS_NEW_TAB_OPENS_COMMAND_BAR_SUBLABEL" desc="Sub-label under the toggle that makes Command+T open the command bar. Says what happens when it is off.">
+-    When off, ⌘T opens a new tab page
++    When off, ⌘T opens a new tab page. ⌥⌘T always opens the command bar.
+   </message>
+ </grit-part>
+--- a/chrome/browser/rac/actions/rac_actions.cc
++++ b/chrome/browser/rac/actions/rac_actions.cc
+@@ -6,6 +6,7 @@
+ #include <utility>
+ 
+ #include "base/check.h"
++#include "base/functional/function_ref.h"
+ #include "base/json/json_reader.h"
+ #include "base/no_destructor.h"
+ #include "chrome/browser/rac/actions/rac_actions_groups.h"
+@@ -124,25 +125,39 @@
+ 
+ namespace {
+ 
+-// How many keys after the first a row's shortcut spans: a numbered row
+-// (Show Space 1-9) takes one key more per command id, so its shortcut is
+-// key, key + 1, ... key + count.
++// How many keys after the first a row's default shortcut spans: a numbered
++// row (Show Space 1-9) takes one key more per command id, so its shortcut
++// is key, key + 1, ... key + count. An `alternate_shortcut` never spans:
++// it is one key for `command_id` only.
+ int ExtraShortcutKeys(const Action& action) {
+   return action.command_id_last > action.command_id
+              ? action.command_id_last - action.command_id
+              : 0;
+ }
+ 
+-// Whether the two rows' shortcuts share a key, with every key of a numbered
+-// row counted.
+-bool ShortcutsOverlap(const Action& a, const Action& b) {
+-  if (a.default_shortcut.modifiers != b.default_shortcut.modifiers) {
++// Whether two shortcut specs share a key, with `a` spanning `a_extra` keys
++// past its first and `b` spanning `b_extra` (a numbered row's expansion).
++bool SpecsOverlap(const ShortcutSpec& a,
++                  int a_extra,
++                  const ShortcutSpec& b,
++                  int b_extra) {
++  if (a.modifiers != b.modifiers) {
+     return false;
+   }
+-  const int a_first = a.default_shortcut.key;
+-  const int b_first = b.default_shortcut.key;
+-  return a_first <= b_first + ExtraShortcutKeys(b) &&
+-         b_first <= a_first + ExtraShortcutKeys(a);
++  return a.key <= b.key + b_extra && b.key <= a.key + a_extra;
++}
++
++// Calls `fn` on each of the row's bound keys: the default (expanded across
++// a numbered row's range) and the always-on alternate (a single key).
++void ForEachShortcutKey(
++    const Action& action,
++    base::FunctionRef<void(const ShortcutSpec&, int)> fn) {
++  if (!action.default_shortcut.empty()) {
++    fn(action.default_shortcut, ExtraShortcutKeys(action));
++  }
++  if (!action.alternate_shortcut.empty()) {
++    fn(action.alternate_shortcut, 0);
++  }
+ }
+ 
+ }  // namespace
+@@ -150,14 +165,29 @@
+ std::optional<std::string_view> FirstShortcutCollision(
+     base::span<const Action> rows) {
+   for (size_t i = 0; i < rows.size(); ++i) {
+-    if (rows[i].default_shortcut.empty() ||
+-        !rows[i].surfaces.Has(Surface::kShortcut)) {
++    if (!rows[i].surfaces.Has(Surface::kShortcut) ||
++        (rows[i].default_shortcut.empty() &&
++         rows[i].alternate_shortcut.empty())) {
+       continue;
+     }
++    // A row's own default and alternate may never take the same key.
++    if (!rows[i].default_shortcut.empty() &&
++        !rows[i].alternate_shortcut.empty() &&
++        SpecsOverlap(rows[i].default_shortcut, ExtraShortcutKeys(rows[i]),
++                     rows[i].alternate_shortcut, 0)) {
++      return rows[i].id;
++    }
+     for (size_t j = i + 1; j < rows.size(); ++j) {
+-      if (rows[j].surfaces.Has(Surface::kShortcut) &&
+-          !rows[j].default_shortcut.empty() &&
+-          ShortcutsOverlap(rows[i], rows[j])) {
++      if (!rows[j].surfaces.Has(Surface::kShortcut)) {
++        continue;
++      }
++      bool clash = false;
++      ForEachShortcutKey(rows[i], [&](const ShortcutSpec& a, int a_extra) {
++        ForEachShortcutKey(rows[j], [&](const ShortcutSpec& b, int b_extra) {
++          clash = clash || SpecsOverlap(a, a_extra, b, b_extra);
++        });
++      });
++      if (clash) {
+         return rows[j].id;
+       }
+     }
+--- a/chrome/browser/rac/actions/rac_actions.h
++++ b/chrome/browser/rac/actions/rac_actions.h
+@@ -154,9 +154,16 @@
+   // object schema for an action with no arguments).
+   std::string_view args_json;
+   ShortcutSpec default_shortcut;  // The shipped binding; empty() = unbound.
++  // A second shipped binding that is always on, even when `shortcut_pref`
++  // turns `default_shortcut` off. Binds `command_id` only (a ranged row's
++  // alternate never expands). Lets a row keep a menu-visible key while its
++  // default is gated, e.g. Opt+Cmd+T for the command bar while Cmd+T is the
++  // setting's.
++  ShortcutSpec alternate_shortcut;
+   // UI. A boolean pref that turns the shortcut and menu item on (for a
+   // feature whose shortcut some users want off). While it is false the row
+-  // has no default shortcut and no menu item, and a replaced command keeps
++  // has no default shortcut — an `alternate_shortcut` still binds, so the
++  // menu item keeps a key and stays shown — and a replaced command keeps
+   // its key. The shortcut service's defaults hook and the menu builder
+   // both read it. "" = always on.
+   std::string_view shortcut_pref;
+--- a/chrome/browser/rac/actions/rac_actions_command_bar.cc
++++ b/chrome/browser/rac/actions/rac_actions_command_bar.cc
+@@ -60,12 +60,15 @@
+         .default_shortcut = {.key = ui::VKEY_T,
+                              .modifiers = ui::EF_COMMAND_DOWN,
+                              .replaces_command_id = IDC_NEW_TAB},
++        .alternate_shortcut = {.key = ui::VKEY_T,
++                               .modifiers =
++                                   ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN},
+         .surfaces = {Surface::kMenu, Surface::kShortcut},
+         .menu = Menu::kFile,
+         .menu_after = IDC_NEW_TAB,
+         // D13's setting (rac::kNewTabOpensCommandBar). Off gives Cmd+T
+-        // back to New Tab and hides this item. A literal: :core depends on
+-        // base only.
++        // back to New Tab; the item stays shown with the always-on ⌥⌘T.
++        // A literal: :core depends on base only.
+         .shortcut_pref = "rac.command_bar.new_tab_opens_bar",
+         .risk = RiskClass::kNone,
+         .outside = OutsideClass::kNotOffered,
+--- a/chrome/browser/rac/power/shortcuts/table_shortcuts.cc
++++ b/chrome/browser/rac/power/shortcuts/table_shortcuts.cc
+@@ -34,9 +34,13 @@
+ }
+ 
+ // A ranged row whose last id comes before its first. It is a table bug, so it
+-// gets no default, no label, and no listing.
++// gets no default, no label, and no listing. So is a ranged row with an
++// `alternate_shortcut`: the alternate never expands, so it can't cover the
++// range.
+ bool IsMalformed(const action_table::Action& row) {
+-  return row.command_id_last != 0 && row.command_id_last < row.command_id;
++  return (row.command_id_last != 0 &&
++          row.command_id_last < row.command_id) ||
++         (row.command_id_last != 0 && !row.alternate_shortcut.empty());
+ }
+ 
+ // The last command id of a row: a single command is its own last.
+@@ -110,17 +114,33 @@
+     bool ai_on) {
+   std::vector<TableShortcut> result;
+   for (const action_table::Action& row : rows) {
+-    if (!RowIsEnabled(row, pref_is_on, ai_on)) {
++    if (!IsLiveRow(row, ai_on)) {
+       continue;
+     }
+-    const int count = LastCommandId(row) - row.command_id;
+-    for (int i = 0; i <= count; ++i) {
++    if (RowIsEnabled(row, pref_is_on, ai_on)) {
++      const int count = LastCommandId(row) - row.command_id;
++      for (int i = 0; i <= count; ++i) {
++        result.push_back(
++            {.command_id = row.command_id + i,
++             .accelerator =
++                 ui::Accelerator(
++                     static_cast<ui::KeyboardCode>(
++                         row.default_shortcut.key + i),
++                     row.default_shortcut.modifiers),
++             .replaces_command_id =
++                 row.default_shortcut.replaces_command_id});
++      }
++    }
++    // The alternate is always on: it is how a pref-gated row keeps a
++    // menu-visible key while its default is off. It binds `command_id`
++    // alone (IsMalformed refuses a ranged row's alternate).
++    if (!row.alternate_shortcut.empty()) {
+       result.push_back(
+-          {.command_id = row.command_id + i,
+-           .accelerator = ui::Accelerator(
+-               static_cast<ui::KeyboardCode>(row.default_shortcut.key + i),
+-               row.default_shortcut.modifiers),
+-           .replaces_command_id = row.default_shortcut.replaces_command_id});
++          {.command_id = row.command_id,
++           .accelerator = ui::Accelerator(row.alternate_shortcut.key,
++                                          row.alternate_shortcut.modifiers),
++           .replaces_command_id =
++               row.alternate_shortcut.replaces_command_id});
+     }
+   }
+   return result;
+@@ -134,8 +154,10 @@
+   for (const action_table::Action& row : rows) {
+     // A row whose pref is off, or an ai_only row with AI off, is inactive,
+     // not empty: it adds nothing.
++    // A row with a bound alternate shows a key too, so it adds nothing
++    // either.
+     if (!IsLiveRow(row, ai_on) || !PrefOn(row, pref_is_on) ||
+-        HasUsableDefault(row)) {
++        HasUsableDefault(row) || !row.alternate_shortcut.empty()) {
+       continue;
+     }
+     for (int id = row.command_id; id <= LastCommandId(row); ++id) {
+--- a/chrome/browser/rac/power/shortcuts/table_shortcuts.h
++++ b/chrome/browser/rac/power/shortcuts/table_shortcuts.h
+@@ -188,10 +188,12 @@
+ // 0. If `has_label` says the command has no label, skip it and change nothing
+ //    (Helium's insert_default does the same). If `can_store` says the
+ //    accelerator can't be stored, skip it but keep the command listed.
+-// 1. With replaces_command_id: if that command holds the same accelerator
+-//    and it is locked, skip the shortcut and keep the command listed. If it
+-//    is not locked, erase that entry. The replaced command stays in
+-//    `defaults`, even with no entries, so it stays listed and rebindable.
++// 1. With replaces_command_id: erase that command's held entry for the same
++//    accelerator, whatever its lock state — the replace is an explicit claim
++//    on the key. When no `defaults` entry holds it — an unlabeled platform
++//    or menu reservation lives only in `seen` — the replace takes it out of
++//    `seen` instead. The replaced command stays in `defaults`, even with no
++//    entries, so it stays listed and rebindable.
+ // 2. Otherwise, if `seen` already holds the accelerator, skip the shortcut
+ //    (keeping the command listed): it never takes a key from an unrelated
+ //    command. If not, add it to `seen`.
+@@ -222,15 +224,16 @@
+         auto held_it =
+             std::ranges::find(held, shortcut.accelerator, &Entry::accelerator);
+         if (held_it != held.end()) {
+-          if (!held_it->user_modifiable) {
+-            // Keep the row listed, with no key, so it can still be bound.
+-            defaults.try_emplace(shortcut.command_id);
+-            continue;
+-          }
+           held.erase(held_it);
+           replaced = true;
+         }
+       }
++      if (!replaced) {
++        // The replaced command's hold on the key may live in `seen` alone:
++        // an unlabeled platform or menu reservation never reaches
++        // `defaults`. The replace claims the key either way.
++        replaced = seen.erase(shortcut.accelerator);
++      }
+     }
+     if (!seen.insert(shortcut.accelerator).second && !replaced) {
+       // Another command owns these keys; never take them.
+--- a/chrome/browser/ui/rac/command_bar_prefs.h
++++ b/chrome/browser/ui/rac/command_bar_prefs.h
+@@ -11,11 +11,9 @@
+ 
+ namespace rac {
+ 
+-// Profile pref behind D13's one setting. True: Cmd+T and the
+-// sidebar's New tab row open the command bar. False brings back the new tab
+-// page. The action table's `open_command_bar` row names it as its
+-// `shortcut_pref`, so turning it off also gives Cmd+T back to File > New Tab
+-// and hides the bar's menu item.
++// Profile pref behind D13's one setting. True: ⌘T and the sidebar's New
++// tab row open the command bar. False: they do the new tab page. Either way
++// File > Open Command Bar and its ⌥⌘T open the bar.
+ inline constexpr char kNewTabOpensCommandBar[] =
+     "rac.command_bar.new_tab_opens_bar";
+ 
+--- a/chrome/browser/ui/views/rac/command_bar/command_bar_controller.cc
++++ b/chrome/browser/ui/views/rac/command_bar/command_bar_controller.cc
+@@ -27,7 +27,6 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+-#include "chrome/browser/ui/rac/command_bar_prefs.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -151,18 +150,10 @@
+   if (browser->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
+     return false;
+   }
+-  switch (entry) {
+-    case Entry::kNewTab:
+-      if (!browser->GetProfile()->GetPrefs()->GetBoolean(
+-              kNewTabOpensCommandBar)) {
+-        return false;
+-      }
+-      break;
+-    case Entry::kFocusLocation:
+-      if (!kFocusLocationOpensBar) {
+-        return false;
+-      }
+-      break;
++  // Entry::kNewTab's setting gates the caller, not the command: the menu
++  // item and its always-on ⌥⌘T open the bar whatever the pref says.
++  if (entry == Entry::kFocusLocation && !kFocusLocationOpensBar) {
++    return false;
+   }
+   CommandBarController::GetOrCreate(browser)->Show(entry);
+   return true;
+--- a/chrome/browser/ui/views/rac/command_bar/command_bar_handlers.cc
++++ b/chrome/browser/ui/views/rac/command_bar/command_bar_handlers.cc
+@@ -13,6 +13,9 @@
+ 
+ namespace rac::command_bar {
+ 
++// The command ids always open the bar: the new-tab setting owns only the
++// ⌘T binding (the row's `default_shortcut`), never this entry point, so the
++// menu item and the always-on ⌥⌘T work whatever the pref says.
+ // IDC_NEW_TAB and IDC_FOCUS_LOCATION are outside IDC_RAC_ACTION_FIRST..LAST,
+ // so a fallback never comes back to the table.
+ 
+--- a/chrome/browser/ui/views/rac/command_bar/command_bar_switches.h
++++ b/chrome/browser/ui/views/rac/command_bar/command_bar_switches.h
+@@ -15,7 +15,7 @@
+ namespace rac::command_bar {
+ 
+ // D13 is a pref, not a constant: rac::kNewTabOpensCommandBar
+-// (chrome/browser/ui/rac/command_bar_prefs.h), default on.
++// (chrome/browser/ui/rac/command_bar_prefs.h), default off.
+ 
+ // D28. Cmd+L opens the command bar with the URL selected. A click on the
+ // address bar is untouched and edits in place, so no switch is needed for it.
+--- a/chrome/browser/ui/views/rac/sidebar/new_tab_row.cc
++++ b/chrome/browser/ui/views/rac/sidebar/new_tab_row.cc
+@@ -11,10 +11,12 @@
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "cc/paint/paint_flags.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/rac/command_bar_prefs.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/rac/command_bar/command_bar_controller.h"
+@@ -22,6 +24,7 @@
+ #include "chrome/browser/ui/views/rac/rac_tokens.h"
+ #include "chrome/browser/ui/views/tabs/shared/new_tab_button_menu_model.h"
+ #include "chrome/grit/generated_resources.h"
++#include "components/prefs/pref_service.h"
+ #include "components/vector_icons/vector_icons.h"
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+@@ -51,8 +54,11 @@
+ NewTabRow::NewTabRow(BrowserWindowInterface* browser)
+     : views::Button(base::BindRepeating(
+           [](BrowserWindowInterface* browser) {
+-            // D13: the command bar, unless its setting is off.
+-            if (!command_bar::ShowCommandBar(browser,
++            // D13's setting owns this row: on opens the command bar, off a
++            // plain new tab.
++            if (!browser->GetProfile()->GetPrefs()->GetBoolean(
++                    kNewTabOpensCommandBar) ||
++                !command_bar::ShowCommandBar(browser,
+                                              command_bar::Entry::kNewTab)) {
+               chrome::NewTab(browser, NewTabTypes::kNewTabButton);
+             }
