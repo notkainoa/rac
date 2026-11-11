@@ -257,8 +257,9 @@ window, however many tabs have a chat.
   last tab that shows it, or turning AI off. Ending it stops its reply and
   its agent task, and a card waiting with it. Switching tabs, or another
   side panel taking the panel, keeps it. A tab moved to another window
-  takes its messages along (`CarryAssistantConversation`); its reply
-  stops. Chromium keeps the cached view of a tab's open entry, so a view
+  takes its messages along (`CarryAssistantConversation`); a reply still
+  running stops, and the new window shows what it had, then "Stopped
+  because the tab moved to another window." Chromium keeps the cached view of a tab's open entry, so a view
   can arrive from the old window; it takes the new window's page
   (`ViewNeedsWindowPage`).
 - **A conversation follows its agent task.** `open_tab` and `switch_tab`
