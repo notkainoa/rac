@@ -31,10 +31,62 @@ jobs:
     - uses: actions/setup-python@v6
       with:
         python-version: '3.14'
+    # quilt (and diffstat, which it depends on) are the only packages these
+    # tests need from outside the runner image. Ubuntu's mirrors have been
+    # unreachable from runners for hours at a time, so they come from, in
+    # order: the runner, the Actions cache, Debian's CDN (pinned .debs,
+    # checked against SHA-256), and only then apt, bounded in time.
+    - name: Restore the cached quilt packages
+      uses: actions/cache@v4
+      with:
+        path: ~/quilt-debs
+        key: quilt-debs-${{ runner.os }}-${{ runner.arch }}-v2
     - name: Install quilt and the macOS tool names the tests use
+      timeout-minutes: 8
+      env:
+        QUILT_DEB: https://deb.debian.org/debian/pool/main/q/quilt/quilt_0.67+really0.66-1_all.deb
+        QUILT_SHA256: a540ed782849c6f175eabc8551a5c365bfda1b7a52d836b7f0c7ef05ecccc4eb
+        DIFFSTAT_DEB: https://deb.debian.org/debian/pool/main/d/diffstat/diffstat_1.65-1_amd64.deb
+        DIFFSTAT_SHA256: 6a8c8f3b34d536dbf54ffd9d016d2aab8080323d10915f164344d9f0515ed418
       run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends quilt
+        debs="$HOME/quilt-debs"
+        works() { command -v quilt >/dev/null && quilt --version >/dev/null 2>&1; }
+        # quilt's push/pop/refresh need bash, patch and perl, which the
+        # image has; its other Depends (ed, gettext, ...) are optional here.
+        install_debs() {
+          sudo dpkg -i --force-depends "$debs"/*.deb >/dev/null 2>&1 && works
+        }
+        fetch_pinned() {
+          [ "$RUNNER_ARCH" = X64 ] || return 1
+          mkdir -p "$debs" && rm -f "$debs"/*.deb
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --max-time 60 \
+            -o "$debs/quilt.deb" "$QUILT_DEB" &&
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --max-time 60 \
+            -o "$debs/diffstat.deb" "$DIFFSTAT_DEB" &&
+          echo "$QUILT_SHA256  $debs/quilt.deb" | sha256sum -c --quiet &&
+          echo "$DIFFSTAT_SHA256  $debs/diffstat.deb" | sha256sum -c --quiet
+        }
+        if works; then
+          echo "quilt is already installed"
+        elif compgen -G "$debs/*.deb" >/dev/null && install_debs; then
+          echo "quilt installed from the cached packages"
+        elif fetch_pinned && install_debs; then
+          echo "quilt installed from the pinned Debian packages"
+        else
+          echo "::warning::No cached or pinned quilt; trying apt"
+          rm -f "$debs"/*.deb
+          for delay in 0 20 40; do
+            [ "$delay" = 0 ] || sleep "$delay"
+            if timeout 60 sudo apt-get -o Acquire::Retries=2 install -y -qq --no-install-recommends quilt ||
+               { timeout 60 sudo apt-get -o Acquire::Retries=2 update -qq &&
+                 timeout 60 sudo apt-get -o Acquire::Retries=2 install -y -qq --no-install-recommends quilt; }; then
+              break
+            fi
+          done
+          works || { echo "::error::Could not install quilt from the cache, Debian's CDN or Ubuntu's mirrors"; exit 1; }
+          echo "quilt installed from apt"
+        fi
+        quilt --version
         # worktree.sh wants Homebrew's greadlink; GNU readlink is the same tool.
         mkdir -p "$RUNNER_TEMP/bin"
         ln -s "$(command -v readlink)" "$RUNNER_TEMP/bin/greadlink"
