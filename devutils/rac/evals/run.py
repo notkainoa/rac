@@ -146,6 +146,8 @@ def flat_prefs(variant, origins):
 
 
 def tab_url(ref, origins):
+    if ref.startswith("view-source:"):
+        return "view-source:" + tab_url(ref[len("view-source:"):], origins)
     origin, path = ref.split(":", 1)
     return origins[origin] + path
 

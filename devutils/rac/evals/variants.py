@@ -148,7 +148,7 @@ def validate_variant(v):
         if not turn.get("user"):
             problems.append(f"turn {i}: missing user message")
         for ref in turn.get("open", []) + turn.get("attach", []):
-            origin = ref.split(":", 1)[0]
+            origin = ref.removeprefix("view-source:").split(":", 1)[0]
             if origin not in (v.get("origins") or {}):
                 problems.append(f"turn {i}: unknown origin in {ref!r}")
     for key in (v.get("prefs") or {}):
