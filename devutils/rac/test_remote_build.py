@@ -2476,6 +2476,31 @@ class RunTest(RemoteBuildTest):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn('must stay empty', result.stderr)
 
+    def test_run_takes_a_bangs_fixture_in_the_clone(self):
+        # Power's Bangs page reads its list from a fixture; the path is the
+        # clone's, must exist, and is not an Arc import input.
+        write(self.clone / 'devutils/rac/fixtures/bangs/list.json', '[]\n')
+        clone = os.path.realpath(self.clone)
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    '--rac-bangs-fixture=devutils/rac/fixtures/bangs/list.json',
+                    success=True)
+        calls = self.calls()
+        self.assertIn('--rac-bangs-fixture='
+                      f'{clone}/devutils/rac/fixtures/bangs/list.json', calls)
+        # Still a plain run: --test-type, the empty Arc root, no dead proxy.
+        self.assertIn('--test-type', calls)
+        self.assertIn('empty-import-root', calls)
+        self.assertNotIn('--proxy-server', calls)
+        for arg, why in (('--rac-bangs-fixture=/tmp/x.json', 'absolute'),
+                         ('--rac-bangs-fixture=../x.json', 'leave the clone'),
+                         ('--rac-bangs-fixture=', 'needs a path'),
+                         ('--rac-bangs-fixture', 'needs a path'),
+                         ('--rac-bangs-fixture=missing.json', 'no ')):
+            result = self.run_rb('run', self.wt, '--timeout', '3', '--', arg,
+                                 success=False)
+            self.assertEqual(result.returncode, 2, arg)
+            self.assertIn(why, result.stderr, arg)
+
     def test_run_net_log_quits_the_browser_alone_first(self):
         # A net log is finished by a clean quit, which needs the network
         # service alive: a run with one SIGTERMs the browser's main process
