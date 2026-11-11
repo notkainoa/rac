@@ -1,0 +1,369 @@
+--- a/chrome/browser/rac/agent/BUILD.gn
++++ b/chrome/browser/rac/agent/BUILD.gn
+@@ -79,6 +79,7 @@ source_set("browser") {
+   ]
+   deps = [
+     "//chrome/browser/profiles:profile",
++    "//chrome/browser/rac/ai:internal_tab",
+     "//chrome/browser/rac/spaces:tab_state",
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/navigator",
+@@ -149,6 +150,7 @@ test("rac_agent_unittests") {
+     "mcp_server_unittest.cc",
+     "ref_table_unittest.cc",
+     "snapshot_serializer_unittest.cc",
++    "tab_reach_unittest.cc",
+     "tool_registry_unittest.cc",
+   ]
+   deps = [
+@@ -158,7 +160,9 @@ test("rac_agent_unittests") {
+     "//base",
+     "//base/test:run_all_unittests",
+     "//base/test:test_support",
++    "//chrome/browser/rac/ai:internal_tab",
+     "//components/optimization_guide/proto:optimization_guide_proto",
++    "//content/public/common",
+     "//testing/gtest",
+   ]
+ }
+--- a/chrome/browser/rac/agent/agent_controller.cc
++++ b/chrome/browser/rac/agent/agent_controller.cc
+@@ -197,7 +197,7 @@ void AgentController::BeginTurn(
+   TabTools tabs(browser);
+   for (auto* tab : attached_tabs) {
+     if (!tab || tab->GetBrowserContext() != profile_ ||
+-        !IsAllowedAgentUrl(tab->GetLastCommittedURL().spec())) {
++        !IsTabInAgentReach(tab)) {
+       continue;
+     }
+     const std::string alias = tabs.AliasFor(tab);
+@@ -501,7 +501,7 @@ void AgentController::ProcessTool() {
+ }
+ void AgentController::ReadPage(bool for_action, bool revalidate) {
+   auto* tab = TargetTab();
+-  if (!tab || !IsAllowedAgentUrl(tab->GetLastCommittedURL().spec())) {
++  if (!tab || !IsTabInAgentReach(tab)) {
+     Finish(Error("denied", "Only attached web pages can be read."));
+     return;
+   }
+--- /dev/null
++++ b/chrome/browser/rac/agent/tab_reach_unittest.cc
+@@ -0,0 +1,109 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// The agent's tabs are in reach only when IsTabInAgentReach() is true, which
++// is !rac::ai::IsInternalTab(): IsInternalEntry() of the tab's last committed
++// entry. These tests build real navigation entries the way a tab holds them.
++
++#include <memory>
++
++#include "chrome/browser/rac/ai/internal_tab.h"
++#include "content/public/browser/content_browser_client.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/common/content_client.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace rac::agent {
++namespace {
++
++using rac::ai::IsInternalEntry;
++
++// A committed entry for `url`, shown in the address bar as `shown` (the same
++// address when `shown` is empty).
++std::unique_ptr<content::NavigationEntry> Entry(const char* url,
++                                                const char* shown = "") {
++  std::unique_ptr<content::NavigationEntry> entry =
++      content::NavigationEntry::Create();
++  entry->SetURL(GURL(url));
++  if (*shown) {
++    entry->SetVirtualURL(GURL(shown));
++  }
++  return entry;
++}
++
++bool InReach(const char* url, const char* shown = "") {
++  return !IsInternalEntry(Entry(url, shown).get());
++}
++
++// A navigation entry asks the content client for its default favicon.
++class RacAgentTabReachTest : public testing::Test {
++ protected:
++  RacAgentTabReachTest() {
++    content::SetContentClient(&client_);
++    content::SetBrowserClientForTesting(&browser_client_);
++  }
++  ~RacAgentTabReachTest() override {
++    content::SetBrowserClientForTesting(nullptr);
++    content::SetContentClient(nullptr);
++  }
++
++ private:
++  content::ContentClient client_;
++  content::ContentBrowserClient browser_client_;
++};
++
++TEST_F(RacAgentTabReachTest, WebPagesAreInReach) {
++  EXPECT_TRUE(InReach("https://example.com/"));
++  EXPECT_TRUE(InReach("http://example.com/a?b#c"));
++  EXPECT_TRUE(InReach("http://127.0.0.1:8080/plans"));
++  EXPECT_TRUE(InReach("https://example.com/", "https://example.com/"));
++}
++
++TEST_F(RacAgentTabReachTest, ViewSourceIsOutOfReach) {
++  // How the browser commits view-source:https://example.com/: the entry
++  // loads the page's own address and the address bar shows view-source:.
++  // WebContents::GetLastCommittedURL() is the shown one.
++  auto entry =
++      Entry("https://example.com/", "view-source:https://example.com/");
++  EXPECT_EQ(entry->GetURL(), GURL("https://example.com/"));
++  EXPECT_EQ(entry->GetVirtualURL(), GURL("view-source:https://example.com/"));
++  EXPECT_TRUE(IsInternalEntry(entry.get()));
++  // Either half alone is enough.
++  EXPECT_FALSE(
++      InReach("view-source:https://example.com/", "https://example.com/"));
++  EXPECT_FALSE(InReach("view-source:https://example.com/"));
++}
++
++TEST_F(RacAgentTabReachTest, BrowserPagesAreOutOfReach) {
++  EXPECT_FALSE(InReach("chrome://settings/"));
++  EXPECT_FALSE(InReach("chrome://newtab/"));
++  EXPECT_FALSE(InReach("chrome://rac-ai/"));
++  EXPECT_FALSE(InReach("rac://settings/"));
++  EXPECT_FALSE(InReach("rac://newtab/"));
++  EXPECT_FALSE(InReach("chrome-extension://abcdefghijklmnop/options.html"));
++  // An internal page can't pass by showing a web address, nor a web page by
++  // showing an internal one.
++  EXPECT_FALSE(InReach("chrome://settings/", "https://example.com/"));
++  EXPECT_FALSE(InReach("https://example.com/", "rac://settings/"));
++}
++
++TEST_F(RacAgentTabReachTest, OtherNonWebPagesAreOutOfReach) {
++  EXPECT_FALSE(InReach("file:///Users/me/notes.html"));
++  EXPECT_FALSE(InReach("data:text/html,hello"));
++  EXPECT_FALSE(InReach("about:blank"));
++  EXPECT_FALSE(InReach("javascript:alert(1)"));
++  EXPECT_FALSE(InReach("blob:https://example.com/0f0f0f0f"));
++}
++
++TEST_F(RacAgentTabReachTest, LoadingTabsAreOutOfReach) {
++  // A tab still loading its first page has committed nothing: no entry, or
++  // the initial entry, whose address is empty.
++  EXPECT_TRUE(IsInternalEntry(nullptr));
++  EXPECT_FALSE(InReach(""));
++  EXPECT_TRUE(rac::ai::IsInternalTab(nullptr));
++}
++
++}  // namespace
++}  // namespace rac::agent
+--- a/chrome/browser/rac/agent/tab_tools.cc
++++ b/chrome/browser/rac/agent/tab_tools.cc
+@@ -8,6 +8,7 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/rac/agent/action_context.h"
+ #include "chrome/browser/rac/agent/tool_registry.h"
++#include "chrome/browser/rac/ai/internal_tab.h"
+ #include "chrome/browser/rac/spaces/space_tab_tag.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+@@ -24,6 +25,10 @@
+ 
+ namespace rac::agent {
+ 
++bool IsTabInAgentReach(content::WebContents* contents) {
++  return !rac::ai::IsInternalTab(contents);
++}
++
+ TabTools::TabTools(BrowserWindowInterface* browser)
+     : browser_(browser ? browser->GetWeakPtr() : nullptr) {}
+ TabTools::~TabTools() = default;
+@@ -61,10 +66,7 @@ content::WebContents* TabTools::FindByAl
+     if (AliasFor(contents) == tab_id &&
+         SpaceTabTag::IsVisible(model->GetTabAtIndex(i)) &&
+         contents->GetBrowserContext() == browser_->GetProfile() &&
+-        (contents->GetLastCommittedURL().SchemeIsHTTPOrHTTPS() ||
+-         (contents->GetLastCommittedURL().IsAboutBlank() &&
+-          ActionContext::From(contents) &&
+-          ActionContext::From(contents)->agent_opened()))) {
++        IsTabInAgentReach(contents)) {
+       return contents;
+     }
+   }
+@@ -82,13 +84,11 @@ std::vector<TabInfo> TabTools::ListTabs(
+   }
+   for (int i = 0; i < model->count(); ++i) {
+     content::WebContents* contents = model->GetWebContentsAt(i);
+-    if (!contents || !SpaceTabTag::IsVisible(model->GetTabAtIndex(i))) {
++    if (!contents || !SpaceTabTag::IsVisible(model->GetTabAtIndex(i)) ||
++        !IsTabInAgentReach(contents)) {
+       continue;
+     }
+     const GURL& url = contents->GetLastCommittedURL();
+-    if (!url.SchemeIsHTTPOrHTTPS()) {
+-      continue;
+-    }
+     TabInfo info;
+     info.tab_id = AliasFor(contents);
+     info.title = base::UTF16ToUTF8(contents->GetTitle());
+@@ -199,8 +199,11 @@ ActionResult TabTools::GoBack(content::W
+   }
+   const content::NavigationEntry* entry =
+       contents->GetController().GetEntryAtOffset(-1);
+-  if (entry && !IsAllowedAgentUrl(entry->GetURL().spec()) &&
+-      !entry->GetURL().IsAboutBlank()) {
++  // Not back to a page the agent couldn't see, view-source: included (its
++  // entry has the page's own address). A blank page is fine.
++  if (entry && rac::ai::IsInternalEntry(entry) &&
++      !(entry->GetURL().IsAboutBlank() &&
++        entry->GetVirtualURL().IsAboutBlank())) {
+     result.error_code = "denied";
+     result.error = "Back target URL not allowed.";
+     return result;
+--- a/chrome/browser/rac/agent/tab_tools.h
++++ b/chrome/browser/rac/agent/tab_tools.h
+@@ -28,6 +28,13 @@ struct TabInfo {
+   bool agent_owned = false;
+ };
+ 
++// Whether the agent may see `contents` at all: true only once it has
++// committed an ordinary http(s) web page (!rac::ai::IsInternalTab(), which
++// judges both the entry's address and the one the address bar shows). Every
++// tab the agent lists, reads, or acts on passes this. A blank tab, one still
++// loading its first page, view-source:, and the browser's own pages don't.
++bool IsTabInAgentReach(content::WebContents* contents);
++
+ class TabTools {
+  public:
+   using NavigateDone = base::OnceCallback<void(ActionResult)>;
+--- a/chrome/browser/rac/ai/BUILD.gn
++++ b/chrome/browser/rac/ai/BUILD.gn
+@@ -7,13 +7,12 @@ import("//testing/test.gni")
+ # rac's opt-in AI browser-process code.
+ source_set("ai") {
+   sources = [
+-    "internal_tab.cc",
+-    "internal_tab.h",
+     "link_fetcher.cc",
+     "link_fetcher.h",
+     "page_context.cc",
+     "page_context.h",
+   ]
++  public_deps = [ ":internal_tab" ]
+   deps = [
+     ":core",
+     "//base",
+@@ -32,6 +31,20 @@ source_set("ai") {
+   ]
+ }
+ 
++# What the assistant and the agent may read (IsInternalTab()). Apart from
++# ":ai" so the agent's tab tools can use it without a dependency cycle.
++source_set("internal_tab") {
++  sources = [
++    "internal_tab.cc",
++    "internal_tab.h",
++  ]
++  public_deps = [ "//content/public/browser" ]
++  deps = [
++    ":core",
++    "//url",
++  ]
++}
++
+ # Prefs and provider descriptions. Depends only on base, prefs and net, so it
+ # can be tested without a browser.
+ source_set("core") {
+--- a/chrome/browser/rac/ai/internal_tab.cc
++++ b/chrome/browser/rac/ai/internal_tab.cc
+@@ -13,11 +13,11 @@
+ namespace rac::ai {
+ 
+ bool IsInternalTab(content::WebContents* contents) {
+-  if (!contents) {
+-    return true;
+-  }
+-  content::NavigationEntry* entry =
+-      contents->GetController().GetLastCommittedEntry();
++  return !contents ||
++         IsInternalEntry(contents->GetController().GetLastCommittedEntry());
++}
++
++bool IsInternalEntry(const content::NavigationEntry* entry) {
+   if (!entry || entry->IsInitialEntry()) {
+     return true;
+   }
+--- a/chrome/browser/rac/ai/internal_tab.h
++++ b/chrome/browser/rac/ai/internal_tab.h
+@@ -6,6 +6,7 @@
+ #define CHROME_BROWSER_RAC_AI_INTERNAL_TAB_H_
+ 
+ namespace content {
++class NavigationEntry;
+ class WebContents;
+ }  // namespace content
+ 
+@@ -20,6 +21,10 @@ namespace rac::ai {
+ // (IsAssistantBlockedHere()).
+ bool IsInternalTab(content::WebContents* contents);
+ 
++// IsInternalTab() of a tab whose last committed entry is `entry`: true for
++// null and for the initial entry a tab has before it commits a page.
++bool IsInternalEntry(const content::NavigationEntry* entry);
++
+ }  // namespace rac::ai
+ 
+ #endif  // CHROME_BROWSER_RAC_AI_INTERNAL_TAB_H_
+--- a/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
++++ b/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
+@@ -234,8 +234,7 @@ class ActivePageWatch : public content::
+     active_tab_subscription_ =
+         browser->RegisterActiveTabDidChange(base::BindRepeating(
+             &ActivePageWatch::OnActiveTabChanged, base::Unretained(this)));
+-    tabs::TabInterface* tab = browser->GetActiveTabInterface();
+-    Observe(tab ? tab->GetContents() : nullptr);
++    WatchTab(browser->GetActiveTabInterface());
+     VLOG(1) << "rac assistant: watching the active tab";
+   }
+ 
+@@ -245,11 +244,29 @@ class ActivePageWatch : public content::
+ 
+  private:
+   void OnActiveTabChanged(BrowserWindowInterface* browser) {
+-    tabs::TabInterface* tab = browser->GetActiveTabInterface();
+-    Observe(tab ? tab->GetContents() : nullptr);
++    WatchTab(browser->GetActiveTabInterface());
+     on_change_.Run();
+   }
+ 
++  // Follows `tab` into the contents that replace its own when it's
++  // discarded, so the watch doesn't end until the next tab switch.
++  void WatchTab(tabs::TabInterface* tab) {
++    Observe(tab ? tab->GetContents() : nullptr);
++    discard_subscription_ =
++        tab ? tab->RegisterWillDiscardContents(
++                  base::BindRepeating(&ActivePageWatch::OnWillDiscardContents,
++                                      base::Unretained(this)))
++            : base::CallbackListSubscription();
++  }
++
++  // The new contents load their page later, and DidFinishNavigation()
++  // reports it then.
++  void OnWillDiscardContents(tabs::TabInterface* tab,
++                             content::WebContents* old_contents,
++                             content::WebContents* new_contents) {
++    Observe(new_contents);
++  }
++
+   // content::WebContentsObserver:
+   void DidFinishNavigation(content::NavigationHandle* handle) override {
+     if (handle->IsInPrimaryMainFrame() && !handle->IsSameDocument()) {
+@@ -261,6 +278,7 @@ class ActivePageWatch : public content::
+ 
+   base::RepeatingClosure on_change_;
+   base::CallbackListSubscription active_tab_subscription_;
++  base::CallbackListSubscription discard_subscription_;
+ };
+ 
+ // The wash is translucent, so it leaves out the part of the panel over the
