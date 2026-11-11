@@ -65,6 +65,17 @@ the agent's safety check. An agent is a provider for chat, and also a
 source of browser tool calls, but it is never asked to judge its own
 actions.
 
+Exactly one provider is active per profile: the agent in `rac.ai.agent_id`
+when it names one, else the direct provider in `rac.ai.provider`. Settings
+and the chat's model menu change it only through `SelectDirectProvider` and
+`SelectAgent` (`active_provider.h`). Choosing a direct provider clears the
+agent; choosing an agent keeps the direct provider underneath, for link
+summaries and the safety check. A handler that wrote `rac.ai.provider`
+itself is how Settings once said OpenAI while the chat kept using Claude
+Code. Open chat pages and Settings watch these prefs, so a choice shows
+everywhere at once. A reply reads the choice, model included, when it
+starts and keeps it, so a change applies to the next message.
+
 The model menu asks each set-up provider for its model list when the menu
 opens, and Settings asks only while the Assistant page itself is open (a
 settings search renders the section too, and must not send the key):
