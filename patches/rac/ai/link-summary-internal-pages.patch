@@ -1,0 +1,280 @@
+--- a/chrome/browser/rac/ai/link_summary.cc
++++ b/chrome/browser/rac/ai/link_summary.cc
+@@ -14,6 +14,7 @@
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/rac/ai/internal_page.h"
+ #include "components/optimization_guide/proto/features/common_quality_data.pb.h"
+ 
+ namespace rac::ai {
+@@ -114,6 +115,13 @@ bool IsSummarizableLink(const GURL& link
+   return !HasNonPageExtension(link);
+ }
+ 
++bool CanSummarizeLinksOn(const GURL& url,
++                         const GURL& virtual_url,
++                         const GURL& visible_url) {
++  return !IsInternalPageUrl(url, virtual_url) &&
++         !IsInternalPageUrl(visible_url, GURL());
++}
++
+ GURL LinkCacheKey(const GURL& link) {
+   if (!link.has_ref()) {
+     return link;
+--- a/chrome/browser/rac/ai/link_summary.h
++++ b/chrome/browser/rac/ai/link_summary.h
+@@ -47,6 +47,17 @@ inline constexpr int kLinkCardGap = 8;
+ // file download. `page` may be empty.
+ bool IsSummarizableLink(const GURL& link, const GURL& page);
+ 
++// Whether links on a page may be summarized. Never on an internal page
++// (IsInternalPageUrl()): a link's address there, such as a row in history or
++// downloads, is the user's own browsing. `url` and `virtual_url` are the
++// tab's last committed entry, the page the link is on (both empty when it
++// has committed nothing), and `visible_url` is the address bar's. All of
++// them must be web pages, so a tab on its way between an internal page and a
++// web page is refused whichever way it's going.
++bool CanSummarizeLinksOn(const GURL& url,
++                         const GURL& virtual_url,
++                         const GURL& visible_url);
++
+ // Same document, ignoring the fragment.
+ GURL LinkCacheKey(const GURL& link);
+ 
+--- a/chrome/browser/rac/ai/link_summary_unittest.cc
++++ b/chrome/browser/rac/ai/link_summary_unittest.cc
+@@ -42,6 +42,88 @@ TEST(LinkSummaryTest, RejectsCredentials
+       GURL("https://example.org/" + std::string(3000, 'a')), page));
+ }
+ 
++TEST(LinkSummaryTest, LinksToInternalPagesNeverQualify) {
++  const GURL page("https://example.com/post");
++  EXPECT_FALSE(IsSummarizableLink(GURL("chrome://history/"), page));
++  EXPECT_FALSE(IsSummarizableLink(GURL("rac://settings/assistant"), page));
++  EXPECT_FALSE(IsSummarizableLink(GURL("chrome://newtab/"), page));
++  EXPECT_FALSE(
++      IsSummarizableLink(GURL("view-source:https://example.org/"), page));
++  EXPECT_FALSE(IsSummarizableLink(
++      GURL("chrome-extension://abcdefghijklmnop/options.html"), page));
++  EXPECT_FALSE(IsSummarizableLink(GURL("about:blank"), page));
++  EXPECT_FALSE(IsSummarizableLink(GURL("data:text/html,hi"), page));
++}
++
++// The page the link is on: the last committed entry's address and shown
++// address, then the address bar's.
++bool CanSummarizeOn(const char* url,
++                    const char* virtual_url,
++                    const char* visible_url) {
++  return CanSummarizeLinksOn(GURL(url), GURL(virtual_url), GURL(visible_url));
++}
++
++TEST(LinkSummaryTest, LinksOnWebPagesCanBeSummarized) {
++  EXPECT_TRUE(CanSummarizeOn("https://example.com/post",
++                             "https://example.com/post",
++                             "https://example.com/post"));
++  EXPECT_TRUE(
++      CanSummarizeOn("http://127.0.0.1:8771/", "", "http://127.0.0.1:8771/"));
++  // The address bar may already show the next web page.
++  EXPECT_TRUE(CanSummarizeOn("https://example.com/", "https://example.com/",
++                             "https://example.org/next"));
++}
++
++TEST(LinkSummaryTest, LinksOnInternalPagesAreNeverSummarized) {
++  for (const char* page : {
++           "chrome://history/",
++           "rac://history/",
++           "chrome://downloads/",
++           "chrome://settings/assistant",
++           "rac://settings/",
++           "chrome://newtab/",
++           "rac://newtab/",
++           "chrome://rac-ai/?mode=page",
++           "chrome://bookmarks/",
++           "chrome-extension://abcdefghijklmnop/options.html",
++           "chrome-untrusted://print/",
++           "devtools://devtools/bundled/devtools_app.html",
++           "file:///Users/me/notes.html",
++           "about:blank",
++           "data:text/html,<a href=https://example.com>x</a>",
++       }) {
++    SCOPED_TRACE(page);
++    EXPECT_FALSE(CanSummarizeOn(page, page, page));
++    EXPECT_FALSE(CanSummarizeOn(page, "", page));
++  }
++}
++
++TEST(LinkSummaryTest, ViewSourceIsInternalThoughItsEntryIsTheWebPage) {
++  EXPECT_FALSE(CanSummarizeOn("https://example.com/",
++                              "view-source:https://example.com/",
++                              "view-source:https://example.com/"));
++}
++
++TEST(LinkSummaryTest, ATabBetweenInternalAndWebPagesIsRefused) {
++  // Leaving history for a web page: history's links are still on screen.
++  EXPECT_FALSE(CanSummarizeOn("chrome://history/", "chrome://history/",
++                              "https://example.com/"));
++  // Typed chrome://history on a web page: refused until it settles.
++  EXPECT_FALSE(CanSummarizeOn("https://example.com/", "https://example.com/",
++                              "chrome://history/"));
++  // A web entry that shows an internal address.
++  EXPECT_FALSE(CanSummarizeOn("https://example.com/", "rac://settings/",
++                              "https://example.com/"));
++}
++
++TEST(LinkSummaryTest, NoPageMeansNoSummary) {
++  EXPECT_FALSE(CanSummarizeOn("", "", ""));
++  EXPECT_FALSE(CanSummarizeOn("", "", "https://example.com/"));
++  EXPECT_FALSE(
++      CanSummarizeOn("https://example.com/", "https://example.com/", ""));
++  EXPECT_FALSE(CanSummarizeOn("not a url", "", "https://example.com/"));
++}
++
+ TEST(LinkSummaryTest, OptionAloneStartsAHover) {
+   EXPECT_TRUE(IsOnlyOptionHeld(true, false, false, false));
+   EXPECT_FALSE(IsOnlyOptionHeld(false, false, false, false));
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.cc
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+@@ -2164,8 +2164,7 @@ void RenderViewContextMenu::AppendLinkIt
+   }
+ 
+   AppendCopyLinkLocationItem();
+-  if (rac::ai::ShouldOfferLinkSummary(browser_context_, params_.link_url,
+-                                      params_.page_url)) {
++  if (rac::ai::ShouldOfferLinkSummary(source_web_contents_, params_.link_url)) {
+     menu_model_.AddItem(IDC_CONTENT_CONTEXT_RAC_SUMMARIZE_LINK,
+                         u"Summarize Link");
+   }
+--- a/chrome/browser/ui/views/rac/ai/link_hover_watcher.cc
++++ b/chrome/browser/ui/views/rac/ai/link_hover_watcher.cc
+@@ -9,11 +9,8 @@
+ #include "base/functional/bind.h"
+ #include "base/no_destructor.h"
+ #include "base/timer/timer.h"
+-#include "chrome/browser/profiles/profile.h"
+-#include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/rac/ai/link_summary.h"
+ #include "chrome/browser/ui/views/rac/ai/link_summary_controller.h"
+-#include "components/prefs/pref_service.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_observer.h"
+ #include "ui/display/screen.h"
+@@ -152,10 +149,8 @@ void OnLinkTargetChanged(content::WebCon
+     return;
+   }
+   NotifyLinkTarget(source, target);
+-  Profile* profile = Profile::FromBrowserContext(source->GetBrowserContext());
+-  if (!profile || !profile->IsRegularProfile() ||
+-      !IsAiEnabled(profile->GetPrefs()) ||
+-      !IsSummarizableLink(target, source->GetLastCommittedURL())) {
++  // Before anything watches the pointer: never on an internal page.
++  if (!ShouldOfferLinkSummary(source, target)) {
+     watcher.reset();
+     return;
+   }
+--- a/chrome/browser/ui/views/rac/ai/link_hover_watcher.h
++++ b/chrome/browser/ui/views/rac/ai/link_hover_watcher.h
+@@ -16,7 +16,8 @@ namespace rac::ai {
+ // Called whenever the link under the pointer changes; `target` is empty when
+ // the pointer isn't on a link. While the assistant is off this reads one
+ // preference and returns. While it is on, listeners and a timer exist only
+-// while the pointer is on an http(s) link and, for the timer, ⌥ Option is
++// while the pointer is on a link ShouldOfferLinkSummary() allows (an http(s)
++// link on a web page, never an internal one) and, for the timer, ⌥ Option is
+ // held.
+ void OnLinkTargetChanged(content::WebContents* source, const GURL& target);
+ 
+--- a/chrome/browser/ui/views/rac/ai/link_summary_controller.cc
++++ b/chrome/browser/ui/views/rac/ai/link_summary_controller.cc
+@@ -33,6 +33,8 @@
+ #include "chrome/grit/rac_strings.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "components/prefs/pref_service.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_observer.h"
+@@ -112,6 +114,17 @@ std::string OneLine(const std::string& t
+   return line;
+ }
+ 
++// The page the link is on: the tab's last committed entry, the one its links
++// belong to, and the address bar's address must both be web pages
++// (CanSummarizeLinksOn()). A tab that hasn't committed a page has no links.
++bool IsOnLinkSummaryPage(content::WebContents* source) {
++  const content::NavigationEntry* entry =
++      source->GetController().GetLastCommittedEntry();
++  return entry && !entry->IsInitialEntry() &&
++         CanSummarizeLinksOn(entry->GetURL(), entry->GetVirtualURL(),
++                             source->GetVisibleURL());
++}
++
+ bool IsPrefixOfNoContent(const std::string& reply) {
+   const std::string trimmed(base::TrimWhitespaceASCII(reply, base::TRIM_ALL));
+   return !trimmed.empty() &&
+@@ -442,22 +455,23 @@ void Controller::Close(bool animate) {
+ 
+ }  // namespace
+ 
+-bool ShouldOfferLinkSummary(content::BrowserContext* context,
+-                            const GURL& link,
+-                            const GURL& page) {
++bool ShouldOfferLinkSummary(content::WebContents* source, const GURL& link) {
++  if (!source) {
++    return false;
++  }
+   // Like the chat, the summary is off in Incognito and guest windows: it would
+   // send what they browse to a provider.
+-  Profile* profile = Profile::FromBrowserContext(context);
++  Profile* profile = Profile::FromBrowserContext(source->GetBrowserContext());
+   return profile && profile->IsRegularProfile() &&
+-         IsAiEnabled(profile->GetPrefs()) && IsSummarizableLink(link, page);
++         IsAiEnabled(profile->GetPrefs()) && IsOnLinkSummaryPage(source) &&
++         IsSummarizableLink(link, source->GetLastCommittedURL());
+ }
+ 
+ void SummarizeLink(content::WebContents* source,
+                    const GURL& link,
+                    const gfx::Point& pointer,
+                    LinkTrigger trigger) {
+-  if (!source || !ShouldOfferLinkSummary(source->GetBrowserContext(), link,
+-                                         source->GetLastCommittedURL())) {
++  if (!ShouldOfferLinkSummary(source, link)) {
+     return;
+   }
+   if (Controller* current = Current().get();
+--- a/chrome/browser/ui/views/rac/ai/link_summary_controller.h
++++ b/chrome/browser/ui/views/rac/ai/link_summary_controller.h
+@@ -10,7 +10,6 @@
+ class GURL;
+ 
+ namespace content {
+-class BrowserContext;
+ class WebContents;
+ }  // namespace content
+ 
+@@ -21,15 +20,17 @@ enum class LinkTrigger {
+   kHover,
+ };
+ 
+-// Whether the link menu should offer "Summarize Link". False while the
+-// assistant is off. Does no work beyond reading a preference in that case.
+-bool ShouldOfferLinkSummary(content::BrowserContext* context,
+-                            const GURL& link,
+-                            const GURL& page);
++// Whether `link`, on the page `source` shows, may be summarized: by the
++// link menu's "Summarize Link", or by holding Option over it. False while
++// the assistant is off, and does no work beyond reading a preference then.
++// Also false in Incognito and guest windows, and on internal pages
++// (CanSummarizeLinksOn()), where a link's address is the user's own
++// browsing.
++bool ShouldOfferLinkSummary(content::WebContents* source, const GURL& link);
+ 
+ // Shows the link's summary in a card near `pointer` (screen coordinates),
+ // replacing any card already up. Reads the page privately; see LinkFetcher.
+-// Does nothing unless the assistant is on and `link` is an http(s) page.
++// Does nothing unless ShouldOfferLinkSummary().
+ void SummarizeLink(content::WebContents* source,
+                    const GURL& link,
+                    const gfx::Point& pointer,
