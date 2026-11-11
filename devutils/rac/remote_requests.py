@@ -465,6 +465,7 @@ class Checker:
             'tabdrag-select': n == 2 and ints(*args),
             'tabdrag-group': n == 2 and ints(*args),
             'tabdrag-start-group': n == 1 and ints(args[0]),
+            'tabdrag-window': n == 1 and args[0] in ('incognito', 'normal'),
         }
         if verb not in simple:
             raise Refused(f'unknown request verb {verb!r}')
