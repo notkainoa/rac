@@ -111,7 +111,7 @@ def stop_grace():
 
 def drain_grace():
     """Seconds the rest of a group gets to exit after its leader did."""
-    return float(os.environ.get('RAC_BUILD_QUEUE_DRAIN_GRACE', '5'))
+    return float(os.environ.get('RAC_BUILD_QUEUE_DRAIN_GRACE', '10'))
 
 
 def say(message):

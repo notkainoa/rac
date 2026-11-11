@@ -53,12 +53,13 @@
 #                                     --rac-arc-import-fixture=<path> and
 #                                     --rac-import-source-root=<path> (Arc
 #                                     import inputs, relative to the clone,
-#                                     that must exist there; a run with
-#                                     neither gets
-#                                     --rac-import-source-root= an empty
-#                                     build/empty-import-root, so a restored
-#                                     setup?arc tab or the tour's Arc step
-#                                     never reads the Pro's real Arc),
+#                                     that must exist there; a run without
+#                                     --rac-import-source-root= gets the
+#                                     clone's empty build/empty-import-root
+#                                     as one, so a restored setup?arc tab,
+#                                     the tour or Settings never reads the
+#                                     Pro's real Arc; evals hand it to the
+#                                     runner too),
 #                                     --rac-window-screenshot=<name>.png
 #                                     (first shot; lands in build/shots) and
 #                                     --rac-window-screenshot-delay=<1-4
@@ -260,6 +261,30 @@ safe_name() {
   case "$1" in
     '' | .* | *[!A-Za-z0-9._-]*) return 1 ;;
   esac
+}
+
+# Prints clone $1's empty Arc import root, making it if needed. A dev build
+# without --rac-import-source-root reads the Pro's real Arc wherever an Arc
+# step opens (a restored setup?arc tab, the tour, Settings, an eval), so
+# every browser this script starts gets a source root: this one when the
+# run names none. It is a plain empty folder in the clone, never a
+# symlink; anything else fails (exit 2 from the caller's `|| exit 2`).
+empty_import_root() {
+  local root="$1/build/empty-import-root" path
+  for path in "$1/build" "$root"; do
+    [ ! -L "$path" ] || { echo "rac remote: refusing: $path is a symlink" >&2; return 2; }
+  done
+  inside_clone "$1" "$root" || { echo "rac remote: refusing: $root leaves the clone" >&2; return 2; }
+  mkdir -p "$root"
+  { [ -d "$root" ] && [ ! -L "$root" ] && inside_clone "$1" "$root"; } || {
+    echo "rac remote: refusing: $root is not a folder in the clone" >&2
+    return 2
+  }
+  [ -z "$(ls -A "$root")" ] || {
+    echo "rac remote: refusing: $root must stay empty; remove what is in it" >&2
+    return 2
+  }
+  printf '%s\n' "$root"
 }
 
 # The toolchain record a tree answers to: a clone's own copy in its
@@ -1536,10 +1561,11 @@ args=()
 expected=()
 # Log files the browser is asked to write, mapped under build/logs.
 logfiles=()
-# Whether the run writes a net log, and names an Arc import input of its
-# own.
+# Whether the run writes a net log, and names an Arc source root of its
+# own (a fixture alone isn't one: Settings and the reader still look for
+# Arc on disk).
 net_log=0
-import_given=0
+root_given=0
 for arg in "$@"; do
   case "$arg" in
     --rac-window-screenshot=*)
@@ -1556,7 +1582,7 @@ for arg in "$@"; do
     # to the clone, existing, and still inside it once symlinks resolve.
     # Nothing is created for them.
     --rac-arc-import-fixture=* | --rac-import-source-root=*)
-      import_given=1
+      case "$arg" in --rac-import-source-root=*) root_given=1 ;; esac
       input=${arg#*=}
       [ -n "$input" ] || { echo "rac remote: refusing: ${arg%%=*} needs a path in the clone" >&2; exit 2; }
       input="$clone/$input"
@@ -1566,29 +1592,15 @@ for arg in "$@"; do
   esac
   args+=("$arg")
 done
-# A run with no import input can still reach the Arc import screen: a
-# setup?arc tab restored from the clone's saved session, or the first-run
-# tour's Arc step without --no-first-run. A dev build without
-# --rac-import-source-root reads the Pro's real Arc there, so the run gets
-# an empty root of its own: Arc is not found, nothing can be imported, and
-# the real Arc is never opened. It is a plain empty folder in the clone,
-# never a symlink. The Air made its import-run decisions (--test-type, the
+# A run without a source root can still reach an Arc step: a setup?arc tab
+# restored from the clone's saved session, the first-run tour without
+# --no-first-run, or Settings' import card in a fixture run. A dev build
+# without --rac-import-source-root reads the Pro's real Arc there, so the
+# run gets the clone's empty root: Arc is not found and the real Arc is
+# never opened. The Air made its import-run decisions (--test-type, the
 # dead proxy, the refusals) without it, so the run stays what it was.
-if [ "$import_given" = 0 ]; then
-  empty_root="$clone/build/empty-import-root"
-  for path in "$clone/build" "$empty_root"; do
-    [ ! -L "$path" ] || { echo "rac remote: refusing: $path is a symlink" >&2; exit 2; }
-  done
-  inside_clone "$clone" "$empty_root" || { echo "rac remote: refusing: $empty_root leaves the clone" >&2; exit 2; }
-  mkdir -p "$empty_root"
-  { [ -d "$empty_root" ] && [ ! -L "$empty_root" ] && inside_clone "$clone" "$empty_root"; } || {
-    echo "rac remote: refusing: $empty_root is not a folder in the clone" >&2
-    exit 2
-  }
-  [ -z "$(ls -A "$empty_root")" ] || {
-    echo "rac remote: refusing: $empty_root must stay empty; remove what is in it" >&2
-    exit 2
-  }
+if [ "$root_given" = 0 ]; then
+  empty_root=$(empty_import_root "$clone") || exit 2
   args+=("--rac-import-source-root=$empty_root")
 fi
 if [ -n "$shot" ]; then
@@ -1905,7 +1917,7 @@ quit_main() {
     [ -n "$left" ] || return 0
     sleep 0.25
   done
-  echo "rac remote: the browser did not quit within 10s of SIGTERM; stopping it" >&2 || true
+  echo "rac remote: the browser did not quit within 10s of SIGTERM; the queue stops it next" >&2 || true
   return 0
 }
 stop_own() {
@@ -2320,6 +2332,14 @@ for dir in "$clone/build" "$evals_dir" "$results" "$tmp"; do
   }
 done
 mkdir -p "$results" "$tmp"
+# The runner launches the browser itself, so it has to hand every launch
+# the clone's empty Arc root the way `run` does; a runner that doesn't
+# know RAC_EVALS_IMPORT_SOURCE_ROOT could read the Pro's real Arc.
+grep -q RAC_EVALS_IMPORT_SOURCE_ROOT "$runner/devutils/rac/evals/run.py" || {
+  echo "rac remote: refusing: the runner at $ref doesn't pass RAC_EVALS_IMPORT_SOURCE_ROOT to the browser; run evals from a branch that does" >&2
+  exit 2
+}
+import_root=$(empty_import_root "$clone") || exit 2
 for dir in "$evals_dir" "$results" "$tmp"; do
   inside_clone "$clone" "$dir" || {
     echo "rac remote: refusing: $dir leaves the clone through a symlink" >&2
@@ -2381,7 +2401,7 @@ trap 'cleanup; exit 130' INT TERM HUP
 # process on one line and tree_procs finds it by run.py's path.
 run_main='import os, runpy, sys; sys.argv = sys.argv[1:]; sys.path.insert(0, os.path.dirname(sys.argv[0])); runpy.run_path(sys.argv[0], run_name="__main__")'
 python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-  env RAC_EVALS_NO_QUEUE=1 "TMPDIR=$tmp" \
+  env RAC_EVALS_NO_QUEUE=1 "TMPDIR=$tmp" "RAC_EVALS_IMPORT_SOURCE_ROOT=$import_root" \
   nice -n 10 taskpolicy -c utility devutils/rac/build-queue.sh --run \
   bash -c 'cd "$1" && shift && exec "$@"' rac-evals "$runner" \
   python3 -I -c "$run_main" "$runner/devutils/rac/evals/run.py" \

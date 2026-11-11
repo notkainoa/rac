@@ -274,7 +274,7 @@ done
 # QUEUE_GROUP_KILL: like the real queue, run the command in a session of
 # its own and, when stopped, SIGTERM that whole group, then SIGKILL it if
 # it outlives a 5s grace; once it exits on its own, give the rest of the
-# group 5s to drain before the SIGTERM.
+# group 10s to drain before the SIGTERM.
 if [ -n "${QUEUE_GROUP_KILL:-}" ]; then
   python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
   child=$!
@@ -289,7 +289,7 @@ if [ -n "${QUEUE_GROUP_KILL:-}" ]; then
   }
   trap stop TERM
   wait "$child" || true
-  for _ in $(seq 1 20); do
+  for _ in $(seq 1 40); do
     kill -0 -- "-$child" 2>/dev/null || exit 0
     sleep 0.25
   done
@@ -413,6 +413,8 @@ if log:
         f.write('run.py env RAC_EVALS_NO_QUEUE=%s TMPDIR=%s\\n' % (
             os.environ.get('RAC_EVALS_NO_QUEUE', ''),
             os.environ.get('TMPDIR', '')))
+        f.write('run.py env RAC_EVALS_IMPORT_SOURCE_ROOT=%s\\n' % (
+            os.environ.get('RAC_EVALS_IMPORT_SOURCE_ROOT', ''),))
 args = sys.argv[1:]
 if '--list' in args:
     sys.exit(0)
@@ -2388,15 +2390,20 @@ class RunTest(RemoteBuildTest):
         self.run_rb('run', self.wt, '--timeout', '3', '--',
                     '--rac-import-arc-undo-now', success=True)
         self.assertIn(empty, self.calls())
-        # A run that names an input gets only its own.
+        # A fixture alone isn't a source root (Settings and the reader
+        # still look for Arc on disk), so it gets the empty root too...
         write(self.clone / 'devutils/fixtures/arc/StorableSidebar.json', '{}\n')
+        self.log.unlink()
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    '--rac-arc-import-fixture=devutils/fixtures/arc/StorableSidebar.json',
+                    success=True)
+        self.assertIn(empty, self.calls())
+        # ...and a run that names a source root gets only its own.
         (self.clone / 'build/arc-root').mkdir(parents=True)
-        for arg in ('--rac-arc-import-fixture=devutils/fixtures/arc/StorableSidebar.json',
-                    '--rac-import-source-root=build/arc-root'):
-            self.log.unlink()
-            self.run_rb('run', self.wt, '--timeout', '3', '--', arg,
-                        success=True)
-            self.assertNotIn('empty-import-root', self.calls(), arg)
+        self.log.unlink()
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    '--rac-import-source-root=build/arc-root', success=True)
+        self.assertNotIn('empty-import-root', self.calls())
         # The empty root never makes the import screen safe to open.
         for arg in ('chrome://setup', 'rac://setup?arc',
                     'chrome://settings/general'):
@@ -3029,6 +3036,11 @@ class EvalsTest(RemoteBuildTest):
         # the clone for temp files.
         self.assertIn('run.py env RAC_EVALS_NO_QUEUE=1 '
                       f'TMPDIR={clone}/build/evals/tmp', calls)
+        # ...and the clone's empty Arc root to hand every browser it starts.
+        self.assertIn('run.py env RAC_EVALS_IMPORT_SOURCE_ROOT='
+                      f'{clone}/build/empty-import-root', calls)
+        root = self.clone / 'build/empty-import-root'
+        self.assertTrue(root.is_dir() and not root.is_symlink())
         # Only the runner's own subtree was extracted, into a fresh dir.
         self.assertEqual([p.name for p in runner.iterdir()], ['devutils'])
         self.assertTrue((runner / 'devutils/rac/evals/run.py').exists())
@@ -3186,6 +3198,19 @@ class EvalsTest(RemoteBuildTest):
         result = self.run_evals('--ref', 'no-such-branch', success=False)
         self.assertIn('no-such-branch', result.stderr)
         self.assertNotIn('run.py', self.calls())
+
+    def test_evals_refuses_a_runner_without_the_empty_arc_root(self):
+        # A runner that doesn't hand its browsers RAC_EVALS_IMPORT_SOURCE_ROOT
+        # could open an Arc step that reads the Pro's real Arc: refused
+        # before it runs.
+        git(self.origin, 'checkout', '-q', '-b', 'old-runner')
+        write(self.origin / 'devutils/rac/evals/run.py',
+              STUB_RUN_PY.replace('RAC_EVALS_IMPORT_SOURCE_ROOT', 'OTHER'))
+        git(self.origin, 'commit', '-qam', 'old runner')
+        result = self.run_evals('--ref', 'old-runner', success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('RAC_EVALS_IMPORT_SOURCE_ROOT', result.stderr)
+        self.assertNotIn('run.py ', self.calls())
 
     def test_evals_exit_status_is_the_runners(self):
         result = self.run_evals(success=False, RUNPY_EXIT='7')

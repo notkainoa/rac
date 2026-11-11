@@ -448,6 +448,21 @@ class ShotsTest(unittest.TestCase):
                                            activate="T1", timeout=0.5))
             self.assertIn("ws gone", shots.taken[0]["error"])
 
+    def test_launch_args_adds_the_empty_arc_root_from_the_env(self):
+        # remote-build.sh evals sets RAC_EVALS_IMPORT_SOURCE_ROOT so every
+        # launch reads the clone's empty Arc root, never the host's Arc.
+        with tempfile.TemporaryDirectory() as wt:
+            LaunchTest().make_worktree(wt)
+            env = {"RAC_EVALS_NO_QUEUE": "1",
+                   "RAC_EVALS_IMPORT_SOURCE_ROOT": "/x/build/empty-import-root"}
+            with mock.patch.dict(os.environ, env):
+                args = run.launch_args("/tmp/p", wt)
+            self.assertIn("--rac-import-source-root=/x/build/empty-import-root", args)
+            with mock.patch.dict(os.environ, {"RAC_EVALS_NO_QUEUE": "1"}):
+                os.environ.pop("RAC_EVALS_IMPORT_SOURCE_ROOT", None)
+                args = run.launch_args("/tmp/p", wt)
+            self.assertFalse(any(a.startswith("--rac-import-source-root") for a in args))
+
     def test_launch_args_adds_the_screenshot_switches_only_with_shots(self):
         wt_test = LaunchTest()
         with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as d, \
