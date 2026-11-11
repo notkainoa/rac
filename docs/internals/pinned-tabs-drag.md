@@ -45,8 +45,9 @@ unpinned containers during a drag. rac does, and that breaks assumptions:
   app and popup windows have no sidebar sync, so the header gate stays
   closed and Chromium's drop bounds decide: the header tears a tab off, as
   it always has.
-- **The band must not catch a drag on its way back.** Dropping into the band
-  pins the tab, and the grid opens one row under it. The drag stays in the
+- **The band must not catch a drag on its way back.** Reaching the band
+  makes the dragged tab a favorite (Chromium pins it underneath), and the
+  grid opens one row under it. The drag stays in the
   favorites until the pointer is below that row, and the band hangs from the
   top of the tab strip, not from the open tabs, which move while the grid
   opens and closes. Otherwise the closing grid would carry the band down onto
