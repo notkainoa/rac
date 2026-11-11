@@ -181,7 +181,8 @@ UI-control WebSocket — with `--user-data-dir` at the clone's throwaway
   `--disable-backgrounding-occluded-windows`.
 - `--rac-import-arc-now` (only with `--rac-import-source-root=`),
   `--rac-import-arc-undo-now` (undoes the clone profile's own Arc import
-  at startup, reading no Arc data),
+  at startup, reading no Arc data; alone or with
+  `--rac-import-source-root=`),
   `--rac-arc-import-fixture=<path>` and `--rac-import-source-root=<path>`,
   Arc import inputs that must exist inside the clone. Any of these four
   makes it an Arc import run: it launches without `--test-type` (the
@@ -189,13 +190,22 @@ UI-control WebSocket — with `--user-data-dir` at the clone's throwaway
   gets no network at all. Every request, loopback included, goes to a
   dead proxy, so nothing an import run opens or clicks can reach a page
   that offers a PWA install. It also refuses `--test-type`, `--serve`,
-  the PWA commands and http(s) URLs.
+  the PWA commands and http(s) URLs. A run with neither input still
+  gets `--rac-import-source-root=` an empty `build/empty-import-root`
+  the Pro makes in the clone, because a `setup?arc` tab restored from
+  the clone's session, or the tour's Arc step, would otherwise read the
+  Pro's real Arc. That root doesn't make it an import run, and it
+  doesn't count as the import input that opening `chrome://setup` or
+  Settings > General needs.
 - `--rac-window-screenshot=<name>.png` and
   `--rac-window-screenshot-delay=<1-4 digits>`, in seconds and shorter
   than the run's `--timeout`; the shot lands in
   `build/shots/`.
 - `--log-net-log=<name>.json` and `--rac-frame-log=<name>.log`; the logs
-  land in `build/logs/`, never in `build/profile`.
+  land in `build/logs/`, never in `build/profile`. A run with a net log
+  ends by sending SIGTERM to the browser's main process alone and giving
+  it 10 seconds to quit cleanly, which flushes the log; stopping the
+  whole process group at once kills the network service first.
 - `--net-log-capture-mode=Default|IncludeSensitive|Everything`,
   `--enable-logging=stderr`, `--vmodule=<spec>`,
   `--rac-force-color-mode=light|dark|system`.
