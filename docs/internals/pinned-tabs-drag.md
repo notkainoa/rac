@@ -24,15 +24,16 @@ unpinned containers during a drag. rac does, and that breaks assumptions:
   Its sync sees the drag before it starts, so it doesn't fill the window
   with items. Otherwise that window would stay open after the tabs move on.
 - **The pointer, not the tab, picks the container.** Above the open tabs'
-  scroll view means favorites. A window with no favorites also gives them a
-  band at the top of the open tabs (`favorites_drop.cc`), over the space's
-  name row, so a drag doesn't have to reach into the header to find them.
-  Without that row (no spaces UI) there's no band: the pin zone starts at
-  the top of the open tabs, and the header stays the favorites target.
-  Going up, the order is open tabs, then the pin zone where the divider
-  opens, then the band. The band never takes the pin zone: it ends at least
-  half a tab above the first place a drop would pin, so with no pinned tabs
-  and no favorites both stay reachable.
+  scroll view means favorites. Chromium only takes drops inside the tab
+  strip, so the sidebar header above it would tear the tab off into a new
+  window; in a window whose drags can make favorites, the header drops into
+  the favorites instead (`DragReachesFavoritesAboveStrip()`). A window with no
+  favorites also gives them a band at the top of the open tabs
+  (`favorites_drop.cc`), over the space's name row. Going up, the order is
+  open tabs, then the pin zone where the divider opens, then the band, then
+  the header. The band never takes the pin zone: it ends at least half a tab
+  above the first place a drop would pin. Without the name row (no spaces
+  UI) there's no room for a band, so the header is the favorites target.
 - **The band must not catch a drag on its way back.** Dropping into the band
   pins the tab, and the grid opens one row under it. The drag stays in the
   favorites until the pointer is below that row, and the band hangs from the
