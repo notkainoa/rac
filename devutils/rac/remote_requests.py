@@ -462,6 +462,9 @@ class Checker:
             'tabdrag-drop': n == 0,
             'tabdrag-cancel': n == 0,
             'proof-hide-spaces': n == 0,
+            'tabdrag-select': n == 2 and ints(*args),
+            'tabdrag-group': n == 2 and ints(*args),
+            'tabdrag-start-group': n == 1 and ints(args[0]),
         }
         if verb not in simple:
             raise Refused(f'unknown request verb {verb!r}')
