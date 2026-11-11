@@ -132,7 +132,8 @@ second copy.
 Hold Option over a link for 500 ms, or use "Summarize Link" in the context
 menu. Only the pointer counts: Blink also reports keyboard- and
 script-focused links as the link target, so the hover path needs a recent
-mouse move or scroll, more recent than any key, and rac in front.
+mouse move or scroll, more recent than any key, and rac in front. Links
+on internal pages are never summarized (see [Internal pages](#internal-pages)).
 Turning AI off stops a running summary and forgets the cached ones. The page is fetched in a hidden tab in a throwaway off-the-record
 profile created for that one fetch, with cookies blocked, JavaScript, images,
 and plugins off, and downloads denied. This is what keeps a summary from
@@ -160,7 +161,7 @@ The assistant sits only beside web pages, which are also the only pages it
 can read. `rac::ai::IsInternalPageUrl` says what counts: http and https, and
 nothing else, so rac:// and chrome:// pages, the new tab page, extension
 pages, files, data:, view-source:, and any scheme added later are internal.
-Two callers apply it differently:
+Its callers apply it differently:
 
 - What the chat may read (`IsInternalTab`, used to attach a tab) goes by the
   last committed entry, both its address and the one the address bar shows
@@ -174,6 +175,16 @@ Two callers apply it differently:
   `Need::kWebPage`) go by the address bar's address, and a blank tab
   doesn't block them. The agent opens its tabs blank first, and a new tab
   on its way to a web page would otherwise flash the panel shut, mid-task.
+- Link summaries (`ShouldOfferLinkSummary`, for Option-hover and
+  "Summarize Link") need both: the last committed entry, the page the
+  link is on, and the address bar's address must be web pages
+  (`CanSummarizeLinksOn`). A link's address on history or downloads is the
+  user's own browsing, and a tab between an internal page and a web page
+  is refused whichever way it's going. The check runs before the hover
+  watcher exists and before the menu item is added, so an internal page
+  gets no card, no loading state and no fetch. The link itself must be
+  http(s) (`IsSummarizableLink`), so a web page's link to rac://settings
+  isn't summarized either.
 
 A panel opened beside an internal page by a way in that calls
 `SidePanelUI::Show` itself (the agent's tab pill, the side panel action)
