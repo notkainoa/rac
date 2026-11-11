@@ -11,6 +11,11 @@ Wikipedia for "cats".
 - Each downloaded bang becomes an in-memory search engine entry (a
   `TemplateURL` with a `bang_id`). They aren't saved; the list is applied
   again at every start.
+- The list is applied only after the saved engines have loaded
+  (`bangs-deleted.patch`). A list already in memory, as in every profile
+  after the first, used to arrive first: its bangs took the ids the saved
+  engines then loaded with, and a downloaded `!x` slipped in next to the
+  user's own `!x`.
 - A bang works at the start of the query (`!w cats`), and in the middle or
   at the end (`cats !w`) once a space or Return follows it.
 
@@ -47,13 +52,16 @@ thousands of entries, too many to share the site search page. Three lists:
 - **Yours**, with Add, Edit and Delete. Deleting asks first, since it
   can't be undone.
 - **Bangs list**: the downloaded bangs that match the page's search field,
-  at most 100 rows. The browser does the matching, so the page never holds
-  the whole list. Deleting doesn't ask, since it can be restored.
+  at most 100 rows: by name with no search, best match first with one. The
+  browser does the matching, so the page never holds the whole list.
+  Deleting doesn't ask, since it can be restored.
 - **Deleted**, with Restore. A row whose trigger the user's own bang took
   says "Replaced by yours" and can't be restored until that bang is gone.
 
+Rows are keyed by the engine's sync GUID rather than its id.
 Row icons come only from the favicons already stored on the Mac; the page
-fetches nothing. It does no work until it's opened.
+fetches nothing. The browser side does no work until the page opens, and
+stops watching the engines when it closes.
 
 ## Dev fixture
 
@@ -70,9 +78,9 @@ each: the user's own bangs from an earlier run stay in the profile.
 - **The address bar.** Typing a bang at the end of a query (`cats !w`)
   still shows a search on the default engine as the top suggestion, plus a
   badge for the bang. When a bang is there, the search isn't a search on
-  the default engine. The fix
-  isn't just the label: rethink what the address bar shows while typing a
-  bang, at the start versus the end, and for a bang that doesn't exist.
+  the default engine. The fix isn't just the label: rethink what the
+  address bar shows while typing a bang, at the start versus the end, and
+  for a bang that doesn't exist.
 - How bangs relate to the command bar (phase 5) and to Chromium's keyword
   search, which also uses the address bar.
 - Matching must not slow typing in the address bar, even with no bangs in
