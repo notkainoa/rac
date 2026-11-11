@@ -13,7 +13,10 @@
 #                                     updating its clone; --seed has a
 #                                     clone without a tree yet clone the
 #                                     finished, idle tree of wt/<clone>
-#                                     instead of the base's
+#                                     instead of the base's. A new tree
+#                                     needs one build before run or
+#                                     evals (they refuse until then: its
+#                                     browser doesn't paint a window)
 #   build <worktree> [-- targets...]  build the clone through the remote queue
 #   run <worktree> [--timeout S] [--requests-file F] [--fresh-profile]
 #       [--layout sidebar|top-bar] [--no-profile-picker] [--serve DIR] [-- args...]
@@ -1096,6 +1099,9 @@ if [ ! -d "$clone" ]; then
   fi
   devutils/rac/worktree.sh setup "$from"
   [ ! -f "$record" ] || { mkdir -p build && cp "$record" build/.rac-toolchain; }
+  # A tree setup just cloned (from the base or a seed) doesn't paint a
+  # window until the clone builds it once; run and evals refuse until then.
+  mkdir -p build && : > build/.needs-build
 else
   cd "$clone"
   [ "$(git rev-parse --show-toplevel 2>/dev/null)" = "$(pwd -P)" ] || {
@@ -1152,6 +1158,7 @@ else
     devutils/rac/worktree.sh setup "$from"
     # A clone that just got its tree also inherits the toolchain record.
     [ ! -f "$record" ] || { mkdir -p build && cp "$record" build/.rac-toolchain; }
+    mkdir -p build && : > build/.needs-build
   fi
 fi
 EOS
@@ -1198,11 +1205,15 @@ targets=("$@")
 # local jobs (autoninja passes -local_jobs through to siso ninja) so the
 # Pro stays usable for the maintainer while it compiles. The queue's step
 # cap stops a build that turned out to be a full one.
-exec nice -n 10 taskpolicy -c utility devutils/rac/build-queue.sh \
+status=0
+nice -n 10 taskpolicy -c utility devutils/rac/build-queue.sh \
   bash -c 'cd "$1" && shift && exec "$@"' rac-build "$src" \
   env "SISO_PATH=$src/third_party/siso/cipd/siso" "DEVELOPER_DIR=$xcode" \
   python3 third_party/depot_tools/autoninja.py -C out/Default \
-  "${targets[@]}" "-local_jobs=$jobs" -k 0
+  "${targets[@]}" "-local_jobs=$jobs" -k 0 || status=$?
+# The first good build of a fresh tree makes it runnable.
+[ "$status" != 0 ] || rm -f build/.needs-build
+exit "$status"
 EOS
 }
 
@@ -2063,6 +2074,10 @@ app_bin="$clone/build/src/out/Default/rac.app/Contents/MacOS/rac"
   echo "rac remote: no built browser at $app_bin; run build first" >&2
   exit 1
 }
+[ ! -e "$clone/build/.needs-build" ] || {
+  echo "rac remote: refusing: $clone got its tree from push and hasn't been built yet; its browser doesn't paint a window until then, so run build first" >&2
+  exit 2
+}
 # --test-type on every run but an Arc import run (the Air decided). An
 # import run has no network instead: every request, loopback included,
 # goes to a dead proxy and WebRTC may not send UDP around it. With no page
@@ -2276,6 +2291,10 @@ app="$clone/build/src/out/Default/rac.app/"
 app_bin="${app}Contents/MacOS/rac"
 [ -x "$app_bin" ] || {
   echo "rac remote: refusing: no built browser at $app_bin; run build first" >&2
+  exit 2
+}
+[ ! -e "$clone/build/.needs-build" ] || {
+  echo "rac remote: refusing: $clone got its tree from push and hasn't been built yet; run build first" >&2
   exit 2
 }
 [ -z "$(clone_pids)" ] || {

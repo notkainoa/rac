@@ -1223,6 +1223,10 @@ class PushTest(RemoteBuildTest):
         self.assertEqual(git(clone, 'rev-parse', 'HEAD').stdout.strip(),
                          git(self.wt, 'rev-parse', 'HEAD').stdout.strip())
 
+    def test_push_marks_a_new_tree_as_needing_a_build(self):
+        self.run_rb('push', self.wt, success=True)
+        self.assertTrue((self.remote_root / 'wt/feature/build/.needs-build').exists())
+
     def test_push_refuses_an_uncommitted_rac_patch(self):
         (self.wt / 'patches/series').unlink()
         write(self.wt / 'patches/series.merged', 'a.patch\nrac/x/new.patch\n')
@@ -1488,6 +1492,17 @@ class BuildTest(RemoteBuildTest):
         self.assertIn('autoninja -C out/Default chrome chromedriver -local_jobs=14 -k 0',
                       result.stdout)
 
+    def test_a_good_build_makes_a_fresh_clone_runnable(self):
+        # push marks a tree it just set up; only a build that succeeds
+        # clears the mark.
+        marker = self.remote_root / 'wt/feature/build/.needs-build'
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        self.run_rb('build', self.wt, success=False, QUEUE_EXIT='7')
+        self.assertTrue(marker.exists())
+        self.run_rb('build', self.wt, success=True)
+        self.assertFalse(marker.exists())
+
     def test_build_with_targets(self):
         result = self.run_rb('build', self.wt, '--', 'chrome', success=True)
         self.assertIn('autoninja -C out/Default chrome -local_jobs=4', result.stdout)
@@ -1583,6 +1598,17 @@ class RunTest(RemoteBuildTest):
         write(rac / 'window_screenshot.mm',
               ''.join(f'if (verb == "{verb}") {{\n' for verb in
                       self.HARNESS_VERBS if verb not in without))
+
+    def test_run_and_evals_refuse_an_unbuilt_fresh_tree(self):
+        # A tree push just cloned doesn't paint a window until its first
+        # build, so a run would only time out with no screenshot.
+        (self.clone / 'build/.needs-build').touch()
+        result = self.run_rb('run', self.wt, '--timeout', '3', success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("hasn't been built yet", result.stderr)
+        result = self.run_rb('evals', self.wt, success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("hasn't been built yet", result.stderr)
 
     def test_run_refuses_profile_and_foreground_args(self):
         for args, why in [
