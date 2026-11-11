@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -605,15 +606,22 @@ class QueueTest(unittest.TestCase):
     def test_manual_lock_holds_build_slots(self):
         (self.state / 'manual').mkdir(parents=True)
         proc, release = self.start('blocked')
-        self.wait_until(lambda: self.waiting() == 1)
+        # The queue writes its ticket before its first poll reports the
+        # lock, so read its stderr as it comes and lift the lock only once
+        # the note is out; waiting on the ticket alone races that poll.
+        err = []
+        reader = threading.Thread(target=lambda: err.extend(proc.stderr),
+                                  daemon=True)
+        reader.start()
+        self.wait_until(lambda: any('the manual lock' in line for line in err))
         self.assertEqual(self.held(), [])
+        self.assertEqual(self.waiting(), 1)
         (self.state / 'manual').rmdir()
         self.wait_until(lambda: self.held() == ['build-1'])
         release.touch()
         self.assertEqual(proc.wait(10), 0)
-        _, err = proc.communicate(timeout=10)
-        self.assertIn('the manual lock', err)
-        self.assertIn('has held both build slots for', err)
+        reader.join(10)
+        self.assertIn('has held both build slots for', ''.join(err))
 
     def test_outside_build_counts_once_and_holders_are_excluded(self):
         mine = self.workdir('work-mine')
