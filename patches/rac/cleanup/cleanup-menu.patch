@@ -1,0 +1,1005 @@
+--- a/chrome/app/rac_strings.grd
++++ b/chrome/app/rac_strings.grd
+@@ -306,6 +306,27 @@
+       <message name="IDS_RAC_CLEAR_TABS_KEYWORDS" desc="Other words someone might type in the command bar to find the Clear open tabs action. Comma-separated; not shown to the user.">
+         close tabs, close all tabs, tidy up, clean up
+       </message>
++      <message name="IDS_RAC_CLEANUP_BUTTON" desc="Tooltip and accessible name of the broom button at the bottom of the sidebar. It opens a menu that closes the current space's open tabs: the ones no one has looked at for a while, or all of them.">
++        Clean up tabs
++      </message>
++      <message name="IDS_RAC_CLEANUP_INACTIVE_TITLE" desc="Heading in the sidebar's clean-up menu, in title case, above the items 5 Hours, 1 Day, 2 Days, and 5 Days. Each item closes the space's open tabs that no one has looked at for that long.">
++        Clear Tabs Inactive for
++      </message>
++      <message name="IDS_RAC_CLEANUP_5_HOURS" desc="Item in the sidebar's clean-up menu, in title case, under the heading Clear Tabs Inactive for. Closes the open tabs of the current space that no one has looked at for five hours or more, except ones that are busy; Undo brings them back.">
++        5 Hours
++      </message>
++      <message name="IDS_RAC_CLEANUP_1_DAY" desc="Item in the sidebar's clean-up menu, in title case, under the heading Clear Tabs Inactive for. Closes the open tabs of the current space that no one has looked at for a day or more, except ones that are busy; Undo brings them back.">
++        1 Day
++      </message>
++      <message name="IDS_RAC_CLEANUP_2_DAYS" desc="Item in the sidebar's clean-up menu, in title case, under the heading Clear Tabs Inactive for. Closes the open tabs of the current space that no one has looked at for two days or more, except ones that are busy; Undo brings them back.">
++        2 Days
++      </message>
++      <message name="IDS_RAC_CLEANUP_5_DAYS" desc="Item in the sidebar's clean-up menu, in title case, under the heading Clear Tabs Inactive for. Closes the open tabs of the current space that no one has looked at for five days or more, except ones that are busy; Undo brings them back.">
++        5 Days
++      </message>
++      <message name="IDS_RAC_CLEANUP_CLEAR_ALL" desc="Last item in the sidebar's clean-up menu, in title case. Closes all the open tabs of the current space, except ones that are busy; Undo brings them back.">
++        Clear All
++      </message>
+       <message name="IDS_RAC_CLEAR_TOAST_BODY" desc="Toast after the user cleared a space's open tabs. Shown with an Undo button.">
+         {NUM_TABS, plural,
+           =1 {Cleared 1 tab}
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -2317,6 +2317,8 @@ static_library("ui") {
+       "browser_tabstrip.h",
+       "rac/cleanup/clear_tabs.cc",
+       "rac/cleanup/clear_tabs.h",
++      "rac/cleanup/last_deselected.cc",
++      "rac/cleanup/last_deselected.h",
+       "rac/cleanup/may_clear.cc",
+       "rac/cleanup/may_clear.h",
+       "rac/power/group_namer.cc",
+@@ -3747,6 +3749,8 @@ static_library("ui") {
+       "views/helium/frame_corner_radius.h",
+       "views/helium/native_frame_materials.cc",
+       "views/helium/native_frame_materials.h",
++      "views/rac/sidebar/cleanup_button.cc",
++      "views/rac/sidebar/cleanup_button.h",
+       "views/rac/sidebar_address_bar/sidebar_header_view.cc",
+       "views/rac/sidebar_address_bar/sidebar_header_view.h",
+       "views/rac/sidebar_reveal/sidebar_overshoot.h",
+--- a/chrome/browser/ui/rac/cleanup/BUILD.gn
++++ b/chrome/browser/ui/rac/cleanup/BUILD.gn
+@@ -13,6 +13,8 @@ source_set("logic") {
+     "clear_reason.h",
+     "cleared_tabs_context.cc",
+     "cleared_tabs_context.h",
++    "inactive_tabs.cc",
++    "inactive_tabs.h",
+   ]
+   public_deps = [
+     "//components/sessions",
+@@ -47,6 +49,7 @@ test("rac_cleanup_unittests") {
+   sources = [
+     "clear_reason_unittest.cc",
+     "cleared_tabs_context_unittest.cc",
++    "inactive_tabs_unittest.cc",
+   ]
+   deps = [
+     ":logic",
+--- a/chrome/browser/ui/rac/cleanup/clear_tabs.cc
++++ b/chrome/browser/ui/rac/cleanup/clear_tabs.cc
+@@ -32,6 +32,8 @@
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/rac/cleanup/clear_toast.h"
+ #include "chrome/browser/ui/rac/cleanup/cleared_tabs_context.h"
++#include "chrome/browser/ui/rac/cleanup/inactive_tabs.h"
++#include "chrome/browser/ui/rac/cleanup/last_deselected.h"
+ #include "chrome/browser/ui/rac/cleanup/may_clear.h"
+ #include "chrome/browser/ui/rac/sidebar/sidebar_actions.h"
+ #include "chrome/browser/ui/rac/sidebar/sidebar_window_sync.h"
+@@ -232,6 +234,17 @@ bool IsOpenTab(SidebarWindowSync* sync,
+          GetSidebarTabKind(sync, tab) == SidebarTabKind::kOpen;
+ }
+ 
++// Whether a Clear for tabs `inactive_for` that long looks at `tab`: every
++// tab when it's for all of them.
++bool IsOldEnough(const tabs::TabInterface* tab,
++                 std::optional<base::TimeDelta> inactive_for,
++                 base::Time now) {
++  return !inactive_for ||
++         IsInactiveFor(tab->GetLastActiveTime(),
++                       GetLastDeselected(tab->GetContents()),
++                       tab->IsActivated(), now, *inactive_for);
++}
++
+ bool IsLoaded(tabs::TabInterface* tab) {
+   content::WebContents* contents = tab->GetContents();
+   return !contents->WasDiscarded() && !contents->GetController().NeedsReload();
+@@ -315,21 +328,24 @@ sessions::LiveTabContext* RouteRestoredT
+   return target;
+ }
+ 
+-bool HasOpenTabs(BrowserWindowInterface* browser) {
++bool HasOpenTabs(BrowserWindowInterface* browser,
++                 std::optional<base::TimeDelta> inactive_for) {
+   SidebarWindowSync* sync =
+       browser ? SidebarWindows::ForBrowser(browser) : nullptr;
+   if (!sync) {
+     return false;
+   }
++  const base::Time now = base::Time::Now();
+   for (tabs::TabInterface* tab : *browser->GetTabStripModel()) {
+-    if (IsOpenTab(sync, tab)) {
++    if (IsOpenTab(sync, tab) && IsOldEnough(tab, inactive_for, now)) {
+       return true;
+     }
+   }
+   return false;
+ }
+ 
+-void ClearTabs(BrowserWindowInterface* browser) {
++void ClearTabs(BrowserWindowInterface* browser,
++               std::optional<base::TimeDelta> inactive_for) {
+   if (!browser || browser->GetProfile()->IsOffTheRecord()) {
+     return;
+   }
+@@ -351,9 +367,10 @@ void ClearTabs(BrowserWindowInterface* b
+   // A split or group shows one note, under the whole of it.
+   std::set<split_tabs::SplitTabId> noted_splits;
+   std::set<tab_groups::TabGroupId> noted_groups;
++  const base::Time now = base::Time::Now();
+   for (int i = 0; i < model->count(); ++i) {
+     tabs::TabInterface* tab = model->GetTabAtIndex(i);
+-    if (!IsOpenTab(sync, tab)) {
++    if (!IsOpenTab(sync, tab) || !IsOldEnough(tab, inactive_for, now)) {
+       continue;
+     }
+     const ClearReason reason = MayClear(*tab);
+--- a/chrome/browser/ui/rac/cleanup/clear_tabs.h
++++ b/chrome/browser/ui/rac/cleanup/clear_tabs.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_RAC_CLEANUP_CLEAR_TABS_H_
+ #define CHROME_BROWSER_UI_RAC_CLEANUP_CLEAR_TABS_H_
+ 
++#include <optional>
+ #include <utility>
+ #include <vector>
+ 
+@@ -31,14 +32,19 @@ struct Tab;
+ namespace rac::cleanup {
+ 
+ // Whether the space `browser` shows has an open tab (one that isn't a
+-// favorite or a pinned tab), so Clear has something to look at. Cheap
+-// enough for layout; it doesn't run MayClear().
+-bool HasOpenTabs(BrowserWindowInterface* browser);
++// favorite or a pinned tab), so Clear has something to look at. With
++// `inactive_for`, only an open tab IsInactiveFor() it counts. Cheap enough
++// for layout; it doesn't run MayClear().
++bool HasOpenTabs(BrowserWindowInterface* browser,
++                 std::optional<base::TimeDelta> inactive_for = std::nullopt);
+ 
+ // Closes the space's open tabs except those MayClear() keeps, recorded as one
+ // recently-closed entry, and shows a toast with Undo. Does nothing in a
+-// window without spaces (incognito, guest, apps, popups).
+-void ClearTabs(BrowserWindowInterface* browser);
++// window without spaces (incognito, guest, apps, popups). With
++// `inactive_for` (the sidebar's clean-up menu), it looks only at the open
++// tabs IsInactiveFor() it; the newer ones stay, without a note.
++void ClearTabs(BrowserWindowInterface* browser,
++               std::optional<base::TimeDelta> inactive_for = std::nullopt);
+ 
+ // The open tabs the Clear running now in `browser` keeps, each with the
+ // IDS_ string that says why ("Kept: playing sound"), for the sidebar to show
+--- /dev/null
++++ b/chrome/browser/ui/rac/cleanup/inactive_tabs.cc
+@@ -0,0 +1,23 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/cleanup/inactive_tabs.h"
++
++#include <algorithm>
++
++namespace rac::cleanup {
++
++bool IsInactiveFor(base::Time last_shown,
++                   base::Time last_left,
++                   bool selected,
++                   base::Time now,
++                   base::TimeDelta period) {
++  const base::Time last_used = std::max(last_shown, last_left);
++  if (selected || last_used.is_null() || last_used > now) {
++    return false;
++  }
++  return now - last_used >= period;
++}
++
++}  // namespace rac::cleanup
+--- /dev/null
++++ b/chrome/browser/ui/rac/cleanup/inactive_tabs.h
+@@ -0,0 +1,45 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_CLEANUP_INACTIVE_TABS_H_
++#define CHROME_BROWSER_UI_RAC_CLEANUP_INACTIVE_TABS_H_
++
++#include "base/time/time.h"
++
++// Which tabs the sidebar's clean-up menu counts as unused, as plain data so
++// it can be tested without a browser. clear_tabs.cc reads the times from
++// real tabs.
++namespace rac::cleanup {
++
++// The clean-up menu's choices, shortest first: Clear the open tabs nobody
++// has looked at for this long.
++inline constexpr base::TimeDelta kInactivePeriods[] = {
++    base::Hours(5),
++    base::Days(1),
++    base::Days(2),
++    base::Days(5),
++};
++
++// Whether a tab has gone unused for at least `period` by `now`. A tab was
++// last used when it was last left, if that's known, and otherwise when it
++// was last shown:
++// - `last_shown` is TabInterface::GetLastActiveTime(), which Chromium sets
++//   when the tab becomes visible, not when it's left, and which session
++//   restore keeps.
++// - `last_left` is when the tab stopped being its window's selected tab
++//   (GetLastDeselected()). It isn't saved, so after a restart it's null
++//   until the tab is selected and left again, and `last_shown` decides.
++// The later of the two counts. The selected tab is in use, however long ago
++// it was selected; that includes the selected tab of a window in the
++// background. So is a tab without either time, or whose time is after
++// `now` (the clock moved back): Clear closes only tabs it knows are old.
++bool IsInactiveFor(base::Time last_shown,
++                   base::Time last_left,
++                   bool selected,
++                   base::Time now,
++                   base::TimeDelta period);
++
++}  // namespace rac::cleanup
++
++#endif  // CHROME_BROWSER_UI_RAC_CLEANUP_INACTIVE_TABS_H_
+--- /dev/null
++++ b/chrome/browser/ui/rac/cleanup/inactive_tabs_unittest.cc
+@@ -0,0 +1,108 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/cleanup/inactive_tabs.h"
++
++#include <algorithm>
++#include <iterator>
++
++#include "base/time/time.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::cleanup {
++namespace {
++
++// A fixed "now", far from the epoch, so subtracting days stays valid.
++base::Time Now() {
++  return base::Time::UnixEpoch() + base::Days(20000);
++}
++
++// Unknown: the tab hasn't been left since the browser started.
++constexpr base::Time kNeverLeft;
++
++TEST(InactiveTabsTest, PeriodsAreTheMenusChoicesShortestFirst) {
++  ASSERT_EQ(std::size(kInactivePeriods), 4u);
++  EXPECT_EQ(kInactivePeriods[0], base::Hours(5));
++  EXPECT_EQ(kInactivePeriods[1], base::Days(1));
++  EXPECT_EQ(kInactivePeriods[2], base::Days(2));
++  EXPECT_EQ(kInactivePeriods[3], base::Days(5));
++  EXPECT_TRUE(std::ranges::is_sorted(kInactivePeriods));
++}
++
++TEST(InactiveTabsTest, ATabUnusedForThePeriodIsInactive) {
++  EXPECT_TRUE(IsInactiveFor(Now() - base::Hours(6), kNeverLeft,
++                            /*selected=*/false, Now(), base::Hours(5)));
++}
++
++TEST(InactiveTabsTest, ATabUsedWithinThePeriodIsNot) {
++  EXPECT_FALSE(IsInactiveFor(Now() - base::Hours(4), kNeverLeft,
++                             /*selected=*/false, Now(), base::Hours(5)));
++  EXPECT_FALSE(IsInactiveFor(Now(), kNeverLeft, /*selected=*/false, Now(),
++                             base::Hours(5)));
++}
++
++TEST(InactiveTabsTest, ThePeriodItselfCounts) {
++  EXPECT_TRUE(IsInactiveFor(Now() - base::Days(1), kNeverLeft,
++                            /*selected=*/false, Now(), base::Days(1)));
++  EXPECT_FALSE(IsInactiveFor(Now() - base::Days(1) + base::Seconds(1),
++                             kNeverLeft, /*selected=*/false, Now(),
++                             base::Days(1)));
++}
++
++TEST(InactiveTabsTest, EachChoiceTakesTheTabsAtLeastThatOld) {
++  // A tab last used two days ago goes with 5 hours, 1 day and 2 days, but
++  // not with 5 days.
++  const base::Time two_days_ago = Now() - base::Days(2);
++  for (size_t i = 0; i < 3; ++i) {
++    EXPECT_TRUE(IsInactiveFor(two_days_ago, kNeverLeft, false, Now(),
++                              kInactivePeriods[i]))
++        << i;
++  }
++  EXPECT_FALSE(IsInactiveFor(two_days_ago, kNeverLeft, false, Now(),
++                             kInactivePeriods[3]));
++}
++
++TEST(InactiveTabsTest, ATabReadForHoursAndJustLeftIsNotInactive) {
++  // Selected at 9:00, read until 14:59, cleared at 15:00: it was in use a
++  // minute ago, though it was shown six hours ago.
++  EXPECT_FALSE(IsInactiveFor(Now() - base::Hours(6), Now() - base::Minutes(1),
++                             /*selected=*/false, Now(), base::Hours(5)));
++}
++
++TEST(InactiveTabsTest, ATabLeftLongAgoIsInactive) {
++  EXPECT_TRUE(IsInactiveFor(Now() - base::Hours(9), Now() - base::Hours(8),
++                            /*selected=*/false, Now(), base::Hours(5)));
++}
++
++TEST(InactiveTabsTest, ALaterShowingCountsOverAnEarlierLeaving) {
++  // Left long ago, shown again a minute ago (and left before this run kept
++  // track): the showing is the later use.
++  EXPECT_FALSE(IsInactiveFor(Now() - base::Minutes(1), Now() - base::Days(3),
++                             /*selected=*/false, Now(), base::Hours(5)));
++}
++
++TEST(InactiveTabsTest, TheSelectedTabIsAlwaysInUse) {
++  // Selected long ago and still showing, in this window or a window in the
++  // background: in use, not old.
++  EXPECT_FALSE(IsInactiveFor(Now() - base::Days(30), kNeverLeft,
++                             /*selected=*/true, Now(), base::Hours(5)));
++  EXPECT_FALSE(IsInactiveFor(Now() - base::Days(30), Now() - base::Days(29),
++                             /*selected=*/true, Now(), base::Hours(5)));
++}
++
++TEST(InactiveTabsTest, ATabWithoutATimeIsNotInactive) {
++  EXPECT_FALSE(IsInactiveFor(base::Time(), kNeverLeft, /*selected=*/false,
++                             Now(), base::Hours(5)));
++}
++
++TEST(InactiveTabsTest, ATimeAfterNowIsNotInactive) {
++  // The clock moved back since the tab was last used.
++  EXPECT_FALSE(IsInactiveFor(Now() + base::Days(3), kNeverLeft,
++                             /*selected=*/false, Now(), base::Hours(5)));
++  EXPECT_FALSE(IsInactiveFor(Now() - base::Days(3), Now() + base::Days(1),
++                             /*selected=*/false, Now(), base::Hours(5)));
++}
++
++}  // namespace
++}  // namespace rac::cleanup
+--- /dev/null
++++ b/chrome/browser/ui/rac/cleanup/last_deselected.cc
+@@ -0,0 +1,65 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/cleanup/last_deselected.h"
++
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_contents_user_data.h"
++
++namespace rac::cleanup {
++
++namespace {
++
++class LastDeselected : public content::WebContentsUserData<LastDeselected> {
++ public:
++  LastDeselected(const LastDeselected&) = delete;
++  LastDeselected& operator=(const LastDeselected&) = delete;
++  ~LastDeselected() override = default;
++
++  base::Time time() const { return time_; }
++  void set_time(base::Time time) { time_ = time; }
++
++ private:
++  friend class content::WebContentsUserData<LastDeselected>;
++  explicit LastDeselected(content::WebContents* contents)
++      : content::WebContentsUserData<LastDeselected>(*contents) {}
++
++  base::Time time_;
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(LastDeselected);
++
++}  // namespace
++
++base::Time GetLastDeselected(content::WebContents* contents) {
++  const LastDeselected* stamp =
++      contents ? LastDeselected::FromWebContents(contents) : nullptr;
++  return stamp ? stamp->time() : base::Time();
++}
++
++DeselectionStamps::DeselectionStamps(TabStripModel* model) {
++  model->AddObserver(this);
++}
++
++DeselectionStamps::~DeselectionStamps() = default;
++
++void DeselectionStamps::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  // Only a tab still in the strip: not one closing, which may be on its way
++  // to being deleted.
++  if (!selection.active_tab_changed() || !selection.old_contents ||
++      tab_strip_model->GetIndexOfWebContents(selection.old_contents) ==
++          TabStripModel::kNoTab) {
++    return;
++  }
++  LastDeselected::GetOrCreateForWebContents(selection.old_contents)
++      ->set_time(base::Time::Now());
++}
++
++}  // namespace rac::cleanup
+--- /dev/null
++++ b/chrome/browser/ui/rac/cleanup/last_deselected.h
+@@ -0,0 +1,45 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_CLEANUP_LAST_DESELECTED_H_
++#define CHROME_BROWSER_UI_RAC_CLEANUP_LAST_DESELECTED_H_
++
++#include "base/memory/raw_ptr.h"
++#include "base/time/time.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++
++class TabStripModel;
++
++namespace content {
++class WebContents;
++}  // namespace content
++
++namespace rac::cleanup {
++
++// When `contents` last stopped being its window's selected tab, or null if
++// it hasn't since this run of the browser started. Kept on the tab in
++// memory only: after a restart, IsInactiveFor() falls back to the last time
++// the tab was shown, which session restore keeps.
++base::Time GetLastDeselected(content::WebContents* contents);
++
++// Stamps each tab of a window's tab strip with the time it stops being the
++// selected tab, for GetLastDeselected(). The window's clean-up button owns
++// one, so only windows that can Clear keep the stamps.
++class DeselectionStamps : public TabStripModelObserver {
++ public:
++  explicit DeselectionStamps(TabStripModel* model);
++  DeselectionStamps(const DeselectionStamps&) = delete;
++  DeselectionStamps& operator=(const DeselectionStamps&) = delete;
++  ~DeselectionStamps() override;
++
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(
++      TabStripModel* tab_strip_model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++};
++
++}  // namespace rac::cleanup
++
++#endif  // CHROME_BROWSER_UI_RAC_CLEANUP_LAST_DESELECTED_H_
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -2116,6 +2116,11 @@ void BrowserView::UpdateZenModeReveal(bo
+   if (rac_sidebar_address_bar && rac::ShouldKeepSidebarRevealed(this)) {
+     reveal_side = true;
+   }
++  // rac: so does a menu the sidebar opened, such as the clean-up menu,
++  // wherever the address bar is.
++  if (rac::IsSidebarMenuShowing(this)) {
++    reveal_side = true;
++  }
+ 
+   // Keep the top chrome visible while the omnibox is focused.
+   const bool omnibox_focused = toolbar_ && toolbar_->location_bar_view() &&
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -45,6 +45,7 @@
+ #include "chrome/browser/ui/views/frame/safe_invoke/safe_invoke.h"
+ #include "chrome/browser/ui/views/frame/shadow_frame_view.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
++#include "chrome/browser/ui/views/rac/sidebar/cleanup_button.h"
+ #include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h"
+ #include "chrome/browser/ui/views/rac/spaces/space_tint_background.h"
+ #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
+@@ -175,6 +176,8 @@ VerticalTabStripRegionView::VerticalTabS
+   space_switcher_ = static_cast<rac::SpaceSwitcherView*>(footer->SetCenterView(
+       std::make_unique<rac::SpaceSwitcherView>(browser_view->browser(),
+                                                state_controller_)));
++  footer->SetCleanupButton(
++      rac::CleanupButton::CreateFor(browser_view->browser()));
+ 
+   // Views that go into the content area above
+   // --------------
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar/cleanup_button.cc
+@@ -0,0 +1,224 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/sidebar/cleanup_button.h"
++
++#include <iterator>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/actions/rac_action_ids.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/rac/cleanup/clear_tabs.h"
++#include "chrome/browser/ui/rac/cleanup/inactive_tabs.h"
++#include "chrome/browser/ui/rac/cleanup/last_deselected.h"
++#include "chrome/browser/ui/rac/rac_action_handlers.h"
++#include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
++#include "chrome/browser/ui/views/frame/base_tab_strip_region_view.h"
++#include "chrome/browser/ui/views/rac/sidebar/pinned_section.h"
++#include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
++#include "chrome/grit/rac_strings.h"
++#include "ui/accessibility/ax_enums.mojom.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/menu_source_utils.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/events/event.h"
++#include "ui/gfx/vector_icon_types.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/controls/menu/menu_runner.h"
++#include "ui/views/view_utils.h"
++#include "ui/views/widget/widget.h"
++
++namespace rac {
++
++namespace {
++
++using gfx::CANVAS_DIMENSIONS;
++using gfx::CLOSE;
++using gfx::LINE_TO;
++using gfx::MOVE_TO;
++using gfx::NEW_PATH;
++using gfx::QUADRATIC_TO;
++using gfx::STROKE;
++
++// A broom leaning right: the handle up to the top right, a band, and the
++// bristles flaring down to the left with two strands. Drawn in strokes as
++// heavy as the outlined icons beside it (the profile button, the app menu).
++// clang-format off
++constexpr gfx::PathElement kBroomPath[] = {
++    CANVAS_DIMENSIONS, 20,
++    // The handle.
++    STROKE, 1.5f,
++    MOVE_TO, 17.48f, 2.52f,
++    LINE_TO, 12.29f, 7.71f,
++    // The band, a pill across the top of the bristles.
++    NEW_PATH,
++    STROKE, 2,
++    MOVE_TO, 10.08f, 6.72f,
++    LINE_TO, 13.28f, 9.92f,
++    // The bristles.
++    NEW_PATH,
++    STROKE, 1.5f,
++    MOVE_TO, 8.4f, 7.63f,
++    LINE_TO, 2.52f, 10.77f,
++    QUADRATIC_TO, 5.19f, 14.81f, 9.23f, 17.48f,
++    LINE_TO, 12.37f, 11.6f,
++    CLOSE,
++    // Two strands.
++    NEW_PATH,
++    STROKE, 1.5f,
++    MOVE_TO, 7.79f, 10.84f,
++    LINE_TO, 5.19f, 12.83f,
++    NEW_PATH,
++    STROKE, 1.5f,
++    MOVE_TO, 9.16f, 12.21f,
++    LINE_TO, 7.17f, 14.81f,
++};
++// clang-format on
++constexpr gfx::VectorIconRep kBroomReps[] = {{kBroomPath}};
++constexpr gfx::VectorIcon kBroomIcon = {kBroomReps, std::size(kBroomReps),
++                                        "rac_broom"};
++
++// The menu, top to bottom: a title, one item per kInactivePeriods entry,
++// then Clear All.
++constexpr int kFirstPeriodCommand = 1;
++constexpr int kClearAllCommand = 100;
++constexpr int kPeriodLabels[] = {
++    IDS_RAC_CLEANUP_5_HOURS,
++    IDS_RAC_CLEANUP_1_DAY,
++    IDS_RAC_CLEANUP_2_DAYS,
++    IDS_RAC_CLEANUP_5_DAYS,
++};
++static_assert(std::size(kPeriodLabels) == std::size(cleanup::kInactivePeriods));
++
++}  // namespace
++
++// static
++std::unique_ptr<CleanupButton> CleanupButton::CreateFor(
++    BrowserWindowInterface* browser) {
++  if (!browser || browser->GetProfile()->IsOffTheRecord() ||
++      !SpacesWindowManager::From(browser)) {
++    return nullptr;
++  }
++  return std::make_unique<CleanupButton>(browser);
++}
++
++CleanupButton::CleanupButton(BrowserWindowInterface* browser)
++    : ToolbarButton(base::BindRepeating(&CleanupButton::ShowMenu,
++                                        base::Unretained(this))),
++      browser_(browser),
++      stamps_(std::make_unique<cleanup::DeselectionStamps>(
++          browser->GetTabStripModel())) {
++  SetVectorIcon(kBroomIcon);
++  const std::u16string name = l10n_util::GetStringUTF16(IDS_RAC_CLEANUP_BUTTON);
++  SetTooltipText(name);
++  GetViewAccessibility().SetName(name);
++  GetViewAccessibility().SetHasPopup(ax::mojom::HasPopup::kMenu);
++}
++
++CleanupButton::~CleanupButton() = default;
++
++bool CleanupButton::IsMenuShowing() const {
++  return menu_runner_ && menu_runner_->IsRunning();
++}
++
++bool CleanupButton::IsCommandIdEnabled(int command_id) const {
++  // Greyed out when it would close nothing. Neither runs MayClear(), so an
++  // item can still find every tab it looks at busy.
++  if (command_id == kClearAllCommand) {
++    return action_table::IsBrowserCommandEnabled(browser_,
++                                                 IDC_RAC_CLEAR_TABS) &&
++           cleanup::HasOpenTabs(browser_);
++  }
++  const std::optional<base::TimeDelta> period = PeriodFor(command_id);
++  return period && cleanup::HasOpenTabs(browser_, period);
++}
++
++void CleanupButton::ExecuteCommand(int command_id, int event_flags) {
++  if (command_id == kClearAllCommand) {
++    action_table::ExecuteBrowserCommand(browser_, IDC_RAC_CLEAR_TABS);
++  } else if (const std::optional<base::TimeDelta> period =
++                 PeriodFor(command_id)) {
++    cleanup::ClearTabs(browser_, period);
++  } else {
++    return;
++  }
++  ShowKeptNotes();
++}
++
++void CleanupButton::ShowMenu(const ui::Event& event) {
++  if (menu_runner_ && menu_runner_->IsRunning()) {
++    return;
++  }
++  // The press that closed the menu mustn't reopen it. An event without a
++  // time (a synthetic one) is never that press.
++  const base::TimeTicks closed =
++      menu_runner_ ? menu_runner_->closing_event_time() : base::TimeTicks();
++  if (!event.time_stamp().is_null() && !closed.is_null() &&
++      event.time_stamp() <= closed) {
++    return;
++  }
++  if (!GetWidget()) {
++    return;
++  }
++  // The last menu's runner points at its model; let go of both, runner first.
++  menu_runner_.reset();
++  model_ = std::make_unique<ui::SimpleMenuModel>(this);
++  model_->AddTitle(l10n_util::GetStringUTF16(IDS_RAC_CLEANUP_INACTIVE_TITLE));
++  for (size_t i = 0; i < std::size(kPeriodLabels); ++i) {
++    model_->AddItemWithStringId(kFirstPeriodCommand + static_cast<int>(i),
++                                kPeriodLabels[i]);
++  }
++  model_->AddSeparator(ui::NORMAL_SEPARATOR);
++  model_->AddItemWithStringId(kClearAllCommand, IDS_RAC_CLEANUP_CLEAR_ALL);
++
++  SetHighlighted(true);
++  // Made for each menu: the model it shows is.
++  menu_runner_ = std::make_unique<views::MenuRunner>(
++      model_.get(), views::MenuRunner::NO_FLAGS,
++      base::BindRepeating(&CleanupButton::OnMenuClosed,
++                          base::Unretained(this)));
++  // Up from the bottom of the sidebar, and in from the window's edge the
++  // button sits at.
++  const bool at_left_edge =
++      GetBoundsInScreen().CenterPoint().x() <
++      GetWidget()->GetWindowBoundsInScreen().CenterPoint().x();
++  menu_runner_->RunMenuAt(
++      GetWidget(), nullptr, GetAnchorBoundsInScreen(),
++      at_left_edge ? views::MenuAnchorPosition::kBubbleTopRight
++                   : views::MenuAnchorPosition::kBubbleTopLeft,
++      ui::GetMenuSourceTypeForEvent(event));
++}
++
++void CleanupButton::OnMenuClosed() {
++  SetHighlighted(false);
++}
++
++// static
++std::optional<base::TimeDelta> CleanupButton::PeriodFor(int command_id) {
++  const int index = command_id - kFirstPeriodCommand;
++  if (index < 0 ||
++      static_cast<size_t>(index) >= std::size(cleanup::kInactivePeriods)) {
++    return std::nullopt;
++  }
++  return cleanup::kInactivePeriods[index];
++}
++
++void CleanupButton::ShowKeptNotes() {
++  for (views::View* view = parent(); view; view = view->parent()) {
++    if (auto* region = views::AsViewClass<BaseTabStripRegionView>(view)) {
++      if (PinnedSection* section =
++              PinnedSection::Get(region->GetUnpinnedTabsContainer())) {
++        section->ShowKeptRows();
++      }
++      return;
++    }
++  }
++}
++
++BEGIN_METADATA(CleanupButton)
++END_METADATA
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar/cleanup_button.h
+@@ -0,0 +1,80 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_CLEANUP_BUTTON_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_CLEANUP_BUTTON_H_
++
++#include <memory>
++#include <optional>
++
++#include "base/memory/raw_ptr.h"
++#include "base/time/time.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_button.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/menus/simple_menu_model.h"
++
++class BrowserWindowInterface;
++
++namespace rac::cleanup {
++class DeselectionStamps;
++}  // namespace rac::cleanup
++
++namespace ui {
++class Event;
++}  // namespace ui
++
++namespace views {
++class MenuRunner;
++}  // namespace views
++
++namespace rac {
++
++// The broom at the bottom of the sidebar, at the window's edge across the
++// footer from the app menu. Its menu clears the space's open tabs nobody has
++// looked at for 5 hours, a day, 2 days or 5 days, or all of them. Each is
++// one Clear: MayClear() keeps busy tabs, with notes under them, and one
++// toast offers Undo. Clear All is the clear_tabs row (IDC_RAC_CLEAR_TABS),
++// as in the command bar and on Shift+Cmd+K.
++class CleanupButton : public ToolbarButton,
++                      public ui::SimpleMenuModel::Delegate {
++  METADATA_HEADER(CleanupButton, ToolbarButton)
++
++ public:
++  // Null for a window Clear doesn't work in: one without spaces, such as
++  // incognito, guest, apps, and popups.
++  static std::unique_ptr<CleanupButton> CreateFor(
++      BrowserWindowInterface* browser);
++
++  explicit CleanupButton(BrowserWindowInterface* browser);
++  CleanupButton(const CleanupButton&) = delete;
++  CleanupButton& operator=(const CleanupButton&) = delete;
++  ~CleanupButton() override;
++
++  bool IsMenuShowing() const;
++
++  // ui::SimpleMenuModel::Delegate:
++  bool IsCommandIdEnabled(int command_id) const override;
++  void ExecuteCommand(int command_id, int event_flags) override;
++
++ private:
++  void ShowMenu(const ui::Event& event);
++  void OnMenuClosed();
++  // The period a menu command clears tabs inactive for, or nullopt for Clear
++  // All.
++  static std::optional<base::TimeDelta> PeriodFor(int command_id);
++  // Shows, under the tabs the Clear just kept, why it kept them. Clear
++  // hands them over only within its own task, and only the sidebar's tab
++  // list can show them.
++  void ShowKeptNotes();
++
++  const raw_ptr<BrowserWindowInterface> browser_;
++  // When each tab was last left, for the inactive choices.
++  std::unique_ptr<cleanup::DeselectionStamps> stamps_;
++  std::unique_ptr<ui::SimpleMenuModel> model_;
++  std::unique_ptr<views::MenuRunner> menu_runner_;
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_CLEANUP_BUTTON_H_
+--- a/chrome/browser/ui/views/rac/sidebar/pinned_section.cc
++++ b/chrome/browser/ui/views/rac/sidebar/pinned_section.cc
+@@ -477,6 +477,11 @@ const PinnedSection* PinnedSection::Get(
+ }
+ 
+ // static
++PinnedSection* PinnedSection::Get(views::View* container) {
++  return container->GetProperty(kPinnedSectionKey);
++}
++
++// static
+ bool PinnedSection::IsRow(const views::View& view) {
+   return views::IsViewClass<FolderHeaderView>(&view) ||
+          views::IsViewClass<SectionDividerView>(&view) ||
+--- a/chrome/browser/ui/views/rac/sidebar/pinned_section.h
++++ b/chrome/browser/ui/views/rac/sidebar/pinned_section.h
+@@ -121,6 +121,7 @@ class PinnedSection : public views::View
+   static void Attach(views::View* container);
+   // Returns null for containers without one.
+   static const PinnedSection* Get(const views::View* container);
++  static PinnedSection* Get(views::View* container);
+   // True for the folder headers and the divider the section adds to the
+   // container.
+   static bool IsRow(const views::View& view);
+--- a/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.cc
++++ b/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.cc
+@@ -23,6 +23,7 @@
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/location_bar/location_bar_view.h"
+ #include "chrome/browser/ui/views/rac/rac_look.h"
++#include "chrome/browser/ui/views/rac/sidebar/cleanup_button.h"
+ #include "chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.h"
+ #include "chrome/browser/ui/views/rac/sidebar_reveal/window_buttons_ratio.h"
+ #include "chrome/browser/ui/views/rac/sidebar_visibility.h"
+@@ -169,11 +170,13 @@ RacSidebarFooterView::~RacSidebarFooterV
+ void RacSidebarFooterView::AddLeadingControl(views::View* view) {
+   AddChildViewAt(view, GetIndexOf(spacer_).value());
+   view->SetProperty(views::kFlexBehaviorKey, FlexFor(view));
++  PlaceCleanupButton();
+ }
+ 
+ void RacSidebarFooterView::AddTrailingControl(views::View* view) {
+   AddChildView(view);
+   view->SetProperty(views::kFlexBehaviorKey, FlexFor(view));
++  PlaceCleanupButton();
+ }
+ 
+ views::View* RacSidebarFooterView::SetCenterView(
+@@ -187,10 +190,12 @@ views::View* RacSidebarFooterView::SetCe
+                           .WithOrder(2));
+   RemoveChildViewT(spacer_.get());
+   spacer_ = center;
++  PlaceCleanupButton();
+   return center;
+ }
+ 
+ void RacSidebarFooterView::SetCollapsed(bool collapsed) {
++  collapsed_ = collapsed;
+   auto* layout = static_cast<views::FlexLayout*>(GetLayoutManager());
+   layout->SetOrientation(collapsed ? views::LayoutOrientation::kVertical
+                                    : views::LayoutOrientation::kHorizontal);
+@@ -201,9 +206,53 @@ void RacSidebarFooterView::SetCollapsed(
+                            collapsed ? views::MaximumFlexSizeRule::kPreferred
+                                      : views::MaximumFlexSizeRule::kUnbounded)
+                            .WithOrder(2));
++  PlaceCleanupButton();
+   InvalidateLayout();
+ }
+ 
++void RacSidebarFooterView::SetCleanupButton(
++    std::unique_ptr<views::View> button) {
++  if (!button) {
++    return;
++  }
++  cleanup_button_ = AddChildView(std::move(button));
++  cleanup_button_->SetProperty(views::kFlexBehaviorKey,
++                               FlexFor(cleanup_button_));
++  PlaceCleanupButton();
++}
++
++void RacSidebarFooterView::PlaceCleanupButton() {
++  if (!cleanup_button_) {
++    return;
++  }
++  // The app menu sits toward the page, so clean-up takes the window's edge:
++  // bottom left beside a left sidebar, bottom right beside a right one.
++  const size_t center = GetIndexOf(spacer_).value();
++  const views::View* menu =
++      FindToolbarChild(this, kToolbarAppMenuButtonElementId);
++  const bool menu_first = menu && GetIndexOf(menu).value() < center;
++  ReorderChildView(cleanup_button_, menu_first ? children().size() : 0);
++  // The center gives up as much room on its other side, so the space
++  // switcher stays where it was.
++  const int width =
++      collapsed_ ? 0 : cleanup_button_->GetPreferredSize().width();
++  spacer_->SetProperty(views::kMarginsKey,
++                       menu_first ? gfx::Insets::TLBR(0, width, 0, 0)
++                                  : gfx::Insets::TLBR(0, 0, 0, width));
++}
++
++bool RacSidebarFooterView::IsCleanupMenuShowing() const {
++  const auto* button = views::AsViewClass<rac::CleanupButton>(cleanup_button_);
++  return button && button->IsMenuShowing();
++}
++
++void RacSidebarFooterView::ChildPreferredSizeChanged(views::View* child) {
++  if (child == cleanup_button_) {
++    PlaceCleanupButton();
++  }
++  views::View::ChildPreferredSizeChanged(child);
++}
++
+ bool RacSidebarFooterView::IsPositionInWindowCaption(const gfx::Point& point) {
+   // Empty space drags the window, like the toolbar did.
+   return !HitsVisibleChild(this, point);
+@@ -864,6 +913,11 @@ bool RacSidebarHeaderView::ShouldKeepSid
+   return false;
+ }
+ 
++bool RacSidebarHeaderView::IsSidebarMenuShowing() const {
++  const RacSidebarFooterView* footer = GetFooter();
++  return footer && footer->IsCleanupMenuShowing();
++}
++
+ int RacSidebarHeaderView::GetMinimumSidebarWidth() const {
+   if (!GetVisible()) {
+     return 0;
+@@ -1018,6 +1072,11 @@ bool ShouldKeepSidebarRevealed(const Bro
+   return header && header->ShouldKeepSidebarRevealed();
+ }
+ 
++bool IsSidebarMenuShowing(const BrowserView* browser_view) {
++  const auto* header = HeaderFor(browser_view);
++  return header && header->IsSidebarMenuShowing();
++}
++
+ int GetMinimumSidebarWidth(const BrowserView* browser_view) {
+   const auto* header = HeaderFor(browser_view);
+   return header ? header->GetMinimumSidebarWidth() : 0;
+--- a/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h
++++ b/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h
+@@ -56,10 +56,27 @@ class RacSidebarFooterView : public view
+   // A collapsed sidebar is too narrow for a row, so the controls stack.
+   void SetCollapsed(bool collapsed);
+ 
++  // The clean-up button (rac::CleanupButton), or null for a window without
++  // one.
++  void SetCleanupButton(std::unique_ptr<views::View> button);
++
+   bool IsPositionInWindowCaption(const gfx::Point& point);
+ 
++  // Whether the clean-up button's menu is open.
++  bool IsCleanupMenuShowing() const;
++
++  // views::View:
++  void ChildPreferredSizeChanged(views::View* child) override;
++
+  private:
++  // Keeps the clean-up button at the window's edge, across the footer from
++  // the app menu, on either side of the window, and the center view (the
++  // space switcher) centered where it was without the button.
++  void PlaceCleanupButton();
++
+   raw_ptr<views::View> spacer_ = nullptr;
++  raw_ptr<views::View> cleanup_button_ = nullptr;
++  bool collapsed_ = false;
+ };
+ 
+ // The top of the sidebar when the address bar lives there. It borrows the
+@@ -134,6 +151,8 @@ class RacSidebarHeaderView : public view
+   // True while something in the header needs the sidebar to stay shown: a
+   // control has focus, or a menu or bubble opened from the header is open.
+   bool ShouldKeepSidebarRevealed() const;
++  // Whether a menu of the sidebar's own, such as the clean-up menu, is open.
++  bool IsSidebarMenuShowing() const;
+ 
+   // The narrowest sidebar that still fits every control, or 0 when hidden.
+   int GetMinimumSidebarWidth() const;
+@@ -264,6 +283,9 @@ void UpdateSidebarAddressBar(BrowserView
+ void RestoreToolbarControls(BrowserView* browser_view);
+ void RevealSidebarForAddressBar(BrowserView* browser_view);
+ bool ShouldKeepSidebarRevealed(const BrowserView* browser_view);
++// Whether a menu the sidebar opened itself is open, wherever the address bar
++// is. A hidden sidebar stays revealed while it is.
++bool IsSidebarMenuShowing(const BrowserView* browser_view);
+ int GetMinimumSidebarWidth(const BrowserView* browser_view);
+ 
+ // True for views in the sidebar's header, such as the address bar.
