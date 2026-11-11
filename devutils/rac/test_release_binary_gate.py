@@ -114,11 +114,12 @@ class ReleaseBinaryGateTest(unittest.TestCase):
         self.assertIn('RAC_G6_GATE=warn', out)
         self.assertNotIn('::error::', out)
 
-    def test_default_mode_is_warn(self):
+    def test_default_mode_is_enforce(self):
         self.write('Contents/MacOS/rac', fake_binary('rac-launch-in-background'))
         code, out = self.run_gate()
-        self.assertEqual(code, 0, out)
-        self.assertIn('::warning::G6', out)
+        self.assertEqual(code, 1, out)
+        self.assertIn("::error::G6: 'rac-launch-in-background' found in Contents/MacOS/rac", out)
+        self.assertNotIn('::warning::', out)
 
     def test_helper_app_with_spaces_in_path(self):
         rel = f'{FRAMEWORK}/Versions/146.0.0.0/Helpers/rac Helper (GPU).app/Contents/MacOS/rac Helper (GPU)'
