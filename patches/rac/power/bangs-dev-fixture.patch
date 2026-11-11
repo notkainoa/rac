@@ -1,0 +1,229 @@
+--- a/chrome/browser/rac/power/BUILD.gn
++++ b/chrome/browser/rac/power/BUILD.gn
+@@ -24,6 +24,21 @@ source_set("power") {
+   deps = [ "//components/url_formatter" ]
+ }
+ 
++# --rac-bangs-fixture, which starts a dev build's profile with a given bangs
++# state (see bangs_fixture.h). It compiles to nothing in release builds.
++source_set("bangs_fixture") {
++  sources = [
++    "bangs_fixture.cc",
++    "bangs_fixture.h",
++  ]
++  deps = [
++    "//base",
++    "//chrome/browser/rac/dev:buildflags",
++    "//components/prefs",
++    "//components/search_engines",
++  ]
++}
++
+ # Build with `autoninja -C out/Default
+ # chrome/browser/rac/power:rac_power_unittests`. It also runs the SitePattern
+ # tests, so one binary covers both. It's separate from Chromium's unit_tests,
+--- /dev/null
++++ b/chrome/browser/rac/power/bangs_fixture.cc
+@@ -0,0 +1,137 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/power/bangs_fixture.h"
++
++#include "chrome/browser/rac/dev/buildflags.h"
++
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/callback_list.h"
++#include "base/command_line.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/logging.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/threading/thread_restrictions.h"
++#include "base/values.h"
++#include "components/prefs/pref_service.h"
++#include "components/search_engines/rac_bangs_edit.h"
++#include "components/search_engines/rac_deleted_bangs.h"
++#include "components/search_engines/template_url_service.h"
++#endif
++
++namespace rac {
++
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++namespace {
++
++// Not in release builds, so a release always downloads the real list.
++constexpr char kBangsFixtureSwitch[] = "rac-bangs-fixture";
++
++std::optional<base::DictValue> ReadFixture() {
++  const base::CommandLine& command_line =
++      *base::CommandLine::ForCurrentProcess();
++  if (!command_line.HasSwitch(kBangsFixtureSwitch)) {
++    return std::nullopt;
++  }
++  base::FilePath path = command_line.GetSwitchValuePath(kBangsFixtureSwitch);
++  std::string json;
++  // Dev builds only: a few KB, read once per profile at startup.
++  base::ScopedAllowBlockingForTesting allow_blocking;
++  // A relative path is taken from the current folder, which is the
++  // worktree when worktree.sh (or remote-build.sh on another Mac) runs it.
++  if (!path.empty() && !path.IsAbsolute() && !path.ReferencesParent()) {
++    path = base::MakeAbsoluteFilePath(path);
++  }
++  if (!path.IsAbsolute() || !base::ReadFileToString(path, &json)) {
++    LOG(ERROR) << "--" << kBangsFixtureSwitch
++               << " needs a path to a readable file, absolute or relative to"
++                  " the worktree";
++    return std::nullopt;
++  }
++  std::optional<base::DictValue> fixture =
++      base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC);
++  if (!fixture) {
++    LOG(ERROR) << "--" << kBangsFixtureSwitch
++               << ": the fixture isn't a JSON object";
++  }
++  return fixture;
++}
++
++void AddYours(TemplateURLService* service,
++              PrefService* prefs,
++              const base::ListValue& yours) {
++  for (const base::Value& entry : yours) {
++    const base::DictValue* bang = entry.GetIfDict();
++    const std::string* name = bang ? bang->FindString("name") : nullptr;
++    const std::string* trigger = bang ? bang->FindString("trigger") : nullptr;
++    const std::string* url = bang ? bang->FindString("url") : nullptr;
++    // SaveBang refuses a keyword that's taken, so a profile that already
++    // has the bang from an earlier run keeps one copy.
++    if (name && trigger && url) {
++      SaveBang(*service, *prefs, /*existing=*/nullptr, base::UTF8ToUTF16(*name),
++               base::UTF8ToUTF16(*trigger), *url);
++    }
++  }
++}
++
++void OnServiceLoaded(TemplateURLService* service,
++                     PrefService* prefs,
++                     base::ListValue yours) {
++  AddYours(service, prefs, yours);
++  // The list arrives after the user's engines, as a download does.
++  ReleaseBangsListOverride();
++}
++
++}  // namespace
++#endif  // BUILDFLAG(RAC_DEV_SWITCHES)
++
++void MaybeApplyBangsFixture(TemplateURLService& service, PrefService& prefs) {
++#if BUILDFLAG(RAC_DEV_SWITCHES)
++  std::optional<base::DictValue> fixture = ReadFixture();
++  if (!fixture) {
++    return;
++  }
++
++  if (const base::ListValue* bangs = fixture->FindList("bangs")) {
++    std::optional<std::string> bangs_json = base::WriteJson(*bangs);
++    if (bangs_json) {
++      SetBangsListOverride(std::move(*bangs_json), /*hold=*/true);
++    }
++  }
++
++  base::ListValue deleted;
++  if (const base::ListValue* triggers = fixture->FindList("deleted")) {
++    for (const base::Value& trigger : *triggers) {
++      if (trigger.is_string()) {
++        deleted.Append(base::ToLowerASCII(trigger.GetString()));
++      }
++    }
++  }
++  prefs.SetList(kDeletedBangsPref, std::move(deleted));
++
++  base::ListValue yours;
++  if (base::ListValue* list = fixture->FindList("yours")) {
++    yours = std::move(*list);
++  }
++  // The subscription has to outlive the load. Profiles live until the
++  // browser quits in a dev run, so the list of them never shrinks.
++  static base::NoDestructor<std::vector<base::CallbackListSubscription>>
++      subscriptions;
++  subscriptions->push_back(service.RegisterOnLoadedCallback(
++      base::BindOnce(&OnServiceLoaded, &service, &prefs, std::move(yours))));
++#endif  // BUILDFLAG(RAC_DEV_SWITCHES)
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/rac/power/bangs_fixture.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_POWER_BANGS_FIXTURE_H_
++#define CHROME_BROWSER_RAC_POWER_BANGS_FIXTURE_H_
++
++class PrefService;
++class TemplateURLService;
++
++namespace rac {
++
++// Dev builds: --rac-bangs-fixture=<file> starts a profile with the bangs
++// state the file describes, so the Bangs page can be shown without clicks.
++// The file is a JSON object (devutils/rac/fixtures/bangs/ has examples):
++//
++//   bangs   — the bangs list, in bangs.json's format; it's loaded in place
++//             of the download, once the profile's engines have loaded
++//   deleted — triggers (no "!") to record as deleted; replaces the pref
++//   yours   — [{name, trigger, url}], the user's own bangs, added unless the
++//             keyword is taken; url has %s for the query
++//
++// Called when the profile's TemplateURLService is built, before it loads.
++// Release builds compile this to nothing, switch name included.
++void MaybeApplyBangsFixture(TemplateURLService& service, PrefService& prefs);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_POWER_BANGS_FIXTURE_H_
+--- a/chrome/browser/search_engines/BUILD.gn
++++ b/chrome/browser/search_engines/BUILD.gn
+@@ -38,6 +38,7 @@ source_set("search_engines") {
+     "//chrome/browser/google",
+     "//chrome/browser/history",
+     "//chrome/browser/metrics",
++    "//chrome/browser/rac/power:bangs_fixture",
+     "//chrome/browser/regional_capabilities",
+     "//chrome/browser/search_engine_choice",
+     "//chrome/browser/webdata_services",
+--- a/chrome/browser/search_engines/template_url_service_factory.cc
++++ b/chrome/browser/search_engines/template_url_service_factory.cc
+@@ -16,6 +16,7 @@
+ #include "chrome/browser/metrics/profile_metrics_service_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/profiles/profile_selections.h"
++#include "chrome/browser/rac/power/bangs_fixture.h"
+ #include "chrome/browser/regional_capabilities/regional_capabilities_service_factory.h"
+ #include "chrome/browser/search_engine_choice/search_engine_choice_service_factory.h"
+ #include "chrome/browser/search_engines/chrome_template_url_service_client.h"
+@@ -131,7 +132,11 @@ TemplateURLServiceFactory::BuildServiceI
+   }
+ #endif
+ 
+-  return BuildInstanceFor(profile);
++  std::unique_ptr<KeyedService> service = BuildInstanceFor(profile);
++  // rac: dev builds can start with a given bangs state (--rac-bangs-fixture).
++  rac::MaybeApplyBangsFixture(static_cast<TemplateURLService&>(*service),
++                              CHECK_DEREF(profile->GetPrefs()));
++  return service;
+ }
+ 
+ void TemplateURLServiceFactory::RegisterProfilePrefs(
