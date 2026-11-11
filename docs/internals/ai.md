@@ -169,19 +169,26 @@ Its callers apply it differently:
   committed a page yet is internal. The agent asks the same question
   through `rac::agent::IsTabInAgentReach`: its tab list, every tab it
   reads or acts on (`TabTools::FindByAlias`), the tabs a turn starts
-  with, and `go_back`'s target. So a blank tab, even one the agent
-  opened, is out of its reach until a web page commits there.
+  with, and the `--rac-agent-debug` commands. So a blank tab, even one the
+  agent opened, is out of its reach until a web page commits there.
+  `go_back` judges the entry it goes back to by the same rule
+  (`IsInternalEntry`), on the approval card and in the step, except that
+  the step may go back to a blank page.
 - The entry points (`IsAssistantBlockedHere`: the Chat button, the edge
   handle, the Assistant command, Find's Ask, the command bar's Ask row via
   `Need::kWebPage`) go by the address bar's address, and a blank tab
   doesn't block them. The agent opens its tabs blank first, and a new tab
   on its way to a web page would otherwise flash the panel shut, mid-task.
 - Link summaries (`ShouldOfferLinkSummary`, for Option-hover and
-  "Summarize Link") need both: the last committed entry, the page the
-  link is on, and the address bar's address must be web pages
-  (`CanSummarizeLinksOn`). A link's address on history or downloads is the
-  user's own browsing, and a tab between an internal page and a web page
-  is refused whichever way it's going. The check runs before the hover
+  "Summarize Link") need both: the tab, which holds the page the link is
+  on, must not be internal (`IsInternalTab`), and the address bar's
+  address must be a web page. A link's address on history or downloads is the user's own
+  browsing, and a tab between an internal page and a web page is refused
+  whichever way it's going. "Summarize Link" also knows the frame the link
+  is in, which must be a web page too (`CanSummarizeLinksInFrame`), so a
+  link in an extension's frame inside a web page isn't summarized.
+  Option-hover can't check the frame: Chromium reports a hovered link with
+  its tab only. The check runs before the hover
   watcher exists and before the menu item is added, so an internal page
   gets no card, no loading state and no fetch. The link itself must be
   http(s) (`IsSummarizableLink`), so a web page's link to rac://settings
