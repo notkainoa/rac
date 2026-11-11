@@ -1,0 +1,1524 @@
+--- a/chrome/browser/rac/agent/tab_tools.cc
++++ b/chrome/browser/rac/agent/tab_tools.cc
+@@ -3,6 +3,7 @@
+ 
+ #include "chrome/browser/rac/agent/tab_tools.h"
+ 
++#include "base/auto_reset.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -24,6 +25,18 @@
+ 
+ namespace rac::agent {
+ 
++namespace {
++
++// How many of the agent's own tab switches are under way.
++int g_bringing_forward = 0;
++
++}  // namespace
++
++// static
++bool TabTools::IsBringingTabForward() {
++  return g_bringing_forward > 0;
++}
++
+ TabTools::TabTools(BrowserWindowInterface* browser)
+     : browser_(browser ? browser->GetWeakPtr() : nullptr) {}
+ TabTools::~TabTools() = default;
+@@ -109,7 +122,10 @@ ActionResult TabTools::OpenTab(const GUR
+   NavigateParams params(browser_.get(), GURL("about:blank"),
+                         ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
+   params.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
+-  ::Navigate(&params);
++  {
++    base::AutoReset<int> forward(&g_bringing_forward, g_bringing_forward + 1);
++    ::Navigate(&params);
++  }
+   content::WebContents* created = params.navigated_or_inserted_contents;
+   if (!created) {
+     result.error_code = "open_failed";
+@@ -143,7 +159,10 @@ ActionResult TabTools::SwitchTab(const s
+     result.error = "Unknown tab.";
+     return result;
+   }
+-  model->ActivateTabAt(index);
++  {
++    base::AutoReset<int> forward(&g_bringing_forward, g_bringing_forward + 1);
++    model->ActivateTabAt(index);
++  }
+   result.ok = true;
+   return result;
+ }
+--- a/chrome/browser/rac/agent/tab_tools.h
++++ b/chrome/browser/rac/agent/tab_tools.h
+@@ -35,6 +35,11 @@ class TabTools {
+   explicit TabTools(BrowserWindowInterface* browser);
+   ~TabTools();
+ 
++  // True while open_tab or switch_tab brings a tab to the front, for code
++  // that watches the active tab: the assistant's chat follows its agent
++  // task there, and stays with a tab the user switches to.
++  static bool IsBringingTabForward();
++
+   std::vector<TabInfo> ListTabs() const;
+   content::WebContents* FindByAlias(const std::string& tab_id) const;
+   std::string AliasFor(content::WebContents* contents) const;
+--- a/chrome/browser/rac/ai/BUILD.gn
++++ b/chrome/browser/rac/ai/BUILD.gn
+@@ -58,6 +58,8 @@ source_set("core") {
+     "chat_protocol.h",
+     "chat_history.cc",
+     "chat_history.h",
++    "chat_placement.cc",
++    "chat_placement.h",
+     "internal_page.cc",
+     "internal_page.h",
+     "link_summary.cc",
+@@ -138,6 +140,7 @@ test("rac_ai_unittests") {
+     "ai_prefs_unittest.cc",
+     "ask_query_unittest.cc",
+     "chat_history_unittest.cc",
++    "chat_placement_unittest.cc",
+     "chat_prompt_unittest.cc",
+     "chat_protocol_unittest.cc",
+     "internal_page_unittest.cc",
+--- /dev/null
++++ b/chrome/browser/rac/ai/chat_placement.cc
+@@ -0,0 +1,31 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/chat_placement.h"
++
++namespace rac::ai {
++
++ChatMove DecideChatMove(const ActiveTabState& state) {
++  if (state.blocked) {
++    // The assistant never sits beside an internal page.
++    return state.chat_showing ? ChatMove::kStepAside : ChatMove::kNone;
++  }
++  // Another side panel the user opened since keeps its place.
++  if (state.panel_showing) {
++    return ChatMove::kNone;
++  }
++  if (state.has_chat) {
++    return state.stepped_aside ? ChatMove::kComeBack : ChatMove::kNone;
++  }
++  // The two tabs of a split view are read side by side, so moving between
++  // them keeps the chat in view instead of closing it on every click.
++  return state.split_partner_chat_open ? ChatMove::kShareWithSplit
++                                       : ChatMove::kNone;
++}
++
++bool ReleasesChat(ChatHideReason reason, bool window_closing) {
++  return reason == ChatHideReason::kClosed && !window_closing;
++}
++
++}  // namespace rac::ai
+--- /dev/null
++++ b/chrome/browser/rac/ai/chat_placement.h
+@@ -0,0 +1,61 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_CHAT_PLACEMENT_H_
++#define CHROME_BROWSER_RAC_AI_CHAT_PLACEMENT_H_
++
++namespace rac::ai {
++
++// The assistant's chat belongs to tabs, not to the window: each tab shows its
++// own chat, opened on that tab, and the side panel follows the active tab.
++// These decide the few moves rac makes on top of what Chromium's per-tab side
++// panel entries already do.
++
++// The window's active tab, or the page in it, has just changed.
++struct ActiveTabState {
++  // The tab shows an internal page (IsAssistantBlockedHere()).
++  bool blocked = false;
++  // The side panel shows this tab's chat, and isn't closing.
++  bool chat_showing = false;
++  // The side panel shows anything at all.
++  bool panel_showing = false;
++  // This tab's chat stepped aside for an internal page and hasn't come back.
++  bool stepped_aside = false;
++  // This tab has a chat (its own, or one it shares).
++  bool has_chat = false;
++  // The tab active just before this one shares a split view with it, and
++  // its chat was open when the user left it.
++  bool split_partner_chat_open = false;
++};
++
++enum class ChatMove {
++  kNone,
++  // Close the panel and keep the chat: the tab now shows an internal page.
++  kStepAside,
++  // Open the tab's chat again: the tab is back on a web page.
++  kComeBack,
++  // Show the split partner's chat beside this tab too.
++  kShareWithSplit,
++};
++
++ChatMove DecideChatMove(const ActiveTabState& state);
++
++// Why a tab's chat left the panel. Mirrors SidePanelEntryHideReason.
++enum class ChatHideReason {
++  // The panel closed: the user closed it, or something else did.
++  kClosed,
++  // Another side panel took its place.
++  kReplaced,
++  // The user, the agent, or a closing tab switched to another tab.
++  kTabSwitched,
++};
++
++// Whether the tab lets its chat go. Only closing the panel does that, and not
++// while the window is closing, when the chat goes with its tabs. A chat shared
++// with other tabs stays with them; one with no tab left ends.
++bool ReleasesChat(ChatHideReason reason, bool window_closing);
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_CHAT_PLACEMENT_H_
+--- /dev/null
++++ b/chrome/browser/rac/ai/chat_placement_unittest.cc
+@@ -0,0 +1,76 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/chat_placement.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::ai {
++namespace {
++
++TEST(RacAiChatPlacementTest, AWebTabWithNothingToDoStaysAsItIs) {
++  EXPECT_EQ(DecideChatMove({}), ChatMove::kNone);
++  EXPECT_EQ(
++      DecideChatMove(
++          {.chat_showing = true, .panel_showing = true, .has_chat = true}),
++      ChatMove::kNone);
++  // A tab with a chat that is merely closed keeps it closed.
++  EXPECT_EQ(DecideChatMove({.has_chat = true}), ChatMove::kNone);
++}
++
++TEST(RacAiChatPlacementTest, AnInternalPageSendsAShowingChatAside) {
++  EXPECT_EQ(DecideChatMove({.blocked = true,
++                            .chat_showing = true,
++                            .panel_showing = true,
++                            .has_chat = true}),
++            ChatMove::kStepAside);
++  // Nothing to send aside: the panel is closed, or shows something else.
++  EXPECT_EQ(DecideChatMove({.blocked = true, .has_chat = true}),
++            ChatMove::kNone);
++  EXPECT_EQ(DecideChatMove(
++                {.blocked = true, .panel_showing = true, .has_chat = true}),
++            ChatMove::kNone);
++}
++
++TEST(RacAiChatPlacementTest, AnInternalPageNeverBringsAChatBack) {
++  EXPECT_EQ(DecideChatMove(
++                {.blocked = true, .has_chat = true, .stepped_aside = true}),
++            ChatMove::kNone);
++  EXPECT_EQ(DecideChatMove({.blocked = true, .split_partner_chat_open = true}),
++            ChatMove::kNone);
++}
++
++TEST(RacAiChatPlacementTest, BackOnAWebPageTheChatReturns) {
++  EXPECT_EQ(DecideChatMove({.has_chat = true, .stepped_aside = true}),
++            ChatMove::kComeBack);
++}
++
++TEST(RacAiChatPlacementTest, AnotherPanelKeepsItsPlace) {
++  EXPECT_EQ(
++      DecideChatMove(
++          {.panel_showing = true, .has_chat = true, .stepped_aside = true}),
++      ChatMove::kNone);
++  EXPECT_EQ(
++      DecideChatMove({.panel_showing = true, .split_partner_chat_open = true}),
++      ChatMove::kNone);
++}
++
++TEST(RacAiChatPlacementTest, ASplitPartnerSharesItsOpenChat) {
++  EXPECT_EQ(DecideChatMove({.split_partner_chat_open = true}),
++            ChatMove::kShareWithSplit);
++  // A tab with a chat of its own shows that one instead.
++  EXPECT_EQ(DecideChatMove({.has_chat = true, .split_partner_chat_open = true}),
++            ChatMove::kNone);
++}
++
++TEST(RacAiChatPlacementTest, OnlyClosingThePanelReleasesTheChat) {
++  EXPECT_TRUE(ReleasesChat(ChatHideReason::kClosed, false));
++  EXPECT_FALSE(ReleasesChat(ChatHideReason::kTabSwitched, false));
++  EXPECT_FALSE(ReleasesChat(ChatHideReason::kReplaced, false));
++  // A closing window takes the chat with its tabs.
++  EXPECT_FALSE(ReleasesChat(ChatHideReason::kClosed, true));
++}
++
++}  // namespace
++}  // namespace rac::ai
+--- a/chrome/browser/ui/views/rac/agent/agent_tab_indicator.cc
++++ b/chrome/browser/ui/views/rac/agent/agent_tab_indicator.cc
+@@ -25,14 +25,12 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
+-#include "chrome/browser/ui/side_panel/side_panel_entry_id.h"
+-#include "chrome/browser/ui/side_panel/side_panel_entry_key.h"
+-#include "chrome/browser/ui/side_panel/side_panel_ui.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/contents_capture_border_view.h"
+ #include "chrome/browser/ui/views/frame/contents_container_view.h"
+ #include "chrome/browser/ui/views/frame/contents_web_view.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_view.h"
++#include "chrome/browser/ui/views/rac/ai/assistant_side_panel.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_observer.h"
+@@ -723,14 +721,8 @@ class AgentTabController
+     owned_pill_ = std::move(pill);
+   }
+ 
+-  void OpenSidebar() {
+-    BrowserWindowInterface* browser = GetBrowser();
+-    SidePanelUI* ui = browser ? SidePanelUI::From(browser) : nullptr;
+-    if (ui) {
+-      ui->Show(SidePanelEntryKey(SidePanelEntryId::kRacAi),
+-               SidePanelOpenTrigger::kToolbarButton);
+-    }
+-  }
++  // The chat is per tab, and the agent's tab shows the chat that runs it.
++  void OpenSidebar() { rac::ai::ShowAssistantForTab(GetTab(), false); }
+ 
+   void Reattach(bool fade) {
+     if (hiding_) {
+--- a/chrome/browser/ui/views/rac/ai/assistant_actions.cc
++++ b/chrome/browser/ui/views/rac/ai/assistant_actions.cc
+@@ -15,11 +15,6 @@
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/ui/actions/chrome_action_id.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+-#include "chrome/browser/ui/side_panel/side_panel_action_callback.h"
+-#include "chrome/browser/ui/side_panel/side_panel_entry_id.h"
+-#include "chrome/browser/ui/side_panel/side_panel_entry_key.h"
+-#include "chrome/browser/ui/side_panel/side_panel_enums.h"
+-#include "chrome/browser/ui/side_panel/side_panel_ui.h"
+ #include "chrome/browser/ui/singleton_tabs.h"
+ #include "chrome/browser/ui/views/rac/ai/assistant_side_panel.h"
+ #include "chrome/browser/ui/window_feature_controller/window_feature_controller.h"
+@@ -113,10 +108,7 @@ void ToggleAssistant(BrowserWindowInterf
+   if (IsAssistantBlockedHere(browser) && !IsAssistantPanelOpen(browser)) {
+     return;
+   }
+-  if (SidePanelUI* ui = SidePanelUI::From(browser)) {
+-    ui->Toggle(SidePanelEntryKey(SidePanelEntryId::kRacAi),
+-               SidePanelOpenTrigger::kToolbarButton);
+-  }
++  ToggleAssistantPanel(browser);
+ }
+ 
+ bool CanRunAssistantCommand(BrowserWindowInterface* browser) {
+@@ -149,9 +141,15 @@ bool HidesAssistantMenuItem(BrowserWindo
+ actions::ActionItem* CreateAssistantAction(actions::ActionItem* root,
+                                            BrowserWindowInterface* browser) {
+   return root->AddChild(
++      // Chromium's side panel toggle needs an entry in the active tab, which
++      // a tab gets only once its chat opens.
+       actions::ActionItem::Builder(
+-          CreateToggleSidePanelActionCallback(
+-              SidePanelEntryKey(SidePanelEntryId::kRacAi), browser))
++          base::BindRepeating(
++              [](BrowserWindowInterface* browser, actions::ActionItem*,
++                 actions::ActionInvocationContext) {
++                ToggleAssistant(browser);
++              },
++              base::Unretained(browser)))
+           .SetActionId(kActionSidePanelShowRacAi)
+           .SetText(u"Assistant")
+           .SetTooltipText(u"Assistant")
+--- a/chrome/browser/ui/views/rac/ai/assistant_actions.h
++++ b/chrome/browser/ui/views/rac/ai/assistant_actions.h
+@@ -15,9 +15,9 @@ class ActionItem;
+ 
+ namespace rac::ai {
+ 
+-// Shows the assistant in the window's side panel, or hides it if it is
+-// showing. While the assistant is off this opens its settings instead, so the
+-// button always leads somewhere.
++// Shows the active tab's chat in the window's side panel, or hides it if it
++// is showing. While the assistant is off this opens its settings instead, so
++// the button always leads somewhere.
+ void ToggleAssistant(BrowserWindowInterface* browser);
+ 
+ // The Assistant command (IDC_RAC_ASSISTANT_TOGGLE: the View menu's Assistant
+--- a/chrome/browser/ui/views/rac/ai/assistant_edge_handle.cc
++++ b/chrome/browser/ui/views/rac/ai/assistant_edge_handle.cc
+@@ -16,8 +16,6 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/rac/layout_prefs.h"
+ #include "chrome/browser/ui/side_panel/side_panel_entry_id.h"
+-#include "chrome/browser/ui/side_panel/side_panel_entry_key.h"
+-#include "chrome/browser/ui/side_panel/side_panel_enums.h"
+ #include "chrome/browser/ui/side_panel/side_panel_ui.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/contents_container_view.h"
+@@ -104,9 +102,8 @@ class AssistantEdgeHandle : public views
+     // without sliding so its edge stays under the pointer.
+     panel_width_ = GetPanelWidth(event, *panel);
+     SaveWidth();
+-    ui->Show(SidePanelEntryKey(SidePanelEntryId::kRacAi),
+-             SidePanelOpenTrigger::kToolbarButton,
+-             /*suppress_animations=*/true);
++    ShowAssistantForTab(browser_view_->browser()->GetActiveTabInterface(),
++                        /*suppress_animations=*/true);
+     return true;
+   }
+ 
+--- a/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
++++ b/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
+@@ -8,13 +8,16 @@
+ #include <memory>
+ #include <optional>
+ #include <utility>
++#include <vector>
+ 
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+ #include "base/location.h"
+ #include "base/logging.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/ref_counted.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/supports_user_data.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
+ #include "cc/paint/paint_flags.h"
+@@ -23,6 +26,7 @@
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/rac/ai/ai_service.h"
+ #include "chrome/browser/rac/ai/ai_service_factory.h"
++#include "chrome/browser/rac/ai/chat_placement.h"
+ #include "chrome/browser/rac/ai/internal_page.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+@@ -51,14 +55,18 @@
+ #include "chrome/browser/ui/webui/webui_embedding_context.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "components/prefs/pref_service.h"
++#include "components/split_tabs/split_tab_id.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/file_select_listener.h"
++#include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_contents_delegate.h"
+ #include "content/public/browser/web_contents_observer.h"
+ #include "third_party/blink/public/mojom/choosers/file_chooser.mojom.h"
+ #include "third_party/skia/include/core/SkColor.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/page_transition_types.h"
+ #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
+ #include "ui/color/color_id.h"
+ #include "ui/color/color_provider.h"
+@@ -164,26 +172,85 @@ namespace {
+ 
+ constexpr int kDefaultWidth = 400;
+ constexpr char kPanelUrl[] = "chrome://rac-ai/?mode=panel";
++// Marks a chat page, for AssistantChat::FromPage().
++constexpr char kChatPageKey[] = "rac-assistant-chat";
+ 
+-// The chat page, hosted directly in the side panel with no header: the page
+-// draws its own buttons, close included, as Dia's panel does. The page is
+-// transparent so the panel sits on the window's wash beside the page card.
+-class AssistantWebView : public views::WebView {
+-  METADATA_HEADER(AssistantWebView, views::WebView)
++SidePanelEntryKey ChatKey() {
++  return SidePanelEntryKey(SidePanelEntryId::kRacAi);
++}
+ 
+- public:
+-  AssistantWebView(Profile* profile, BrowserWindowInterface* browser)
+-      : views::WebView(profile) {
+-    webui::SetBrowserWindowInterface(GetWebContents(), browser);
+-    GetWebContents()->SetPageBaseBackgroundColor(SK_ColorTRANSPARENT);
+-    LoadInitialURL(GURL(kPanelUrl));
++void SchedulePaintContainer(BrowserWindowInterface* browser);
++
++// The Chat button and the container follow this.
++void SetPanelOpen(BrowserWindowInterface* browser, bool open) {
++  AssistantPanelState* state =
++      browser ? AssistantPanelState::From(browser) : nullptr;
++  if (state && state->open() != open) {
++    state->SetOpen(open);
++    SchedulePaintContainer(browser);
+   }
++}
+ 
+-  ~AssistantWebView() override = default;
++// Only regular windows with tabs get the assistant, and only while it is on.
++bool CanHaveAssistant(BrowserWindowInterface* browser) {
++  return browser && browser->GetProfile()->IsRegularProfile() &&
++         browser->GetType() == BrowserWindowInterface::Type::TYPE_NORMAL &&
++         IsAiEnabled(browser->GetProfile()->GetPrefs());
++}
+ 
+-  base::WeakPtr<AssistantWebView> AsWeakPtr() {
+-    return weak_factory_.GetWeakPtr();
+-  }
++class AssistantWebView;
++class TabChat;
++
++// One conversation: its chat page and the tabs that show it. Most chats
++// belong to the one tab they were opened on. A chat follows its agent task to
++// the tabs the agent brings forward or works in, and the two tabs of a split
++// view share one, so a chat can belong to several tabs, but the panel shows
++// it beside one tab at a time.
++//
++// The chat owns its page rather than a view: the side panel deletes the views
++// of entries it closes or no longer needs, and a reply or a task must carry
++// on while its tab is in the background. Each tab that shows the chat holds a
++// reference, as does the view showing it, and the chat ends when the last one
++// goes: when the user closes it on its last tab, when its last tab closes, or
++// when AI turns off.
++class AssistantChat : public base::RefCounted<AssistantChat>,
++                      public content::WebContentsDelegate {
++ public:
++  AssistantChat(Profile* profile, tabs::TabInterface* tab) {
++    page_ = content::WebContents::Create(
++        content::WebContents::CreateParams(profile, FROM_HERE));
++    page_->SetDelegate(this);
++    page_->SetPageBaseBackgroundColor(SK_ColorTRANSPARENT);
++    page_->SetUserData(kChatPageKey, std::make_unique<PageTag>(this));
++    // The page's window is its tab's, wherever the tab moves.
++    webui::SetTabInterface(page_.get(), tab);
++    content::NavigationController::LoadURLParams params((GURL(kPanelUrl)));
++    params.transition_type = ui::PAGE_TRANSITION_AUTO_TOPLEVEL;
++    page_->GetController().LoadURLWithParams(params);
++    VLOG(1) << "rac assistant: a new chat page";
++  }
++
++  AssistantChat(const AssistantChat&) = delete;
++  AssistantChat& operator=(const AssistantChat&) = delete;
++
++  static AssistantChat* FromPage(content::WebContents* page) {
++    auto* tag =
++        page ? static_cast<PageTag*>(page->GetUserData(kChatPageKey)) : nullptr;
++    return tag ? tag->chat.get() : nullptr;
++  }
++
++  // Shows the page in `host`, beside `tab`. The view that showed it before
++  // lets it go.
++  void Show(AssistantWebView* host, tabs::TabInterface* tab);
++
++  // `host` no longer shows the page, if it did.
++  void Hide(AssistantWebView* host);
++
++  // True while the side panel shows the page.
++  bool IsShowing() const;
++
++  void AddTab(TabChat* tab_chat) { tabs_.push_back(tab_chat); }
++  void RemoveTab(TabChat* tab_chat);
+ 
+   // content::WebContentsDelegate:
+   void RunFileChooser(content::RenderFrameHost* render_frame_host,
+@@ -193,12 +260,63 @@ class AssistantWebView : public views::W
+                                      params);
+   }
+ 
++ private:
++  friend class base::RefCounted<AssistantChat>;
++
++  struct PageTag : public base::SupportsUserData::Data {
++    explicit PageTag(AssistantChat* chat) : chat(chat) {}
++    raw_ptr<AssistantChat> chat;
++  };
++
++  ~AssistantChat() override {
++    VLOG(1) << "rac assistant: a chat ended";
++    page_->RemoveUserData(kChatPageKey);
++    page_->SetDelegate(nullptr);
++  }
++
++  std::unique_ptr<content::WebContents> page_;
++  // The view showing the page, or the last one to.
++  raw_ptr<AssistantWebView> host_ = nullptr;
++  std::vector<raw_ptr<TabChat>> tabs_;
++};
++
++// The chat page in the side panel, hosted directly with no header: the page
++// draws its own buttons, close included, as Dia's panel does. The page is
++// transparent so the panel sits on the window's wash beside the page card.
++// The side panel makes one per tab entry and deletes them freely; the chat
++// it shows lives on in AssistantChat.
++class AssistantWebView : public views::WebView {
++  METADATA_HEADER(AssistantWebView, views::WebView)
++
++ public:
++  AssistantWebView(Profile* profile,
++                   scoped_refptr<AssistantChat> chat,
++                   tabs::TabInterface* tab,
++                   base::WeakPtr<SidePanelEntry> entry)
++      : views::WebView(profile),
++        chat_(std::move(chat)),
++        tab_(tab->GetHandle()),
++        entry_(std::move(entry)) {
++    chat_->Show(this, tab);
++  }
++
++  ~AssistantWebView() override { chat_->Hide(this); }
++
+  protected:
+   // views::View:
++  void AddedToWidget() override {
++    views::WebView::AddedToWidget();
++    // Another tab's view may have shown the chat since this one was cached.
++    chat_->Show(this, tab_.Get());
++  }
++
+   void VisibilityChanged(views::View* starting_from, bool is_visible) override {
+     views::WebView::VisibilityChanged(starting_from, is_visible);
+-    if (is_visible && starting_from == this) {
+-      // Let the user type straight away.
++    // Let the user type straight away, but not when the chat came back with
++    // its tab: focus stays where the tab switch put it.
++    if (is_visible && starting_from == this &&
++        !(entry_ &&
++          entry_->last_open_trigger() == SidePanelOpenTrigger::kTabChanged)) {
+       base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+           FROM_HERE, base::BindOnce(&AssistantWebView::FocusPage,
+                                     weak_factory_.GetWeakPtr()));
+@@ -212,15 +330,245 @@ class AssistantWebView : public views::W
+     }
+   }
+ 
++  scoped_refptr<AssistantChat> chat_;
++  tabs::TabHandle tab_;
++  base::WeakPtr<SidePanelEntry> entry_;
+   base::WeakPtrFactory<AssistantWebView> weak_factory_{this};
+ };
+ 
+ BEGIN_METADATA(AssistantWebView)
+ END_METADATA
+ 
+-std::unique_ptr<AssistantWebView> CreateView(SidePanelEntryScope& scope) {
+-  BrowserWindowInterface& browser = scope.GetBrowserWindowInterface();
+-  return std::make_unique<AssistantWebView>(browser.GetProfile(), &browser);
++void AssistantChat::Show(AssistantWebView* host, tabs::TabInterface* tab) {
++  if (host_ && host_ != host) {
++    host_->SetWebContents(nullptr);
++  }
++  host_ = host;
++  host->SetWebContents(page_.get());
++  if (tab && webui::GetTabInterface(page_.get()) != tab) {
++    webui::SetTabInterface(page_.get(), tab);
++  }
++}
++
++void AssistantChat::Hide(AssistantWebView* host) {
++  if (host_ == host) {
++    host->SetWebContents(nullptr);
++    host_ = nullptr;
++  }
++}
++
++bool AssistantChat::IsShowing() const {
++  return host_ && host_->GetWidget() && host_->web_contents() == page_.get();
++}
++
++// What one tab knows about the assistant: the chat it shows, if any, and
++// whether that chat stepped aside for an internal page. It is made the first
++// time the assistant opens on the tab, and lives in the tab's side panel
++// entry, which the tab's registry owns, so it goes with the tab. The entry is
++// tab-scoped, so Chromium keeps it open or closed per tab, keeps its view
++// while the tab is in the background, and shows it again on return.
++class TabChat : public SidePanelEntryObserver {
++ public:
++  DECLARE_USER_DATA(TabChat);
++
++  static TabChat* From(tabs::TabInterface* tab) {
++    return Get(tab->GetUnownedUserDataHost());
++  }
++
++  // Registers the tab's entry, and a TabChat with it, unless it has one.
++  static TabChat* GetOrCreate(tabs::TabInterface* tab) {
++    if (TabChat* tab_chat = From(tab)) {
++      return tab_chat;
++    }
++    SidePanelRegistry* registry = SidePanelRegistry::From(tab);
++    if (!registry || registry->GetEntryForKey(ChatKey())) {
++      return nullptr;
++    }
++    auto owned = std::make_unique<TabChat>(tab);
++    TabChat* tab_chat = owned.get();
++    auto entry = std::make_unique<SidePanelEntry>(
++        ChatKey(),
++        base::BindRepeating(&TabChat::CreateContent,
++                            base::Owned(std::move(owned))),
++        base::BindRepeating([] { return kDefaultWidth; }));
++    // The Chat button and the page's own close button are the way in and
++    // out, so Chromium's header and toolbar button would double them.
++    entry->set_should_show_header(false);
++    entry->set_should_show_ephemerally_in_toolbar(false);
++    tab_chat->entry_ = entry->GetWeakPtr();
++    entry->AddObserver(tab_chat);
++    registry->Register(std::move(entry));
++    return tab_chat;
++  }
++
++  explicit TabChat(tabs::TabInterface* tab)
++      : tab_(tab), scoped_data_(tab->GetUnownedUserDataHost(), *this) {}
++
++  TabChat(const TabChat&) = delete;
++  TabChat& operator=(const TabChat&) = delete;
++
++  // Goes with its entry, which no longer lists it by then.
++  ~TabChat() override { Release(); }
++
++  tabs::TabInterface* tab() { return tab_; }
++  AssistantChat* chat() { return chat_.get(); }
++  SidePanelEntry* entry() { return entry_.get(); }
++  bool stepped_aside() const { return stepped_aside_; }
++
++  // True while the tab's chat is open on it, whether or not the tab is in
++  // front: Chromium's per-tab state, kept in the tab's registry.
++  bool IsOpen() {
++    SidePanelRegistry* registry = SidePanelRegistry::From(tab_);
++    std::optional<SidePanelEntry*> active =
++        registry ? registry->GetActiveEntry() : std::nullopt;
++    return chat_ && entry_ && active && *active == entry_.get();
++  }
++
++  // The tab shows `chat` from now on.
++  void Share(scoped_refptr<AssistantChat> chat) {
++    Release();
++    chat_ = std::move(chat);
++    chat_->AddTab(this);
++  }
++
++  // The tab lets its chat go, and gets a new one the next time the assistant
++  // opens on it.
++  void Release() {
++    stepped_aside_ = false;
++    if (chat_) {
++      chat_->RemoveTab(this);
++      chat_ = nullptr;
++    }
++  }
++
++  // Closes the panel showing this tab's chat beside an internal page. The
++  // chat stays, and comes back when the tab shows a web page again.
++  void StepAside() {
++    BrowserWindowInterface* browser = tab_->GetBrowserWindowInterface();
++    SidePanelUI* ui = browser ? SidePanelUI::From(browser) : nullptr;
++    // Not a panel already on its way out: the user closed that one.
++    if (!ui || !tab_->IsActivated() ||
++        !ui->IsSidePanelEntryShowing(ChatKey()) ||
++        !IsAssistantPanelOpen(browser)) {
++      return;
++    }
++    VLOG(1) << "rac assistant: the chat steps aside for an internal page";
++    stepped_aside_ = true;
++    ui->Close(SidePanelEntryHideReason::kBackgrounded,
++              /*suppress_animations=*/true);
++  }
++
++ private:
++  // The entry's view, made when the side panel first shows the entry and
++  // again after it dropped the last one.
++  std::unique_ptr<views::View> CreateContent(SidePanelEntryScope& scope) {
++    Profile* profile =
++        Profile::FromBrowserContext(tab_->GetContents()->GetBrowserContext());
++    if (!chat_) {
++      Share(base::MakeRefCounted<AssistantChat>(profile, tab_));
++    } else {
++      VLOG(1) << "rac assistant: the tab's chat is back";
++    }
++    return std::make_unique<AssistantWebView>(profile, chat_, tab_, entry_);
++  }
++
++  // A way in that shows the panel directly opened it beside an internal page.
++  void StepAsideIfBlocked() {
++    BrowserWindowInterface* browser = tab_->GetBrowserWindowInterface();
++    if (browser && IsAssistantBlockedHere(browser)) {
++      StepAside();
++    }
++  }
++
++  // SidePanelEntryObserver:
++  void OnEntryShown(SidePanelEntry* entry) override {
++    stepped_aside_ = false;
++    hide_reason_ = ChatHideReason::kTabSwitched;
++    BrowserWindowInterface* browser = tab_->GetBrowserWindowInterface();
++    shown_in_ = browser ? browser->GetWeakPtr() : nullptr;
++    SetPanelOpen(browser, true);
++    // The one check every way in passes, Chromium's own tab switch included.
++    // The side panel is still finishing the show, so the close waits for
++    // it; it can't loop, since only a web page brings the chat back.
++    if (browser && IsAssistantBlockedHere(browser)) {
++      base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(&TabChat::StepAsideIfBlocked,
++                                    weak_factory_.GetWeakPtr()));
++    }
++  }
++
++  void OnEntryHideCancelled(SidePanelEntry* entry) override {
++    hide_reason_ = ChatHideReason::kTabSwitched;
++    SetPanelOpen(shown_in_.get(), true);
++  }
++
++  void OnEntryWillHide(SidePanelEntry* entry,
++                       SidePanelEntryHideReason reason) override {
++    hide_reason_ = reason == SidePanelEntryHideReason::kSidePanelClosed
++                       ? ChatHideReason::kClosed
++                   : reason == SidePanelEntryHideReason::kReplaced
++                       ? ChatHideReason::kReplaced
++                       : ChatHideReason::kTabSwitched;
++    SetPanelOpen(shown_in_.get(), false);
++  }
++
++  void OnEntryHidden(SidePanelEntry* entry) override {
++    BrowserWindowInterface* browser = shown_in_.get();
++    SidePanelUI* ui = browser ? SidePanelUI::From(browser) : nullptr;
++    // Another tab's chat may have taken its place.
++    SetPanelOpen(browser, ui && ui->IsSidePanelEntryShowing(ChatKey()));
++    const TabStripModel* tabs = browser ? browser->GetTabStripModel() : nullptr;
++    if (chat_ && ReleasesChat(hide_reason_, tabs && tabs->closing_all())) {
++      VLOG(1) << "rac assistant: the chat closed on its tab";
++      Release();
++    }
++    hide_reason_ = ChatHideReason::kTabSwitched;
++  }
++
++  const raw_ptr<tabs::TabInterface> tab_;
++  base::WeakPtr<SidePanelEntry> entry_;
++  scoped_refptr<AssistantChat> chat_;
++  bool stepped_aside_ = false;
++  ChatHideReason hide_reason_ = ChatHideReason::kTabSwitched;
++  // The window the entry last showed in. A tab can move to another.
++  base::WeakPtr<BrowserWindowInterface> shown_in_;
++  ui::ScopedUnownedUserData<TabChat> scoped_data_;
++  base::WeakPtrFactory<TabChat> weak_factory_{this};
++};
++
++DEFINE_USER_DATA(TabChat);
++
++void AssistantChat::RemoveTab(TabChat* tab_chat) {
++  std::erase(tabs_, tab_chat);
++  // The page belongs to a tab that still shows it, if any is left.
++  tabs::TabInterface* embedder = webui::GetTabInterface(page_.get());
++  if (!tabs_.empty() && (!embedder || embedder == tab_chat->tab())) {
++    webui::SetTabInterface(page_.get(), tabs_.front()->tab());
++  }
++}
++
++// Shows `tab`'s chat, making one if it has none. `tab` must be its window's
++// active tab, showing a web page.
++void ShowTabChat(tabs::TabInterface* tab,
++                 SidePanelOpenTrigger trigger,
++                 bool keep_focus,
++                 bool suppress_animations) {
++  BrowserWindowInterface* browser = tab->GetBrowserWindowInterface();
++  SidePanelUI* ui = browser ? SidePanelUI::From(browser) : nullptr;
++  if (!ui || !TabChat::GetOrCreate(tab)) {
++    return;
++  }
++  // Showing the panel focuses it. When the chat comes back on its own,
++  // focus stays where the user put it.
++  BrowserView* browser_view =
++      keep_focus ? BrowserView::GetBrowserViewForBrowser(browser) : nullptr;
++  views::FocusManager* focus =
++      browser_view ? browser_view->GetFocusManager() : nullptr;
++  views::ViewTracker focused(focus ? focus->GetFocusedView() : nullptr);
++  ui->Show(ChatKey(), trigger, suppress_animations);
++  if (focus && focused.view()) {
++    focus->SetFocusedView(focused.view());
++  }
+ }
+ 
+ // Reports when the page in the window's active tab may have changed between
+@@ -372,96 +720,54 @@ void SchedulePaintContainer(BrowserWindo
+   }
+ }
+ 
+-// Registers and removes the entry as the pref changes, and reports when the
+-// panel opens and closes. While AI is on it also keeps the assistant away
+-// from internal pages (IsAssistantBlockedHere()). It deletes itself when its
+-// window closes, and the chat it kept goes with it.
+-class EntryRegistrar : public SidePanelEntryObserver {
++// The assistant's part in one window: while AI is on, it keeps the assistant
++// away from internal pages (IsAssistantBlockedHere()) and moves chats the
++// way ChatMove says as the active tab and its page change. Turning AI off
++// ends the window's chats. It deletes itself when its window closes.
++class WindowAssistant {
+  public:
+-  EntryRegistrar(BrowserWindowInterface* browser, SidePanelRegistry* registry)
+-      : browser_(browser), registry_(registry) {
++  explicit WindowAssistant(BrowserWindowInterface* browser)
++      : browser_(browser) {
+     close_subscription_ = browser_->RegisterBrowserDidClose(base::BindRepeating(
+-        [](EntryRegistrar* self, BrowserWindowInterface*) { delete self; },
++        [](WindowAssistant* self, BrowserWindowInterface*) { delete self; },
+         base::Unretained(this)));
+     pref_registrar_.Init(browser_->GetProfile()->GetPrefs());
+-    pref_registrar_.Add(kEnabled, base::BindRepeating(&EntryRegistrar::Update,
++    pref_registrar_.Add(kEnabled, base::BindRepeating(&WindowAssistant::Update,
+                                                       base::Unretained(this)));
+     Update();
+   }
+ 
+-  EntryRegistrar(const EntryRegistrar&) = delete;
+-  EntryRegistrar& operator=(const EntryRegistrar&) = delete;
++  WindowAssistant(const WindowAssistant&) = delete;
++  WindowAssistant& operator=(const WindowAssistant&) = delete;
+ 
+  private:
+-  ~EntryRegistrar() override {
+-    if (entry_ && registry_->GetEntryForKey(SidePanelEntry::Key(
+-                      SidePanelEntry::Id::kRacAi)) == entry_) {
+-      entry_->RemoveObserver(this);
+-    }
+-  }
++  ~WindowAssistant() = default;
+ 
+   void Update() {
+-    const SidePanelEntry::Key key(SidePanelEntry::Id::kRacAi);
+     const bool enabled = IsAiEnabled(browser_->GetProfile()->GetPrefs());
+-    const bool registered = registry_->GetEntryForKey(key) != nullptr;
+-    if (enabled && !registered) {
+-      AssistantPanelState::GetOrCreate(browser_);
+-      // The registry keeps the entry until the window is gone, after this
+-      // object, so the callback holds it weakly.
+-      auto entry = std::make_unique<SidePanelEntry>(
+-          key,
+-          base::BindRepeating(
+-              [](base::WeakPtr<EntryRegistrar> self,
+-                 SidePanelEntryScope& scope) -> std::unique_ptr<views::View> {
+-                if (self) {
+-                  return self->CreateContent(scope);
+-                }
+-                return CreateView(scope);
+-              },
+-              weak_factory_.GetWeakPtr()),
+-          base::BindRepeating([] { return kDefaultWidth; }));
+-      // The Chat button and the page's own close button are the way in and
+-      // out, so Chromium's header and toolbar button would double them.
+-      entry->set_should_show_header(false);
+-      entry->set_should_show_ephemerally_in_toolbar(false);
+-      entry->AddObserver(this);
+-      entry_ = entry.get();
+-      registry_->Register(std::move(entry));
+-    } else if (!enabled && registered) {
+-      if (SidePanelUI* ui = SidePanelUI::From(browser_);
+-          ui && ui->IsSidePanelEntryShowing(key)) {
+-        ui->Close();
+-      }
+-      if (entry_) {
+-        entry_->RemoveObserver(this);
+-        entry_ = nullptr;
+-      }
+-      registry_->Deregister(key);
+-      SetOpen(false);
+-    }
+     if (enabled && !page_watch_) {
++      AssistantPanelState::GetOrCreate(browser_);
++      tabs::TabInterface* tab = browser_->GetActiveTabInterface();
++      last_active_ = tab ? tab->GetHandle() : tabs::TabHandle();
+       page_watch_ = std::make_unique<ActivePageWatch>(
+-          browser_, base::BindRepeating(&EntryRegistrar::OnActivePageChanged,
++          browser_, base::BindRepeating(&WindowAssistant::OnActivePageChanged,
+                                         base::Unretained(this)));
+       OnActivePageChanged();
+-    } else if (!enabled) {
+-      // Turning AI off ends a chat kept for later, as it closes an open one.
++    } else if (!enabled && page_watch_) {
+       page_watch_.reset();
+-      kept_view_.reset();
+-      keep_on_hide_ = false;
+       blocked_ = false;
++      // Turning AI off ends every chat, as it closes an open one: dropping a
++      // tab's entry closes the panel if it shows it, and the chat goes with
++      // the last tab that held it.
++      for (tabs::TabInterface* tab : browser_->GetAllTabInterfaces()) {
++        if (TabChat::From(tab)) {
++          SidePanelRegistry::From(tab)->Deregister(ChatKey());
++        }
++      }
++      SetPanelOpen(browser_, false);
+     }
+   }
+ 
+-  std::unique_ptr<views::View> CreateContent(SidePanelEntryScope& scope) {
+-    VLOG(1) << "rac assistant: "
+-            << (kept_view_ ? "the kept chat is back" : "a new chat page");
+-    std::unique_ptr<AssistantWebView> view =
+-        kept_view_ ? std::move(kept_view_) : CreateView(scope);
+-    live_view_ = view->AsWeakPtr();
+-    return view;
+-  }
+-
+   // The active tab changed, or its page did.
+   void OnActivePageChanged() {
+     // A closing window only passes through its tabs on the way out.
+@@ -469,6 +775,9 @@ class EntryRegistrar : public SidePanelE
+         tabs && tabs->closing_all()) {
+       return;
+     }
++    tabs::TabInterface* tab = browser_->GetActiveTabInterface();
++    tabs::TabInterface* previous = last_active_.Get();
++    last_active_ = tab ? tab->GetHandle() : tabs::TabHandle();
+     const bool blocked = IsAssistantBlockedHere(browser_);
+     if (blocked != blocked_) {
+       blocked_ = blocked;
+@@ -483,117 +792,61 @@ class EntryRegistrar : public SidePanelE
+       }
+     }
+     SidePanelUI* ui = SidePanelUI::From(browser_);
+-    if (!ui) {
+-      return;
++    // A tab closed with its chat open takes its entry with it unheard, so
++    // the Chat button would stay hidden.
++    if (ui && IsAssistantPanelOpen(browser_) &&
++        !ui->IsSidePanelEntryShowing(ChatKey())) {
++      SetPanelOpen(browser_, false);
+     }
+-    const SidePanelEntry::Key key(SidePanelEntry::Id::kRacAi);
+-    if (blocked) {
+-      StepAside(*ui);
++    if (!ui || !tab) {
+       return;
+     }
+-    // Back on a web page: bring the chat back where the user left it, unless
+-    // another panel took its place, in which case it waits for the next time
+-    // the assistant opens.
+-    if (kept_view_ && !ui->IsSidePanelShowing()) {
+-      // Showing the panel focuses it, but the user came back to the tab, and
+-      // focus stays where the tab switch put it.
+-      BrowserView* browser_view =
+-          BrowserView::GetBrowserViewForBrowser(browser_);
+-      views::FocusManager* focus =
+-          browser_view ? browser_view->GetFocusManager() : nullptr;
+-      views::ViewTracker focused(focus ? focus->GetFocusedView() : nullptr);
+-      ui->Show(key, SidePanelOpenTrigger::kTabChanged,
+-               /*suppress_animations=*/true);
+-      if (focus && focused.view()) {
+-        focus->SetFocusedView(focused.view());
+-      }
+-    }
+-  }
+-
+-  // Closes a panel showing beside an internal page and keeps its chat for
+-  // the next web page.
+-  void StepAside(SidePanelUI& ui) {
+-    // Not a panel already on its way out: the user closed that one.
+-    if (ui.IsSidePanelEntryShowing(
+-            SidePanelEntry::Key(SidePanelEntry::Id::kRacAi)) &&
+-        IsAssistantPanelOpen(browser_)) {
+-      // OnEntryHidden() takes the chat out before the side panel drops it.
+-      keep_on_hide_ = true;
+-      ui.Close(SidePanelEntryHideReason::kBackgrounded,
+-               /*suppress_animations=*/true);
+-    }
+-  }
+-
+-  // A way in that shows the panel directly (the agent's tab pill, the side
+-  // panel action) opened it beside an internal page.
+-  void StepAsideIfBlocked() {
+-    SidePanelUI* ui = SidePanelUI::From(browser_);
+-    if (ui && IsAssistantBlockedHere(browser_)) {
+-      VLOG(1) << "rac assistant: opened beside an internal page, so stepping "
+-                 "aside";
+-      StepAside(*ui);
+-    }
+-  }
+-
+-  void SetOpen(bool open) {
+-    if (AssistantPanelState* state = AssistantPanelState::From(browser_)) {
+-      if (state->open() != open) {
+-        state->SetOpen(open);
+-        SchedulePaintContainer(browser_);
+-      }
+-    }
+-  }
+-
+-  // SidePanelEntryObserver:
+-  void OnEntryShown(SidePanelEntry* entry) override {
+-    keep_on_hide_ = false;
+-    SetOpen(true);
+-    // The one check every way in passes. The side panel is still finishing
+-    // the show, so the close waits for it; it can't loop, since only a web
+-    // page brings the panel back.
+-    if (IsAssistantBlockedHere(browser_)) {
+-      base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+-          FROM_HERE, base::BindOnce(&EntryRegistrar::StepAsideIfBlocked,
+-                                    weak_factory_.GetWeakPtr()));
+-    }
+-  }
+-  void OnEntryHideCancelled(SidePanelEntry* entry) override {
+-    keep_on_hide_ = false;
+-    SetOpen(true);
+-  }
+-  void OnEntryWillHide(SidePanelEntry* entry,
+-                       SidePanelEntryHideReason reason) override {
+-    SetOpen(false);
+-  }
+-  void OnEntryHidden(SidePanelEntry* entry) override {
+-    SetOpen(false);
+-    // The side panel deletes the content of an entry it closes. A chat put
+-    // aside for an internal page is taken out first, still running, so a
+-    // reply or a task in progress carries on and is there on return.
+-    if (keep_on_hide_) {
+-      keep_on_hide_ = false;
+-      if (live_view_ && live_view_->parent()) {
+-        kept_view_ = live_view_->parent()->RemoveChildViewT(live_view_.get());
+-        VLOG(1) << "rac assistant: kept the chat for later";
+-      }
++    TabChat* tab_chat = TabChat::From(tab);
++    // Chromium closed the panel on the way here, keeping the chat open on
++    // the tab the user left.
++    TabChat* partner = previous && previous != tab &&
++                               previous->GetSplit().has_value() &&
++                               previous->GetSplit() == tab->GetSplit()
++                           ? TabChat::From(previous)
++                           : nullptr;
++    const ActiveTabState state{
++        .blocked = blocked,
++        .chat_showing = ui->IsSidePanelEntryShowing(ChatKey()) &&
++                        IsAssistantPanelOpen(browser_),
++        .panel_showing = ui->IsSidePanelShowing(),
++        .stepped_aside = tab_chat && tab_chat->stepped_aside(),
++        .has_chat = tab_chat && tab_chat->chat(),
++        .split_partner_chat_open = partner && partner->IsOpen(),
++    };
++    switch (DecideChatMove(state)) {
++      case ChatMove::kNone:
++        break;
++      case ChatMove::kStepAside:
++        tab_chat->StepAside();
++        break;
++      case ChatMove::kComeBack:
++        VLOG(1) << "rac assistant: the chat comes back beside a web page";
++        ShowTabChat(tab, SidePanelOpenTrigger::kTabChanged,
++                    /*keep_focus=*/true, /*suppress_animations=*/true);
++        break;
++      case ChatMove::kShareWithSplit:
++        if (TabChat* split_chat = TabChat::GetOrCreate(tab)) {
++          VLOG(1) << "rac assistant: the split view shares its chat";
++          split_chat->Share(base::WrapRefCounted(partner->chat()));
++          ShowTabChat(tab, SidePanelOpenTrigger::kTabChanged,
++                      /*keep_focus=*/true, /*suppress_animations=*/true);
++        }
++        break;
+     }
+   }
+ 
+-  raw_ptr<BrowserWindowInterface> browser_;
+-  raw_ptr<SidePanelRegistry> registry_;
+-  raw_ptr<SidePanelEntry> entry_ = nullptr;
++  const raw_ptr<BrowserWindowInterface> browser_;
+   PrefChangeRegistrar pref_registrar_;
+   base::CallbackListSubscription close_subscription_;
+   // Only while AI is on.
+   std::unique_ptr<ActivePageWatch> page_watch_;
+   bool blocked_ = false;
+-  // The chat page last made for the panel, while it lives.
+-  base::WeakPtr<AssistantWebView> live_view_;
+-  // Set while closing the panel for an internal page.
+-  bool keep_on_hide_ = false;
+-  // The chat put aside for an internal page, while the panel is closed.
+-  std::unique_ptr<AssistantWebView> kept_view_;
+-  base::WeakPtrFactory<EntryRegistrar> weak_factory_{this};
++  tabs::TabHandle last_active_;
+ };
+ 
+ }  // namespace
+@@ -604,8 +857,9 @@ void RegisterAssistantSidePanel(BrowserW
+       browser->GetType() != BrowserWindowInterface::Type::TYPE_NORMAL) {
+     return;
+   }
+-  // Owns itself; see EntryRegistrar.
+-  new EntryRegistrar(browser, registry);
++  // Owns itself; see WindowAssistant. The chats register in tabs' own
++  // registries, not in the window's `registry`.
++  new WindowAssistant(browser);
+ }
+ 
+ bool IsAssistantPanelOpen(BrowserWindowInterface* browser) {
+@@ -620,6 +874,75 @@ base::CallbackListSubscription AddAssist
+       std::move(callback));
+ }
+ 
++void ShowAssistantForTab(tabs::TabInterface* tab, bool suppress_animations) {
++  BrowserWindowInterface* browser =
++      tab ? tab->GetBrowserWindowInterface() : nullptr;
++  if (!CanHaveAssistant(browser)) {
++    return;
++  }
++  if (!tab->IsActivated()) {
++    TabStripModel* tabs = browser->GetTabStripModel();
++    const int index = tabs ? tabs->GetIndexOfTab(tab) : TabStripModel::kNoTab;
++    if (index == TabStripModel::kNoTab) {
++      return;
++    }
++    tabs->ActivateTabAt(index);
++  }
++  // The panel never opens beside an internal page.
++  if (IsAssistantBlockedHere(browser)) {
++    return;
++  }
++  ShowTabChat(tab, SidePanelOpenTrigger::kToolbarButton, /*keep_focus=*/false,
++              suppress_animations);
++}
++
++void ToggleAssistantPanel(BrowserWindowInterface* browser) {
++  SidePanelUI* ui = SidePanelUI::From(browser);
++  if (!ui) {
++    return;
++  }
++  if (IsAssistantPanelOpen(browser)) {
++    ui->Close();
++    return;
++  }
++  ShowAssistantForTab(browser->GetActiveTabInterface(),
++                      /*suppress_animations=*/false);
++}
++
++void ShowAssistantChatBesideTab(content::WebContents* page,
++                                tabs::TabInterface* tab) {
++  AssistantChat* chat = AssistantChat::FromPage(page);
++  BrowserWindowInterface* browser =
++      tab ? tab->GetBrowserWindowInterface() : nullptr;
++  if (!chat || !CanHaveAssistant(browser)) {
++    return;
++  }
++  TabChat* tab_chat = TabChat::GetOrCreate(tab);
++  // A tab with a chat of its own keeps it.
++  if (!tab_chat || (tab_chat->chat() && tab_chat->chat() != chat)) {
++    return;
++  }
++  if (!tab_chat->chat()) {
++    VLOG(1) << "rac assistant: the chat follows its task to another tab";
++    tab_chat->Share(base::WrapRefCounted(chat));
++  }
++  if (!tab->IsActivated()) {
++    // Open on the tab, so it shows when the user goes there.
++    SidePanelRegistry::From(tab)->SetActiveEntry(tab_chat->entry());
++    return;
++  }
++  SidePanelUI* ui = SidePanelUI::From(browser);
++  if (ui && !ui->IsSidePanelShowing() && !IsAssistantBlockedHere(browser)) {
++    ShowTabChat(tab, SidePanelOpenTrigger::kTabChanged, /*keep_focus=*/true,
++                /*suppress_animations=*/true);
++  }
++}
++
++bool IsAssistantChatShowing(content::WebContents* page) {
++  AssistantChat* chat = AssistantChat::FromPage(page);
++  return chat && chat->IsShowing();
++}
++
+ bool IsAssistantBlockedHere(BrowserWindowInterface* browser) {
+   if (!IsAiEnabled(browser->GetProfile()->GetPrefs())) {
+     return false;
+@@ -650,15 +973,15 @@ bool CanAskAssistant(BrowserWindowInterf
+ }
+ 
+ bool AskAssistant(BrowserWindowInterface* browser, std::string prompt) {
+-  SidePanelUI* ui = SidePanelUI::From(browser);
+-  if (!ui || prompt.empty() || !CanAskAssistant(browser)) {
++  if (prompt.empty() || !SidePanelUI::From(browser) ||
++      !CanAskAssistant(browser)) {
+     return false;
+   }
+-  // A panel already showing is told through the callback; one that opens now
+-  // asks for the prompt as it loads.
++  // The active tab's chat opens first. Showing already, it hears the prompt
++  // through the callback; a new one asks for it as it loads.
++  ShowAssistantForTab(browser->GetActiveTabInterface(),
++                      /*suppress_animations=*/false);
+   AssistantPanelState::GetOrCreate(browser)->SetPrompt(std::move(prompt));
+-  ui->Show(SidePanelEntryKey(SidePanelEntryId::kRacAi),
+-           SidePanelOpenTrigger::kToolbarButton);
+   return true;
+ }
+ 
+--- a/chrome/browser/ui/views/rac/ai/assistant_side_panel.h
++++ b/chrome/browser/ui/views/rac/ai/assistant_side_panel.h
+@@ -15,35 +15,65 @@ class BrowserWindowInterface;
+ class SidePanelRegistry;
+ class SkPath;
+ 
++namespace content {
++class WebContents;
++}  // namespace content
++
+ namespace gfx {
+ class Canvas;
+ }  // namespace gfx
+ 
++namespace tabs {
++class TabInterface;
++}  // namespace tabs
++
+ namespace views {
+ class View;
+ }  // namespace views
+ 
+ namespace rac::ai {
+ 
+-// Keeps the assistant's side panel entry in `registry` in step with the
+-// profile's "assistant on" pref: registered while on, removed (and the panel
+-// closed if it is showing) while off. Does nothing for profiles that can't
+-// have the assistant. The object it creates lives as long as the window.
++// Sets up the assistant in `browser` for profiles that can have it. The
++// chat is per tab: each tab's chat is a tab-scoped side panel entry,
++// registered in the tab's own registry the first time the assistant opens on
++// it, so `registry` (the window's) gets nothing. The object it creates lives
++// as long as the window, follows the profile's "assistant on" pref, and ends
++// the window's chats when AI turns off.
+ void RegisterAssistantSidePanel(BrowserWindowInterface* browser,
+                                 SidePanelRegistry* registry);
+ 
+-// True from the moment the assistant's panel starts opening in `browser`
++// True from the moment the active tab's chat starts opening in `browser`
+ // until it starts closing.
+ bool IsAssistantPanelOpen(BrowserWindowInterface* browser);
+ 
++// Opens `tab`'s chat in its window's side panel, making it if the tab has
++// none, and brings `tab` to the front first. Does nothing beside an internal
++// page, while AI is off, or in a window that can't have the assistant. Every
++// way in that opens the assistant calls this or ToggleAssistantPanel(): a
++// tab without a chat has no entry for SidePanelUI::Show() to find.
++void ShowAssistantForTab(tabs::TabInterface* tab, bool suppress_animations);
++
++// Closes the active tab's chat if it is open, and opens it if not.
++void ToggleAssistantPanel(BrowserWindowInterface* browser);
++
++// The chat in `page` follows its agent task to `tab`: from now on `tab` shows
++// it too, unless it has a chat of its own, and if `tab` is in front with the
++// side panel closed, it opens there. For the tabs the agent brings forward or
++// works in, so its cards stay in reach. Does nothing for any other page.
++void ShowAssistantChatBesideTab(content::WebContents* page,
++                                tabs::TabInterface* tab);
++
++// True while the side panel shows the chat in `page`.
++bool IsAssistantChatShowing(content::WebContents* page);
++
+ // True while AI is on and the address `browser`'s active tab shows is an
+ // internal page (rac::ai::IsInternalPageUrl()) other than a blank one. The
+ // assistant sits only beside web pages, so
+ // then the Chat button and the edge handle are gone, the Assistant command
+-// is disabled, AskAssistant() does nothing, and an open panel steps aside:
+-// it closes with its chat kept, and comes back, chat and all, when the
+-// window's active tab shows a web page again, unless another side panel has
+-// taken its place. Always false while AI is off.
++// is disabled, AskAssistant() does nothing, and the tab's open chat steps
++// aside: it closes with its chat kept, and comes back, chat and all, when the
++// tab shows a web page again, unless another side panel has taken its place.
++// Always false while AI is off.
+ bool IsAssistantBlockedHere(BrowserWindowInterface* browser);
+ 
+ // Runs `callback` whenever IsAssistantPanelOpen() or IsAssistantBlockedHere()
+@@ -52,8 +82,8 @@ base::CallbackListSubscription AddAssist
+     BrowserWindowInterface* browser,
+     base::RepeatingClosure callback);
+ 
+-// Opens the assistant's panel in `browser` and has it send `prompt` as a new
+-// chat about the foreground tab. Returns false, doing nothing, if the
++// Opens the foreground tab's chat in `browser` and has it send `prompt` as a
++// new chat about that tab. Returns false, doing nothing, if the
+ // assistant can't answer in this window: it is off, no provider is set up, the
+ // window is incognito, or the foreground tab is an internal page.
+ bool AskAssistant(BrowserWindowInterface* browser, std::string prompt);
+--- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
++++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+@@ -27,6 +27,7 @@
+ #include "chrome/browser/rac/agent/agent_mcp_tools.h"
+ #include "chrome/browser/rac/agent/agent_ui_delegate.h"
+ #include "chrome/browser/rac/agent/mcp_tool_provider.h"
++#include "chrome/browser/rac/agent/tab_tools.h"
+ #include "chrome/browser/rac/ai/acp/acp_service.h"
+ #include "chrome/browser/rac/ai/acp/agent_recipes.h"
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+@@ -45,8 +46,6 @@
+ #include "chrome/browser/rac/spaces/space.h"
+ #include "chrome/browser/rac/spaces/spaces_service.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+-#include "chrome/browser/ui/side_panel/side_panel_entry_id.h"
+-#include "chrome/browser/ui/side_panel/side_panel_entry_key.h"
+ #include "chrome/browser/ui/side_panel/side_panel_ui.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/views/rac/agent/agent_tab_indicator.h"
+@@ -319,6 +318,7 @@ void PageHandler::OnJavascriptDisallowed
+   ask_subscription_ = base::CallbackListSubscription();
+   agent_event_subscription_ = base::CallbackListSubscription();
+   agent_tab_subscription_ = base::CallbackListSubscription();
++  browser_change_subscription_ = base::CallbackListSubscription();
+   tab_observer_.reset();
+ }
+ 
+@@ -419,6 +419,14 @@ void PageHandler::OnCurrentTabChanged()
+   BrowserWindowInterface* browser = GetBrowser();
+   tabs::TabInterface* tab =
+       browser ? browser->GetActiveTabInterface() : nullptr;
++  // The chat is per tab, so the side panel just closed if the agent brought
++  // a tab of its own forward. The chat that runs the task follows it there,
++  // in the same task, so the panel never shows closed.
++  if (tab && agent_turn_send_id_ != 0 &&
++      agent::GetAgentRunOwner(profile_) == this &&
++      agent::TabTools::IsBringingTabForward()) {
++    ShowAssistantChatBesideTab(web_ui()->GetWebContents(), tab);
++  }
+   if (tab && tab->GetContents()) {
+     tab_observer_ = std::make_unique<TabObserver>(
+         tab->GetContents(), base::BindRepeating(&PageHandler::NotifyCurrentTab,
+@@ -427,6 +435,36 @@ void PageHandler::OnCurrentTabChanged()
+   NotifyCurrentTab();
+ }
+ 
++void PageHandler::OnBrowserChanged() {
++  BrowserWindowInterface* browser = GetBrowser();
++  if (browser == watched_browser_.get()) {
++    return;
++  }
++  // The side panel's chat moved with its tab to another window, or its tab
++  // closed: watch the window it is in now.
++  watched_browser_ = browser ? browser->GetWeakPtr() : nullptr;
++  const bool asks = !!ask_subscription_;
++  active_tab_subscription_ = {};
++  ask_subscription_ = {};
++  tab_observer_.reset();
++  spaces_observation_.Reset();
++  if (!browser || !IsJavascriptAllowed() ||
++      !AiServiceFactory::GetForProfile(profile_)) {
++    return;
++  }
++  WatchTabs();
++  if (SpacesWindowManager* manager = SpacesWindowManager::From(browser)) {
++    spaces_observation_.Observe(manager);
++  }
++  if (asks) {
++    ask_subscription_ = AddAssistantPromptCallback(
++        browser,
++        base::BindRepeating(&PageHandler::OnAskPosted, base::Unretained(this)));
++  }
++  NotifyCurrentTab();
++  NotifyTheme();
++}
++
+ void PageHandler::NotifyCurrentTab() {
+   if (!IsJavascriptAllowed()) {
+     return;
+@@ -554,6 +592,13 @@ void PageHandler::HandleInit(const base:
+       service && manager && !spaces_observation_.IsObserving()) {
+     spaces_observation_.Observe(manager);
+   }
++  if (service && !browser_change_subscription_) {
++    watched_browser_ = browser ? browser->GetWeakPtr() : nullptr;
++    browser_change_subscription_ = webui::RegisterBrowserWindowInterfaceChanged(
++        web_ui()->GetWebContents(),
++        base::BindRepeating(&PageHandler::OnBrowserChanged,
++                            weak_factory_.GetWeakPtr()));
++  }
+   state.Set("theme", DescribeTheme());
+   ResolveJavascriptCallback(args[0], state);
+ }
+@@ -1136,6 +1181,11 @@ void PageHandler::OnAgentTab(content::We
+     return;
+   }
+   agent::AgentTabIndicator::Show(contents, title);
++  // The tab the agent works in shows this chat, so its cards are in reach
++  // there too.
++  ShowAssistantChatBesideTab(
++      web_ui()->GetWebContents(),
++      tabs::TabInterface::MaybeGetFromContents(contents));
+   agent::AgentTabIndicator::SetState(contents,
+                                      status == agent::AgentTabStatus::kWaiting
+                                          ? agent::AgentTabState::kWaiting
+@@ -1189,6 +1239,7 @@ void PageHandler::OnEnabledChanged() {
+     ask_subscription_ = {};
+     agent_event_subscription_ = {};
+     agent_tab_subscription_ = {};
++    browser_change_subscription_ = {};
+     tab_observer_.reset();
+     FireWebUIListener("rac-ai-disabled");
+     content::WebContents* contents = web_ui()->GetWebContents();
+@@ -1233,18 +1284,21 @@ void PageHandler::HandleClosePanel(const
+   if (!browser) {
+     return;
+   }
+-  // Closing without animation deletes this page, so leave its message first.
++  // Closing without animation can delete this page, so leave its message
++  // first. Only the chat on show closes: closing it is what ends it on its
++  // tab.
+   base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+-      FROM_HERE, base::BindOnce(
+-                     [](base::WeakPtr<BrowserWindowInterface> browser) {
+-                       SidePanelUI* ui =
+-                           browser ? SidePanelUI::From(browser.get()) : nullptr;
+-                       if (ui && ui->IsSidePanelEntryShowing(SidePanelEntryKey(
+-                                     SidePanelEntryId::kRacAi))) {
+-                         ui->Close();
+-                       }
+-                     },
+-                     browser->GetWeakPtr()));
++      FROM_HERE,
++      base::BindOnce(
++          [](base::WeakPtr<BrowserWindowInterface> browser,
++             base::WeakPtr<content::WebContents> page) {
++            SidePanelUI* ui =
++                browser ? SidePanelUI::From(browser.get()) : nullptr;
++            if (ui && page && IsAssistantChatShowing(page.get())) {
++              ui->Close();
++            }
++          },
++          browser->GetWeakPtr(), web_ui()->GetWebContents()->GetWeakPtr()));
+ }
+ 
+ // Only the side panel's page asks: it is the one that sends a prompt posted
+@@ -1262,14 +1316,19 @@ void PageHandler::HandleTakeAsk(const ba
+         browser,
+         base::BindRepeating(&PageHandler::OnAskPosted, base::Unretained(this)));
+   }
+-  std::optional<std::string> prompt = TakeAssistantPrompt(browser);
++  // A window has a chat per tab, and the prompt is for the one on show.
++  std::optional<std::string> prompt =
++      IsAssistantChatShowing(web_ui()->GetWebContents())
++          ? TakeAssistantPrompt(browser)
++          : std::nullopt;
+   ResolveJavascriptCallback(args[0],
+                             prompt ? base::Value(*prompt) : base::Value());
+ }
+ 
+ void PageHandler::OnAskPosted() {
+   BrowserWindowInterface* browser = GetBrowser();
+-  if (!IsJavascriptAllowed() || !browser) {
++  if (!IsJavascriptAllowed() || !browser ||
++      !IsAssistantChatShowing(web_ui()->GetWebContents())) {
+     return;
+   }
+   if (std::optional<std::string> prompt = TakeAssistantPrompt(browser)) {
+--- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
++++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+@@ -139,6 +139,8 @@ class PageHandler : public content::WebU
+   base::DictValue DescribeTab(tabs::TabInterface* tab, bool current) const;
+   void WatchTabs();
+   void OnCurrentTabChanged();
++  // The window the page belongs to changed: its tab moved or closed.
++  void OnBrowserChanged();
+   void NotifyCurrentTab();
+   // The colors of the space this page's window shows, which tint the user's
+   // messages. None for windows without spaces.
+@@ -199,6 +201,9 @@ class PageHandler : public content::WebU
+   base::CallbackListSubscription ask_subscription_;
+   base::CallbackListSubscription agent_event_subscription_;
+   base::CallbackListSubscription agent_tab_subscription_;
++  base::CallbackListSubscription browser_change_subscription_;
++  // The window the subscriptions above watch.
++  base::WeakPtr<BrowserWindowInterface> watched_browser_;
+   std::unique_ptr<TabObserver> tab_observer_;
+   base::ScopedObservation<SpacesWindowManager, SpacesWindowManager::Observer>
+       spaces_observation_{this};

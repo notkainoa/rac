@@ -147,7 +147,8 @@ only.
   has at least three words or ends in a question mark. The prompt travels to
   the sidebar through a pending prompt on the window's panel state, which
   expires after 15 seconds. That is how a panel that isn't open yet still
-  gets it.
+  gets it. The active tab's chat opens first, and only the chat on show
+  takes the prompt: hidden chats in other tabs hear it too.
 - The new tab page decides Search or Ask on every keystroke, locally, with no
   model call (`intent.ts`). The Search path goes through
   `AutocompleteClassifier`, so the default search engine and bangs behave as
@@ -175,20 +176,56 @@ Two callers apply it differently:
   doesn't block them. The agent opens its tabs blank first, and a new tab
   on its way to a web page would otherwise flash the panel shut, mid-task.
 
-A panel opened beside an internal page by a way in that calls
-`SidePanelUI::Show` itself (the agent's tab pill, the side panel action)
-steps aside too: `EntryRegistrar::OnEntryShown` checks every show and posts
-the close, since the side panel is still finishing the show. An open panel
-steps aside when the active tab turns internal and comes back
-when a web page is active again, unless the user closed it or another side
-panel took its place. The side panel deletes the content of an entry it
-closes, so `EntryRegistrar` takes the chat page out first and keeps it
-running: a reply or a task carries on, and the conversation is there on
-return. The kept chat goes when AI turns off or the window closes. The
-assistant's own new tab page is a chat page of its own and is unchanged.
-Per-tab chat (issue #120) should replace the kept chat with a tab-scoped
-entry, whose view Chromium already keeps per tab; an internal tab then
-simply has none.
+A tab's open chat steps aside when the tab turns internal: the panel closes
+and the chat stays with the tab (`TabChat::StepAside`). It comes back when
+the tab shows a web page again, unless the user closed it or another side
+panel took its place. An internal tab never shows a chat. Switching to a
+tab whose chat is open goes through Chromium's per-tab entry, and every
+show passes `TabChat::OnEntryShown`, which posts the close beside an
+internal page (the side panel is still finishing the show). The window's
+watch on its active tab runs in the same task as Chromium's tab switch, so
+in practice the close happens before anything paints. The assistant's own
+new tab page is a chat page of its own and is unchanged.
+
+### Chat per tab
+
+Each tab has its own chat (issue #120). Open it on tab A, switch to B, and
+the panel closes; back on A, A's chat is open again, reply and all. The
+chat is a tab-scoped side panel entry, registered in the tab's own
+`SidePanelRegistry` the first time the assistant opens on the tab, so
+Chromium keeps the open or closed state per tab and shows the entry again
+when the tab comes back. There is no window entry: every way in goes
+through `ShowAssistantForTab` or `ToggleAssistantPanel`, since
+`SidePanelUI::Show(kRacAi)` finds nothing in a tab that never had a chat.
+
+- **The chat owns its page, not a view.** `AssistantChat` holds the chat
+  page's `WebContents`; the side panel's view (`AssistantWebView`) only
+  shows it, and the side panel deletes views freely. So a reply or an
+  agent task carries on in a background tab, and a chat can be shown
+  beside more than one tab, one at a time. The page is embedded in the tab
+  it last showed beside (`webui::SetTabInterface`), so its window follows
+  the tab across windows, and the page handler re-watches the new window
+  (`OnBrowserChanged`).
+- **What ends a chat.** Closing the panel ends the chat on that tab, as it
+  did per window; so does closing the tab, and turning AI off ends them
+  all. A chat shared with other tabs lives while any of them has it.
+  Switching tabs, or another side panel taking the panel, keeps it.
+- **A chat follows its agent task.** `open_tab` and `switch_tab` bring a
+  tab forward (`TabTools::IsBringingTabForward`), which would close the
+  panel mid-task. The page that owns the turn shows its chat beside that
+  tab in the same task, and the tab the indicator moves to shows it too.
+  So the cards stay in reach wherever the agent works, and the user's own
+  tab switches still follow the tab. A tab with a chat of its own keeps
+  it.
+- **Split view.** The panel follows the focused pane. Moving between the
+  two panes of a split shares the open chat with the other pane rather than
+  closing it on every click (`ChatMove::kShareWithSplit`); an internal pane
+  gets none.
+- **Cost.** A chat page is created only when the assistant opens on a tab
+  and is released with the chat. Each open chat is its own renderer
+  process: in a component dev build, about 230 MB of resident memory each,
+  most of it shared library pages. A user who opens the chat on many tabs
+  pays for each until they close it there.
 
 ## AI off costs nothing
 
@@ -201,13 +238,14 @@ This is the rule that's easiest to break by accident. How it holds:
 - The `AgentController` is created only when AI is on, browser control is on,
   and the profile is regular (`IsBrowserControlAllowed`).
 - Pref listeners stay registered so that turning AI on works without a
-  restart: the top bar host, the side panel entry, the pull handle, the
-  Assistant action. They watch a pref and do nothing else. The visible
+  restart: the top bar host, each window's `WindowAssistant`, the pull
+  handle, the Assistant action. They watch a pref and do nothing else. The visible
   parts (Chat button, handle, menu entry, native action) are created only
   while AI is on, and removed when it turns off. So is each window's watch
-  on its active tab, which keeps the assistant off internal pages.
+  on its active tab, which keeps the assistant off internal pages. Tabs get
+  a chat entry only when the assistant opens on them.
 - Turning AI off cancels requests, stops the agent process, closes the
-  panel, and navigates open assistant tabs to the ordinary new tab page. A
+  panel, drops every tab's chat entry (ending its chat), and navigates open assistant tabs to the ordinary new tab page. A
   service or controller that already exists stays in memory but dormant.
 - Link hover, the context-menu item, and the find bar's Ask check
   `ShouldOffer…` or `CanAskAssistant` first and return before creating
@@ -380,7 +418,9 @@ opens tabs. It runs in two ways, with the same tools and the same gates.
 Both enter the same `AgentController`. There is one active turn per
 profile, owned by the assistant page that sent it (`SetAgentRunOwner`).
 Only the owner shows the turn's cards and marks its tab, and only the owner
-stops it, so closing a new tab page can't stop the sidebar's task. With
+stops it, so closing a new tab page can't stop the sidebar's task. The
+owner's chat follows the turn to the tabs it works in (see
+[Chat per tab](#chat-per-tab)). With
 browser control on, every send starts a turn, so a send from another page,
 even a plain question on the new tab page, ends the running task. The page
 that loses it says "Stopped because another assistant page started a
