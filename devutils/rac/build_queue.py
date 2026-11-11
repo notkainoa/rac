@@ -76,8 +76,11 @@ GO_DURATION = re.compile(r'(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?')
 # siso's total is every step minus those it has found up to date so far, so
 # it starts near the whole graph and shrinks. Trust it as the build's size
 # only once it has settled: after this much siso time, or after it has stayed
-# within STABLE_FRACTION for STABLE_SECONDS.
-SETTLE_SECONDS = 180
+# within STABLE_FRACTION for STABLE_SECONDS. SETTLE_SECONDS is long because a
+# freshly cloned tree scans slowly while its files aren't in the OS cache yet:
+# ui-g8's first build (2026-11-11) still showed 88,480 steps, shrinking, after
+# three minutes and was capped; its retry settled at 572.
+SETTLE_SECONDS = 420
 STABLE_SECONDS = 60
 STABLE_FRACTION = 0.01
 # A siso build: the executable is siso and its first argument is ninja.

@@ -148,8 +148,20 @@ class StepCapTest(unittest.TestCase):
         self.assertEqual(reasons, [None] * 5)
 
     def test_settled_total_is_capped(self):
-        reasons = self.run_cap(['[0/84903] 181.00s S CXX a.o'])
+        reasons = self.run_cap(['[0/84903] 421.00s S CXX a.o'])
         self.assertIn('84,903 steps', reasons[0])
+
+    def test_cold_scan_of_a_fresh_clone_is_not_capped(self):
+        # A just-cloned tree's total shrinks slowly while the OS cache is
+        # cold, by more than STABLE_FRACTION a minute, for over three
+        # minutes, then settles small (ui-g8 on 2026-11-11).
+        reasons = self.run_cap(['[0/91000] 10.00s S CXX a.o',
+                                '[3/88480] 120.00s F CXX a.o',
+                                '[9/85000] 193.00s F CXX a.o',
+                                '[20/60000] 260.00s F CXX a.o',
+                                '[40/572] 300.00s F CXX a.o',
+                                '[572/572] 340.00s F LINK rac'])
+        self.assertEqual(reasons, [None] * 6)
 
     def test_stable_total_is_capped(self):
         reasons = self.run_cap(['[0/84903] 10.00s S CXX a.o',
@@ -166,7 +178,7 @@ class StepCapTest(unittest.TestCase):
         clock = lambda: now[0]
         checker = build_queue.StepCap(20000, clock=clock)
         self.assertIsNone(checker.check(b'[0/84903] CXX a.o'))
-        now[0] = 200
+        now[0] = 430
         self.assertIsNotNone(checker.check(b'[1/84903] CXX a.o'))
 
     def test_parse_elapsed(self):
@@ -396,7 +408,7 @@ class QueueTest(unittest.TestCase):
     # The step cap.
 
     def test_settled_step_count_stops_build_and_frees_slot(self):
-        proc, _ = self.start('big', lines=['[0/84903] 200.00s S CXX obj/fake.o'])
+        proc, _ = self.start('big', lines=['[0/84903] 430.00s S CXX obj/fake.o'])
         out, err = proc.communicate(timeout=20)
         self.assertEqual(proc.returncode, 76)
         self.assertIn('84,903 steps', err)
@@ -428,7 +440,7 @@ class QueueTest(unittest.TestCase):
 
     def test_max_steps_option(self):
         proc, _ = self.start('small', '--max-steps', '50',
-                             lines=['[0/60] 200.00s S CXX a.o'])
+                             lines=['[0/60] 430.00s S CXX a.o'])
         self.assertEqual(proc.wait(20), 76)
 
     def test_stop_reaches_the_whole_tree(self):
