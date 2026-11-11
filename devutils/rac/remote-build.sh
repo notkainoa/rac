@@ -82,7 +82,8 @@
 #                                     chrome://setup (or setup?arc, the
 #                                     tour's Arc import step) needs an
 #                                     import input; a
-#                                     run that opens a settings page may only
+#                                     run that opens a settings page (or
+#                                     chrome://credits) may only
 #                                     take screenshots, scroll and zoom, so
 #                                     its requests file may send no input
 #                                     but `wheel X Y DY` and the zoom
@@ -1401,7 +1402,8 @@ cmd_run() {
       chrome://settings/general | chrome://settings/general/ | \
         rac://settings/general | rac://settings/general/)
         settings_page=1 general_page=1 ;;
-      chrome://settings | chrome://settings/* | rac://settings | rac://settings/*)
+      chrome://settings | chrome://settings/* | rac://settings | rac://settings/* | \
+        chrome://credits | chrome://credits/ | rac://credits | rac://credits/)
         settings_page=1 ;;
     esac
   done
@@ -1414,7 +1416,8 @@ cmd_run() {
       chrome://settings/general | chrome://settings/general/ | \
         rac://settings/general | rac://settings/general/)
         settings_page=1 general_page=1 ;;
-      chrome://settings | chrome://settings/* | rac://settings | rac://settings/*)
+      chrome://settings | chrome://settings/* | rac://settings | rac://settings/* | \
+        chrome://credits | chrome://credits/ | rac://credits | rac://credits/)
         settings_page=1 ;;
     esac
   done

@@ -1821,6 +1821,18 @@ class RunTest(RemoteBuildTest):
                              success=False)
         self.assertEqual(result.returncode, 2, result.stderr)
 
+    def test_run_opening_credits_is_screenshot_only(self):
+        req = self.folder / 'req.txt'
+        write(req, 'click 1 2\n')
+        for url in ('chrome://credits', 'RAC://CREDITS/'):
+            result = self.run_rb('run', self.wt, '--requests-file', req,
+                                 '--', url, success=False)
+            self.assertEqual(result.returncode, 2, url)
+            self.assertIn('screenshots', result.stderr, url)
+        write(req, 'burst shots 2 100\n')
+        self.run_rb('run', self.wt, '--requests-file', req, '--timeout', '5',
+                    '--', 'chrome://credits', success=True)
+
     def test_run_settings_page_may_scroll(self):
         # `wheel` is the one input a settings run may send, alone or
         # inside `after`; everything else stays refused.
