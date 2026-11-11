@@ -33,11 +33,13 @@ complete event and drops only the torn tail.
       (*.qjz9zk) are reported in their own section, or hidden entirely with
       --ignore-placeholder (--ignore-dev is the old name and still works).
 
-  hostlist.py compare <netlog.json> [...] --list <doc.md>
+  hostlist.py compare <netlog.json> [...] --list <doc.md> [--also NAME]
       Compares what the capture saw with the list published in <doc.md>
       (docs/network.md), which carries a fenced ```hosts block: one host or
       wildcard (*.example.com, which also matches example.com itself) per
-      line, with # comments. Prints hosts seen but not listed and exits 1;
+      line, with # comments. A block fenced ```hosts NAME counts only with
+      --also NAME (repeatable), for hosts a setting adds, such as Helium
+      services once consented. Prints hosts seen but not listed and exits 1;
       listed-but-unseen entries, never-sent hosts and loopback/placeholder
       hosts are informational.
 
@@ -476,10 +478,11 @@ def cmd_hosts(found, never_sent, as_json, ignore_placeholder):
     return 0
 
 
-def parse_host_list(text):
+def parse_host_list(text, also=()):
     """(patterns, found_block): the entries of the fenced ```hosts block in
     a docs page — one host or *.wildcard per line, # comments allowed.
-    Several hosts blocks merge."""
+    Several hosts blocks merge. A ```hosts NAME block counts only when NAME
+    is in `also`, so hosts a setting adds never widen the default list."""
     patterns = []
     in_block = False
     found_block = False
@@ -490,6 +493,9 @@ def parse_host_list(text):
                 in_block = False
             elif stripped == '```hosts':
                 in_block = found_block = True
+            elif stripped.startswith('```hosts ') and \
+                    stripped[len('```hosts '):].strip() in also:
+                in_block = True
             continue
         if in_block:
             entry = stripped.split('#', 1)[0].strip().lower()
@@ -511,13 +517,13 @@ def host_listed(host, patterns):
     return False
 
 
-def cmd_compare(found, never_sent, list_path, ignore_placeholder):
+def cmd_compare(found, never_sent, list_path, ignore_placeholder, also=()):
     try:
         with open(list_path, encoding='utf-8') as stream:
             text = stream.read()
     except OSError as error:
         raise ValueError(f'cannot read {list_path}: {error}')
-    patterns, found_block = parse_host_list(text)
+    patterns, found_block = parse_host_list(text, also)
     if not found_block:
         print(f'warning: no ```hosts block in {list_path}; '
               'treating the list as empty')
@@ -557,7 +563,7 @@ def _run(arguments):
                          arguments.ignore_placeholder)
     if arguments.command == 'compare':
         return cmd_compare(found, never_sent, arguments.list,
-                           arguments.ignore_placeholder)
+                           arguments.ignore_placeholder, arguments.also)
     return 2
 
 
@@ -581,6 +587,8 @@ def main(argv=None):
     compare.add_argument('netlogs', nargs='+', metavar='netlog.json')
     compare.add_argument('--list', required=True, metavar='doc.md',
                          help='docs page carrying the ```hosts block')
+    compare.add_argument('--also', action='append', default=[], metavar='NAME',
+                         help='also count the ```hosts NAME block (repeatable)')
     compare.add_argument('--ignore-placeholder', '--ignore-dev',
                          dest='ignore_placeholder', action='store_true',
                          help='hide loopback and *.qjz9zk placeholder hosts '

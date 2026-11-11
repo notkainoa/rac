@@ -314,7 +314,11 @@ python3 "$_hostlist" hosts "$_out_dir/netlog.json" --json > "$_out_dir/hosts.jso
 
 _compare_out="$_work/compare.txt"
 _compare_rc=0
-python3 "$_hostlist" compare "$_out_dir/netlog.json" --list "$_list" \
+# With services on, the ```hosts services block (what consenting adds)
+# counts too; a services-off capture is held to the default list alone.
+_also=()
+[ "$_services" != "on" ] || _also=(--also services)
+python3 "$_hostlist" compare "$_out_dir/netlog.json" --list "$_list" ${_also[@]+"${_also[@]}"} \
   > "$_compare_out" 2>&1 || _compare_rc=$?
 cat "$_compare_out"
 if [ "$_compare_rc" = 0 ]; then
