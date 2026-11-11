@@ -27,6 +27,7 @@ _forbidden=(
   rac-agent-mcp-echo
   rac-window-screenshot
   rac-launch-in-background
+  rac-bangs-fixture
 )
 
 _mode="${RAC_G6_GATE:-enforce}"
