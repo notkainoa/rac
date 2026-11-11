@@ -1892,13 +1892,16 @@ pid_running() {
 # process is gone. Whatever is left then gets the usual stop. Succeeds
 # when it signalled a browser.
 quit_main() {
-  local mains p i left
+  local mains helpers p i left
   mains=$(main_pids)
   [ -n "$mains" ] || return 1
+  # Taken before the SIGTERM: once the main process exits, its helpers
+  # belong to launchd and no longer show up as this launch's processes.
+  helpers=$(app_pids)
   for p in $mains; do kill -TERM "$p" 2>/dev/null || true; done
   for i in $(seq 1 40); do
     left=
-    for p in $mains $(app_pids); do pid_running "$p" && left="$left $p"; done
+    for p in $mains $helpers; do pid_running "$p" && left="$left $p"; done
     [ -n "$left" ] || return 0
     sleep 0.25
   done
