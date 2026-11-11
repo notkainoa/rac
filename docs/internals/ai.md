@@ -76,6 +76,15 @@ Code. Open chat pages and Settings watch these prefs, so a choice shows
 everywhere at once. A reply reads the choice, model included, when it
 starts and keeps it, so a change applies to the next message.
 
+The chat's model button shows whenever AI is on, set up or not, so someone
+whose only AI is an agent can choose it from the chat. The browser lays out
+the menu (`BuildModelMenu`, `model_menu.h`): before any setup, or with no
+direct provider's models to list, the installed agents come first and the
+last line is "Set up in Settings…". Agents that aren't installed are greyed
+out. A line is checked only when the prefs already name it, so the menu
+never chooses for the user, even when it finds one agent. The page's
+`racAiSelectAgent` takes only an agent the last menu offered.
+
 The model menu asks each set-up provider for its model list when the menu
 opens, and Settings asks only while the Assistant page itself is open (a
 settings search renders the section too, and must not send the key):
