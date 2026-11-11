@@ -184,7 +184,7 @@
 +      break;
 +    }
 +    if (chat.replying || chat.running_task || chat.card_waiting ||
-+        chat.on_show || chat.key.empty()) {
++        chat.on_show || chat.unseen || chat.key.empty()) {
 +      continue;
 +    }
 +    drop.push_back(std::move(chat.key));
@@ -196,7 +196,7 @@
 +}  // namespace rac::ai
 --- /dev/null
 +++ b/chrome/browser/rac/ai/chat_keep.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,55 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -237,11 +237,15 @@
 +  // The page shows it, or showed it just before: a send that crossed a tab
 +  // switch still goes there.
 +  bool on_show = false;
++  // A reply ended while it wasn't on show, and the user hasn't seen it yet.
++  // Showing it clears this, so it can be dropped once it is idle again.
++  bool unseen = false;
 +};
 +
-+// The conversations to drop so that at most `max` are kept: idle ones only,
-+// the one shown longest ago first. While more than `max` are busy, all of
-+// those stay. The caller saves each one to history before it drops it.
++// The conversations to drop so that at most `max` are kept: idle ones only
++// (none of the flags above set), the one shown longest ago first. While more
++// than `max` are busy, all of those stay. The caller saves each one to
++// history before it drops it.
 +std::vector<std::string> PickChatsToDrop(std::vector<KeptChat> chats,
 +                                         size_t max = kMaxKeptChats);
 +
@@ -250,7 +254,7 @@
 +#endif  // CHROME_BROWSER_RAC_AI_CHAT_KEEP_H_
 --- /dev/null
 +++ b/chrome/browser/rac/ai/chat_keep_unittest.cc
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,137 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -313,7 +317,7 @@
 +// Each of these keeps an old conversation, and the next oldest idle one
 +// goes in its place.
 +TEST(RacAiChatKeepTest, NeverDropsABusyChat) {
-+  for (int busy = 0; busy < 4; ++busy) {
++  for (int busy = 0; busy < 5; ++busy) {
 +    SCOPED_TRACE(busy);
 +    std::vector<KeptChat> chats = IdleChats(kMaxKeptChats + 1);
 +    KeptChat& oldest = chats[0];
@@ -323,11 +327,40 @@
 +      oldest.running_task = true;
 +    } else if (busy == 2) {
 +      oldest.card_waiting = true;
++    } else if (busy == 3) {
++      oldest.unseen = true;
 +    } else {
 +      oldest.on_show = true;
 +    }
 +    EXPECT_EQ(PickChatsToDrop(chats), Keys({"c1"}));
 +  }
++}
++
++// A reply that ended in the background and was never seen keeps its
++// conversation, however long ago it was shown. Once shown (unseen cleared,
++// last_shown moved on) and idle again, it can go like any other.
++TEST(RacAiChatKeepTest, KeepsAnUnseenReplyUntilItIsShown) {
++  std::vector<KeptChat> chats = IdleChats(kMaxKeptChats + 2);
++  chats[0].unseen = true;
++  chats[1].unseen = true;
++  EXPECT_EQ(PickChatsToDrop(chats), Keys({"c2", "c3"}));
++  // Every one unseen: nothing goes, however many there are.
++  for (KeptChat& chat : chats) {
++    chat.unseen = true;
++  }
++  EXPECT_EQ(PickChatsToDrop(chats), Keys());
++  // c0 is shown, then the user moves on to newer ones: it is idle and seen,
++  // so it is the one that goes.
++  for (KeptChat& chat : chats) {
++    chat.unseen = false;
++  }
++  chats[1].unseen = true;
++  chats[0].last_shown = base::TimeTicks() + base::Seconds(50);
++  for (size_t i = 2; i < chats.size(); ++i) {
++    chats[i].last_shown =
++        base::TimeTicks() + base::Seconds(100 + static_cast<int>(i));
++  }
++  EXPECT_EQ(PickChatsToDrop(chats), Keys({"c0", "c2"}));
 +}
 +
 +// The one on show is never dropped, even when it was shown longest ago.
@@ -473,21 +506,25 @@
  std::string ReadShortString(const base::DictValue& dict,
                              std::string_view key,
                              size_t max) {
-@@ -336,6 +353,9 @@ struct PageHandler::Chat {
+@@ -336,6 +353,12 @@ struct PageHandler::Chat {
    std::string reply_text;
    // The latest reply hasn't ended.
    bool reply_open = false;
 +  // When the page last showed it. The least recently shown idle one is
 +  // dropped past kMaxKeptChats.
 +  base::TimeTicks last_shown;
++  // Its latest reply ended while it wasn't on show, and hasn't been shown
++  // since. Such a conversation is never dropped.
++  bool unseen = false;
    base::WeakPtrFactory<Chat> reading_factory{this};
    // The ACP run's callbacks. Dropped when the conversation stops its run.
    base::WeakPtrFactory<Chat> run_factory{this};
-@@ -620,7 +640,46 @@ void PageHandler::UpdateShown(bool redra
+@@ -620,7 +643,48 @@ void PageHandler::UpdateShown(bool redra
      VLOG(1) << "rac assistant: a new conversation (" << chats_.size()
              << " in this page)";
    }
 +  chat->last_shown = base::TimeTicks::Now();
++  chat->unseen = false;
    ShowChat(*chat);
 +  DropIdleChats();
 +}
@@ -507,6 +544,7 @@
 +                         chat->agent_turn_send_id != 0;
 +    entry.card_waiting = cards_.PendingAction(key) != nullptr;
 +    entry.on_show = key == shown_key_ || key == previous_shown_key_;
++    entry.unseen = chat->unseen;
 +  }
 +  AiService* service = AiServiceFactory::GetForProfile(profile_);
 +  for (const std::string& key : PickChatsToDrop(std::move(kept))) {
@@ -530,9 +568,12 @@
  }
  
  void PageHandler::ShowChat(Chat& chat) {
-@@ -736,9 +795,17 @@ void PageHandler::StopForCap(Chat& chat)
+@@ -735,10 +799,22 @@ void PageHandler::StopForCap(Chat& chat)
+ }
  
  void PageHandler::SaveInBackground(Chat& chat, bool failed) {
++  // The user hasn't seen how it ended: the cap keeps it until they do.
++  chat.unseen = true;
    AiService* service = AiServiceFactory::GetForProfile(profile_);
 -  if (!service || !profile_->GetPrefs()->GetBoolean(kSaveHistory) ||
 +  std::optional<Conversation> conversation = ToHistory(chat, failed);
@@ -543,14 +584,16 @@
 +
 +std::optional<Conversation> PageHandler::ToHistory(const Chat& chat,
 +                                                   bool failed) {
-+  if (!profile_->GetPrefs()->GetBoolean(kSaveHistory) ||
++  // History is for regular profiles only, whatever the caller.
++  if (profile_->IsOffTheRecord() ||
++      !profile_->GetPrefs()->GetBoolean(kSaveHistory) ||
        !IsValidConversationId(chat.history_id)) {
 -    return;
 +    return std::nullopt;
    }
    Conversation conversation;
    conversation.id = chat.history_id;
-@@ -748,9 +815,10 @@ void PageHandler::SaveInBackground(Chat&
+@@ -748,9 +824,10 @@ void PageHandler::SaveInBackground(Chat&
    if (!failed && !chat.reply_text.empty()) {
      conversation.messages.push_back({"assistant", chat.reply_text, {}});
    }
@@ -563,7 +606,7 @@
  }
  
  void PageHandler::OnTabLeft(tabs::TabHandle tab,
-@@ -1063,6 +1131,7 @@ void PageHandler::HandleInit(const base:
+@@ -1063,6 +1140,7 @@ void PageHandler::HandleInit(const base:
      // The page draws its conversation before it reads `state`. Init comes
      // again each time the page is shown, which draws nothing new.
      UpdateShown(/*redraw=*/shown_key_.empty());
@@ -571,7 +614,7 @@
    }
    state.Set("theme", DescribeTheme());
    ResolveJavascriptCallback(args[0], state);
-@@ -1683,14 +1752,23 @@ void PageHandler::HandleAgentDebugEvent(
+@@ -1683,14 +1761,23 @@ void PageHandler::HandleAgentDebugEvent(
      return;
    }
    // As the agent's own would: logged for the conversation on show, and a

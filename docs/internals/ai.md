@@ -265,9 +265,10 @@ window, however many tabs have a chat.
 - **At most eight conversations stay in memory per window**
   (`kMaxKeptChats`, `PickChatsToDrop`). Past that, the idle one shown
   longest ago is dropped. Idle means no reply coming, no agent task, no
-  card waiting, and not the conversation on show or the one just before it
-  (a send that crossed a tab switch still goes there). So with many busy
-  ones, more than eight stay. One conversation holds about 1.6 MB at worst,
+  card waiting, not the conversation on show or the one just before it (a
+  send that crossed a tab switch still goes there), and no reply that ended
+  in the background that the user hasn't seen yet: showing the conversation
+  clears that. So with many busy ones, more than eight stay. One conversation holds about 1.6 MB at worst,
   so eight cost 13 MB at worst, beside the 230 MB page they share. A dropped
   conversation was already saved to history when its reply ended, by the
   page or the browser. The drop saves it again only if history lacks it,
