@@ -1,0 +1,2212 @@
+--- a/chrome/browser/rac/ai/BUILD.gn
++++ b/chrome/browser/rac/ai/BUILD.gn
+@@ -89,6 +89,8 @@
+     "new_tab_page.h",
+     "page_text.cc",
+     "page_text.h",
++    "provider_list.cc",
++    "provider_list.h",
+     "providers.cc",
+     "providers.h",
+     "reply_log.cc",
+@@ -173,6 +175,7 @@
+     "model_catalog_unittest.cc",
+     "new_tab_page_unittest.cc",
+     "page_text_unittest.cc",
++    "provider_list_unittest.cc",
+     "providers_unittest.cc",
+     "reply_log_unittest.cc",
+     "saved_prompts_unittest.cc",
+--- /dev/null
++++ b/chrome/browser/rac/ai/provider_list.cc
+@@ -0,0 +1,193 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/provider_list.h"
++
++#include <algorithm>
++#include <iterator>
++#include <utility>
++
++#include "chrome/browser/rac/ai/acp/agent_recipes.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
++#include "chrome/browser/rac/ai/providers.h"
++#include "components/prefs/pref_service.h"
++
++namespace rac::ai {
++namespace {
++
++// The order agents are listed in. Unknown ids sort after these, and the
++// custom command always goes last.
++constexpr std::string_view kAgentOrder[] = {
++    "codex", "claude", "cursor", "gemini", "copilot", "opencode", "goose",
++};
++constexpr char kCustomAgent[] = "custom";
++
++size_t AgentRank(std::string_view id) {
++  if (id == kCustomAgent) {
++    return std::size(kAgentOrder) + 1;
++  }
++  const auto* it = std::ranges::find(kAgentOrder, id);
++  return static_cast<size_t>(it - std::begin(kAgentOrder));
++}
++
++// The names the list shows where the provider's own name says more than
++// the group around it does.
++std::string_view ListName(std::string_view id, bool is_agent) {
++  if (is_agent) {
++    if (id == "claude") {
++      return "Claude Code";
++    }
++    const AgentRecipe* recipe = FindAgentRecipe(id);
++    return recipe ? recipe->name : id;
++  }
++  if (id == "ollama") {
++    return "Ollama";
++  }
++  if (id == "lmstudio") {
++    return "LM Studio";
++  }
++  const ProviderInfo* info = FindProvider(id);
++  return info ? info->name : id;
++}
++
++const char* GroupName(ProviderGroup group) {
++  switch (group) {
++    case ProviderGroup::kAgents:
++      return "agents";
++    case ProviderGroup::kApiKey:
++      return "apiKey";
++    case ProviderGroup::kLocal:
++      return "local";
++  }
++}
++
++}  // namespace
++
++std::vector<ProviderRowGroup> BuildProviderList(
++    const ProviderListInput& input) {
++  const bool agent_chosen = FindAgentRecipe(input.agent) != nullptr;
++
++  ProviderRowGroup agents{ProviderGroup::kAgents, {}};
++  bool any_installed = false;
++  if (input.agents) {
++    std::vector<FoundAgent> sorted = *input.agents;
++    std::ranges::stable_sort(sorted, {}, [](const FoundAgent& agent) {
++      return AgentRank(agent.id);
++    });
++    std::vector<ProviderRow> missing;
++    std::optional<ProviderRow> custom;
++    for (const FoundAgent& agent : sorted) {
++      if (!FindAgentRecipe(agent.id)) {
++        continue;
++      }
++      ProviderRow row{.id = agent.id,
++                      .is_agent = true,
++                      .chosen = agent_chosen && agent.id == input.agent};
++      any_installed |= agent.installed;
++      if (agent.id == kCustomAgent) {
++        custom = std::move(row);
++        continue;
++      }
++      // An agent whose program was found but can't start yet (no Node)
++      // stays in view, so its row can say why.
++      if (agent.installed || agent.needs_node || row.chosen) {
++        agents.rows.push_back(std::move(row));
++      } else {
++        row.not_installed = true;
++        missing.push_back(std::move(row));
++      }
++    }
++    std::ranges::move(missing, std::back_inserter(agents.rows));
++    if (custom) {
++      agents.rows.push_back(std::move(*custom));
++    }
++  }
++  // Before the probe answers, the chosen agent is all the list knows.
++  if (agent_chosen &&
++      std::ranges::none_of(agents.rows, &ProviderRow::chosen)) {
++    agents.rows.insert(
++        agents.rows.begin(),
++        ProviderRow{.id = input.agent, .is_agent = true, .chosen = true});
++  }
++
++  ProviderRowGroup api_key{ProviderGroup::kApiKey, {}};
++  ProviderRowGroup local{ProviderGroup::kLocal, {}};
++  for (const ProviderInfo& info : GetProviders()) {
++    ProviderRow row{
++        .id = info.id,
++        .chosen = !agent_chosen && input.direct_provider == info.id};
++    (info.requires_key ? api_key : local).rows.push_back(std::move(row));
++  }
++
++  const bool agents_first = !input.agents || any_installed || agent_chosen;
++  std::vector<ProviderRowGroup> list;
++  if (agents_first) {
++    list.push_back(std::move(agents));
++  }
++  list.push_back(std::move(api_key));
++  list.push_back(std::move(local));
++  if (!agents_first) {
++    list.push_back(std::move(agents));
++  }
++  return list;
++}
++
++std::string ChosenDirectProvider(const PrefService& prefs, bool usable) {
++  if (!usable && prefs.FindPreference(kProvider)->IsDefaultValue()) {
++    return std::string();
++  }
++  return prefs.GetString(kProvider);
++}
++
++std::vector<FoundAgent> ParseFoundAgents(const base::ListValue& agents) {
++  std::vector<FoundAgent> found;
++  for (const base::Value& value : agents) {
++    const base::DictValue* dict = value.GetIfDict();
++    const std::string* id = dict ? dict->FindString("id") : nullptr;
++    if (!id || !FindAgentRecipe(*id)) {
++      continue;
++    }
++    found.push_back(FoundAgent{
++        .id = *id,
++        .installed = dict->FindBool("installed").value_or(false),
++        .needs_node = dict->FindBool("needsNode").value_or(false),
++    });
++  }
++  return found;
++}
++
++bool AgentCanUseBrowser(std::string_view agent_id) {
++  // Gemini, Copilot and Goose have no verified MCP identity yet, and their
++  // own configs don't allow rac's tools, so every tool call is refused. A
++  // custom command is the user's own program, so the list claims nothing
++  // about it.
++  static constexpr std::string_view kChatOnly[] = {"gemini", "copilot",
++                                                   "goose"};
++  return std::ranges::find(kChatOnly, agent_id) == std::end(kChatOnly);
++}
++
++base::ListValue ProviderListToValue(const std::vector<ProviderRowGroup>& list) {
++  base::ListValue groups;
++  for (const ProviderRowGroup& group : list) {
++    base::ListValue rows;
++    for (const ProviderRow& row : group.rows) {
++      base::DictValue value;
++      value.Set("id", row.id);
++      value.Set("agent", row.is_agent);
++      value.Set("name", ListName(row.id, row.is_agent));
++      value.Set("chosen", row.chosen);
++      value.Set("notInstalled", row.not_installed);
++      if (row.is_agent) {
++        value.Set("canUseBrowser", AgentCanUseBrowser(row.id));
++      }
++      rows.Append(std::move(value));
++    }
++    groups.Append(base::DictValue()
++                      .Set("group", GroupName(group.group))
++                      .Set("rows", std::move(rows)));
++  }
++  return groups;
++}
++
++}  // namespace rac::ai
+--- /dev/null
++++ b/chrome/browser/rac/ai/provider_list.h
+@@ -0,0 +1,98 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_PROVIDER_LIST_H_
++#define CHROME_BROWSER_RAC_AI_PROVIDER_LIST_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/values.h"
++
++class PrefService;
++
++namespace rac::ai {
++
++// Settings' one provider list: every way the assistant can answer, in three
++// groups, with the one the profile uses marked. Choosing a row goes through
++// SelectDirectProvider or SelectAgent (active_provider.h), never through
++// here; this only decides what the list shows and in what order.
++
++enum class ProviderGroup {
++  // Agent programs found on this Mac, then the ones that weren't found
++  // (behind "Not installed"), then the custom ACP command.
++  kAgents,
++  // Direct providers that need the user's API key.
++  kApiKey,
++  // Direct providers that run on this Mac (Ollama, LM Studio).
++  kLocal,
++};
++
++// One agent as the login-shell probe (AcpService::ListAgents) saw it.
++struct FoundAgent {
++  std::string id;
++  bool installed = false;
++  // The agent's own program was found, but its adapter needs npx and Node
++  // wasn't found.
++  bool needs_node = false;
++};
++
++struct ProviderRow {
++  std::string id;
++  bool is_agent = false;
++  // The row the profile uses. At most one row in the list is chosen.
++  bool chosen = false;
++  // An agent that wasn't found. These sit behind the "Not installed (n)"
++  // row, unless the user already chose one.
++  bool not_installed = false;
++};
++
++struct ProviderRowGroup {
++  ProviderGroup group;
++  std::vector<ProviderRow> rows;
++};
++
++// What the list is built from. `agents` has no value until the probe has
++// answered (it runs only while the Assistant page is on screen with AI on).
++struct ProviderListInput {
++  std::optional<std::vector<FoundAgent>> agents;
++  // The direct provider the profile chose, or empty when the user never
++  // chose one and it can't be used yet (a fresh profile).
++  std::string direct_provider;
++  // The active agent (GetActiveAgent), or empty.
++  std::string agent;
++};
++
++// The groups in display order. Agents come first once the probe found one
++// that runs, or when an agent is the profile's choice, and also while the
++// probe hasn't answered (so a found agent doesn't push the list down after
++// the page opens). Otherwise API key, local model, then agents. Agents keep
++// a fixed order, with the custom command last. Nothing is ever chosen for
++// the user: an agent is chosen only when `agent` names it.
++std::vector<ProviderRowGroup> BuildProviderList(const ProviderListInput& input);
++
++// The direct provider the list shows as chosen: the profile's provider once
++// the user chose it (even the default one) or set it up so it can be used
++// (`usable`, AiService::HasUsableDirectProvider). A fresh profile's default
++// isn't a choice, so it's empty then and nothing shows chosen.
++std::string ChosenDirectProvider(const PrefService& prefs, bool usable);
++
++// Reads the probe's rows (AcpService::ListAgents) into FoundAgents. Rows
++// without a known agent id are dropped.
++std::vector<FoundAgent> ParseFoundAgents(const base::ListValue& agents);
++
++// Whether the agent can use the browser's tools. rac auto-approves its own
++// tools only for agents whose runtime identity is verified (see
++// IsApprovedRacMcpTool); Cursor and OpenCode allow them in their own config.
++// The rest can only chat for now.
++bool AgentCanUseBrowser(std::string_view agent_id);
++
++// The list as the Settings page reads it.
++base::ListValue ProviderListToValue(const std::vector<ProviderRowGroup>& list);
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_PROVIDER_LIST_H_
+--- /dev/null
++++ b/chrome/browser/rac/ai/provider_list_unittest.cc
+@@ -0,0 +1,282 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/provider_list.h"
++
++#include <string>
++#include <vector>
++
++#include "base/strings/string_util.h"
++#include "base/values.h"
++#include "chrome/browser/rac/ai/active_provider.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
++#include "chrome/browser/rac/ai/providers.h"
++#include "components/prefs/testing_pref_service.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::ai {
++namespace {
++
++// Every agent rac knows, none found.
++std::vector<FoundAgent> NoneFound() {
++  return {{"opencode"}, {"cursor"}, {"gemini"}, {"copilot"},
++          {"codex"},    {"claude"}, {"goose"},  {"custom"}};
++}
++
++std::vector<FoundAgent> With(std::vector<FoundAgent> agents,
++                             const std::string& id,
++                             bool installed,
++                             bool needs_node = false) {
++  for (FoundAgent& agent : agents) {
++    if (agent.id == id) {
++      agent.installed = installed;
++      agent.needs_node = needs_node;
++    }
++  }
++  return agents;
++}
++
++const char* Name(ProviderGroup group) {
++  switch (group) {
++    case ProviderGroup::kAgents:
++      return "agents";
++    case ProviderGroup::kApiKey:
++      return "apiKey";
++    case ProviderGroup::kLocal:
++      return "local";
++  }
++}
++
++// "agents,apiKey,local"
++std::string Groups(const std::vector<ProviderRowGroup>& list) {
++  std::vector<std::string> names;
++  for (const ProviderRowGroup& group : list) {
++    names.push_back(Name(group.group));
++  }
++  return base::JoinString(names, ",");
++}
++
++// The rows of one group, with missing agents in brackets and the chosen row
++// starred: "claude*,[codex],custom".
++std::string Rows(const std::vector<ProviderRowGroup>& list,
++                 ProviderGroup which) {
++  std::vector<std::string> rows;
++  for (const ProviderRowGroup& group : list) {
++    if (group.group != which) {
++      continue;
++    }
++    for (const ProviderRow& row : group.rows) {
++      std::string text = row.not_installed ? "[" + row.id + "]" : row.id;
++      rows.push_back(row.chosen ? text + "*" : text);
++    }
++  }
++  return base::JoinString(rows, ",");
++}
++
++// Every chosen row in the list, as "agent:id" or "direct:id".
++std::vector<std::string> Chosen(const std::vector<ProviderRowGroup>& list) {
++  std::vector<std::string> chosen;
++  for (const ProviderRowGroup& group : list) {
++    for (const ProviderRow& row : group.rows) {
++      if (row.chosen) {
++        chosen.push_back((row.is_agent ? "agent:" : "direct:") + row.id);
++      }
++    }
++  }
++  return chosen;
++}
++
++TEST(RacProviderListTest, AgentsComeFirstWhenOneIsInstalled) {
++  const auto list = BuildProviderList(
++      {.agents = With(NoneFound(), "claude", true), .direct_provider = ""});
++  EXPECT_EQ(Groups(list), "agents,apiKey,local");
++  EXPECT_EQ(Rows(list, ProviderGroup::kAgents),
++            "claude,[codex],[cursor],[gemini],[copilot],[opencode],[goose],"
++            "custom");
++}
++
++TEST(RacProviderListTest, ApiKeyComesFirstWhenNoAgentIsInstalled) {
++  const auto list =
++      BuildProviderList({.agents = NoneFound(), .direct_provider = "openai"});
++  EXPECT_EQ(Groups(list), "apiKey,local,agents");
++  EXPECT_EQ(Rows(list, ProviderGroup::kApiKey),
++            "openai*,anthropic,gemini,openrouter,custom");
++  EXPECT_EQ(Rows(list, ProviderGroup::kLocal), "ollama,lmstudio");
++}
++
++// While the probe hasn't answered, the agents group holds the top, so a
++// found agent fills it in place instead of pushing the list down.
++TEST(RacProviderListTest, AgentsHoldTheTopUntilTheProbeAnswers) {
++  const auto list = BuildProviderList({.direct_provider = "openai"});
++  EXPECT_EQ(Groups(list), "agents,apiKey,local");
++  EXPECT_EQ(Rows(list, ProviderGroup::kAgents), "");
++}
++
++TEST(RacProviderListTest, AgentsKeepAFixedOrderWithCustomLast) {
++  std::vector<FoundAgent> agents = NoneFound();
++  for (FoundAgent& agent : agents) {
++    agent.installed = true;
++  }
++  const auto list = BuildProviderList({.agents = agents});
++  EXPECT_EQ(Rows(list, ProviderGroup::kAgents),
++            "codex,claude,cursor,gemini,copilot,opencode,goose,custom");
++}
++
++// The probe found the program, but its adapter needs Node: the row stays in
++// view so it can say why it can't run. It doesn't count as installed.
++TEST(RacProviderListTest, AnAgentThatNeedsNodeStaysInViewButNotFirst) {
++  const auto list = BuildProviderList(
++      {.agents = With(NoneFound(), "codex", false, /*needs_node=*/true),
++       .direct_provider = "openai"});
++  EXPECT_EQ(Groups(list), "apiKey,local,agents");
++  EXPECT_EQ(Rows(list, ProviderGroup::kAgents),
++            "codex,[claude],[cursor],[gemini],[copilot],[opencode],[goose],"
++            "custom");
++}
++
++TEST(RacProviderListTest, AWorkingCustomCommandPutsAgentsFirst) {
++  const auto list = BuildProviderList(
++      {.agents = With(NoneFound(), "custom", true), .direct_provider = ""});
++  EXPECT_EQ(Groups(list), "agents,apiKey,local");
++}
++
++// Choosing is the consent: one found agent is never chosen for the user.
++TEST(RacProviderListTest, NeverChoosesAnAgentForTheUser) {
++  const auto list = BuildProviderList(
++      {.agents = With(NoneFound(), "claude", true), .direct_provider = ""});
++  EXPECT_TRUE(Chosen(list).empty());
++}
++
++TEST(RacProviderListTest, TheChosenAgentIsTheOnlyChosenRow) {
++  const auto list =
++      BuildProviderList({.agents = With(NoneFound(), "claude", true),
++                         .direct_provider = "anthropic",
++                         .agent = "claude"});
++  EXPECT_EQ(Chosen(list), std::vector<std::string>{"agent:claude"});
++}
++
++TEST(RacProviderListTest, TheDirectProviderIsChosenWithoutAnAgent) {
++  const auto list =
++      BuildProviderList({.agents = With(NoneFound(), "claude", true),
++                         .direct_provider = "ollama"});
++  EXPECT_EQ(Chosen(list), std::vector<std::string>{"direct:ollama"});
++  EXPECT_EQ(Rows(list, ProviderGroup::kLocal), "ollama*,lmstudio");
++}
++
++// The direct provider "custom" and the custom ACP command share an id; only
++// the one the profile uses is chosen.
++TEST(RacProviderListTest, CustomServerAndCustomAgentAreDifferentRows) {
++  auto list = BuildProviderList(
++      {.agents = NoneFound(), .direct_provider = "custom"});
++  EXPECT_EQ(Chosen(list), std::vector<std::string>{"direct:custom"});
++
++  list = BuildProviderList(
++      {.agents = NoneFound(), .direct_provider = "custom", .agent = "custom"});
++  EXPECT_EQ(Chosen(list), std::vector<std::string>{"agent:custom"});
++}
++
++// An agent the user chose stays in view even if it's no longer found, so
++// the list still shows what the chat uses.
++TEST(RacProviderListTest, AChosenAgentThatIsGoneStaysInView) {
++  const auto list = BuildProviderList(
++      {.agents = NoneFound(), .direct_provider = "openai", .agent = "goose"});
++  EXPECT_EQ(Groups(list), "agents,apiKey,local");
++  EXPECT_EQ(Rows(list, ProviderGroup::kAgents),
++            "goose*,[codex],[claude],[cursor],[gemini],[copilot],[opencode],"
++            "custom");
++}
++
++TEST(RacProviderListTest, TheChosenAgentShowsBeforeTheProbeAnswers) {
++  const auto list =
++      BuildProviderList({.direct_provider = "openai", .agent = "codex"});
++  EXPECT_EQ(Rows(list, ProviderGroup::kAgents), "codex*");
++  EXPECT_EQ(Chosen(list), std::vector<std::string>{"agent:codex"});
++}
++
++TEST(RacProviderListTest, UnknownIdsChooseNothing) {
++  const auto list = BuildProviderList({.agents = NoneFound(),
++                                       .direct_provider = "nope",
++                                       .agent = "also-nope"});
++  EXPECT_TRUE(Chosen(list).empty());
++  EXPECT_EQ(Groups(list), "apiKey,local,agents");
++}
++
++// A fresh profile's default provider isn't a choice the user made.
++TEST(RacProviderListTest, AFreshProfileHasNoChosenDirectProvider) {
++  TestingPrefServiceSimple prefs;
++  RegisterProfilePrefs(prefs.registry());
++  EXPECT_EQ(ChosenDirectProvider(prefs, /*usable=*/false), "");
++  // A key saved for the default provider makes it usable, and so chosen.
++  EXPECT_EQ(ChosenDirectProvider(prefs, /*usable=*/true),
++            kDefaultProviderId);
++}
++
++// Choosing the default provider's row in the list is still a choice.
++TEST(RacProviderListTest, ChoosingTheDefaultProviderShowsItChosen) {
++  TestingPrefServiceSimple prefs;
++  RegisterProfilePrefs(prefs.registry());
++  ASSERT_TRUE(SelectDirectProvider(&prefs, kDefaultProviderId));
++  EXPECT_EQ(ChosenDirectProvider(prefs, /*usable=*/false),
++            kDefaultProviderId);
++
++  ASSERT_TRUE(SelectDirectProvider(&prefs, "ollama"));
++  EXPECT_EQ(ChosenDirectProvider(prefs, /*usable=*/false), "ollama");
++}
++
++TEST(RacProviderListTest, ParsesTheProbeAndDropsUnknownAgents) {
++  base::ListValue probe;
++  probe.Append(base::DictValue().Set("id", "claude").Set("installed", true));
++  probe.Append(base::DictValue()
++                   .Set("id", "codex")
++                   .Set("installed", false)
++                   .Set("needsNode", true));
++  probe.Append(base::DictValue().Set("id", "made-up").Set("installed", true));
++  probe.Append(base::DictValue().Set("installed", true));
++  probe.Append("not a row");
++
++  const std::vector<FoundAgent> found = ParseFoundAgents(probe);
++  ASSERT_EQ(found.size(), 2u);
++  EXPECT_EQ(found[0].id, "claude");
++  EXPECT_TRUE(found[0].installed);
++  EXPECT_FALSE(found[0].needs_node);
++  EXPECT_EQ(found[1].id, "codex");
++  EXPECT_FALSE(found[1].installed);
++  EXPECT_TRUE(found[1].needs_node);
++}
++
++TEST(RacProviderListTest, OnlyAgentsWithAVerifiedIdentityUseTheBrowser) {
++  for (const char* id : {"claude", "codex", "cursor", "opencode", "custom"}) {
++    EXPECT_TRUE(AgentCanUseBrowser(id)) << id;
++  }
++  for (const char* id : {"gemini", "copilot", "goose"}) {
++    EXPECT_FALSE(AgentCanUseBrowser(id)) << id;
++  }
++}
++
++TEST(RacProviderListTest, TheValueNamesRowsForTheList) {
++  const base::ListValue value = ProviderListToValue(
++      BuildProviderList({.agents = With(NoneFound(), "claude", true),
++                         .direct_provider = "ollama",
++                         .agent = "claude"}));
++  ASSERT_EQ(value.size(), 3u);
++  const base::DictValue& agents = value[0].GetDict();
++  EXPECT_EQ(*agents.FindString("group"), "agents");
++  const base::DictValue& claude = (*agents.FindList("rows"))[0].GetDict();
++  EXPECT_EQ(*claude.FindString("id"), "claude");
++  EXPECT_EQ(*claude.FindString("name"), "Claude Code");
++  EXPECT_EQ(claude.FindBool("agent"), true);
++  EXPECT_EQ(claude.FindBool("chosen"), true);
++  EXPECT_EQ(claude.FindBool("canUseBrowser"), true);
++
++  const base::DictValue& local = value[2].GetDict();
++  EXPECT_EQ(*local.FindString("group"), "local");
++  const base::DictValue& ollama = (*local.FindList("rows"))[0].GetDict();
++  EXPECT_EQ(*ollama.FindString("name"), "Ollama");
++  EXPECT_EQ(ollama.FindBool("agent"), false);
++  EXPECT_EQ(ollama.FindBool("chosen"), false);
++  EXPECT_FALSE(ollama.FindBool("canUseBrowser").has_value());
++}
++
++}  // namespace
++}  // namespace rac::ai
+--- a/chrome/browser/resources/settings/privacy_page/rac_ai_page.html
++++ b/chrome/browser/resources/settings/privacy_page/rac_ai_page.html
+@@ -97,44 +97,107 @@
+     padding: 12px var(--cr-section-padding);
+   }
+ 
+-  .agents-heading {
+-    padding: 12px var(--cr-section-padding) 4px;
++  /* The one provider list: agents, API key, local model. Rows are radios;
++   * only the chosen row opens, to its own setup. */
++  #providerHead {
++    padding: var(--rac-spacing-16) 0 var(--rac-spacing-4);
+   }
+ 
+-  .agent-row {
++  .providers {
++    padding-bottom: var(--rac-spacing-12);
++  }
++
++  .group-title {
++    align-items: center;
++    color: var(--rac-text-muted);
++    display: flex;
++    font-size: var(--rac-font-size-secondary);
++    font-weight: var(--rac-font-weight-medium);
++    gap: var(--rac-spacing-8);
++    justify-content: space-between;
++    min-height: var(--rac-spacing-24);
++    padding: var(--rac-spacing-12) var(--rac-spacing-10) var(--rac-spacing-4);
++  }
++
++  /* A quiet text button, not a second call to action. */
++  .group-title cr-button {
++    --cr-button-background-color: transparent;
++    --cr-button-border-color: transparent;
++    --cr-button-height: var(--rac-spacing-24);
++    --cr-button-text-color: var(--rac-text-muted);
++    font-size: var(--rac-font-size-secondary);
++  }
++
++  .placeholder {
++    align-content: center;
++    color: var(--rac-text-faint);
++    font-size: var(--rac-font-size-row);
++    min-height: calc(var(--rac-spacing-24) * 2);
++    padding: 0 var(--rac-spacing-10);
++  }
++
++  .item {
++    border-radius: var(--rac-radius-10);
++  }
++
++  .item.chosen {
++    background: var(--rac-token);
++  }
++
++  .provider {
+     align-items: center;
++    border-radius: var(--rac-radius-10);
++    cursor: pointer;
+     display: flex;
+-    gap: 12px;
+-    min-height: 56px;
+-    padding: 0 var(--cr-section-padding);
++    gap: var(--rac-spacing-12);
++    min-height: calc(var(--rac-spacing-24) * 2);
++    outline: none;
++    padding: 0 var(--rac-spacing-10);
++    transition: background-color var(--rac-motion-hover-row);
++  }
++
++  .item:not(.chosen) .provider:hover {
++    background: var(--rac-token);
++  }
++
++  .item.chosen .provider {
++    cursor: default;
++  }
++
++  /* Only for the keyboard. Inset, so it isn't clipped by the card. */
++  .provider:focus-visible {
++    box-shadow: inset 0 0 0 2px var(--rac-accent);
+   }
+ 
+   .tile {
+     align-items: center;
+-    background: var(--cr-hover-background-color);
+-    border-radius: 7px;
+-    color: var(--cr-primary-text-color);
++    background: var(--rac-control-fill);
++    border-radius: var(--rac-radius-6);
++    color: var(--rac-text);
+     display: flex;
+     flex: none;
+-    font-size: 13px;
+-    font-weight: 600;
+-    height: 28px;
++    font-size: var(--rac-font-size-secondary);
++    font-weight: var(--rac-font-weight-semibold);
++    height: var(--rac-spacing-24);
+     justify-content: center;
+-    width: 28px;
++    width: var(--rac-spacing-24);
+   }
+ 
+-  .agent-text {
++  .text {
++    display: flex;
+     flex: 1;
++    flex-direction: column;
+     min-width: 0;
+   }
+ 
+-  .agent-name {
+-    color: var(--cr-primary-text-color);
+-    font-size: 13px;
++  .name {
++    color: var(--rac-text);
++    font-size: var(--rac-font-size-row);
+   }
+ 
+-  .agent-sub {
+-    font-size: 12px;
++  .sub {
++    color: var(--rac-text-muted);
++    font-size: var(--rac-font-size-secondary);
+     overflow: hidden;
+     text-overflow: ellipsis;
+     white-space: nowrap;
+@@ -165,12 +228,56 @@
+     background: var(--settings-error-color);
+   }
+ 
+-  .agent-body {
+-    padding: 0 var(--cr-section-padding) 12px 68px;
++  /* A macOS radio: a ring, filled with the accent and a white dot once
++   * chosen. */
++  .radio {
++    border: 1px solid var(--rac-text-faint);
++    border-radius: 50%;
++    box-sizing: border-box;
++    flex: none;
++    height: var(--rac-spacing-16);
++    width: var(--rac-spacing-16);
++  }
++
++  .item.chosen .radio {
++    background: #fff;
++    border: var(--rac-spacing-4) solid var(--rac-accent);
++  }
++
++  /* A column, so its gaps skip the hidden parts. */
++  .setup {
++    animation: setup-in var(--rac-motion-fade);
++    display: flex;
++    flex-direction: column;
++    font-size: var(--rac-font-size-row);
++    gap: var(--rac-spacing-12);
++    padding: 0 var(--rac-spacing-10) var(--rac-spacing-16)
++        calc(var(--rac-spacing-24) + var(--rac-spacing-10) +
++             var(--rac-spacing-12));
++  }
++
++  .setup .field {
++    padding: 0;
++  }
++
++  .setup .cr-secondary-text {
++    font-size: var(--rac-font-size-secondary);
++  }
++
++  @keyframes setup-in {
++    from {
++      opacity: 0;
++    }
++  }
++
++  .quiet {
++    color: var(--rac-text-muted);
++    font-size: var(--rac-font-size-secondary);
+   }
+ 
+-  .agent-body > * + * {
+-    margin-top: 12px;
++  .setup-error {
++    color: var(--settings-error-color);
++    font-size: var(--rac-font-size-secondary);
+   }
+ 
+   .sign-in {
+@@ -181,7 +288,9 @@
+   }
+ 
+   .sign-in .label {
++    color: var(--rac-text);
+     flex-basis: 100%;
++    font-weight: var(--rac-font-weight-medium);
+   }
+ 
+   code {
+@@ -192,16 +301,37 @@
+     padding: 1px 5px;
+   }
+ 
+-  .agent-error {
+-    color: var(--settings-error-color);
+-  }
+-
+-  .agent-rows {
+-    border-top: var(--cr-separator-line);
+-  }
+-
+-  .agent-rows > .agent-item + .agent-item {
+-    border-top: var(--cr-separator-line);
++  /* Its chevron lines up with the radios above it. */
++  cr-expand-button.more {
++    --cr-expand-button-icon-size: var(--rac-spacing-16);
++    --cr-expand-button-size: calc(var(--rac-spacing-24) + var(--rac-spacing-4));
++    --cr-section-vertical-padding: 0;
++    color: var(--rac-text-muted);
++    font-size: var(--rac-font-size-row);
++    min-height: calc(var(--rac-spacing-24) * 2);
++    padding: 0 var(--rac-spacing-4) 0 var(--rac-spacing-10);
++  }
++
++  @media (prefers-reduced-motion: reduce) {
++    .provider {
++      transition: none;
++    }
++
++    .setup {
++      animation: none;
++    }
++  }
++
++  /* A narrow window keeps each status as its dot. */
++  @media (max-width: 640px) {
++    .status {
++      font-size: 0;
++      gap: 0;
++    }
++
++    .setup {
++      padding-inline-start: var(--rac-spacing-10);
++    }
+   }
+ </style>
+ 
+@@ -303,187 +433,75 @@
+           </div>
+         </div>
+ 
+-        <div class="section">
+-          <div class="field">
+-            <div class="label">$i18n{racAiProvider}</div>
+-            <select class="md-select" id="provider"
+-                aria-label="$i18n{racAiProvider}"
+-                on-change="onProviderChange_">
+-              <template is="dom-repeat" items="[[providers_]]">
+-                <option value="[[item.id]]"
+-                    selected$="[[isSelected_(item.id, selectedId_)]]">
++        <div class="section providers">
++          <div class="label" id="providerHead">$i18n{racAiProvider}</div>
++          <div id="providerList" role="radiogroup"
++              aria-labelledby="providerHead" on-keydown="onListKeydown_"
++              on-focusout="onListFocusout_">
++            <template is="dom-repeat" items="[[items_]]" as="item">
++              <template is="dom-if" if="[[isKind_(item, 'title')]]">
++                <div class="group-title">
++                  <span>[[item.name]]</span>
++                  <template is="dom-if" if="[[item.recheck]]">
++                    <cr-button on-click="onCheckAgain_"
++                        disabled="[[agentsLoading_]]">
++                      $i18n{racAiAgentCheckAgain}
++                    </cr-button>
++                  </template>
++                </div>
++              </template>
++              <template is="dom-if" if="[[isKind_(item, 'loading')]]">
++                <div class="placeholder">[[item.name]]</div>
++              </template>
++              <template is="dom-if" if="[[isKind_(item, 'more')]]">
++                <cr-expand-button class="more" expanded="{{missingOpen_}}"
++                    no-hover>
+                   [[item.name]]
+-                </option>
++                </cr-expand-button>
+               </template>
+-            </select>
+-          </div>
+-
+-          <template is="dom-if" if="[[selected_]]" restamp>
+-            <template is="dom-if" if="[[canEditUrl_(selected_)]]" restamp>
+-              <div class="field">
+-                <cr-input id="baseUrl" label="$i18n{racAiBaseUrl}"
+-                    value="[[selected_.baseUrl]]"
+-                    placeholder="[[selected_.defaultBaseUrl]]"
+-                    invalid="[[baseUrlInvalid_]]"
+-                    error-message="$i18n{racAiBaseUrlInvalid}"
+-                    spellcheck="false" maxlength="512">
+-                </cr-input>
+-                <div class="cr-secondary-text">
+-                  $i18n{racAiBaseUrlHelp}
+-                </div>
+-                <div class="cr-secondary-text" hidden$="[[!urlNote_]]">
+-                  [[urlNote_]]
+-                </div>
+-              </div>
+-            </template>
+-            <div class="field">
+-              <div class="label">$i18n{racAiModels}</div>
+-              <div class="chips" role="list" aria-label="$i18n{racAiModels}">
+-                <template is="dom-repeat" items="[[chips_]]" as="chip">
+-                  <span class$="[[chipClass_(chip)]]" role="listitem">
+-                    <button class="chip-model" on-click="onChipClick_"
+-                        title$="[[chipTip_(chip)]]">[[chip.model]]</button>
+-                    <span class="chip-default"
+-                        hidden$="[[!chip.isDefault]]">
+-                      $i18n{racAiModelDefault}
++              <template is="dom-if" if="[[isKind_(item, 'row')]]">
++                <div class$="[[itemClass_(item)]]"
++                    hidden$="[[isRowHidden_(item, missingOpen_)]]">
++                  <div class="provider" role="radio"
++                      aria-checked$="[[ariaChecked_(item)]]"
++                      aria-describedby$="[[item.subId]]"
++                      tabindex$="[[tabIndex_(item.key, focusKey_)]]"
++                      data-key$="[[item.key]]"
++                      on-click="onRowClick_" on-focus="onRowFocus_">
++                    <span class="tile" aria-hidden="true">
++                      [[item.monogram]]
+                     </span>
+-                    <button class="chip-remove" on-click="onChipRemove_"
+-                        aria-label$="[[chipRemoveAria_(chip.model)]]">
+-                      ✕
+-                    </button>
+-                  </span>
+-                </template>
+-              </div>
+-              <template is="dom-if" if="[[modelChoices_.length]]" restamp>
+-                <select class="md-select" id="modelPick"
+-                    aria-label="$i18n{racAiModelPick}"
+-                    on-change="onModelPickChange_">
+-                  <template is="dom-repeat" items="[[modelChoices_]]">
+-                    <option value="[[item]]">[[item]]</option>
+-                  </template>
+-                </select>
+-              </template>
+-              <cr-input id="model" label="$i18n{racAiModelId}"
+-                  placeholder="[[selected_.defaultModel]]"
+-                  on-keydown="onModelKeydown_"
+-                  spellcheck="false" maxlength="512">
+-              </cr-input>
+-              <div class="cr-secondary-text">
+-                $i18n{racAiModelPickHelp}
+-              </div>
+-              <div class="row-buttons">
+-                <cr-button on-click="onAddModel_">
+-                  $i18n{racAiModelAdd}
+-                </cr-button>
+-                <template is="dom-if" if="[[canEditUrl_(selected_)]]" restamp>
+-                  <cr-button on-click="onSaveSettings_">
+-                    $i18n{racAiSaveSettings}
+-                  </cr-button>
+-                </template>
+-              </div>
+-              <div class$="[[connectionClass_(connectionChecking_, connectionOk_)]]"
+-                  hidden$="[[!connectionVisible_(connectionChecking_, connectionOk_, connectionMessage_)]]">
+-                [[connectionText_(connectionChecking_, connectionOk_, connectionMessage_)]]
+-              </div>
+-              <div class="cr-secondary-text" hidden$="[[!saveNote_]]">
+-                [[saveNote_]]
+-              </div>
+-            </div>
+-
+-            <template is="dom-if" if="[[needsKey_(selected_)]]" restamp>
+-              <div class="field">
+-                <cr-input id="key" type="password" label="$i18n{racAiKey}"
+-                    invalid="[[keyFailed_]]"
+-                    error-message="$i18n{racAiKeyFailed}"
+-                    autocomplete="off" spellcheck="false" maxlength="4096">
+-                </cr-input>
+-                <div class="cr-secondary-text">
+-                  <span hidden$="[[!hasKey_(selected_)]]">
+-                    $i18n{racAiKeySaved}
+-                  </span>
+-                  <span hidden$="[[!hasNoKey_(selected_)]]">
+-                    $i18n{racAiKeyNone}
+-                  </span>
+-                </div>
+-                <div class="row-buttons">
+-                  <cr-button class="action-button" on-click="onSaveKey_">
+-                    $i18n{racAiSaveKey}
+-                  </cr-button>
+-                  <cr-button on-click="onRemoveKey_"
+-                      hidden$="[[!hasKey_(selected_)]]">
+-                    $i18n{racAiRemoveKey}
+-                  </cr-button>
+-                </div>
+-                <div class="cr-secondary-text" hidden$="[[!keyNote_]]">
+-                  [[keyNote_]]
+-                </div>
+-              </div>
+-            </template>
+-            <template is="dom-if" if="[[keyNotNeeded_(selected_)]]" restamp>
+-              <div class="field cr-secondary-text">
+-                $i18n{racAiKeyNotNeeded}
+-              </div>
+-            </template>
+-          </template>
+-        </div>
+-
+-        <div id="agents" role="group" aria-labelledby="agentsTitle">
+-          <div class="agents-heading">
+-            <div class="cr-title-text" id="agentsTitle">
+-              $i18n{racAiAgents}
+-            </div>
+-            <div class="cr-secondary-text">$i18n{racAiAgentsDescription}</div>
+-          </div>
+-          <div class="agent-rows">
+-            <div class="agent-row cr-secondary-text"
+-                hidden$="[[!agentsLoading_]]">
+-              $i18n{racAiAgentChecking}
+-            </div>
+-            <template is="dom-repeat" items="[[rows_]]" as="row">
+-              <div class="agent-item"
+-                  hidden$="[[isRowHidden_(row, missingOpen_)]]">
+-                <template is="dom-if" if="[[isGroup_(row)]]">
+-                  <div class="agent-row">
+-                    <div class="agent-text cr-secondary-text">
+-                      [[row.name]]
+-                    </div>
+-                    <cr-expand-button expanded="{{missingOpen_}}" no-hover
+-                        aria-label="[[row.name]]">
+-                    </cr-expand-button>
++                    <span class="text">
++                      <span class="name">[[item.name]]</span>
++                      <span class="sub" id$="[[item.subId]]"
++                          title$="[[item.subtitle]]"
++                          hidden$="[[!item.subtitle]]">
++                        [[item.subtitle]]
++                      </span>
++                    </span>
++                    <span class$="[[statusClass_(item)]]"
++                        hidden$="[[!item.statusText]]">
++                      [[item.statusText]]
++                    </span>
++                    <span class="radio" aria-hidden="true"></span>
+                   </div>
+-                </template>
+-                <template is="dom-if" if="[[!isGroup_(row)]]">
+-                  <div role="group" aria-label$="[[row.name]]">
+-                    <div class="agent-row">
+-                      <div class="tile" aria-hidden="true">[[row.monogram]]</div>
+-                      <div class="agent-text">
+-                        <div class="agent-name">[[row.name]]</div>
+-                        <div class="agent-sub cr-secondary-text"
+-                            title$="[[row.path]]">
+-                          [[rowSubtitle_(row)]]
++                  <template is="dom-if" if="[[item.chosen]]" restamp>
++                    <div class="setup">
++                      <template is="dom-if" if="[[item.agent]]" restamp>
++                        <div class="quiet">[[item.runs]]</div>
++                        <div class="setup-error" hidden$="[[!item.detail]]">
++                          [[item.detail]]
+                         </div>
+-                      </div>
+-                      <div class$="[[statusClass_(row)]]"
+-                          hidden$="[[!hasStatus_(row)]]">
+-                        [[row.statusText]]
+-                      </div>
+-                      <cr-expand-button expanded="{{row.expanded}}" no-hover
+-                          aria-label="[[row.name]]">
+-                      </cr-expand-button>
+-                    </div>
+-                    <cr-collapse opened="[[row.expanded]]">
+-                      <div class="agent-body">
+-                        <template is="dom-if" if="[[hasDetail_(row)]]">
+-                          <div class="agent-error cr-secondary-text">
+-                            [[row.detail]]
+-                          </div>
+-                        </template>
+-                        <template is="dom-if" if="[[isAgent_(row)]]">
++                        <div class="quiet" hidden$="[[directUsable_]]">
++                          $i18n{racAiAgentNeedsDirect}
++                        </div>
++                        <template is="dom-if" if="[[!item.custom]]" restamp>
+                           <div>
+-                            <cr-input label="$i18n{racAiAgentPath}"
+-                                value="{{row.pathDraft}}"
+-                                placeholder="[[row.placeholder]]"
+-                                invalid="[[row.pathInvalid]]"
++                            <cr-input id="agentPath"
++                                label="$i18n{racAiAgentPath}"
++                                value="[[item.override]]"
++                                placeholder="[[item.placeholder]]"
++                                invalid="[[pathInvalid_]]"
+                                 error-message="$i18n{racAiAgentPathInvalid}"
+                                 on-change="onPathChange_"
+                                 spellcheck="false" maxlength="1024">
+@@ -493,12 +511,13 @@
+                             </div>
+                           </div>
+                         </template>
+-                        <template is="dom-if" if="[[isCustom_(row)]]">
++                        <template is="dom-if" if="[[item.custom]]" restamp>
+                           <div>
+-                            <cr-input label="$i18n{racAiAgentCommand}"
+-                                value="{{row.pathDraft}}"
++                            <cr-input id="agentPath"
++                                label="$i18n{racAiAgentCommand}"
++                                value="[[item.command]]"
+                                 placeholder="$i18n{racAiAgentCommandPlaceholder}"
+-                                invalid="[[row.pathInvalid]]"
++                                invalid="[[pathInvalid_]]"
+                                 error-message="$i18n{racAiAgentCommandInvalid}"
+                                 on-change="onPathChange_"
+                                 spellcheck="false" maxlength="1024">
+@@ -506,44 +525,144 @@
+                             <div class="cr-secondary-text">
+                               $i18n{racAiAgentCustomHelp}
+                             </div>
+-                            <div class="row-buttons">
+-                              <cr-button on-click="onRemoveCustom_"
+-                                  hidden$="[[!row.pathDraft]]">
++                            <div class="row-buttons" hidden$="[[!item.command]]">
++                              <cr-button on-click="onRemoveCustom_">
+                                 $i18n{racAiAgentRemove}
+                               </cr-button>
+                             </div>
+                           </div>
+                         </template>
+-                        <template is="dom-if" if="[[hasSignIn_(row)]]">
++                        <template is="dom-if" if="[[item.signInCommand]]"
++                            restamp>
+                           <div class="sign-in">
+-                            <div class="label cr-title-text">
++                            <div class="label">
+                               $i18n{racAiAgentHowToSignIn}
+                             </div>
+                             <span class="cr-secondary-text">
+                               $i18n{racAiAgentRun}
+                             </span>
+-                            <code>[[row.signInCommand]]</code>
++                            <code>[[item.signInCommand]]</code>
+                             <span class="cr-secondary-text">
+-                              [[row.signInTail]]
++                              [[item.signInTail]]
+                             </span>
+                             <cr-button on-click="onCopy_">
+-                              [[copyLabel_(row.copied)]]
++                              [[copyLabel_(copied_)]]
+                             </cr-button>
+                           </div>
+-                          <div class="cr-secondary-text">[[row.terms]]</div>
++                          <div class="quiet">[[item.terms]]</div>
+                         </template>
+-                        <template is="dom-if" if="[[isAgent_(row)]]">
++                      </template>
++                      <template is="dom-if" if="[[!item.agent]]" restamp>
++                        <template is="dom-if" if="[[canEditUrl_(selected_)]]" restamp>
++                          <div class="field">
++                            <cr-input id="baseUrl" label="$i18n{racAiBaseUrl}"
++                                value="[[selected_.baseUrl]]"
++                                placeholder="[[selected_.defaultBaseUrl]]"
++                                invalid="[[baseUrlInvalid_]]"
++                                error-message="$i18n{racAiBaseUrlInvalid}"
++                                spellcheck="false" maxlength="512">
++                            </cr-input>
++                            <div class="cr-secondary-text">
++                              $i18n{racAiBaseUrlHelp}
++                            </div>
++                            <div class="cr-secondary-text" hidden$="[[!urlNote_]]">
++                              [[urlNote_]]
++                            </div>
++                          </div>
++                        </template>
++                        <template is="dom-if" if="[[needsKey_(selected_)]]" restamp>
++                          <div class="field">
++                            <cr-input id="key" type="password" label="$i18n{racAiKey}"
++                                invalid="[[keyFailed_]]"
++                                error-message="$i18n{racAiKeyFailed}"
++                                autocomplete="off" spellcheck="false" maxlength="4096">
++                            </cr-input>
++                            <div class="cr-secondary-text">
++                              <span hidden$="[[!hasKey_(selected_)]]">
++                                $i18n{racAiKeySaved}
++                              </span>
++                              <span hidden$="[[!hasNoKey_(selected_)]]">
++                                $i18n{racAiKeyNone}
++                              </span>
++                            </div>
++                            <div class="row-buttons">
++                              <cr-button class="action-button" on-click="onSaveKey_">
++                                $i18n{racAiSaveKey}
++                              </cr-button>
++                              <cr-button on-click="onRemoveKey_"
++                                  hidden$="[[!hasKey_(selected_)]]">
++                                $i18n{racAiRemoveKey}
++                              </cr-button>
++                            </div>
++                            <div class="cr-secondary-text" hidden$="[[!keyNote_]]">
++                              [[keyNote_]]
++                            </div>
++                          </div>
++                        </template>
++                        <template is="dom-if" if="[[keyNotNeeded_(selected_)]]" restamp>
++                          <div class="field cr-secondary-text">
++                            $i18n{racAiKeyNotNeeded}
++                          </div>
++                        </template>
++                        <div class="field">
++                          <div class="label">$i18n{racAiModels}</div>
++                          <div class="chips" role="list" aria-label="$i18n{racAiModels}">
++                            <template is="dom-repeat" items="[[chips_]]" as="chip">
++                              <span class$="[[chipClass_(chip)]]" role="listitem">
++                                <button class="chip-model" on-click="onChipClick_"
++                                    title$="[[chipTip_(chip)]]">[[chip.model]]</button>
++                                <span class="chip-default"
++                                    hidden$="[[!chip.isDefault]]">
++                                  $i18n{racAiModelDefault}
++                                </span>
++                                <button class="chip-remove" on-click="onChipRemove_"
++                                    aria-label$="[[chipRemoveAria_(chip.model)]]">
++                                  ✕
++                                </button>
++                              </span>
++                            </template>
++                          </div>
++                          <template is="dom-if" if="[[modelChoices_.length]]" restamp>
++                            <select class="md-select" id="modelPick"
++                                aria-label="$i18n{racAiModelPick}"
++                                on-change="onModelPickChange_">
++                              <template is="dom-repeat" items="[[modelChoices_]]">
++                                <option value="[[item]]">[[item]]</option>
++                              </template>
++                            </select>
++                          </template>
++                          <cr-input id="model" label="$i18n{racAiModelId}"
++                              placeholder="[[selected_.defaultModel]]"
++                              on-keydown="onModelKeydown_"
++                              spellcheck="false" maxlength="512">
++                          </cr-input>
++                          <div class="cr-secondary-text">
++                            $i18n{racAiModelPickHelp}
++                          </div>
+                           <div class="row-buttons">
+-                            <cr-button on-click="onCheckAgain_">
+-                              $i18n{racAiAgentCheckAgain}
++                            <cr-button on-click="onAddModel_">
++                              $i18n{racAiModelAdd}
+                             </cr-button>
++                            <template is="dom-if" if="[[canEditUrl_(selected_)]]" restamp>
++                              <cr-button on-click="onSaveSettings_">
++                                $i18n{racAiSaveSettings}
++                              </cr-button>
++                            </template>
+                           </div>
+-                        </template>
+-                      </div>
+-                    </cr-collapse>
+-                  </div>
+-                </template>
+-              </div>
++                          <div class$="[[connectionClass_(connectionChecking_, connectionOk_)]]"
++                              hidden$="[[!connectionVisible_(connectionChecking_, connectionOk_, connectionMessage_)]]">
++                            [[connectionText_(connectionChecking_, connectionOk_, connectionMessage_)]]
++                          </div>
++                          <div class="cr-secondary-text" hidden$="[[!saveNote_]]">
++                            [[saveNote_]]
++                          </div>
++                        </div>
++
++                      </template>
++                    </div>
++                  </template>
++                </div>
++              </template>
+             </template>
+           </div>
+         </div>
+--- a/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts
++++ b/chrome/browser/resources/settings/privacy_page/rac_ai_page.ts
+@@ -51,30 +51,30 @@
+   needsNode?: boolean;
+ }
+ 
+-interface RacAiAgentRow {
+-  kind: 'agent'|'group'|'custom';
++// One row of the browser's provider list (provider_list.h).
++interface RacAiListRow {
+   id: string;
++  agent: boolean;
+   name: string;
+-  monogram: string;
+-  path: string;
+-  placeholder: string;
+-  pathDraft: string;
+-  pathInvalid: boolean;
+-  status: 'ready'|'error'|'missing'|'unset';
+-  statusText: string;
+-  detail: string;
+-  missing: boolean;
+-  expanded: boolean;
+-  signInCommand: string;
+-  signInTail: string;
+-  terms: string;
+-  copied: boolean;
++  chosen: boolean;
++  notInstalled: boolean;
++  canUseBrowser?: boolean;
++}
++
++interface RacAiListGroup {
++  group: 'agents'|'apiKey'|'local';
++  rows: RacAiListRow[];
+ }
+ 
+ interface RacAiState {
+   available: boolean;
+   provider?: string;
++  agentId?: string;
++  directUsable?: boolean;
+   providers?: RacAiProvider[];
++  // Only once the agent probe has answered.
++  agents?: RacAiAgent[];
++  providerList?: RacAiListGroup[];
+ }
+ 
+ // One model chip: a pinned model, marked when it is the provider's default.
+@@ -83,12 +83,68 @@
+   isDefault: boolean;
+ }
+ 
+-const AGENT_ORDER =
+-    ['codex', 'claude', 'cursor', 'gemini', 'copilot', 'opencode', 'goose'];
++// What the provider list draws, top to bottom: group titles, the agent
++// probe's placeholder, the "Not installed" toggle, and provider rows.
++interface ListItem {
++  kind: 'title'|'loading'|'more'|'row';
++  key: string;
++  name: string;
++  recheck: boolean;
++  id: string;
++  agent: boolean;
++  custom: boolean;
++  chosen: boolean;
++  notInstalled: boolean;
++  monogram: string;
++  subtitle: string;
++  subId: string;
++  status: ''|'ready'|'error';
++  statusText: string;
++  runs: string;
++  detail: string;
++  override: string;
++  placeholder: string;
++  command: string;
++  signInCommand: string;
++  signInTail: string;
++  terms: string;
++}
+ 
+-function agentOrder(id: string): number {
+-  const index = AGENT_ORDER.indexOf(id);
+-  return index < 0 ? AGENT_ORDER.length : index;
++function blankItem(kind: ListItem['kind'], key: string, name: string):
++    ListItem {
++  return {
++    kind,
++    key,
++    name,
++    recheck: false,
++    id: '',
++    agent: false,
++    custom: false,
++    chosen: false,
++    notInstalled: false,
++    monogram: '',
++    subtitle: '',
++    subId: '',
++    status: '',
++    statusText: '',
++    runs: '',
++    detail: '',
++    override: '',
++    placeholder: '',
++    command: '',
++    signInCommand: '',
++    signInTail: '',
++    terms: '',
++  };
++}
++
++// The host and port of a server address, for a row's subtitle.
++function hostOf(url: string): string {
++  try {
++    return new URL(url).host;
++  } catch {
++    return '';
++  }
+ }
+ 
+ interface SiteRule {
+@@ -132,6 +188,10 @@
+     return getTemplate();
+   }
+ 
++  static get observers() {
++    return ['onBrowserControlChanged_(prefs.rac.ai.browser_control.value)'];
++  }
++
+   static get properties() {
+     return {
+       available_: {type: Boolean, value: false},
+@@ -144,11 +204,14 @@
+       connectionChecking_: {type: Boolean, value: false},
+       connectionOk_: {type: Boolean, value: false},
+       connectionMessage_: {type: String, value: ''},
+-      selectedId_: {type: String, value: ''},
+       selected_: {type: Object, value: null},
+       baseUrlInvalid_: {type: Boolean, value: false},
+       keyFailed_: {type: Boolean, value: false},
+-      rows_: {type: Array, value: () => []},
++      items_: {type: Array, value: () => []},
++      focusKey_: {type: String, value: ''},
++      directUsable_: {type: Boolean, value: false},
++      pathInvalid_: {type: Boolean, value: false},
++      copied_: {type: Boolean, value: false},
+       agentsLoading_: {type: Boolean, value: false},
+       missingOpen_: {type: Boolean, value: false},
+       siteRuleInvalid_: {type: Boolean, value: false},
+@@ -235,21 +298,25 @@
+   declare private connectionChecking_: boolean;
+   declare private connectionOk_: boolean;
+   declare private connectionMessage_: string;
+-  declare private selectedId_: string;
+   declare private selected_: RacAiProvider|null;
+   declare private baseUrlInvalid_: boolean;
+   declare private keyFailed_: boolean;
+-  declare private rows_: RacAiAgentRow[];
++  declare private items_: ListItem[];
++  declare private focusKey_: string;
++  declare private directUsable_: boolean;
++  declare private pathInvalid_: boolean;
++  declare private copied_: boolean;
+   declare private agentsLoading_: boolean;
+   declare private missingOpen_: boolean;
+   private onPage_ = false;
+   private modelChoicesProvider_ = '';
+   private agentsLoaded_ = false;
+-  private seenExpand_ = new Set<string>();
++  private state_: RacAiState|null = null;
+ 
+   override currentRouteChanged(newRoute: Route) {
+     this.onPage_ = newRoute === routes.RAC_AI;
+     this.loadAgentsIfShown_();
++    this.buildItems_();
+     this.loadModelsIfSelected_();
+   }
+ 
+@@ -276,18 +343,27 @@
+   }
+ 
+   private applyState_(state: RacAiState) {
++    this.state_ = state;
+     this.available_ = state.available;
+     if (!state.available) {
+       this.agentsLoaded_ = false;
+-      this.rows_ = [];
++      this.missingOpen_ = false;
+       this.modelChoices_ = [];
+       this.chips_ = [];
+     }
+-    this.loadAgentsIfShown_();
+     this.providers_ = state.providers || [];
+-    this.selectedId_ = state.provider || '';
+-    this.selected_ =
+-        this.providers_.find(p => p.id === this.selectedId_) || null;
++    this.directUsable_ = !!state.directUsable;
++    // The direct provider whose setup shows: only while its row is the
++    // chosen one. With an agent chosen, nothing asks the provider for its
++    // models.
++    const chosen = (state.providerList || [])
++                       .flatMap(group => group.rows)
++                       .find(row => row.chosen && !row.agent);
++    this.selected_ = chosen ?
++        (this.providers_.find(p => p.id === chosen.id) || null) :
++        null;
++    this.buildItems_();
++    this.loadAgentsIfShown_();
+     this.chips_ =
+         (this.selected_?.models || [])
+             .map(
+@@ -304,7 +380,7 @@
+       this.modelChoices_ = [];
+       return;
+     }
+-    const providerId = this.selectedId_;
++    const providerId = this.selected_.id;
+     if (this.modelChoicesProvider_ !== providerId) {
+       this.modelChoices_ = [];
+     }
+@@ -313,14 +389,14 @@
+     }
+     sendWithPromise<{models: string[]}>('racAiGetProviderModels', providerId)
+         .then(result => {
+-          // A reply for a provider that's no longer selected is stale.
+-          if (this.selectedId_ === providerId) {
++          // A reply for a provider that's no longer chosen is stale.
++          if (this.selected_?.id === providerId) {
+             this.modelChoices_ = result.models || [];
+             this.modelChoicesProvider_ = providerId;
+           }
+         })
+         .catch(() => {
+-          if (this.selectedId_ === providerId) {
++          if (this.selected_?.id === providerId) {
+             this.modelChoices_ = [];
+           }
+         });
+@@ -428,8 +504,9 @@
+     return this.i18n('racAiModelRemove', model);
+   }
+ 
+-  // The login shell is only asked for its PATH once this section is on screen
+-  // with the assistant on.
++  // The login shell is only asked for its PATH while this page itself is on
++  // screen with the assistant on. A settings search renders the section too,
++  // and must not start a shell.
+   private loadAgentsIfShown_() {
+     if (this.onPage_ && this.available_ && !this.agentsLoaded_ &&
+         !this.agentsLoading_) {
+@@ -437,209 +514,328 @@
+     }
+   }
+ 
++  // The browser answers with the whole state, so the list and the agents it
++  // describes always come from one answer.
+   private loadAgents_(refresh: boolean) {
+     this.agentsLoading_ = true;
+-    sendWithPromise<RacAiAgent[]>('racAiListAgents', refresh)
+-        .then(agents => {
++    sendWithPromise<RacAiState>('racAiListAgents', refresh)
++        .then(state => {
+           this.agentsLoading_ = false;
+           this.agentsLoaded_ = true;
+-          this.applyAgents_(agents);
++          this.applyState_(state);
+         })
+         .catch(() => {
+           this.agentsLoading_ = false;
+         });
+   }
+ 
+-  private applyAgents_(agents: RacAiAgent[]) {
+-    const previous = new Map(this.rows_.map(row => [row.id, row]));
+-    agents = [...agents].sort((a, b) => agentOrder(a.id) - agentOrder(b.id));
+-    const active: RacAiAgentRow[] = [];
+-    const missing: RacAiAgentRow[] = [];
+-    let custom: RacAiAgentRow|null = null;
+-    for (const agent of agents) {
+-      const row = this.makeRow_(agent, previous.get(agent.id));
+-      if (agent.id === 'custom') {
+-        custom = row;
+-      } else if (row.missing) {
+-        missing.push(row);
++  private onBrowserControlChanged_() {
++    this.buildItems_();
++  }
++
++  // Turns the browser's grouped list into what the template draws. The
++  // browser decides the order and the chosen row; this only adds the words.
++  private buildItems_() {
++    const state = this.state_;
++    if (!state || !state.available) {
++      this.items_ = [];
++      return;
++    }
++    const agents =
++        new Map((state.agents || []).map(agent => [agent.id, agent]));
++    const browserControl = !!this.prefs &&
++        this.getPref<boolean>('rac.ai.browser_control').value;
++    const items: ListItem[] = [];
++    for (const group of state.providerList || []) {
++      if (group.group === 'agents') {
++        const looking = !state.agents && this.onPage_;
++        // Before the probe has run (a settings search), an empty group says
++        // nothing useful.
++        if (!group.rows.length && !looking) {
++          continue;
++        }
++        items.push({
++          ...blankItem(
++              'title', 'title:agents', this.i18n('racAiGroupAgents')),
++          recheck: !!state.agents,
++        });
++        if (looking) {
++          items.push(blankItem(
++              'loading', 'loading', this.i18n('racAiAgentLooking')));
++        }
++        const missing = group.rows.filter(row => row.notInstalled).length;
++        let toggled = false;
++        for (const row of group.rows) {
++          if (row.notInstalled && !toggled) {
++            toggled = true;
++            items.push(blankItem(
++                'more', 'more',
++                this.i18n('racAiAgentNotInstalledGroup', missing)));
++          }
++          items.push(this.agentItem_(row, agents.get(row.id), browserControl));
++        }
++        continue;
++      }
++      items.push(blankItem(
++          'title', `title:${group.group}`,
++          this.i18n(
++              group.group === 'apiKey' ? 'racAiGroupApiKey' :
++                                         'racAiGroupLocal')));
++      for (const row of group.rows) {
++        items.push(this.directItem_(row));
++      }
++    }
++    this.items_ = items;
++    if (!items.some(item => item.key === this.focusKey_)) {
++      this.focusKey_ = this.anchorKey_();
++    }
++  }
++
++  private rowItem_(row: RacAiListRow): ListItem {
++    const prefix = row.agent ? 'agent' : 'direct';
++    const item = blankItem('row', `${prefix}:${row.id}`, row.name);
++    item.id = row.id;
++    item.agent = row.agent;
++    item.chosen = row.chosen;
++    item.notInstalled = row.notInstalled;
++    item.subId = `sub-${prefix}-${row.id}`;
++    item.monogram = row.name.charAt(0).toUpperCase();
++    return item;
++  }
++
++  private agentItem_(
++      row: RacAiListRow, agent: RacAiAgent|undefined,
++      browserControl: boolean): ListItem {
++    const item = this.rowItem_(row);
++    if (row.id === 'custom') {
++      item.custom = true;
++      item.command = agent?.command || '';
++      item.runs = this.i18n('racAiAgentRunsCustom');
++      if (!item.command) {
++        item.monogram = '+';
++        item.subtitle = this.i18n('racAiAgentCustomSub');
+       } else {
+-        active.push(row);
++        item.subtitle = item.command;
++        if (agent!.installed) {
++          this.setStatus_(item, 'ready');
++        } else {
++          this.setStatus_(item, 'error', 'racAiAgentCantRun');
++          item.detail = this.i18n('racAiAgentCommandInvalid');
++        }
+       }
++      return item;
+     }
+-    const rows = active;
+-    if (missing.length > 0) {
+-      rows.push({
+-        ...this.makeBlankRow_('group'),
+-        id: 'not-installed',
+-        name: this.i18n('racAiAgentNotInstalledGroup', missing.length),
+-      });
+-      rows.push(...missing);
++    item.runs = this.i18n('racAiAgentRuns', row.name);
++    item.override = agent?.override || '';
++    item.placeholder = agent?.path || this.i18n('racAiAgentNotFound');
++    item.subtitle = browserControl && row.canUseBrowser === false ?
++        this.i18n('racAiAgentChatOnly') :
++        (agent?.path || '');
++    if (agent?.needsNode) {
++      this.setStatus_(item, 'error', 'racAiAgentNeedsNodeStatus');
++      item.detail = this.i18n('racAiAgentNeedsNode');
++    } else if (agent?.installed) {
++      this.setStatus_(item, 'ready');
++    } else if (agent && !row.notInstalled) {
++      // Chosen, but no longer found.
++      this.setStatus_(item, 'error', 'racAiAgentNotFound');
+     }
+-    if (custom) {
+-      rows.push(custom);
++    const commandKey = `racAiSignInCommand_${row.id}`;
++    if (loadTimeData.valueExists(commandKey)) {
++      item.signInCommand = loadTimeData.getString(commandKey);
++      item.signInTail = loadTimeData.getString(`racAiSignInTail_${row.id}`);
++      item.terms = loadTimeData.getString(`racAiTerms_${row.id}`);
+     }
+-    this.rows_ = rows;
++    return item;
+   }
+ 
+-  private makeBlankRow_(kind: RacAiAgentRow['kind']): RacAiAgentRow {
+-    return {
+-      kind,
+-      id: '',
+-      name: '',
+-      monogram: '',
+-      path: '',
+-      placeholder: '',
+-      pathDraft: '',
+-      pathInvalid: false,
+-      status: 'unset',
+-      statusText: '',
+-      detail: '',
+-      missing: false,
+-      expanded: false,
+-      signInCommand: '',
+-      signInTail: '',
+-      terms: '',
+-      copied: false,
+-    };
++  private directItem_(row: RacAiListRow): ListItem {
++    const item = this.rowItem_(row);
++    const provider = this.providers_.find(p => p.id === row.id);
++    if (!provider) {
++      return item;
++    }
++    if (!provider.requiresKey) {
++      item.subtitle = hostOf(provider.baseUrl || provider.defaultBaseUrl);
++    } else if (provider.editableBaseUrl) {
++      item.subtitle = hostOf(provider.baseUrl) ||
++          this.i18n('racAiCustomServerSub');
++    } else if (provider.hasKey) {
++      item.subtitle = provider.model || provider.defaultModel;
++    }
++    if (provider.requiresKey && provider.hasKey) {
++      this.setStatus_(item, 'ready', 'racAiKeySavedStatus');
++    }
++    return item;
+   }
+ 
+-  private makeRow_(agent: RacAiAgent, old?: RacAiAgentRow): RacAiAgentRow {
+-    const isCustom = agent.id === 'custom';
+-    const row = this.makeBlankRow_(isCustom ? 'custom' : 'agent');
+-    row.id = agent.id;
+-    row.name = isCustom ? this.i18n('racAiAgentCustomName') : agent.name;
+-    row.monogram =
+-        isCustom && !agent.command ? '+' : row.name.charAt(0).toUpperCase();
+-    row.path = isCustom ? (agent.command || '') : (agent.path || '');
+-    row.placeholder = agent.path || this.i18n('racAiAgentNotFound');
+-    row.pathDraft = isCustom ? (agent.command || '') : (agent.override || '');
+-    if (isCustom) {
+-      row.status = !agent.command ? 'unset' :
+-          agent.installed         ? 'ready' :
+-                                    'error';
+-      row.detail =
+-          row.status === 'error' ? this.i18n('racAiAgentCommandInvalid') : '';
+-    } else if (agent.needsNode) {
+-      row.status = 'error';
+-      row.detail = this.i18n('racAiAgentNeedsNode');
+-    } else {
+-      row.status = agent.installed ? 'ready' : 'missing';
+-    }
+-    row.missing = row.status === 'missing';
+-    row.statusText = row.status === 'ready' ? this.i18n('racAiAgentReady') :
+-        row.status === 'error'              ? this.i18n('racAiAgentError') :
+-                                              '';
+-    const commandKey = `racAiSignInCommand_${agent.id}`;
+-    if (loadTimeData.valueExists(commandKey)) {
+-      row.signInCommand = loadTimeData.getString(commandKey);
+-      row.signInTail = loadTimeData.getString(`racAiSignInTail_${agent.id}`);
+-      row.terms = loadTimeData.getString(`racAiTerms_${agent.id}`);
+-    }
+-    // Rows that need attention open once; after that the user decides.
+-    if (old) {
+-      row.expanded = old.expanded;
+-    } else if (row.status === 'error' && !this.seenExpand_.has(row.id)) {
+-      row.expanded = true;
+-    }
+-    this.seenExpand_.add(row.id);
+-    return row;
+-  }
+-
+-  private onPathChange_(event: Event&{model: {index: number}}) {
+-    const row = this.rows_[event.model.index];
+-    const input = event.target as HTMLInputElement;
+-    const value = input.value.trim();
+-    if (!row) {
+-      return;
+-    }
+-    const message = row.kind === 'custom' ? 'racAiSetCustomAgentCommand' :
+-                                            'racAiSetAgentPath';
+-    const args = row.kind === 'custom' ? [value] : [row.id, value];
+-    this.set(`rows_.${event.model.index}.pathInvalid`, false);
+-    sendWithPromise(message, ...args)
+-        .then(() => this.loadAgents_(false))
+-        .catch(() => {
+-          this.set(`rows_.${event.model.index}.pathInvalid`, true);
+-        });
++  private setStatus_(
++      item: ListItem, status: 'ready'|'error', textKey?: string) {
++    item.status = status;
++    item.statusText = this.i18n(
++        textKey ||
++        (status === 'ready' ? 'racAiAgentReady' : 'racAiAgentError'));
+   }
+ 
+-  private onRemoveCustom_() {
+-    sendWithPromise('racAiSetCustomAgentCommand', '')
+-        .then(() => this.loadAgents_(false));
++  // The row Tab lands on when focus comes into the list: the chosen row, or
++  // the first one when nothing is chosen yet.
++  private anchorKey_(): string {
++    const rows = this.items_.filter(item => item.kind === 'row');
++    return (rows.find(item => item.chosen) || rows[0])?.key || '';
+   }
+ 
+-  private onCheckAgain_() {
+-    this.loadAgents_(true);
++  private tabIndex_(key: string, focusKey: string): number {
++    return key === focusKey ? 0 : -1;
+   }
+ 
+-  private onCopy_(event: Event&{model: {index: number}}) {
+-    const row = this.rows_[event.model.index];
+-    if (!row) {
++  private visibleRadios_(): HTMLElement[] {
++    return Array
++        .from(this.shadowRoot!.querySelectorAll<HTMLElement>(
++            '#providerList .provider'))
++        .filter(radio => !radio.closest('[hidden]'));
++  }
++
++  // Arrows move between rows without choosing; Space or Enter chooses. Tab
++  // leaves the rows for the chosen row's setup.
++  private onListKeydown_(event: KeyboardEvent) {
++    const target = event.target as HTMLElement;
++    if (!target.classList.contains('provider') || event.altKey ||
++        event.ctrlKey || event.metaKey) {
+       return;
+     }
+-    const index = event.model.index;
+-    navigator.clipboard.writeText(row.signInCommand).then(() => {
+-      this.set(`rows_.${index}.copied`, true);
+-      setTimeout(() => {
+-        if (this.rows_[index]) {
+-          this.set(`rows_.${index}.copied`, false);
+-        }
+-      }, 1500);
+-    });
++    if (event.key === ' ' || event.key === 'Enter') {
++      event.preventDefault();
++      this.choose_(target.dataset['key'] || '');
++      return;
++    }
++    const radios = this.visibleRadios_();
++    const index = radios.indexOf(target);
++    let next = -1;
++    switch (event.key) {
++      case 'ArrowDown':
++      case 'ArrowRight':
++        next = (index + 1) % radios.length;
++        break;
++      case 'ArrowUp':
++      case 'ArrowLeft':
++        next = (index - 1 + radios.length) % radios.length;
++        break;
++      case 'Home':
++        next = 0;
++        break;
++      case 'End':
++        next = radios.length - 1;
++        break;
++      default:
++        return;
++    }
++    event.preventDefault();
++    radios[next]?.focus();
++  }
++
++  private onRowFocus_(event: Event) {
++    const row = event.currentTarget as HTMLElement;
++    this.focusKey_ = row.dataset['key'] || '';
++  }
++
++  // Leaving the list puts the Tab stop back on the chosen row.
++  private onListFocusout_(event: FocusEvent) {
++    const list = this.shadowRoot!.querySelector('#providerList');
++    const next = event.relatedTarget as Node | null;
++    if (list && (!next || !list.contains(next))) {
++      this.focusKey_ = this.anchorKey_();
++    }
++  }
++
++  private onRowClick_(event: Event) {
++    this.choose_((event.currentTarget as HTMLElement).dataset['key'] || '');
++  }
++
++  // Choosing goes through the browser's one choice path, so Settings and
++  // the chat always agree. Choosing an agent starts nothing; it runs when
++  // the user sends.
++  private choose_(key: string) {
++    const item = this.items_.find(i => i.kind === 'row' && i.key === key);
++    if (!item || item.chosen) {
++      return;
++    }
++    this.focusKey_ = key;
++    this.baseUrlInvalid_ = false;
++    this.keyFailed_ = false;
++    this.pathInvalid_ = false;
++    this.copied_ = false;
++    this.clearConnection_();
++    sendWithPromise<RacAiState>(
++        item.agent ? 'racAiSelectAgent' : 'racAiSetProvider', item.id)
++        .then(state => this.applyState_(state));
+   }
+ 
+-  private isAgent_(row: RacAiAgentRow): boolean {
+-    return row.kind === 'agent';
++  private chosenAgent_(): ListItem|undefined {
++    return this.items_.find(item => item.kind === 'row' && item.agent &&
++                                item.chosen);
++  }
++
++  private onPathChange_(event: Event) {
++    const item = this.chosenAgent_();
++    if (!item) {
++      return;
++    }
++    const value = (event.target as HTMLInputElement).value.trim();
++    this.pathInvalid_ = false;
++    const sent = item.custom ?
++        sendWithPromise('racAiSetCustomAgentCommand', value) :
++        sendWithPromise('racAiSetAgentPath', item.id, value);
++    sent.then(() => this.loadAgents_(false)).catch(() => {
++      this.pathInvalid_ = true;
++    });
+   }
+ 
+-  private isGroup_(row: RacAiAgentRow): boolean {
+-    return row.kind === 'group';
++  private onRemoveCustom_() {
++    sendWithPromise('racAiSetCustomAgentCommand', '')
++        .then(() => this.loadAgents_(false));
+   }
+ 
+-  private isCustom_(row: RacAiAgentRow): boolean {
+-    return row.kind === 'custom';
++  private onCheckAgain_() {
++    this.loadAgents_(true);
+   }
+ 
+-  private isRowHidden_(row: RacAiAgentRow, missingOpen: boolean): boolean {
+-    return row.missing && !missingOpen;
++  private onCopy_() {
++    const item = this.chosenAgent_();
++    if (!item) {
++      return;
++    }
++    navigator.clipboard.writeText(item.signInCommand).then(() => {
++      this.copied_ = true;
++      setTimeout(() => {
++        this.copied_ = false;
++      }, 1500);
++    });
+   }
+ 
+-  private hasStatus_(row: RacAiAgentRow): boolean {
+-    return row.status === 'ready' || row.status === 'error';
++  private isKind_(item: ListItem, kind: ListItem['kind']): boolean {
++    return item.kind === kind;
+   }
+ 
+-  private statusClass_(row: RacAiAgentRow): string {
+-    return `status ${row.status}`;
++  private isRowHidden_(item: ListItem, missingOpen: boolean): boolean {
++    return item.notInstalled && !missingOpen;
+   }
+ 
+-  private hasDetail_(row: RacAiAgentRow): boolean {
+-    return !!row.detail;
++  private itemClass_(item: ListItem): string {
++    return item.chosen ? 'item chosen' : 'item';
+   }
+ 
+-  private hasSignIn_(row: RacAiAgentRow): boolean {
+-    return !!row.signInCommand;
++  private ariaChecked_(item: ListItem): string {
++    return item.chosen ? 'true' : 'false';
+   }
+ 
+-  private rowSubtitle_(row: RacAiAgentRow): string {
+-    if (row.kind === 'custom' && row.status === 'unset') {
+-      return this.i18n('racAiAgentCustomHelp');
+-    }
+-    return row.path || this.i18n('racAiAgentNotInstalled');
++  private statusClass_(item: ListItem): string {
++    return `status ${item.status}`;
+   }
+ 
+   private copyLabel_(copied: boolean): string {
+     return this.i18n(copied ? 'racAiAgentCopied' : 'racAiAgentCopy');
+   }
+ 
+-  private onProviderChange_(event: Event) {
+-    const id = (event.target as HTMLSelectElement).value;
+-    this.baseUrlInvalid_ = false;
+-    this.keyFailed_ = false;
+-    this.clearConnection_();
+-    sendWithPromise<RacAiState>('racAiSetProvider', id)
+-        .then(state => this.applyState_(state));
+-  }
+-
+   // Saving is the moment to find out the settings are wrong, not the next
+   // chat. Runs after the browser has the new address and key.
+   private checkConnection_() {
+@@ -710,10 +906,6 @@
+     return searchRequest.getSearchResult();
+   }
+ 
+-  private isSelected_(id: string, selectedId: string): boolean {
+-    return id === selectedId;
+-  }
+-
+   private needsKey_(selected: RacAiProvider|null): boolean {
+     return !!selected && selected.requiresKey;
+   }
+--- a/chrome/browser/ui/webui/settings/rac_ai_handler.cc
++++ b/chrome/browser/ui/webui/settings/rac_ai_handler.cc
+@@ -24,6 +24,7 @@
+ #include "chrome/browser/rac/ai/ai_service_factory.h"
+ #include "chrome/browser/rac/ai/model_catalog.h"
+ #include "chrome/browser/rac/ai/model_list.h"
++#include "chrome/browser/rac/ai/provider_list.h"
+ #include "chrome/browser/rac/ai/providers.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/prefs/scoped_user_pref_update.h"
+@@ -69,6 +70,9 @@
+ }
+ 
+ void RacAiHandler::OnEnabledChanged() {
++  if (!rac::ai::IsAiEnabled(profile_->GetPrefs())) {
++    agents_.reset();
++  }
+   FireWebUIListener("rac-ai-state-changed", CreateState());
+ }
+ 
+@@ -97,6 +101,9 @@
+       "racAiSetProvider", base::BindRepeating(&RacAiHandler::HandleSetProvider,
+                                               base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
++      "racAiSelectAgent", base::BindRepeating(&RacAiHandler::HandleSelectAgent,
++                                              base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
+       "racAiSaveSettings",
+       base::BindRepeating(&RacAiHandler::HandleSaveSettings,
+                           base::Unretained(this)));
+@@ -167,6 +174,22 @@
+                          .Set("hasKey", service->key_store().HasKey(info.id)));
+   }
+   state.Set("providers", std::move(providers));
++  state.Set("directUsable", service->HasUsableDirectProvider());
++
++  // The one provider list. A fresh profile's default provider isn't a choice
++  // the user made, so nothing shows chosen until they choose or set it up.
++  rac::ai::ProviderListInput list_input;
++  list_input.direct_provider = rac::ai::ChosenDirectProvider(
++      *prefs, service->HasUsableDirectProvider());
++  if (agent) {
++    list_input.agent = agent->id;
++  }
++  if (agents_) {
++    list_input.agents = rac::ai::ParseFoundAgents(*agents_);
++    state.Set("agents", agents_->Clone());
++  }
++  state.Set("providerList", rac::ai::ProviderListToValue(
++                                rac::ai::BuildProviderList(list_input)));
+   return state;
+ }
+ 
+@@ -194,6 +217,26 @@
+   ResolveJavascriptCallback(args[0], CreateState());
+ }
+ 
++// Choosing an agent launches nothing; it runs only when the user sends.
++void RacAiHandler::HandleSelectAgent(const base::ListValue& args) {
++  AllowJavascript();
++  CHECK_EQ(args.size(), 2u);
++  const std::string& id = args[1].GetString();
++  if (!rac::ai::AiServiceFactory::GetForProfile(profile_) ||
++      profile_->IsOffTheRecord()) {
++    RejectJavascriptCallback(args[0], base::Value());
++    return;
++  }
++  {
++    base::AutoReset<bool> choosing(&choosing_provider_, true);
++    if (!rac::ai::SelectAgent(profile_->GetPrefs(), id)) {
++      RejectJavascriptCallback(args[0], base::Value());
++      return;
++    }
++  }
++  ResolveJavascriptCallback(args[0], CreateState());
++}
++
+ void RacAiHandler::HandleSaveSettings(const base::ListValue& args) {
+   AllowJavascript();
+   CHECK_EQ(args.size(), 4u);
+@@ -493,7 +536,7 @@
+   rac::ai::AiService* service =
+       rac::ai::AiServiceFactory::GetForProfile(profile_);
+   if (!service || profile_->IsOffTheRecord()) {
+-    ResolveJavascriptCallback(args[0], base::ListValue());
++    ResolveJavascriptCallback(args[0], CreateState());
+     return;
+   }
+   auto done = base::BindOnce(&RacAiHandler::OnAgentsListed,
+@@ -505,11 +548,17 @@
+   }
+ }
+ 
++// The page gets the whole state back, so the list it draws and the agents
++// it describes come from one answer.
+ void RacAiHandler::OnAgentsListed(base::Value callback_id,
+                                   base::ListValue agents) {
+-  if (IsJavascriptAllowed()) {
+-    ResolveJavascriptCallback(callback_id, agents);
++  if (!IsJavascriptAllowed()) {
++    return;
++  }
++  if (rac::ai::AiServiceFactory::GetForProfile(profile_)) {
++    agents_ = std::move(agents);
+   }
++  ResolveJavascriptCallback(callback_id, CreateState());
+ }
+ 
+ // Checking a file touches the disk, so it runs off the UI thread. An empty
+--- a/chrome/browser/ui/webui/settings/rac_ai_handler.h
++++ b/chrome/browser/ui/webui/settings/rac_ai_handler.h
+@@ -50,6 +50,7 @@
+   void SendState();
+   void HandleGetState(const base::ListValue& args);
+   void HandleSetProvider(const base::ListValue& args);
++  void HandleSelectAgent(const base::ListValue& args);
+   void HandleSaveSettings(const base::ListValue& args);
+   void HandleSaveModels(const base::ListValue& args);
+   void HandleSetKey(const base::ListValue& args);
+@@ -89,6 +90,10 @@
+   // Set while this page chooses, so the page hears its own choice once.
+   bool choosing_provider_ = false;
+   bool state_update_pending_ = false;
++  // The agent probe's last answer, kept so a state update can draw the
++  // provider list without asking the login shell again. Empty until the
++  // page has asked (only while it's on screen, with AI on).
++  std::optional<base::ListValue> agents_;
+   base::WeakPtrFactory<RacAiHandler> weak_factory_{this};
+ };
+ 
+--- a/chrome/browser/ui/webui/settings/rac_ai_strings.cc
++++ b/chrome/browser/ui/webui/settings/rac_ai_strings.cc
+@@ -91,15 +91,28 @@
+     {"racAiSiteKind", "Rule for the site"},
+     {"racAiSiteAdd", "Add rule"},
+     {"racAiSiteInvalid", "Enter a web address, like example.com"},
+-    {"racAiAgents", "Agents"},
+-    {"racAiAgentsDescription",
+-     "Use an AI agent you already have installed, with your own login."},
++    // The one provider list.
++    {"racAiGroupAgents", "Agents on this Mac"},
++    {"racAiGroupApiKey", "API key"},
++    {"racAiGroupLocal", "Local model"},
++    {"racAiKeySavedStatus", "Key saved"},
++    {"racAiCustomServerSub", "Any OpenAI-compatible server"},
++    {"racAiAgentLooking", "Looking for agents on this Mac…"},
++    {"racAiAgentRuns",
++     "Runs $1 on this Mac each time you send. Its shell, file, and web tools "
++     "stay off."},
++    {"racAiAgentRunsCustom",
++     "Runs this command on this Mac each time you send."},
++    {"racAiAgentNeedsDirect",
++     "Link summaries and the safety check need an API key or a local model."},
++    {"racAiAgentChatOnly", "Chat only; can't use the browser yet"},
++    {"racAiAgentNeedsNodeStatus", "Needs Node.js"},
++    {"racAiAgentCantRun", "Can't run"},
++    {"racAiAgentCustomSub", "Your own ACP agent"},
+     // Found and runnable. Whether the user is signed in shows only when the
+     // agent runs, since checking would start it.
+     {"racAiAgentReady", "Installed"},
+     {"racAiAgentError", "Error"},
+-    {"racAiAgentChecking", "Checking…"},
+-    {"racAiAgentNotInstalled", "Not installed"},
+     {"racAiAgentNotInstalledGroup", "Not installed ($1)"},
+     {"racAiAgentNeedsNode", "Needs Node.js (npx) to run."},
+     {"racAiAgentPath", "Path"},
+@@ -112,7 +125,6 @@
+     {"racAiAgentCopied", "Copied"},
+     {"racAiAgentCheckAgain", "Check again"},
+     {"racAiAgentAddCustom", "Add a custom agent"},
+-    {"racAiAgentCustomName", "Custom ACP command"},
+     {"racAiAgentCommand", "Command"},
+     {"racAiAgentCommandPlaceholder", "/path/to/agent --acp"},
+     {"racAiAgentCustomHelp",
+@@ -133,8 +145,11 @@
+     {"racAiSignInCommand_copilot", "copilot"},
+     {"racAiSignInTail_copilot", "in Terminal, then type /login."},
+     {"racAiSignInCommand_opencode", "opencode auth login"},
++    // OpenCode's free models refuse every client but OpenCode's own, so
++    // they don't work through rac (docs/internals/ai.md).
+     {"racAiSignInTail_opencode",
+-     "in Terminal. Free models work without signing in."},
++     "in Terminal and sign in to a model provider. OpenCode's free models "
++     "don't work in rac."},
+     {"racAiSignInCommand_goose", "goose configure"},
+     {"racAiSignInTail_goose", "in Terminal."},
+     {"racAiTerms_codex",

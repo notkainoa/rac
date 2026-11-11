@@ -76,6 +76,15 @@ Code. Open chat pages and Settings watch these prefs, so a choice shows
 everywhere at once. A reply reads the choice, model included, when it
 starts and keeps it, so a change applies to the next message.
 
+Settings shows every provider in one list (`provider_list.h` decides the
+groups, their order, and the chosen row). Agents come first once one is
+found, or while the search for them runs, so a found agent fills the top
+instead of pushing the list down. Nothing is chosen for the user: a fresh
+profile's default provider isn't shown as chosen, and one found agent is
+never picked, because choosing an agent is the consent to run it. Gemini,
+Copilot, and Goose rows say they're chat only while browser control is on
+(see [Permission rule](#permission-rule)).
+
 The model menu asks each set-up provider for its model list when the menu
 opens, and Settings asks only while the Assistant page itself is open (a
 settings search renders the section too, and must not send the key):
@@ -318,8 +327,10 @@ This is the rule that's easiest to break by accident. How it holds:
 - Link hover, the context-menu item, and the find bar's Ask check
   `ShouldOffer…` or `CanAskAssistant` first and return before creating
   anything.
-- The agent PATH probe is lazy. Opening the model picker runs the cached
-  probe once. It never starts an agent.
+- The agent PATH probe is lazy. Opening the model picker, or Settings'
+  Assistant page while it's on screen, runs the cached probe once; a
+  settings search that shows the section doesn't. It never starts an
+  agent.
 
 When you add AI code:
 
