@@ -1905,6 +1905,30 @@ class RunTest(RemoteBuildTest):
         self.assertIn('command 38003', written)
         self.assertNotIn('commands ', written)
 
+    def test_run_on_settings_assistant_takes_keyboard_navigation(self):
+        # Settings › Assistant passed as a run arg may also take focus
+        # moves and choices; text, other keys and pointer input stay out,
+        # and so does any other settings page in the same run.
+        req = self.folder / 'req.txt'
+        write(req, 'key tab ; nspress tab shift ; key down ; nspress space ; '
+                   'key return ; key escape ; burst shots 2 100\n')
+        for url in ('chrome://settings/assistant', 'RAC://Settings/assistant/'):
+            self.run_rb('run', self.wt, '--requests-file', req, '--timeout', '5',
+                        '--', url, success=True)
+        for line in ('type sk\n', 'nspress a\n', 'key backspace\n',
+                     'key tab ; click 1 2\n', 'nspress tab cmd\n'):
+            write(req, line)
+            result = self.run_rb('run', self.wt, '--requests-file', req,
+                                 '--', 'chrome://settings/assistant',
+                                 success=False)
+            self.assertEqual(result.returncode, 2, line)
+        write(req, 'key tab\n')
+        result = self.run_rb('run', self.wt, '--requests-file', req, '--',
+                             'chrome://settings/assistant',
+                             'chrome://settings/privacy', success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('keyboard navigation', result.stderr)
+
     def test_run_opening_a_settings_page_is_screenshot_only(self):
         # A settings page as a run arg allows only capture verbs in the
         # requests file: the Air refuses input before anything launches.
@@ -1913,13 +1937,13 @@ class RunTest(RemoteBuildTest):
                      'after 5 key return\n'):
             write(req, line)
             result = self.run_rb('run', self.wt, '--requests-file', req,
-                                 '--', 'chrome://settings/assistant',
+                                 '--', 'chrome://settings/privacy',
                                  success=False)
             self.assertEqual(result.returncode, 2, line)
             self.assertIn('screenshots', result.stderr, line)
         # Case, a trailing slash and rac:// don't dodge the detection.
         write(req, 'key tab\n')
-        for url in ('CHROME://SETTINGS/assistant', 'rac://settings/privacy/'):
+        for url in ('CHROME://SETTINGS/privacy', 'rac://settings/appearance/'):
             result = self.run_rb('run', self.wt, '--requests-file', req,
                                  '--', url, success=False)
             self.assertEqual(result.returncode, 2, url)
