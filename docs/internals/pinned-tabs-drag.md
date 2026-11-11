@@ -34,6 +34,17 @@ unpinned containers during a drag. rac does, and that breaks assumptions:
   the header. The band never takes the pin zone: it ends at least half a tab
   above the first place a drop would pin. Without the name row (no spaces
   UI) there's no room for a band, so the header is the favorites target.
+- **A drag becomes favorites whole or not at all.** A drag of whole tab
+  groups, or one holding a split tab or a tab without a view, is never
+  offered the favorites: the grid, the band and the header all behave as if
+  there were none (`CanDragBecomeFavorites()`). Tabs dragged out of a group
+  can become favorites; pinning takes each out of its group. A drop among the
+  favorites also forgets any pinned-tab position the drag passed through, so
+  one drop never makes both favorites and pinned tabs.
+- **Only windows that can make favorites change the header.** Incognito,
+  app and popup windows have no sidebar sync, so the header gate stays
+  closed and Chromium's drop bounds decide: the header tears a tab off, as
+  it always has.
 - **The band must not catch a drag on its way back.** Dropping into the band
   pins the tab, and the grid opens one row under it. The drag stays in the
   favorites until the pointer is below that row, and the band hangs from the
