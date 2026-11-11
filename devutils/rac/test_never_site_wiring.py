@@ -5,10 +5,11 @@
 # the terms of the GPL-3.0 license that can be found in the LICENSE file.
 """A never site's text stays out of the chat and the link summary.
 
-The checks themselves (NeverReadHost, PagePromptCache::DropNeverSites) have
-unit tests in rac_ai_unittests. The calls to them sit in the chat panel's
-page handler and the link summary's controller, which need a browser
-window, a WebUI, and a profile, so only `browser_tests` could run them. A
+The checks themselves (NeverReadHost, PagePromptCache::DropNeverSites,
+PrepareCacheForSend) have unit tests in rac_ai_unittests. The calls to them
+sit in the chat panel's page handler and the link summary's controller,
+which need a browser window, a WebUI, and a profile, so only `browser_tests`
+could run them. A
 refresh that drops one of those calls leaves everything building and every
 unit test green while the rule stops holding. So this reads the two files
 as rac's patches leave them (patched_files.py) and checks each call is still
@@ -25,6 +26,7 @@ import patched_files
 
 HANDLER = 'chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc'
 LINKS = 'chrome/browser/ui/views/rac/ai/link_summary_controller.cc'
+SEND = 'chrome/browser/rac/ai/chat_send.cc'
 
 
 def code(body):
@@ -69,14 +71,53 @@ class NeverSiteWiringTest(unittest.TestCase):
                       'a send no longer leaves never tabs out')
 
     def test_the_chat_cache_drops_never_sites_before_each_send(self):
+        # Each tab's conversation keeps its own cache (PageHandler::Chat's
+        # page_context). StartSession is the one place a request is built,
+        # for direct providers and agents alike, and it drops first.
         body = self.function(self.handler, 'void PageHandler::StartSession(')
-        drop = 'page_context_.DropNeverSites(SiteRules(profile_))'
+        drop = 'PrepareCacheForSend(chat.page_context, SiteRules(profile_))'
         why = ('a rule added mid-conversation must empty the cache before '
                'the next request, for direct providers and agents alike')
-        self.assert_before(body, drop, 'StartAgentSession(', why)
-        self.assert_before(body, drop, 'session_->Start()', why)
-        self.assert_before(body, drop, 'FireWebUIListener("rac-ai-attach-failed"',
+        self.assert_before(body, drop, 'StartAgentSession(chat,', why)
+        self.assert_before(body, drop, 'chat.session->Start()', why)
+        self.assert_before(body, drop, 'Emit(chat, kAttachFailedEvent',
                            'the user is no longer told which sites were left out')
+        # The seam is the drop itself.
+        seam = self.function(patched_files.final_text(SEND),
+                             'std::vector<std::string> PrepareCacheForSend(')
+        self.assertIn('cache.DropNeverSites(rules)', seam,
+                      'the send seam no longer drops never sites')
+
+    def test_every_send_goes_through_the_drop(self):
+        handler = code(self.handler)
+        # The page's one way to send, HandleSend, reads the attached tabs and
+        # then starts the session; nothing else starts one.
+        self.assertEqual(handler.count('"racAiSend"'), 1)
+        self.assertIn('ReadNextPage(*chat, std::move(send))',
+                      self.function(self.handler, 'void PageHandler::HandleSend('))
+        self.assertIn('ReadNextPage(chat, std::move(send))',
+                      self.function(self.handler, 'void PageHandler::OnPageRead('))
+        self.assertEqual(handler.count('StartSession(chat,'), 1,
+                         'a request is started outside the one send path')
+        self.assertIn('StartSession(chat, std::move(send))',
+                      self.function(self.handler, 'void PageHandler::ReadNextPage('))
+        # The agent's prompt is built only from StartSession, after the drop.
+        self.assertEqual(handler.count('StartAgentSession(chat,'), 1)
+        self.assertEqual(handler.count('page_context.Apply('), 1)
+        self.assertIn('chat.page_context.Apply(',
+                      self.function(self.handler,
+                                    'void PageHandler::StartAgentSession('))
+        # A direct provider's session gets the cache only in StartSession.
+        self.assertEqual(handler.count('&chat.page_context'), 1)
+        self.assertIn('&chat.page_context', self.function(
+            self.handler, 'void PageHandler::StartSession('))
+        # Every way the page sends (the composer, Ask, retry, the new tab
+        # page's question) ends in the one racAiSend, in startReply.
+        app = code(patched_files.final_text(
+            'chrome/browser/resources/rac_ai/app.ts'))
+        self.assertEqual(app.count("'racAiSend'"), 1)
+        self.assertIn("'racAiSend'", code(patched_files.braced_body(
+            app, 'function startReply(question: Message) {')))
 
     def test_attached_tabs_on_never_sites_are_not_read(self):
         body = self.function(self.handler, 'void PageHandler::ReadNextPage(')
