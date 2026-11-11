@@ -189,43 +189,72 @@ new tab page is a chat page of its own and is unchanged.
 
 ### Chat per tab
 
-Each tab has its own chat (issue #120). Open it on tab A, switch to B, and
-the panel closes; back on A, A's chat is open again, reply and all. The
-chat is a tab-scoped side panel entry, registered in the tab's own
-`SidePanelRegistry` the first time the assistant opens on the tab, so
-Chromium keeps the open or closed state per tab and shows the entry again
-when the tab comes back. There is no window entry: every way in goes
-through `ShowAssistantForTab` or `ToggleAssistantPanel`, since
-`SidePanelUI::Show(kRacAi)` finds nothing in a tab that never had a chat.
+Each tab has its own conversation (issue #120). Open the chat on tab A,
+switch to B, and the panel closes; back on A, A's conversation is there,
+reply and all. The memory cost stays where main had it: one chat page per
+window, however many tabs have a chat.
 
-- **The chat owns its page, not a view.** `AssistantChat` holds the chat
-  page's `WebContents`; the side panel's view (`AssistantWebView`) only
-  shows it, and the side panel deletes views freely. So a reply or an
-  agent task carries on in a background tab, and a chat can be shown
-  beside more than one tab, one at a time. The page is embedded in the tab
-  it last showed beside (`webui::SetTabInterface`), so its window follows
-  the tab across windows, and the page handler re-watches the new window
-  (`OnBrowserChanged`).
-- **What ends a chat.** Closing the panel ends the chat on that tab, as it
-  did per window; so does closing the tab, and turning AI off ends them
-  all. A chat shared with other tabs lives while any of them has it.
-  Switching tabs, or another side panel taking the panel, keeps it.
-- **A chat follows its agent task.** `open_tab` and `switch_tab` bring a
-  tab forward (`TabTools::IsBringingTabForward`), which would close the
-  panel mid-task. The page that owns the turn shows its chat beside that
+- **Open or closed is Chromium's, per tab.** The chat is a tab-scoped side
+  panel entry, registered in the tab's own `SidePanelRegistry` the first
+  time the assistant opens on the tab (`TabChat`), so Chromium keeps it
+  open or closed per tab and shows it again when the tab comes back. There
+  is no window entry: every way in goes through `ShowAssistantForTab` or
+  `ToggleAssistantPanel`, since `SidePanelUI::Show(kRacAi)` finds nothing in
+  a tab that never had a chat.
+- **One page per window.** Every tab's entry shows the same `chrome://rac-ai`
+  page (`AssistantChat`), so any number of open chats is one renderer. Each
+  `TabChat` holds a conversation key and a reference to the page; the last
+  chat to close releases the page and its renderer. A per-tab page cost
+  about 230 MB resident each in a dev build, which is why the page is
+  shared and the conversations are not.
+- **Conversations live in the browser.** The page handler keeps one `Chat`
+  per key: what the page showed before the latest reply, its history id and
+  title, its prompt cache, its reply (`ChatSession`) or ACP run, its agent
+  turn, and a `ReplyLog` of every event the page heard about the latest
+  reply. Provider calls already ran in the browser, so a reply on A keeps
+  going while B is on show. Only the conversation on show reaches the page.
+  When the panel moves to a tab with another conversation, the handler
+  sends `rac-ai-show`, and the page clears itself, loads the messages the
+  way it loads a saved chat, and replays the log through its normal
+  handlers, holding back history saves and title requests. Every event
+  names its conversation, and the page drops any other. The page tells the
+  browser when it shows something the log can't explain (New chat, a saved
+  chat opened, a title) with `racAiSyncConversation`.
+- **The log is capped at 512 KB per conversation** (`ReplyLog::kMaxBytes`).
+  Text joins into one entry, so the log grows with the reply, not with the
+  number of updates. An event that would pass the cap is dropped whole and
+  stops the reply, which ends with "This reply got too long, so the
+  assistant stopped it." as a browser stop. So the page and the log always
+  hold the same transcript. A conversation's input is already capped at
+  400 KB, so an ordinary reply never gets near it.
+- **A reply that ends in the background** is saved to history by the
+  browser, as the page would have saved it, and named when the user comes
+  back to it.
+- **Approval cards.** An answer names the conversation, the card's action,
+  and the nonce the browser gave the card when it last put it on show
+  (`CardGate`). The browser takes it only for the conversation on show, the
+  action that conversation waits on, and the newest nonce, and the card is
+  used up. A card drawn again (back on its tab) gets a new nonce, so a click
+  from the copy it replaced is refused, and after a tab switch a click can
+  never reach another tab's card. Stop and Resume name the conversation
+  too, and stop only its own task.
+- **What ends a conversation.** Closing the panel on its tab, closing the
+  last tab that shows it, or turning AI off. Ending it stops its reply and
+  its agent task, and a card waiting with it. Switching tabs, or another
+  side panel taking the panel, keeps it. A tab moved to another window
+  takes its messages along (`CarryAssistantConversation`); its reply
+  stops.
+- **A conversation follows its agent task.** `open_tab` and `switch_tab`
+  bring a tab forward (`TabTools::IsBringingTabForward`), which would close
+  the panel mid-task. The conversation that owns the turn shows beside that
   tab in the same task, and the tab the indicator moves to shows it too.
   So the cards stay in reach wherever the agent works, and the user's own
-  tab switches still follow the tab. A tab with a chat of its own keeps
-  it.
+  tab switches still follow the tab. A tab with a conversation of its own
+  keeps it.
 - **Split view.** The panel follows the focused pane. Moving between the
-  two panes of a split shares the open chat with the other pane rather than
-  closing it on every click (`ChatMove::kShareWithSplit`); an internal pane
-  gets none.
-- **Cost.** A chat page is created only when the assistant opens on a tab
-  and is released with the chat. Each open chat is its own renderer
-  process: in a component dev build, about 230 MB of resident memory each,
-  most of it shared library pages. A user who opens the chat on many tabs
-  pays for each until they close it there.
+  two panes of a split shares the open conversation with the other pane
+  rather than closing it on every click (`ChatMove::kShareWithSplit`); an
+  internal pane gets none.
 
 ## AI off costs nothing
 
@@ -245,7 +274,9 @@ This is the rule that's easiest to break by accident. How it holds:
   on its active tab, which keeps the assistant off internal pages. Tabs get
   a chat entry only when the assistant opens on them.
 - Turning AI off cancels requests, stops the agent process, closes the
-  panel, drops every tab's chat entry (ending its chat), and navigates open assistant tabs to the ordinary new tab page. A
+  panel, drops every tab's chat entry, ends every conversation (and the
+  window's chat page with them), and navigates open assistant tabs to the
+  ordinary new tab page. A
   service or controller that already exists stays in memory but dormant.
 - Link hover, the context-menu item, and the find bar's Ask check
   `ShouldOffer…` or `CanAskAssistant` first and return before creating
@@ -771,9 +802,10 @@ The controller and the sidebar talk through events, and the sidebar has
 exactly one parser.
 
 - The controller builds events with the functions in `agent_events.cc` and
-  sends them through `DispatchAgentEvent`. The page handler forwards them,
-  as the `racAiAgentEvent` WebUI listener, only to a page that has a reply
-  running.
+  sends them through `DispatchAgentEvent`. The page handler logs them with
+  the conversation that owns the turn, and forwards them, as the
+  `racAiAgentEvent` WebUI listener, only while that conversation's reply is
+  running and on show.
 - `agent_events.ts` is the only place that reads event fields
   (`parseAgentEvent`). It drops anything malformed and caps every string.
   To add an event, add a builder, a case in `parseAgentEvent`, and a case in
@@ -815,7 +847,8 @@ exactly one parser.
   its fix a link away. The confirm card is the only surface, a tint with
   no edge: what it will do, one line on what could happen and where, and
   the buttons. Stop stays in the composer.
-- Decisions go back with `racAiAgentRespond(id, decision)`. There are two
+- Decisions go back with `racAiAgentRespond(id, decision, conversation,
+  nonce)`, checked as in [Chat per tab](#chat-per-tab). There are two
   spellings: the cards say `allow`, `confirm`, `skip`, `always`, `grant`,
   `stop`, and the controller says `allow_once` and `deny`. Both are accepted at the bridge
   and anything else is ignored, as is a stale ID. A bridge that accepted only
