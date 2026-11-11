@@ -2,8 +2,9 @@
 
 How a drag moves tabs between the favorites grid, the pinned section, its
 folders, and the open tabs, and the traps in that code. The patches are in
-`patches/rac/pinned/`: `drag.patch`, `motion.patch`, `snap.patch`, in that
-order, after the patches that add the item store and the sections.
+`patches/rac/pinned/`: `drag.patch`, `motion.patch`, `snap.patch`, and
+`drag-to-favorite.patch`, in that order, after the patches that add the item
+store and the sections.
 
 ## Dragging
 
@@ -22,8 +23,26 @@ unpinned containers during a drag. rac does, and that breaks assumptions:
 - **Chromium creates a window to carry tabs dragged out of the tab strip.**
   Its sync sees the drag before it starts, so it doesn't fill the window
   with items. Otherwise that window would stay open after the tabs move on.
-- The pointer, not the tab, picks the container: above the open tabs'
-  scroll view means favorites.
+- **The pointer, not the tab, picks the container.** Above the open tabs'
+  scroll view means favorites. A window with no favorites also gives them a
+  band at the top of the open tabs (`favorites_drop.cc`), over the space's
+  name row, so a drag doesn't have to reach into the header to find them.
+  Without that row (no spaces UI), the band shrinks over "+ New Tab", or
+  goes away when a pinned tab is at the very top; the header stays a
+  favorites target either way.
+  Going up, the order is open tabs, then the pin zone where the divider
+  opens, then the band. The band never takes the pin zone: it ends at least
+  half a tab above the first place a drop would pin, so with no pinned tabs
+  and no favorites both stay reachable.
+- **The band must not catch a drag on its way back.** Dropping into the band
+  pins the tab, and the grid opens one row under it. The drag stays in the
+  favorites until the pointer is below that row, and the band hangs from the
+  top of the tab strip, not from the open tabs, which move while the grid
+  opens and closes. Otherwise the closing grid would carry the band down onto
+  the pointer and the tab would bounce back into the favorites.
+- **The band waits while the open tabs are scrolled.** Their top edge then
+  scrolls them up during a drag, so the band only exists at the top of the
+  list. Above the open tabs still means favorites.
 - **The old views must not show.** After a pin change mid-drag, Chromium
   animates the old view out right under the new one. Its layer is hidden,
   since the animation keeps resetting its opacity.
@@ -41,7 +60,18 @@ the first open tab. It opens only when a drag reaches the top of the open
 tabs, so other drags don't shift the open tabs under the pointer.
 
 The layout manager takes its duration from `gfx::Animation::RichAnimationDuration`,
-so Reduce Motion makes these changes instant.
+so Reduce Motion makes these changes instant. That includes the favorites
+grid opening its first row when a drag drops into the band.
+
+While a drag is in the favorites grid, the cell it would drop into shows the
+row hover fill. It's painted only while that grid handles a drag, in windows
+whose drags can make favorites, so it costs nothing at rest.
+
+A drag that reaches the favorites or the pinned tabs taps the trackpad once
+(`NSHapticFeedbackPatternAlignment`, `drag_haptics.mm`). Only moving into one
+of them from somewhere else in the same drag counts: where a drag starts,
+hovering, moving within the pinned tabs, leaving for the open tabs, and
+cancelling don't.
 
 A dragged tab is drawn pulled toward the slot it would drop into
 (`drag_snap.cc`): favorites stay near their cell and glide to the next one,
