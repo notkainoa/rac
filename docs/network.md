@@ -13,11 +13,17 @@ drift from what the build really does.
 AI off, Helium services off, a single fresh window left idle:
 
 ```hosts
-# None. A fresh profile with defaults contacts no host: three 10-minute
-# captures of the signed 0.1.0 dry-run DMG (2026-11-11; first launch
-# skipped, the tour left open, and the tour closed without consent) saw
-# nothing leave the browser.
+github.com  # rac's update check (Sparkle, at launch), the one default contact
 ```
+
+That update check is the only thing a default rac sends. Captures of the
+signed 0.1.0 dry-run DMG (2026-11-11): Chromium's net-log saw nothing leave
+the browser in three 10-minute runs (first launch skipped, the tour left
+open, the tour closed without consent), and the OS record (below) saw rac's
+main process connect to `github.com` once at launch. Sparkle checks the
+feed with macOS's own NSURLSession, outside Chromium's network stack, so
+only the OS record can see it. Turn updates off on the About rac page and
+rac contacts nothing.
 
 One line per host, or `*.example.com`, which covers `example.com` itself and
 every subdomain (but not `example.com.evil.net`). The IP addresses sockets
@@ -93,6 +99,19 @@ WebSockets, proxy resolution), and `hostlist.py compare` fails the job when
 a seen host isn't listed above. The net-log and host list are uploaded as
 the `net-capture-*` artifact.
 
+The net-log only sees Chromium's own network stack. Some of rac's traffic
+goes around it, like Sparkle's update check through macOS NSURLSession, so
+the capture also keeps an **OS record** for the whole run: root `tcpdump`
+on `pktap` writes DNS answers and every new TCP connection tagged with the
+process that opened it, and `lsof` polls rac's own processes every second.
+The DNS cache is flushed first so rac's lookups reach the wire.
+`devutils/rac/os_hosts.py` joins them into the hosts rac's processes
+reached, named from DNS: the main process (NSURLSession) and helpers (the
+network service, which the net-log covers too). A named host missing from
+the list above fails the job like a net-log host; an address with no DNS
+answer is reported, not failed. Connections macOS makes on rac's behalf
+(`trustd` checking a certificate) belong to the OS and aren't counted.
+
 ## What changes when you turn things on
 
 - **Helium services.** Extension downloads, uBlock filter lists, spell
@@ -113,14 +132,15 @@ the `net-capture-*` artifact.
   Turned on, rac talks only to the provider you configure: your API key's
   endpoint, a local model, or an installed agent's own CLI. There is no
   rac-hosted AI server.
-- **Updates.** `rac.browser_updates` is on by default. The feed is
-  `github.com/notkainoa/rac/releases/latest/download/appcast-<arch>.xml`,
-  and GitHub serves release assets from a CDN host
-  (`objects.githubusercontent.com` — TODO: confirm the exact host). The
-  10-minute captures above saw no update check: Sparkle's first scheduled
-  check comes later in a session, so these hosts aren't in the default
-  list yet. TODO: capture a session long enough to include the check and
-  list its hosts. The check never touches `updates.helium.computer`.
+- **Updates.** `rac.browser_updates` is on by default, and Sparkle checks
+  the feed at launch: `github.com/notkainoa/rac/releases/latest/download/appcast-<arch>.xml`.
+  GitHub redirects release downloads to a CDN host. No rac release was
+  published when the default list was captured, so the feed request
+  didn't redirect and the CDN host isn't listed yet; the first capture of
+  a published release will name it (and fail until it's listed). The check
+  never touches `updates.helium.computer`. When rac opens that TLS
+  connection, macOS's own `trustd` may check the certificate with Apple;
+  that's the operating system, not rac, and the OS record doesn't count it.
 - **Crash reports.** Off. `rac/privacy/disable-crash-uploads.patch` empties
   the upload URL and deletes reports locally, so nothing is ever sent.
 - **Sync.** rac has no sync.

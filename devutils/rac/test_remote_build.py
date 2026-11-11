@@ -703,6 +703,11 @@ class BuildBaseTest(RemoteBuildTest):
 
     def run_base(self, *args, **env):
         env.setdefault('RAC_REMOTE_REPO_URL', str(self.origin))
+        # build-base refuses under its 120 GB floor, and the df stub falls
+        # back to the host's real df, so without this the tests passed or
+        # failed with the free disk of whatever Mac ran them. Tests of the
+        # floor itself pass their own DF_AVAILABLE.
+        env.setdefault('DF_AVAILABLE', '500')
         return self.run_rb(*args, **env)
 
     def hand_bootstrapped_base(self):
@@ -743,6 +748,16 @@ class BuildBaseTest(RemoteBuildTest):
                              success=False)
         self.assertIn('replaced by build-base', result.stderr)
         self.assertEqual(self.calls(), '')
+
+    def test_build_base_refuses_under_its_disk_floor(self):
+        # A cold build needs room: under the floor (120 GB by default) the
+        # Pro refuses before cloning anything.
+        result = self.run_base('build-base', 'base-156', success=False,
+                               DF_AVAILABLE='50')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('50 GB free', result.stderr)
+        self.assertIn('120 GB floor', result.stderr)
+        self.assertFalse((self.remote_root / 'base').exists())
 
     def test_build_base_prepares_the_base(self):
         result = self.run_base('build-base', 'base-156', success=True)

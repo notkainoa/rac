@@ -65,6 +65,17 @@ the agent's safety check. An agent is a provider for chat, and also a
 source of browser tool calls, but it is never asked to judge its own
 actions.
 
+Exactly one provider is active per profile: the agent in `rac.ai.agent_id`
+when it names one, else the direct provider in `rac.ai.provider`. Settings
+and the chat's model menu change it only through `SelectDirectProvider` and
+`SelectAgent` (`active_provider.h`). Choosing a direct provider clears the
+agent; choosing an agent keeps the direct provider underneath, for link
+summaries and the safety check. A handler that wrote `rac.ai.provider`
+itself is how Settings once said OpenAI while the chat kept using Claude
+Code. Open chat pages and Settings watch these prefs, so a choice shows
+everywhere at once. A reply reads the choice, model included, when it
+starts and keeps it, so a change applies to the next message.
+
 The model menu asks each set-up provider for its model list when the menu
 opens, and Settings asks only while the Assistant page itself is open (a
 settings search renders the section too, and must not send the key):
@@ -175,10 +186,10 @@ Its callers apply it differently:
   `go_back` judges the entry it goes back to by the same rule
   (`IsInternalEntry`), on the approval card and in the step, except that
   the step may go back to a blank page.
-- The entry points (`IsAssistantBlockedHere`: the Chat button, the edge
-  handle, the Assistant command, Find's Ask, the command bar's Ask row via
-  `Need::kWebPage`) go by the address bar's address, and a blank tab
-  doesn't block them. The agent opens its tabs blank first, and a new tab
+- The entry points (`IsAssistantBlockedHere`: the Chat buttons in the
+  top bar and the sidebar, the edge handle, the Assistant command, Find's
+  Ask, the command bar's Ask row via `Need::kWebPage`) go by the address
+  bar's address, and a blank tab doesn't block them. The agent opens its tabs blank first, and a new tab
   on its way to a web page would otherwise flash the panel shut, mid-task.
 - Link summaries (`ShouldOfferLinkSummary`, for Option-hover and
   "Summarize Link") need both: the tab, which holds the page the link is
@@ -312,12 +323,13 @@ This is the rule that's easiest to break by accident. How it holds:
 - The `AgentController` is created only when AI is on, browser control is on,
   and the profile is regular (`IsBrowserControlAllowed`).
 - Pref listeners stay registered so that turning AI on works without a
-  restart: the top bar host, each window's `WindowAssistant`, the pull
-  handle, the Assistant action. They watch a pref and do nothing else. The visible
-  parts (Chat button, handle, menu entry, native action) are created only
-  while AI is on, and removed when it turns off. So is each window's watch
-  on its active tab, which keeps the assistant off internal pages. Tabs get
-  a chat entry only when the assistant opens on them.
+  restart: the top bar and sidebar Chat hosts, each window's
+  `WindowAssistant`, the pull handle, the Assistant action. They watch a
+  pref and do nothing else. The visible parts (Chat buttons, handle, menu
+  entry, native action) are created only while AI is on, and removed when
+  it turns off. So is each window's watch on its active tab, which keeps
+  the assistant off internal pages. Tabs get a chat entry only when the
+  assistant opens on them.
 - Turning AI off cancels requests, stops the agent process, closes the
   panel, drops every tab's chat entry, ends every conversation (and the
   window's chat page with them), and navigates open assistant tabs to the

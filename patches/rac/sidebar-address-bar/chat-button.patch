@@ -1,0 +1,518 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3751,6 +3751,8 @@ static_library("ui") {
+       "views/helium/native_frame_materials.h",
+       "views/rac/sidebar/cleanup_button.cc",
+       "views/rac/sidebar/cleanup_button.h",
++      "views/rac/sidebar_address_bar/sidebar_chat_button.cc",
++      "views/rac/sidebar_address_bar/sidebar_chat_button.h",
+       "views/rac/sidebar_address_bar/sidebar_header_view.cc",
+       "views/rac/sidebar_address_bar/sidebar_header_view.h",
+       "views/rac/sidebar_reveal/sidebar_overshoot.h",
+@@ -3762,6 +3764,7 @@ static_library("ui") {
+     ]
+     deps += [ "//chrome/browser/ui/views/rac:sidebar_overshoot_zone" ]
+     deps += [ "//chrome/browser/ui/views/rac:window_buttons_ratio" ]
++    deps += [ "//chrome/browser/ui/views/rac:sidebar_chat_state" ]
+ 
+     sources += get_target_outputs(":webui_name_variants")
+ 
+--- a/chrome/browser/ui/views/location_bar/location_bar_view.cc
++++ b/chrome/browser/ui/views/location_bar/location_bar_view.cc
+@@ -88,6 +88,7 @@
+ #include "chrome/browser/ui/views/page_info/page_info_bubble_view.h"
+ #include "chrome/browser/ui/views/permissions/chip/permission_chip_view.h"
+ #include "chrome/browser/ui/views/permissions/chip/permission_dashboard_view.h"
++#include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_chat_button.h"
+ #include "chrome/browser/ui/views/rac/site_controls/site_controls_button.h"
+ #include "chrome/browser/ui/views/rac/top_bar.h"
+ #include "chrome/browser/ui/views/toolbar/pinned_toolbar_actions_container.h"
+@@ -543,6 +544,7 @@ void LocationBarView::Init() {
+   RefreshClearAllButtonIcon();
+ 
+   rac::AddSiteControlsButton(this, browser_);
++  rac::AddSidebarChatButton(this, browser_);
+ 
+   auto ai_mode_hint_label = std::make_unique<views::Label>(
+       std::u16string(), CONTEXT_OMNIBOX_PRIMARY, views::style::STYLE_PRIMARY);
+@@ -968,6 +970,10 @@ void LocationBarView::Layout(PassKey) {
+     add_trailing_decoration(site_controls, /*intra_item_padding=*/0,
+                             /*edge_padding=*/trailing_decorations_edge_padding);
+   }
++  if (views::View* chat = rac::UpdateSidebarChatForLayout(this)) {
++    add_trailing_decoration(chat, /*intra_item_padding=*/0,
++                            /*edge_padding=*/trailing_decorations_edge_padding);
++  }
+ 
+   if (features::IsPageActionsElevatedToolbarEnabled()) {
+     if (page_action_container_ && page_action_container_->GetVisible()) {
+--- a/chrome/browser/ui/views/rac/BUILD.gn
++++ b/chrome/browser/ui/views/rac/BUILD.gn
+@@ -321,3 +321,23 @@ test("rac_switcher_layout_unittests") {
+     "//ui/views",
+   ]
+ }
++
++# When the Sidebar layout's Chat button exists and shows.
++source_set("sidebar_chat_state") {
++  sources = [
++    "sidebar_address_bar/sidebar_chat_state.cc",
++    "sidebar_address_bar/sidebar_chat_state.h",
++  ]
++  deps = [ "//base" ]
++}
++
++# Build with `autoninja -C out/Default
++# chrome/browser/ui/views/rac:rac_sidebar_chat_unittests`.
++test("rac_sidebar_chat_unittests") {
++  sources = [ "sidebar_address_bar/sidebar_chat_state_unittest.cc" ]
++  deps = [
++    ":sidebar_chat_state",
++    "//base/test:run_all_unittests",
++    "//testing/gtest",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_chat_button.cc
+@@ -0,0 +1,255 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_chat_button.h"
++
++#include <iterator>
++#include <memory>
++#include <optional>
++#include <string>
++
++#include "base/functional/bind.h"
++#include "base/memory/raw_ptr.h"
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
++#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/omnibox/omnibox_controller.h"
++#include "chrome/browser/ui/omnibox/omnibox_edit_model.h"
++#include "chrome/browser/ui/rac/layout_prefs.h"
++#include "chrome/browser/ui/ui_features.h"
++#include "chrome/browser/ui/views/location_bar/location_bar_view.h"
++#include "chrome/browser/ui/views/rac/ai/assistant_side_panel.h"
++#include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_chat_state.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "components/prefs/pref_service.h"
++#include "ui/accessibility/ax_enums.mojom.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/vector_icon_types.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/border.h"
++#include "ui/views/controls/button/button.h"
++#include "ui/views/controls/button/image_button.h"
++#include "ui/views/controls/button/image_button_factory.h"
++#include "ui/views/controls/highlight_path_generator.h"
++#include "ui/views/layout/fill_layout.h"
++#include "ui/views/view.h"
++#include "ui/views/view_utils.h"
++
++namespace rac {
++
++namespace {
++
++using gfx::ARC_TO;
++using gfx::CANVAS_DIMENSIONS;
++using gfx::CLOSE;
++using gfx::CUBIC_TO;
++using gfx::MOVE_TO;
++using gfx::STROKE;
++
++// The Top bar Chat pill's speech bubble as an outline, at the stroke and
++// footprint of the site controls' tune icon beside it, so it is no heavier
++// than its neighbour.
++// clang-format off
++constexpr gfx::PathElement kChatOutlinePath[] = {
++    CANVAS_DIMENSIONS, 20,
++    STROKE, 1.5f,
++    MOVE_TO, 3.5f, 9.75f,
++    ARC_TO, 6.5f, 5.75f, 0, 0, 1, 16.5f, 9.75f,
++    ARC_TO, 6.5f, 5.75f, 0, 0, 1, 10, 15.5f,
++    CUBIC_TO, 7.16f, 15.5f, 4.72f, 15.66f, 3.58f, 15.79f,
++    CUBIC_TO, 4.8f, 14.39f, 3.5f, 12.01f, 3.5f, 9.75f,
++    CLOSE,
++};
++// clang-format on
++constexpr gfx::VectorIconRep kChatOutlineReps[] = {{kChatOutlinePath}};
++constexpr gfx::VectorIcon kChatOutlineIcon = {
++    kChatOutlineReps, std::size(kChatOutlineReps), "rac_chat_outline"};
++
++// The icon itself, drawn the way the site controls button beside it is.
++class ChatIconButton : public views::ImageButton {
++  METADATA_HEADER(ChatIconButton, views::ImageButton)
++
++ public:
++  explicit ChatIconButton(BrowserWindowInterface* browser) {
++    SetCallback(
++        base::BindRepeating(&ToggleChatFromSidebar, base::Unretained(browser)));
++    views::ConfigureVectorImageButton(this);
++    views::InstallCircleHighlightPathGenerator(this);
++    const std::u16string name =
++        l10n_util::GetStringUTF16(IDS_RAC_ASSISTANT_TOOLTIP);
++    SetTooltipText(name);
++    GetViewAccessibility().SetName(name);
++    GetViewAccessibility().SetRole(ax::mojom::Role::kToggleButton);
++    GetViewAccessibility().SetCheckedState(ax::mojom::CheckedState::kFalse);
++    SetBorder(views::CreateEmptyBorder(
++        GetLayoutInsets(LOCATION_BAR_PAGE_ACTION_ICON_PADDING)));
++  }
++  ChatIconButton(const ChatIconButton&) = delete;
++  ChatIconButton& operator=(const ChatIconButton&) = delete;
++  ~ChatIconButton() override = default;
++
++  // Lit the way a toolbar button is while its side panel is open.
++  void ShowOpen(bool open) {
++    if (open == open_highlight_.has_value()) {
++      return;
++    }
++    if (open) {
++      open_highlight_ = AddAnchorHighlight();
++    } else {
++      open_highlight_.reset();
++    }
++    GetViewAccessibility().SetCheckedState(
++        open ? ax::mojom::CheckedState::kTrue
++             : ax::mojom::CheckedState::kFalse);
++  }
++
++  // views::ImageButton:
++  void OnThemeChanged() override {
++    views::ImageButton::OnThemeChanged();
++    const SkColor color = GetColorProvider()->GetColor(kColorOmniboxActionIcon);
++    views::SetImageFromVectorIconWithColor(
++        this, kChatOutlineIcon,
++        GetLayoutConstant(LayoutConstant::kLocationBarTrailingIconSize),
++        views::IconColors(color, SkColorSetA(color, 0x66)));
++  }
++
++ private:
++  std::optional<views::Button::ScopedAnchorHighlight> open_highlight_;
++};
++
++BEGIN_METADATA(ChatIconButton)
++END_METADATA
++
++// Lives in the address bar for the window's life. Holds the icon while it
++// exists and keeps it in step with the AI pref, the layout, the chat panel,
++// and the page beside it.
++class SidebarChatHost : public views::View {
++  METADATA_HEADER(SidebarChatHost, views::View)
++
++ public:
++  explicit SidebarChatHost(BrowserWindowInterface* browser)
++      : browser_(browser) {
++    SetLayoutManager(std::make_unique<views::FillLayout>());
++    SetVisible(false);
++    pref_change_registrar_.Init(browser_->GetProfile()->GetPrefs());
++    pref_change_registrar_.Add(
++        ai::kEnabled,
++        base::BindRepeating(&SidebarChatHost::Update, base::Unretained(this)));
++    pref_change_registrar_.Add(
++        kLayout,
++        base::BindRepeating(&SidebarChatHost::Update, base::Unretained(this)));
++    Update();
++  }
++  SidebarChatHost(const SidebarChatHost&) = delete;
++  SidebarChatHost& operator=(const SidebarChatHost&) = delete;
++  ~SidebarChatHost() override = default;
++
++  bool wants_visible() const { return state_.visible; }
++
++ private:
++  void Update() {
++    const PrefService* prefs = browser_->GetProfile()->GetPrefs();
++    const bool regular_profile = browser_->GetProfile()->IsRegularProfile();
++    const bool ai_enabled = ai::IsAiEnabled(prefs);
++    const bool sidebar_layout = GetLayout(prefs) == Layout::kSidebar;
++    // Watch the panel, and ask the assistant about the window, only while
++    // there's a button to keep in step.
++    const bool wanted = regular_profile && ai_enabled && sidebar_layout;
++    if (wanted && !panel_subscription_) {
++      panel_subscription_ = ai::AddAssistantPanelOpenCallback(
++          browser_, base::BindRepeating(&SidebarChatHost::Update,
++                                        base::Unretained(this)));
++    } else if (!wanted) {
++      panel_subscription_ = {};
++    }
++    const SidebarChatState state =
++        GetSidebarChatState(regular_profile, ai_enabled, sidebar_layout,
++                            wanted && ai::IsAssistantBlockedHere(browser_),
++                            wanted && IsChatOpen(browser_));
++
++    if (state.exists && !button_) {
++      button_ = AddChildView(std::make_unique<ChatIconButton>(browser_));
++    } else if (!state.exists && button_) {
++      ChatIconButton* button = button_;
++      button_ = nullptr;
++      RemoveChildViewT(button);
++    }
++    if (button_) {
++      button_->ShowOpen(state.open);
++    }
++    if (state != state_) {
++      state_ = state;
++      // The address bar shows or hides the icon in its own layout.
++      if (parent()) {
++        parent()->InvalidateLayout();
++      }
++    }
++  }
++
++  const raw_ptr<BrowserWindowInterface> browser_;
++  raw_ptr<ChatIconButton> button_ = nullptr;
++  SidebarChatState state_;
++  PrefChangeRegistrar pref_change_registrar_;
++  base::CallbackListSubscription panel_subscription_;
++};
++
++BEGIN_METADATA(SidebarChatHost)
++END_METADATA
++
++SidebarChatHost* FindHost(const LocationBarView* location_bar) {
++  for (views::View* child : location_bar->children()) {
++    if (auto* host = views::AsViewClass<SidebarChatHost>(child)) {
++      return host;
++    }
++  }
++  return nullptr;
++}
++
++}  // namespace
++
++void AddSidebarChatButton(LocationBarView* location_bar,
++                          BrowserWindowInterface* browser) {
++  // The same windows as the Top bar's Chat pill (CreateAssistantButton()).
++  // GetSidebarChatState() never gives other profiles a button, so they get
++  // no host either, and nothing watches their prefs.
++  if (!browser ||
++      browser->GetType() != BrowserWindowInterface::Type::TYPE_NORMAL ||
++      !browser->GetProfile()->IsRegularProfile() ||
++      features::IsWebUIToolbarEnabled()) {
++    return;
++  }
++  location_bar->AddChildView(std::make_unique<SidebarChatHost>(browser));
++}
++
++views::View* UpdateSidebarChatForLayout(LocationBarView* location_bar) {
++  SidebarChatHost* host = FindHost(location_bar);
++  if (!host) {
++    return nullptr;
++  }
++  // As with the site controls, typing needs the room.
++  const OmniboxController* controller = location_bar->GetOmniboxController();
++  const bool visible =
++      host->wants_visible() &&
++      !(controller && controller->edit_model()->user_input_in_progress());
++  host->SetVisible(visible);
++  return visible ? host : nullptr;
++}
++
++void ToggleChatFromSidebar(BrowserWindowInterface* browser) {
++  chrome::ExecuteCommand(browser, IDC_RAC_ASSISTANT_TOGGLE);
++}
++
++bool IsChatOpen(BrowserWindowInterface* browser) {
++  return ai::IsAssistantPanelOpen(browser);
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_chat_button.h
+@@ -0,0 +1,37 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_ADDRESS_BAR_SIDEBAR_CHAT_BUTTON_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_ADDRESS_BAR_SIDEBAR_CHAT_BUTTON_H_
++
++class BrowserWindowInterface;
++class LocationBarView;
++
++namespace views {
++class View;
++}  // namespace views
++
++namespace rac {
++
++// The Sidebar layout's way into the chat: an icon at the end of the address
++// bar, just before the site controls, that opens and closes the chat panel
++// and stays lit while it's open. It does the Top bar's Chat pill's job and
++// follows the same rule: while AI is off, or in Top bar layout, only a small
++// pref watcher exists, with no button in it and nothing watching the panel.
++// Does nothing for windows that never have the chat (not a normal window,
++// incognito).
++void AddSidebarChatButton(LocationBarView* location_bar,
++                          BrowserWindowInterface* browser);
++
++// For the address bar's layout: the Chat button if it shows now, else null.
++views::View* UpdateSidebarChatForLayout(LocationBarView* location_bar);
++
++// The two calls the button makes: the pill's Assistant command, and whether
++// the window's chat panel is open.
++void ToggleChatFromSidebar(BrowserWindowInterface* browser);
++bool IsChatOpen(BrowserWindowInterface* browser);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_ADDRESS_BAR_SIDEBAR_CHAT_BUTTON_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_chat_state.cc
+@@ -0,0 +1,21 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_chat_state.h"
++
++namespace rac {
++
++SidebarChatState GetSidebarChatState(bool regular_profile,
++                                     bool ai_enabled,
++                                     bool sidebar_layout,
++                                     bool blocked_here,
++                                     bool panel_open) {
++  SidebarChatState state;
++  state.exists = regular_profile && ai_enabled && sidebar_layout;
++  state.visible = state.exists && !blocked_here;
++  state.open = state.visible && panel_open;
++  return state;
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_chat_state.h
+@@ -0,0 +1,36 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_ADDRESS_BAR_SIDEBAR_CHAT_STATE_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_ADDRESS_BAR_SIDEBAR_CHAT_STATE_H_
++
++namespace rac {
++
++// What the Sidebar layout's Chat button does for one window.
++struct SidebarChatState {
++  // The button is created. False means no button view exists and nothing
++  // watches the chat panel.
++  bool exists = false;
++  bool visible = false;
++  // The button shows that the chat panel is open.
++  bool open = false;
++
++  friend bool operator==(const SidebarChatState&,
++                         const SidebarChatState&) = default;
++};
++
++// The Chat button in the address bar exists only for a regular profile
++// (never Incognito or Guest, as for every AI surface), while AI is on and
++// the layout is Sidebar; the Top bar layout has its own Chat pill. It hides
++// beside an internal page, where there's nothing for the chat to read, and
++// stays shown while the panel is open so it can close it.
++SidebarChatState GetSidebarChatState(bool regular_profile,
++                                     bool ai_enabled,
++                                     bool sidebar_layout,
++                                     bool blocked_here,
++                                     bool panel_open);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_ADDRESS_BAR_SIDEBAR_CHAT_STATE_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_chat_state_unittest.cc
+@@ -0,0 +1,80 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_chat_state.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++constexpr SidebarChatState kNone = {.exists = false,
++                                    .visible = false,
++                                    .open = false};
++
++TEST(SidebarChatStateTest, NoButtonOutsideARegularProfile) {
++  // Incognito and Guest get no AI, even with AI on in the Sidebar layout.
++  for (bool blocked : {false, true}) {
++    for (bool open : {false, true}) {
++      EXPECT_EQ(GetSidebarChatState(/*regular_profile=*/false,
++                                    /*ai_enabled=*/true,
++                                    /*sidebar_layout=*/true, blocked, open),
++                kNone);
++    }
++  }
++}
++
++TEST(SidebarChatStateTest, NoButtonWhileAiIsOff) {
++  // Nothing exists with AI off, whatever else is true.
++  for (bool sidebar_layout : {false, true}) {
++    for (bool blocked : {false, true}) {
++      for (bool open : {false, true}) {
++        EXPECT_EQ(
++            GetSidebarChatState(/*regular_profile=*/true, /*ai_enabled=*/false,
++                                sidebar_layout, blocked, open),
++            kNone);
++      }
++    }
++  }
++}
++
++TEST(SidebarChatStateTest, NoButtonInTopBarLayout) {
++  // The Top bar layout has its own Chat pill.
++  for (bool blocked : {false, true}) {
++    for (bool open : {false, true}) {
++      EXPECT_EQ(
++          GetSidebarChatState(/*regular_profile=*/true, /*ai_enabled=*/true,
++                              /*sidebar_layout=*/false, blocked, open),
++          kNone);
++    }
++  }
++}
++
++TEST(SidebarChatStateTest, ShownBesideAWebPage) {
++  EXPECT_EQ(GetSidebarChatState(/*regular_profile=*/true, true, true,
++                                /*blocked_here=*/false,
++                                /*panel_open=*/false),
++            (SidebarChatState{.exists = true, .visible = true, .open = false}));
++}
++
++TEST(SidebarChatStateTest, StaysShownAndLitWhileThePanelIsOpen) {
++  EXPECT_EQ(GetSidebarChatState(/*regular_profile=*/true, true, true,
++                                /*blocked_here=*/false,
++                                /*panel_open=*/true),
++            (SidebarChatState{.exists = true, .visible = true, .open = true}));
++}
++
++TEST(SidebarChatStateTest, HiddenBesideAnInternalPage) {
++  // It still exists, so it comes back on the next web page without being
++  // built again.
++  for (bool open : {false, true}) {
++    EXPECT_EQ(
++        GetSidebarChatState(/*regular_profile=*/true, true, true,
++                            /*blocked_here=*/true, open),
++        (SidebarChatState{.exists = true, .visible = false, .open = false}));
++  }
++}
++
++}  // namespace
++}  // namespace rac
