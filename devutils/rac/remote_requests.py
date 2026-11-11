@@ -72,14 +72,15 @@ HTTP_URL = re.compile(r'https?://(?P<host>\[::1\]|[A-Za-z0-9.-]+)(:[0-9]{1,5})?'
 # never match. Never add pages that read the maintainer's data or open
 # the browser to control (importData, passwords, flags, downloads,
 # history, devtools, ...). The settings root is off the list on purpose:
-# only these three sub-pages may open, and a run that opens one may take
+# only these sub-pages may open, and a run that opens one may take
 # screenshots only -- the script may not send input (see check_line).
 # chrome://credits (the build's static license page) is screenshot-only
 # the same way: its links lead to the open web.
 INTERNAL_PAGES = frozenset((
     'setup', 'version', 'newtab', 'settings/assistant',
     'settings/privacy', 'settings/appearance', 'settings/general',
-    'settings/system', 'settings/system/shortcuts', 'rac-ai', 'credits',
+    'settings/system', 'settings/system/shortcuts', 'settings/bangs',
+    'rac-ai', 'credits',
 ))
 INTERNAL_URL = re.compile(r'(?:chrome|rac)://([!-\[\]-~]*)', re.ASCII | re.I)
 SETUP_STEP = re.compile(r'setup/[A-Za-z0-9-]+')
