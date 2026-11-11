@@ -1287,6 +1287,78 @@ class PushTest(RemoteBuildTest):
         self.assertIn('no finished build', result.stderr)
         self.assertFalse((self.remote_root / 'wt/feature').exists())
 
+    def make_seed(self, name='seedling', built=True):
+        """A clone push made for another worktree, with a finished tree."""
+        wt = self.make_repo(self.folder / name, branch=f'feat/{name}')
+        self.run_rb('push', wt, success=True, FAKE_SETUP_TREE='1')
+        seed = self.remote_root / 'wt' / name
+        if built:
+            write(seed / 'build/src/out/Default/.siso_fs_state', '')
+        self.log.unlink()
+        return seed
+
+    def test_push_seed_clones_another_clone(self):
+        write(self.remote_root / 'base/.rac-toolchain',
+              'xcode_build 16F6\nsdk 26.0\n')
+        seed = self.make_seed()
+        write(seed / 'build/.rac-toolchain', 'Build version 16F6\nSDK 26.0\n')
+        self.run_rb('push', '--seed', 'seedling', self.wt, success=True)
+        calls = self.calls()
+        self.assertIn(f'worktree.sh setup {seed}\n', calls)
+        self.assertNotIn(f'worktree.sh setup {self.remote_root}/base', calls)
+        # The clone answers to the toolchain the seed's tree was built with.
+        clone = self.remote_root / 'wt/feature'
+        self.assertEqual((clone / 'build/.rac-toolchain').read_text(),
+                         'Build version 16F6\nSDK 26.0\n')
+        # A seed without its own record hands down the base's.
+        shutil.rmtree(clone)
+        git(self.remote_root / 'base', 'worktree', 'prune')
+        (seed / 'build/.rac-toolchain').unlink()
+        self.run_rb('push', self.wt, '--seed', 'seedling', success=True)
+        self.assertEqual((clone / 'build/.rac-toolchain').read_text(),
+                         'xcode_build 16F6\nsdk 26.0\n')
+
+    def assert_seed_refused(self, message, *args):
+        result = self.run_rb('push', '--seed', *args, self.wt, success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(message, result.stderr)
+        self.assertNotIn('worktree.sh setup', self.calls())
+        self.assertFalse((self.remote_root / 'wt/feature').exists())
+        return result
+
+    def test_push_seed_refuses_a_missing_or_unbuilt_seed(self):
+        self.assert_seed_refused('no clone at', 'nothere')
+        self.make_seed(built=False)
+        self.assert_seed_refused('has no finished build', 'seedling')
+
+    def test_push_seed_refuses_bad_names_and_itself(self):
+        for name in ('../base', '.hidden', 'has space', ''):
+            self.assert_seed_refused('--seed takes a clone name', name)
+        self.assert_seed_refused('from itself', 'feature')
+        self.assertEqual(self.calls(), '')
+
+    def test_push_seed_refuses_a_busy_seed(self):
+        seed = self.make_seed()
+        real = os.path.realpath(seed)
+        queue = self.remote_root / 'build-queue'
+        self.holder(queue / 'build-1', os.getpid(), real)
+        self.assert_seed_refused('owns the seed', 'seedling')
+        shutil.rmtree(queue)
+        rogue = subprocess.Popen(
+            ['bash', '-c', 'exec -a "$1" sleep 300', '_',
+             f'{real}/build/src/out/Default/rac.app/Contents/MacOS/rac'])
+        self.addCleanup(lambda: (rogue.kill(), rogue.wait()))
+        self.assert_seed_refused('running under the seed', 'seedling')
+
+    def test_push_seed_refuses_a_clone_that_has_a_tree(self):
+        self.make_seed()
+        self.run_rb('push', self.wt, success=True, FAKE_SETUP_TREE='1')
+        self.log.unlink()
+        result = self.run_rb('push', '--seed', 'seedling', self.wt, success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('already has one', result.stderr)
+        self.assertNotIn('worktree.sh', self.calls())
+
     def test_push_updates_the_submodule(self):
         # A worktree whose commits pin helium-chromium.
         core = self.make_repo(self.folder / 'push-core', branch='main')
@@ -1748,6 +1820,18 @@ class RunTest(RemoteBuildTest):
         result = self.run_rb('run', self.wt, '--requests-file', req,
                              success=False)
         self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_run_opening_credits_is_screenshot_only(self):
+        req = self.folder / 'req.txt'
+        write(req, 'click 1 2\n')
+        for url in ('chrome://credits', 'RAC://CREDITS/'):
+            result = self.run_rb('run', self.wt, '--requests-file', req,
+                                 '--', url, success=False)
+            self.assertEqual(result.returncode, 2, url)
+            self.assertIn('screenshots', result.stderr, url)
+        write(req, 'burst shots 2 100\n')
+        self.run_rb('run', self.wt, '--requests-file', req, '--timeout', '5',
+                    '--', 'chrome://credits', success=True)
 
     def test_run_settings_page_may_scroll(self):
         # `wheel` is the one input a settings run may send, alone or

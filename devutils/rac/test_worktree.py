@@ -661,6 +661,20 @@ class SetupTest(WorktreeTestCase):
         self.worktree('setup', str(self.wt), cwd=other, env=self.env())
         self.assertTrue((other / 'build/src/out/Default/from-feature').exists())
 
+    def test_setup_keeps_folder_times(self):
+        # clonefile gives every folder the clone's time; setup puts the
+        # source's back so siso steps with folder inputs don't rebuild.
+        public = self.tree / 'components' / 'public'
+        public.mkdir(parents=True)
+        (public / 'logo.svg').write_text('svg\n')
+        old = 1_600_000_000_000_000_000
+        for folder in (public, public.parent):
+            os.utime(folder, ns=(old, old))
+        result = self.setup_worktree()
+        self.assertIn('folders their source times', result.stderr)
+        for folder in ('components', 'components/public'):
+            self.assertEqual((self.wt_src / folder).stat().st_mtime_ns, old)
+
     def test_siso_failure_is_loud(self):
         result = self.setup_worktree(success=False, FAIL_SISO='1')
         self.assertIn('siso: broken', result.stderr)
@@ -670,6 +684,71 @@ class SetupTest(WorktreeTestCase):
         result = self.setup_worktree(success=False, FAIL_GN='1')
         self.assertIn('ERROR: xcodebuild requires Xcode', result.stderr)
         self.assertIn('gn gen failed', result.stderr)
+
+
+@unittest.skipUnless(shutil.which('quilt') and shutil.which('greadlink'),
+                     'needs quilt and greadlink')
+class RestoreDirTimesTest(unittest.TestCase):
+    """restore_dir_times on a source tree and a copy whose folders are new."""
+
+    OLD = 1_600_000_000_000_000_000
+    NEW = 1_700_000_000_000_000_000
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='rac-test-dirtimes-')
+        self.addCleanup(temporary.cleanup)
+        self.folder = Path(temporary.name).resolve()
+        self.root = self.folder / 'checkout'
+        make_checkout(self.root)
+        self.source = self.folder / 'source'
+        self.clone = self.folder / 'clone'
+        for name in ('a/b/file', 'a/other', 'changed/file', 'grown/file', 'out/x/file',
+                     '.git/objects/file', 'a/.git/file'):
+            path = self.source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(name + '\n')
+        (self.source / 'a' / 'link').symlink_to('b')
+        self.folders = sorted(p for p in self.source.rglob('*') if p.is_dir() and not p.is_symlink())
+        for folder in self.folders:
+            os.utime(folder, ns=(self.OLD, self.OLD))
+        shutil.copytree(self.source, self.clone, symlinks=True)
+        # What clonefile leaves: same files and file times, new folder times.
+        (self.clone / 'changed' / 'file').write_text('edited\n')
+        (self.clone / 'grown' / 'extra').write_text('new\n')
+        for folder in self.folders:
+            os.utime(self.clone / folder.relative_to(self.source), ns=(self.NEW, self.NEW))
+
+    def restore(self):
+        script = f'source {self.root}/devutils/rac/worktree.sh; restore_dir_times "$1" "$2"'
+        return subprocess.run(['/bin/bash', '-c', script, '_', self.source, self.clone],
+                              cwd=self.root,
+                              capture_output=True,
+                              text=True,
+                              check=True).stdout.strip()
+
+    def mtime(self, name):
+        return (self.clone / name).stat().st_mtime_ns
+
+    def test_restores_unchanged_folders_only(self):
+        # Four folders are walked (a, a/b, changed and grown), never out/
+        # or any .git.
+        self.assertEqual(self.restore(), '2 of 4')
+        for name in ('a', 'a/b'):
+            self.assertEqual(self.mtime(name), self.OLD, name)
+        # A folder whose entries differ keeps the clone's time.
+        for name in ('changed', 'grown', 'out', 'out/x', '.git', 'a/.git'):
+            self.assertEqual(self.mtime(name), self.NEW, name)
+
+    def test_never_follows_a_symlinked_folder(self):
+        # A clone folder that became a symlink is left alone, and so is
+        # its target and the folder holding it (its entries differ now).
+        shutil.rmtree(self.clone / 'a' / 'b')
+        (self.clone / 'a' / 'b').symlink_to('../changed')
+        os.utime(self.clone / 'a', ns=(self.NEW, self.NEW))
+        self.assertEqual(self.restore(), '0 of 4')
+        self.assertEqual(self.mtime('a'), self.NEW)
+        self.assertEqual(self.mtime('changed'), self.NEW)
+        self.assertNotEqual((self.clone / 'a' / 'b').lstat().st_mtime_ns, self.OLD)
 
 
 @unittest.skipUnless(shutil.which('quilt') and shutil.which('greadlink'),

@@ -74,10 +74,12 @@ HTTP_URL = re.compile(r'https?://(?P<host>\[::1\]|[A-Za-z0-9.-]+)(:[0-9]{1,5})?'
 # history, devtools, ...). The settings root is off the list on purpose:
 # only these three sub-pages may open, and a run that opens one may take
 # screenshots only -- the script may not send input (see check_line).
+# chrome://credits (the build's static license page) is screenshot-only
+# the same way: its links lead to the open web.
 INTERNAL_PAGES = frozenset((
     'setup', 'version', 'newtab', 'settings/assistant',
     'settings/privacy', 'settings/appearance', 'settings/general',
-    'settings/system/shortcuts', 'rac-ai',
+    'settings/system/shortcuts', 'rac-ai', 'credits',
 ))
 INTERNAL_URL = re.compile(r'(?:chrome|rac)://([!-\[\]-~]*)', re.ASCII | re.I)
 SETUP_STEP = re.compile(r'setup/[A-Za-z0-9-]+')
@@ -421,7 +423,8 @@ class Checker:
                 # settings page makes the whole run screenshot-only.
                 if page is not None:
                     self.outputs.append(f'pages {url}')
-                    if page == 'settings' or page.startswith('settings/'):
+                    if (page == 'settings' or page.startswith('settings/')
+                            or page == 'credits'):
                         self.settings = True
             return words
         simple = {
