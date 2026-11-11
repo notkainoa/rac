@@ -246,18 +246,21 @@ window, however many tabs have a chat.
   back to it.
 - **Approval cards.** An answer names the conversation, the card's action,
   and the nonce the browser gave the card when it last put it on show
-  (`CardGate`). The browser takes it only for the conversation on show, the
-  action that conversation waits on, and the newest nonce, and the card is
-  used up. A card drawn again (back on its tab) gets a new nonce, so a click
+  (`CardGate`). The browser takes it only while the panel is on screen, for
+  the conversation on show, the action that conversation waits on, and the
+  newest nonce, and the card is used up. A card drawn again (back on its tab) gets a new nonce, so a click
   from the copy it replaced is refused, and after a tab switch a click can
   never reach another tab's card. Stop and Resume name the conversation
-  too, and stop only its own task.
+  too, and act only on its own task; Resume also needs it on show. A send
+  goes only to the conversation on show, or the one just before it.
 - **What ends a conversation.** Closing the panel on its tab, closing the
   last tab that shows it, or turning AI off. Ending it stops its reply and
   its agent task, and a card waiting with it. Switching tabs, or another
   side panel taking the panel, keeps it. A tab moved to another window
   takes its messages along (`CarryAssistantConversation`); its reply
-  stops.
+  stops. Chromium keeps the cached view of a tab's open entry, so a view
+  can arrive from the old window; it takes the new window's page
+  (`ViewNeedsWindowPage`).
 - **A conversation follows its agent task.** `open_tab` and `switch_tab`
   bring a tab forward (`TabTools::IsBringingTabForward`), which would close
   the panel mid-task. The conversation that owns the turn shows beside that

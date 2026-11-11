@@ -939,6 +939,9 @@ def answer_card(assistant, card_id, answer, proc, shots):
 # racAiInit calls AllowJavascript() and subscribes the page to the profile's
 # agent events; without it FireWebUIListener is a no-op and racAiAgentEvent
 # never arrives. Returns the init state ({enabled, configured, needsKey...}).
+# Stops the task of the conversation the page shows.
+STOP_JS = ("chrome.send('racAiAgentStop', [window.__evals.key || '']); true")
+
 ASSISTANT_HOOK = """
 (async () => {
   const cr = await import('chrome://resources/js/cr.js');
@@ -946,6 +949,9 @@ ASSISTANT_HOOK = """
     window.__evals = {events: [], updates: [], cr};
     cr.addWebUiListener('racAiAgentEvent', e => window.__evals.events.push(e));
     cr.addWebUiListener('rac-ai-update', u => window.__evals.updates.push(u));
+    // The conversation the page shows: Stop names it (the browser stops only
+    // that conversation's own task).
+    cr.addWebUiListener('rac-ai-show', c => { window.__evals.key = c.key; });
     // An attached page that yields no text keeps the send but loses the
     // page block the model was meant to read; it is runner plumbing, not a
     // guard event, so it is marked for grade.py to ignore.
@@ -1260,7 +1266,7 @@ def drive(variant, rig, browser, proc, shots=None, trigger=None):
                 # the composer isn't still streaming on the next turn.
                 _ui_eval(assistant, PANEL_STOP_JS)
             else:
-                assistant.eval("chrome.send('racAiAgentStop', []); true", await_promise=False)
+                assistant.eval(STOP_JS, await_promise=False)
         # Identical adjacent events come from a listener registered twice (a
         # retried evaluate); drop them so one step pairs with one event.
         events = [e for i, e in enumerate(events) if i == 0 or e != events[i - 1]]

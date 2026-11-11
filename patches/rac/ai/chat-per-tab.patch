@@ -113,7 +113,7 @@
    ]
 --- /dev/null
 +++ b/chrome/browser/rac/ai/chat_placement.cc
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,51 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -144,16 +144,38 @@
 +  return reason == ChatHideReason::kClosed && !window_closing;
 +}
 +
++bool ViewNeedsWindowPage(const void* view_window, const void* tab_window) {
++  return tab_window && view_window != tab_window;
++}
++
++bool MaySendTo(const std::string& key,
++               const std::string& shown,
++               const std::string& previous) {
++  return !key.empty() && (key == shown || key == previous);
++}
++
++bool MayStopTask(const std::string& key, const std::string& owner) {
++  return !key.empty() && key == owner;
++}
++
++bool MayResumeTask(const std::string& key,
++                   const std::string& owner,
++                   const std::string& shown) {
++  return MayStopTask(key, owner) && key == shown;
++}
++
 +}  // namespace rac::ai
 --- /dev/null
 +++ b/chrome/browser/rac/ai/chat_placement.h
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,86 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#ifndef CHROME_BROWSER_RAC_AI_CHAT_PLACEMENT_H_
 +#define CHROME_BROWSER_RAC_AI_CHAT_PLACEMENT_H_
++
++#include <string>
 +
 +namespace rac::ai {
 +
@@ -206,12 +228,35 @@
 +// with other tabs stays with them; one with no tab left ends.
 +bool ReleasesChat(ChatHideReason reason, bool window_closing);
 +
++// A side panel view shows the chat page of the window its tab is in now. A
++// cached view that moved with its tab to another window still holds the old
++// window's page, and must take the new window's instead. `view_window` and
++// `tab_window` only compare.
++bool ViewNeedsWindowPage(const void* view_window, const void* tab_window);
++
++// Which conversation a send from the side panel page may go to: the one on
++// show, or the one shown just before it, for a send that crossed a tab switch
++// on its way. Never an empty key.
++bool MaySendTo(const std::string& key,
++               const std::string& shown,
++               const std::string& previous);
++
++// Stop names the conversation whose task it stops, and stops only that
++// conversation's own task.
++bool MayStopTask(const std::string& key, const std::string& owner);
++
++// Resume also needs the conversation to be on show: the user resumes the task
++// they are looking at.
++bool MayResumeTask(const std::string& key,
++                   const std::string& owner,
++                   const std::string& shown);
++
 +}  // namespace rac::ai
 +
 +#endif  // CHROME_BROWSER_RAC_AI_CHAT_PLACEMENT_H_
 --- /dev/null
 +++ b/chrome/browser/rac/ai/chat_placement_unittest.cc
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,106 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -284,6 +329,36 @@
 +  EXPECT_FALSE(ReleasesChat(ChatHideReason::kReplaced, false));
 +  // A closing window takes the chat with its tabs.
 +  EXPECT_FALSE(ReleasesChat(ChatHideReason::kClosed, true));
++}
++
++// A view cached with its tab shows the page of the tab's window now.
++TEST(RacAiChatPlacementTest, AMovedViewTakesItsNewWindowsPage) {
++  int old_window = 0;
++  int new_window = 0;
++  EXPECT_FALSE(ViewNeedsWindowPage(&old_window, &old_window));
++  EXPECT_TRUE(ViewNeedsWindowPage(&old_window, &new_window));
++  // A tab on its way out of every window keeps what it has.
++  EXPECT_FALSE(ViewNeedsWindowPage(&old_window, nullptr));
++}
++
++TEST(RacAiChatPlacementTest, ASendGoesOnlyToTheShownOrTheLastShown) {
++  EXPECT_TRUE(MaySendTo("b", "b", "a"));
++  EXPECT_TRUE(MaySendTo("a", "b", "a"));
++  EXPECT_FALSE(MaySendTo("c", "b", "a"));
++  EXPECT_FALSE(MaySendTo("", "b", ""));
++  EXPECT_FALSE(MaySendTo("", "", ""));
++}
++
++TEST(RacAiChatPlacementTest, StopAndResumeNameTheTasksConversation) {
++  EXPECT_TRUE(MayStopTask("a", "a"));
++  EXPECT_FALSE(MayStopTask("b", "a"));
++  EXPECT_FALSE(MayStopTask("", "a"));
++  EXPECT_FALSE(MayStopTask("", ""));
++  // Resume also needs it on show.
++  EXPECT_TRUE(MayResumeTask("a", "a", "a"));
++  EXPECT_FALSE(MayResumeTask("a", "a", "b"));
++  EXPECT_FALSE(MayResumeTask("b", "a", "b"));
++  EXPECT_FALSE(MayResumeTask("", "", ""));
 +}
 +
 +}  // namespace
@@ -516,7 +591,7 @@
    base::CallbackListSubscription close_subscription_;
    ui::ScopedUnownedUserData<AssistantPanelState> scoped_data_;
  };
-@@ -164,27 +215,77 @@ namespace {
+@@ -164,27 +215,80 @@ namespace {
  
  constexpr int kDefaultWidth = 400;
  constexpr char kPanelUrl[] = "chrome://rac-ai/?mode=panel";
@@ -605,10 +680,13 @@
 +  // True while the side panel shows the page.
 +  bool IsShowing() const;
 +
++  // The window whose page this is, or null once it has closed.
++  BrowserWindowInterface* window() const { return browser_.get(); }
++
    // content::WebContentsDelegate:
    void RunFileChooser(content::RenderFrameHost* render_frame_host,
                        scoped_refptr<content::FileSelectListener> listener,
-@@ -193,12 +294,83 @@ class AssistantWebView : public views::W
+@@ -193,12 +297,83 @@ class AssistantWebView : public views::W
                                       params);
    }
  
@@ -694,7 +772,7 @@
        base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
            FROM_HERE, base::BindOnce(&AssistantWebView::FocusPage,
                                      weak_factory_.GetWeakPtr()));
-@@ -206,21 +378,344 @@ class AssistantWebView : public views::W
+@@ -206,21 +381,361 @@ class AssistantWebView : public views::W
    }
  
   private:
@@ -839,12 +917,17 @@
 +  }
 +
 +  // Gives the tab a new conversation if it has none.
++  // A tab that moved to another window holds that window's page from now on.
 +  void EnsureConversation() {
++    BrowserWindowInterface* browser = tab_->GetBrowserWindowInterface();
++    if (browser && window_.get() != browser) {
++      window_ = browser->GetWeakPtr();
++      if (has_chat()) {
++        page_ = AssistantChat::GetOrCreate(browser);
++      }
++    }
 +    if (has_chat()) {
 +      return;
-+    }
-+    if (BrowserWindowInterface* browser = tab_->GetBrowserWindowInterface()) {
-+      window_ = browser->GetWeakPtr();
 +    }
 +    VLOG(1) << "rac assistant: a new conversation for a tab";
 +    SetConversation(base::Uuid::GenerateRandomV4().AsLowercaseString());
@@ -1009,8 +1092,20 @@
 +
 +void AssistantWebView::TakePage() {
 +  tabs::TabInterface* tab = tab_.Get();
++  BrowserWindowInterface* window =
++      tab ? tab->GetBrowserWindowInterface() : nullptr;
++  // Chromium keeps the cached view of a tab's open entry, so a view can come
++  // with its tab from another window. It shows this window's page then,
++  // never the old window's: that page belongs to the other window's tabs.
++  if (ViewNeedsWindowPage(chat_->window(), window)) {
++    VLOG(1) << "rac assistant: a chat view came with its tab from another "
++               "window, so it takes this window's page";
++    chat_->Hide(this);
++    chat_ = AssistantChat::GetOrCreate(window);
++  }
 +  // A cached view shown again after its tab's chat closed starts a new
-+  // conversation, as a new view would.
++  // conversation, as a new view would; a tab that moved holds its new
++  // window's page.
 +  if (TabChat* tab_chat = tab ? TabChat::From(tab) : nullptr) {
 +    tab_chat->EnsureConversation();
 +  }
@@ -1042,7 +1137,7 @@
  }
  
  // Reports when the page in the window's active tab may have changed between
-@@ -390,96 +885,54 @@ void SchedulePaintContainer(BrowserWindo
+@@ -390,96 +905,54 @@ void SchedulePaintContainer(BrowserWindo
    }
  }
  
@@ -1165,7 +1260,7 @@
    // The active tab changed, or its page did.
    void OnActivePageChanged() {
      // A closing window only passes through its tabs on the way out.
-@@ -487,6 +940,9 @@ class EntryRegistrar : public SidePanelE
+@@ -487,6 +960,9 @@ class EntryRegistrar : public SidePanelE
          tabs && tabs->closing_all()) {
        return;
      }
@@ -1175,7 +1270,7 @@
      const bool blocked = IsAssistantBlockedHere(browser_);
      if (blocked != blocked_) {
        blocked_ = blocked;
-@@ -501,117 +957,61 @@ class EntryRegistrar : public SidePanelE
+@@ -501,117 +977,61 @@ class EntryRegistrar : public SidePanelE
        }
      }
      SidePanelUI* ui = SidePanelUI::From(browser_);
@@ -1337,7 +1432,7 @@
  };
  
  }  // namespace
-@@ -622,8 +1022,9 @@ void RegisterAssistantSidePanel(BrowserW
+@@ -622,8 +1042,9 @@ void RegisterAssistantSidePanel(BrowserW
        browser->GetType() != BrowserWindowInterface::Type::TYPE_NORMAL) {
      return;
    }
@@ -1349,7 +1444,7 @@
  }
  
  bool IsAssistantPanelOpen(BrowserWindowInterface* browser) {
-@@ -638,6 +1039,131 @@ base::CallbackListSubscription AddAssist
+@@ -638,6 +1059,131 @@ base::CallbackListSubscription AddAssist
        std::move(callback));
  }
  
@@ -1481,7 +1576,7 @@
  bool IsAssistantBlockedHere(BrowserWindowInterface* browser) {
    if (!IsAiEnabled(browser->GetProfile()->GetPrefs())) {
      return false;
-@@ -668,15 +1194,15 @@ bool CanAskAssistant(BrowserWindowInterf
+@@ -668,15 +1214,15 @@ bool CanAskAssistant(BrowserWindowInterf
  }
  
  bool AskAssistant(BrowserWindowInterface* browser, std::string prompt) {
@@ -1663,7 +1758,7 @@
  #include "chrome/browser/autocomplete/autocomplete_classifier_factory.h"
  #include "chrome/browser/profiles/profile.h"
  #include "chrome/browser/rac/agent/action_guard.h"
-@@ -27,6 +31,7 @@
+@@ -27,11 +31,13 @@
  #include "chrome/browser/rac/agent/agent_mcp_tools.h"
  #include "chrome/browser/rac/agent/agent_ui_delegate.h"
  #include "chrome/browser/rac/agent/mcp_tool_provider.h"
@@ -1671,7 +1766,13 @@
  #include "chrome/browser/rac/ai/acp/acp_service.h"
  #include "chrome/browser/rac/ai/acp/agent_recipes.h"
  #include "chrome/browser/rac/ai/ai_prefs.h"
-@@ -45,8 +50,6 @@
+ #include "chrome/browser/rac/ai/ai_service.h"
+ #include "chrome/browser/rac/ai/ai_service_factory.h"
++#include "chrome/browser/rac/ai/chat_placement.h"
+ #include "chrome/browser/rac/ai/chat_prompt.h"
+ #include "chrome/browser/rac/ai/chat_protocol.h"
+ #include "chrome/browser/rac/ai/chat_session.h"
+@@ -45,8 +51,6 @@
  #include "chrome/browser/rac/spaces/space.h"
  #include "chrome/browser/rac/spaces/spaces_service.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
@@ -1680,7 +1781,7 @@
  #include "chrome/browser/ui/side_panel/side_panel_ui.h"
  #include "chrome/browser/ui/tab_ui_helper.h"
  #include "chrome/browser/ui/views/rac/agent/agent_tab_indicator.h"
-@@ -103,6 +106,21 @@ constexpr char kSystemPrompt[] =
+@@ -103,6 +107,21 @@ constexpr char kSystemPrompt[] =
      "Markdown only when it helps.";
  
  constexpr char kSettingsUrl[] = "chrome://settings/assistant";
@@ -1702,7 +1803,7 @@
  // What a task that a space switch stopped ends with.
  constexpr char kSpaceSwitchedError[] =
      "Stopped because the window switched spaces.";
-@@ -150,6 +168,83 @@ std::set<std::string> ReadOrigins(const
+@@ -150,6 +169,83 @@ std::set<std::string> ReadOrigins(const
    return origins;
  }
  
@@ -1786,7 +1887,7 @@
  }  // namespace
  
  // Reports when the foreground tab's title or address changes.
-@@ -178,6 +273,49 @@ struct PageHandler::PendingSend {
+@@ -178,6 +274,49 @@ struct PageHandler::PendingSend {
    std::vector<std::string> never;
  };
  
@@ -1836,7 +1937,7 @@
  // The model menu: each provider the user set up, with the models it offers.
  struct PageHandler::ModelQuery {
    struct Entry {
-@@ -198,7 +336,7 @@ struct PageHandler::ModelQuery {
+@@ -198,7 +337,7 @@ struct PageHandler::ModelQuery {
  PageHandler::PageHandler(Profile* profile) : profile_(profile) {}
  
  PageHandler::~PageHandler() {
@@ -1845,7 +1946,7 @@
  }
  
  void PageHandler::RegisterMessages() {
-@@ -212,6 +350,10 @@ void PageHandler::RegisterMessages() {
+@@ -212,6 +351,10 @@ void PageHandler::RegisterMessages() {
        "racAiSend",
        base::BindRepeating(&PageHandler::HandleSend, base::Unretained(this)));
    web_ui()->RegisterMessageCallback(
@@ -1856,7 +1957,7 @@
        "racAiStop",
        base::BindRepeating(&PageHandler::HandleStop, base::Unretained(this)));
    web_ui()->RegisterMessageCallback(
-@@ -307,8 +449,20 @@ void PageHandler::RegisterMessages() {
+@@ -307,8 +450,21 @@ void PageHandler::RegisterMessages() {
  
  void PageHandler::OnJavascriptDisallowed() {
    // First, while this page still hears the turn end: that is what takes the
@@ -1874,12 +1975,13 @@
 +    cards_.Hide(shown_key_);
 +  }
 +  shown_key_.clear();
++  previous_shown_key_.clear();
 +  shown_subscription_ = {};
 +  tab_left_subscription_ = {};
    CloseMenu();
    model_loaders_.clear();
    title_session_.reset();
-@@ -322,42 +476,335 @@ void PageHandler::OnJavascriptDisallowed
+@@ -322,42 +478,339 @@ void PageHandler::OnJavascriptDisallowed
    tab_observer_.reset();
  }
  
@@ -1994,6 +2096,7 @@
 +  }
 +  if (!shown_key_.empty() && shown_key_ != key) {
 +    cards_.Hide(shown_key_);
++    previous_shown_key_ = shown_key_;
 +  }
 +  shown_key_ = key;
 +  std::unique_ptr<Chat>& chat = chats_[key];
@@ -2199,6 +2302,9 @@
 +  if (shown_key_ == key) {
 +    shown_key_.clear();
 +  }
++  if (previous_shown_key_ == key) {
++    previous_shown_key_.clear();
++  }
 +  chats_.erase(it);
 +}
 +
@@ -2236,7 +2342,7 @@
  }
  
  BrowserWindowInterface* PageHandler::GetBrowser() {
-@@ -419,6 +866,14 @@ void PageHandler::OnCurrentTabChanged()
+@@ -419,6 +872,14 @@ void PageHandler::OnCurrentTabChanged()
    BrowserWindowInterface* browser = GetBrowser();
    tabs::TabInterface* tab =
        browser ? browser->GetActiveTabInterface() : nullptr;
@@ -2251,7 +2357,7 @@
    if (tab && tab->GetContents()) {
      tab_observer_ = std::make_unique<TabObserver>(
          tab->GetContents(), base::BindRepeating(&PageHandler::NotifyCurrentTab,
-@@ -473,14 +928,15 @@ void PageHandler::OnActiveSpaceChanged(B
+@@ -473,14 +934,15 @@ void PageHandler::OnActiveSpaceChanged(B
      // A window's first space claim can come well after the window opens
      // (half a minute or more after launch). It isn't a switch: stopping on
      // it cancelled any task started in this window before the claim.
@@ -2272,7 +2378,7 @@
        }
      }
      NotifyTheme();
-@@ -554,6 +1010,23 @@ void PageHandler::HandleInit(const base:
+@@ -554,6 +1016,23 @@ void PageHandler::HandleInit(const base:
        service && manager && !spaces_observation_.IsObserving()) {
      spaces_observation_.Observe(manager);
    }
@@ -2296,7 +2402,7 @@
    state.Set("theme", DescribeTheme());
    ResolveJavascriptCallback(args[0], state);
  }
-@@ -577,16 +1050,35 @@ void PageHandler::HandleGetTabs(const ba
+@@ -577,16 +1056,40 @@ void PageHandler::HandleGetTabs(const ba
    ResolveJavascriptCallback(args[0], list);
  }
  
@@ -2310,11 +2416,16 @@
    const int send_id = args[0].GetInt();
    const base::ListValue& list = args[1].GetList();
    const base::ListValue& tab_list = args[2].GetList();
++  // The conversation on show, or the one just before it for a send that
++  // crossed a tab switch. A send for any other, or for one that has ended,
++  // goes nowhere.
++  const std::string key = args.size() >= 6u && args[5].is_string()
++                              ? args[5].GetString()
++                              : shown_key_;
 +  Chat* chat =
-+      FindChat(args.size() >= 6u && args[5].is_string() ? args[5].GetString()
-+                                                        : shown_key_);
-+  // The page sent it for a conversation that has ended.
++      MaySendTo(key, shown_key_, previous_shown_key_) ? FindChat(key) : nullptr;
 +  if (!chat) {
++    VLOG(1) << "rac assistant: refused a send for a conversation not on show";
 +    return;
 +  }
 +  // The reply starts here, so the page hears why it ends at once.
@@ -2334,7 +2445,7 @@
      return;
    }
  
-@@ -595,7 +1087,7 @@ void PageHandler::HandleSend(const base:
+@@ -595,7 +1098,7 @@ void PageHandler::HandleSend(const base:
    send->request.system_prompt = kSystemPrompt;
    size_t total = 0;
    if (list.empty() || list.size() > kMaxMessages) {
@@ -2343,7 +2454,7 @@
      return;
    }
    for (const base::Value& value : list) {
-@@ -612,7 +1104,7 @@ void PageHandler::HandleSend(const base:
+@@ -612,7 +1115,7 @@ void PageHandler::HandleSend(const base:
                                        *text});
    }
    if (total > kMaxTotalChars) {
@@ -2352,7 +2463,7 @@
      return;
    }
    if (send->request.messages.back().role != ChatMessage::Role::kUser) {
-@@ -642,18 +1134,32 @@ void PageHandler::HandleSend(const base:
+@@ -642,18 +1145,32 @@ void PageHandler::HandleSend(const base:
    }
  
    const std::string conversation =
@@ -2365,10 +2476,7 @@
 -    conversation_id_ = conversation;
 +    chat->page_context.Clear();
 +    chat->history_id = conversation;
-   }
--  StopSession();
--  active_send_id_ = send_id;
--  ReadNextPage(std::move(send));
++  }
 +  StopChat(*chat);
 +  chat->active_send_id = send_id;
 +  chat->log.Start(send_id);
@@ -2384,7 +2492,10 @@
 +    chat->title_requested = view.FindBool("titleRequested").value_or(false);
 +    chat->agent_id = ReadShortString(view, "agentId", kMaxIdChars);
 +    chat->agent_name = ReadShortString(view, "agentName", kMaxShownTitleChars);
-+  }
+   }
+-  StopSession();
+-  active_send_id_ = send_id;
+-  ReadNextPage(std::move(send));
 +  ReadNextPage(*chat, std::move(send));
  }
  
@@ -2393,7 +2504,7 @@
    while (!send->tab_ids.empty()) {
      const int id = send->tab_ids.front();
      send->tab_ids.erase(send->tab_ids.begin());
-@@ -676,14 +1182,24 @@ void PageHandler::ReadNextPage(std::uniq
+@@ -676,14 +1193,24 @@ void PageHandler::ReadNextPage(std::uniq
      }
      ExtractPageText(
          tab->GetContents(),
@@ -2422,7 +2533,7 @@
                               std::string title,
                               std::string url,
                               PageTextResult result) {
-@@ -703,17 +1219,18 @@ void PageHandler::OnPageRead(std::unique
+@@ -703,17 +1230,18 @@ void PageHandler::OnPageRead(std::unique
    } else {
      send->failed.push_back(std::move(title));
    }
@@ -2445,7 +2556,7 @@
      send->never.push_back(std::move(host));
    }
    if (!send->failed.empty() || !send->never.empty()) {
-@@ -731,12 +1248,12 @@ void PageHandler::StartSession(std::uniq
+@@ -731,12 +1259,12 @@ void PageHandler::StartSession(std::uniq
        }
      }
      event.Set("never", std::move(never));
@@ -2460,7 +2571,7 @@
      return;
    }
    const int send_id = send->send_id;
-@@ -757,13 +1274,13 @@ void PageHandler::StartSession(std::uniq
+@@ -757,13 +1285,13 @@ void PageHandler::StartSession(std::uniq
          user_messages.push_back(message.text);
        }
      }
@@ -2479,7 +2590,7 @@
      for (auto& tool : controller->AvailableTools()) {
        std::string schema;
        base::JSONWriter::Write(tool.parameters, &schema);
-@@ -806,17 +1323,24 @@ void PageHandler::StartSession(std::uniq
+@@ -806,17 +1334,24 @@ void PageHandler::StartSession(std::uniq
                    },
                    std::move(done)));
          },
@@ -2510,7 +2621,7 @@
      const PendingSend& send,
      int send_id) {
    auto* controller = rac::agent::AgentController::GetOrCreate(profile_);
-@@ -841,37 +1365,37 @@ std::unique_ptr<rac::agent::McpToolProvi
+@@ -841,37 +1376,37 @@ std::unique_ptr<rac::agent::McpToolProvi
    const std::string goal = send.request.messages.empty()
                                 ? std::string()
                                 : send.request.messages.back().text;
@@ -2560,7 +2671,7 @@
    std::string prompt =
        BuildSystemPrompt(send->request.system_prompt, send->request.pages);
    for (const ChatMessage& message : send->request.messages) {
-@@ -886,38 +1410,52 @@ void PageHandler::StartAgentSession(std:
+@@ -886,38 +1421,52 @@ void PageHandler::StartAgentSession(std:
    }
    const int send_id = send->send_id;
    AcpService* acp = service->acp_service();
@@ -2630,7 +2741,7 @@
  }
  
  void PageHandler::HandleListAgents(const base::ListValue& args) {
-@@ -989,18 +1527,33 @@ void PageHandler::HandleSelectAgent(cons
+@@ -989,18 +1538,33 @@ void PageHandler::HandleSelectAgent(cons
    profile_->GetPrefs()->SetString(kAgentId, id);
  }
  
@@ -2668,7 +2779,7 @@
    if (id.size() > 120 ||
        (decision != "allow" && decision != "allow_once" && decision != "deny" &&
         decision != "stop" && decision != "confirm" && decision != "skip" &&
-@@ -1008,14 +1561,43 @@ void PageHandler::HandleAgentRespond(con
+@@ -1008,21 +1572,64 @@ void PageHandler::HandleAgentRespond(con
      ResolveJavascriptCallback(args[0], base::Value(false));
      return;
    }
@@ -2677,10 +2788,15 @@
 +  // page shows, the action its card asks about, and the card's newest nonce.
 +  // So a click can't reach another tab's card, or come from a copy of the
 +  // card the page has drawn again since.
-+  if (!cards_.Check(shown_key_, key, id, nonce)) {
++  // A side panel page is off screen while its panel is closed, and then no
++  // card is on show at all.
++  const bool page_showing =
++      !IsPanelPage() || IsAssistantChatShowing(web_ui()->GetWebContents());
++  if (!cards_.Check(page_showing, shown_key_, key, id, nonce)) {
 +    const std::string* pending = cards_.PendingAction(key);
 +    VLOG(1) << "rac assistant: refused an answer to card " << id << ": "
-+            << (key != shown_key_            ? "not the conversation on show"
++            << (!page_showing                ? "the panel is closed"
++                : key != shown_key_          ? "not the conversation on show"
 +                : !pending || *pending != id ? "not the card it waits on"
 +                                             : "a stale copy of the card");
 +    ResolveJavascriptCallback(args[0], base::Value(false));
@@ -2696,7 +2812,7 @@
 +  VLOG(1) << "rac assistant: the card " << id << " passed the checks; "
 +          << decision << (taken ? " taken" : " not taken by the agent");
 +  if (taken) {
-+    cards_.Take(shown_key_, key, id, nonce);
++    cards_.Take(page_showing, shown_key_, key, id, nonce);
 +    Emit(
 +        *owner, kAnsweredEntry,
 +        base::Value(base::DictValue().Set("id", id).Set("decision", decision)));
@@ -2708,26 +2824,30 @@
 +// conversation's own task stops.
  void PageHandler::HandleAgentStop(const base::ListValue& args) {
 +  Chat* owner = OwnerChat();
-+  if (!owner || (!args.empty() && args[0].is_string() &&
-+                 args[0].GetString() != owner->key)) {
++  if (!owner || args.size() != 1u || !args[0].is_string() ||
++      !MayStopTask(args[0].GetString(), owner->key)) {
++    VLOG(1) << "rac assistant: refused a stop for another conversation";
 +    return;
 +  }
    VLOG(1) << "rac agent: stop";
    if (agent::AgentUiDelegate* delegate = agent::GetAgentUiDelegate(profile_)) {
      delegate->Stop();
-@@ -1023,6 +1605,11 @@ void PageHandler::HandleAgentStop(const
+   }
  }
  
++// args: the conversation whose task the user resumed, which is on show.
  void PageHandler::HandleAgentResume(const base::ListValue& args) {
 +  Chat* owner = OwnerChat();
-+  if (!owner || (!args.empty() && args[0].is_string() &&
-+                 args[0].GetString() != owner->key)) {
++  if (!owner || args.size() != 1u || !args[0].is_string() ||
++      !MayResumeTask(args[0].GetString(), owner->key, shown_key_)) {
++    VLOG(1) << "rac assistant: refused a resume for a conversation not on "
++               "show";
 +    return;
 +  }
    VLOG(1) << "rac agent: resume";
    if (agent::AgentUiDelegate* delegate = agent::GetAgentUiDelegate(profile_)) {
      delegate->Resume();
-@@ -1044,7 +1631,17 @@ void PageHandler::HandleAgentDebugEvent(
+@@ -1044,7 +1651,17 @@ void PageHandler::HandleAgentDebugEvent(
      ApplyDebugIndicator(*event);
      return;
    }
@@ -2746,7 +2866,7 @@
  }
  
  void PageHandler::ApplyDebugIndicator(const base::DictValue& event) {
-@@ -1071,13 +1668,22 @@ void PageHandler::ApplyDebugIndicator(co
+@@ -1071,13 +1688,22 @@ void PageHandler::ApplyDebugIndicator(co
  
  void PageHandler::OnAgentTaskEvent(const base::DictValue& event) {
    // Only the reply that owns the turn shows the agent's work.
@@ -2772,7 +2892,7 @@
    if (type && *type == "run_state" && state && *state == "stopped") {
      // The task was stopped from the card, the pill or the keyboard. End the
      // model's side of it as well.
-@@ -1087,30 +1693,33 @@ void PageHandler::OnAgentTaskEvent(const
+@@ -1087,30 +1713,33 @@ void PageHandler::OnAgentTaskEvent(const
                               : std::string();
      base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
          FROM_HERE, base::BindOnce(
@@ -2819,7 +2939,7 @@
    // The page is still waiting on the reply it started. Nothing else will
    // finish it now that the session is gone.
    base::DictValue update;
-@@ -1122,7 +1731,10 @@ void PageHandler::FinishStoppedTurn(int
+@@ -1122,7 +1751,10 @@ void PageHandler::FinishStoppedTurn(int
      update.Set("stopped", true);
    }
    update.Set("done", true);
@@ -2831,7 +2951,7 @@
  }
  
  void PageHandler::OnAgentTab(content::WebContents* contents,
-@@ -1132,10 +1744,17 @@ void PageHandler::OnAgentTab(content::We
+@@ -1132,10 +1764,17 @@ void PageHandler::OnAgentTab(content::We
      agent::AgentTabIndicator::Hide(contents);
      return;
    }
@@ -2850,7 +2970,7 @@
    agent::AgentTabIndicator::SetState(contents,
                                       status == agent::AgentTabStatus::kWaiting
                                           ? agent::AgentTabState::kWaiting
-@@ -1144,14 +1763,13 @@ void PageHandler::OnAgentTab(content::We
+@@ -1144,14 +1783,13 @@ void PageHandler::OnAgentTab(content::We
                                           : agent::AgentTabState::kWorking);
  }
  
@@ -2870,7 +2990,7 @@
      return;
    }
    base::DictValue event;
-@@ -1171,15 +1789,30 @@ void PageHandler::OnUpdate(int send_id,
+@@ -1171,15 +1809,31 @@ void PageHandler::OnUpdate(int send_id,
    if (update.done) {
      event.Set("done", true);
    }
@@ -2900,12 +3020,13 @@
 +    chats_.clear();
 +    cards_.Clear();
 +    shown_key_.clear();
++    previous_shown_key_.clear();
 +    shown_subscription_ = {};
 +    tab_left_subscription_ = {};
      title_session_.reset();
      FinishTitle(base::Value());
      model_loaders_.clear();
-@@ -1233,18 +1866,21 @@ void PageHandler::HandleClosePanel(const
+@@ -1233,18 +1887,21 @@ void PageHandler::HandleClosePanel(const
    if (!browser) {
      return;
    }
@@ -2938,7 +3059,7 @@
  }
  
  // Only the side panel's page asks: it is the one that sends a prompt posted
-@@ -1262,14 +1898,19 @@ void PageHandler::HandleTakeAsk(const ba
+@@ -1262,14 +1919,19 @@ void PageHandler::HandleTakeAsk(const ba
          browser,
          base::BindRepeating(&PageHandler::OnAskPosted, base::Unretained(this)));
    }
@@ -3063,7 +3184,7 @@
    void OnAgentTab(content::WebContents* contents,
                    rac::agent::AgentTabStatus status,
                    const std::u16string& title);
-@@ -145,51 +183,48 @@ class PageHandler : public content::WebU
+@@ -145,51 +183,49 @@ class PageHandler : public content::WebU
    base::Value DescribeTheme();
    void NotifyTheme();
  
@@ -3125,8 +3246,9 @@
 +  // tab page has one, `own_key_`.
 +  std::map<std::string, std::unique_ptr<Chat>> chats_;
 +  std::string own_key_;
-+  // The conversation the page shows, or empty.
++  // The conversation the page shows, or empty, and the one it showed before.
 +  std::string shown_key_;
++  std::string previous_shown_key_;
 +  // The approval cards the page may answer.
 +  CardGate cards_;
 +  base::CallbackListSubscription shown_subscription_;
@@ -3142,7 +3264,7 @@
    // Names a finished chat. Separate from `session_`, so the next message
    // doesn't cancel it.
    std::unique_ptr<ChatSession> title_session_;
-@@ -206,9 +241,6 @@ class PageHandler : public content::WebU
+@@ -206,9 +242,6 @@ class PageHandler : public content::WebU
    std::unique_ptr<MenuPanel> menu_panel_;
    int menu_token_ = 0;
    base::WeakPtrFactory<PageHandler> menu_factory_{this};
@@ -3154,7 +3276,7 @@
  
 --- /dev/null
 +++ b/chrome/browser/rac/ai/card_gate.cc
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,77 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -3196,12 +3318,13 @@
 +  return it == cards_.end() ? nullptr : &it->second.action_id;
 +}
 +
-+bool CardGate::Check(const std::string& shown_conversation,
++bool CardGate::Check(bool page_showing,
++                     const std::string& shown_conversation,
 +                     const std::string& conversation,
 +                     const std::string& action_id,
 +                     const std::string& nonce) const {
-+  if (conversation.empty() || action_id.empty() || nonce.empty() ||
-+      conversation != shown_conversation) {
++  if (!page_showing || conversation.empty() || action_id.empty() ||
++      nonce.empty() || conversation != shown_conversation) {
 +    return false;
 +  }
 +  auto it = cards_.find(conversation);
@@ -3209,11 +3332,13 @@
 +         !it->second.nonce.empty() && it->second.nonce == nonce;
 +}
 +
-+bool CardGate::Take(const std::string& shown_conversation,
++bool CardGate::Take(bool page_showing,
++                    const std::string& shown_conversation,
 +                    const std::string& conversation,
 +                    const std::string& action_id,
 +                    const std::string& nonce) {
-+  if (!Check(shown_conversation, conversation, action_id, nonce)) {
++  if (!Check(page_showing, shown_conversation, conversation, action_id,
++             nonce)) {
 +    return false;
 +  }
 +  cards_.erase(conversation);
@@ -3231,7 +3356,7 @@
 +}  // namespace rac::ai
 --- /dev/null
 +++ b/chrome/browser/rac/ai/card_gate.h
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,87 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -3250,8 +3375,8 @@
 +// the nonce the browser gave the card when it last put it on show. The
 +// browser checks all three before the agent hears the answer:
 +//
-+// - The conversation must be the one on show, so after a tab switch a click
-+//   never reaches another tab's card.
++// - The page must be on screen, and the conversation must be the one it
++//   shows, so after a tab switch a click never reaches another tab's card.
 +// - The action must be the one the conversation waits on.
 +// - The nonce must be the newest: a card drawn again (the user came back to
 +//   its tab, or the page drew the conversation again) gets a new one, and a
@@ -3283,15 +3408,19 @@
 +  const std::string* PendingAction(const std::string& conversation) const;
 +
 +  // True if an answer naming `conversation`, `action_id` and `nonce` is for
-+  // the card on show now, while the page shows `shown_conversation`. Never
-+  // true for an empty field.
-+  bool Check(const std::string& shown_conversation,
++  // the card on show now, while the page shows `shown_conversation` and is
++  // itself on screen (`page_showing`: a side panel page is hidden while its
++  // panel is closed, and then no card is on show). Never true for an empty
++  // field.
++  bool Check(bool page_showing,
++             const std::string& shown_conversation,
 +             const std::string& conversation,
 +             const std::string& action_id,
 +             const std::string& nonce) const;
 +
 +  // Check(), and on success the card is used up.
-+  bool Take(const std::string& shown_conversation,
++  bool Take(bool page_showing,
++            const std::string& shown_conversation,
 +            const std::string& conversation,
 +            const std::string& action_id,
 +            const std::string& nonce);
@@ -3317,7 +3446,7 @@
 +#endif  // CHROME_BROWSER_RAC_AI_CARD_GATE_H_
 --- /dev/null
 +++ b/chrome/browser/rac/ai/card_gate_unittest.cc
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,112 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -3341,19 +3470,19 @@
 +};
 +
 +TEST_F(RacAiCardGateTest, TakesTheAnswerForTheCardOnShow) {
-+  EXPECT_TRUE(gate_.Check("A", "A", "c1", "n1"));
-+  EXPECT_TRUE(gate_.Take("A", "A", "c1", "n1"));
++  EXPECT_TRUE(gate_.Check(true, "A", "A", "c1", "n1"));
++  EXPECT_TRUE(gate_.Take(true, "A", "A", "c1", "n1"));
 +}
 +
 +// 1. The answer is bound to the conversation and to the action.
 +TEST_F(RacAiCardGateTest, NeedsTheConversationAndTheAction) {
-+  EXPECT_FALSE(gate_.Take("A", "A", "c2", "n1"));
-+  EXPECT_FALSE(gate_.Take("A", "B", "c1", "n1"));
-+  EXPECT_FALSE(gate_.Take("A", "", "c1", "n1"));
-+  EXPECT_FALSE(gate_.Take("A", "A", "", "n1"));
-+  EXPECT_FALSE(gate_.Take("A", "A", "c1", ""));
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c2", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "A", "B", "c1", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "A", "", "c1", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c1", ""));
 +  // None of them used the card up.
-+  EXPECT_TRUE(gate_.Take("A", "A", "c1", "n1"));
++  EXPECT_TRUE(gate_.Take(true, "A", "A", "c1", "n1"));
 +}
 +
 +// 2. After a switch to tab B, a click left over from A's card, or one that
@@ -3362,40 +3491,46 @@
 +  gate_.SetPending("B", "c9");
 +  ASSERT_TRUE(gate_.Show("B", "n9"));
 +  gate_.Hide("A");
-+  EXPECT_FALSE(gate_.Take("B", "A", "c1", "n1"));
-+  EXPECT_FALSE(gate_.Take("B", "B", "c1", "n1"));
-+  EXPECT_FALSE(gate_.Take("B", "B", "c1", "n9"));
-+  EXPECT_TRUE(gate_.Take("B", "B", "c9", "n9"));
++  EXPECT_FALSE(gate_.Take(true, "B", "A", "c1", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "B", "B", "c1", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "B", "B", "c1", "n9"));
++  EXPECT_TRUE(gate_.Take(true, "B", "B", "c9", "n9"));
 +  // Back on A, its card counts only once it is drawn again.
-+  EXPECT_FALSE(gate_.Take("A", "A", "c1", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c1", "n1"));
 +  ASSERT_TRUE(gate_.Show("A", "n2"));
-+  EXPECT_TRUE(gate_.Take("A", "A", "c1", "n2"));
++  EXPECT_TRUE(gate_.Take(true, "A", "A", "c1", "n2"));
 +}
 +
 +TEST_F(RacAiCardGateTest, AHiddenCardTakesNoAnswer) {
++  // The panel closed on a tab with no chat of its own: the page still shows
++  // A's card, off screen. The handler passes whether the page is showing.
++  EXPECT_FALSE(gate_.Check(false, "A", "A", "c1", "n1"));
++  EXPECT_FALSE(gate_.Take(false, "A", "A", "c1", "n1"));
++  // The card isn't used up: on screen again, it answers.
++  EXPECT_TRUE(gate_.Check(true, "A", "A", "c1", "n1"));
 +  gate_.Hide("A");
-+  EXPECT_FALSE(gate_.Take("A", "A", "c1", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c1", "n1"));
 +}
 +
 +// 3. A card drawn again gets a new nonce; the copy it replaced is stale.
 +TEST_F(RacAiCardGateTest, AReplacedCardsClickIsStale) {
 +  ASSERT_TRUE(gate_.Show("A", "n2"));
-+  EXPECT_FALSE(gate_.Take("A", "A", "c1", "n1"));
-+  EXPECT_TRUE(gate_.Take("A", "A", "c1", "n2"));
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c1", "n1"));
++  EXPECT_TRUE(gate_.Take(true, "A", "A", "c1", "n2"));
 +}
 +
 +TEST_F(RacAiCardGateTest, ANewCardReplacesTheOld) {
 +  gate_.SetPending("A", "c2");
-+  EXPECT_FALSE(gate_.Take("A", "A", "c2", "n1"));
-+  EXPECT_FALSE(gate_.Take("A", "A", "c1", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c2", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c1", "n1"));
 +  ASSERT_TRUE(gate_.Show("A", "n3"));
-+  EXPECT_FALSE(gate_.Take("A", "A", "c1", "n3"));
-+  EXPECT_TRUE(gate_.Take("A", "A", "c2", "n3"));
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c1", "n3"));
++  EXPECT_TRUE(gate_.Take(true, "A", "A", "c2", "n3"));
 +}
 +
 +TEST_F(RacAiCardGateTest, ACardIsAnsweredOnce) {
-+  ASSERT_TRUE(gate_.Take("A", "A", "c1", "n1"));
-+  EXPECT_FALSE(gate_.Check("A", "A", "c1", "n1"));
++  ASSERT_TRUE(gate_.Take(true, "A", "A", "c1", "n1"));
++  EXPECT_FALSE(gate_.Check(true, "A", "A", "c1", "n1"));
 +  EXPECT_EQ(gate_.PendingAction("A"), nullptr);
 +  EXPECT_FALSE(gate_.Show("A", "n2"));
 +}
@@ -3406,12 +3541,12 @@
 +  ASSERT_TRUE(gate_.Show("B", "n9"));
 +  gate_.Revoke("A");
 +  EXPECT_EQ(gate_.PendingAction("A"), nullptr);
-+  EXPECT_FALSE(gate_.Take("A", "A", "c1", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c1", "n1"));
 +  EXPECT_FALSE(gate_.Show("A", "n2"));
 +  // Another tab's card is untouched.
-+  EXPECT_TRUE(gate_.Check("B", "B", "c9", "n9"));
++  EXPECT_TRUE(gate_.Check(true, "B", "B", "c9", "n9"));
 +  gate_.Clear();
-+  EXPECT_FALSE(gate_.Check("B", "B", "c9", "n9"));
++  EXPECT_FALSE(gate_.Check(true, "B", "B", "c9", "n9"));
 +}
 +
 +TEST_F(RacAiCardGateTest, PendingActionNamesTheCard) {

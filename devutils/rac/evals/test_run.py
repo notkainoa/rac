@@ -1189,5 +1189,13 @@ class DialogTriggerTest(unittest.TestCase):
         self.assertEqual(len(seen), 1)
 
 
+class StopNamesTheConversationTest(unittest.TestCase):
+    def test_stop_names_the_conversation_on_show(self):
+        # The browser stops only the named conversation's own task.
+        self.assertIn("racAiAgentStop", run.STOP_JS)
+        self.assertIn("window.__evals.key", run.STOP_JS)
+        self.assertIn("'rac-ai-show'", run.ASSISTANT_HOOK)
+
+
 if __name__ == "__main__":
     unittest.main()
