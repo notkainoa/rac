@@ -387,6 +387,12 @@ serves every agent.
 - With browser control off, incognito, or AI off, no tool provider is set, so
   the agent sees an empty server list. The `--rac-agent-mcp-echo` switch
   adds a harmless `rac_echo` tool for testing.
+- Nothing on this path starts rac: the socket exists only inside a running
+  browser, and `nc` only connects to it. Anything added later that launches
+  rac for an agent (a helper binary, a CLI verb, socket activation) must
+  refuse, where `rac_dev_switches` is on, to launch without an explicit
+  `--user-data-dir` (from an argument or `RAC_USER_DATA_DIR`). A dev
+  build's default user data dir is the real `me.kainoa.rac` profile.
 
 ## The agent
 
