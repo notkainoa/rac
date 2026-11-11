@@ -63,6 +63,46 @@ if libc.clonefile(sys.argv[1].encode(), sys.argv[2].encode(), CLONE_NOFOLLOW) !=
 EOF
 }
 
+# clonefile(2) keeps file times but gives every folder of the clone the
+# clone's time, so siso steps with folder inputs would all rebuild. Gives
+# each folder of clone $2 the times of the same folder in source $1 when
+# both list the same entries, with the same times for everything but
+# subfolders. Skips out/ and .git. Prints "<restored> of <folders>".
+restore_dir_times() {
+  python3 - "$1" "$2" <<'EOF'
+import os, stat, sys
+source, clone = sys.argv[1:]
+
+def entries(path):
+    found = []
+    with os.scandir(path) as it:
+        for entry in it:
+            if entry.is_dir(follow_symlinks=False):
+                found.append((entry.name, None))
+            else:
+                found.append((entry.name, entry.stat(follow_symlinks=False).st_mtime_ns))
+    return sorted(found)
+
+restored = total = 0
+for top, dirs, _ in os.walk(source):
+    rel = os.path.relpath(top, source)
+    dirs[:] = [d for d in dirs if d != '.git' and not (rel == '.' and d == 'out')]
+    if rel == '.':
+        continue
+    total += 1
+    target = os.path.join(clone, rel)
+    try:
+        if not stat.S_ISDIR(os.lstat(target).st_mode) or entries(top) != entries(target):
+            continue
+    except OSError:
+        continue
+    st = os.lstat(top)
+    os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
+    restored += 1
+print(f'{restored} of {total}')
+EOF
+}
+
 # gn and siso run xcodebuild, which fails ("xcodebuild requires Xcode") when
 # xcode-select points at the Command Line Tools. Prints the developer dir to
 # give them: DEVELOPER_DIR or xcode-select's if that's an Xcode, otherwise
@@ -187,6 +227,10 @@ cmd_setup() {
   log "cloning $from_src (copy-on-write)"
   mkdir -p "$root/build"
   clone_tree "$from_src" "$src"
+  local times
+  times=$(restore_dir_times "$from_src" "$src") \
+    || die "couldn't give the clone's folders their source times"
+  log "gave $times folders their source times"
 
   # The clone still points at its source checkout in a few places.
   printf '%s\n' "$root/patches" > "$src/.pc/.quilt_patches"

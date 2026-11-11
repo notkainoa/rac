@@ -144,7 +144,9 @@ The base's toolchain is recorded once in `base/.rac-toolchain`, and each
 clone keeps a copy in its `build/`. `push`, `build`, `run`, and
 `--resume` refuse when the Pro's Xcode or SDK drifts from it, since a
 build then recompiles all of Chromium. `push` a committed worktree to its
-clone (a new clone waits for the base's finished build), `build` it
+clone (a new clone waits for the base's finished build; `--seed <clone>`
+clones another idle, built clone's tree instead, such as one closer to
+the branch), `build` it
 through the queue under `nice` with four cores left free,
 `run -- --rac-window-screenshot=x.png` for a background browser with its
 own profile (the shot lands in the clone's `build/shots/`), `evals` for

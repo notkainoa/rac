@@ -9,8 +9,11 @@
 #   build-base [--resume] [--approved "who/when"] <ref>
 #                                     fetch <ref> from GitHub on the Pro and
 #                                     cold-build its base tree there
-#   push <worktree>                   push its committed state, making or
-#                                     updating its clone
+#   push [--seed <clone>] <worktree>  push its committed state, making or
+#                                     updating its clone; --seed has a
+#                                     clone without a tree yet clone the
+#                                     finished, idle tree of wt/<clone>
+#                                     instead of the base's
 #   build <worktree> [-- targets...]  build the clone through the remote queue
 #   run <worktree> [--timeout S] [--requests-file F] [--fresh-profile]
 #       [--layout sidebar|top-bar] [--no-profile-picker] [--serve DIR] [-- args...]
@@ -931,7 +934,7 @@ EOS
 }
 
 cmd_push() {
-  local wt name=$2
+  local wt name=$2 seed=${3:-}
   wt=$(worktree_root "$1") || exit 1
   local branch commit
   branch=$(git -C "$wt" symbolic-ref -q --short HEAD) \
@@ -957,7 +960,7 @@ EOS
     fi
   fi
   run_dry git -C "$wt" push --force "$repo" "refs/heads/$branch:refs/heads/$branch"
-  remote "$name" "$branch" "$commit" <<'EOS'
+  remote "$name" "$branch" "$commit" "$seed" <<'EOS'
 set -e
 safe_name "$1" || { echo "rac remote: bad clone name '$1'" >&2; exit 2; }
 base="$HOME/rac-remote/base"
@@ -966,6 +969,25 @@ base="$HOME/rac-remote/base"
   exit 1
 }
 clone="$HOME/rac-remote/wt/$1"
+# The tree a clone without one gets from setup: the base's, or with
+# --seed another clone's.
+from=$base
+if [ -n "$4" ]; then
+  safe_name "$4" && [ "$4" != "$1" ] || {
+    echo "rac remote: refusing: can't seed $1 from '$4'" >&2
+    exit 2
+  }
+  [ ! -d "$clone/build/src" ] || {
+    echo "rac remote: refusing: --seed only makes a new tree, and $clone" >&2
+    echo "  already has one; push without --seed to sync it" >&2
+    exit 2
+  }
+  from="$HOME/rac-remote/wt/$4"
+  [ -d "$from" ] || {
+    echo "rac remote: refusing: no clone at $from to seed from" >&2
+    exit 2
+  }
+fi
 # The submodule updates below fetch pinned commits by sha; let the bare
 # repo serve any commit it holds, not only advertised refs. (Set here too
 # so a remote set up before this config still works.)
@@ -974,9 +996,26 @@ git -C "$HOME/rac-remote/helium-chromium.git" \
 # gn gen in setup/sync needs the toolchain the tree was built with; a clone
 # without its own record yet answers to the base's.
 check_toolchain_record "$clone"
-# A clone without a tree gets one from setup, which clones the base's: the
-# base has to be built, and not being built right now.
-if [ ! -d "$clone/build/src" ]; then
+# A clone without a tree gets one from setup, which clones the base's (or
+# the seed's): that tree has to be built, and not being built right now.
+if [ ! -d "$clone/build/src" ] && [ "$from" != "$base" ]; then
+  [ -f "$from/build/src/out/Default/.siso_fs_state" ] || {
+    echo "rac remote: refusing: the seed $from has no finished build" >&2
+    exit 2
+  }
+  if busy=$(queue_busy "$from"); then
+    echo "rac remote: refusing: a queued or running build or run owns the seed" >&2
+    echo "  $from ($busy); let it finish or stop it first" >&2
+    exit 2
+  fi
+  procs=$(tree_procs "$from")
+  [ -z "$procs" ] || {
+    echo "rac remote: refusing: processes are still running under the seed $from:" >&2
+    echo "$procs" >&2
+    exit 2
+  }
+  check_toolchain_record "$from"
+elif [ ! -d "$clone/build/src" ]; then
   if busy=$(queue_busy "$base"); then
     echo "rac remote: refusing: the base's build is queued or running" >&2
     echo "  ($busy); push once it finishes (see: status, log)" >&2
@@ -988,6 +1027,10 @@ if [ ! -d "$clone/build/src" ]; then
     exit 2
   }
 fi
+# The clone keeps the toolchain record of the tree it was made from, in
+# its build/, which git ignores.
+record="$base/.rac-toolchain"
+[ "$from" = "$base" ] || record=$(toolchain_record "$from")
 if [ ! -d "$clone" ]; then
   # The pushed branch lives in the bare rac.git, which base knows as `air`.
   # --no-recurse-submodules: the new commit can pin a helium-chromium the
@@ -1014,11 +1057,8 @@ if [ ! -d "$clone" ]; then
     git -c protocol.file.allow=always \
       submodule update --init --quiet helium-chromium
   fi
-  devutils/rac/worktree.sh setup "$base"
-  # The clone keeps the toolchain record of the tree it was made from, in
-  # its build/, which git ignores.
-  [ ! -f "$base/.rac-toolchain" ] \
-    || { mkdir -p build && cp "$base/.rac-toolchain" build/.rac-toolchain; }
+  devutils/rac/worktree.sh setup "$from"
+  [ ! -f "$record" ] || { mkdir -p build && cp "$record" build/.rac-toolchain; }
 else
   cd "$clone"
   [ "$(git rev-parse --show-toplevel 2>/dev/null)" = "$(pwd -P)" ] || {
@@ -1072,10 +1112,9 @@ else
   if [ -d build/src ]; then
     devutils/rac/worktree.sh sync
   else
-    devutils/rac/worktree.sh setup "$base"
+    devutils/rac/worktree.sh setup "$from"
     # A clone that just got its tree also inherits the toolchain record.
-    [ ! -f "$base/.rac-toolchain" ] \
-      || { mkdir -p build && cp "$base/.rac-toolchain" build/.rac-toolchain; }
+    [ ! -f "$record" ] || { mkdir -p build && cp "$record" build/.rac-toolchain; }
   fi
 fi
 EOS
@@ -2583,9 +2622,27 @@ case "${1:-}" in
   seed-base)
     die "seed-base was replaced by build-base; the Pro builds its own base from GitHub: remote-build.sh build-base <ref> --approved \"<who/when>\"" ;;
   push)
-    [ $# = 2 ] || die "usage: remote-build.sh push <worktree>"
-    name=$(clone_name "$2")
-    cmd_push "$2" "$name" ;;
+    shift
+    seed='' wt=''
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --seed)
+          [ $# -ge 2 ] || die "push: --seed needs a clone name"
+          safe_name "$2" \
+            || refuse "--seed takes a clone name of letters, digits, '.', '_' and '-', not '$2'"
+          seed=$2
+          shift 2 ;;
+        -*) die "usage: remote-build.sh push [--seed <clone>] <worktree>" ;;
+        *)
+          [ -z "$wt" ] || die "usage: remote-build.sh push [--seed <clone>] <worktree>"
+          wt=$1
+          shift ;;
+      esac
+    done
+    [ -n "$wt" ] || die "usage: remote-build.sh push [--seed <clone>] <worktree>"
+    name=$(clone_name "$wt")
+    [ "$seed" != "$name" ] || refuse "push can't seed the clone $name from itself"
+    cmd_push "$wt" "$name" "$seed" ;;
   build)
     [ $# -ge 2 ] || die "usage: remote-build.sh build <worktree> [-- targets...]"
     name=$(clone_name "$2")
