@@ -489,8 +489,26 @@ class RemoteRequestsTest(unittest.TestCase):
         for line in ('open-urls chrome://settings/system/shortcuts ; click 1 2',
                      'open-urls chrome://settings/system/shortcuts ; key return',
                      'open-urls chrome://settings/system/shortcuts ; type x',
-                     'open-urls chrome://settings/system',
+                     'open-urls chrome://settings/system/x',
                      'open-urls chrome://settings/system/shortcuts/x'):
+            self.refused(line)
+
+    def test_system_page_is_a_screenshot_only_settings_page(self):
+        self.ok('open-urls chrome://settings/system ; burst shots 2 100')
+        self.ok('open-urls rac://settings/system/ ; command 38003 ; '
+                'wheel 10 10 3')
+        self.refused('open-urls chrome://settings/system ; click 1 2')
+
+    def test_bangs_page_is_a_screenshot_only_settings_page(self):
+        # Power's Bangs page: shots, scroll and zoom only, like the rest of
+        # Settings; its delete and restore buttons can't be clicked.
+        for line in ('open-urls chrome://settings/bangs ; burst shots 2 100',
+                     'open-urls rac://settings/bangs/ ; wheel 10 10 3 ; command 38003'):
+            self.ok(line)
+        for line in ('open-urls chrome://settings/bangs ; click 1 2',
+                     'open-urls chrome://settings/bangs ; key return',
+                     'open-urls chrome://settings/bangs/edit',
+                     'open-urls chrome://settings/bangs?x'):
             self.refused(line)
 
     def test_credits_page_is_screenshot_only(self):
