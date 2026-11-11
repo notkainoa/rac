@@ -1,0 +1,141 @@
+--- a/chrome/browser/ui/views/rac/sidebar/pinned_section.cc
++++ b/chrome/browser/ui/views/rac/sidebar/pinned_section.cc
+@@ -924,14 +924,16 @@ void PinnedSection::OnViewAddedToWidget(
+ }
+ 
+ void PinnedSection::OnViewIsDeleting(views::View* observed_view) {
+-  // The container deletes its children, the rows among them, before it
+-  // deletes this.
+-  divider_ = nullptr;
+-  new_tab_row_ = nullptr;
+-  kept_rows_.clear();
++  if (observed_view != container_) {
++    ForgetRow(observed_view);
++    return;
++  }
++  // ~View() deletes the container's children before it tells observers that
++  // the container is going, so every row has already called ForgetRow().
++  DCHECK(!row_observations_.IsObservingAnySource());
++  DCHECK(!divider_ && !new_tab_row_ && !space_header_);
++  DCHECK(folder_headers_.empty() && kept_rows_.empty());
+   kept_timer_.reset();
+-  space_header_ = nullptr;
+-  folder_headers_.clear();
+   folder_menu_runner_.reset();
+   folder_menu_.reset();
+   items_observation_.Reset();
+@@ -946,6 +948,33 @@ void PinnedSection::OnViewIsDeleting(vie
+   container_ = nullptr;
+ }
+ 
++template <typename T>
++T* PinnedSection::AddRow(std::unique_ptr<T> row) {
++  T* view = container_->AddChildView(std::move(row));
++  row_observations_.AddObservation(view);
++  return view;
++}
++
++void PinnedSection::ForgetRow(views::View* row) {
++  // The row is mid-destruction but not yet freed, so letting go now never
++  // leaves a pointer behind it. Only pointers are dropped here: during the
++  // container's teardown nothing else is safe to touch.
++  row_observations_.RemoveObservation(row);
++  if (divider_.get() == row) {
++    divider_ = nullptr;
++  }
++  if (new_tab_row_.get() == row) {
++    new_tab_row_ = nullptr;
++  }
++  if (space_header_.get() == row) {
++    space_header_ = nullptr;
++  }
++  std::erase_if(folder_headers_,
++                [row](const auto& entry) { return entry.second.get() == row; });
++  std::erase_if(kept_rows_,
++                [row](const auto& entry) { return entry.second.get() == row; });
++}
++
+ void PinnedSection::OnSidebarItemsChanged() {
+   UpdateRows();
+ }
+@@ -991,8 +1020,7 @@ void PinnedSection::ShowKeptRows() {
+   HideKeptRows();
+   for (const auto& [handle, message_id] : kept) {
+     kept_rows_.emplace_back(
+-        handle,
+-        container_->AddChildView(std::make_unique<KeptReasonRow>(message_id)));
++        handle, AddRow(std::make_unique<KeptReasonRow>(message_id)));
+   }
+   StartKeptTimer();
+   container_->InvalidateLayout();
+@@ -1035,7 +1063,7 @@ void PinnedSection::Start(BrowserWindowI
+     return;
+   }
+   browser_ = browser;
+-  new_tab_row_ = container_->AddChildView(std::make_unique<NewTabRow>(browser));
++  new_tab_row_ = AddRow(std::make_unique<NewTabRow>(browser));
+   items_ = SidebarItems::Get(browser->GetProfile());
+   if (!items_) {
+     container_->InvalidateLayout();
+@@ -1050,14 +1078,13 @@ void PinnedSection::Start(BrowserWindowI
+         [](views::View* container) { container->InvalidateLayout(); },
+         base::Unretained(container_.get())));
+   }
+-  divider_ = container_->AddChildView(std::make_unique<SectionDividerView>(
++  divider_ = AddRow(std::make_unique<SectionDividerView>(
+       browser_, base::BindRepeating(&PinnedSection::ShowKeptRows,
+                                     base::Unretained(this))));
+   if (SpacesWindowManager::From(browser_)) {
+-    space_header_ = container_->AddChildView(
+-        std::make_unique<SpaceTabListHeader>(
+-            browser_, base::BindRepeating(&PinnedSection::TogglePinnedTabs,
+-                                          base::Unretained(this))));
++    space_header_ = AddRow(std::make_unique<SpaceTabListHeader>(
++        browser_, base::BindRepeating(&PinnedSection::TogglePinnedTabs,
++                                      base::Unretained(this))));
+   }
+   UpdateRows();
+ }
+@@ -1086,7 +1113,7 @@ void PinnedSection::UpdateRows() {
+       header = it->second;
+       old_headers.erase(it);
+     } else {
+-      header = container_->AddChildView(std::make_unique<FolderHeaderView>(
++      header = AddRow(std::make_unique<FolderHeaderView>(
+           base::BindRepeating(&PinnedSection::ToggleFolder,
+                               base::Unretained(this), folder->id),
+           base::BindRepeating(&PinnedSection::ShowFolderMenu,
+--- a/chrome/browser/ui/views/rac/sidebar/pinned_section.h
++++ b/chrome/browser/ui/views/rac/sidebar/pinned_section.h
+@@ -14,6 +14,7 @@
+ #include "base/callback_list.h"
+ #include "base/containers/flat_map.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/scoped_multi_source_observation.h"
+ #include "base/scoped_observation.h"
+ #include "chrome/browser/ui/rac/sidebar/sidebar_items.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+@@ -162,6 +163,12 @@ class PinnedSection : public views::View
+   void ShowKeptRows();
+ 
+  private:
++  // Adds `row` to the container and watches it, so the section lets go of
++  // it when it's deleted, however that happens.
++  template <typename T>
++  T* AddRow(std::unique_ptr<T> row);
++  // Drops every pointer to `row`, which is being deleted.
++  void ForgetRow(views::View* row);
+   void HideKeptRows();
+   void StartKeptTimer();
+   // When Clear's Undo lapses, the notes go.
+@@ -197,6 +204,10 @@ class PinnedSection : public views::View
+   base::CallbackListSubscription drag_subscription_;
+   base::ScopedObservation<views::View, views::ViewObserver>
+       container_observation_{this};
++  // Every row the section added and that is still alive, including rows
++  // closing on their way out.
++  base::ScopedMultiSourceObservation<views::View, views::ViewObserver>
++      row_observations_{this};
+   base::ScopedObservation<SidebarItems, SidebarItems::Observer>
+       items_observation_{this};
+ };
