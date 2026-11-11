@@ -1,0 +1,311 @@
+--- a/components/search_engines/BUILD.gn
++++ b/components/search_engines/BUILD.gn
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//build/config/chrome_build.gni")
++import("//testing/test.gni")
+ import("//tools/json_to_struct/json_to_struct.gni")
+ if (is_android) {
+   import("//build/config/android/config.gni")
+@@ -30,6 +31,8 @@ static_library("search_engines") {
+     "keyword_table.h",
+     "keyword_web_data_service.cc",
+     "keyword_web_data_service.h",
++    "rac_deleted_bangs.cc",
++    "rac_deleted_bangs.h",
+     "reconciling_template_url_data_holder.cc",
+     "reconciling_template_url_data_holder.h",
+     "search_engine_choice/search_engine_choice_metrics_service_accessor.h",
+@@ -338,3 +341,20 @@ component("search_engines_switches") {
+ 
+   deps = [ "//base" ]
+ }
++
++# Build with `autoninja -C out/Default rac_search_engines_unittests`. It is
++# separate from components_unittests, which takes hours to build.
++test("rac_search_engines_unittests") {
++  sources = [
++    "rac_deleted_bangs.cc",
++    "rac_deleted_bangs.h",
++    "rac_deleted_bangs_unittest.cc",
++  ]
++  deps = [
++    "//base",
++    "//base/test:run_all_unittests",
++    "//components/prefs",
++    "//components/prefs:test_support",
++    "//testing/gtest",
++  ]
++}
+--- /dev/null
++++ b/components/search_engines/rac_deleted_bangs.cc
+@@ -0,0 +1,60 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/search_engines/rac_deleted_bangs.h"
++
++#include <utility>
++
++#include "base/strings/string_util.h"
++#include "base/values.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++
++namespace rac {
++
++void RegisterDeletedBangsPref(PrefRegistrySimple* registry) {
++  registry->RegisterListPref(kDeletedBangsPref);
++}
++
++base::flat_set<std::string> ReadDeletedBangs(const PrefService* prefs) {
++  base::flat_set<std::string> deleted;
++  if (!prefs) {
++    return deleted;
++  }
++  for (const base::Value& entry : prefs->GetList(kDeletedBangsPref)) {
++    if (entry.is_string() && !entry.GetString().empty()) {
++      deleted.insert(base::ToLowerASCII(entry.GetString()));
++    }
++  }
++  return deleted;
++}
++
++bool IsDeletedBang(std::string_view trigger,
++                   const base::flat_set<std::string>& deleted) {
++  return !deleted.empty() && deleted.contains(base::ToLowerASCII(trigger));
++}
++
++void AddDeletedBang(PrefService* prefs, std::string_view trigger) {
++  if (!prefs || trigger.empty() ||
++      IsDeletedBang(trigger, ReadDeletedBangs(prefs))) {
++    return;
++  }
++  ScopedListPrefUpdate update(prefs, kDeletedBangsPref);
++  update->Append(base::ToLowerASCII(trigger));
++}
++
++void RemoveDeletedBang(PrefService* prefs, std::string_view trigger) {
++  if (!prefs || trigger.empty() ||
++      !IsDeletedBang(trigger, ReadDeletedBangs(prefs))) {
++    return;
++  }
++  const std::string lower = base::ToLowerASCII(trigger);
++  ScopedListPrefUpdate update(prefs, kDeletedBangsPref);
++  update->EraseIf([&](const base::Value& entry) {
++    return entry.is_string() && base::ToLowerASCII(entry.GetString()) == lower;
++  });
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/components/search_engines/rac_deleted_bangs.h
+@@ -0,0 +1,41 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_SEARCH_ENGINES_RAC_DELETED_BANGS_H_
++#define COMPONENTS_SEARCH_ENGINES_RAC_DELETED_BANGS_H_
++
++#include <string>
++#include <string_view>
++
++#include "base/containers/flat_set.h"
++
++class PrefRegistrySimple;
++class PrefService;
++
++namespace rac {
++
++// The triggers (without the "!") of downloaded bangs the user deleted. A
++// list of strings. TemplateURLService skips these when it re-applies the
++// downloaded list, so a deleted bang stays deleted.
++inline constexpr char kDeletedBangsPref[] = "rac.bangs.deleted";
++
++void RegisterDeletedBangsPref(PrefRegistrySimple* registry);
++
++// Triggers are compared in ASCII lower case, so the set holds lower case
++// triggers. Entries that are not strings are skipped. A null |prefs| gives an
++// empty set.
++base::flat_set<std::string> ReadDeletedBangs(const PrefService* prefs);
++
++// True when |trigger| (no "!") is in |deleted|, ignoring ASCII case.
++bool IsDeletedBang(std::string_view trigger,
++                   const base::flat_set<std::string>& deleted);
++
++// Both do nothing when the trigger is already in (or already out of) the
++// list, and when |prefs| is null or |trigger| is empty.
++void AddDeletedBang(PrefService* prefs, std::string_view trigger);
++void RemoveDeletedBang(PrefService* prefs, std::string_view trigger);
++
++}  // namespace rac
++
++#endif  // COMPONENTS_SEARCH_ENGINES_RAC_DELETED_BANGS_H_
+--- /dev/null
++++ b/components/search_engines/rac_deleted_bangs_unittest.cc
+@@ -0,0 +1,131 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/search_engines/rac_deleted_bangs.h"
++
++#include <string>
++#include <vector>
++
++#include "base/containers/flat_set.h"
++#include "base/values.h"
++#include "components/prefs/testing_pref_service.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++class DeletedBangsTest : public testing::Test {
++ protected:
++  DeletedBangsTest() { RegisterDeletedBangsPref(prefs_.registry()); }
++
++  TestingPrefServiceSimple prefs_;
++};
++
++// What BangsLoadedCallback does for one downloaded list: a bang is added
++// unless the user deleted it or already has that keyword.
++std::vector<std::string> BangsToAdd(
++    const std::vector<std::string>& downloaded,
++    const base::flat_set<std::u16string>& user_keywords,
++    const base::flat_set<std::string>& deleted) {
++  std::vector<std::string> add;
++  for (const std::string& trigger : downloaded) {
++    if (IsDeletedBang(trigger, deleted)) {
++      continue;
++    }
++    if (user_keywords.contains(
++            u"!" + std::u16string(trigger.begin(), trigger.end()))) {
++      continue;
++    }
++    add.push_back(trigger);
++  }
++  return add;
++}
++
++TEST_F(DeletedBangsTest, EmptyByDefaultAndNullSafe) {
++  EXPECT_TRUE(ReadDeletedBangs(&prefs_).empty());
++  EXPECT_TRUE(ReadDeletedBangs(nullptr).empty());
++  AddDeletedBang(nullptr, "w");
++  RemoveDeletedBang(nullptr, "w");
++}
++
++TEST_F(DeletedBangsTest, AddAndReadRoundTrip) {
++  AddDeletedBang(&prefs_, "w");
++  AddDeletedBang(&prefs_, "yt");
++  base::flat_set<std::string> deleted = ReadDeletedBangs(&prefs_);
++  EXPECT_EQ(2u, deleted.size());
++  EXPECT_TRUE(IsDeletedBang("w", deleted));
++  EXPECT_TRUE(IsDeletedBang("yt", deleted));
++  EXPECT_FALSE(IsDeletedBang("g", deleted));
++}
++
++TEST_F(DeletedBangsTest, AddIsIdempotent) {
++  AddDeletedBang(&prefs_, "w");
++  AddDeletedBang(&prefs_, "w");
++  AddDeletedBang(&prefs_, "W");
++  EXPECT_EQ(1u, prefs_.GetList(kDeletedBangsPref).size());
++}
++
++TEST_F(DeletedBangsTest, RemoveIsIdempotent) {
++  AddDeletedBang(&prefs_, "w");
++  AddDeletedBang(&prefs_, "yt");
++  RemoveDeletedBang(&prefs_, "w");
++  RemoveDeletedBang(&prefs_, "w");
++  RemoveDeletedBang(&prefs_, "never-there");
++  base::flat_set<std::string> deleted = ReadDeletedBangs(&prefs_);
++  EXPECT_FALSE(IsDeletedBang("w", deleted));
++  EXPECT_TRUE(IsDeletedBang("yt", deleted));
++  EXPECT_EQ(1u, deleted.size());
++}
++
++TEST_F(DeletedBangsTest, EmptyTriggerIsIgnored) {
++  AddDeletedBang(&prefs_, "");
++  EXPECT_TRUE(prefs_.GetList(kDeletedBangsPref).empty());
++  EXPECT_FALSE(IsDeletedBang("", ReadDeletedBangs(&prefs_)));
++}
++
++TEST_F(DeletedBangsTest, NonStringEntriesAreIgnored) {
++  base::ListValue list;
++  list.Append(1);
++  list.Append(true);
++  list.Append(base::ListValue());
++  list.Append("w");
++  list.Append("");
++  prefs_.SetList(kDeletedBangsPref, std::move(list));
++  base::flat_set<std::string> deleted = ReadDeletedBangs(&prefs_);
++  EXPECT_EQ(1u, deleted.size());
++  EXPECT_TRUE(IsDeletedBang("w", deleted));
++  // Removing leaves the entries it does not own alone.
++  RemoveDeletedBang(&prefs_, "w");
++  EXPECT_EQ(4u, prefs_.GetList(kDeletedBangsPref).size());
++}
++
++TEST_F(DeletedBangsTest, CaseIsIgnored) {
++  AddDeletedBang(&prefs_, "YT");
++  base::flat_set<std::string> deleted = ReadDeletedBangs(&prefs_);
++  EXPECT_TRUE(IsDeletedBang("yt", deleted));
++  EXPECT_TRUE(IsDeletedBang("Yt", deleted));
++  RemoveDeletedBang(&prefs_, "yT");
++  EXPECT_TRUE(ReadDeletedBangs(&prefs_).empty());
++}
++
++TEST_F(DeletedBangsTest, DeletedBangStaysDeletedAcrossListUpdates) {
++  AddDeletedBang(&prefs_, "w");
++  const std::vector<std::string> list = {"g", "w", "yt"};
++  const std::vector<std::string> expected = {"g", "yt"};
++  EXPECT_EQ(expected, BangsToAdd(list, {}, ReadDeletedBangs(&prefs_)));
++  // A new download, with the bang still in it.
++  EXPECT_EQ(expected, BangsToAdd(list, {}, ReadDeletedBangs(&prefs_)));
++  // Un-deleting brings it back.
++  RemoveDeletedBang(&prefs_, "w");
++  EXPECT_EQ(list, BangsToAdd(list, {}, ReadDeletedBangs(&prefs_)));
++}
++
++TEST_F(DeletedBangsTest, UsersOwnKeywordBlocksTheDownloadedBang) {
++  const std::vector<std::string> list = {"g", "w"};
++  const std::vector<std::string> expected = {"g"};
++  EXPECT_EQ(expected, BangsToAdd(list, {u"!w"}, ReadDeletedBangs(&prefs_)));
++}
++
++}  // namespace
++}  // namespace rac
+--- a/components/search_engines/template_url_service.cc
++++ b/components/search_engines/template_url_service.cc
+@@ -53,6 +53,7 @@
+ #include "components/search_engines/choice_made_location.h"
+ #include "components/search_engines/enterprise/enterprise_search_manager.h"
+ #include "components/search_engines/keyword_web_data_service.h"
++#include "components/search_engines/rac_deleted_bangs.h"
+ #include "components/search_engines/regulatory_extension_type.h"
+ #include "components/search_engines/search_engine_choice/search_engine_choice_service.h"
+ #include "components/search_engines/search_engine_choice/search_engine_choice_utils.h"
+@@ -673,6 +674,7 @@ void TemplateURLService::RegisterProfile
+   registry->RegisterBooleanPref(prefs::kDefaultSearchProviderEnabled, true);
+   registry->RegisterBooleanPref(
+       prefs::kDefaultSearchProviderContextMenuAccessAllowed, true);
++  rac::RegisterDeletedBangsPref(registry);
+ }
+ 
+ #if BUILDFLAG(IS_ANDROID)
+@@ -1676,7 +1678,11 @@ void TemplateURLService::LoadBangs() {
+ void TemplateURLService::BangsLoadedCallback() {
+   VLOG(2) << "BangsLoadedCallback() called";
+ 
++  const auto deleted_bangs = rac::ReadDeletedBangs(&prefs_.get());
+   for (const auto& bang : bang_manager_->GetBangs()) {
++    if (rac::IsDeletedBang(bang.bang, deleted_bangs)) {
++      continue;
++    }
+     auto template_data = TemplateURLDataFromBang(bang);
+ 
+     if (!GetTemplateURLForKeyword(template_data.keyword())) {
