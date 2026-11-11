@@ -493,6 +493,20 @@ class RemoteRequestsTest(unittest.TestCase):
                      'open-urls chrome://settings/system/shortcuts/x'):
             self.refused(line)
 
+    def test_credits_page_is_screenshot_only(self):
+        # chrome://credits is the build's static license page; its links
+        # lead to the open web, so a run that opens it takes shots only.
+        for line in ('open-urls chrome://credits ; burst shots 2 100',
+                     'open-urls rac://credits/ ; wheel 10 10 3',
+                     'open-urls CHROME://credits ; command 38003'):
+            self.ok(line)
+        for line in ('open-urls chrome://credits ; click 1 2',
+                     'open-urls rac://credits ; key tab',
+                     'open-urls chrome://credits ; type x',
+                     'open-urls chrome://credits/x',
+                     'open-urls chrome://credits?x'):
+            self.refused(line)
+
     def test_settings_pages_may_zoom(self):
         for line in ('open-urls chrome://settings/general ; command 38003 ; '
                      'burst shots 2 100',
