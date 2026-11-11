@@ -184,7 +184,9 @@ Its callers apply it differently:
   watcher exists and before the menu item is added, so an internal page
   gets no card, no loading state and no fetch. The link itself must be
   http(s) (`IsSummarizableLink`), so a web page's link to rac://settings
-  isn't summarized either.
+  isn't summarized either. The assistant's own chat page counts as
+  internal on purpose: a reply's links can come from injected page
+  content, and a one-click summary fetch would be a way to send data out.
 
 A panel opened beside an internal page by a way in that calls
 `SidePanelUI::Show` itself (the agent's tab pill, the side panel action)
