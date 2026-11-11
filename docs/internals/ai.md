@@ -175,10 +175,10 @@ Its callers apply it differently:
   `go_back` judges the entry it goes back to by the same rule
   (`IsInternalEntry`), on the approval card and in the step, except that
   the step may go back to a blank page.
-- The entry points (`IsAssistantBlockedHere`: the Chat button, the edge
-  handle, the Assistant command, Find's Ask, the command bar's Ask row via
-  `Need::kWebPage`) go by the address bar's address, and a blank tab
-  doesn't block them. The agent opens its tabs blank first, and a new tab
+- The entry points (`IsAssistantBlockedHere`: the Chat buttons in the
+  top bar and the sidebar, the edge handle, the Assistant command, Find's
+  Ask, the command bar's Ask row via `Need::kWebPage`) go by the address
+  bar's address, and a blank tab doesn't block them. The agent opens its tabs blank first, and a new tab
   on its way to a web page would otherwise flash the panel shut, mid-task.
 - Link summaries (`ShouldOfferLinkSummary`, for Option-hover and
   "Summarize Link") need both: the tab, which holds the page the link is
@@ -292,12 +292,13 @@ This is the rule that's easiest to break by accident. How it holds:
 - The `AgentController` is created only when AI is on, browser control is on,
   and the profile is regular (`IsBrowserControlAllowed`).
 - Pref listeners stay registered so that turning AI on works without a
-  restart: the top bar host, each window's `WindowAssistant`, the pull
-  handle, the Assistant action. They watch a pref and do nothing else. The visible
-  parts (Chat button, handle, menu entry, native action) are created only
-  while AI is on, and removed when it turns off. So is each window's watch
-  on its active tab, which keeps the assistant off internal pages. Tabs get
-  a chat entry only when the assistant opens on them.
+  restart: the top bar and sidebar Chat hosts, each window's
+  `WindowAssistant`, the pull handle, the Assistant action. They watch a
+  pref and do nothing else. The visible parts (Chat buttons, handle, menu
+  entry, native action) are created only while AI is on, and removed when
+  it turns off. So is each window's watch on its active tab, which keeps
+  the assistant off internal pages. Tabs get a chat entry only when the
+  assistant opens on them.
 - Turning AI off cancels requests, stops the agent process, closes the
   panel, drops every tab's chat entry, ends every conversation (and the
   window's chat page with them), and navigates open assistant tabs to the
