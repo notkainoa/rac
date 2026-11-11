@@ -5,7 +5,12 @@
 # docs/network.md (launch gate G10: rac's promise of nothing phoning home is
 # proven by recording, not asserted). Writes <out>/net-capture.md (one line
 # per check plus the host list), <out>/netlog.json, <out>/hosts.txt,
-# <out>/hosts.json, and <out>/rac-capture.log.
+# <out>/hosts.json, and <out>/rac-capture.log, plus <out>/os-hosts.txt: the
+# hosts rac's processes reached according to the OS (DNS and new
+# connections from tcpdump, rac's sockets from polled lsof), which covers
+# traffic outside Chromium's network stack that the net-log can't see, such
+# as Sparkle's update check through NSURLSession. The raw os-*.txt records
+# are kept next to it.
 #
 # Usage: github_net_capture.sh <rac.dmg> <out-dir> [--minutes N] [--services off|on]
 #                              [--first-run skip|onboarding-open|onboarding-closed] [--list doc.md]
@@ -55,6 +60,7 @@ set -u
 _here="$(cd "$(dirname "$0")" && pwd)"
 _repo="$(cd "$_here/../.." && pwd)"
 _hostlist="$_repo/devutils/rac/hostlist.py"
+_os_hosts="$_repo/devutils/rac/os_hosts.py"
 _smoke_py="$_here/release_smoke.py"
 
 _dmg=""
@@ -144,7 +150,25 @@ _stop_app() {
   _pid=""
 }
 
+# The OS-level record: two root tcpdumps (their pids in pidfiles, since a
+# root process can't be signaled by the runner user) and an lsof poller.
+_os_dir=""
+_os_poller=""
+_os_stop() {
+  [ -n "$_os_dir" ] || return 0
+  [ -z "$_os_poller" ] || { kill "$_os_poller" 2>/dev/null || true; wait "$_os_poller" 2>/dev/null || true; }
+  _os_poller=""
+  local f
+  for f in "$_os_dir"/tcpdump-*.pid; do
+    [ -f "$f" ] || continue
+    sudo -n kill "$(cat "$f")" 2>/dev/null || true
+    rm -f "$f"
+  done
+  sleep 1
+}
+
 _cleanup() {
+  _os_stop
   _stop_app
   if [ "$_mounted" = 1 ]; then
     hdiutil detach "$_mnt" -quiet 2>/dev/null || hdiutil detach "$_mnt" -force -quiet 2>/dev/null || true
@@ -228,6 +252,48 @@ else
   record PASS "profile" "fresh throwaway profile; nothing consented to Helium services"
 fi
 
+# Record rac's traffic from outside Chromium too. Sparkle checks the update
+# feed with NSURLSession in the main process, which --log-net-log never
+# sees. Flush the OS DNS cache first so rac's lookups reach the wire even
+# for names the runner resolved already (github.com, for the checkout).
+_os_dir="$_work/os"
+mkdir -p "$_os_dir"
+_os_started=0
+if sudo -n true 2>/dev/null; then
+  sudo -n dscacheutil -flushcache 2>/dev/null || true
+  sudo -n killall -HUP mDNSResponder 2>/dev/null || true
+  # $1: name, $2: output, rest: tcpdump args. pktap covers every interface
+  # and tags packets with the process that sent them.
+  _os_tcpdump() {
+    local name=$1 out=$2
+    shift 2
+    sudo -n sh -c 'echo $$ > "$1"; shift; exec tcpdump "$@"' _ \
+      "$_os_dir/tcpdump-$name.pid" "$@" > "$out" 2> "$_os_dir/tcpdump-$name.err" &
+  }
+  _os_tcpdump dns "$_os_dir/os-dns.txt" -i pktap -n -l -vv 'port 53'
+  _os_tcpdump syn "$_os_dir/os-syn.txt" -i pktap -k NP -n -l \
+    'tcp[tcpflags] & (tcp-syn|tcp-ack) == tcp-syn'
+  sleep 2
+  # A tcpdump that couldn't open pktap has exited by now; record DNS on the
+  # primary interface instead (no process tags needed for DNS).
+  if [ ! -s "$_os_dir/tcpdump-dns.pid" ] || ! sudo -n kill -0 "$(cat "$_os_dir/tcpdump-dns.pid")" 2>/dev/null; then
+    _os_tcpdump dns "$_os_dir/os-dns.txt" -i en0 -n -l -vv 'port 53'
+    sleep 1
+  fi
+  _os_started=1
+fi
+(
+  while :; do
+    _pids="$(pgrep -f -- "$_app/Contents/" | paste -sd, - || true)"
+    if [ -n "$_pids" ]; then
+      echo "# $(date +%s)"
+      lsof -nP -a -p "$_pids" -i 2>/dev/null || true
+    fi
+    sleep 1
+  done
+) > "$_os_dir/os-lsof.txt" 2>/dev/null &
+_os_poller=$!
+
 # Launch with the net-log recorder on and nothing to navigate to. Deliberately
 # no --custom-update-server-url: the capture must show the real feed check.
 _log="$_work/rac.log"
@@ -277,6 +343,7 @@ else
   record FAIL "capture" "rac exited after ${_waited}s (see rac-capture.log in the artifact)"
 fi
 _stop_app
+_os_stop
 if [ "$_killed" = 1 ]; then
   record SKIP "shutdown" "rac ignored SIGTERM for 30s and was killed; the net-log may end mid-event"
 else
@@ -303,10 +370,59 @@ with open(sys.argv[2], encoding='utf-8') as f:
 EOF
 )"
 
+# With services on, the ```hosts services block (what consenting adds)
+# counts too; a services-off capture is held to the default list alone.
+_also=()
+[ "$_services" != "on" ] || _also=(--also services)
+
 if [ "${_events:-0}" -gt 0 ]; then
   record PASS "net-log" "$_events events captured"
 else
   record FAIL "net-log" "netlog.json holds no complete events (browser died too early?)"
+fi
+
+# The OS record: hosts rac's own processes reached, named from DNS. A
+# resolved name missing from the published list fails like a net-log host;
+# an address with no DNS answer in the record is reported, not failed.
+for f in os-dns.txt os-syn.txt os-lsof.txt tcpdump-dns.err tcpdump-syn.err; do
+  cp "$_os_dir/$f" "$_out_dir/$f" 2>/dev/null || true
+done
+python3 "$_os_hosts" --app-path "$_app" --dns "$_os_dir/os-dns.txt" \
+  --syn "$_os_dir/os-syn.txt" --lsof "$_os_dir/os-lsof.txt" > "$_out_dir/os-hosts.txt" 2>&1 || true
+python3 "$_os_hosts" --app-path "$_app" --dns "$_os_dir/os-dns.txt" \
+  --syn "$_os_dir/os-syn.txt" --lsof "$_os_dir/os-lsof.txt" --json > "$_out_dir/os-hosts.json" 2>/dev/null || echo '[]' > "$_out_dir/os-hosts.json"
+_os_compare="$_work/os-compare.txt"
+_os_rc=0
+python3 - "$_hostlist" "$_list" "$_out_dir/os-hosts.json" ${_also[@]+"${_also[@]}"} > "$_os_compare" <<'EOF' || _os_rc=$?
+import importlib.util, ipaddress, json, sys
+spec = importlib.util.spec_from_file_location('hostlist', sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+also = [a for a in sys.argv[4:] if a != '--also']
+with open(sys.argv[2], encoding='utf-8') as f:
+    patterns, _ = m.parse_host_list(f.read(), also)
+entries = json.load(open(sys.argv[3]))
+unlisted, unresolved = [], []
+for e in entries:
+    try:
+        ipaddress.ip_address(e['host']); unresolved.append(e); continue
+    except ValueError:
+        pass
+    if not m.host_listed(e['host'], patterns):
+        unlisted.append(e)
+for e in unlisted:
+    print(f"error: reached outside the net-log but not listed: {e['host']} ({', '.join(e['processes'])})")
+for e in unresolved:
+    print(f"info: address with no DNS answer in the record: {e['host']} ({', '.join(e['processes'])})")
+if not unlisted:
+    print(f'ok: all {len(entries) - len(unresolved)} named hosts are listed')
+sys.exit(1 if unlisted else 0)
+EOF
+if [ "$_os_started" = 0 ]; then
+  record SKIP "os hosts" "no passwordless sudo for tcpdump; only lsof polling ran ($(grep -vc '^#' "$_out_dir/os-hosts.txt" 2>/dev/null || echo 0) hosts)"
+elif [ "$_os_rc" = 0 ]; then
+  record PASS "os hosts" "every host rac reached outside the net-log is published in $(basename "$_list")"
+else
+  record FAIL "os hosts" "a host rac reached outside the net-log isn't listed in $(basename "$_list") (see os-hosts.txt)"
 fi
 
 python3 "$_hostlist" hosts "$_out_dir/netlog.json" > "$_out_dir/hosts.txt"
@@ -314,10 +430,6 @@ python3 "$_hostlist" hosts "$_out_dir/netlog.json" --json > "$_out_dir/hosts.jso
 
 _compare_out="$_work/compare.txt"
 _compare_rc=0
-# With services on, the ```hosts services block (what consenting adds)
-# counts too; a services-off capture is held to the default list alone.
-_also=()
-[ "$_services" != "on" ] || _also=(--also services)
 python3 "$_hostlist" compare "$_out_dir/netlog.json" --list "$_list" ${_also[@]+"${_also[@]}"} \
   > "$_compare_out" 2>&1 || _compare_rc=$?
 cat "$_compare_out"
@@ -343,6 +455,16 @@ _rc=$?
   echo
   echo '```'
   cat "$_compare_out"
+  echo '```'
+  echo
+  echo "### Hosts reached outside Chromium's net-log (OS record)"
+  echo
+  echo 'From tcpdump (DNS, new connections) and polled lsof of rac'"'"'s own processes.'
+  echo "The main process's hosts come from NSURLSession, e.g. Sparkle's update check."
+  echo
+  echo '```'
+  cat "$_out_dir/os-hosts.txt" 2>/dev/null
+  cat "$_os_compare" 2>/dev/null
   echo '```'
 } >> "$_out_dir/net-capture.md"
 exit "$_rc"
