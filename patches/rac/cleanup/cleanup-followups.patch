@@ -1,0 +1,157 @@
+--- a/chrome/browser/ui/rac/cleanup/inactive_tabs.cc
++++ b/chrome/browser/ui/rac/cleanup/inactive_tabs.cc
+@@ -20,4 +20,8 @@ bool IsInactiveFor(base::Time last_shown
+   return now - last_used >= period;
+ }
+ 
++bool ShouldStampLeftTab(bool still_in_window, bool moving_to_another_window) {
++  return still_in_window || moving_to_another_window;
++}
++
+ }  // namespace rac::cleanup
+--- a/chrome/browser/ui/rac/cleanup/inactive_tabs.h
++++ b/chrome/browser/ui/rac/cleanup/inactive_tabs.h
+@@ -40,6 +40,12 @@ bool IsInactiveFor(base::Time last_shown
+                    base::Time now,
+                    base::TimeDelta period);
+ 
++// Whether the tab that just stopped being a window's selected tab gets its
++// "last left" stamp: one still in the window, or one leaving it for another
++// window (dragged out). Not one being closed, which is on its way to being
++// deleted.
++bool ShouldStampLeftTab(bool still_in_window, bool moving_to_another_window);
++
+ }  // namespace rac::cleanup
+ 
+ #endif  // CHROME_BROWSER_UI_RAC_CLEANUP_INACTIVE_TABS_H_
+--- a/chrome/browser/ui/rac/cleanup/inactive_tabs_unittest.cc
++++ b/chrome/browser/ui/rac/cleanup/inactive_tabs_unittest.cc
+@@ -104,5 +104,20 @@ TEST(InactiveTabsTest, ATimeAfterNowIsNo
+                              /*selected=*/false, Now(), base::Hours(5)));
+ }
+ 
++TEST(InactiveTabsTest, ALeftTabStillInTheWindowIsStamped) {
++  EXPECT_TRUE(ShouldStampLeftTab(/*still_in_window=*/true,
++                                 /*moving_to_another_window=*/false));
++}
++
++TEST(InactiveTabsTest, ASelectedTabDraggedToAnotherWindowIsStamped) {
++  EXPECT_TRUE(ShouldStampLeftTab(/*still_in_window=*/false,
++                                 /*moving_to_another_window=*/true));
++}
++
++TEST(InactiveTabsTest, AClosingTabIsNotStamped) {
++  EXPECT_FALSE(ShouldStampLeftTab(/*still_in_window=*/false,
++                                  /*moving_to_another_window=*/false));
++}
++
+ }  // namespace
+ }  // namespace rac::cleanup
+--- a/chrome/browser/ui/rac/cleanup/last_deselected.cc
++++ b/chrome/browser/ui/rac/cleanup/last_deselected.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/rac/cleanup/last_deselected.h"
+ 
++#include "chrome/browser/ui/rac/cleanup/inactive_tabs.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_user_data.h"
+@@ -51,11 +52,22 @@ void DeselectionStamps::OnTabStripModelC
+     TabStripModel* tab_strip_model,
+     const TabStripModelChange& change,
+     const TabStripSelectionChange& selection) {
+-  // Only a tab still in the strip: not one closing, which may be on its way
+-  // to being deleted.
+-  if (!selection.active_tab_changed() || !selection.old_contents ||
+-      tab_strip_model->GetIndexOfWebContents(selection.old_contents) ==
+-          TabStripModel::kNoTab) {
++  if (!selection.active_tab_changed() || !selection.old_contents) {
++    return;
++  }
++  bool moving_to_another_window = false;
++  if (change.type() == TabStripModelChange::kRemoved) {
++    for (const auto& removed : change.GetRemove()->contents) {
++      if (removed.contents == selection.old_contents &&
++          removed.remove_reason ==
++              TabRemovedReason::kInsertedIntoOtherTabStrip) {
++        moving_to_another_window = true;
++      }
++    }
++  }
++  if (!ShouldStampLeftTab(tab_strip_model->GetIndexOfWebContents(
++                              selection.old_contents) != TabStripModel::kNoTab,
++                          moving_to_another_window)) {
+     return;
+   }
+   LastDeselected::GetOrCreateForWebContents(selection.old_contents)
+--- a/chrome/browser/ui/views/rac/sidebar/cleanup_button.cc
++++ b/chrome/browser/ui/views/rac/sidebar/cleanup_button.cc
+@@ -17,7 +17,9 @@
+ #include "chrome/browser/ui/rac/rac_action_handlers.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
+ #include "chrome/browser/ui/views/frame/base_tab_strip_region_view.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/rac/sidebar/pinned_section.h"
++#include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h"
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
+ #include "chrome/grit/rac_strings.h"
+ #include "ui/accessibility/ax_enums.mojom.h"
+@@ -194,6 +196,12 @@ void CleanupButton::ShowMenu(const ui::E
+ 
+ void CleanupButton::OnMenuClosed() {
+   SetHighlighted(false);
++  // The menu held a revealed sidebar out. Closed by a key or a click, it
++  // leaves no pointer move to let the sidebar slide away, so re-check now.
++  if (BrowserView* browser_view =
++          BrowserView::GetBrowserViewForBrowser(browser_)) {
++    RefreshSidebarReveal(browser_view);
++  }
+ }
+ 
+ // static
+--- a/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.cc
++++ b/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.cc
+@@ -40,6 +40,10 @@
+ #include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/compositor/layer.h"
++#include "ui/events/base_event_utils.h"
++#include "ui/events/event.h"
++#include "ui/events/event_observer.h"
++#include "ui/gfx/geometry/point_f.h"
+ #include "ui/gfx/geometry/rect.h"
+ #include "ui/gfx/text_utils.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+@@ -1077,6 +1081,19 @@ bool IsSidebarMenuShowing(const BrowserV
+   return header && header->IsSidebarMenuShowing();
+ }
+ 
++void RefreshSidebarReveal(BrowserView* browser_view) {
++  // BrowserView re-checks its reveal on any mouse event it observes, from
++  // where the pointer is, not where the event says. The event goes to
++  // BrowserView::OnEvent alone; nothing else sees it. It stands in for
++  // calling UpdateZenModeRevealFromCursor(), which is private: making it
++  // public would edit browser_view.h, which nearly everything includes, so
++  // every build would recompile most of the browser.
++  const ui::MouseEvent move(ui::EventType::kMouseMoved, gfx::PointF(),
++                            gfx::PointF(), ui::EventTimeForNow(), ui::EF_NONE,
++                            ui::EF_NONE);
++  static_cast<ui::EventObserver*>(browser_view)->OnEvent(move);
++}
++
+ int GetMinimumSidebarWidth(const BrowserView* browser_view) {
+   const auto* header = HeaderFor(browser_view);
+   return header ? header->GetMinimumSidebarWidth() : 0;
+--- a/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h
++++ b/chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h
+@@ -286,6 +286,9 @@ bool ShouldKeepSidebarRevealed(const Bro
+ // Whether a menu the sidebar opened itself is open, wherever the address bar
+ // is. A hidden sidebar stays revealed while it is.
+ bool IsSidebarMenuShowing(const BrowserView* browser_view);
++// Re-checks whether a hidden sidebar should stay revealed, as a pointer move
++// would. For a sidebar menu that closed without one (a key, a click).
++void RefreshSidebarReveal(BrowserView* browser_view);
+ int GetMinimumSidebarWidth(const BrowserView* browser_view);
+ 
+ // True for views in the sidebar's header, such as the address bar.
