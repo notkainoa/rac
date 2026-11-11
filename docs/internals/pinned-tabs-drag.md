@@ -27,9 +27,8 @@ unpinned containers during a drag. rac does, and that breaks assumptions:
   scroll view means favorites. A window with no favorites also gives them a
   band at the top of the open tabs (`favorites_drop.cc`), over the space's
   name row, so a drag doesn't have to reach into the header to find them.
-  Without that row (no spaces UI), the band shrinks over "+ New Tab", or
-  goes away when a pinned tab is at the very top; the header stays a
-  favorites target either way.
+  Without that row (no spaces UI) there's no band: the pin zone starts at
+  the top of the open tabs, and the header stays the favorites target.
   Going up, the order is open tabs, then the pin zone where the divider
   opens, then the band. The band never takes the pin zone: it ends at least
   half a tab above the first place a drop would pin, so with no pinned tabs
@@ -55,9 +54,12 @@ unpinned containers during a drag. rac does, and that breaks assumptions:
 
 Chromium's animating layout manager moves every row from its last bounds to
 its new ones. A row that's hidden still has bounds, so lay it out where it
-will appear. That's why, with no pinned tabs, the divider waits closed above
-the first open tab. It opens only when a drag reaches the top of the open
-tabs, so other drags don't shift the open tabs under the pointer.
+will appear. That's why, with no pinned tabs, the divider waits closed where
+it opens: under the space's name, above "+ New Tab". It opens only when a drag
+reaches the top of the open tabs, so other drags don't shift the open tabs
+under the pointer. Waiting anywhere else moves the place a drop pins as soon
+as it opens, and a real drag then flips between pinning and not on every
+pointer move.
 
 The layout manager takes its duration from `gfx::Animation::RichAnimationDuration`,
 so Reduce Motion makes these changes instant. That includes the favorites
