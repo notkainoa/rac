@@ -12,16 +12,18 @@ Wikipedia for "cats".
   `TemplateURL` with a `bang_id`). They aren't saved; the list is applied
   again at every start.
 - The list is applied only after the saved engines have loaded
-  (`bangs-deleted.patch`). A list already in memory, as in every profile
-  after the first, used to arrive first: its bangs took the ids the saved
-  engines then loaded with, and a downloaded `!x` slipped in next to the
-  user's own `!x`.
+  (`rac/power/bangs-deleted.patch`). A list already in memory, as in every
+  profile after the first, used to arrive first: its bangs took the ids the
+  saved engines then loaded with, and a downloaded `!x` slipped in next to
+  the user's own `!x`. Applying a list that added bangs tells the
+  service's observers once, so an open Bangs page sees a list that arrives
+  late.
 - A bang works at the start of the query (`!w cats`), and in the middle or
   at the end (`cats !w`) once a space or Return follows it.
 
 ## Edits that survive list updates
 
-Patches: `rac/power/bangs-deleted.patch`, `bangs-page.patch`.
+Patches: `rac/power/bangs-deleted.patch`, `rac/power/bangs-page.patch`.
 
 - **Deleted bangs** are a profile pref, `rac.bangs.deleted`: a list of
   triggers, without the `!`. `TemplateURLService::BangsLoadedCallback`
