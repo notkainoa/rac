@@ -1,0 +1,2470 @@
+Index: src/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+===================================================================
+--- src.orig/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
++++ src/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+@@ -660,6 +660,7 @@
+ #if defined(TOOLKIT_VIEWS)
+ #include "chrome/browser/bookmarks/bookmark_merged_surface_service_factory.h"
+ #include "chrome/browser/ui/browser_shortcuts/browser_shortcut_service_factory.h"
++#include "chrome/browser/ui/rac/media/sidebar_media_factory.h"
+ #include "chrome/browser/ui/rac/sidebar/sidebar_items_factory.h"
+ #endif
+ 
+@@ -857,6 +858,7 @@ void ChromeBrowserMainExtraPartsProfiles
+ #if defined(TOOLKIT_VIEWS)
+   browser_shortcuts::BrowserShortcutServiceFactory::GetInstance();
+   rac::SidebarItemsFactory::GetInstance();
++  rac::SidebarMediaFactory::GetInstance();
+ #endif
+ #if !BUILDFLAG(IS_ANDROID)
+   BrowserManagerServiceFactory::GetInstance();
+Index: src/chrome/browser/ui/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/BUILD.gn
++++ src/chrome/browser/ui/BUILD.gn
+@@ -3765,6 +3765,7 @@ static_library("ui") {
+     deps += [ "//chrome/browser/ui/views/rac:sidebar_overshoot_zone" ]
+     deps += [ "//chrome/browser/ui/views/rac:window_buttons_ratio" ]
+     deps += [ "//chrome/browser/ui/views/rac:sidebar_chat_state" ]
++    deps += [ "//chrome/browser/ui/views/rac/media" ]
+ 
+     sources += get_target_outputs(":webui_name_variants")
+ 
+Index: src/chrome/browser/ui/rac/media/BUILD.gn
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/media/BUILD.gn
+@@ -0,0 +1,82 @@
++# Copyright 2026 The rac Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import("//testing/test.gni")
++
++assert(!is_android)
++
++# The rules behind the sidebar's media card. Apart from mojo and views so
++# they can be tested without a browser.
++source_set("model") {
++  sources = [
++    "sidebar_media_model.cc",
++    "sidebar_media_model.h",
++  ]
++  public_deps = [
++    "//base",
++    "//services/media_session/public/cpp:base_cpp",
++  ]
++}
++
++# The profile's media sessions, as the sidebar's media card sees them. It
++# reaches content only through SidebarMedia::Bindings, so tests can run it
++# against an in-process media session service.
++source_set("service") {
++  sources = [
++    "sidebar_media.cc",
++    "sidebar_media.h",
++  ]
++  public_deps = [
++    ":model",
++    "//base",
++    "//components/keyed_service/core",
++    "//mojo/public/cpp/bindings",
++    "//services/media_session/public/mojom",
++    "//ui/gfx",
++  ]
++  deps = [
++    "//services/media_session/public/cpp",
++    "//skia",
++  ]
++}
++
++# One SidebarMedia per profile, bound to content's media session service.
++source_set("media") {
++  sources = [
++    "sidebar_media_factory.cc",
++    "sidebar_media_factory.h",
++  ]
++  public_deps = [
++    ":service",
++    "//chrome/browser/profiles:profile",
++  ]
++  deps = [
++    "//content/public/browser",
++    "//services/media_session/public/cpp",
++  ]
++}
++
++# Build with `autoninja -C out/Default
++# chrome/browser/ui/rac/media:rac_media_unittests`. It's separate from
++# Chromium's unit_tests, which takes hours to build.
++test("rac_media_unittests") {
++  sources = [
++    "sidebar_media_model_unittest.cc",
++    "sidebar_media_unittest.cc",
++  ]
++  deps = [
++    ":model",
++    ":service",
++    "//base",
++    "//base/test:test_support",
++    "//mojo/core/test:run_all_unittests",
++    "//mojo/public/cpp/bindings",
++    "//services/media_session:lib",
++    "//services/media_session/public/cpp",
++    "//services/media_session/public/cpp:base_cpp",
++    "//services/media_session/public/cpp/test:test_support",
++    "//services/media_session/public/mojom",
++    "//testing/gtest",
++  ]
++}
+Index: src/chrome/browser/ui/rac/media/sidebar_media.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/media/sidebar_media.cc
+@@ -0,0 +1,475 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/media/sidebar_media.h"
++
++#include <algorithm>
++#include <string>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/time/time.h"
++#include "base/timer/timer.h"
++#include "services/media_session/public/cpp/media_metadata.h"
++#include "services/media_session/public/mojom/media_session.mojom.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "ui/gfx/favicon_size.h"
++
++namespace rac {
++
++namespace {
++
++using media_session::mojom::MediaSessionAction;
++using media_session::mojom::MediaSessionImageType;
++
++// The card's thumbnail is 32 DIPs; this covers 2x screens.
++constexpr int kArtworkMinSizePx = 32;
++constexpr int kArtworkDesiredSizePx = 64;
++constexpr int kFaviconDesiredSizePx = 32;
++
++bool HasAction(const std::vector<MediaSessionAction>& actions,
++               MediaSessionAction action) {
++  return std::ranges::find(actions, action) != actions.end();
++}
++
++bool SameImage(const gfx::ImageSkia& a, const gfx::ImageSkia& b) {
++  return a.isNull() ? b.isNull() : a.BackedBySameObjectAs(b);
++}
++
++// Whether the windows' cards must redraw. See sidebar_media::NeedsRedraw.
++bool NeedsNotify(const std::optional<SidebarMedia::Card>& before,
++                 const std::optional<SidebarMedia::Card>& after) {
++  if (!before || !after) {
++    return before.has_value() != after.has_value();
++  }
++  return !SameImage(before->artwork, after->artwork) ||
++         !SameImage(before->favicon, after->favicon) ||
++         sidebar_media::NeedsRedraw(before->state, after->state,
++                                    before->position, after->position,
++                                    base::TimeTicks::Now());
++}
++
++// How long a session that lost audio focus keeps its card, in case it gets
++// focus back, as some sites do between tracks.
++constexpr base::TimeDelta kFocusLossGrace =
++    base::Seconds(2);  // motion-lint: not motion (focus-loss grace)
++
++}  // namespace
++
++// One of the profile's media sessions, seen through a media controller bound
++// to it alone.
++class SidebarMedia::Session
++    : public media_session::mojom::MediaControllerObserver,
++      public media_session::mojom::MediaControllerImageObserver {
++ public:
++  // `remove` drops this session from `owner`.
++  Session(SidebarMedia* owner,
++          base::RepeatingClosure remove,
++          mojo::Remote<media_session::mojom::MediaController> controller,
++          const media_session::mojom::MediaSessionInfoPtr& info)
++      : owner_(owner), remove_(std::move(remove)) {
++    snapshot_.last_active = base::TimeTicks::Now();
++    ApplyInfo(info);
++    SetController(std::move(controller));
++  }
++  Session(const Session&) = delete;
++  Session& operator=(const Session&) = delete;
++  ~Session() override = default;
++
++  const sidebar_media::SessionSnapshot& snapshot() const { return snapshot_; }
++  const gfx::ImageSkia& artwork() const { return artwork_; }
++  const gfx::ImageSkia& favicon() const { return favicon_; }
++
++  media_session::mojom::MediaController* controller() {
++    return controller_.is_bound() ? controller_.get() : nullptr;
++  }
++
++  // Images are fetched only once the session has been shown.
++  void WantImages() {
++    if (wants_images_) {
++      return;
++    }
++    wants_images_ = true;
++    if (controller_.is_bound()) {
++      ObserveImages();
++    }
++  }
++
++  void Dismiss() { snapshot_.dismissed = true; }
++
++  // Losing focus closes the controller with the focus request. The card
++  // stays for a moment in case focus comes back.
++  void OnFocusLost() {
++    has_focus_ = false;
++    removal_timer_.Start(FROM_HERE, kFocusLossGrace, remove_);
++    // Its controller is gone, so its playing state is stale. Counting it as
++    // paused keeps it from outranking a session that still has focus.
++    if (snapshot_.playing) {
++      snapshot_.playing = false;
++      owner_->OnSessionChanged();
++    }
++  }
++
++  // Gaining focus again needs a new controller. A session that kept focus
++  // hears OnFocusGained on every resume; that changes nothing here.
++  bool has_focus() const { return has_focus_; }
++  void OnFocusRegained(
++      mojo::Remote<media_session::mojom::MediaController> controller) {
++    has_focus_ = true;
++    removal_timer_.Stop();
++    SetController(std::move(controller));
++  }
++
++  // media_session::mojom::MediaControllerObserver:
++  void MediaSessionInfoChanged(
++      media_session::mojom::MediaSessionInfoPtr info) override {
++    // Null when the controller lost its session. Keep the last state until
++    // the session is removed.
++    if (!info) {
++      return;
++    }
++    ApplyInfo(info);
++    owner_->OnSessionChanged();
++  }
++
++  void MediaSessionMetadataChanged(
++      const std::optional<media_session::MediaMetadata>& metadata) override {
++    snapshot_.title = metadata ? metadata->title : std::u16string();
++    snapshot_.artist = metadata ? metadata->artist : std::u16string();
++    snapshot_.source_title =
++        metadata ? metadata->source_title : std::u16string();
++    owner_->OnSessionChanged();
++  }
++
++  void MediaSessionActionsChanged(
++      const std::vector<MediaSessionAction>& actions) override {
++    snapshot_.can_play_pause = HasAction(actions, MediaSessionAction::kPlay) ||
++                               HasAction(actions, MediaSessionAction::kPause);
++    snapshot_.can_previous =
++        HasAction(actions, MediaSessionAction::kPreviousTrack);
++    snapshot_.can_next = HasAction(actions, MediaSessionAction::kNextTrack);
++    owner_->OnSessionChanged();
++  }
++
++  void MediaSessionChanged(
++      const std::optional<base::UnguessableToken>& request_id) override {}
++
++  void MediaSessionPositionChanged(
++      const std::optional<media_session::MediaPosition>& position) override {
++    snapshot_.position = position;
++    owner_->OnSessionChanged();
++  }
++
++  // media_session::mojom::MediaControllerImageObserver:
++  void MediaControllerImageChanged(MediaSessionImageType type,
++                                   const SkBitmap& bitmap) override {
++    gfx::ImageSkia image = bitmap.drawsNothing()
++                               ? gfx::ImageSkia()
++                               : gfx::ImageSkia::CreateFrom1xBitmap(bitmap);
++    if (type == MediaSessionImageType::kArtwork) {
++      artwork_ = std::move(image);
++    } else if (type == MediaSessionImageType::kSourceIcon) {
++      favicon_ = std::move(image);
++    } else {
++      return;
++    }
++    owner_->OnSessionChanged();
++  }
++
++  void MediaControllerChapterImageChanged(int32_t index,
++                                          const SkBitmap& bitmap) override {}
++
++ private:
++  void ApplyInfo(const media_session::mojom::MediaSessionInfoPtr& info) {
++    if (!info) {
++      return;
++    }
++    const bool playing = info->playback_state ==
++                         media_session::mojom::MediaPlaybackState::kPlaying;
++    if (playing && !snapshot_.playing) {
++      snapshot_.last_active = base::TimeTicks::Now();
++      snapshot_.dismissed = false;
++    }
++    snapshot_.playing = playing;
++    snapshot_.controllable = info->is_controllable;
++    snapshot_.hide_metadata = info->hide_metadata;
++  }
++
++  void SetController(
++      mojo::Remote<media_session::mojom::MediaController> controller) {
++    observer_receiver_.reset();
++    artwork_receiver_.reset();
++    favicon_receiver_.reset();
++    controller_ = std::move(controller);
++    if (!controller_.is_bound()) {
++      return;
++    }
++    // A controller closes with its focus request. If the focus events raced
++    // ahead of it (a request listed at startup that had already ended, or a
++    // loss that arrived first), treat the closing as the loss, so the next
++    // gain binds a new controller and a session that never comes back goes.
++    // Unretained: this owns the remote.
++    controller_.set_disconnect_handler(base::BindOnce(
++        &Session::OnControllerDisconnected, base::Unretained(this)));
++    // Adding the observer sends the current state at once.
++    controller_->AddObserver(observer_receiver_.BindNewPipeAndPassRemote());
++    if (wants_images_) {
++      ObserveImages();
++    }
++  }
++
++  void OnControllerDisconnected() {
++    if (has_focus_) {
++      OnFocusLost();
++    }
++  }
++
++  void ObserveImages() {
++    controller_->ObserveImages(MediaSessionImageType::kArtwork,
++                               kArtworkMinSizePx, kArtworkDesiredSizePx,
++                               artwork_receiver_.BindNewPipeAndPassRemote());
++    controller_->ObserveImages(MediaSessionImageType::kSourceIcon,
++                               gfx::kFaviconSize, kFaviconDesiredSizePx,
++                               favicon_receiver_.BindNewPipeAndPassRemote());
++  }
++
++  const raw_ptr<SidebarMedia> owner_;
++  const base::RepeatingClosure remove_;
++  sidebar_media::SessionSnapshot snapshot_;
++  gfx::ImageSkia artwork_;
++  gfx::ImageSkia favicon_;
++  bool wants_images_ = false;
++  bool has_focus_ = true;
++  base::OneShotTimer removal_timer_;
++  mojo::Remote<media_session::mojom::MediaController> controller_;
++  mojo::Receiver<media_session::mojom::MediaControllerObserver>
++      observer_receiver_{this};
++  mojo::Receiver<media_session::mojom::MediaControllerImageObserver>
++      artwork_receiver_{this};
++  mojo::Receiver<media_session::mojom::MediaControllerImageObserver>
++      favicon_receiver_{this};
++};
++
++SidebarMedia::Card::Card() = default;
++SidebarMedia::Card::Card(const Card&) = default;
++SidebarMedia::Card& SidebarMedia::Card::operator=(const Card&) = default;
++SidebarMedia::Card::~Card() = default;
++
++SidebarMedia::Bindings::Bindings() = default;
++SidebarMedia::Bindings::Bindings(Bindings&&) = default;
++SidebarMedia::Bindings& SidebarMedia::Bindings::operator=(Bindings&&) = default;
++SidebarMedia::Bindings::~Bindings() = default;
++
++SidebarMedia::SidebarMedia(Bindings bindings)
++    : bind_controller_manager_(std::move(bindings.bind_controller_manager)),
++      raise_(std::move(bindings.raise)) {
++  std::move(bindings.bind_audio_focus)
++      .Run(audio_focus_.BindNewPipeAndPassReceiver());
++  // Only this profile's sessions: incognito and other profiles have their
++  // own source ids.
++  audio_focus_->AddSourceObserver(
++      bindings.source_id, audio_focus_observer_.BindNewPipeAndPassRemote());
++  audio_focus_->GetSourceFocusRequests(
++      bindings.source_id, base::BindOnce(&SidebarMedia::OnReceivedFocusRequests,
++                                         weak_factory_.GetWeakPtr()));
++}
++
++SidebarMedia::~SidebarMedia() = default;
++
++void SidebarMedia::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void SidebarMedia::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++std::optional<SidebarMedia::Card> SidebarMedia::GetCard() const {
++  Session* session = GetShownSession();
++  if (!session) {
++    return std::nullopt;
++  }
++  Card card;
++  card.state = sidebar_media::MakeCardState(session->snapshot());
++  card.position = session->snapshot().position;
++  if (!session->snapshot().hide_metadata) {
++    card.artwork = session->artwork();
++  }
++  card.favicon = session->favicon();
++  return card;
++}
++
++void SidebarMedia::TogglePlayPause() {
++  Session* session = GetShownSession();
++  media_session::mojom::MediaController* controller =
++      session ? session->controller() : nullptr;
++  if (!controller) {
++    return;
++  }
++  if (session->snapshot().playing) {
++    controller->Suspend();
++  } else {
++    controller->Resume();
++  }
++}
++
++void SidebarMedia::PreviousTrack() {
++  Session* session = GetShownSession();
++  if (auto* controller = session ? session->controller() : nullptr) {
++    controller->PreviousTrack();
++  }
++}
++
++void SidebarMedia::NextTrack() {
++  Session* session = GetShownSession();
++  if (auto* controller = session ? session->controller() : nullptr) {
++    controller->NextTrack();
++  }
++}
++
++void SidebarMedia::Raise() {
++  if (shown_ && raise_) {
++    raise_.Run(*shown_);
++  }
++}
++
++void SidebarMedia::Dismiss() {
++  Session* session = GetShownSession();
++  if (!session) {
++    return;
++  }
++  session->Dismiss();
++  if (auto* controller = session->controller()) {
++    controller->Stop();
++  }
++  Update();
++}
++
++void SidebarMedia::Shutdown() {
++  weak_factory_.InvalidateWeakPtrs();
++  audio_focus_observer_.reset();
++  audio_focus_.reset();
++  sessions_.clear();
++  shown_.reset();
++  shown_card_.reset();
++  controller_manager_.reset();
++  observers_.Notify(&Observer::OnSidebarMediaShutdown);
++}
++
++void SidebarMedia::OnFocusGained(
++    media_session::mojom::AudioFocusRequestStatePtr state) {
++  if (!state || !state->request_id) {
++    return;
++  }
++  const base::UnguessableToken request_id = *state->request_id;
++  auto it = sessions_.find(request_id);
++  if (it != sessions_.end()) {
++    if (!it->second->has_focus()) {
++      it->second->OnFocusRegained(CreateController(request_id));
++    }
++    return;
++  }
++  // Unretained: this owns the session, and the session owns the timer and
++  // the remote that run it.
++  sessions_.emplace(request_id,
++                    std::make_unique<Session>(
++                        this,
++                        base::BindRepeating(&SidebarMedia::RemoveSession,
++                                            base::Unretained(this), request_id),
++                        CreateController(request_id), state->session_info));
++  Update();
++}
++
++void SidebarMedia::OnFocusLost(
++    media_session::mojom::AudioFocusRequestStatePtr state) {
++  if (!state || !state->request_id) {
++    return;
++  }
++  auto it = sessions_.find(*state->request_id);
++  if (it == sessions_.end()) {
++    return;
++  }
++  it->second->OnFocusLost();
++}
++
++void SidebarMedia::OnRequestIdReleased(
++    const base::UnguessableToken& request_id) {
++  // The tab closed.
++  RemoveSession(request_id);
++}
++
++void SidebarMedia::OnReceivedFocusRequests(
++    std::vector<media_session::mojom::AudioFocusRequestStatePtr> requests) {
++  for (auto& request : requests) {
++    OnFocusGained(std::move(request));
++  }
++}
++
++mojo::Remote<media_session::mojom::MediaController>
++SidebarMedia::CreateController(const base::UnguessableToken& request_id) {
++  if (!controller_manager_.is_bound() && bind_controller_manager_) {
++    std::move(bind_controller_manager_)
++        .Run(controller_manager_.BindNewPipeAndPassReceiver());
++  }
++  mojo::Remote<media_session::mojom::MediaController> controller;
++  controller_manager_->CreateMediaControllerForSession(
++      controller.BindNewPipeAndPassReceiver(), request_id);
++  return controller;
++}
++
++void SidebarMedia::RemoveSession(const base::UnguessableToken& request_id) {
++  if (sessions_.erase(request_id) == 0) {
++    return;
++  }
++  Update();
++}
++
++void SidebarMedia::OnSessionChanged() {
++  Update();
++}
++
++void SidebarMedia::Update() {
++  Session* best = nullptr;
++  std::optional<base::UnguessableToken> best_id;
++  for (const auto& [request_id, session] : sessions_) {
++    if (!sidebar_media::ShouldShow(session->snapshot())) {
++      continue;
++    }
++    if (!best ||
++        sidebar_media::ShowsBefore(session->snapshot(), best->snapshot())) {
++      best = session.get();
++      best_id = request_id;
++    }
++  }
++  shown_ = best_id;
++  if (best) {
++    best->WantImages();
++  }
++  std::optional<Card> card = GetCard();
++  const bool notify = NeedsNotify(shown_card_, card);
++  // Keep the newest position either way: it's what the next change is
++  // measured against.
++  shown_card_ = std::move(card);
++  if (notify) {
++    observers_.Notify(&Observer::OnSidebarMediaChanged);
++  }
++}
++
++std::optional<media_session::MediaPosition> SidebarMedia::GetShownPosition()
++    const {
++  Session* session = GetShownSession();
++  return session ? session->snapshot().position : std::nullopt;
++}
++
++SidebarMedia::Session* SidebarMedia::GetShownSession() const {
++  if (!shown_) {
++    return nullptr;
++  }
++  auto it = sessions_.find(*shown_);
++  return it == sessions_.end() ? nullptr : it->second.get();
++}
++
++}  // namespace rac
+Index: src/chrome/browser/ui/rac/media/sidebar_media.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/media/sidebar_media.h
+@@ -0,0 +1,161 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_MEDIA_SIDEBAR_MEDIA_H_
++#define CHROME_BROWSER_UI_RAC_MEDIA_SIDEBAR_MEDIA_H_
++
++#include <map>
++#include <memory>
++#include <optional>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++#include "base/observer_list.h"
++#include "base/observer_list_types.h"
++#include "base/unguessable_token.h"
++#include "chrome/browser/ui/rac/media/sidebar_media_model.h"
++#include "components/keyed_service/core/keyed_service.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "services/media_session/public/cpp/media_position.h"
++#include "services/media_session/public/mojom/audio_focus.mojom.h"
++#include "services/media_session/public/mojom/media_controller.mojom.h"
++#include "ui/gfx/image/image_skia.h"
++
++namespace rac {
++
++// The media playing in one profile, for the sidebar's media card. Each window
++// draws its own card from this shared model, so every window of the profile
++// shows the same controls. Incognito has its own instance.
++//
++// It watches the profile's audio focus directly, the way Chromium's
++// MediaSessionItemProducer does, but owns its own media controllers. It never
++// touches the toolbar's media dialog or its items.
++//
++// The first sidebar creates it. With no media it holds one audio focus
++// observer and nothing else; per-session controllers, artwork, and timers
++// exist only while a session does.
++class SidebarMedia : public KeyedService,
++                     public media_session::mojom::AudioFocusObserver {
++ public:
++  class Observer : public base::CheckedObserver {
++   public:
++    // The shown session, what its card shows, or its artwork changed. A new
++    // position alone while it plays doesn't count: read GetShownPosition()
++    // when the progress line moves.
++    virtual void OnSidebarMediaChanged() = 0;
++    // The profile is shutting down. Drop the pointer to the service.
++    virtual void OnSidebarMediaShutdown() = 0;
++  };
++
++  // What a window's card draws.
++  struct Card {
++    Card();
++    Card(const Card&);
++    Card& operator=(const Card&);
++    ~Card();
++
++    sidebar_media::CardState state;
++    std::optional<media_session::MediaPosition> position;
++    // Null when the page has none.
++    gfx::ImageSkia artwork;
++    gfx::ImageSkia favicon;
++  };
++
++  // How the service reaches the media session service and the tabs. The
++  // factory fills these in from content; tests use an in-process service.
++  struct Bindings {
++    Bindings();
++    Bindings(Bindings&&);
++    Bindings& operator=(Bindings&&);
++    ~Bindings();
++
++    // The profile's audio focus source: incognito and other profiles have
++    // their own.
++    base::UnguessableToken source_id;
++    base::OnceCallback<void(
++        mojo::PendingReceiver<media_session::mojom::AudioFocusManager>)>
++        bind_audio_focus;
++    // Called once, with the first session.
++    base::OnceCallback<void(
++        mojo::PendingReceiver<media_session::mojom::MediaControllerManager>)>
++        bind_controller_manager;
++    // Switches to the tab of the session with this request id.
++    base::RepeatingCallback<void(const base::UnguessableToken&)> raise;
++  };
++
++  explicit SidebarMedia(Bindings bindings);
++  SidebarMedia(const SidebarMedia&) = delete;
++  SidebarMedia& operator=(const SidebarMedia&) = delete;
++  ~SidebarMedia() override;
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
++
++  // The card to show, or nothing when no session should show.
++  std::optional<Card> GetCard() const;
++  // The shown session's latest position, for its progress line.
++  std::optional<media_session::MediaPosition> GetShownPosition() const;
++
++  // Act on the shown session.
++  void TogglePlayPause();
++  void PreviousTrack();
++  void NextTrack();
++  // Switches to the session's tab and window.
++  void Raise();
++  // Stops the shown session, as the toolbar's dismiss does, and hides it
++  // until it plays again.
++  void Dismiss();
++
++  size_t SessionCountForTesting() const { return sessions_.size(); }
++
++  // KeyedService:
++  void Shutdown() override;
++
++ private:
++  class Session;
++
++  // media_session::mojom::AudioFocusObserver:
++  void OnFocusGained(
++      media_session::mojom::AudioFocusRequestStatePtr state) override;
++  void OnFocusLost(
++      media_session::mojom::AudioFocusRequestStatePtr state) override;
++  void OnRequestIdReleased(const base::UnguessableToken& request_id) override;
++
++  void OnReceivedFocusRequests(
++      std::vector<media_session::mojom::AudioFocusRequestStatePtr> requests);
++  mojo::Remote<media_session::mojom::MediaController> CreateController(
++      const base::UnguessableToken& request_id);
++  void RemoveSession(const base::UnguessableToken& request_id);
++
++  // Called by sessions when anything about them changes.
++  void OnSessionChanged();
++  // Picks the session to show and tells the windows.
++  void Update();
++  Session* GetShownSession() const;
++
++  base::OnceCallback<void(
++      mojo::PendingReceiver<media_session::mojom::MediaControllerManager>)>
++      bind_controller_manager_;
++  base::RepeatingCallback<void(const base::UnguessableToken&)> raise_;
++  mojo::Remote<media_session::mojom::AudioFocusManager> audio_focus_;
++  mojo::Receiver<media_session::mojom::AudioFocusObserver>
++      audio_focus_observer_{this};
++  // Bound with the first session.
++  mojo::Remote<media_session::mojom::MediaControllerManager>
++      controller_manager_;
++  std::map<base::UnguessableToken, std::unique_ptr<Session>> sessions_;
++  std::optional<base::UnguessableToken> shown_;
++  // What the windows were last told, so changes that don't show are
++  // dropped. Null `shown_card_` means no card.
++  std::optional<Card> shown_card_;
++  base::ObserverList<Observer> observers_;
++  base::WeakPtrFactory<SidebarMedia> weak_factory_{this};
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_RAC_MEDIA_SIDEBAR_MEDIA_H_
+Index: src/chrome/browser/ui/rac/media/sidebar_media_factory.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/media/sidebar_media_factory.cc
+@@ -0,0 +1,81 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/media/sidebar_media_factory.h"
++
++#include "base/functional/bind.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/rac/media/sidebar_media.h"
++#include "content/public/browser/media_session.h"
++#include "content/public/browser/media_session_service.h"
++#include "services/media_session/public/cpp/media_session_service.h"
++
++namespace rac {
++
++namespace {
++
++// The tab's media session activates its tab and window through the tab's
++// delegate, as the toolbar's media dialog does.
++void RaiseSession(const base::UnguessableToken& request_id) {
++  content::WebContents* web_contents =
++      content::MediaSession::GetWebContentsFromRequestId(request_id);
++  content::MediaSession* media_session =
++      web_contents ? content::MediaSession::GetIfExists(web_contents) : nullptr;
++  if (media_session) {
++    media_session->Raise();
++  }
++}
++
++}  // namespace
++
++// static
++SidebarMedia* SidebarMediaFactory::GetForProfile(Profile* profile) {
++  return static_cast<SidebarMedia*>(
++      GetInstance()->GetServiceForBrowserContext(profile, /*create=*/true));
++}
++
++// static
++SidebarMediaFactory* SidebarMediaFactory::GetInstance() {
++  static base::NoDestructor<SidebarMediaFactory> instance;
++  return instance.get();
++}
++
++SidebarMediaFactory::SidebarMediaFactory()
++    : ProfileKeyedServiceFactory(
++          "RacSidebarMedia",
++          ProfileSelections::Builder()
++              .WithRegular(ProfileSelection::kOwnInstance)
++              .WithGuest(ProfileSelection::kOwnInstance)
++              .WithSystem(ProfileSelection::kNone)
++              .Build()) {}
++
++SidebarMediaFactory::~SidebarMediaFactory() = default;
++
++std::unique_ptr<KeyedService>
++SidebarMediaFactory::BuildServiceInstanceForBrowserContext(
++    content::BrowserContext* context) const {
++  SidebarMedia::Bindings bindings;
++  bindings.source_id = content::MediaSession::GetSourceId(context);
++  bindings.bind_audio_focus = base::BindOnce(
++      [](mojo::PendingReceiver<media_session::mojom::AudioFocusManager>
++             receiver) {
++        content::GetMediaSessionService().BindAudioFocusManager(
++            std::move(receiver));
++      });
++  bindings.bind_controller_manager = base::BindOnce(
++      [](mojo::PendingReceiver<media_session::mojom::MediaControllerManager>
++             receiver) {
++        content::GetMediaSessionService().BindMediaControllerManager(
++            std::move(receiver));
++      });
++  bindings.raise = base::BindRepeating(&RaiseSession);
++  return std::make_unique<SidebarMedia>(std::move(bindings));
++}
++
++// Unit tests have no media session service to bind.
++bool SidebarMediaFactory::ServiceIsNULLWhileTesting() const {
++  return true;
++}
++
++}  // namespace rac
+Index: src/chrome/browser/ui/rac/media/sidebar_media_factory.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/media/sidebar_media_factory.h
+@@ -0,0 +1,42 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_MEDIA_SIDEBAR_MEDIA_FACTORY_H_
++#define CHROME_BROWSER_UI_RAC_MEDIA_SIDEBAR_MEDIA_FACTORY_H_
++
++#include <memory>
++
++#include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile_keyed_service_factory.h"
++
++class Profile;
++
++namespace rac {
++
++class SidebarMedia;
++
++// One SidebarMedia per profile, made when the first sidebar asks for it.
++// Incognito gets its own, so an incognito window shows only its own media.
++class SidebarMediaFactory : public ProfileKeyedServiceFactory {
++ public:
++  // Null for profiles without windows, such as the system profile, and in
++  // tests.
++  static SidebarMedia* GetForProfile(Profile* profile);
++  static SidebarMediaFactory* GetInstance();
++
++ private:
++  friend base::NoDestructor<SidebarMediaFactory>;
++
++  SidebarMediaFactory();
++  ~SidebarMediaFactory() override;
++
++  // ProfileKeyedServiceFactory:
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override;
++  bool ServiceIsNULLWhileTesting() const override;
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_RAC_MEDIA_SIDEBAR_MEDIA_FACTORY_H_
+Index: src/chrome/browser/ui/rac/media/sidebar_media_model.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/media/sidebar_media_model.cc
+@@ -0,0 +1,130 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/media/sidebar_media_model.h"
++
++#include <algorithm>
++#include <cmath>
++
++namespace rac::sidebar_media {
++
++namespace {
++
++const std::u16string& GetTitle(const SessionSnapshot& session) {
++  return session.hide_metadata ? session.source_title : session.title;
++}
++
++}  // namespace
++
++SessionSnapshot::SessionSnapshot() = default;
++SessionSnapshot::SessionSnapshot(const SessionSnapshot&) = default;
++SessionSnapshot& SessionSnapshot::operator=(const SessionSnapshot&) = default;
++SessionSnapshot::~SessionSnapshot() = default;
++
++CardState::CardState() = default;
++CardState::CardState(const CardState&) = default;
++CardState& CardState::operator=(const CardState&) = default;
++CardState::~CardState() = default;
++
++bool ShouldShow(const SessionSnapshot& session) {
++  return session.controllable && !session.dismissed &&
++         !GetTitle(session).empty();
++}
++
++bool ShowsBefore(const SessionSnapshot& a, const SessionSnapshot& b) {
++  if (a.playing != b.playing) {
++    return a.playing;
++  }
++  return a.last_active > b.last_active;
++}
++
++CardState MakeCardState(const SessionSnapshot& session) {
++  CardState state;
++  state.title = GetTitle(session);
++  if (!session.hide_metadata) {
++    state.subtitle =
++        session.artist.empty() ? session.source_title : session.artist;
++  }
++  state.playing = session.playing;
++  state.show_play_pause = session.can_play_pause;
++  state.show_previous = session.can_previous;
++  state.show_next = session.can_next;
++  state.show_dismiss = !session.playing;
++  state.has_progress = HasProgress(session.position);
++  return state;
++}
++
++bool HasProgress(const std::optional<media_session::MediaPosition>& position) {
++  if (!position) {
++    return false;
++  }
++  const base::TimeDelta duration = position->duration();
++  return duration.is_positive() && !duration.is_max();
++}
++
++double ProgressAt(const media_session::MediaPosition& position,
++                  bool playing,
++                  base::TimeTicks now) {
++  const base::TimeDelta duration = position.duration();
++  if (!duration.is_positive() || duration.is_max()) {
++    return 0;
++  }
++  const base::TimeDelta at =
++      position.GetPositionAtTime(playing ? now : position.last_updated_time());
++  return std::clamp(at / duration, 0.0, 1.0);
++}
++
++bool ShouldRunProgressTimer(
++    bool drawn,
++    bool playing,
++    const std::optional<media_session::MediaPosition>& position,
++    base::TimeTicks now) {
++  return drawn && playing && HasProgress(position) &&
++         position->playback_rate() > 0 &&
++         ProgressAt(*position, playing, now) < 1.0;
++}
++
++base::TimeDelta ProgressInterval(const media_session::MediaPosition& position,
++                                 int line_width) {
++  const double rate = position.playback_rate();
++  if (line_width <= 0 || rate <= 0 || !HasProgress(position)) {
++    return kProgressInterval;
++  }
++  return std::max(kProgressInterval, position.duration() / (rate * line_width));
++}
++
++bool NeedsRedraw(
++    const CardState& before,
++    const CardState& after,
++    const std::optional<media_session::MediaPosition>& before_position,
++    const std::optional<media_session::MediaPosition>& after_position,
++    base::TimeTicks now) {
++  if (before != after) {
++    return true;
++  }
++  if (before_position == after_position) {
++    return false;
++  }
++  // A paused line doesn't tick, so it only moves when told.
++  if (!after.playing || !before_position || !after_position) {
++    return true;
++  }
++  // A new speed changes how often the line ticks, and starting or stalling
++  // starts or stops its timer.
++  if (before_position->playback_rate() != after_position->playback_rate()) {
++    return true;
++  }
++  // A line that reached its end stopped its timer: a loop or a seek back
++  // has to restart it.
++  const double predicted = ProgressAt(*before_position, /*playing=*/true, now);
++  if (predicted >= 1.0) {
++    return true;
++  }
++  // A seek: the line would otherwise wait for the next tick, which can be
++  // tens of seconds away for long media.
++  const double reported = ProgressAt(*after_position, /*playing=*/true, now);
++  return std::abs(reported - predicted) > kRedrawJump;
++}
++
++}  // namespace rac::sidebar_media
+Index: src/chrome/browser/ui/rac/media/sidebar_media_model.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/media/sidebar_media_model.h
+@@ -0,0 +1,118 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_RAC_MEDIA_SIDEBAR_MEDIA_MODEL_H_
++#define CHROME_BROWSER_UI_RAC_MEDIA_SIDEBAR_MEDIA_MODEL_H_
++
++#include <optional>
++#include <string>
++
++#include "base/time/time.h"
++#include "services/media_session/public/cpp/media_position.h"
++
++// The rules behind the sidebar's media card, kept apart from mojo and views
++// so they can be tested on their own.
++namespace rac::sidebar_media {
++
++// The progress line moves at most this often, and only while it's drawn.
++inline constexpr base::TimeDelta kProgressInterval = base::Seconds(1);
++
++// What the sidebar knows about one of the profile's media sessions.
++struct SessionSnapshot {
++  SessionSnapshot();
++  SessionSnapshot(const SessionSnapshot&);
++  SessionSnapshot& operator=(const SessionSnapshot&);
++  ~SessionSnapshot();
++
++  bool controllable = false;
++  // The page asked to keep its metadata private: show only the site.
++  bool hide_metadata = false;
++  bool playing = false;
++  // The user dismissed it. It shows again when it next plays.
++  bool dismissed = false;
++  bool can_play_pause = false;
++  bool can_previous = false;
++  bool can_next = false;
++  std::u16string title;
++  std::u16string artist;
++  std::u16string source_title;
++  std::optional<media_session::MediaPosition> position;
++  // When it was first seen or last started playing. Newer wins.
++  base::TimeTicks last_active;
++};
++
++// What a window's card draws for the session it shows.
++struct CardState {
++  CardState();
++  CardState(const CardState&);
++  CardState& operator=(const CardState&);
++  ~CardState();
++
++  std::u16string title;
++  // The artist, or the site when there's no artist.
++  std::u16string subtitle;
++  bool playing = false;
++  bool show_play_pause = false;
++  bool show_previous = false;
++  bool show_next = false;
++  // Only a paused session can be dismissed; pause first.
++  bool show_dismiss = false;
++  bool has_progress = false;
++
++  friend bool operator==(const CardState&, const CardState&) = default;
++};
++
++// Whether the session gets a card at all.
++bool ShouldShow(const SessionSnapshot& session);
++
++// Whether `a` should take the card over `b`. Both must pass ShouldShow().
++// Playing beats paused; then the most recently active wins.
++bool ShowsBefore(const SessionSnapshot& a, const SessionSnapshot& b);
++
++CardState MakeCardState(const SessionSnapshot& session);
++
++// Whether the position can draw a progress line: a known, finite length.
++// Live streams report an infinite one.
++bool HasProgress(const std::optional<media_session::MediaPosition>& position);
++
++// How far through the media it is at `now`, from 0 to 1. A paused session
++// stays where it was last reported.
++double ProgressAt(const media_session::MediaPosition& position,
++                  bool playing,
++                  base::TimeTicks now);
++
++// The progress line ticks only while someone can see it move: the card is
++// drawn in a window on screen, and the media is playing forward with a known
++// length and hasn't reached its end.
++bool ShouldRunProgressTimer(
++    bool drawn,
++    bool playing,
++    const std::optional<media_session::MediaPosition>& position,
++    base::TimeTicks now);
++
++// How often a line `line_width` DIPs long needs to move: about a DIP per
++// tick, and never more than once a second.
++base::TimeDelta ProgressInterval(const media_session::MediaPosition& position,
++                                 int line_width);
++
++// How far the line must jump, as a fraction of its length, for a new
++// position to redraw at once: about half a DIP on the widest sidebar.
++inline constexpr double kRedrawJump = 0.002;
++
++// Whether the windows must redraw their cards for a change to the shown
++// session. A new position alone doesn't count while the media plays on as
++// the old position predicted: each card's progress timer reads it then.
++// Without this, a site that reports its position on every timeupdate would
++// repaint every window several times a second. A seek, a new speed, or a
++// line that had stopped at its end does redraw.
++bool NeedsRedraw(
++    const CardState& before,
++    const CardState& after,
++    const std::optional<media_session::MediaPosition>& before_position,
++    const std::optional<media_session::MediaPosition>& after_position,
++    base::TimeTicks now);
++
++}  // namespace rac::sidebar_media
++
++#endif  // CHROME_BROWSER_UI_RAC_MEDIA_SIDEBAR_MEDIA_MODEL_H_
+Index: src/chrome/browser/ui/rac/media/sidebar_media_model_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/media/sidebar_media_model_unittest.cc
+@@ -0,0 +1,269 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/media/sidebar_media_model.h"
++
++#include <optional>
++
++#include "base/test/task_environment.h"
++#include "base/time/time.h"
++#include "services/media_session/public/cpp/media_position.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::sidebar_media {
++
++namespace {
++
++SessionSnapshot Playable() {
++  SessionSnapshot session;
++  session.controllable = true;
++  session.title = u"Song";
++  session.artist = u"Artist";
++  session.source_title = u"example.com";
++  session.can_play_pause = true;
++  return session;
++}
++
++media_session::MediaPosition Position(double rate,
++                                      base::TimeDelta duration,
++                                      base::TimeDelta at) {
++  return media_session::MediaPosition(rate, duration, at,
++                                      /*end_of_media=*/false);
++}
++
++}  // namespace
++
++TEST(SidebarMediaModelTest, ShowsControllableSessionsWithATitle) {
++  EXPECT_TRUE(ShouldShow(Playable()));
++
++  SessionSnapshot uncontrollable = Playable();
++  uncontrollable.controllable = false;
++  EXPECT_FALSE(ShouldShow(uncontrollable));
++
++  SessionSnapshot untitled = Playable();
++  untitled.title.clear();
++  EXPECT_FALSE(ShouldShow(untitled));
++
++  SessionSnapshot dismissed = Playable();
++  dismissed.dismissed = true;
++  EXPECT_FALSE(ShouldShow(dismissed));
++}
++
++TEST(SidebarMediaModelTest, HiddenMetadataShowsOnlyTheSite) {
++  SessionSnapshot session = Playable();
++  session.hide_metadata = true;
++  EXPECT_TRUE(ShouldShow(session));
++
++  const CardState card = MakeCardState(session);
++  EXPECT_EQ(card.title, u"example.com");
++  EXPECT_TRUE(card.subtitle.empty());
++
++  session.source_title.clear();
++  EXPECT_FALSE(ShouldShow(session));
++}
++
++TEST(SidebarMediaModelTest, SubtitleFallsBackToTheSite) {
++  SessionSnapshot session = Playable();
++  EXPECT_EQ(MakeCardState(session).subtitle, u"Artist");
++
++  session.artist.clear();
++  EXPECT_EQ(MakeCardState(session).subtitle, u"example.com");
++}
++
++TEST(SidebarMediaModelTest, ButtonsFollowTheSessionsActions) {
++  SessionSnapshot session = Playable();
++  session.playing = true;
++  CardState card = MakeCardState(session);
++  EXPECT_TRUE(card.playing);
++  EXPECT_TRUE(card.show_play_pause);
++  EXPECT_FALSE(card.show_previous);
++  EXPECT_FALSE(card.show_next);
++  EXPECT_FALSE(card.show_dismiss);
++
++  session.playing = false;
++  session.can_previous = true;
++  session.can_next = true;
++  card = MakeCardState(session);
++  EXPECT_FALSE(card.playing);
++  EXPECT_TRUE(card.show_previous);
++  EXPECT_TRUE(card.show_next);
++  EXPECT_TRUE(card.show_dismiss);
++}
++
++TEST(SidebarMediaModelTest, PlayingBeatsPausedThenNewestWins) {
++  const base::TimeTicks now = base::TimeTicks::Now();
++  SessionSnapshot old_playing = Playable();
++  old_playing.playing = true;
++  old_playing.last_active = now - base::Minutes(5);
++  SessionSnapshot new_paused = Playable();
++  new_paused.last_active = now;
++  EXPECT_TRUE(ShowsBefore(old_playing, new_paused));
++  EXPECT_FALSE(ShowsBefore(new_paused, old_playing));
++
++  SessionSnapshot new_playing = old_playing;
++  new_playing.last_active = now;
++  EXPECT_TRUE(ShowsBefore(new_playing, old_playing));
++  EXPECT_FALSE(ShowsBefore(old_playing, new_playing));
++  EXPECT_FALSE(ShowsBefore(new_playing, new_playing));
++}
++
++TEST(SidebarMediaModelTest, ProgressNeedsAFiniteLength) {
++  EXPECT_FALSE(HasProgress(std::nullopt));
++  EXPECT_FALSE(HasProgress(Position(1, base::TimeDelta(), base::TimeDelta())));
++  EXPECT_FALSE(
++      HasProgress(Position(1, base::TimeDelta::Max(), base::Seconds(10))));
++  EXPECT_TRUE(HasProgress(Position(1, base::Minutes(3), base::Seconds(10))));
++
++  SessionSnapshot live = Playable();
++  live.position = Position(1, base::TimeDelta::Max(), base::Seconds(10));
++  EXPECT_FALSE(MakeCardState(live).has_progress);
++}
++
++TEST(SidebarMediaModelTest, ProgressMovesOnlyWhilePlaying) {
++  const media_session::MediaPosition position =
++      Position(1, base::Seconds(100), base::Seconds(25));
++  const base::TimeTicks later =
++      position.last_updated_time() + base::Seconds(25);
++
++  EXPECT_DOUBLE_EQ(ProgressAt(position, /*playing=*/true, later), 0.5);
++  EXPECT_DOUBLE_EQ(ProgressAt(position, /*playing=*/false, later), 0.25);
++  EXPECT_DOUBLE_EQ(
++      ProgressAt(position, /*playing=*/true, later + base::Hours(1)), 1.0);
++  EXPECT_DOUBLE_EQ(
++      ProgressAt(Position(1, base::TimeDelta::Max(), base::Seconds(1)),
++                 /*playing=*/true, later),
++      0.0);
++}
++
++TEST(SidebarMediaModelTest, TimerRunsOnlyWhileDrawnAndPlaying) {
++  const std::optional<media_session::MediaPosition> position =
++      Position(1, base::Minutes(3), base::Seconds(10));
++  const base::TimeTicks now = position->last_updated_time();
++
++  EXPECT_TRUE(
++      ShouldRunProgressTimer(/*drawn=*/true, /*playing=*/true, position, now));
++  // A hidden sidebar, a minimized window, or one on another Space.
++  EXPECT_FALSE(
++      ShouldRunProgressTimer(/*drawn=*/false, /*playing=*/true, position, now));
++  EXPECT_FALSE(
++      ShouldRunProgressTimer(/*drawn=*/true, /*playing=*/false, position, now));
++  EXPECT_FALSE(ShouldRunProgressTimer(/*drawn=*/true, /*playing=*/true,
++                                      std::nullopt, now));
++  EXPECT_FALSE(ShouldRunProgressTimer(
++      /*drawn=*/true, /*playing=*/true,
++      Position(1, base::TimeDelta::Max(), base::Seconds(10)), now));
++  // Playing but stalled: nothing to move.
++  EXPECT_FALSE(ShouldRunProgressTimer(
++      /*drawn=*/true, /*playing=*/true,
++      Position(0, base::Minutes(3), base::Seconds(10)), now));
++  // The line reached its end.
++  EXPECT_FALSE(ShouldRunProgressTimer(/*drawn=*/true, /*playing=*/true,
++                                      position, now + base::Minutes(3)));
++}
++
++TEST(SidebarMediaModelTest, IntervalMovesAboutADipPerTick) {
++  // Ten minutes over 100 DIPs is six seconds a DIP.
++  EXPECT_EQ(
++      ProgressInterval(Position(1, base::Minutes(10), base::TimeDelta()), 100),
++      base::Seconds(6));
++  // Twice the speed, twice as often.
++  EXPECT_EQ(
++      ProgressInterval(Position(2, base::Minutes(10), base::TimeDelta()), 100),
++      base::Seconds(3));
++  // Short media never ticks faster than once a second.
++  EXPECT_EQ(
++      ProgressInterval(Position(1, base::Seconds(20), base::TimeDelta()), 100),
++      kProgressInterval);
++  EXPECT_EQ(
++      ProgressInterval(Position(1, base::Minutes(10), base::TimeDelta()), 0),
++      kProgressInterval);
++}
++
++// The redraw rules compare a position with where an earlier one predicts
++// the media is now, so these tests move a mock clock.
++class SidebarMediaRedrawTest : public testing::Test {
++ protected:
++  SidebarMediaRedrawTest() {
++    SessionSnapshot session = Playable();
++    session.playing = true;
++    playing_ = MakeCardState(session);
++  }
++
++  void Wait(base::TimeDelta delta) { task_environment_.FastForwardBy(delta); }
++  base::TimeTicks Now() const { return base::TimeTicks::Now(); }
++
++  base::test::TaskEnvironment task_environment_{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME};
++  CardState playing_;
++};
++
++TEST_F(SidebarMediaRedrawTest, PositionAsPredictedDoesNotRedraw) {
++  const media_session::MediaPosition at_10s =
++      Position(1, base::Minutes(3), base::Seconds(10));
++  Wait(base::Seconds(1));
++  // The page reports where the media got to on its own.
++  const media_session::MediaPosition at_11s =
++      Position(1, base::Minutes(3), base::Seconds(11));
++
++  EXPECT_FALSE(NeedsRedraw(playing_, playing_, at_10s, at_11s, Now()));
++  EXPECT_FALSE(NeedsRedraw(playing_, playing_, at_10s, at_10s, Now()));
++}
++
++TEST_F(SidebarMediaRedrawTest, SeekingRedraws) {
++  const media_session::MediaPosition at_10s =
++      Position(1, base::Minutes(3), base::Seconds(10));
++  Wait(base::Seconds(1));
++
++  EXPECT_TRUE(NeedsRedraw(playing_, playing_, at_10s,
++                          Position(1, base::Minutes(3), base::Seconds(90)),
++                          Now()));
++  EXPECT_TRUE(NeedsRedraw(playing_, playing_, at_10s,
++                          Position(1, base::Minutes(3), base::TimeDelta()),
++                          Now()));
++}
++
++TEST_F(SidebarMediaRedrawTest, SpeedChangeRedraws) {
++  const media_session::MediaPosition at_10s =
++      Position(1, base::Minutes(3), base::Seconds(10));
++
++  EXPECT_TRUE(NeedsRedraw(playing_, playing_, at_10s,
++                          Position(2, base::Minutes(3), base::Seconds(10)),
++                          Now()));
++  // Stalling stops the timer.
++  EXPECT_TRUE(NeedsRedraw(playing_, playing_, at_10s,
++                          Position(0, base::Minutes(3), base::Seconds(10)),
++                          Now()));
++}
++
++TEST_F(SidebarMediaRedrawTest, StateAndPausedPositionsRedraw) {
++  const media_session::MediaPosition at_10s =
++      Position(1, base::Minutes(3), base::Seconds(10));
++  const media_session::MediaPosition at_11s =
++      Position(1, base::Minutes(3), base::Seconds(11));
++
++  // Anything the card shows besides the line does.
++  CardState renamed = playing_;
++  renamed.title = u"Another Song";
++  EXPECT_TRUE(NeedsRedraw(playing_, renamed, at_10s, at_10s, Now()));
++
++  // A paused line only moves when told.
++  CardState paused = playing_;
++  paused.playing = false;
++  EXPECT_TRUE(NeedsRedraw(paused, paused, at_10s, at_11s, Now()));
++
++  // Gaining a position starts the line.
++  EXPECT_TRUE(NeedsRedraw(playing_, playing_, std::nullopt, at_11s, Now()));
++}
++
++TEST_F(SidebarMediaRedrawTest, LoopAfterTheEndRedraws) {
++  const media_session::MediaPosition near_end =
++      Position(1, base::Minutes(3), base::Minutes(3) - base::Seconds(1));
++  Wait(base::Seconds(5));
++  // The line stopped full; the media looped back to the start.
++  EXPECT_TRUE(NeedsRedraw(playing_, playing_, near_end,
++                          Position(1, base::Minutes(3), base::Seconds(4)),
++                          Now()));
++}
++
++}  // namespace rac::sidebar_media
+Index: src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+===================================================================
+--- src.orig/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ src/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -45,6 +45,7 @@
+ #include "chrome/browser/ui/views/frame/safe_invoke/safe_invoke.h"
+ #include "chrome/browser/ui/views/frame/shadow_frame_view.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
++#include "chrome/browser/ui/views/rac/media/sidebar_media_card.h"
+ #include "chrome/browser/ui/views/rac/sidebar/cleanup_button.h"
+ #include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h"
+ #include "chrome/browser/ui/views/rac/spaces/space_tint_background.h"
+@@ -170,6 +171,13 @@ VerticalTabStripRegionView::VerticalTabS
+   gemini_button_ =
+       content_area_view_->AddChildView(std::make_unique<views::View>());
+ 
++  // rac: the media card sits above the footer while the profile has media.
++  content_area_view_
++      ->AddChildView(
++          std::make_unique<rac::SidebarMediaCard>(browser_view->GetProfile()))
++      ->SetProperty(views::kMarginsKey,
++                    gfx::Insets::VH(0, region_horizontal_padding));
++
+   auto* footer = content_area_view_->AddChildView(
+       std::make_unique<RacSidebarFooterView>(region_horizontal_padding));
+   // Profile, space dots, and the app menu share the last row of the sidebar.
+Index: src/chrome/browser/ui/views/rac/media/BUILD.gn
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/rac/media/BUILD.gn
+@@ -0,0 +1,35 @@
++# Copyright 2026 The rac Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++assert(!is_android)
++
++# The sidebar's media card. It needs only the profile's SidebarMedia, not a
++# Browser, so it builds apart from //chrome/browser/ui.
++source_set("media") {
++  sources = [
++    "sidebar_media_card.cc",
++    "sidebar_media_card.h",
++  ]
++  public_deps = [
++    "//base",
++    "//chrome/browser/ui/rac/media",
++    "//services/media_session/public/cpp:base_cpp",
++    "//ui/gfx",
++    "//ui/views",
++  ]
++  deps = [
++    "//base:i18n",
++    "//cc/paint",
++    "//chrome/browser/ui/color:color_headers",
++    "//chrome/browser/ui/views/rac:tokens",
++    "//components/strings:components_strings",
++    "//components/vector_icons",
++    "//skia",
++    "//ui/accessibility:ax_base",
++    "//ui/base",
++    "//ui/color",
++    "//ui/gfx/geometry",
++    "//ui/strings:ui_strings",
++  ]
++}
+Index: src/chrome/browser/ui/views/rac/media/sidebar_media_card.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/rac/media/sidebar_media_card.cc
+@@ -0,0 +1,551 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/media/sidebar_media_card.h"
++
++#include <algorithm>
++#include <initializer_list>
++#include <memory>
++#include <string>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/i18n/rtl.h"
++#include "cc/paint/paint_flags.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/rac/media/sidebar_media_factory.h"
++#include "chrome/browser/ui/rac/media/sidebar_media_model.h"
++#include "chrome/browser/ui/views/rac/rac_tokens.h"
++#include "components/strings/grit/components_strings.h"
++#include "components/vector_icons/vector_icons.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "third_party/skia/include/core/SkPath.h"
++#include "ui/accessibility/ax_enums.mojom.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/font.h"
++#include "ui/gfx/font_list.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/gfx/geometry/point_f.h"
++#include "ui/gfx/geometry/rect_f.h"
++#include "ui/gfx/geometry/skia_conversions.h"
++#include "ui/gfx/paint_vector_icon.h"
++#include "ui/gfx/scoped_canvas.h"
++#include "ui/gfx/text_constants.h"
++#include "ui/gfx/vector_icon_types.h"
++#include "ui/strings/grit/ui_strings.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/controls/button/image_button.h"
++#include "ui/views/controls/highlight_path_generator.h"
++#include "ui/views/controls/label.h"
++
++namespace rac {
++
++namespace {
++
++// The card fills the sidebar's width. Below this, as in the sidebar
++// collapsed to icons, it takes no space.
++constexpr int kMinCardWidth = 120;
++// Space above and below the card's fill, inside its bounds, so it needs no
++// margins and takes no room when it's gone.
++constexpr int kOuterInset = tokens::kSpacing2;
++constexpr int kPadding = tokens::kSpacing8;
++constexpr int kArtworkSize = 32;
++constexpr int kArtworkRadius = tokens::kRadius6;
++constexpr int kFallbackIconSize = 16;
++constexpr int kTextGap = tokens::kSpacing8;
++constexpr int kRowGap = tokens::kSpacing6;
++constexpr int kControlSize = 24;
++constexpr int kControlIconSize = 16;
++constexpr int kPlayIconSize = 18;
++constexpr int kControlGap = tokens::kSpacing8;
++constexpr int kDismissSize = 20;
++constexpr int kDismissIconSize = 16;
++constexpr int kProgressGap = tokens::kSpacing6;
++constexpr int kProgressHeight = 2;
++// The height stays the same with or without a progress line, so the
++// sidebar doesn't jump when a live stream ends.
++constexpr int kCardHeight = 2 * kOuterInset + 2 * kPadding + kArtworkSize +
++                            kRowGap + kControlSize + kProgressGap +
++                            kProgressHeight;
++
++gfx::FontList GetFont(int size, gfx::Font::Weight weight) {
++  const gfx::FontList base;
++  return base.DeriveWithSizeDelta(size - base.GetFontSize())
++      .DeriveWithWeight(weight);
++}
++
++void ConfigureLabel(views::Label* label, ui::ColorId color) {
++  label->SetHorizontalAlignment(gfx::ALIGN_TO_HEAD);
++  label->SetElideBehavior(gfx::FADE_TAIL);
++  label->SetAutoColorReadabilityEnabled(false);
++  label->SetBackgroundColor(SK_ColorTRANSPARENT);
++  label->SetSkipSubpixelRenderingOpacityCheck(true);
++  label->SetCanProcessEventsWithinSubtree(false);
++  label->SetEnabledColor(color);
++  // The card's own name already reads the title and subtitle.
++  label->GetViewAccessibility().SetIsIgnored(true);
++}
++
++bool SameImage(const gfx::ImageSkia& a, const gfx::ImageSkia& b) {
++  return a.isNull() ? b.isNull() : a.BackedBySameObjectAs(b);
++}
++
++// A round control on the card. Its hover fill is instant, like the
++// sidebar's rows, so nothing animates.
++class ControlButton : public views::ImageButton {
++  METADATA_HEADER(ControlButton, views::ImageButton)
++
++ public:
++  ControlButton(PressedCallback callback, int size)
++      : views::ImageButton(std::move(callback)), size_(size) {
++    SetImageHorizontalAlignment(ALIGN_CENTER);
++    SetImageVerticalAlignment(ALIGN_MIDDLE);
++    SetFocusBehavior(FocusBehavior::ACCESSIBLE_ONLY);
++    views::InstallCircleHighlightPathGenerator(this);
++  }
++
++  void SetIcon(const gfx::VectorIcon& icon, int icon_size, int name_id) {
++    SetImageModel(STATE_NORMAL, ui::ImageModel::FromVectorIcon(
++                                    icon, kColorRacTextPrimary, icon_size));
++    const std::u16string name = l10n_util::GetStringUTF16(name_id);
++    SetTooltipText(name);
++    GetViewAccessibility().SetName(name);
++  }
++
++  // views::ImageButton:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override {
++    return gfx::Size(size_, size_);
++  }
++
++  void PaintButtonContents(gfx::Canvas* canvas) override {
++    if (GetState() == STATE_HOVERED || GetState() == STATE_PRESSED) {
++      cc::PaintFlags flags;
++      flags.setAntiAlias(true);
++      flags.setColor(
++          GetColorProvider()->GetColor(kColorRacTabBackgroundHovered));
++      canvas->DrawCircle(gfx::PointF(GetLocalBounds().CenterPoint()),
++                         size_ / 2.0f, flags);
++    }
++    views::ImageButton::PaintButtonContents(canvas);
++  }
++
++ private:
++  const int size_;
++};
++
++BEGIN_METADATA(ControlButton)
++END_METADATA
++
++}  // namespace
++
++SidebarMediaCard::SidebarMediaCard(Profile* profile)
++    : views::Button(base::BindRepeating(
++          [](SidebarMediaCard* card) {
++            if (card->media_) {
++              card->media_->Raise();
++            }
++          },
++          base::Unretained(this))) {
++  // The role goes first: naming a view that has no role fails a DCHECK.
++  GetViewAccessibility().SetRole(ax::mojom::Role::kButton);
++  GetViewAccessibility().SetDescription(
++      l10n_util::GetStringUTF16(IDS_GLOBAL_MEDIA_CONTROLS_BACK_TO_TAB));
++  SetFocusBehavior(FocusBehavior::ACCESSIBLE_ONLY);
++  views::InstallRoundRectHighlightPathGenerator(
++      this, gfx::Insets::VH(kOuterInset, 0), tokens::kRadiusControl);
++
++  title_ = AddChildView(std::make_unique<views::Label>());
++  title_->SetFontList(GetFont(tokens::kFontSizeRow, gfx::Font::Weight::MEDIUM));
++  ConfigureLabel(title_, kColorRacTextPrimary);
++  subtitle_ = AddChildView(std::make_unique<views::Label>());
++  subtitle_->SetFontList(
++      GetFont(tokens::kFontSizeSecondary, gfx::Font::Weight::NORMAL));
++  ConfigureLabel(subtitle_, kColorRacTextSecondary);
++
++  // Focus moves through the controls in the order they're added.
++  auto dismiss =
++      std::make_unique<ControlButton>(base::BindRepeating(
++                                          [](SidebarMediaCard* card) {
++                                            if (card->media_) {
++                                              card->media_->Dismiss();
++                                            }
++                                          },
++                                          base::Unretained(this)),
++                                      kDismissSize);
++  dismiss->SetIcon(vector_icons::kCloseSmallIcon, kDismissIconSize,
++                   IDS_GLOBAL_MEDIA_CONTROLS_DISMISS_ICON_TOOLTIP_TEXT);
++  dismiss_ = AddChildView(std::move(dismiss));
++
++  auto previous =
++      std::make_unique<ControlButton>(base::BindRepeating(
++                                          [](SidebarMediaCard* card) {
++                                            if (card->media_) {
++                                              card->media_->PreviousTrack();
++                                            }
++                                          },
++                                          base::Unretained(this)),
++                                      kControlSize);
++  previous->SetIcon(
++      vector_icons::kSkipPreviousIcon, kControlIconSize,
++      IDS_MEDIA_MESSAGE_CENTER_MEDIA_NOTIFICATION_ACTION_PREVIOUS_TRACK);
++  previous_ = AddChildView(std::move(previous));
++
++  play_pause_ = AddChildView(
++      std::make_unique<ControlButton>(base::BindRepeating(
++                                          [](SidebarMediaCard* card) {
++                                            if (card->media_) {
++                                              card->media_->TogglePlayPause();
++                                            }
++                                          },
++                                          base::Unretained(this)),
++                                      kControlSize));
++
++  auto next = std::make_unique<ControlButton>(base::BindRepeating(
++                                                  [](SidebarMediaCard* card) {
++                                                    if (card->media_) {
++                                                      card->media_->NextTrack();
++                                                    }
++                                                  },
++                                                  base::Unretained(this)),
++                                              kControlSize);
++  next->SetIcon(vector_icons::kSkipNextIcon, kControlIconSize,
++                IDS_MEDIA_MESSAGE_CENTER_MEDIA_NOTIFICATION_ACTION_NEXT_TRACK);
++  next_ = AddChildView(std::move(next));
++
++  media_ = SidebarMediaFactory::GetForProfile(profile);
++  if (media_) {
++    media_observation_.Observe(media_.get());
++  }
++  Update();
++}
++
++SidebarMediaCard::~SidebarMediaCard() = default;
++
++gfx::Size SidebarMediaCard::CalculatePreferredSize(
++    const views::SizeBounds& available_size) const {
++  const int width = available_size.width().value_or(kMinCardWidth);
++  if (width < kMinCardWidth) {
++    return gfx::Size();
++  }
++  return gfx::Size(width, kCardHeight);
++}
++
++void SidebarMediaCard::Layout(PassKey) {
++  gfx::Rect content = GetFillBounds();
++  content.Inset(kPadding);
++
++  // Artwork, then the title and subtitle, then dismiss at the far edge.
++  artwork_bounds_ =
++      gfx::Rect(content.x(), content.y(), kArtworkSize, kArtworkSize);
++  int text_right = content.right();
++  if (dismiss_->GetVisible()) {
++    dismiss_->SetBounds(content.right() - kDismissSize,
++                        content.y() + (kArtworkSize - kDismissSize) / 2,
++                        kDismissSize, kDismissSize);
++    text_right = dismiss_->x() - tokens::kSpacing4;
++  }
++  const int text_x = artwork_bounds_.right() + kTextGap;
++  const int text_width = std::max(0, text_right - text_x);
++  const int title_height = title_->GetLineHeight();
++  const int subtitle_height =
++      subtitle_->GetVisible() ? subtitle_->GetLineHeight() : 0;
++  int text_y =
++      content.y() + (kArtworkSize - title_height - subtitle_height) / 2;
++  title_->SetBounds(text_x, text_y, text_width, title_height);
++  text_y += title_height;
++  subtitle_->SetBounds(text_x, text_y, text_width, subtitle_height);
++
++  // The controls, centered on the row below.
++  const int controls_y = artwork_bounds_.bottom() + kRowGap;
++  int controls_width = 0;
++  int controls_count = 0;
++  for (views::View* control :
++       {previous_.get(), play_pause_.get(), next_.get()}) {
++    if (control->GetVisible()) {
++      controls_width += kControlSize;
++      ++controls_count;
++    }
++  }
++  if (controls_count > 1) {
++    controls_width += (controls_count - 1) * kControlGap;
++  }
++  int control_x = content.x() + (content.width() - controls_width) / 2;
++  for (views::View* control :
++       {previous_.get(), play_pause_.get(), next_.get()}) {
++    if (control->GetVisible()) {
++      control->SetBounds(control_x, controls_y, kControlSize, kControlSize);
++      control_x += kControlSize + kControlGap;
++    }
++  }
++
++  progress_bounds_ =
++      gfx::Rect(content.x(), controls_y + kControlSize + kProgressGap,
++                content.width(), kProgressHeight);
++  // The tick interval depends on the line's length.
++  UpdateProgressTimer();
++}
++
++void SidebarMediaCard::PaintButtonContents(gfx::Canvas* canvas) {
++  const ui::ColorProvider* colors = GetColorProvider();
++  if (!colors) {
++    return;
++  }
++  // Translucent sidebar colors, so the card sits on any space's tint.
++  const bool hovered =
++      GetState() == STATE_HOVERED || GetState() == STATE_PRESSED;
++  cc::PaintFlags flags;
++  flags.setAntiAlias(true);
++  flags.setColor(colors->GetColor(hovered ? kColorRacTabBackgroundHovered
++                                          : kColorRacTabBackgroundUnselected));
++  canvas->DrawRoundRect(GetFillBounds(), tokens::kRadiusControl, flags);
++  PaintArtwork(canvas, *colors);
++  PaintProgress(canvas, *colors);
++}
++
++void SidebarMediaCard::VisibilityChanged(views::View* starting_from,
++                                         bool is_visible) {
++  views::Button::VisibilityChanged(starting_from, is_visible);
++  // The card, or the hidden sidebar around it, showed or hid.
++  UpdateProgressTimer();
++}
++
++void SidebarMediaCard::OnBoundsChanged(const gfx::Rect& previous_bounds) {
++  views::Button::OnBoundsChanged(previous_bounds);
++  UpdateProgressTimer();
++}
++
++void SidebarMediaCard::AddedToWidget() {
++  views::Button::AddedToWidget();
++  widget_observation_.Reset();
++  widget_observation_.Observe(GetWidget());
++  UpdateProgressTimer();
++}
++
++void SidebarMediaCard::RemovedFromWidget() {
++  widget_observation_.Reset();
++  progress_timer_.Stop();
++  views::Button::RemovedFromWidget();
++}
++
++void SidebarMediaCard::OnSidebarMediaChanged() {
++  Update();
++}
++
++void SidebarMediaCard::OnSidebarMediaShutdown() {
++  media_observation_.Reset();
++  media_ = nullptr;
++  Update();
++}
++
++void SidebarMediaCard::OnWidgetVisibilityChanged(views::Widget* widget,
++                                                 bool visible) {
++  UpdateProgressTimer();
++}
++
++void SidebarMediaCard::OnWidgetVisibilityOnScreenChanged(views::Widget* widget,
++                                                         bool visible) {
++  // Moved to or from another macOS Space, or covered or uncovered.
++  UpdateProgressTimer();
++}
++
++void SidebarMediaCard::OnWidgetShowStateChanged(views::Widget* widget) {
++  // Minimized or restored.
++  UpdateProgressTimer();
++}
++
++void SidebarMediaCard::OnWidgetDestroying(views::Widget* widget) {
++  widget_observation_.Reset();
++  progress_timer_.Stop();
++}
++
++void SidebarMediaCard::Update() {
++  std::optional<SidebarMedia::Card> card =
++      media_ ? media_->GetCard() : std::nullopt;
++  if (!card) {
++    position_.reset();
++    state_ = sidebar_media::CardState();
++    playing_ = false;
++    has_progress_ = false;
++    artwork_ = gfx::ImageSkia();
++    favicon_ = gfx::ImageSkia();
++    SetVisible(false);
++    UpdateProgressTimer();
++    return;
++  }
++
++  const sidebar_media::CardState& state = card->state;
++  if (GetVisible() && state_ == state && SameImage(artwork_, card->artwork) &&
++      SameImage(favicon_, card->favicon)) {
++    // Only the position moved, as after a seek: just the line redraws.
++    position_ = card->position;
++    SchedulePaintInRect(GetMirroredRect(progress_bounds_));
++    UpdateProgressTimer();
++    return;
++  }
++  state_ = state;
++  title_->SetText(state.title);
++  subtitle_->SetText(state.subtitle);
++  subtitle_->SetVisible(!state.subtitle.empty());
++  dismiss_->SetVisible(state.show_dismiss);
++  previous_->SetVisible(state.show_previous);
++  next_->SetVisible(state.show_next);
++  play_pause_->SetVisible(state.show_play_pause);
++  if (play_pause_shows_pause_ != state.playing) {
++    play_pause_shows_pause_ = state.playing;
++    // Every control is a ControlButton.
++    static_cast<ControlButton*>(play_pause_.get())
++        ->SetIcon(
++            state.playing ? vector_icons::kPauseFilledIcon
++                          : vector_icons::kPlayArrowFilledFlippableIcon,
++            kPlayIconSize,
++            state.playing
++                ? IDS_MEDIA_MESSAGE_CENTER_MEDIA_NOTIFICATION_ACTION_PAUSE
++                : IDS_MEDIA_MESSAGE_CENTER_MEDIA_NOTIFICATION_ACTION_PLAY);
++  }
++
++  const std::u16string name =
++      state.subtitle.empty()
++          ? state.title
++          : l10n_util::GetStringFUTF16(IDS_CONCAT_TWO_STRINGS_WITH_COMMA,
++                                       state.title, state.subtitle);
++  SetTooltipText(name);
++  // The role was set in the constructor; the name is never empty here.
++  GetViewAccessibility().SetName(name);
++
++  playing_ = state.playing;
++  has_progress_ = state.has_progress;
++  position_ = card->position;
++  artwork_ = card->artwork;
++  favicon_ = card->favicon;
++
++  // Text and visibility changes lay the card out again on their own. The
++  // artwork and the progress line need a paint.
++  SetVisible(true);
++  SchedulePaint();
++  UpdateProgressTimer();
++}
++
++bool SidebarMediaCard::IsCardDrawn() const {
++  const views::Widget* widget = GetWidget();
++  // IsVisibleOnScreen() is false for a window on another macOS Space, a
++  // minimized one, and one that other windows cover completely.
++  return widget && widget->IsVisibleOnScreen() && !widget->IsMinimized() &&
++         IsDrawn() && !GetVisibleBounds().IsEmpty();
++}
++
++void SidebarMediaCard::UpdateProgressTimer() {
++  if (!sidebar_media::ShouldRunProgressTimer(IsCardDrawn(), playing_, position_,
++                                             base::TimeTicks::Now())) {
++    progress_timer_.Stop();
++    return;
++  }
++  const base::TimeDelta interval =
++      sidebar_media::ProgressInterval(*position_, progress_bounds_.width());
++  if (progress_timer_.IsRunning() &&
++      progress_timer_.GetCurrentDelay() == interval) {
++    return;
++  }
++  if (!progress_timer_.IsRunning()) {
++    // Catch up at once: the line didn't move while it was out of sight.
++    SchedulePaintInRect(GetMirroredRect(progress_bounds_));
++  }
++  progress_timer_.Start(FROM_HERE, interval,
++                        base::BindRepeating(&SidebarMediaCard::OnProgressTick,
++                                            base::Unretained(this)));
++}
++
++void SidebarMediaCard::OnProgressTick() {
++  // The service doesn't send new positions while the media plays; read the
++  // latest one here.
++  if (media_) {
++    position_ = media_->GetShownPosition();
++  }
++  // Only the line repaints.
++  SchedulePaintInRect(GetMirroredRect(progress_bounds_));
++  // Stops once the line is full, or if something hid the card without
++  // telling it, such as a clipping parent.
++  UpdateProgressTimer();
++}
++
++gfx::Rect SidebarMediaCard::GetFillBounds() const {
++  gfx::Rect fill = GetLocalBounds();
++  fill.Inset(gfx::Insets::VH(kOuterInset, 0));
++  return fill;
++}
++
++void SidebarMediaCard::PaintArtwork(gfx::Canvas* canvas,
++                                    const ui::ColorProvider& colors) {
++  if (artwork_bounds_.IsEmpty()) {
++    return;
++  }
++  // Layout() works in left-to-right terms, as child bounds do; painting
++  // mirrors them for right-to-left languages itself.
++  const gfx::Rect bounds = GetMirroredRect(artwork_bounds_);
++  gfx::ScopedCanvas scoped_canvas(canvas);
++  canvas->ClipPath(
++      SkPath::RRect(gfx::RectToSkRect(bounds), kArtworkRadius, kArtworkRadius),
++      /*do_anti_alias=*/true);
++  if (!artwork_.isNull()) {
++    // Fill the square, cropping the longer side.
++    const int side = std::min(artwork_.width(), artwork_.height());
++    canvas->DrawImageInt(artwork_, (artwork_.width() - side) / 2,
++                         (artwork_.height() - side) / 2, side, side, bounds.x(),
++                         bounds.y(), bounds.width(), bounds.height(),
++                         /*filter=*/true);
++    return;
++  }
++  // No artwork: the site's icon on a tile, or a speaker without one.
++  cc::PaintFlags flags;
++  flags.setColor(colors.GetColor(kColorRacTabBackgroundUnselected));
++  canvas->DrawRect(bounds, flags);
++  const gfx::ImageSkia icon =
++      favicon_.isNull() ? gfx::CreateVectorIcon(
++                              vector_icons::kVolumeUpIcon, kFallbackIconSize,
++                              colors.GetColor(kColorRacTextSecondary))
++                        : favicon_;
++  const gfx::Rect icon_bounds(
++      bounds.x() + (kArtworkSize - kFallbackIconSize) / 2,
++      bounds.y() + (kArtworkSize - kFallbackIconSize) / 2, kFallbackIconSize,
++      kFallbackIconSize);
++  canvas->DrawImageInt(icon, 0, 0, icon.width(), icon.height(), icon_bounds.x(),
++                       icon_bounds.y(), icon_bounds.width(),
++                       icon_bounds.height(), /*filter=*/true);
++}
++
++void SidebarMediaCard::PaintProgress(gfx::Canvas* canvas,
++                                     const ui::ColorProvider& colors) {
++  if (!has_progress_ || !position_ || progress_bounds_.IsEmpty()) {
++    return;
++  }
++  const double fraction =
++      sidebar_media::ProgressAt(*position_, playing_, base::TimeTicks::Now());
++  const float radius = kProgressHeight / 2.0f;
++  cc::PaintFlags flags;
++  flags.setAntiAlias(true);
++  const SkColor track = colors.GetColor(kColorRacTextTertiary);
++  flags.setColor(SkColorSetA(track, SkColorGetA(track) / 2));
++  const gfx::RectF line(GetMirroredRect(progress_bounds_));
++  canvas->DrawRoundRect(line, radius, flags);
++  gfx::RectF done = line;
++  done.set_width(line.width() * fraction);
++  if (done.width() <= 0) {
++    return;
++  }
++  // Right-to-left languages fill the line from the right.
++  if (base::i18n::IsRTL()) {
++    done.set_x(line.right() - done.width());
++  }
++  flags.setColor(colors.GetColor(kColorRacTextSecondary));
++  canvas->DrawRoundRect(done, radius, flags);
++}
++
++BEGIN_METADATA(SidebarMediaCard)
++END_METADATA
++
++}  // namespace rac
+Index: src/chrome/browser/ui/views/rac/media/sidebar_media_card.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/views/rac/media/sidebar_media_card.h
+@@ -0,0 +1,126 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_MEDIA_SIDEBAR_MEDIA_CARD_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_MEDIA_SIDEBAR_MEDIA_CARD_H_
++
++#include <optional>
++
++#include "base/memory/raw_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/ui/rac/media/sidebar_media.h"
++#include "chrome/browser/ui/rac/media/sidebar_media_model.h"
++#include "services/media_session/public/cpp/media_position.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/image/image_skia.h"
++#include "ui/views/controls/button/button.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/widget/widget_observer.h"
++
++class Profile;
++
++namespace gfx {
++class Canvas;
++}  // namespace gfx
++
++namespace ui {
++class ColorProvider;
++}  // namespace ui
++
++namespace views {
++class ImageButton;
++class Label;
++}  // namespace views
++
++namespace rac {
++
++// The media card at the bottom of the sidebar: artwork, the title, the
++// artist or site, and play or pause, with previous and next when the page
++// offers them. Clicking it goes to the playing tab. Each window has its own
++// card, drawn from the profile's SidebarMedia.
++//
++// It's hidden while the profile has no media, and does no work then. Its
++// progress line moves once a second, and only while the card is drawn in a
++// visible, unminimized window.
++class SidebarMediaCard : public views::Button,
++                         public SidebarMedia::Observer,
++                         public views::WidgetObserver {
++  METADATA_HEADER(SidebarMediaCard, views::Button)
++
++ public:
++  explicit SidebarMediaCard(Profile* profile);
++  SidebarMediaCard(const SidebarMediaCard&) = delete;
++  SidebarMediaCard& operator=(const SidebarMediaCard&) = delete;
++  ~SidebarMediaCard() override;
++
++  // views::Button:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override;
++  void Layout(PassKey) override;
++  void PaintButtonContents(gfx::Canvas* canvas) override;
++  void VisibilityChanged(views::View* starting_from, bool is_visible) override;
++  void OnBoundsChanged(const gfx::Rect& previous_bounds) override;
++  void AddedToWidget() override;
++  void RemovedFromWidget() override;
++
++  // SidebarMedia::Observer:
++  void OnSidebarMediaChanged() override;
++  void OnSidebarMediaShutdown() override;
++
++  // views::WidgetObserver:
++  void OnWidgetVisibilityChanged(views::Widget* widget, bool visible) override;
++  void OnWidgetVisibilityOnScreenChanged(views::Widget* widget,
++                                         bool visible) override;
++  void OnWidgetShowStateChanged(views::Widget* widget) override;
++  void OnWidgetDestroying(views::Widget* widget) override;
++
++ private:
++  // Pulls the shown session from the service.
++  void Update();
++
++  // Whether anyone can see the card right now.
++  bool IsCardDrawn() const;
++  void UpdateProgressTimer();
++  void OnProgressTick();
++
++  gfx::Rect GetFillBounds() const;
++  void PaintArtwork(gfx::Canvas* canvas, const ui::ColorProvider& colors);
++  void PaintProgress(gfx::Canvas* canvas, const ui::ColorProvider& colors);
++
++  raw_ptr<SidebarMedia> media_ = nullptr;
++
++  raw_ptr<views::Label> title_ = nullptr;
++  raw_ptr<views::Label> subtitle_ = nullptr;
++  raw_ptr<views::ImageButton> dismiss_ = nullptr;
++  raw_ptr<views::ImageButton> previous_ = nullptr;
++  raw_ptr<views::ImageButton> play_pause_ = nullptr;
++  raw_ptr<views::ImageButton> next_ = nullptr;
++
++  // What the card shows now, to tell a new position from a new state.
++  sidebar_media::CardState state_;
++  gfx::ImageSkia artwork_;
++  gfx::ImageSkia favicon_;
++  std::optional<media_session::MediaPosition> position_;
++  bool playing_ = false;
++  bool has_progress_ = false;
++  // Which icon the play button has; unset until the first session.
++  std::optional<bool> play_pause_shows_pause_;
++
++  // Set by Layout().
++  gfx::Rect artwork_bounds_;
++  gfx::Rect progress_bounds_;
++
++  base::RepeatingTimer progress_timer_;
++
++  base::ScopedObservation<SidebarMedia, SidebarMedia::Observer>
++      media_observation_{this};
++  base::ScopedObservation<views::Widget, views::WidgetObserver>
++      widget_observation_{this};
++};
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_MEDIA_SIDEBAR_MEDIA_CARD_H_
+Index: src/chrome/browser/ui/rac/media/sidebar_media_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/ui/rac/media/sidebar_media_unittest.cc
+@@ -0,0 +1,282 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/rac/media/sidebar_media.h"
++
++#include <memory>
++#include <optional>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/test/bind.h"
++#include "base/test/task_environment.h"
++#include "base/time/time.h"
++#include "base/unguessable_token.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "services/media_session/media_session_service_impl.h"
++#include "services/media_session/public/cpp/media_metadata.h"
++#include "services/media_session/public/cpp/media_position.h"
++#include "services/media_session/public/cpp/test/mock_media_session.h"
++#include "services/media_session/public/mojom/audio_focus.mojom.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++
++namespace {
++
++using media_session::mojom::AudioFocusType;
++using media_session::mojom::MediaSession;
++
++class CountingObserver : public SidebarMedia::Observer {
++ public:
++  void OnSidebarMediaChanged() override { ++changes; }
++  void OnSidebarMediaShutdown() override { ++shutdowns; }
++
++  int changes = 0;
++  int shutdowns = 0;
++};
++
++media_session::MediaMetadata Metadata(const std::u16string& title) {
++  media_session::MediaMetadata metadata;
++  metadata.title = title;
++  metadata.artist = u"Artist";
++  metadata.source_title = u"example.com";
++  return metadata;
++}
++
++// SidebarMedia against the real in-process media session service, with a
++// mock page session whose requests carry the profile's source id.
++class SidebarMediaTest : public testing::Test {
++ protected:
++  SidebarMediaTest() {
++    service_ = std::make_unique<media_session::MediaSessionServiceImpl>();
++    SidebarMedia::Bindings bindings;
++    bindings.source_id = source_id_;
++    bindings.bind_audio_focus = base::BindOnce(
++        &media_session::MediaSessionServiceImpl::BindAudioFocusManager,
++        base::Unretained(service_.get()));
++    bindings.bind_controller_manager = base::BindOnce(
++        &media_session::MediaSessionServiceImpl::BindMediaControllerManager,
++        base::Unretained(service_.get()));
++    bindings.raise = base::BindLambdaForTesting(
++        [this](const base::UnguessableToken& id) { raised_ = id; });
++    media_ = std::make_unique<SidebarMedia>(std::move(bindings));
++    media_->AddObserver(&observer_);
++
++    // The page's own connection, tagged as this profile's.
++    service_->BindAudioFocusManager(page_focus_.BindNewPipeAndPassReceiver());
++    page_focus_->SetSource(source_id_, "profile");
++    session_.SetIsControllable(true);
++    Flush();
++  }
++
++  ~SidebarMediaTest() override {
++    if (!shut_down_) {
++      media_->RemoveObserver(&observer_);
++      media_->Shutdown();
++    }
++  }
++
++  void Flush() { task_environment_.RunUntilIdle(); }
++
++  void StartPlaying(const std::u16string& title = u"Song") {
++    session_.RequestAudioFocusFromService(page_focus_, AudioFocusType::kGain);
++    Flush();
++    session_.SimulateMetadataChanged(Metadata(title));
++    Flush();
++  }
++
++  std::u16string ShownTitle() const {
++    std::optional<SidebarMedia::Card> card = media_->GetCard();
++    return card ? card->state.title : std::u16string();
++  }
++
++  // Delivers an audio focus event as the manager would, to stand in for
++  // races the real manager can't be made to produce on demand.
++  media_session::mojom::AudioFocusObserver& FocusObserver() { return *media_; }
++
++  media_session::mojom::AudioFocusRequestStatePtr State(
++      const base::UnguessableToken& request_id) {
++    auto state = media_session::mojom::AudioFocusRequestState::New();
++    state->session_info = media_session::mojom::MediaSessionInfo::New();
++    state->session_info->is_controllable = true;
++    state->request_id = request_id;
++    state->source_id = source_id_;
++    return state;
++  }
++
++  base::test::TaskEnvironment task_environment_{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME};
++  const base::UnguessableToken source_id_ = base::UnguessableToken::Create();
++  std::unique_ptr<media_session::MediaSessionServiceImpl> service_;
++  mojo::Remote<media_session::mojom::AudioFocusManager> page_focus_;
++  media_session::test::MockMediaSession session_;
++  CountingObserver observer_;
++  std::unique_ptr<SidebarMedia> media_;
++  std::optional<base::UnguessableToken> raised_;
++  bool shut_down_ = false;
++};
++
++}  // namespace
++
++TEST_F(SidebarMediaTest, ShowsAPlayingSession) {
++  EXPECT_FALSE(media_->GetCard());
++
++  StartPlaying();
++
++  std::optional<SidebarMedia::Card> card = media_->GetCard();
++  ASSERT_TRUE(card);
++  EXPECT_EQ(card->state.title, u"Song");
++  EXPECT_EQ(card->state.subtitle, u"Artist");
++  EXPECT_TRUE(card->state.playing);
++  EXPECT_GT(observer_.changes, 0);
++
++  media_->Raise();
++  EXPECT_EQ(raised_, session_.request_id());
++}
++
++TEST_F(SidebarMediaTest, OtherProfilesSessionsDontShow) {
++  mojo::Remote<media_session::mojom::AudioFocusManager> other_focus;
++  service_->BindAudioFocusManager(other_focus.BindNewPipeAndPassReceiver());
++  other_focus->SetSource(base::UnguessableToken::Create(), "other");
++  media_session::test::MockMediaSession other;
++  other.SetIsControllable(true);
++  other.RequestAudioFocusFromService(other_focus, AudioFocusType::kGain);
++  Flush();
++  other.SimulateMetadataChanged(Metadata(u"Elsewhere"));
++  Flush();
++
++  EXPECT_FALSE(media_->GetCard());
++}
++
++TEST_F(SidebarMediaTest, FocusLossKeepsTheCardBriefly) {
++  StartPlaying();
++  session_.AbandonAudioFocusFromClient();
++  Flush();
++  EXPECT_EQ(ShownTitle(), u"Song");
++
++  task_environment_.FastForwardBy(base::Seconds(1));
++  EXPECT_EQ(ShownTitle(), u"Song");
++
++  task_environment_.FastForwardBy(base::Seconds(2));
++  EXPECT_FALSE(media_->GetCard());
++  EXPECT_EQ(media_->SessionCountForTesting(), 0u);
++}
++
++TEST_F(SidebarMediaTest, RegainingFocusBindsANewController) {
++  StartPlaying();
++  const base::UnguessableToken id = session_.request_id();
++
++  FocusObserver().OnFocusLost(State(id));
++  Flush();
++  FocusObserver().OnFocusGained(State(id));
++  Flush();
++
++  // The removal was called off, and the new controller hears the page.
++  task_environment_.FastForwardBy(base::Seconds(5));
++  session_.SimulateMetadataChanged(Metadata(u"Next Song"));
++  Flush();
++  EXPECT_EQ(ShownTitle(), u"Next Song");
++}
++
++TEST_F(SidebarMediaTest, ARequestThatAlreadyEndedIsDropped) {
++  // Startup can list a request that ended before its controller was made.
++  // The controller closes, and the session goes after the grace period
++  // instead of staying until a tab closes.
++  FocusObserver().OnFocusGained(State(base::UnguessableToken::Create()));
++  Flush();
++  EXPECT_EQ(media_->SessionCountForTesting(), 1u);
++
++  task_environment_.FastForwardBy(base::Seconds(3));
++  EXPECT_EQ(media_->SessionCountForTesting(), 0u);
++}
++
++TEST_F(SidebarMediaTest, ReleasedRequestIsRemovedAtOnce) {
++  StartPlaying();
++  page_focus_->RequestIdReleased(session_.request_id());
++  Flush();
++
++  EXPECT_FALSE(media_->GetCard());
++  EXPECT_EQ(media_->SessionCountForTesting(), 0u);
++}
++
++TEST_F(SidebarMediaTest, DismissStopsUntilItPlaysAgain) {
++  StartPlaying();
++  session_.Suspend(MediaSession::SuspendType::kUI);
++  Flush();
++  ASSERT_TRUE(media_->GetCard());
++  EXPECT_TRUE(media_->GetCard()->state.show_dismiss);
++
++  media_->Dismiss();
++  Flush();
++  EXPECT_FALSE(media_->GetCard());
++  EXPECT_EQ(session_.GetState(),
++            media_session::mojom::MediaSessionInfo::SessionState::kInactive);
++
++  session_.Resume(MediaSession::SuspendType::kUI);
++  Flush();
++  EXPECT_EQ(ShownTitle(), u"Song");
++}
++
++TEST_F(SidebarMediaTest, PositionAloneDoesNotNotifyWhilePlaying) {
++  StartPlaying();
++  session_.SimulatePositionChanged(media_session::MediaPosition(
++      1, base::Minutes(3), base::Seconds(10), /*end_of_media=*/false));
++  Flush();
++  const int changes = observer_.changes;
++
++  // Thirty seconds later the page reports where the media got to.
++  task_environment_.FastForwardBy(base::Seconds(30));
++  session_.SimulatePositionChanged(media_session::MediaPosition(
++      1, base::Minutes(3), base::Seconds(40), /*end_of_media=*/false));
++  Flush();
++  EXPECT_EQ(observer_.changes, changes);
++  // The progress line still reads the new position.
++  ASSERT_TRUE(media_->GetShownPosition());
++  EXPECT_GE(media_->GetShownPosition()->GetPosition(), base::Seconds(40));
++
++  // A seek does notify, so the line jumps at once.
++  session_.SimulatePositionChanged(media_session::MediaPosition(
++      1, base::Minutes(3), base::Seconds(120), /*end_of_media=*/false));
++  Flush();
++  EXPECT_GT(observer_.changes, changes);
++}
++
++TEST_F(SidebarMediaTest, ASessionThatLostFocusDoesNotOutrankAPausedOne) {
++  // A plays, then B starts and becomes the card.
++  StartPlaying(u"A");
++  mojo::Remote<media_session::mojom::AudioFocusManager> b_focus;
++  service_->BindAudioFocusManager(b_focus.BindNewPipeAndPassReceiver());
++  b_focus->SetSource(source_id_, "profile");
++  media_session::test::MockMediaSession b;
++  b.SetIsControllable(true);
++  task_environment_.FastForwardBy(base::Seconds(1));
++  b.RequestAudioFocusFromService(b_focus, AudioFocusType::kGain);
++  Flush();
++  b.SimulateMetadataChanged(Metadata(u"B"));
++  Flush();
++  ASSERT_EQ(ShownTitle(), u"B");
++
++  // A loses focus while still marked playing, and B pauses within A's
++  // grace period. B keeps the card, and the controls act on B.
++  session_.AbandonAudioFocusFromClient();
++  Flush();
++  b.Suspend(MediaSession::SuspendType::kUI);
++  Flush();
++  EXPECT_EQ(ShownTitle(), u"B");
++  media_->Raise();
++  EXPECT_EQ(raised_, b.request_id());
++}
++
++TEST_F(SidebarMediaTest, ShutdownTellsTheWindows) {
++  StartPlaying();
++  media_->Shutdown();
++  shut_down_ = true;
++
++  EXPECT_EQ(observer_.shutdowns, 1);
++  EXPECT_FALSE(media_->GetCard());
++  media_->RemoveObserver(&observer_);
++}
++
++}  // namespace rac
