@@ -1267,6 +1267,15 @@ def drive(variant, rig, browser, proc, shots=None, trigger=None):
         notes += [n for n in reply_notes(events) if n not in notes]
         record = {"index": index, "user": user, "events": events, "reply": reply,
                   "notes": notes, "end_state": end_state}
+        try:
+            # Proof only: every open page as the browser shows it (DevTools
+            # gives a tab's visible address).
+            record["targets"] = [
+                {"url": t.get("url"), "title": t.get("title")}
+                for t in browser.call("Target.getTargets", {}).get("targetInfos", [])
+                if t.get("type") == "page"]
+        except cdp.CdpError:
+            pass
         if shots is not None and variant.get("reply_shot") and not reply_shot:
             # A variant whose reply carries a note instead of a card gets
             # its own shot after the reply: the note in the panel, and the
