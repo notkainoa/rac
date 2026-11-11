@@ -170,7 +170,7 @@ locally](#testing-an-update-locally).
 
 Release builds must not contain rac's developer switches
 (`--rac-agent-debug`, `--rac-agent-mcp-echo`, `--rac-window-screenshot`,
-`--rac-launch-in-background`). Before signing, the `sign` job runs
+`--rac-launch-in-background`, `--rac-bangs-fixture`). Before signing, the `sign` job runs
 `.github/scripts/github_check_release_binary.sh`, which reads every Mach-O
 file in the app with `strings` and names each binary and match it finds.
 
