@@ -1,0 +1,4492 @@
+--- a/chrome/browser/rac/agent/tab_tools.cc
++++ b/chrome/browser/rac/agent/tab_tools.cc
+@@ -3,6 +3,7 @@
+ 
+ #include "chrome/browser/rac/agent/tab_tools.h"
+ 
++#include "base/auto_reset.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -29,6 +30,18 @@ bool IsTabInAgentReach(content::WebConte
+   return !rac::ai::IsInternalTab(contents);
+ }
+ 
++namespace {
++
++// How many of the agent's own tab switches are under way.
++int g_bringing_forward = 0;
++
++}  // namespace
++
++// static
++bool TabTools::IsBringingTabForward() {
++  return g_bringing_forward > 0;
++}
++
+ TabTools::TabTools(BrowserWindowInterface* browser)
+     : browser_(browser ? browser->GetWeakPtr() : nullptr) {}
+ TabTools::~TabTools() = default;
+@@ -109,7 +122,10 @@ ActionResult TabTools::OpenTab(const GUR
+   NavigateParams params(browser_.get(), GURL("about:blank"),
+                         ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
+   params.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
+-  ::Navigate(&params);
++  {
++    base::AutoReset<int> forward(&g_bringing_forward, g_bringing_forward + 1);
++    ::Navigate(&params);
++  }
+   content::WebContents* created = params.navigated_or_inserted_contents;
+   if (!created) {
+     result.error_code = "open_failed";
+@@ -143,7 +159,10 @@ ActionResult TabTools::SwitchTab(const s
+     result.error = "Unknown tab.";
+     return result;
+   }
+-  model->ActivateTabAt(index);
++  {
++    base::AutoReset<int> forward(&g_bringing_forward, g_bringing_forward + 1);
++    model->ActivateTabAt(index);
++  }
+   result.ok = true;
+   return result;
+ }
+--- a/chrome/browser/rac/agent/tab_tools.h
++++ b/chrome/browser/rac/agent/tab_tools.h
+@@ -42,6 +42,11 @@ class TabTools {
+   explicit TabTools(BrowserWindowInterface* browser);
+   ~TabTools();
+ 
++  // True while open_tab or switch_tab brings a tab to the front, for code
++  // that watches the active tab: the assistant's chat follows its agent
++  // task there, and stays with a tab the user switches to.
++  static bool IsBringingTabForward();
++
+   std::vector<TabInfo> ListTabs() const;
+   content::WebContents* FindByAlias(const std::string& tab_id) const;
+   std::string AliasFor(content::WebContents* contents) const;
+--- a/chrome/browser/rac/ai/BUILD.gn
++++ b/chrome/browser/rac/ai/BUILD.gn
+@@ -65,12 +65,18 @@ source_set("core") {
+     "ai_prefs.h",
+     "ask_query.cc",
+     "ask_query.h",
++    "card_gate.cc",
++    "card_gate.h",
+     "chat_prompt.cc",
+     "chat_prompt.h",
+     "chat_protocol.cc",
+     "chat_protocol.h",
+     "chat_history.cc",
+     "chat_history.h",
++    "chat_placement.cc",
++    "chat_placement.h",
++    "chat_send.cc",
++    "chat_send.h",
+     "internal_page.cc",
+     "internal_page.h",
+     "link_summary.cc",
+@@ -83,6 +89,8 @@ source_set("core") {
+     "page_text.h",
+     "providers.cc",
+     "providers.h",
++    "reply_log.cc",
++    "reply_log.h",
+     "saved_prompts.cc",
+     "saved_prompts.h",
+     "sse_parser.cc",
+@@ -150,7 +158,10 @@ test("rac_ai_unittests") {
+     "acp/agent_settings_unittest.cc",
+     "ai_prefs_unittest.cc",
+     "ask_query_unittest.cc",
++    "card_gate_unittest.cc",
+     "chat_history_unittest.cc",
++    "chat_placement_unittest.cc",
++    "chat_send_unittest.cc",
+     "chat_prompt_unittest.cc",
+     "chat_protocol_unittest.cc",
+     "internal_page_unittest.cc",
+@@ -160,6 +171,7 @@ test("rac_ai_unittests") {
+     "new_tab_page_unittest.cc",
+     "page_text_unittest.cc",
+     "providers_unittest.cc",
++    "reply_log_unittest.cc",
+     "saved_prompts_unittest.cc",
+     "sse_parser_unittest.cc",
+   ]
+--- /dev/null
++++ b/chrome/browser/rac/ai/chat_placement.cc
+@@ -0,0 +1,51 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/chat_placement.h"
++
++namespace rac::ai {
++
++ChatMove DecideChatMove(const ActiveTabState& state) {
++  if (state.blocked) {
++    // The assistant never sits beside an internal page.
++    return state.chat_showing ? ChatMove::kStepAside : ChatMove::kNone;
++  }
++  // Another side panel the user opened since keeps its place.
++  if (state.panel_showing) {
++    return ChatMove::kNone;
++  }
++  if (state.has_chat) {
++    return state.stepped_aside ? ChatMove::kComeBack : ChatMove::kNone;
++  }
++  // The two tabs of a split view are read side by side, so moving between
++  // them keeps the chat in view instead of closing it on every click.
++  return state.split_partner_chat_open ? ChatMove::kShareWithSplit
++                                       : ChatMove::kNone;
++}
++
++bool ReleasesChat(ChatHideReason reason, bool window_closing) {
++  return reason == ChatHideReason::kClosed && !window_closing;
++}
++
++bool ViewNeedsWindowPage(const void* view_window, const void* tab_window) {
++  return tab_window && view_window != tab_window;
++}
++
++bool MaySendTo(const std::string& key,
++               const std::string& shown,
++               const std::string& previous) {
++  return !key.empty() && (key == shown || key == previous);
++}
++
++bool MayStopTask(const std::string& key, const std::string& owner) {
++  return !key.empty() && key == owner;
++}
++
++bool MayResumeTask(const std::string& key,
++                   const std::string& owner,
++                   const std::string& shown) {
++  return MayStopTask(key, owner) && key == shown;
++}
++
++}  // namespace rac::ai
+--- /dev/null
++++ b/chrome/browser/rac/ai/chat_placement.h
+@@ -0,0 +1,86 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_CHAT_PLACEMENT_H_
++#define CHROME_BROWSER_RAC_AI_CHAT_PLACEMENT_H_
++
++#include <string>
++
++namespace rac::ai {
++
++// The assistant's chat belongs to tabs, not to the window: each tab shows its
++// own chat, opened on that tab, and the side panel follows the active tab.
++// These decide the few moves rac makes on top of what Chromium's per-tab side
++// panel entries already do.
++
++// The window's active tab, or the page in it, has just changed.
++struct ActiveTabState {
++  // The tab shows an internal page (IsAssistantBlockedHere()).
++  bool blocked = false;
++  // The side panel shows this tab's chat, and isn't closing.
++  bool chat_showing = false;
++  // The side panel shows anything at all.
++  bool panel_showing = false;
++  // This tab's chat stepped aside for an internal page and hasn't come back.
++  bool stepped_aside = false;
++  // This tab has a chat (its own, or one it shares).
++  bool has_chat = false;
++  // The tab active just before this one shares a split view with it, and
++  // its chat was open when the user left it.
++  bool split_partner_chat_open = false;
++};
++
++enum class ChatMove {
++  kNone,
++  // Close the panel and keep the chat: the tab now shows an internal page.
++  kStepAside,
++  // Open the tab's chat again: the tab is back on a web page.
++  kComeBack,
++  // Show the split partner's chat beside this tab too.
++  kShareWithSplit,
++};
++
++ChatMove DecideChatMove(const ActiveTabState& state);
++
++// Why a tab's chat left the panel. Mirrors SidePanelEntryHideReason.
++enum class ChatHideReason {
++  // The panel closed: the user closed it, or something else did.
++  kClosed,
++  // Another side panel took its place.
++  kReplaced,
++  // The user, the agent, or a closing tab switched to another tab.
++  kTabSwitched,
++};
++
++// Whether the tab lets its chat go. Only closing the panel does that, and not
++// while the window is closing, when the chat goes with its tabs. A chat shared
++// with other tabs stays with them; one with no tab left ends.
++bool ReleasesChat(ChatHideReason reason, bool window_closing);
++
++// A side panel view shows the chat page of the window its tab is in now. A
++// cached view that moved with its tab to another window still holds the old
++// window's page, and must take the new window's instead. `view_window` and
++// `tab_window` only compare.
++bool ViewNeedsWindowPage(const void* view_window, const void* tab_window);
++
++// Which conversation a send from the side panel page may go to: the one on
++// show, or the one shown just before it, for a send that crossed a tab switch
++// on its way. Never an empty key.
++bool MaySendTo(const std::string& key,
++               const std::string& shown,
++               const std::string& previous);
++
++// Stop names the conversation whose task it stops, and stops only that
++// conversation's own task.
++bool MayStopTask(const std::string& key, const std::string& owner);
++
++// Resume also needs the conversation to be on show: the user resumes the task
++// they are looking at.
++bool MayResumeTask(const std::string& key,
++                   const std::string& owner,
++                   const std::string& shown);
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_CHAT_PLACEMENT_H_
+--- /dev/null
++++ b/chrome/browser/rac/ai/chat_placement_unittest.cc
+@@ -0,0 +1,106 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/chat_placement.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::ai {
++namespace {
++
++TEST(RacAiChatPlacementTest, AWebTabWithNothingToDoStaysAsItIs) {
++  EXPECT_EQ(DecideChatMove({}), ChatMove::kNone);
++  EXPECT_EQ(
++      DecideChatMove(
++          {.chat_showing = true, .panel_showing = true, .has_chat = true}),
++      ChatMove::kNone);
++  // A tab with a chat that is merely closed keeps it closed.
++  EXPECT_EQ(DecideChatMove({.has_chat = true}), ChatMove::kNone);
++}
++
++TEST(RacAiChatPlacementTest, AnInternalPageSendsAShowingChatAside) {
++  EXPECT_EQ(DecideChatMove({.blocked = true,
++                            .chat_showing = true,
++                            .panel_showing = true,
++                            .has_chat = true}),
++            ChatMove::kStepAside);
++  // Nothing to send aside: the panel is closed, or shows something else.
++  EXPECT_EQ(DecideChatMove({.blocked = true, .has_chat = true}),
++            ChatMove::kNone);
++  EXPECT_EQ(DecideChatMove(
++                {.blocked = true, .panel_showing = true, .has_chat = true}),
++            ChatMove::kNone);
++}
++
++TEST(RacAiChatPlacementTest, AnInternalPageNeverBringsAChatBack) {
++  EXPECT_EQ(DecideChatMove(
++                {.blocked = true, .has_chat = true, .stepped_aside = true}),
++            ChatMove::kNone);
++  EXPECT_EQ(DecideChatMove({.blocked = true, .split_partner_chat_open = true}),
++            ChatMove::kNone);
++}
++
++TEST(RacAiChatPlacementTest, BackOnAWebPageTheChatReturns) {
++  EXPECT_EQ(DecideChatMove({.has_chat = true, .stepped_aside = true}),
++            ChatMove::kComeBack);
++}
++
++TEST(RacAiChatPlacementTest, AnotherPanelKeepsItsPlace) {
++  EXPECT_EQ(
++      DecideChatMove(
++          {.panel_showing = true, .has_chat = true, .stepped_aside = true}),
++      ChatMove::kNone);
++  EXPECT_EQ(
++      DecideChatMove({.panel_showing = true, .split_partner_chat_open = true}),
++      ChatMove::kNone);
++}
++
++TEST(RacAiChatPlacementTest, ASplitPartnerSharesItsOpenChat) {
++  EXPECT_EQ(DecideChatMove({.split_partner_chat_open = true}),
++            ChatMove::kShareWithSplit);
++  // A tab with a chat of its own shows that one instead.
++  EXPECT_EQ(DecideChatMove({.has_chat = true, .split_partner_chat_open = true}),
++            ChatMove::kNone);
++}
++
++TEST(RacAiChatPlacementTest, OnlyClosingThePanelReleasesTheChat) {
++  EXPECT_TRUE(ReleasesChat(ChatHideReason::kClosed, false));
++  EXPECT_FALSE(ReleasesChat(ChatHideReason::kTabSwitched, false));
++  EXPECT_FALSE(ReleasesChat(ChatHideReason::kReplaced, false));
++  // A closing window takes the chat with its tabs.
++  EXPECT_FALSE(ReleasesChat(ChatHideReason::kClosed, true));
++}
++
++// A view cached with its tab shows the page of the tab's window now.
++TEST(RacAiChatPlacementTest, AMovedViewTakesItsNewWindowsPage) {
++  int old_window = 0;
++  int new_window = 0;
++  EXPECT_FALSE(ViewNeedsWindowPage(&old_window, &old_window));
++  EXPECT_TRUE(ViewNeedsWindowPage(&old_window, &new_window));
++  // A tab on its way out of every window keeps what it has.
++  EXPECT_FALSE(ViewNeedsWindowPage(&old_window, nullptr));
++}
++
++TEST(RacAiChatPlacementTest, ASendGoesOnlyToTheShownOrTheLastShown) {
++  EXPECT_TRUE(MaySendTo("b", "b", "a"));
++  EXPECT_TRUE(MaySendTo("a", "b", "a"));
++  EXPECT_FALSE(MaySendTo("c", "b", "a"));
++  EXPECT_FALSE(MaySendTo("", "b", ""));
++  EXPECT_FALSE(MaySendTo("", "", ""));
++}
++
++TEST(RacAiChatPlacementTest, StopAndResumeNameTheTasksConversation) {
++  EXPECT_TRUE(MayStopTask("a", "a"));
++  EXPECT_FALSE(MayStopTask("b", "a"));
++  EXPECT_FALSE(MayStopTask("", "a"));
++  EXPECT_FALSE(MayStopTask("", ""));
++  // Resume also needs it on show.
++  EXPECT_TRUE(MayResumeTask("a", "a", "a"));
++  EXPECT_FALSE(MayResumeTask("a", "a", "b"));
++  EXPECT_FALSE(MayResumeTask("b", "a", "b"));
++  EXPECT_FALSE(MayResumeTask("", "", ""));
++}
++
++}  // namespace
++}  // namespace rac::ai
+--- a/chrome/browser/ui/views/rac/agent/agent_tab_indicator.cc
++++ b/chrome/browser/ui/views/rac/agent/agent_tab_indicator.cc
+@@ -25,14 +25,12 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
+-#include "chrome/browser/ui/side_panel/side_panel_entry_id.h"
+-#include "chrome/browser/ui/side_panel/side_panel_entry_key.h"
+-#include "chrome/browser/ui/side_panel/side_panel_ui.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/contents_capture_border_view.h"
+ #include "chrome/browser/ui/views/frame/contents_container_view.h"
+ #include "chrome/browser/ui/views/frame/contents_web_view.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_view.h"
++#include "chrome/browser/ui/views/rac/ai/assistant_side_panel.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_observer.h"
+@@ -723,14 +721,8 @@ class AgentTabController
+     owned_pill_ = std::move(pill);
+   }
+ 
+-  void OpenSidebar() {
+-    BrowserWindowInterface* browser = GetBrowser();
+-    SidePanelUI* ui = browser ? SidePanelUI::From(browser) : nullptr;
+-    if (ui) {
+-      ui->Show(SidePanelEntryKey(SidePanelEntryId::kRacAi),
+-               SidePanelOpenTrigger::kToolbarButton);
+-    }
+-  }
++  // The chat is per tab, and the agent's tab shows the chat that runs it.
++  void OpenSidebar() { rac::ai::ShowAssistantForTab(GetTab(), false); }
+ 
+   void Reattach(bool fade) {
+     if (hiding_) {
+--- a/chrome/browser/ui/views/rac/ai/assistant_actions.cc
++++ b/chrome/browser/ui/views/rac/ai/assistant_actions.cc
+@@ -15,11 +15,6 @@
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/ui/actions/chrome_action_id.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+-#include "chrome/browser/ui/side_panel/side_panel_action_callback.h"
+-#include "chrome/browser/ui/side_panel/side_panel_entry_id.h"
+-#include "chrome/browser/ui/side_panel/side_panel_entry_key.h"
+-#include "chrome/browser/ui/side_panel/side_panel_enums.h"
+-#include "chrome/browser/ui/side_panel/side_panel_ui.h"
+ #include "chrome/browser/ui/singleton_tabs.h"
+ #include "chrome/browser/ui/views/rac/ai/assistant_side_panel.h"
+ #include "chrome/browser/ui/window_feature_controller/window_feature_controller.h"
+@@ -113,10 +108,7 @@ void ToggleAssistant(BrowserWindowInterf
+   if (IsAssistantBlockedHere(browser) && !IsAssistantPanelOpen(browser)) {
+     return;
+   }
+-  if (SidePanelUI* ui = SidePanelUI::From(browser)) {
+-    ui->Toggle(SidePanelEntryKey(SidePanelEntryId::kRacAi),
+-               SidePanelOpenTrigger::kToolbarButton);
+-  }
++  ToggleAssistantPanel(browser);
+ }
+ 
+ bool CanRunAssistantCommand(BrowserWindowInterface* browser) {
+@@ -149,9 +141,15 @@ bool HidesAssistantMenuItem(BrowserWindo
+ actions::ActionItem* CreateAssistantAction(actions::ActionItem* root,
+                                            BrowserWindowInterface* browser) {
+   return root->AddChild(
++      // Chromium's side panel toggle needs an entry in the active tab, which
++      // a tab gets only once its chat opens.
+       actions::ActionItem::Builder(
+-          CreateToggleSidePanelActionCallback(
+-              SidePanelEntryKey(SidePanelEntryId::kRacAi), browser))
++          base::BindRepeating(
++              [](BrowserWindowInterface* browser, actions::ActionItem*,
++                 actions::ActionInvocationContext) {
++                ToggleAssistant(browser);
++              },
++              base::Unretained(browser)))
+           .SetActionId(kActionSidePanelShowRacAi)
+           .SetText(u"Assistant")
+           .SetTooltipText(u"Assistant")
+--- a/chrome/browser/ui/views/rac/ai/assistant_actions.h
++++ b/chrome/browser/ui/views/rac/ai/assistant_actions.h
+@@ -15,9 +15,9 @@ class ActionItem;
+ 
+ namespace rac::ai {
+ 
+-// Shows the assistant in the window's side panel, or hides it if it is
+-// showing. While the assistant is off this opens its settings instead, so the
+-// button always leads somewhere.
++// Shows the active tab's chat in the window's side panel, or hides it if it
++// is showing. While the assistant is off this opens its settings instead, so
++// the button always leads somewhere.
+ void ToggleAssistant(BrowserWindowInterface* browser);
+ 
+ // The Assistant command (IDC_RAC_ASSISTANT_TOGGLE: the View menu's Assistant
+--- a/chrome/browser/ui/views/rac/ai/assistant_edge_handle.cc
++++ b/chrome/browser/ui/views/rac/ai/assistant_edge_handle.cc
+@@ -16,8 +16,6 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/rac/layout_prefs.h"
+ #include "chrome/browser/ui/side_panel/side_panel_entry_id.h"
+-#include "chrome/browser/ui/side_panel/side_panel_entry_key.h"
+-#include "chrome/browser/ui/side_panel/side_panel_enums.h"
+ #include "chrome/browser/ui/side_panel/side_panel_ui.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/contents_container_view.h"
+@@ -104,9 +102,8 @@ class AssistantEdgeHandle : public views
+     // without sliding so its edge stays under the pointer.
+     panel_width_ = GetPanelWidth(event, *panel);
+     SaveWidth();
+-    ui->Show(SidePanelEntryKey(SidePanelEntryId::kRacAi),
+-             SidePanelOpenTrigger::kToolbarButton,
+-             /*suppress_animations=*/true);
++    ShowAssistantForTab(browser_view_->browser()->GetActiveTabInterface(),
++                        /*suppress_animations=*/true);
+     return true;
+   }
+ 
+--- a/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
++++ b/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
+@@ -8,21 +8,26 @@
+ #include <memory>
+ #include <optional>
+ #include <utility>
++#include <vector>
+ 
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+ #include "base/location.h"
+ #include "base/logging.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/ref_counted.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/supports_user_data.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
++#include "base/uuid.h"
+ #include "cc/paint/paint_flags.h"
+ #include "chrome/browser/file_select_helper.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/rac/ai/ai_service.h"
+ #include "chrome/browser/rac/ai/ai_service_factory.h"
++#include "chrome/browser/rac/ai/chat_placement.h"
+ #include "chrome/browser/rac/ai/internal_page.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+@@ -51,14 +56,18 @@
+ #include "chrome/browser/ui/webui/webui_embedding_context.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "components/prefs/pref_service.h"
++#include "components/split_tabs/split_tab_id.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/file_select_listener.h"
++#include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_contents_delegate.h"
+ #include "content/public/browser/web_contents_observer.h"
+ #include "third_party/blink/public/mojom/choosers/file_chooser.mojom.h"
+ #include "third_party/skia/include/core/SkColor.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/page_transition_types.h"
+ #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
+ #include "ui/color/color_id.h"
+ #include "ui/color/color_provider.h"
+@@ -77,6 +86,10 @@
+ 
+ namespace rac::ai {
+ 
++namespace {
++class AssistantChat;
++}  // namespace
++
+ // Whether the assistant's panel is open in one window, for the views that
+ // change with it (the top bar's Chat button hides while it is open, as in
+ // Dia). It is made on first use and deletes itself when its window closes.
+@@ -135,6 +148,38 @@ class AssistantPanelState {
+     return prompt_callbacks_.Add(std::move(callback));
+   }
+ 
++  // The tab the window's chat page was last shown beside.
++  tabs::TabInterface* shown_tab() const { return shown_tab_.Get(); }
++
++  // Also for a change in the conversation a tab shows: the page handler
++  // works out what to show, so a call that changes nothing costs a lookup.
++  void SetShownTab(tabs::TabInterface* tab) {
++    shown_tab_ = tab->GetHandle();
++    shown_callbacks_.Notify();
++  }
++
++  void NotifyConversationsChanged() { shown_callbacks_.Notify(); }
++
++  // The window's chat page, while it has one.
++  AssistantChat* chat() const { return chat_; }
++  void set_chat(AssistantChat* chat) { chat_ = chat; }
++
++  base::CallbackListSubscription AddShownTabCallback(
++      base::RepeatingClosure callback) {
++    return shown_callbacks_.Add(std::move(callback));
++  }
++
++  void NotifyTabLeft(tabs::TabHandle tab,
++                     const std::string& conversation,
++                     AssistantTabLeave reason) {
++    tab_left_callbacks_.Notify(tab, conversation, reason);
++  }
++
++  base::CallbackListSubscription AddTabLeftCallback(
++      AssistantTabLeftCallback callback) {
++    return tab_left_callbacks_.Add(std::move(callback));
++  }
++
+  private:
+   // A panel that never loads must not send the prompt much later, when the
+   // user opens it for something else.
+@@ -154,6 +199,12 @@ class AssistantPanelState {
+   base::RepeatingClosureList prompt_callbacks_;
+   std::optional<std::string> prompt_;
+   base::TimeTicks prompt_time_;
++  tabs::TabHandle shown_tab_;
++  base::RepeatingClosureList shown_callbacks_;
++  raw_ptr<AssistantChat> chat_ = nullptr;
++  base::RepeatingCallbackList<
++      void(tabs::TabHandle, const std::string&, AssistantTabLeave)>
++      tab_left_callbacks_;
+   base::CallbackListSubscription close_subscription_;
+   ui::ScopedUnownedUserData<AssistantPanelState> scoped_data_;
+ };
+@@ -164,27 +215,80 @@ namespace {
+ 
+ constexpr int kDefaultWidth = 400;
+ constexpr char kPanelUrl[] = "chrome://rac-ai/?mode=panel";
++// Marks a chat page, for AssistantChat::FromPage().
++constexpr char kChatPageKey[] = "rac-assistant-chat";
+ 
+-// The chat page, hosted directly in the side panel with no header: the page
+-// draws its own buttons, close included, as Dia's panel does. The page is
+-// transparent so the panel sits on the window's wash beside the page card.
+-class AssistantWebView : public views::WebView {
+-  METADATA_HEADER(AssistantWebView, views::WebView)
++SidePanelEntryKey ChatKey() {
++  return SidePanelEntryKey(SidePanelEntryId::kRacAi);
++}
+ 
+- public:
+-  AssistantWebView(Profile* profile, BrowserWindowInterface* browser)
+-      : views::WebView(profile) {
+-    webui::SetBrowserWindowInterface(GetWebContents(), browser);
+-    GetWebContents()->SetPageBaseBackgroundColor(SK_ColorTRANSPARENT);
+-    LoadInitialURL(GURL(kPanelUrl));
++void SchedulePaintContainer(BrowserWindowInterface* browser);
++
++// The Chat button and the container follow this.
++void SetPanelOpen(BrowserWindowInterface* browser, bool open) {
++  AssistantPanelState* state =
++      browser ? AssistantPanelState::From(browser) : nullptr;
++  if (state && state->open() != open) {
++    state->SetOpen(open);
++    SchedulePaintContainer(browser);
+   }
++}
++
++// Only regular windows with tabs get the assistant, and only while it is on.
++bool CanHaveAssistant(BrowserWindowInterface* browser) {
++  return browser && browser->GetProfile()->IsRegularProfile() &&
++         browser->GetType() == BrowserWindowInterface::Type::TYPE_NORMAL &&
++         IsAiEnabled(browser->GetProfile()->GetPrefs());
++}
+ 
+-  ~AssistantWebView() override = default;
++class AssistantWebView;
++
++// The window's chat page: one per window, whatever the number of tabs with a
++// chat, so N chats cost one renderer. Each tab's conversation lives in the
++// browser (the page handler), which tells the page which one to show as the
++// panel moves from tab to tab.
++//
++// The chat owns its page rather than a view: the side panel deletes the
++// views of entries it closes or no longer needs, and a reply or a task must
++// carry on while its tab is in the background. Every tab with a conversation
++// holds a reference, as does the view showing the page, and the page ends
++// when the last one goes: when the user closes the last chat, when the last
++// tab with one closes or leaves the window, or when AI turns off.
++class AssistantChat : public base::RefCounted<AssistantChat>,
++                      public content::WebContentsDelegate {
++ public:
++  // The window's page, made if it has none.
++  static scoped_refptr<AssistantChat> GetOrCreate(
++      BrowserWindowInterface* browser) {
++    if (AssistantChat* chat =
++            AssistantPanelState::GetOrCreate(browser)->chat()) {
++      return base::WrapRefCounted(chat);
++    }
++    return base::WrapRefCounted(new AssistantChat(browser));
++  }
+ 
+-  base::WeakPtr<AssistantWebView> AsWeakPtr() {
+-    return weak_factory_.GetWeakPtr();
++  static AssistantChat* FromPage(content::WebContents* page) {
++    auto* tag =
++        page ? static_cast<PageTag*>(page->GetUserData(kChatPageKey)) : nullptr;
++    return tag ? tag->chat.get() : nullptr;
+   }
+ 
++  AssistantChat(const AssistantChat&) = delete;
++  AssistantChat& operator=(const AssistantChat&) = delete;
++
++  // Shows the page in `host`, beside `tab`. The view that showed it before
++  // lets it go, and the page handler hears which tab it is beside now.
++  void Show(AssistantWebView* host, tabs::TabInterface* tab);
++
++  // `host` no longer shows the page, if it did.
++  void Hide(AssistantWebView* host);
++
++  // True while the side panel shows the page.
++  bool IsShowing() const;
++
++  // The window whose page this is, or null once it has closed.
++  BrowserWindowInterface* window() const { return browser_.get(); }
++
+   // content::WebContentsDelegate:
+   void RunFileChooser(content::RenderFrameHost* render_frame_host,
+                       scoped_refptr<content::FileSelectListener> listener,
+@@ -193,12 +297,83 @@ class AssistantWebView : public views::W
+                                      params);
+   }
+ 
++ private:
++  friend class base::RefCounted<AssistantChat>;
++
++  struct PageTag : public base::SupportsUserData::Data {
++    explicit PageTag(AssistantChat* chat) : chat(chat) {}
++    raw_ptr<AssistantChat> chat;
++  };
++
++  explicit AssistantChat(BrowserWindowInterface* browser)
++      : browser_(browser->GetWeakPtr()) {
++    AssistantPanelState::GetOrCreate(browser)->set_chat(this);
++    page_ = content::WebContents::Create(
++        content::WebContents::CreateParams(browser->GetProfile(), FROM_HERE));
++    page_->SetDelegate(this);
++    page_->SetPageBaseBackgroundColor(SK_ColorTRANSPARENT);
++    page_->SetUserData(kChatPageKey, std::make_unique<PageTag>(this));
++    webui::SetBrowserWindowInterface(page_.get(), browser);
++    content::NavigationController::LoadURLParams params((GURL(kPanelUrl)));
++    params.transition_type = ui::PAGE_TRANSITION_AUTO_TOPLEVEL;
++    page_->GetController().LoadURLWithParams(params);
++    VLOG(1) << "rac assistant: the window's chat page";
++  }
++
++  ~AssistantChat() override {
++    VLOG(1) << "rac assistant: the window's chat page ended";
++    // The window may be gone: its tabs close first and let the page go.
++    if (AssistantPanelState* state =
++            browser_ ? AssistantPanelState::From(browser_.get()) : nullptr;
++        state && state->chat() == this) {
++      state->set_chat(nullptr);
++    }
++    page_->RemoveUserData(kChatPageKey);
++    page_->SetDelegate(nullptr);
++  }
++
++  const base::WeakPtr<BrowserWindowInterface> browser_;
++  std::unique_ptr<content::WebContents> page_;
++  // The view showing the page, or the last one to.
++  raw_ptr<AssistantWebView> host_ = nullptr;
++};
++
++// The chat page in the side panel, hosted directly with no header: the page
++// draws its own buttons, close included, as Dia's panel does. The page is
++// transparent so the panel sits on the window's wash beside the page card.
++// The side panel makes one per tab entry and deletes them freely; the page
++// it shows lives on in AssistantChat.
++class AssistantWebView : public views::WebView {
++  METADATA_HEADER(AssistantWebView, views::WebView)
++
++ public:
++  AssistantWebView(Profile* profile,
++                   scoped_refptr<AssistantChat> chat,
++                   tabs::TabInterface* tab,
++                   base::WeakPtr<SidePanelEntry> entry)
++      : views::WebView(profile),
++        chat_(std::move(chat)),
++        tab_(tab->GetHandle()),
++        entry_(std::move(entry)) {
++    chat_->Show(this, tab);
++  }
++
++  ~AssistantWebView() override { chat_->Hide(this); }
++
+  protected:
+   // views::View:
++  void AddedToWidget() override;
++
+   void VisibilityChanged(views::View* starting_from, bool is_visible) override {
+     views::WebView::VisibilityChanged(starting_from, is_visible);
+-    if (is_visible && starting_from == this) {
+-      // Let the user type straight away.
++    if (is_visible) {
++      TakePage();
++    }
++    // Let the user type straight away, but not when the chat came back with
++    // its tab: focus stays where the tab switch put it.
++    if (is_visible && starting_from == this &&
++        !(entry_ &&
++          entry_->last_open_trigger() == SidePanelOpenTrigger::kTabChanged)) {
+       base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+           FROM_HERE, base::BindOnce(&AssistantWebView::FocusPage,
+                                     weak_factory_.GetWeakPtr()));
+@@ -206,21 +381,368 @@ class AssistantWebView : public views::W
+   }
+ 
+  private:
++  // Shows the window's page here, beside this view's tab: another tab's
++  // view may have shown it since this one was cached.
++  void TakePage();
++
+   void FocusPage() {
+     if (GetVisible() && GetWidget()) {
+       RequestFocus();
+     }
+   }
+ 
++  scoped_refptr<AssistantChat> chat_;
++  tabs::TabHandle tab_;
++  base::WeakPtr<SidePanelEntry> entry_;
+   base::WeakPtrFactory<AssistantWebView> weak_factory_{this};
+ };
+ 
+ BEGIN_METADATA(AssistantWebView)
+ END_METADATA
+ 
+-std::unique_ptr<AssistantWebView> CreateView(SidePanelEntryScope& scope) {
+-  BrowserWindowInterface& browser = scope.GetBrowserWindowInterface();
+-  return std::make_unique<AssistantWebView>(browser.GetProfile(), &browser);
++void AssistantChat::Show(AssistantWebView* host, tabs::TabInterface* tab) {
++  if (host_ && host_ != host) {
++    host_->SetWebContents(nullptr);
++  }
++  host_ = host;
++  if (host->web_contents() != page_.get()) {
++    host->SetWebContents(page_.get());
++  }
++  if (tab && browser_) {
++    AssistantPanelState::GetOrCreate(browser_.get())->SetShownTab(tab);
++  }
++}
++
++void AssistantChat::Hide(AssistantWebView* host) {
++  if (host_ == host) {
++    host->SetWebContents(nullptr);
++    host_ = nullptr;
++  }
++}
++
++bool AssistantChat::IsShowing() const {
++  return host_ && host_->GetWidget() && host_->web_contents() == page_.get();
++}
++
++// What one tab knows about the assistant: which conversation it shows, and
++// whether that chat stepped aside for an internal page. It is made the
++// first time the assistant opens on the tab, and lives in the tab's side
++// panel entry, which the tab's registry owns, so it goes with the tab, to
++// another window too. The entry is tab-scoped, so Chromium keeps it open or
++// closed per tab and shows it again on return; what it shows is the window's
++// one chat page, told to show this tab's conversation.
++class TabChat : public SidePanelEntryObserver {
++ public:
++  DECLARE_USER_DATA(TabChat);
++
++  static TabChat* From(tabs::TabInterface* tab) {
++    return Get(tab->GetUnownedUserDataHost());
++  }
++
++  // Registers the tab's entry, and a TabChat with it, unless it has one.
++  static TabChat* GetOrCreate(tabs::TabInterface* tab) {
++    if (TabChat* tab_chat = From(tab)) {
++      return tab_chat;
++    }
++    SidePanelRegistry* registry = SidePanelRegistry::From(tab);
++    if (!registry || registry->GetEntryForKey(ChatKey())) {
++      return nullptr;
++    }
++    auto owned = std::make_unique<TabChat>(tab);
++    TabChat* tab_chat = owned.get();
++    auto entry = std::make_unique<SidePanelEntry>(
++        ChatKey(),
++        base::BindRepeating(&TabChat::CreateContent,
++                            base::Owned(std::move(owned))),
++        base::BindRepeating([] { return kDefaultWidth; }));
++    // The Chat button and the page's own close button are the way in and
++    // out, so Chromium's header and toolbar button would double them.
++    entry->set_should_show_header(false);
++    entry->set_should_show_ephemerally_in_toolbar(false);
++    tab_chat->entry_ = entry->GetWeakPtr();
++    entry->AddObserver(tab_chat);
++    registry->Register(std::move(entry));
++    return tab_chat;
++  }
++
++  explicit TabChat(tabs::TabInterface* tab)
++      : tab_(tab), scoped_data_(tab->GetUnownedUserDataHost(), *this) {
++    BrowserWindowInterface* browser = tab->GetBrowserWindowInterface();
++    window_ = browser ? browser->GetWeakPtr() : nullptr;
++    detach_subscription_ = tab->RegisterWillDetach(
++        base::BindRepeating(&TabChat::OnWillDetach, base::Unretained(this)));
++  }
++
++  TabChat(const TabChat&) = delete;
++  TabChat& operator=(const TabChat&) = delete;
++
++  // Goes with its entry, when the tab closes or AI turns off.
++  ~TabChat() override {
++    Leave(AssistantTabLeave::kClosed);
++    ReleasePage();
++  }
++
++  tabs::TabInterface* tab() { return tab_; }
++  const std::string& conversation() const { return conversation_; }
++  bool has_chat() const { return !conversation_.empty(); }
++  SidePanelEntry* entry() { return entry_.get(); }
++  bool stepped_aside() const { return stepped_aside_; }
++
++  // True while the tab's chat is open on it, whether or not the tab is in
++  // front: Chromium's per-tab state, kept in the tab's registry.
++  bool IsOpen() {
++    SidePanelRegistry* registry = SidePanelRegistry::From(tab_);
++    std::optional<SidePanelEntry*> active =
++        registry ? registry->GetActiveEntry() : std::nullopt;
++    return has_chat() && entry_ && active && *active == entry_.get();
++  }
++
++  // The tab shows `conversation` from now on. The one it showed, if it was
++  // another, is no longer this tab's.
++  void SetConversation(const std::string& conversation) {
++    if (conversation == conversation_) {
++      return;
++    }
++    if (has_chat()) {
++      Leave(AssistantTabLeave::kReleased);
++    }
++    conversation_ = conversation;
++    stepped_aside_ = false;
++    // A conversation lives in its window's page, so the tab holds it.
++    if (window_ && has_chat()) {
++      page_ = AssistantChat::GetOrCreate(window_.get());
++    }
++    if (AssistantPanelState* state =
++            window_ ? AssistantPanelState::From(window_.get()) : nullptr) {
++      state->NotifyConversationsChanged();
++    }
++  }
++
++  // Gives the tab a new conversation if it has none.
++  // A tab that moved to another window holds that window's page from now on.
++  void EnsureConversation() {
++    BrowserWindowInterface* browser = tab_->GetBrowserWindowInterface();
++    if (browser && window_.get() != browser) {
++      window_ = browser->GetWeakPtr();
++      if (has_chat()) {
++        page_ = AssistantChat::GetOrCreate(browser);
++      }
++    }
++    if (has_chat()) {
++      return;
++    }
++    VLOG(1) << "rac assistant: a new conversation for a tab";
++    SetConversation(base::Uuid::GenerateRandomV4().AsLowercaseString());
++  }
++
++  base::Value TakeCarried() { return std::exchange(carried_, base::Value()); }
++
++  void Carry(base::Value snapshot) { carried_ = std::move(snapshot); }
++
++  // Closes the panel showing this tab's chat beside an internal page. The
++  // chat stays, and comes back when the tab shows a web page again.
++  void StepAside() {
++    BrowserWindowInterface* browser = tab_->GetBrowserWindowInterface();
++    SidePanelUI* ui = browser ? SidePanelUI::From(browser) : nullptr;
++    // Not a panel already on its way out: the user closed that one.
++    if (!ui || !tab_->IsActivated() ||
++        !ui->IsSidePanelEntryShowing(ChatKey()) ||
++        !IsAssistantPanelOpen(browser)) {
++      return;
++    }
++    VLOG(1) << "rac assistant: the chat steps aside for an internal page";
++    stepped_aside_ = true;
++    ui->Close(SidePanelEntryHideReason::kBackgrounded,
++              /*suppress_animations=*/true);
++  }
++
++ private:
++  // The entry's view, made when the side panel first shows the entry and
++  // again after it dropped the last one. A tab opening the assistant for
++  // the first time, or again after the user closed its chat, gets a new
++  // conversation.
++  std::unique_ptr<views::View> CreateContent(SidePanelEntryScope& scope) {
++    BrowserWindowInterface* browser = tab_->GetBrowserWindowInterface();
++    CHECK(browser);
++    window_ = browser->GetWeakPtr();
++    if (!has_chat()) {
++      conversation_ = base::Uuid::GenerateRandomV4().AsLowercaseString();
++      VLOG(1) << "rac assistant: a new conversation for a tab";
++    }
++    page_ = AssistantChat::GetOrCreate(browser);
++    return std::make_unique<AssistantWebView>(browser->GetProfile(), page_,
++                                              tab_, entry_);
++  }
++
++  // The tab no longer shows its conversation, and the window's page
++  // handler decides whether the conversation ends.
++  void Leave(AssistantTabLeave reason) {
++    std::string conversation = std::exchange(conversation_, std::string());
++    stepped_aside_ = false;
++    if (!conversation.empty() && window_) {
++      if (AssistantPanelState* state =
++              AssistantPanelState::From(window_.get())) {
++        state->NotifyTabLeft(tab_->GetHandle(), conversation, reason);
++      }
++    }
++  }
++
++  // Lets the window's page go, after the current task: this can run while
++  // the tab closes or moves, and the page may end with it.
++  void ReleasePage() {
++    if (page_) {
++      base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce([](scoped_refptr<AssistantChat>) {},
++                                    std::move(page_)));
++    }
++  }
++
++  void OnWillDetach(tabs::TabInterface* tab,
++                    tabs::TabInterface::DetachReason reason) {
++    if (reason != tabs::TabInterface::DetachReason::kInsertIntoOtherWindow ||
++        !has_chat()) {
++      return;
++    }
++    // The conversation goes with the tab. This window's handler hears it
++    // first, at once, and carries what it can (Carry()) before the other
++    // window shows the tab.
++    const std::string conversation = conversation_;
++    Leave(AssistantTabLeave::kMoved);
++    conversation_ = conversation;
++    ReleasePage();
++    window_ = nullptr;
++  }
++
++  // A way in that shows the panel directly opened it beside an internal page.
++  void StepAsideIfBlocked() {
++    BrowserWindowInterface* browser = tab_->GetBrowserWindowInterface();
++    if (browser && IsAssistantBlockedHere(browser)) {
++      StepAside();
++    }
++  }
++
++  // SidePanelEntryObserver:
++  void OnEntryShown(SidePanelEntry* entry) override {
++    stepped_aside_ = false;
++    hide_reason_ = ChatHideReason::kTabSwitched;
++    BrowserWindowInterface* browser = tab_->GetBrowserWindowInterface();
++    shown_in_ = browser ? browser->GetWeakPtr() : nullptr;
++    SetPanelOpen(browser, true);
++    // The one check every way in passes, Chromium's own tab switch included.
++    // The side panel is still finishing the show, so the close waits for
++    // it; it can't loop, since only a web page brings the chat back.
++    if (browser && IsAssistantBlockedHere(browser)) {
++      base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(&TabChat::StepAsideIfBlocked,
++                                    weak_factory_.GetWeakPtr()));
++    }
++  }
++
++  void OnEntryHideCancelled(SidePanelEntry* entry) override {
++    hide_reason_ = ChatHideReason::kTabSwitched;
++    SetPanelOpen(shown_in_.get(), true);
++  }
++
++  void OnEntryWillHide(SidePanelEntry* entry,
++                       SidePanelEntryHideReason reason) override {
++    hide_reason_ = reason == SidePanelEntryHideReason::kSidePanelClosed
++                       ? ChatHideReason::kClosed
++                   : reason == SidePanelEntryHideReason::kReplaced
++                       ? ChatHideReason::kReplaced
++                       : ChatHideReason::kTabSwitched;
++    SetPanelOpen(shown_in_.get(), false);
++  }
++
++  void OnEntryHidden(SidePanelEntry* entry) override {
++    BrowserWindowInterface* browser = shown_in_.get();
++    SidePanelUI* ui = browser ? SidePanelUI::From(browser) : nullptr;
++    // Another tab's chat may have taken its place.
++    SetPanelOpen(browser, ui && ui->IsSidePanelEntryShowing(ChatKey()));
++    const TabStripModel* tabs = browser ? browser->GetTabStripModel() : nullptr;
++    if (has_chat() && ReleasesChat(hide_reason_, tabs && tabs->closing_all())) {
++      VLOG(1) << "rac assistant: the chat closed on its tab";
++      Leave(AssistantTabLeave::kReleased);
++      ReleasePage();
++    }
++    hide_reason_ = ChatHideReason::kTabSwitched;
++  }
++
++  const raw_ptr<tabs::TabInterface> tab_;
++  base::WeakPtr<SidePanelEntry> entry_;
++  // The conversation the tab shows, or empty.
++  std::string conversation_;
++  // The window's page, held while the tab has a conversation in it.
++  scoped_refptr<AssistantChat> page_;
++  // What the tab took with it from another window, for this window's page.
++  base::Value carried_;
++  bool stepped_aside_ = false;
++  ChatHideReason hide_reason_ = ChatHideReason::kTabSwitched;
++  // The window the tab is in, and the one its entry last showed in.
++  base::WeakPtr<BrowserWindowInterface> window_;
++  base::WeakPtr<BrowserWindowInterface> shown_in_;
++  base::CallbackListSubscription detach_subscription_;
++  ui::ScopedUnownedUserData<TabChat> scoped_data_;
++  base::WeakPtrFactory<TabChat> weak_factory_{this};
++};
++
++DEFINE_USER_DATA(TabChat);
++
++void AssistantWebView::AddedToWidget() {
++  views::WebView::AddedToWidget();
++  TakePage();
++}
++
++void AssistantWebView::TakePage() {
++  tabs::TabInterface* tab = tab_.Get();
++  BrowserWindowInterface* window =
++      tab ? tab->GetBrowserWindowInterface() : nullptr;
++  // Chromium keeps the cached view of a tab's open entry, so a view can come
++  // with its tab from another window. It shows this window's page then,
++  // never the old window's: that page belongs to the other window's tabs.
++  if (ViewNeedsWindowPage(chat_->window(), window)) {
++    VLOG(1) << "rac assistant: a chat view came with its tab from another "
++               "window, so it takes this window's page";
++    chat_->Hide(this);
++    scoped_refptr<AssistantChat> old =
++        std::exchange(chat_, AssistantChat::GetOrCreate(window));
++    // This runs while the tab is inserted into its new window, and the old
++    // page may end with this reference: let it go after, as
++    // TabChat::ReleasePage() does.
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce([](scoped_refptr<AssistantChat>) {}, std::move(old)));
++  }
++  // A cached view shown again after its tab's chat closed starts a new
++  // conversation, as a new view would; a tab that moved holds its new
++  // window's page.
++  if (TabChat* tab_chat = tab ? TabChat::From(tab) : nullptr) {
++    tab_chat->EnsureConversation();
++  }
++  chat_->Show(this, tab);
++}
++
++// Shows `tab`'s chat, making one if it has none. `tab` must be its window's
++// active tab, showing a web page.
++void ShowTabChat(tabs::TabInterface* tab,
++                 SidePanelOpenTrigger trigger,
++                 bool keep_focus,
++                 bool suppress_animations) {
++  BrowserWindowInterface* browser = tab->GetBrowserWindowInterface();
++  SidePanelUI* ui = browser ? SidePanelUI::From(browser) : nullptr;
++  if (!ui || !TabChat::GetOrCreate(tab)) {
++    return;
++  }
++  // Showing the panel focuses it. When the chat comes back on its own,
++  // focus stays where the user put it.
++  BrowserView* browser_view =
++      keep_focus ? BrowserView::GetBrowserViewForBrowser(browser) : nullptr;
++  views::FocusManager* focus =
++      browser_view ? browser_view->GetFocusManager() : nullptr;
++  views::ViewTracker focused(focus ? focus->GetFocusedView() : nullptr);
++  ui->Show(ChatKey(), trigger, suppress_animations);
++  if (focus && focused.view()) {
++    focus->SetFocusedView(focused.view());
++  }
+ }
+ 
+ // Reports when the page in the window's active tab may have changed between
+@@ -390,96 +912,54 @@ void SchedulePaintContainer(BrowserWindo
+   }
+ }
+ 
+-// Registers and removes the entry as the pref changes, and reports when the
+-// panel opens and closes. While AI is on it also keeps the assistant away
+-// from internal pages (IsAssistantBlockedHere()). It deletes itself when its
+-// window closes, and the chat it kept goes with it.
+-class EntryRegistrar : public SidePanelEntryObserver {
++// The assistant's part in one window: while AI is on, it keeps the assistant
++// away from internal pages (IsAssistantBlockedHere()) and moves chats the
++// way ChatMove says as the active tab and its page change. Turning AI off
++// ends the window's chats. It deletes itself when its window closes.
++class WindowAssistant {
+  public:
+-  EntryRegistrar(BrowserWindowInterface* browser, SidePanelRegistry* registry)
+-      : browser_(browser), registry_(registry) {
++  explicit WindowAssistant(BrowserWindowInterface* browser)
++      : browser_(browser) {
+     close_subscription_ = browser_->RegisterBrowserDidClose(base::BindRepeating(
+-        [](EntryRegistrar* self, BrowserWindowInterface*) { delete self; },
++        [](WindowAssistant* self, BrowserWindowInterface*) { delete self; },
+         base::Unretained(this)));
+     pref_registrar_.Init(browser_->GetProfile()->GetPrefs());
+-    pref_registrar_.Add(kEnabled, base::BindRepeating(&EntryRegistrar::Update,
++    pref_registrar_.Add(kEnabled, base::BindRepeating(&WindowAssistant::Update,
+                                                       base::Unretained(this)));
+     Update();
+   }
+ 
+-  EntryRegistrar(const EntryRegistrar&) = delete;
+-  EntryRegistrar& operator=(const EntryRegistrar&) = delete;
++  WindowAssistant(const WindowAssistant&) = delete;
++  WindowAssistant& operator=(const WindowAssistant&) = delete;
+ 
+  private:
+-  ~EntryRegistrar() override {
+-    if (entry_ && registry_->GetEntryForKey(SidePanelEntry::Key(
+-                      SidePanelEntry::Id::kRacAi)) == entry_) {
+-      entry_->RemoveObserver(this);
+-    }
+-  }
++  ~WindowAssistant() = default;
+ 
+   void Update() {
+-    const SidePanelEntry::Key key(SidePanelEntry::Id::kRacAi);
+     const bool enabled = IsAiEnabled(browser_->GetProfile()->GetPrefs());
+-    const bool registered = registry_->GetEntryForKey(key) != nullptr;
+-    if (enabled && !registered) {
+-      AssistantPanelState::GetOrCreate(browser_);
+-      // The registry keeps the entry until the window is gone, after this
+-      // object, so the callback holds it weakly.
+-      auto entry = std::make_unique<SidePanelEntry>(
+-          key,
+-          base::BindRepeating(
+-              [](base::WeakPtr<EntryRegistrar> self,
+-                 SidePanelEntryScope& scope) -> std::unique_ptr<views::View> {
+-                if (self) {
+-                  return self->CreateContent(scope);
+-                }
+-                return CreateView(scope);
+-              },
+-              weak_factory_.GetWeakPtr()),
+-          base::BindRepeating([] { return kDefaultWidth; }));
+-      // The Chat button and the page's own close button are the way in and
+-      // out, so Chromium's header and toolbar button would double them.
+-      entry->set_should_show_header(false);
+-      entry->set_should_show_ephemerally_in_toolbar(false);
+-      entry->AddObserver(this);
+-      entry_ = entry.get();
+-      registry_->Register(std::move(entry));
+-    } else if (!enabled && registered) {
+-      if (SidePanelUI* ui = SidePanelUI::From(browser_);
+-          ui && ui->IsSidePanelEntryShowing(key)) {
+-        ui->Close();
+-      }
+-      if (entry_) {
+-        entry_->RemoveObserver(this);
+-        entry_ = nullptr;
+-      }
+-      registry_->Deregister(key);
+-      SetOpen(false);
+-    }
+     if (enabled && !page_watch_) {
++      AssistantPanelState::GetOrCreate(browser_);
++      tabs::TabInterface* tab = browser_->GetActiveTabInterface();
++      last_active_ = tab ? tab->GetHandle() : tabs::TabHandle();
+       page_watch_ = std::make_unique<ActivePageWatch>(
+-          browser_, base::BindRepeating(&EntryRegistrar::OnActivePageChanged,
++          browser_, base::BindRepeating(&WindowAssistant::OnActivePageChanged,
+                                         base::Unretained(this)));
+       OnActivePageChanged();
+-    } else if (!enabled) {
+-      // Turning AI off ends a chat kept for later, as it closes an open one.
++    } else if (!enabled && page_watch_) {
+       page_watch_.reset();
+-      kept_view_.reset();
+-      keep_on_hide_ = false;
+       blocked_ = false;
++      // Turning AI off ends every chat, as it closes an open one: dropping a
++      // tab's entry closes the panel if it shows it, and the chat goes with
++      // the last tab that held it.
++      for (tabs::TabInterface* tab : browser_->GetAllTabInterfaces()) {
++        if (TabChat::From(tab)) {
++          SidePanelRegistry::From(tab)->Deregister(ChatKey());
++        }
++      }
++      SetPanelOpen(browser_, false);
+     }
+   }
+ 
+-  std::unique_ptr<views::View> CreateContent(SidePanelEntryScope& scope) {
+-    VLOG(1) << "rac assistant: "
+-            << (kept_view_ ? "the kept chat is back" : "a new chat page");
+-    std::unique_ptr<AssistantWebView> view =
+-        kept_view_ ? std::move(kept_view_) : CreateView(scope);
+-    live_view_ = view->AsWeakPtr();
+-    return view;
+-  }
+-
+   // The active tab changed, or its page did.
+   void OnActivePageChanged() {
+     // A closing window only passes through its tabs on the way out.
+@@ -487,6 +967,9 @@ class EntryRegistrar : public SidePanelE
+         tabs && tabs->closing_all()) {
+       return;
+     }
++    tabs::TabInterface* tab = browser_->GetActiveTabInterface();
++    tabs::TabInterface* previous = last_active_.Get();
++    last_active_ = tab ? tab->GetHandle() : tabs::TabHandle();
+     const bool blocked = IsAssistantBlockedHere(browser_);
+     if (blocked != blocked_) {
+       blocked_ = blocked;
+@@ -501,117 +984,61 @@ class EntryRegistrar : public SidePanelE
+       }
+     }
+     SidePanelUI* ui = SidePanelUI::From(browser_);
+-    if (!ui) {
+-      return;
++    // A tab closed with its chat open takes its entry with it unheard, so
++    // the Chat button would stay hidden.
++    if (ui && IsAssistantPanelOpen(browser_) &&
++        !ui->IsSidePanelEntryShowing(ChatKey())) {
++      SetPanelOpen(browser_, false);
+     }
+-    const SidePanelEntry::Key key(SidePanelEntry::Id::kRacAi);
+-    if (blocked) {
+-      StepAside(*ui);
++    if (!ui || !tab) {
+       return;
+     }
+-    // Back on a web page: bring the chat back where the user left it, unless
+-    // another panel took its place, in which case it waits for the next time
+-    // the assistant opens.
+-    if (kept_view_ && !ui->IsSidePanelShowing()) {
+-      // Showing the panel focuses it, but the user came back to the tab, and
+-      // focus stays where the tab switch put it.
+-      BrowserView* browser_view =
+-          BrowserView::GetBrowserViewForBrowser(browser_);
+-      views::FocusManager* focus =
+-          browser_view ? browser_view->GetFocusManager() : nullptr;
+-      views::ViewTracker focused(focus ? focus->GetFocusedView() : nullptr);
+-      ui->Show(key, SidePanelOpenTrigger::kTabChanged,
+-               /*suppress_animations=*/true);
+-      if (focus && focused.view()) {
+-        focus->SetFocusedView(focused.view());
+-      }
+-    }
+-  }
+-
+-  // Closes a panel showing beside an internal page and keeps its chat for
+-  // the next web page.
+-  void StepAside(SidePanelUI& ui) {
+-    // Not a panel already on its way out: the user closed that one.
+-    if (ui.IsSidePanelEntryShowing(
+-            SidePanelEntry::Key(SidePanelEntry::Id::kRacAi)) &&
+-        IsAssistantPanelOpen(browser_)) {
+-      // OnEntryHidden() takes the chat out before the side panel drops it.
+-      keep_on_hide_ = true;
+-      ui.Close(SidePanelEntryHideReason::kBackgrounded,
+-               /*suppress_animations=*/true);
+-    }
+-  }
+-
+-  // A way in that shows the panel directly (the agent's tab pill, the side
+-  // panel action) opened it beside an internal page.
+-  void StepAsideIfBlocked() {
+-    SidePanelUI* ui = SidePanelUI::From(browser_);
+-    if (ui && IsAssistantBlockedHere(browser_)) {
+-      VLOG(1) << "rac assistant: opened beside an internal page, so stepping "
+-                 "aside";
+-      StepAside(*ui);
+-    }
+-  }
+-
+-  void SetOpen(bool open) {
+-    if (AssistantPanelState* state = AssistantPanelState::From(browser_)) {
+-      if (state->open() != open) {
+-        state->SetOpen(open);
+-        SchedulePaintContainer(browser_);
+-      }
+-    }
+-  }
+-
+-  // SidePanelEntryObserver:
+-  void OnEntryShown(SidePanelEntry* entry) override {
+-    keep_on_hide_ = false;
+-    SetOpen(true);
+-    // The one check every way in passes. The side panel is still finishing
+-    // the show, so the close waits for it; it can't loop, since only a web
+-    // page brings the panel back.
+-    if (IsAssistantBlockedHere(browser_)) {
+-      base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+-          FROM_HERE, base::BindOnce(&EntryRegistrar::StepAsideIfBlocked,
+-                                    weak_factory_.GetWeakPtr()));
+-    }
+-  }
+-  void OnEntryHideCancelled(SidePanelEntry* entry) override {
+-    keep_on_hide_ = false;
+-    SetOpen(true);
+-  }
+-  void OnEntryWillHide(SidePanelEntry* entry,
+-                       SidePanelEntryHideReason reason) override {
+-    SetOpen(false);
+-  }
+-  void OnEntryHidden(SidePanelEntry* entry) override {
+-    SetOpen(false);
+-    // The side panel deletes the content of an entry it closes. A chat put
+-    // aside for an internal page is taken out first, still running, so a
+-    // reply or a task in progress carries on and is there on return.
+-    if (keep_on_hide_) {
+-      keep_on_hide_ = false;
+-      if (live_view_ && live_view_->parent()) {
+-        kept_view_ = live_view_->parent()->RemoveChildViewT(live_view_.get());
+-        VLOG(1) << "rac assistant: kept the chat for later";
+-      }
++    TabChat* tab_chat = TabChat::From(tab);
++    // Chromium closed the panel on the way here, keeping the chat open on
++    // the tab the user left.
++    TabChat* partner = previous && previous != tab &&
++                               previous->GetSplit().has_value() &&
++                               previous->GetSplit() == tab->GetSplit()
++                           ? TabChat::From(previous)
++                           : nullptr;
++    const ActiveTabState state{
++        .blocked = blocked,
++        .chat_showing = ui->IsSidePanelEntryShowing(ChatKey()) &&
++                        IsAssistantPanelOpen(browser_),
++        .panel_showing = ui->IsSidePanelShowing(),
++        .stepped_aside = tab_chat && tab_chat->stepped_aside(),
++        .has_chat = tab_chat && tab_chat->has_chat(),
++        .split_partner_chat_open = partner && partner->IsOpen(),
++    };
++    switch (DecideChatMove(state)) {
++      case ChatMove::kNone:
++        break;
++      case ChatMove::kStepAside:
++        tab_chat->StepAside();
++        break;
++      case ChatMove::kComeBack:
++        VLOG(1) << "rac assistant: the chat comes back beside a web page";
++        ShowTabChat(tab, SidePanelOpenTrigger::kTabChanged,
++                    /*keep_focus=*/true, /*suppress_animations=*/true);
++        break;
++      case ChatMove::kShareWithSplit:
++        if (TabChat* split_chat = TabChat::GetOrCreate(tab)) {
++          VLOG(1) << "rac assistant: the split view shares its chat";
++          split_chat->SetConversation(partner->conversation());
++          ShowTabChat(tab, SidePanelOpenTrigger::kTabChanged,
++                      /*keep_focus=*/true, /*suppress_animations=*/true);
++        }
++        break;
+     }
+   }
+ 
+-  raw_ptr<BrowserWindowInterface> browser_;
+-  raw_ptr<SidePanelRegistry> registry_;
+-  raw_ptr<SidePanelEntry> entry_ = nullptr;
++  const raw_ptr<BrowserWindowInterface> browser_;
+   PrefChangeRegistrar pref_registrar_;
+   base::CallbackListSubscription close_subscription_;
+   // Only while AI is on.
+   std::unique_ptr<ActivePageWatch> page_watch_;
+   bool blocked_ = false;
+-  // The chat page last made for the panel, while it lives.
+-  base::WeakPtr<AssistantWebView> live_view_;
+-  // Set while closing the panel for an internal page.
+-  bool keep_on_hide_ = false;
+-  // The chat put aside for an internal page, while the panel is closed.
+-  std::unique_ptr<AssistantWebView> kept_view_;
+-  base::WeakPtrFactory<EntryRegistrar> weak_factory_{this};
++  tabs::TabHandle last_active_;
+ };
+ 
+ }  // namespace
+@@ -622,8 +1049,9 @@ void RegisterAssistantSidePanel(BrowserW
+       browser->GetType() != BrowserWindowInterface::Type::TYPE_NORMAL) {
+     return;
+   }
+-  // Owns itself; see EntryRegistrar.
+-  new EntryRegistrar(browser, registry);
++  // Owns itself; see WindowAssistant. The chats register in tabs' own
++  // registries, not in the window's `registry`.
++  new WindowAssistant(browser);
+ }
+ 
+ bool IsAssistantPanelOpen(BrowserWindowInterface* browser) {
+@@ -638,6 +1066,131 @@ base::CallbackListSubscription AddAssist
+       std::move(callback));
+ }
+ 
++void ShowAssistantForTab(tabs::TabInterface* tab, bool suppress_animations) {
++  BrowserWindowInterface* browser =
++      tab ? tab->GetBrowserWindowInterface() : nullptr;
++  if (!CanHaveAssistant(browser)) {
++    return;
++  }
++  if (!tab->IsActivated()) {
++    TabStripModel* tabs = browser->GetTabStripModel();
++    const int index = tabs ? tabs->GetIndexOfTab(tab) : TabStripModel::kNoTab;
++    if (index == TabStripModel::kNoTab) {
++      return;
++    }
++    tabs->ActivateTabAt(index);
++  }
++  // The panel never opens beside an internal page.
++  if (IsAssistantBlockedHere(browser)) {
++    return;
++  }
++  ShowTabChat(tab, SidePanelOpenTrigger::kToolbarButton, /*keep_focus=*/false,
++              suppress_animations);
++}
++
++void ToggleAssistantPanel(BrowserWindowInterface* browser) {
++  SidePanelUI* ui = SidePanelUI::From(browser);
++  if (!ui) {
++    return;
++  }
++  if (IsAssistantPanelOpen(browser)) {
++    ui->Close();
++    return;
++  }
++  ShowAssistantForTab(browser->GetActiveTabInterface(),
++                      /*suppress_animations=*/false);
++}
++
++void ShowAssistantConversationBesideTab(tabs::TabInterface* tab,
++                                        const std::string& conversation) {
++  BrowserWindowInterface* browser =
++      tab ? tab->GetBrowserWindowInterface() : nullptr;
++  if (conversation.empty() || !CanHaveAssistant(browser)) {
++    return;
++  }
++  TabChat* tab_chat = TabChat::GetOrCreate(tab);
++  // A tab with a chat of its own keeps it.
++  if (!tab_chat ||
++      (tab_chat->has_chat() && tab_chat->conversation() != conversation)) {
++    return;
++  }
++  if (!tab_chat->has_chat()) {
++    VLOG(1) << "rac assistant: the chat follows its task to another tab";
++    tab_chat->SetConversation(conversation);
++  }
++  if (!tab->IsActivated()) {
++    // Open on the tab, so it shows when the user goes there.
++    SidePanelRegistry::From(tab)->SetActiveEntry(tab_chat->entry());
++    return;
++  }
++  SidePanelUI* ui = SidePanelUI::From(browser);
++  if (ui && !ui->IsSidePanelShowing() && !IsAssistantBlockedHere(browser)) {
++    ShowTabChat(tab, SidePanelOpenTrigger::kTabChanged, /*keep_focus=*/true,
++                /*suppress_animations=*/true);
++  }
++}
++
++bool IsAssistantPanelPage(content::WebContents* page) {
++  return AssistantChat::FromPage(page) != nullptr;
++}
++
++tabs::TabInterface* GetAssistantShownTab(BrowserWindowInterface* browser) {
++  AssistantPanelState* state = AssistantPanelState::From(browser);
++  return state ? state->shown_tab() : nullptr;
++}
++
++base::CallbackListSubscription AddAssistantShownTabCallback(
++    BrowserWindowInterface* browser,
++    base::RepeatingClosure callback) {
++  return AssistantPanelState::GetOrCreate(browser)->AddShownTabCallback(
++      std::move(callback));
++}
++
++base::CallbackListSubscription AddAssistantTabLeftCallback(
++    BrowserWindowInterface* browser,
++    AssistantTabLeftCallback callback) {
++  return AssistantPanelState::GetOrCreate(browser)->AddTabLeftCallback(
++      std::move(callback));
++}
++
++std::string GetAssistantConversation(tabs::TabInterface* tab) {
++  TabChat* tab_chat = tab ? TabChat::From(tab) : nullptr;
++  return tab_chat ? tab_chat->conversation() : std::string();
++}
++
++void SetAssistantConversation(tabs::TabInterface* tab,
++                              const std::string& conversation) {
++  if (TabChat* tab_chat = tab ? TabChat::From(tab) : nullptr) {
++    tab_chat->SetConversation(conversation);
++  }
++}
++
++int CountAssistantConversationTabs(BrowserWindowInterface* browser,
++                                   const std::string& conversation) {
++  int count = 0;
++  for (tabs::TabInterface* tab : browser->GetAllTabInterfaces()) {
++    TabChat* tab_chat = TabChat::From(tab);
++    count += tab_chat && tab_chat->conversation() == conversation;
++  }
++  return count;
++}
++
++void CarryAssistantConversation(tabs::TabHandle tab, base::Value snapshot) {
++  if (TabChat* tab_chat = tab.Get() ? TabChat::From(tab.Get()) : nullptr) {
++    tab_chat->Carry(std::move(snapshot));
++  }
++}
++
++base::Value TakeCarriedAssistantConversation(tabs::TabInterface* tab) {
++  TabChat* tab_chat = tab ? TabChat::From(tab) : nullptr;
++  return tab_chat ? tab_chat->TakeCarried() : base::Value();
++}
++
++bool IsAssistantChatShowing(content::WebContents* page) {
++  AssistantChat* chat = AssistantChat::FromPage(page);
++  return chat && chat->IsShowing();
++}
++
+ bool IsAssistantBlockedHere(BrowserWindowInterface* browser) {
+   if (!IsAiEnabled(browser->GetProfile()->GetPrefs())) {
+     return false;
+@@ -668,15 +1221,15 @@ bool CanAskAssistant(BrowserWindowInterf
+ }
+ 
+ bool AskAssistant(BrowserWindowInterface* browser, std::string prompt) {
+-  SidePanelUI* ui = SidePanelUI::From(browser);
+-  if (!ui || prompt.empty() || !CanAskAssistant(browser)) {
++  if (prompt.empty() || !SidePanelUI::From(browser) ||
++      !CanAskAssistant(browser)) {
+     return false;
+   }
+-  // A panel already showing is told through the callback; one that opens now
+-  // asks for the prompt as it loads.
++  // The active tab's chat opens first. Showing already, it hears the prompt
++  // through the callback; a new one asks for it as it loads.
++  ShowAssistantForTab(browser->GetActiveTabInterface(),
++                      /*suppress_animations=*/false);
+   AssistantPanelState::GetOrCreate(browser)->SetPrompt(std::move(prompt));
+-  ui->Show(SidePanelEntryKey(SidePanelEntryId::kRacAi),
+-           SidePanelOpenTrigger::kToolbarButton);
+   return true;
+ }
+ 
+--- a/chrome/browser/ui/views/rac/ai/assistant_side_panel.h
++++ b/chrome/browser/ui/views/rac/ai/assistant_side_panel.h
+@@ -10,11 +10,17 @@
+ 
+ #include "base/callback_list.h"
+ #include "base/functional/callback_forward.h"
++#include "base/values.h"
++#include "components/tabs/public/tab_interface.h"
+ 
+ class BrowserWindowInterface;
+ class SidePanelRegistry;
+ class SkPath;
+ 
++namespace content {
++class WebContents;
++}  // namespace content
++
+ namespace gfx {
+ class Canvas;
+ }  // namespace gfx
+@@ -25,25 +31,96 @@ class View;
+ 
+ namespace rac::ai {
+ 
+-// Keeps the assistant's side panel entry in `registry` in step with the
+-// profile's "assistant on" pref: registered while on, removed (and the panel
+-// closed if it is showing) while off. Does nothing for profiles that can't
+-// have the assistant. The object it creates lives as long as the window.
++// Sets up the assistant in `browser` for profiles that can have it. The
++// chat is per tab: each tab's chat is a tab-scoped side panel entry,
++// registered in the tab's own registry the first time the assistant opens on
++// it, so `registry` (the window's) gets nothing. The object it creates lives
++// as long as the window, follows the profile's "assistant on" pref, and ends
++// the window's chats when AI turns off.
+ void RegisterAssistantSidePanel(BrowserWindowInterface* browser,
+                                 SidePanelRegistry* registry);
+ 
+-// True from the moment the assistant's panel starts opening in `browser`
++// True from the moment the active tab's chat starts opening in `browser`
+ // until it starts closing.
+ bool IsAssistantPanelOpen(BrowserWindowInterface* browser);
+ 
++// Opens `tab`'s chat in its window's side panel, making it if the tab has
++// none, and brings `tab` to the front first. Does nothing beside an internal
++// page, while AI is off, or in a window that can't have the assistant. Every
++// way in that opens the assistant calls this or ToggleAssistantPanel(): a
++// tab without a chat has no entry for SidePanelUI::Show() to find.
++void ShowAssistantForTab(tabs::TabInterface* tab, bool suppress_animations);
++
++// Closes the active tab's chat if it is open, and opens it if not.
++void ToggleAssistantPanel(BrowserWindowInterface* browser);
++
++// The conversation `conversation` follows its agent task to `tab`: from now
++// on `tab` shows it too, unless it has a chat of its own, and if `tab` is in
++// front with the side panel closed, it opens there. For the tabs the agent
++// brings forward or works in, so its cards stay in reach.
++void ShowAssistantConversationBesideTab(tabs::TabInterface* tab,
++                                        const std::string& conversation);
++
++// The window's chat page: one per window, showing one tab's conversation at
++// a time. The conversations themselves live in the page handler, keyed by
++// the ids below, and each tab says which one it shows.
++bool IsAssistantPanelPage(content::WebContents* page);
++
++// The tab the window's chat page was last shown beside, and a callback for
++// when that may have changed, or the conversation a tab shows may have: the
++// page then shows the shown tab's conversation.
++tabs::TabInterface* GetAssistantShownTab(BrowserWindowInterface* browser);
++base::CallbackListSubscription AddAssistantShownTabCallback(
++    BrowserWindowInterface* browser,
++    base::RepeatingClosure callback);
++
++// The conversation `tab` shows, or empty if the assistant never opened on it
++// or the user closed its chat. A new one gets an id when its entry first
++// shows.
++std::string GetAssistantConversation(tabs::TabInterface* tab);
++
++// `tab` shows `conversation` from now on: New chat, or a saved chat the user
++// opened. The one it showed is let go (AssistantTabLeave::kReleased).
++void SetAssistantConversation(tabs::TabInterface* tab,
++                              const std::string& conversation);
++
++// How many of `browser`'s tabs show `conversation`.
++int CountAssistantConversationTabs(BrowserWindowInterface* browser,
++                                   const std::string& conversation);
++
++// Why a tab stopped showing its conversation.
++enum class AssistantTabLeave {
++  // The user closed its chat, or the tab took another conversation.
++  kReleased,
++  // The tab closed, or AI turned off.
++  kClosed,
++  // The tab moved to another window, taking the conversation's id along.
++  kMoved,
++};
++using AssistantTabLeftCallback = base::RepeatingCallback<
++    void(tabs::TabHandle, const std::string&, AssistantTabLeave)>;
++// Runs `callback`, at once, whenever a tab in `browser` stops showing its
++// conversation. The tab may be closing.
++base::CallbackListSubscription AddAssistantTabLeftCallback(
++    BrowserWindowInterface* browser,
++    AssistantTabLeftCallback callback);
++
++// What a tab that moved to another window takes along: the conversation as
++// its old window last had it, for the new window's page to show.
++void CarryAssistantConversation(tabs::TabHandle tab, base::Value snapshot);
++base::Value TakeCarriedAssistantConversation(tabs::TabInterface* tab);
++
++// True while the side panel shows the chat in `page`.
++bool IsAssistantChatShowing(content::WebContents* page);
++
+ // True while AI is on and the address `browser`'s active tab shows is an
+ // internal page (rac::ai::IsInternalPageUrl()) other than a blank one. The
+ // assistant sits only beside web pages, so
+ // then the Chat button and the edge handle are gone, the Assistant command
+-// is disabled, AskAssistant() does nothing, and an open panel steps aside:
+-// it closes with its chat kept, and comes back, chat and all, when the
+-// window's active tab shows a web page again, unless another side panel has
+-// taken its place. Always false while AI is off.
++// is disabled, AskAssistant() does nothing, and the tab's open chat steps
++// aside: it closes with its chat kept, and comes back, chat and all, when the
++// tab shows a web page again, unless another side panel has taken its place.
++// Always false while AI is off.
+ bool IsAssistantBlockedHere(BrowserWindowInterface* browser);
+ 
+ // Runs `callback` whenever IsAssistantPanelOpen() or IsAssistantBlockedHere()
+@@ -52,8 +129,8 @@ base::CallbackListSubscription AddAssist
+     BrowserWindowInterface* browser,
+     base::RepeatingClosure callback);
+ 
+-// Opens the assistant's panel in `browser` and has it send `prompt` as a new
+-// chat about the foreground tab. Returns false, doing nothing, if the
++// Opens the foreground tab's chat in `browser` and has it send `prompt` as a
++// new chat about that tab. Returns false, doing nothing, if the
+ // assistant can't answer in this window: it is off, no provider is set up, the
+ // window is incognito, or the foreground tab is an internal page.
+ bool AskAssistant(BrowserWindowInterface* browser, std::string prompt);
+--- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
++++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+@@ -6,9 +6,12 @@
+ 
+ #include <algorithm>
+ #include <map>
++#include <optional>
+ #include <set>
+ #include <string>
++#include <string_view>
+ #include <utility>
++#include <vector>
+ 
+ #include "base/functional/bind.h"
+ #include "base/json/json_reader.h"
+@@ -19,6 +22,7 @@
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "base/uuid.h"
+ #include "chrome/browser/autocomplete/autocomplete_classifier_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/rac/agent/action_guard.h"
+@@ -27,13 +31,16 @@
+ #include "chrome/browser/rac/agent/agent_mcp_tools.h"
+ #include "chrome/browser/rac/agent/agent_ui_delegate.h"
+ #include "chrome/browser/rac/agent/mcp_tool_provider.h"
++#include "chrome/browser/rac/agent/tab_tools.h"
+ #include "chrome/browser/rac/ai/acp/acp_service.h"
+ #include "chrome/browser/rac/ai/acp/agent_recipes.h"
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/rac/ai/ai_service.h"
+ #include "chrome/browser/rac/ai/ai_service_factory.h"
++#include "chrome/browser/rac/ai/chat_placement.h"
+ #include "chrome/browser/rac/ai/chat_prompt.h"
+ #include "chrome/browser/rac/ai/chat_protocol.h"
++#include "chrome/browser/rac/ai/chat_send.h"
+ #include "chrome/browser/rac/ai/chat_session.h"
+ #include "chrome/browser/rac/ai/history_store.h"
+ #include "chrome/browser/rac/ai/internal_tab.h"
+@@ -45,8 +52,6 @@
+ #include "chrome/browser/rac/spaces/space.h"
+ #include "chrome/browser/rac/spaces/spaces_service.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+-#include "chrome/browser/ui/side_panel/side_panel_entry_id.h"
+-#include "chrome/browser/ui/side_panel/side_panel_entry_key.h"
+ #include "chrome/browser/ui/side_panel/side_panel_ui.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/views/rac/agent/agent_tab_indicator.h"
+@@ -103,6 +108,24 @@ constexpr char kSystemPrompt[] =
+     "Markdown only when it helps.";
+ 
+ constexpr char kSettingsUrl[] = "chrome://settings/assistant";
++// What a reply that outgrew its log (ReplyLog::kMaxBytes) ends with.
++constexpr char kTooLongError[] =
++    "This reply got too long, so the assistant stopped it.";
++// What a reply ends with when its tab moved to another window on the way.
++constexpr char kMovedError[] =
++    "Stopped because the tab moved to another window.";
++constexpr size_t kMaxShownTitleChars = 200;
++constexpr size_t kMaxIdChars = 100;
++constexpr size_t kMaxAttachedTitles = 16;
++// What the page hears about a reply. The log keeps them for a replay.
++constexpr char kUpdateEvent[] = "rac-ai-update";
++constexpr char kAgentEvent[] = "racAiAgentEvent";
++constexpr char kAgentUpdateEvent[] = "rac-ai-agent-update";
++constexpr char kAttachFailedEvent[] = "rac-ai-attach-failed";
++// Only in a replay: the user stopped the reply, and the user answered a
++// card. The page did both itself when they happened.
++constexpr char kStoppedEntry[] = "rac-ai-stopped";
++constexpr char kAnsweredEntry[] = "rac-ai-card-answered";
+ // What a task that a space switch stopped ends with.
+ constexpr char kSpaceSwitchedError[] =
+     "Stopped because the window switched spaces.";
+@@ -150,6 +173,83 @@ std::set<std::string> ReadOrigins(const
+   return origins;
+ }
+ 
++// Unguessable, for a conversation's key and a card's nonce.
++std::string NewToken() {
++  return base::Uuid::GenerateRandomV4().AsLowercaseString();
++}
++
++bool IsCardEvent(const base::DictValue& event) {
++  const std::string* type = event.FindString("type");
++  return type && (*type == "confirm_request" || *type == "plan_request");
++}
++
++std::string ReadShortString(const base::DictValue& dict,
++                            std::string_view key,
++                            size_t max) {
++  const std::string* text = dict.FindString(key);
++  if (!text || !base::IsStringUTF8(*text)) {
++    return std::string();
++  }
++  std::string cut;
++  base::TruncateUTF8ToByteSize(*text, max, &cut);
++  return cut;
++}
++
++// The messages the page shows for a conversation, in the form history keeps.
++// Nothing if any of them is malformed.
++std::optional<std::vector<StoredMessage>> ReadMessages(
++    const base::ListValue& list) {
++  if (list.size() > kMaxMessages) {
++    return std::nullopt;
++  }
++  std::vector<StoredMessage> messages;
++  size_t total = 0;
++  for (const base::Value& value : list) {
++    const base::DictValue* dict = value.GetIfDict();
++    const std::string* role = dict ? dict->FindString("role") : nullptr;
++    const std::string* text = dict ? dict->FindString("text") : nullptr;
++    if (!role || !text || (*role != "user" && *role != "assistant") ||
++        !base::IsStringUTF8(*text)) {
++      return std::nullopt;
++    }
++    total += text->size();
++    if (total > kMaxTotalChars) {
++      return std::nullopt;
++    }
++    StoredMessage message{*role, *text, {}};
++    if (const base::ListValue* attached = dict->FindList("attached")) {
++      for (const base::Value& title : *attached) {
++        if (title.is_string() && base::IsStringUTF8(title.GetString()) &&
++            message.attached.size() < kMaxAttachedTitles) {
++          std::string cut;
++          base::TruncateUTF8ToByteSize(title.GetString(), kMaxMenuText, &cut);
++          message.attached.push_back(std::move(cut));
++        }
++      }
++    }
++    messages.push_back(std::move(message));
++  }
++  return messages;
++}
++
++base::ListValue MessagesToPage(const std::vector<StoredMessage>& messages) {
++  base::ListValue list;
++  for (const StoredMessage& message : messages) {
++    base::DictValue dict;
++    dict.Set("role", message.role);
++    dict.Set("text", message.text);
++    if (!message.attached.empty()) {
++      base::ListValue attached;
++      for (const std::string& title : message.attached) {
++        attached.Append(title);
++      }
++      dict.Set("attached", std::move(attached));
++    }
++    list.Append(std::move(dict));
++  }
++  return list;
++}
++
+ }  // namespace
+ 
+ // Reports when the foreground tab's title or address changes.
+@@ -178,6 +278,49 @@ struct PageHandler::PendingSend {
+   std::vector<std::string> never;
+ };
+ 
++// One conversation: a tab's (shared by the tabs that show it), or a new tab
++// page's. It keeps its reply going whether or not the page shows it.
++struct PageHandler::Chat {
++  explicit Chat(std::string key) : key(std::move(key)) {}
++  Chat(const Chat&) = delete;
++  Chat& operator=(const Chat&) = delete;
++  ~Chat() = default;
++
++  const std::string key;
++  // The page's id for it, which history saves it under.
++  std::string history_id;
++  std::string title;
++  bool title_requested = false;
++  // What the page showed before the latest reply.
++  std::vector<StoredMessage> messages;
++  // The agent the latest reply went to, if any, to draw it again.
++  std::string agent_id;
++  std::string agent_name;
++  PagePromptCache page_context;
++  std::unique_ptr<ChatSession> session;
++  // Valid only while this conversation owns the controller's turn: a turn
++  // another one begins invalidates it.
++  base::WeakPtr<rac::agent::AgentController> agent_controller;
++  // The live ACP run, or 0.
++  int acp_run_id = 0;
++  int active_send_id = 0;
++  // The last reply the page was told is over.
++  int finished_send_id = 0;
++  // The send that owns the running agent turn, or 0. Only that reply shows
++  // the agent's cards.
++  int agent_turn_send_id = 0;
++  // What the page heard about the latest reply.
++  ReplyLog log;
++  // The latest reply's text, to save it if it ends in the background.
++  std::string reply_text;
++  // The latest reply hasn't ended.
++  bool reply_open = false;
++  base::WeakPtrFactory<Chat> reading_factory{this};
++  // The ACP run's callbacks. Dropped when the conversation stops its run.
++  base::WeakPtrFactory<Chat> run_factory{this};
++  base::WeakPtrFactory<Chat> weak_factory{this};
++};
++
+ // The model menu: each provider the user set up, with the models it offers.
+ struct PageHandler::ModelQuery {
+   struct Entry {
+@@ -198,7 +341,7 @@ struct PageHandler::ModelQuery {
+ PageHandler::PageHandler(Profile* profile) : profile_(profile) {}
+ 
+ PageHandler::~PageHandler() {
+-  StopSession();
++  StopAllChats();
+ }
+ 
+ void PageHandler::RegisterMessages() {
+@@ -212,6 +355,10 @@ void PageHandler::RegisterMessages() {
+       "racAiSend",
+       base::BindRepeating(&PageHandler::HandleSend, base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
++      "racAiSyncConversation",
++      base::BindRepeating(&PageHandler::HandleSyncConversation,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
+       "racAiStop",
+       base::BindRepeating(&PageHandler::HandleStop, base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
+@@ -307,8 +454,21 @@ void PageHandler::RegisterMessages() {
+ 
+ void PageHandler::OnJavascriptDisallowed() {
+   // First, while this page still hears the turn end: that is what takes the
+-  // ring and pill off the tab.
+-  StopSession();
++  // ring and pill off the tab. A reply this cuts short is drawn stopped.
++  for (auto& [key, chat] : chats_) {
++    if (std::exchange(chat->reply_open, false)) {
++      chat->log.AppendFinal(kStoppedEntry, base::Value(base::DictValue().Set(
++                                               "id", chat->active_send_id)));
++    }
++  }
++  StopAllChats();
++  if (!shown_key_.empty()) {
++    cards_.Hide(shown_key_);
++  }
++  shown_key_.clear();
++  previous_shown_key_.clear();
++  shown_subscription_ = {};
++  tab_left_subscription_ = {};
+   CloseMenu();
+   model_loaders_.clear();
+   title_session_.reset();
+@@ -322,42 +482,351 @@ void PageHandler::OnJavascriptDisallowed
+   tab_observer_.reset();
+ }
+ 
+-void PageHandler::ClaimAgentTurn(rac::agent::AgentController* controller) {
+-  // Ends the current turn while its page still owns it, so that page hears
+-  // it stop, and why, and the new turn's events reach only this page.
++void PageHandler::ClaimAgentTurn(Chat& chat,
++                                 rac::agent::AgentController* controller) {
++  // Ends the current turn while its conversation still owns it, so that
++  // conversation hears it stop, and why, and the new turn's events reach
++  // only `chat`.
+   const void* owner = agent::GetAgentRunOwner(profile_);
+-  agent::SetAgentRunHandoff(profile_, owner && owner != this);
++  agent::SetAgentRunHandoff(profile_, owner && owner != &chat);
+   controller->Cancel();
+   agent::SetAgentRunHandoff(profile_, false);
+-  agent::SetAgentRunOwner(profile_, this);
++  agent::SetAgentRunOwner(profile_, &chat);
+ }
+ 
+-void PageHandler::ClearAgentToolTurn() {
+-  if (agent::GetAgentRunOwner(profile_) == this) {
++void PageHandler::ClearAgentToolTurn(Chat& chat) {
++  if (agent::GetAgentRunOwner(profile_) == &chat) {
+     agent::SetAgentRunOwner(profile_, nullptr);
+   }
+-  agent_controller_.reset();
+-  agent_turn_send_id_ = 0;
++  chat.agent_controller.reset();
++  chat.agent_turn_send_id = 0;
+ }
+ 
+-void PageHandler::StopSession() {
+-  reading_factory_.InvalidateWeakPtrs();
+-  session_.reset();
+-  if (agent_controller_) {
+-    agent_controller_->Cancel();
+-  }
+-  ClearAgentToolTurn();
+-  if (acp_run_id_) {
++void PageHandler::StopChat(Chat& chat) {
++  chat.reading_factory.InvalidateWeakPtrs();
++  chat.session.reset();
++  if (chat.agent_controller) {
++    chat.agent_controller->Cancel();
++  }
++  ClearAgentToolTurn(chat);
++  cards_.Revoke(chat.key);
++  if (chat.acp_run_id) {
+     // The page already knows; it doesn't need to hear "Cancelled".
+-    run_factory_.InvalidateWeakPtrs();
++    chat.run_factory.InvalidateWeakPtrs();
+     if (AiService* service = AiServiceFactory::GetForProfile(profile_)) {
+       if (AcpService* acp = service->acp_service_if_created()) {
+-        acp->Stop(acp_run_id_);
++        acp->Stop(chat.acp_run_id);
++      }
++    }
++    chat.acp_run_id = 0;
++  }
++  chat.active_send_id = 0;
++}
++
++void PageHandler::StopAllChats() {
++  for (auto& [key, chat] : chats_) {
++    StopChat(*chat);
++  }
++}
++
++PageHandler::Chat* PageHandler::FindChat(const std::string& key) {
++  auto it = chats_.find(key);
++  return it == chats_.end() ? nullptr : it->second.get();
++}
++
++PageHandler::Chat* PageHandler::ShownChat() {
++  return shown_key_.empty() ? nullptr : FindChat(shown_key_);
++}
++
++PageHandler::Chat* PageHandler::OwnerChat() {
++  const void* owner = agent::GetAgentRunOwner(profile_);
++  if (!owner) {
++    return nullptr;
++  }
++  for (auto& [key, chat] : chats_) {
++    if (chat.get() == owner) {
++      return chat.get();
++    }
++  }
++  return nullptr;
++}
++
++bool PageHandler::IsPanelPage() {
++  return IsAssistantPanelPage(web_ui()->GetWebContents());
++}
++
++void PageHandler::UpdateShown(bool redraw) {
++  // A page that isn't listening yet draws on init.
++  if (!IsJavascriptAllowed() || !AiServiceFactory::GetForProfile(profile_)) {
++    return;
++  }
++  std::string key = own_key_;
++  tabs::TabInterface* tab = nullptr;
++  if (IsPanelPage()) {
++    BrowserWindowInterface* browser = GetBrowser();
++    tab = browser ? GetAssistantShownTab(browser) : nullptr;
++    key = GetAssistantConversation(tab);
++  }
++  // A tab whose chat just closed shows nothing new: the page is hidden.
++  if (key.empty() || (key == shown_key_ && !redraw)) {
++    return;
++  }
++  if (!shown_key_.empty() && shown_key_ != key) {
++    cards_.Hide(shown_key_);
++    previous_shown_key_ = shown_key_;
++  }
++  shown_key_ = key;
++  std::unique_ptr<Chat>& chat = chats_[key];
++  if (!chat) {
++    chat = std::make_unique<Chat>(key);
++    // A tab from another window brings its conversation as it was there.
++    base::Value carried = TakeCarriedAssistantConversation(tab);
++    if (const base::DictValue* dict = carried.GetIfDict()) {
++      chat->history_id = ReadShortString(*dict, "id", kMaxIdChars);
++      chat->title = ReadShortString(*dict, "title", kMaxShownTitleChars);
++      chat->title_requested = dict->FindBool("titleRequested").value_or(false);
++      if (const base::ListValue* list = dict->FindList("messages")) {
++        chat->messages =
++            ReadMessages(*list).value_or(std::vector<StoredMessage>());
++      }
++      if (dict->FindBool("stopped").value_or(false)) {
++        const std::string* partial = dict->FindString("partialReply");
++        chat->log.StartStopped(1, partial ? *partial : std::string(),
++                               kMovedError);
++        chat->reply_text = partial ? *partial : std::string();
+       }
+     }
+-    acp_run_id_ = 0;
++    VLOG(1) << "rac assistant: a new conversation (" << chats_.size()
++            << " in this page)";
++  }
++  ShowChat(*chat);
++}
++
++void PageHandler::ShowChat(Chat& chat) {
++  VLOG(1) << "rac assistant: the page shows a conversation with "
++          << chat.messages.size() << " messages and a " << chat.log.bytes()
++          << "-byte reply log";
++  FireWebUIListener("rac-ai-show", DescribeChat(chat));
++}
++
++base::DictValue PageHandler::DescribeChat(Chat& chat) {
++  base::DictValue dict;
++  dict.Set("key", chat.key);
++  dict.Set("id", chat.history_id);
++  dict.Set("title", chat.title);
++  dict.Set("titleRequested", chat.title_requested);
++  dict.Set("messages", MessagesToPage(chat.messages));
++  if (chat.log.send_id() == 0) {
++    return dict;
++  }
++  // The card the conversation waits on is drawn again with a new nonce, so
++  // a click from the copy it replaces no longer counts.
++  const std::string* pending = cards_.PendingAction(chat.key);
++  const ReplyLog::Entry* card = nullptr;
++  for (const ReplyLog::Entry& entry : chat.log.entries()) {
++    const base::DictValue* event = entry.value.GetIfDict();
++    const std::string* id =
++        pending && entry.name == kAgentEvent && event && IsCardEvent(*event)
++            ? event->FindString("id")
++            : nullptr;
++    if (id && *id == *pending) {
++      card = &entry;
++    }
++  }
++  base::ListValue events;
++  for (const ReplyLog::Entry& entry : chat.log.entries()) {
++    base::Value value = entry.value.Clone();
++    if (&entry == card) {
++      std::string nonce = NewToken();
++      if (cards_.Show(chat.key, nonce)) {
++        value.GetDict().Set("nonce", std::move(nonce));
++      }
++    }
++    events.Append(base::DictValue()
++                      .Set("name", entry.name)
++                      .Set("value", std::move(value)));
++  }
++  dict.Set("reply", base::DictValue()
++                        .Set("sendId", chat.log.send_id())
++                        .Set("open", chat.reply_open)
++                        .Set("agentId", chat.agent_id)
++                        .Set("agentName", chat.agent_name)
++                        .Set("events", std::move(events)));
++  return dict;
++}
++
++bool PageHandler::Emit(Chat& chat, const char* name, base::Value value) {
++  if (chat.log.send_id() != 0) {
++    if (chat.log.closed()) {
++      return false;
++    }
++    if (!chat.log.Append(name, value)) {
++      StopForCap(chat);
++      return false;
++    }
++  }
++  if (!IsJavascriptAllowed() || chat.key != shown_key_) {
++    return true;
++  }
++  base::DictValue& event = value.GetDict();
++  event.Set("conversation", chat.key);
++  if (std::string_view(name) == kAgentEvent && IsCardEvent(event)) {
++    const std::string* id = event.FindString("id");
++    const std::string* pending = cards_.PendingAction(chat.key);
++    std::string nonce = NewToken();
++    if (id && pending && *id == *pending && cards_.Show(chat.key, nonce)) {
++      event.Set("nonce", std::move(nonce));
++    }
++  }
++  FireWebUIListener(name, value);
++  return true;
++}
++
++void PageHandler::StopForCap(Chat& chat) {
++  const int send_id = chat.log.send_id();
++  VLOG(1) << "rac assistant: a reply filled its " << ReplyLog::kMaxBytes
++          << "-byte log, so it stops";
++  base::DictValue update;
++  update.Set("id", send_id);
++  update.Set("error", kTooLongError);
++  update.Set("stopped", true);
++  update.Set("done", true);
++  chat.log.AppendFinal(kUpdateEvent, base::Value(update.Clone()));
++  chat.finished_send_id = send_id;
++  const bool open = std::exchange(chat.reply_open, false);
++  cards_.Revoke(chat.key);
++  if (IsJavascriptAllowed() && chat.key == shown_key_) {
++    update.Set("conversation", chat.key);
++    FireWebUIListener(kUpdateEvent, update);
++  } else if (open) {
++    SaveInBackground(chat, /*failed=*/true);
++  }
++  // The reply's own callback may be what is running: stop it after.
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(
++          [](PageHandler* self, base::WeakPtr<Chat> chat, int send_id) {
++            if (chat && chat->active_send_id == send_id) {
++              self->StopChat(*chat);
++            }
++          },
++          base::Unretained(this), chat.weak_factory.GetWeakPtr(), send_id));
++}
++
++void PageHandler::SaveInBackground(Chat& chat, bool failed) {
++  AiService* service = AiServiceFactory::GetForProfile(profile_);
++  if (!service || !profile_->GetPrefs()->GetBoolean(kSaveHistory) ||
++      !IsValidConversationId(chat.history_id)) {
++    return;
++  }
++  Conversation conversation;
++  conversation.id = chat.history_id;
++  conversation.title = chat.title;
++  conversation.updated = base::Time::Now();
++  conversation.messages = chat.messages;
++  if (!failed && !chat.reply_text.empty()) {
++    conversation.messages.push_back({"assistant", chat.reply_text, {}});
++  }
++  if (!conversation.messages.empty()) {
++    service->history_store().Save(std::move(conversation));
++  }
++}
++
++void PageHandler::OnTabLeft(tabs::TabHandle tab,
++                            const std::string& key,
++                            AssistantTabLeave reason) {
++  Chat* chat = FindChat(key);
++  if (!chat) {
++    return;
++  }
++  // Another window shows the tab next, so this happens now.
++  if (reason == AssistantTabLeave::kMoved) {
++    CarryAssistantConversation(tab, CarrySnapshot(*chat));
++  }
++  // The tab may be closing: end the conversation after, if no tab of this
++  // window shows it any more.
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(
++                     [](base::WeakPtr<PageHandler> self, std::string key) {
++                       BrowserWindowInterface* browser =
++                           self ? self->GetBrowser() : nullptr;
++                       if (!self || (browser && CountAssistantConversationTabs(
++                                                    browser, key) > 0)) {
++                         return;
++                       }
++                       self->EndChat(key);
++                     },
++                     weak_factory_.GetWeakPtr(), key));
++}
++
++base::Value PageHandler::CarrySnapshot(const Chat& chat) {
++  base::DictValue snapshot;
++  snapshot.Set("id", chat.history_id);
++  snapshot.Set("title", chat.title);
++  snapshot.Set("titleRequested", chat.title_requested);
++  std::vector<StoredMessage> messages = chat.messages;
++  if (chat.reply_open) {
++    // The reply stops with the move: the new window draws what it had, and
++    // says why it ended, even before its first word.
++    snapshot.Set("stopped", true);
++    snapshot.Set("partialReply", chat.reply_text);
++  } else if (!chat.reply_text.empty()) {
++    messages.push_back({"assistant", chat.reply_text, {}});
++  }
++  snapshot.Set("messages", MessagesToPage(messages));
++  return base::Value(std::move(snapshot));
++}
++
++void PageHandler::EndChat(const std::string& key) {
++  auto it = chats_.find(key);
++  if (it == chats_.end()) {
++    return;
++  }
++  // Its reply, its ACP run, and its agent turn with any card waiting.
++  VLOG(1) << "rac assistant: a conversation ended"
++          << (OwnerChat() == it->second.get() ? ", and its agent task with it"
++                                              : "");
++  StopChat(*it->second);
++  cards_.Revoke(key);
++  if (shown_key_ == key) {
++    shown_key_.clear();
++  }
++  if (previous_shown_key_ == key) {
++    previous_shown_key_.clear();
++  }
++  chats_.erase(it);
++}
++
++void PageHandler::HandleSyncConversation(const base::ListValue& args) {
++  if (args.size() != 2u || !args[0].is_string() || !args[1].is_dict() ||
++      args[0].GetString() != shown_key_) {
++    return;
++  }
++  Chat* chat = ShownChat();
++  if (!chat) {
++    return;
++  }
++  const base::DictValue& view = args[1].GetDict();
++  const std::string id = ReadShortString(view, "id", kMaxIdChars);
++  if (id != chat->history_id) {
++    chat->page_context.Clear();
++    chat->history_id = id;
++  }
++  chat->title = ReadShortString(view, "title", kMaxShownTitleChars);
++  chat->title_requested =
++      view.FindBool("titleRequested").value_or(chat->title_requested);
++  // New chat, or a saved one opened: the page shows these messages alone.
++  const base::ListValue* list = view.FindList("messages");
++  if (list && !chat->reply_open) {
++    if (std::optional<std::vector<StoredMessage>> messages =
++            ReadMessages(*list)) {
++      chat->messages = std::move(*messages);
++      chat->log.Clear();
++      chat->reply_text.clear();
++      chat->agent_id.clear();
++      chat->agent_name.clear();
++    }
+   }
+-  active_send_id_ = 0;
+ }
+ 
+ BrowserWindowInterface* PageHandler::GetBrowser() {
+@@ -419,6 +888,14 @@ void PageHandler::OnCurrentTabChanged()
+   BrowserWindowInterface* browser = GetBrowser();
+   tabs::TabInterface* tab =
+       browser ? browser->GetActiveTabInterface() : nullptr;
++  // The chat is per tab, so the side panel just closed if the agent brought
++  // a tab of its own forward. The conversation that runs the task follows it
++  // there, in the same task, so its cards stay in reach.
++  if (tab && IsPanelPage() && agent::TabTools::IsBringingTabForward()) {
++    if (Chat* owner = OwnerChat(); owner && owner->agent_turn_send_id != 0) {
++      ShowAssistantConversationBesideTab(tab, owner->key);
++    }
++  }
+   if (tab && tab->GetContents()) {
+     tab_observer_ = std::make_unique<TabObserver>(
+         tab->GetContents(), base::BindRepeating(&PageHandler::NotifyCurrentTab,
+@@ -473,14 +950,15 @@ void PageHandler::OnActiveSpaceChanged(B
+     // A window's first space claim can come well after the window opens
+     // (half a minute or more after launch). It isn't a switch: stopping on
+     // it cancelled any task started in this window before the claim.
+-    if (previous && previous != current && agent_controller_) {
+-      // The page didn't ask for this stop, and StopSession() keeps the run's
++    Chat* owner = OwnerChat();
++    if (previous && previous != current && owner && owner->agent_controller) {
++      // The page didn't ask for this stop, and StopChat() keeps the run's
+       // own "done" from it, so say here that the reply is over. Otherwise it
+       // waits on "Thinking…" for good.
+-      const int send_id = active_send_id_;
+-      StopSession();
++      const int send_id = owner->active_send_id;
++      StopChat(*owner);
+       if (send_id) {
+-        FinishStoppedTurn(send_id, kSpaceSwitchedError);
++        FinishStoppedTurn(*owner, send_id, kSpaceSwitchedError);
+       }
+     }
+     NotifyTheme();
+@@ -554,6 +1032,23 @@ void PageHandler::HandleInit(const base:
+       service && manager && !spaces_observation_.IsObserving()) {
+     spaces_observation_.Observe(manager);
+   }
++  if (service) {
++    if (!IsPanelPage()) {
++      if (own_key_.empty()) {
++        own_key_ = NewToken();
++      }
++    } else if (browser && !shown_subscription_) {
++      shown_subscription_ = AddAssistantShownTabCallback(
++          browser, base::BindRepeating(&PageHandler::UpdateShown,
++                                       base::Unretained(this), false));
++      tab_left_subscription_ = AddAssistantTabLeftCallback(
++          browser,
++          base::BindRepeating(&PageHandler::OnTabLeft, base::Unretained(this)));
++    }
++    // The page draws its conversation before it reads `state`. Init comes
++    // again each time the page is shown, which draws nothing new.
++    UpdateShown(/*redraw=*/shown_key_.empty());
++  }
+   state.Set("theme", DescribeTheme());
+   ResolveJavascriptCallback(args[0], state);
+ }
+@@ -577,16 +1072,40 @@ void PageHandler::HandleGetTabs(const ba
+   ResolveJavascriptCallback(args[0], list);
+ }
+ 
++// args: the reply's id, the transcript, the attached tabs and files, the
++// page's id for the conversation, the conversation's key, and what the page
++// shows before the reply (to draw it again).
+ void PageHandler::HandleSend(const base::ListValue& args) {
+-  CHECK(args.size() >= 3u && args.size() <= 5u);
++  CHECK(args.size() >= 3u && args.size() <= 7u);
+   AllowJavascript();
+   const int send_id = args[0].GetInt();
+   const base::ListValue& list = args[1].GetList();
+   const base::ListValue& tab_list = args[2].GetList();
++  // The conversation on show, or the one just before it for a send that
++  // crossed a tab switch. A send for any other, or for one that has ended,
++  // goes nowhere.
++  const std::string key = args.size() >= 6u && args[5].is_string()
++                              ? args[5].GetString()
++                              : shown_key_;
++  Chat* chat =
++      MaySendTo(key, shown_key_, previous_shown_key_) ? FindChat(key) : nullptr;
++  if (!chat) {
++    VLOG(1) << "rac assistant: refused a send for a conversation not on show";
++    return;
++  }
++  // The reply starts here, so the page hears why it ends at once.
++  const auto fail = [&](std::string error) {
++    StopChat(*chat);
++    chat->active_send_id = send_id;
++    chat->log.Start(send_id);
++    chat->reply_text.clear();
++    chat->reply_open = true;
++    OnUpdate(*chat, send_id, {.error = std::move(error)});
++  };
+ 
+   AiService* service = AiServiceFactory::GetForProfile(profile_);
+   if (!service) {
+-    OnUpdate(send_id, {.error = "The assistant is turned off."});
++    fail("The assistant is turned off.");
+     return;
+   }
+ 
+@@ -595,7 +1114,7 @@ void PageHandler::HandleSend(const base:
+   send->request.system_prompt = kSystemPrompt;
+   size_t total = 0;
+   if (list.empty() || list.size() > kMaxMessages) {
+-    OnUpdate(send_id, {.error = "That conversation is too long."});
++    fail("That conversation is too long.");
+     return;
+   }
+   for (const base::Value& value : list) {
+@@ -612,7 +1131,7 @@ void PageHandler::HandleSend(const base:
+                                       *text});
+   }
+   if (total > kMaxTotalChars) {
+-    OnUpdate(send_id, {.error = "That conversation is too long."});
++    fail("That conversation is too long.");
+     return;
+   }
+   if (send->request.messages.back().role != ChatMessage::Role::kUser) {
+@@ -642,18 +1161,32 @@ void PageHandler::HandleSend(const base:
+   }
+ 
+   const std::string conversation =
+-      args.size() == 5u && args[4].is_string() ? args[4].GetString() : "";
+-  if (conversation != conversation_id_ ||
++      args.size() >= 5u && args[4].is_string() ? args[4].GetString() : "";
++  if (conversation != chat->history_id ||
+       (conversation.empty() && list.size() == 1u)) {
+-    page_context_.Clear();
+-    conversation_id_ = conversation;
++    chat->page_context.Clear();
++    chat->history_id = conversation;
+   }
+-  StopSession();
+-  active_send_id_ = send_id;
+-  ReadNextPage(std::move(send));
++  StopChat(*chat);
++  chat->active_send_id = send_id;
++  chat->log.Start(send_id);
++  chat->reply_text.clear();
++  chat->reply_open = true;
++  if (args.size() >= 7u && args[6].is_dict()) {
++    const base::DictValue& view = args[6].GetDict();
++    if (const base::ListValue* shown = view.FindList("messages")) {
++      chat->messages =
++          ReadMessages(*shown).value_or(std::vector<StoredMessage>());
++    }
++    chat->title = ReadShortString(view, "title", kMaxShownTitleChars);
++    chat->title_requested = view.FindBool("titleRequested").value_or(false);
++    chat->agent_id = ReadShortString(view, "agentId", kMaxIdChars);
++    chat->agent_name = ReadShortString(view, "agentName", kMaxShownTitleChars);
++  }
++  ReadNextPage(*chat, std::move(send));
+ }
+ 
+-void PageHandler::ReadNextPage(std::unique_ptr<PendingSend> send) {
++void PageHandler::ReadNextPage(Chat& chat, std::unique_ptr<PendingSend> send) {
+   while (!send->tab_ids.empty()) {
+     const int id = send->tab_ids.front();
+     send->tab_ids.erase(send->tab_ids.begin());
+@@ -676,14 +1209,24 @@ void PageHandler::ReadNextPage(std::uniq
+     }
+     ExtractPageText(
+         tab->GetContents(),
+-        base::BindOnce(&PageHandler::OnPageRead, reading_factory_.GetWeakPtr(),
+-                       std::move(send), title, std::move(url)));
++        base::BindOnce(
++            [](PageHandler* self, base::WeakPtr<Chat> chat,
++               std::unique_ptr<PendingSend> send, std::string title,
++               std::string url, PageTextResult result) {
++              if (chat) {
++                self->OnPageRead(*chat, std::move(send), std::move(title),
++                                 std::move(url), std::move(result));
++              }
++            },
++            base::Unretained(this), chat.reading_factory.GetWeakPtr(),
++            std::move(send), title, std::move(url)));
+     return;
+   }
+-  StartSession(std::move(send));
++  StartSession(chat, std::move(send));
+ }
+ 
+-void PageHandler::OnPageRead(std::unique_ptr<PendingSend> send,
++void PageHandler::OnPageRead(Chat& chat,
++                             std::unique_ptr<PendingSend> send,
+                              std::string title,
+                              std::string url,
+                              PageTextResult result) {
+@@ -703,17 +1246,20 @@ void PageHandler::OnPageRead(std::unique
+   } else {
+     send->failed.push_back(std::move(title));
+   }
+-  ReadNextPage(std::move(send));
++  ReadNextPage(chat, std::move(send));
+ }
+ 
+-void PageHandler::StartSession(std::unique_ptr<PendingSend> send) {
++void PageHandler::StartSession(Chat& chat, std::unique_ptr<PendingSend> send) {
+   AiService* service = AiServiceFactory::GetForProfile(profile_);
+   if (!service) {
+-    OnUpdate(send->send_id, {.error = "The assistant is turned off."});
++    OnUpdate(chat, send->send_id, {.error = "The assistant is turned off."});
+     return;
+   }
+   // A rule added during the conversation keeps its pages out from now on.
+-  for (std::string& host : page_context_.DropNeverSites(SiteRules(profile_))) {
++  // Every send of every conversation passes here before its request is
++  // built, the agent's too (StartAgentSession below).
++  for (std::string& host :
++       PrepareCacheForSend(chat.page_context, SiteRules(profile_))) {
+     send->never.push_back(std::move(host));
+   }
+   if (!send->failed.empty() || !send->never.empty()) {
+@@ -731,12 +1277,12 @@ void PageHandler::StartSession(std::uniq
+       }
+     }
+     event.Set("never", std::move(never));
+-    FireWebUIListener("rac-ai-attach-failed", event);
++    Emit(chat, kAttachFailedEvent, base::Value(std::move(event)));
+   }
+   send->request.pages = std::move(send->pages);
+   const std::string agent_id = profile_->GetPrefs()->GetString(kAgentId);
+   if (!agent_id.empty() && !profile_->IsOffTheRecord()) {
+-    StartAgentSession(std::move(send), agent_id);
++    StartAgentSession(chat, std::move(send), agent_id);
+     return;
+   }
+   const int send_id = send->send_id;
+@@ -757,13 +1303,13 @@ void PageHandler::StartSession(std::uniq
+         user_messages.push_back(message.text);
+       }
+     }
+-    ClaimAgentTurn(controller);
+-    controller->BeginTurn(browser, conversation_id_,
++    ClaimAgentTurn(chat, controller);
++    controller->BeginTurn(browser, chat.history_id,
+                           send->request.messages.back().text, user_messages,
+                           attached,
+-                          ReadOrigins(page_context_, send->request.pages));
+-    agent_controller_ = controller->GetWeakPtr();
+-    agent_turn_send_id_ = send_id;
++                          ReadOrigins(chat.page_context, send->request.pages));
++    chat.agent_controller = controller->GetWeakPtr();
++    chat.agent_turn_send_id = send_id;
+     for (auto& tool : controller->AvailableTools()) {
+       std::string schema;
+       base::JSONWriter::Write(tool.parameters, &schema);
+@@ -806,17 +1352,24 @@ void PageHandler::StartSession(std::uniq
+                   },
+                   std::move(done)));
+         },
+-        agent_controller_);
++        chat.agent_controller);
+   }
+-  session_ = std::make_unique<ChatSession>(
++  chat.session = std::make_unique<ChatSession>(
+       service, std::move(send->request),
+-      base::BindRepeating(&PageHandler::OnUpdate, weak_factory_.GetWeakPtr(),
+-                          send_id),
+-      &page_context_, std::move(tools));
+-  session_->Start();
++      base::BindRepeating(
++          [](PageHandler* self, base::WeakPtr<Chat> chat, int send_id,
++             StreamUpdate update) {
++            if (chat) {
++              self->OnUpdate(*chat, send_id, std::move(update));
++            }
++          },
++          base::Unretained(this), chat.weak_factory.GetWeakPtr(), send_id),
++      &chat.page_context, std::move(tools));
++  chat.session->Start();
+ }
+ 
+ std::unique_ptr<rac::agent::McpToolProvider> PageHandler::BeginAgentToolTurn(
++    Chat& chat,
+     const PendingSend& send,
+     int send_id) {
+   auto* controller = rac::agent::AgentController::GetOrCreate(profile_);
+@@ -841,37 +1394,37 @@ std::unique_ptr<rac::agent::McpToolProvi
+   const std::string goal = send.request.messages.empty()
+                                ? std::string()
+                                : send.request.messages.back().text;
+-  ClaimAgentTurn(controller);
+-  controller->BeginTurn(browser, conversation_id_, goal, user_messages,
+-                        attached,
+-                        ReadOrigins(page_context_, send.request.pages));
+-  agent_controller_ = controller->GetWeakPtr();
+-  agent_turn_send_id_ = send_id;
++  ClaimAgentTurn(chat, controller);
++  controller->BeginTurn(browser, chat.history_id, goal, user_messages, attached,
++                        ReadOrigins(chat.page_context, send.request.pages));
++  chat.agent_controller = controller->GetWeakPtr();
++  chat.agent_turn_send_id = send_id;
+   // The run owns these tools and ends with them. Plan, confirm, and the
+   // critic all live in AgentController::HandleToolCall, which every call
+   // goes through.
+-  return std::make_unique<rac::agent::AgentMcpTools>(agent_controller_);
++  return std::make_unique<rac::agent::AgentMcpTools>(chat.agent_controller);
+ }
+ 
+-void PageHandler::StartAgentSession(std::unique_ptr<PendingSend> send,
++void PageHandler::StartAgentSession(Chat& chat,
++                                    std::unique_ptr<PendingSend> send,
+                                     const std::string& agent_id) {
+   AiService* service = AiServiceFactory::GetForProfile(profile_);
+   if (!service || profile_->IsOffTheRecord()) {
+-    OnUpdate(send->send_id,
++    OnUpdate(chat, send->send_id,
+              {.error = profile_->IsOffTheRecord()
+                            ? "Agents are not available in Incognito."
+                            : "The assistant is turned off."});
+     return;
+   }
+   if (!FindAgentRecipe(agent_id)) {
+-    OnUpdate(send->send_id, {.error = "Unknown agent."});
++    OnUpdate(chat, send->send_id, {.error = "Unknown agent."});
+     return;
+   }
+   // Before Apply: the guard takes the user's words from the messages as the
+   // user wrote them. Apply adds page-named blocks to the last one.
+   std::unique_ptr<rac::agent::McpToolProvider> tools =
+-      BeginAgentToolTurn(*send, send->send_id);
+-  page_context_.Apply(send->request);
++      BeginAgentToolTurn(chat, *send, send->send_id);
++  chat.page_context.Apply(send->request);
+   std::string prompt =
+       BuildSystemPrompt(send->request.system_prompt, send->request.pages);
+   for (const ChatMessage& message : send->request.messages) {
+@@ -886,38 +1439,52 @@ void PageHandler::StartAgentSession(std:
+   }
+   const int send_id = send->send_id;
+   AcpService* acp = service->acp_service();
++  const base::WeakPtr<Chat> weak_chat = chat.run_factory.GetWeakPtr();
+   const AcpService::RunId run =
+       acp->Prompt(agent_id, std::move(prompt), std::move(tools),
+-                  base::BindRepeating(&PageHandler::OnUpdate,
+-                                      run_factory_.GetWeakPtr(), send_id),
+-                  base::BindRepeating(&PageHandler::OnAgentEvent,
+-                                      run_factory_.GetWeakPtr(), send_id),
++                  base::BindRepeating(
++                      [](PageHandler* self, base::WeakPtr<Chat> chat,
++                         int send_id, StreamUpdate update) {
++                        if (chat) {
++                          self->OnUpdate(*chat, send_id, std::move(update));
++                        }
++                      },
++                      base::Unretained(this), weak_chat, send_id),
++                  base::BindRepeating(
++                      [](PageHandler* self, base::WeakPtr<Chat> chat,
++                         int send_id, base::DictValue update) {
++                        if (chat) {
++                          self->OnAgentEvent(*chat, send_id, std::move(update));
++                        }
++                      },
++                      base::Unretained(this), weak_chat, send_id),
+                   base::BindOnce(
+-                      [](base::WeakPtr<PageHandler> handler, int send_id,
+-                         std::string error) {
+-                        if (!handler || handler->active_send_id_ != send_id) {
++                      [](PageHandler* self, base::WeakPtr<Chat> chat,
++                         int send_id, std::string error) {
++                        if (!chat || chat->active_send_id != send_id) {
+                           return;
+                         }
+-                        handler->acp_run_id_ = 0;
+-                        if (handler->agent_controller_) {
+-                          handler->agent_controller_->EndTurn(std::move(error));
++                        chat->acp_run_id = 0;
++                        if (chat->agent_controller) {
++                          chat->agent_controller->EndTurn(std::move(error));
+                         }
+-                        handler->ClearAgentToolTurn();
++                        self->ClearAgentToolTurn(*chat);
+                       },
+-                      run_factory_.GetWeakPtr(), send_id));
++                      base::Unretained(this), weak_chat, send_id));
+   // A run can end before Prompt returns (AI off, an unknown agent).
+-  acp_run_id_ = acp->IsRunning(run) ? run : 0;
++  chat.acp_run_id = acp->IsRunning(run) ? run : 0;
+ }
+ 
+-void PageHandler::OnAgentEvent(int send_id, base::DictValue update) {
+-  if (!IsJavascriptAllowed() ||
+-      (send_id != active_send_id_ && active_send_id_ != 0)) {
++void PageHandler::OnAgentEvent(Chat& chat,
++                               int send_id,
++                               base::DictValue update) {
++  if (send_id != chat.active_send_id && chat.active_send_id != 0) {
+     return;
+   }
+   base::DictValue event;
+   event.Set("id", send_id);
+   event.Set("update", std::move(update));
+-  FireWebUIListener("rac-ai-agent-update", event);
++  Emit(chat, kAgentUpdateEvent, base::Value(std::move(event)));
+ }
+ 
+ void PageHandler::HandleListAgents(const base::ListValue& args) {
+@@ -989,18 +1556,33 @@ void PageHandler::HandleSelectAgent(cons
+   profile_->GetPrefs()->SetString(kAgentId, id);
+ }
+ 
++// args: the conversation the user stopped.
+ void PageHandler::HandleStop(const base::ListValue& args) {
+-  StopSession();
++  Chat* chat = FindChat(
++      !args.empty() && args[0].is_string() ? args[0].GetString() : shown_key_);
++  if (!chat) {
++    return;
++  }
++  // The page stopped the reply itself; drawn again, it shows that.
++  if (std::exchange(chat->reply_open, false)) {
++    chat->log.AppendFinal(kStoppedEntry, base::Value(base::DictValue().Set(
++                                             "id", chat->active_send_id)));
++  }
++  StopChat(*chat);
+ }
+ 
+ void PageHandler::HandleAgentRespond(const base::ListValue& args) {
+-  // [callback id, card id, decision]. The reply says whether the browser took
+-  // the decision, so the page marks a card answered only when it was.
+-  if (args.size() != 3 || !args[1].is_string() || !args[2].is_string()) {
++  // [callback id, card id, decision, conversation, nonce]. The reply says
++  // whether the browser took the decision, so the page marks a card answered
++  // only when it was.
++  if (args.size() != 5 || !args[1].is_string() || !args[2].is_string() ||
++      !args[3].is_string() || !args[4].is_string()) {
+     return;
+   }
+   const std::string& id = args[1].GetString();
+   const std::string& decision = args[2].GetString();
++  const std::string& key = args[3].GetString();
++  const std::string& nonce = args[4].GetString();
+   if (id.size() > 120 ||
+       (decision != "allow" && decision != "allow_once" && decision != "deny" &&
+        decision != "stop" && decision != "confirm" && decision != "skip" &&
+@@ -1008,21 +1590,64 @@ void PageHandler::HandleAgentRespond(con
+     ResolveJavascriptCallback(args[0], base::Value(false));
+     return;
+   }
+-  VLOG(1) << "rac agent: respond id=" << id << " decision=" << decision;
++  // The answer counts only for the card on show now: the conversation the
++  // page shows, the action its card asks about, and the card's newest nonce.
++  // So a click can't reach another tab's card, or come from a copy of the
++  // card the page has drawn again since.
++  // A side panel page is off screen while its panel is closed, and then no
++  // card is on show at all.
++  const bool page_showing =
++      !IsPanelPage() || IsAssistantChatShowing(web_ui()->GetWebContents());
++  if (!cards_.Check(page_showing, shown_key_, key, id, nonce)) {
++    const std::string* pending = cards_.PendingAction(key);
++    VLOG(1) << "rac assistant: refused an answer to card " << id << ": "
++            << (!page_showing                ? "the panel is closed"
++                : key != shown_key_          ? "not the conversation on show"
++                : !pending || *pending != id ? "not the card it waits on"
++                                             : "a stale copy of the card");
++    ResolveJavascriptCallback(args[0], base::Value(false));
++    return;
++  }
++  Chat* owner = OwnerChat();
+   rac::agent::AgentController* controller =
+       rac::agent::AgentController::GetIfCreated(profile_);
+-  ResolveJavascriptCallback(
+-      args[0], base::Value(controller && controller->TryRespond(id, decision)));
++  const bool taken = owner && owner->key == key && controller &&
++                     controller->TryRespond(id, decision);
++  VLOG(1) << "rac assistant: the card " << id << " passed the checks; "
++          << decision << (taken ? " taken" : " not taken by the agent");
++  if (taken) {
++    cards_.Take(page_showing, shown_key_, key, id, nonce);
++    Emit(
++        *owner, kAnsweredEntry,
++        base::Value(base::DictValue().Set("id", id).Set("decision", decision)));
++  }
++  ResolveJavascriptCallback(args[0], base::Value(taken));
+ }
+ 
++// args: the conversation whose task the user stopped. Only that
++// conversation's own task stops.
+ void PageHandler::HandleAgentStop(const base::ListValue& args) {
++  Chat* owner = OwnerChat();
++  if (!owner || args.size() != 1u || !args[0].is_string() ||
++      !MayStopTask(args[0].GetString(), owner->key)) {
++    VLOG(1) << "rac assistant: refused a stop for another conversation";
++    return;
++  }
+   VLOG(1) << "rac agent: stop";
+   if (agent::AgentUiDelegate* delegate = agent::GetAgentUiDelegate(profile_)) {
+     delegate->Stop();
+   }
+ }
+ 
++// args: the conversation whose task the user resumed, which is on show.
+ void PageHandler::HandleAgentResume(const base::ListValue& args) {
++  Chat* owner = OwnerChat();
++  if (!owner || args.size() != 1u || !args[0].is_string() ||
++      !MayResumeTask(args[0].GetString(), owner->key, shown_key_)) {
++    VLOG(1) << "rac assistant: refused a resume for a conversation not on "
++               "show";
++    return;
++  }
+   VLOG(1) << "rac agent: resume";
+   if (agent::AgentUiDelegate* delegate = agent::GetAgentUiDelegate(profile_)) {
+     delegate->Resume();
+@@ -1044,7 +1669,17 @@ void PageHandler::HandleAgentDebugEvent(
+     ApplyDebugIndicator(*event);
+     return;
+   }
+-  FireWebUIListener("racAiAgentEvent", *event);
++  // As the agent's own would: logged for the conversation on show, and a
++  // card goes through the same checks.
++  Chat* chat = ShownChat();
++  if (!chat) {
++    return;
++  }
++  if (const std::string* id = event->FindString("id");
++      id && IsCardEvent(*event)) {
++    cards_.SetPending(chat->key, *id);
++  }
++  Emit(*chat, kAgentEvent, base::Value(std::move(*event)));
+ }
+ 
+ void PageHandler::ApplyDebugIndicator(const base::DictValue& event) {
+@@ -1071,13 +1706,22 @@ void PageHandler::ApplyDebugIndicator(co
+ 
+ void PageHandler::OnAgentTaskEvent(const base::DictValue& event) {
+   // Only the reply that owns the turn shows the agent's work.
+-  if (!IsJavascriptAllowed() || agent_turn_send_id_ == 0 ||
+-      agent_turn_send_id_ != active_send_id_ ||
+-      agent::GetAgentRunOwner(profile_) != this) {
++  Chat* chat = OwnerChat();
++  if (!chat || chat->agent_turn_send_id == 0 ||
++      chat->agent_turn_send_id != chat->active_send_id) {
+     return;
+   }
+   const std::string* type = event.FindString("type");
+   const std::string* state = event.FindString("state");
++  // The card the conversation waits on, until it is answered or the task
++  // ends. Only it can be answered.
++  if (const std::string* id = event.FindString("id");
++      id && IsCardEvent(event)) {
++    cards_.SetPending(chat->key, *id);
++  } else if (type && *type == "run_state" && state &&
++             (*state == "done" || *state == "stopped" || *state == "error")) {
++    cards_.Revoke(chat->key);
++  }
+   if (type && *type == "run_state" && state && *state == "stopped") {
+     // The task was stopped from the card, the pill or the keyboard. End the
+     // model's side of it as well.
+@@ -1087,30 +1731,33 @@ void PageHandler::OnAgentTaskEvent(const
+                              : std::string();
+     base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+         FROM_HERE, base::BindOnce(
+-                       [](base::WeakPtr<PageHandler> handler, int send_id,
+-                          std::string reason) {
+-                         if (handler && handler->active_send_id_ == send_id) {
+-                           handler->StopSession();
+-                           handler->FinishStoppedTurn(send_id,
+-                                                      std::move(reason));
++                       [](PageHandler* self, base::WeakPtr<Chat> chat,
++                          int send_id, std::string reason) {
++                         if (chat && chat->active_send_id == send_id) {
++                           self->StopChat(*chat);
++                           self->FinishStoppedTurn(*chat, send_id,
++                                                   std::move(reason));
+                          }
+                        },
+-                       weak_factory_.GetWeakPtr(), agent_turn_send_id_,
+-                       std::move(reason)));
++                       base::Unretained(this), chat->weak_factory.GetWeakPtr(),
++                       chat->agent_turn_send_id, std::move(reason)));
+   }
+   // The page drops events for a reply it has moved past, such as the
+   // "Stopped" that follows New chat.
+   base::DictValue tagged = event.Clone();
+-  tagged.Set("sendId", agent_turn_send_id_);
+-  FireWebUIListener("racAiAgentEvent", tagged);
++  tagged.Set("sendId", chat->agent_turn_send_id);
++  Emit(*chat, kAgentEvent, base::Value(std::move(tagged)));
+ }
+ 
+-void PageHandler::FinishStoppedTurn(int send_id, std::string error) {
++void PageHandler::FinishStoppedTurn(Chat& chat,
++                                    int send_id,
++                                    std::string error) {
+   // An ACP run that a newer one replaced has already said so.
+-  if (!IsJavascriptAllowed() || finished_send_id_ == send_id) {
++  if (chat.finished_send_id == send_id) {
+     return;
+   }
+-  finished_send_id_ = send_id;
++  chat.finished_send_id = send_id;
++  const bool failed = !error.empty();
+   // The page is still waiting on the reply it started. Nothing else will
+   // finish it now that the session is gone.
+   base::DictValue update;
+@@ -1122,7 +1769,10 @@ void PageHandler::FinishStoppedTurn(int
+     update.Set("stopped", true);
+   }
+   update.Set("done", true);
+-  FireWebUIListener("rac-ai-update", update);
++  Emit(chat, kUpdateEvent, base::Value(std::move(update)));
++  if (std::exchange(chat.reply_open, false) && chat.key != shown_key_) {
++    SaveInBackground(chat, failed);
++  }
+ }
+ 
+ void PageHandler::OnAgentTab(content::WebContents* contents,
+@@ -1132,10 +1782,17 @@ void PageHandler::OnAgentTab(content::We
+     agent::AgentTabIndicator::Hide(contents);
+     return;
+   }
+-  if (agent_turn_send_id_ == 0 || agent::GetAgentRunOwner(profile_) != this) {
++  Chat* owner = OwnerChat();
++  if (!owner || owner->agent_turn_send_id == 0) {
+     return;
+   }
+   agent::AgentTabIndicator::Show(contents, title);
++  // The tab the agent works in shows its conversation, so the cards are in
++  // reach there too.
++  if (IsPanelPage()) {
++    ShowAssistantConversationBesideTab(
++        tabs::TabInterface::MaybeGetFromContents(contents), owner->key);
++  }
+   agent::AgentTabIndicator::SetState(contents,
+                                      status == agent::AgentTabStatus::kWaiting
+                                          ? agent::AgentTabState::kWaiting
+@@ -1144,14 +1801,13 @@ void PageHandler::OnAgentTab(content::We
+                                          : agent::AgentTabState::kWorking);
+ }
+ 
+-void PageHandler::OnUpdate(int send_id, StreamUpdate update) {
+-  if (send_id == active_send_id_ && agent_controller_ &&
++void PageHandler::OnUpdate(Chat& chat, int send_id, StreamUpdate update) {
++  if (send_id == chat.active_send_id && chat.agent_controller &&
+       (update.done || update.error)) {
+-    agent_controller_->EndTurn(update.error.value_or(""));
+-    ClearAgentToolTurn();
++    chat.agent_controller->EndTurn(update.error.value_or(""));
++    ClearAgentToolTurn(chat);
+   }
+-  if (!IsJavascriptAllowed() ||
+-      (send_id != active_send_id_ && active_send_id_ != 0)) {
++  if (send_id != chat.active_send_id && chat.active_send_id != 0) {
+     return;
+   }
+   base::DictValue event;
+@@ -1171,15 +1827,31 @@ void PageHandler::OnUpdate(int send_id,
+   if (update.done) {
+     event.Set("done", true);
+   }
+-  if (update.done || update.error) {
+-    finished_send_id_ = send_id;
++  const bool ends = update.done || update.error.has_value();
++  if (!Emit(chat, kUpdateEvent, base::Value(std::move(event)))) {
++    return;
++  }
++  chat.reply_text += update.text_delta;
++  if (ends) {
++    chat.finished_send_id = send_id;
++    cards_.Revoke(chat.key);
++    // A reply that ends in the background is saved as the page would have.
++    if (std::exchange(chat.reply_open, false) && chat.key != shown_key_) {
++      SaveInBackground(chat, update.error.has_value());
++    }
+   }
+-  FireWebUIListener("rac-ai-update", event);
+ }
+ 
+ void PageHandler::OnEnabledChanged() {
+   if (!IsAiEnabled(profile_->GetPrefs())) {
+-    StopSession();
++    // Every conversation ends with AI.
++    StopAllChats();
++    chats_.clear();
++    cards_.Clear();
++    shown_key_.clear();
++    previous_shown_key_.clear();
++    shown_subscription_ = {};
++    tab_left_subscription_ = {};
+     title_session_.reset();
+     FinishTitle(base::Value());
+     model_loaders_.clear();
+@@ -1233,18 +1905,21 @@ void PageHandler::HandleClosePanel(const
+   if (!browser) {
+     return;
+   }
+-  // Closing without animation deletes this page, so leave its message first.
++  // Closing without animation can delete this page, so leave its message
++  // first. Only the chat on show closes: closing it is what ends it on its
++  // tab.
+   base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+-      FROM_HERE, base::BindOnce(
+-                     [](base::WeakPtr<BrowserWindowInterface> browser) {
+-                       SidePanelUI* ui =
+-                           browser ? SidePanelUI::From(browser.get()) : nullptr;
+-                       if (ui && ui->IsSidePanelEntryShowing(SidePanelEntryKey(
+-                                     SidePanelEntryId::kRacAi))) {
+-                         ui->Close();
+-                       }
+-                     },
+-                     browser->GetWeakPtr()));
++      FROM_HERE,
++      base::BindOnce(
++          [](base::WeakPtr<BrowserWindowInterface> browser,
++             base::WeakPtr<content::WebContents> page) {
++            SidePanelUI* ui =
++                browser ? SidePanelUI::From(browser.get()) : nullptr;
++            if (ui && page && IsAssistantChatShowing(page.get())) {
++              ui->Close();
++            }
++          },
++          browser->GetWeakPtr(), web_ui()->GetWebContents()->GetWeakPtr()));
+ }
+ 
+ // Only the side panel's page asks: it is the one that sends a prompt posted
+@@ -1262,14 +1937,19 @@ void PageHandler::HandleTakeAsk(const ba
+         browser,
+         base::BindRepeating(&PageHandler::OnAskPosted, base::Unretained(this)));
+   }
+-  std::optional<std::string> prompt = TakeAssistantPrompt(browser);
++  // The prompt is for the chat on show.
++  std::optional<std::string> prompt =
++      IsAssistantChatShowing(web_ui()->GetWebContents())
++          ? TakeAssistantPrompt(browser)
++          : std::nullopt;
+   ResolveJavascriptCallback(args[0],
+                             prompt ? base::Value(*prompt) : base::Value());
+ }
+ 
+ void PageHandler::OnAskPosted() {
+   BrowserWindowInterface* browser = GetBrowser();
+-  if (!IsJavascriptAllowed() || !browser) {
++  if (!IsJavascriptAllowed() || !browser ||
++      !IsAssistantChatShowing(web_ui()->GetWebContents())) {
+     return;
+   }
+   if (std::optional<std::string> prompt = TakeAssistantPrompt(browser)) {
+--- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
++++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+@@ -17,12 +17,15 @@
+ #include "base/scoped_observation.h"
+ #include "base/values.h"
+ #include "chrome/browser/rac/agent/agent_ui_delegate.h"
++#include "chrome/browser/rac/ai/card_gate.h"
+ #include "chrome/browser/rac/ai/chat_history.h"
+ #include "chrome/browser/rac/ai/chat_prompt.h"
+ #include "chrome/browser/rac/ai/chat_protocol.h"
+ #include "chrome/browser/rac/ai/page_context.h"
++#include "chrome/browser/rac/ai/reply_log.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
+ #include "components/prefs/pref_change_registrar.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/web_ui_message_handler.h"
+ 
+ class BrowserWindowInterface;
+@@ -32,10 +35,6 @@ namespace network {
+ class SimpleURLLoader;
+ }
+ 
+-namespace tabs {
+-class TabInterface;
+-}
+-
+ namespace rac::agent {
+ class AgentController;
+ class McpToolProvider;
+@@ -46,11 +45,20 @@ namespace rac::ai {
+ class ChatSession;
+ class MenuPanel;
+ struct MenuRequest;
++enum class AssistantTabLeave;
+ 
+ // Messages between the assistant page (chrome://rac-ai) and the browser. The
+ // page only ever holds text; keys and network access stay here. Page text from
+ // a tab is read here too, and only for a tab the user attached to a message
+ // they are sending.
++//
++// A window has one side panel page, and each tab with the assistant open has
++// a conversation of its own (rac::ai::GetAssistantConversation()). The
++// conversations live here, in the browser: each keeps its replies and agent
++// turn going, and logs what it sent the page about its latest reply, so the
++// page can draw it again. Only the conversation on show reaches the page; a
++// tab switch has the page draw the new tab's conversation from its log. A
++// new tab page is a page of its own with one conversation.
+ class PageHandler : public content::WebUIMessageHandler,
+                     public SpacesWindowManager::Observer {
+  public:
+@@ -71,9 +79,39 @@ class PageHandler : public content::WebU
+ 
+  private:
+   class TabObserver;
++  struct Chat;
+   struct PendingSend;
+   struct ModelQuery;
+ 
++  // The conversations.
++  Chat* FindChat(const std::string& key);
++  Chat* ShownChat();
++  // The conversation that owns the profile's agent turn, if it is one here.
++  Chat* OwnerChat();
++  // Whether this is a window's side panel page, not a new tab page.
++  bool IsPanelPage();
++  // The window's shown tab, or the conversation it shows, may have changed.
++  void UpdateShown(bool redraw);
++  // Has the page draw `chat`, its latest reply replayed from its log.
++  void ShowChat(Chat& chat);
++  base::DictValue DescribeChat(Chat& chat);
++  void OnTabLeft(tabs::TabHandle tab,
++                 const std::string& key,
++                 AssistantTabLeave reason);
++  // What a tab that moves to another window takes with it.
++  base::Value CarrySnapshot(const Chat& chat);
++  // Stops `key`'s work, takes back its card, and forgets it.
++  void EndChat(const std::string& key);
++  void StopAllChats();
++  // Logs an event about `chat`'s latest reply, and sends it to the page when
++  // `chat` is on show. False when the log is full or closed: then the event
++  // is dropped, and a full log stops the reply (StopForCap()).
++  bool Emit(Chat& chat, const char* name, base::Value value);
++  void StopForCap(Chat& chat);
++  // Saves a reply that ended while its conversation wasn't on show.
++  void SaveInBackground(Chat& chat, bool failed);
++  void HandleSyncConversation(const base::ListValue& args);
++
+   void HandleInit(const base::ListValue& args);
+   void HandleGetTabs(const base::ListValue& args);
+   void HandleSend(const base::ListValue& args);
+@@ -84,9 +122,9 @@ class PageHandler : public content::WebU
+   void HandleAgentDebugEvent(const base::ListValue& args);
+   void ApplyDebugIndicator(const base::DictValue& event);
+   void OnAgentTaskEvent(const base::DictValue& event);
+-  // Ends the page's reply `send_id` if nothing else has, with `error` when
+-  // it isn't empty.
+-  void FinishStoppedTurn(int send_id, std::string error);
++  // Ends `chat`'s reply `send_id` if nothing else has, with `error` when it
++  // isn't empty.
++  void FinishStoppedTurn(Chat& chat, int send_id, std::string error);
+   void OnAgentTab(content::WebContents* contents,
+                   rac::agent::AgentTabStatus status,
+                   const std::u16string& title);
+@@ -145,51 +183,49 @@ class PageHandler : public content::WebU
+   base::Value DescribeTheme();
+   void NotifyTheme();
+ 
+-  void ReadNextPage(std::unique_ptr<PendingSend> send);
+-  void OnPageRead(std::unique_ptr<PendingSend> send,
++  void ReadNextPage(Chat& chat, std::unique_ptr<PendingSend> send);
++  void OnPageRead(Chat& chat,
++                  std::unique_ptr<PendingSend> send,
+                   std::string title,
+                   std::string url,
+                   PageTextResult result);
+-  void StartSession(std::unique_ptr<PendingSend> send);
+-  void StartAgentSession(std::unique_ptr<PendingSend> send,
++  void StartSession(Chat& chat, std::unique_ptr<PendingSend> send);
++  void StartAgentSession(Chat& chat,
++                         std::unique_ptr<PendingSend> send,
+                          const std::string& agent_id);
+   // When browser control is on, begins an AgentController turn and returns
+   // the tools the ACP run serves over MCP. Null when the agent gets none.
+-  std::unique_ptr<rac::agent::McpToolProvider> BeginAgentToolTurn(
+-      const PendingSend& send,
+-      int send_id);
+-  // Makes this page the owner of the profile's agent turn, ending another
+-  // page's turn first while that page still owns it.
+-  void ClaimAgentTurn(rac::agent::AgentController* controller);
+-  void ClearAgentToolTurn();
+-  void OnUpdate(int send_id, StreamUpdate update);
+-  void OnAgentEvent(int send_id, base::DictValue update);
++  std::unique_ptr<rac::agent::McpToolProvider>
++  BeginAgentToolTurn(Chat& chat, const PendingSend& send, int send_id);
++  // Makes `chat` the owner of the profile's agent turn, ending another
++  // conversation's turn first while it still owns it.
++  void ClaimAgentTurn(Chat& chat, rac::agent::AgentController* controller);
++  void ClearAgentToolTurn(Chat& chat);
++  void OnUpdate(Chat& chat, int send_id, StreamUpdate update);
++  void OnAgentEvent(Chat& chat, int send_id, base::DictValue update);
+   void OnAgentsListed(base::Value callback_id, base::ListValue agents);
+   void OnEnabledChanged();
+-  // Ends only what this page started: its chat reply, its agent turn, and its
+-  // ACP run. Another page's run is left alone.
+-  void StopSession();
++  // Ends only what `chat` started: its reply, its agent turn, and its ACP
++  // run. Another conversation's run is left alone.
++  void StopChat(Chat& chat);
+ 
+   raw_ptr<Profile> profile_;
+   PrefChangeRegistrar pref_registrar_;
+-  PagePromptCache page_context_;
+-  std::string conversation_id_;
+-  std::unique_ptr<ChatSession> session_;
+-  // Valid only while this page owns the controller's turn: a turn another
+-  // page begins invalidates it.
+-  base::WeakPtr<rac::agent::AgentController> agent_controller_;
+-  // This page's live ACP run, or 0.
+-  int acp_run_id_ = 0;
+-  // The last reply the page was told is over.
+-  int finished_send_id_ = 0;
++  // By key. The side panel page's keys come from its window's tabs; a new
++  // tab page has one, `own_key_`.
++  std::map<std::string, std::unique_ptr<Chat>> chats_;
++  std::string own_key_;
++  // The conversation the page shows, or empty, and the one it showed before.
++  std::string shown_key_;
++  std::string previous_shown_key_;
++  // The approval cards the page may answer.
++  CardGate cards_;
++  base::CallbackListSubscription shown_subscription_;
++  base::CallbackListSubscription tab_left_subscription_;
+   // One loader per request, so a second menu open never cancels the first
+   // one's reply.
+   std::map<int, std::unique_ptr<network::SimpleURLLoader>> model_loaders_;
+   int next_model_loader_id_ = 0;
+-  int active_send_id_ = 0;
+-  // The send that owns the running agent turn, or 0. Only that reply shows
+-  // the agent's cards, even when other assistant pages are open.
+-  int agent_turn_send_id_ = 0;
+   // Names a finished chat. Separate from `session_`, so the next message
+   // doesn't cancel it.
+   std::unique_ptr<ChatSession> title_session_;
+@@ -206,9 +242,6 @@ class PageHandler : public content::WebU
+   std::unique_ptr<MenuPanel> menu_panel_;
+   int menu_token_ = 0;
+   base::WeakPtrFactory<PageHandler> menu_factory_{this};
+-  base::WeakPtrFactory<PageHandler> reading_factory_{this};
+-  // The ACP run's callbacks. Dropped when this page stops its own run.
+-  base::WeakPtrFactory<PageHandler> run_factory_{this};
+   base::WeakPtrFactory<PageHandler> weak_factory_{this};
+ };
+ 
+--- /dev/null
++++ b/chrome/browser/rac/ai/card_gate.cc
+@@ -0,0 +1,77 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/card_gate.h"
++
++namespace rac::ai {
++
++CardGate::CardGate() = default;
++CardGate::~CardGate() = default;
++
++void CardGate::SetPending(const std::string& conversation,
++                          const std::string& action_id) {
++  if (conversation.empty() || action_id.empty()) {
++    Revoke(conversation);
++    return;
++  }
++  cards_[conversation] = {action_id, std::string()};
++}
++
++bool CardGate::Show(const std::string& conversation, const std::string& nonce) {
++  auto it = cards_.find(conversation);
++  if (it == cards_.end() || nonce.empty()) {
++    return false;
++  }
++  it->second.nonce = nonce;
++  return true;
++}
++
++void CardGate::Hide(const std::string& conversation) {
++  if (auto it = cards_.find(conversation); it != cards_.end()) {
++    it->second.nonce.clear();
++  }
++}
++
++const std::string* CardGate::PendingAction(
++    const std::string& conversation) const {
++  auto it = cards_.find(conversation);
++  return it == cards_.end() ? nullptr : &it->second.action_id;
++}
++
++bool CardGate::Check(bool page_showing,
++                     const std::string& shown_conversation,
++                     const std::string& conversation,
++                     const std::string& action_id,
++                     const std::string& nonce) const {
++  if (!page_showing || conversation.empty() || action_id.empty() ||
++      nonce.empty() || conversation != shown_conversation) {
++    return false;
++  }
++  auto it = cards_.find(conversation);
++  return it != cards_.end() && it->second.action_id == action_id &&
++         !it->second.nonce.empty() && it->second.nonce == nonce;
++}
++
++bool CardGate::Take(bool page_showing,
++                    const std::string& shown_conversation,
++                    const std::string& conversation,
++                    const std::string& action_id,
++                    const std::string& nonce) {
++  if (!Check(page_showing, shown_conversation, conversation, action_id,
++             nonce)) {
++    return false;
++  }
++  cards_.erase(conversation);
++  return true;
++}
++
++void CardGate::Revoke(const std::string& conversation) {
++  cards_.erase(conversation);
++}
++
++void CardGate::Clear() {
++  cards_.clear();
++}
++
++}  // namespace rac::ai
+--- /dev/null
++++ b/chrome/browser/rac/ai/card_gate.h
+@@ -0,0 +1,87 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_CARD_GATE_H_
++#define CHROME_BROWSER_RAC_AI_CARD_GATE_H_
++
++#include <map>
++#include <string>
++
++namespace rac::ai {
++
++// Which agent approval card the assistant page may answer. A window has one
++// chat page, and the page shows one tab's conversation at a time, so an
++// answer names the conversation, the agent action the card asks about, and
++// the nonce the browser gave the card when it last put it on show. The
++// browser checks all three before the agent hears the answer:
++//
++// - The page must be on screen, and the conversation must be the one it
++//   shows, so after a tab switch a click never reaches another tab's card.
++// - The action must be the one the conversation waits on.
++// - The nonce must be the newest: a card drawn again (the user came back to
++//   its tab, or the page drew the conversation again) gets a new one, and a
++//   click from the copy it replaced is refused.
++//
++// A card is answered once. Ending a conversation (its last tab closed, the
++// user closed its chat, AI turned off) takes its card back.
++class CardGate {
++ public:
++  CardGate();
++  CardGate(const CardGate&) = delete;
++  CardGate& operator=(const CardGate&) = delete;
++  ~CardGate();
++
++  // `conversation` waits on the card for `action_id`, in place of any card
++  // it had. It has no nonce until it is shown.
++  void SetPending(const std::string& conversation,
++                  const std::string& action_id);
++
++  // The page shows `conversation`'s card, with `nonce`. Every earlier nonce
++  // stops working. False, changing nothing, if it has no card.
++  bool Show(const std::string& conversation, const std::string& nonce);
++
++  // The page no longer shows `conversation`: no answer counts until its card
++  // is shown again.
++  void Hide(const std::string& conversation);
++
++  // The action `conversation` waits on, or null.
++  const std::string* PendingAction(const std::string& conversation) const;
++
++  // True if an answer naming `conversation`, `action_id` and `nonce` is for
++  // the card on show now, while the page shows `shown_conversation` and is
++  // itself on screen (`page_showing`: a side panel page is hidden while its
++  // panel is closed, and then no card is on show). Never true for an empty
++  // field.
++  bool Check(bool page_showing,
++             const std::string& shown_conversation,
++             const std::string& conversation,
++             const std::string& action_id,
++             const std::string& nonce) const;
++
++  // Check(), and on success the card is used up.
++  bool Take(bool page_showing,
++            const std::string& shown_conversation,
++            const std::string& conversation,
++            const std::string& action_id,
++            const std::string& nonce);
++
++  // Takes back `conversation`'s card.
++  void Revoke(const std::string& conversation);
++
++  // Takes back every card.
++  void Clear();
++
++ private:
++  struct Card {
++    std::string action_id;
++    // Empty while the card isn't on show.
++    std::string nonce;
++  };
++  // At most one card per conversation: an agent turn waits on one at a time.
++  std::map<std::string, Card> cards_;
++};
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_CARD_GATE_H_
+--- /dev/null
++++ b/chrome/browser/rac/ai/card_gate_unittest.cc
+@@ -0,0 +1,112 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/card_gate.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::ai {
++namespace {
++
++// Tab A's conversation waits on card "c1", shown with nonce "n1".
++class RacAiCardGateTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    gate_.SetPending("A", "c1");
++    ASSERT_TRUE(gate_.Show("A", "n1"));
++  }
++
++  CardGate gate_;
++};
++
++TEST_F(RacAiCardGateTest, TakesTheAnswerForTheCardOnShow) {
++  EXPECT_TRUE(gate_.Check(true, "A", "A", "c1", "n1"));
++  EXPECT_TRUE(gate_.Take(true, "A", "A", "c1", "n1"));
++}
++
++// 1. The answer is bound to the conversation and to the action.
++TEST_F(RacAiCardGateTest, NeedsTheConversationAndTheAction) {
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c2", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "A", "B", "c1", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "A", "", "c1", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c1", ""));
++  // None of them used the card up.
++  EXPECT_TRUE(gate_.Take(true, "A", "A", "c1", "n1"));
++}
++
++// 2. After a switch to tab B, a click left over from A's card, or one that
++// names A's action from B, does nothing.
++TEST_F(RacAiCardGateTest, ATabSwitchStopsTheOtherTabsCard) {
++  gate_.SetPending("B", "c9");
++  ASSERT_TRUE(gate_.Show("B", "n9"));
++  gate_.Hide("A");
++  EXPECT_FALSE(gate_.Take(true, "B", "A", "c1", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "B", "B", "c1", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "B", "B", "c1", "n9"));
++  EXPECT_TRUE(gate_.Take(true, "B", "B", "c9", "n9"));
++  // Back on A, its card counts only once it is drawn again.
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c1", "n1"));
++  ASSERT_TRUE(gate_.Show("A", "n2"));
++  EXPECT_TRUE(gate_.Take(true, "A", "A", "c1", "n2"));
++}
++
++TEST_F(RacAiCardGateTest, AHiddenCardTakesNoAnswer) {
++  // The panel closed on a tab with no chat of its own: the page still shows
++  // A's card, off screen. The handler passes whether the page is showing.
++  EXPECT_FALSE(gate_.Check(false, "A", "A", "c1", "n1"));
++  EXPECT_FALSE(gate_.Take(false, "A", "A", "c1", "n1"));
++  // The card isn't used up: on screen again, it answers.
++  EXPECT_TRUE(gate_.Check(true, "A", "A", "c1", "n1"));
++  gate_.Hide("A");
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c1", "n1"));
++}
++
++// 3. A card drawn again gets a new nonce; the copy it replaced is stale.
++TEST_F(RacAiCardGateTest, AReplacedCardsClickIsStale) {
++  ASSERT_TRUE(gate_.Show("A", "n2"));
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c1", "n1"));
++  EXPECT_TRUE(gate_.Take(true, "A", "A", "c1", "n2"));
++}
++
++TEST_F(RacAiCardGateTest, ANewCardReplacesTheOld) {
++  gate_.SetPending("A", "c2");
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c2", "n1"));
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c1", "n1"));
++  ASSERT_TRUE(gate_.Show("A", "n3"));
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c1", "n3"));
++  EXPECT_TRUE(gate_.Take(true, "A", "A", "c2", "n3"));
++}
++
++TEST_F(RacAiCardGateTest, ACardIsAnsweredOnce) {
++  ASSERT_TRUE(gate_.Take(true, "A", "A", "c1", "n1"));
++  EXPECT_FALSE(gate_.Check(true, "A", "A", "c1", "n1"));
++  EXPECT_EQ(gate_.PendingAction("A"), nullptr);
++  EXPECT_FALSE(gate_.Show("A", "n2"));
++}
++
++// 4. Closing the conversation's tab (or its chat) takes its card back.
++TEST_F(RacAiCardGateTest, EndingTheConversationTakesItsCardBack) {
++  gate_.SetPending("B", "c9");
++  ASSERT_TRUE(gate_.Show("B", "n9"));
++  gate_.Revoke("A");
++  EXPECT_EQ(gate_.PendingAction("A"), nullptr);
++  EXPECT_FALSE(gate_.Take(true, "A", "A", "c1", "n1"));
++  EXPECT_FALSE(gate_.Show("A", "n2"));
++  // Another tab's card is untouched.
++  EXPECT_TRUE(gate_.Check(true, "B", "B", "c9", "n9"));
++  gate_.Clear();
++  EXPECT_FALSE(gate_.Check(true, "B", "B", "c9", "n9"));
++}
++
++TEST_F(RacAiCardGateTest, PendingActionNamesTheCard) {
++  ASSERT_NE(gate_.PendingAction("A"), nullptr);
++  EXPECT_EQ(*gate_.PendingAction("A"), "c1");
++  EXPECT_EQ(gate_.PendingAction("B"), nullptr);
++  gate_.SetPending("A", "");
++  EXPECT_EQ(gate_.PendingAction("A"), nullptr);
++}
++
++}  // namespace
++}  // namespace rac::ai
+--- /dev/null
++++ b/chrome/browser/rac/ai/reply_log.cc
+@@ -0,0 +1,101 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/reply_log.h"
++
++#include <optional>
++#include <utility>
++
++#include "base/json/json_writer.h"
++
++namespace rac::ai {
++
++namespace {
++constexpr char kUpdate[] = "rac-ai-update";
++}  // namespace
++
++ReplyLog::ReplyLog() = default;
++ReplyLog::~ReplyLog() = default;
++
++void ReplyLog::Start(int send_id) {
++  Clear();
++  send_id_ = send_id;
++}
++
++void ReplyLog::Clear() {
++  send_id_ = 0;
++  bytes_ = 0;
++  closed_ = false;
++  entries_.clear();
++}
++
++// static
++size_t ReplyLog::SizeOf(const base::Value& value) {
++  std::string json;
++  base::JSONWriter::Write(value, &json);
++  // The listener name and the entry itself, roughly.
++  return json.size() + 32;
++}
++
++bool ReplyLog::IsText(const std::string& name, const base::Value& value) const {
++  const base::DictValue* dict = value.GetIfDict();
++  if (name != kUpdate || !dict || dict->size() != 2u) {
++    return false;
++  }
++  const std::optional<int> id = dict->FindInt("id");
++  return id && *id == send_id_ && dict->FindString("delta");
++}
++
++bool ReplyLog::Append(const std::string& name, const base::Value& value) {
++  if (send_id_ == 0 || closed_) {
++    return false;
++  }
++  if (IsText(name, value) && !entries_.empty() &&
++      IsText(entries_.back().name, entries_.back().value)) {
++    const std::string& delta = *value.GetDict().FindString("delta");
++    if (bytes_ + delta.size() > kMaxBytes) {
++      closed_ = true;
++      return false;
++    }
++    std::string* joined = entries_.back().value.GetDict().FindString("delta");
++    joined->append(delta);
++    bytes_ += delta.size();
++    return true;
++  }
++  const size_t size = SizeOf(value);
++  if (bytes_ + size > kMaxBytes) {
++    closed_ = true;
++    return false;
++  }
++  entries_.push_back({name, value.Clone()});
++  bytes_ += size;
++  return true;
++}
++
++void ReplyLog::StartStopped(int send_id,
++                            const std::string& text,
++                            const std::string& reason) {
++  Start(send_id);
++  if (!text.empty()) {
++    Append(
++        kUpdate,
++        base::Value(base::DictValue().Set("id", send_id).Set("delta", text)));
++  }
++  AppendFinal(kUpdate, base::Value(base::DictValue()
++                                       .Set("id", send_id)
++                                       .Set("error", reason)
++                                       .Set("stopped", true)
++                                       .Set("done", true)));
++}
++
++void ReplyLog::AppendFinal(const std::string& name, const base::Value& value) {
++  if (send_id_ == 0) {
++    return;
++  }
++  entries_.push_back({name, value.Clone()});
++  bytes_ += SizeOf(value);
++  closed_ = true;
++}
++
++}  // namespace rac::ai
+--- /dev/null
++++ b/chrome/browser/rac/ai/reply_log.h
+@@ -0,0 +1,79 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_REPLY_LOG_H_
++#define CHROME_BROWSER_RAC_AI_REPLY_LOG_H_
++
++#include <cstddef>
++#include <string>
++#include <vector>
++
++#include "base/values.h"
++
++namespace rac::ai {
++
++// What the browser sent the assistant page about one reply, kept so the
++// page can draw the reply again: its tab was in the background while the
++// reply went on, or the user left and came back. One per conversation, for
++// its latest reply. Text arrives a few words at a time, and consecutive text
++// for the same reply is joined into one entry, so the log grows with the
++// reply, not with the number of updates.
++class ReplyLog {
++ public:
++  // The most a log holds, counted as its events' text and JSON sizes. A
++  // reply that would pass it is stopped (the caller's job) and ends with
++  // AppendFinal(), so a background reply can't grow without bound.
++  static constexpr size_t kMaxBytes = 512 * 1024;
++
++  struct Entry {
++    // The WebUI listener the event went to.
++    std::string name;
++    base::Value value;
++  };
++
++  ReplyLog();
++  ReplyLog(const ReplyLog&) = delete;
++  ReplyLog& operator=(const ReplyLog&) = delete;
++  ~ReplyLog();
++
++  // Forgets the last reply and starts one for `send_id`.
++  void Start(int send_id);
++  void Clear();
++
++  int send_id() const { return send_id_; }
++  bool empty() const { return entries_.empty(); }
++  size_t bytes() const { return bytes_; }
++  const std::vector<Entry>& entries() const { return entries_; }
++
++  // Adds an event of the current reply. False, keeping nothing, when it
++  // would take the log past kMaxBytes, or when no reply was started.
++  bool Append(const std::string& name, const base::Value& value);
++
++  // Adds the reply's last event even at the cap. Later events are refused.
++  void AppendFinal(const std::string& name, const base::Value& value);
++
++  // Starts the log for `send_id` as a reply that was cut short: its text so
++  // far, if any, then a browser stop with `reason`. For a conversation that
++  // came from another window, whose reply stopped on the way.
++  void StartStopped(int send_id,
++                    const std::string& text,
++                    const std::string& reason);
++
++  // True once the log refused an event or took its final one.
++  bool closed() const { return closed_; }
++
++ private:
++  static size_t SizeOf(const base::Value& value);
++  // A text-only update ({id, delta}) for the current reply.
++  bool IsText(const std::string& name, const base::Value& value) const;
++
++  int send_id_ = 0;
++  size_t bytes_ = 0;
++  bool closed_ = false;
++  std::vector<Entry> entries_;
++};
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_REPLY_LOG_H_
+--- /dev/null
++++ b/chrome/browser/rac/ai/reply_log_unittest.cc
+@@ -0,0 +1,139 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/reply_log.h"
++
++#include <string>
++
++#include "base/values.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::ai {
++namespace {
++
++base::Value Delta(int id, std::string text) {
++  return base::Value(
++      base::DictValue().Set("id", id).Set("delta", std::move(text)));
++}
++
++TEST(RacAiReplyLogTest, TextForOneReplyIsJoined) {
++  ReplyLog log;
++  log.Start(7);
++  EXPECT_TRUE(log.Append("rac-ai-update", Delta(7, "Apples ")));
++  EXPECT_TRUE(log.Append("rac-ai-update", Delta(7, "grow ")));
++  EXPECT_TRUE(log.Append("rac-ai-update", Delta(7, "on trees.")));
++  ASSERT_EQ(log.entries().size(), 1u);
++  EXPECT_EQ(*log.entries()[0].value.GetDict().FindString("delta"),
++            "Apples grow on trees.");
++}
++
++TEST(RacAiReplyLogTest, OtherEventsKeepTheirOrder) {
++  ReplyLog log;
++  log.Start(7);
++  log.Append("rac-ai-update", Delta(7, "One "));
++  log.Append("racAiAgentEvent",
++             base::Value(base::DictValue().Set("type", "step_started")));
++  log.Append("rac-ai-update", Delta(7, "two"));
++  log.Append("rac-ai-update",
++             base::Value(base::DictValue().Set("id", 7).Set("done", true)));
++  ASSERT_EQ(log.entries().size(), 4u);
++  EXPECT_EQ(log.entries()[1].name, "racAiAgentEvent");
++  EXPECT_EQ(*log.entries()[2].value.GetDict().FindString("delta"), "two");
++  EXPECT_TRUE(log.entries()[3].value.GetDict().FindBool("done").value());
++}
++
++TEST(RacAiReplyLogTest, AnotherRepliesTextIsNotJoined) {
++  ReplyLog log;
++  log.Start(7);
++  log.Append("rac-ai-update", Delta(7, "mine"));
++  log.Append("rac-ai-update", Delta(6, "an older reply's"));
++  EXPECT_EQ(log.entries().size(), 2u);
++}
++
++TEST(RacAiReplyLogTest, NothingIsKeptWithoutAReply) {
++  ReplyLog log;
++  EXPECT_FALSE(log.Append("rac-ai-update", Delta(1, "lost")));
++  EXPECT_TRUE(log.empty());
++}
++
++TEST(RacAiReplyLogTest, StartingAReplyForgetsTheLast) {
++  ReplyLog log;
++  log.Start(1);
++  log.Append("rac-ai-update", Delta(1, "old"));
++  log.Start(2);
++  EXPECT_TRUE(log.empty());
++  EXPECT_EQ(log.send_id(), 2);
++  EXPECT_EQ(log.bytes(), 0u);
++}
++
++TEST(RacAiReplyLogTest, TheCapStopsGrowthAndKeepsTheTranscriptWhole) {
++  ReplyLog log;
++  log.Start(3);
++  const std::string chunk(4096, 'a');
++  size_t appended = 0;
++  while (log.Append("rac-ai-update", Delta(3, chunk))) {
++    ++appended;
++    ASSERT_LT(appended, 1000u);
++  }
++  EXPECT_TRUE(log.closed());
++  EXPECT_LE(log.bytes(), ReplyLog::kMaxBytes);
++  // The refused chunk left no partial text behind: the reply is whole
++  // chunks only.
++  const std::string& text =
++      *log.entries().back().value.GetDict().FindString("delta");
++  EXPECT_EQ(text.size(), appended * chunk.size());
++  // Nothing more gets in, text or not.
++  EXPECT_FALSE(log.Append("rac-ai-update", Delta(3, "x")));
++  EXPECT_FALSE(log.Append("racAiAgentEvent", base::Value(base::DictValue())));
++  // The reply still ends, with the browser's reason.
++  log.AppendFinal("rac-ai-update", base::Value(base::DictValue()
++                                                   .Set("id", 3)
++                                                   .Set("error", "too long")
++                                                   .Set("stopped", true)
++                                                   .Set("done", true)));
++  EXPECT_TRUE(log.entries().back().value.GetDict().FindBool("done").value());
++  EXPECT_FALSE(log.Append("rac-ai-update", Delta(3, "after")));
++}
++
++// A reply cut short by its tab moving draws as its text, then the stop.
++TEST(RacAiReplyLogTest, AStoppedReplyKeepsItsTextAndSaysWhy) {
++  ReplyLog log;
++  log.StartStopped(1, "Apples grow", "Stopped because the tab moved.");
++  ASSERT_EQ(log.entries().size(), 2u);
++  EXPECT_EQ(log.send_id(), 1);
++  EXPECT_EQ(*log.entries()[0].value.GetDict().FindString("delta"),
++            "Apples grow");
++  const base::DictValue& end = log.entries()[1].value.GetDict();
++  EXPECT_EQ(*end.FindString("error"), "Stopped because the tab moved.");
++  EXPECT_TRUE(end.FindBool("stopped").value());
++  EXPECT_TRUE(end.FindBool("done").value());
++  EXPECT_TRUE(log.closed());
++}
++
++// A reply with no text yet still says it stopped.
++TEST(RacAiReplyLogTest, AStoppedReplyWithNoTextStillSaysWhy) {
++  ReplyLog log;
++  log.StartStopped(1, "", "Stopped because the tab moved.");
++  ASSERT_EQ(log.entries().size(), 1u);
++  EXPECT_EQ(*log.entries()[0].value.GetDict().FindString("error"),
++            "Stopped because the tab moved.");
++}
++
++TEST(RacAiReplyLogTest, ManySmallEventsHitTheCapToo) {
++  ReplyLog log;
++  log.Start(3);
++  base::DictValue event;
++  event.Set("type", "step_finished");
++  event.Set("result", std::string(1000, 'r'));
++  size_t appended = 0;
++  while (log.Append("racAiAgentEvent", base::Value(event.Clone()))) {
++    ++appended;
++    ASSERT_LT(appended, 10000u);
++  }
++  EXPECT_GT(appended, 100u);
++  EXPECT_LE(log.bytes(), ReplyLog::kMaxBytes);
++}
++
++}  // namespace
++}  // namespace rac::ai
+--- a/chrome/browser/resources/rac_ai/app.ts
++++ b/chrome/browser/resources/rac_ai/app.ts
+@@ -57,6 +57,7 @@ interface AgentInfo {
+ interface AgentUpdateEvent {
+   id: number;
+   update: Record<string, unknown>;
++  conversation?: string;
+ }
+ 
+ // The stops of the window's space, as "#rrggbb".
+@@ -75,6 +76,32 @@ interface UpdateEvent {
+   // browser sets this, so a provider's text can't pass for a stop.
+   stopped?: boolean;
+   notice?: string;
++  conversation?: string;
++}
++
++interface AttachFailedEvent {
++  id: number;
++  failed: string[];
++  never?: string[];
++  conversation?: string;
++}
++
++// A conversation the browser has the page show: a tab's, as it was when the
++// page last showed it, with its latest reply as the events the page heard
++// (or would have heard) about it.
++interface ShownConversation {
++  key: string;
++  id: string;
++  title: string;
++  titleRequested: boolean;
++  messages: StoredMessage[];
++  reply?: {
++    sendId: number,
++    open: boolean,
++    agentId: string,
++    agentName: string,
++    events: Array<{name: string, value: unknown}>,
++  };
+ }
+ 
+ interface StoredMessage {
+@@ -208,6 +235,17 @@ let currentTab: TabInfo|null = null;
+ const extraTabs: TabInfo[] = [];
+ const files: FileAttachment[] = [];
+ let conversationId: string = crypto.randomUUID();
++// The browser's key for the conversation on show: in the side panel, the
++// one of the tab the panel sits beside. Every message about it names it, and
++// events about any other conversation are dropped.
++let shownKey = '';
++// While a conversation is drawn again from what the browser kept, the page
++// sends nothing back: the browser has already saved, named and stopped it.
++let replaying = false;
++// Each conversation's unsent text, while this page lives.
++const drafts = new Map<string, string>();
++// The nonce the browser gave each card it put on show. An answer carries it.
++const cardNonces = new Map<string, string>();
+ let chatTitle = '';
+ let titleRequested = false;
+ let saveHistory = true;
+@@ -1342,7 +1380,16 @@ function applyToolFields(step: Step, upd
+   }
+ }
+ 
++// An event about a conversation that isn't the one on show.
++function fromOtherConversation(event: unknown): boolean {
++  const conversation = (event as {conversation?: unknown} | null)?.conversation;
++  return typeof conversation === 'string' && conversation !== shownKey;
++}
++
+ function onAgentUpdate(event: AgentUpdateEvent) {
++  if (fromOtherConversation(event)) {
++    return;
++  }
+   const message = lastAssistant();
+   if (event.id !== activeId || !message?.agent) {
+     return;
+@@ -1406,6 +1453,9 @@ function onAgentUpdate(event: AgentUpdat
+ // they belong to the reply that is running.
+ 
+ function announce(text: string, assertive: boolean) {
++  if (replaying) {
++    return;
++  }
+   const region = getRequiredElement(assertive ? 'agentAlert' : 'agentPolite');
+   region.textContent = '';
+   requestAnimationFrame(() => {
+@@ -1472,14 +1522,19 @@ function settleTask(message: Message) {
+ function onAgentEvent(raw: unknown) {
+   // Events from a reply this page has moved past (New chat, Stop) would
+   // otherwise start a ghost reply.
+-  const sendId = (raw as {sendId?: unknown} | null)?.sendId;
+-  if (typeof sendId === 'number' && sendId !== activeId) {
++  const tags = (raw ?? {}) as {sendId?: unknown, nonce?: unknown, id?: unknown};
++  if (fromOtherConversation(raw) ||
++      (typeof tags.sendId === 'number' && tags.sendId !== activeId)) {
+     return;
+   }
+   const event = parseAgentEvent(raw);
+   if (!event) {
+     return;
+   }
++  // A card can be answered only with the nonce it came with.
++  if (typeof tags.nonce === 'string' && typeof tags.id === 'string') {
++    cardNonces.set(tags.id, tags.nonce);
++  }
+   const starts = event.type === 'step_started' ||
+       event.type === 'step_finished' || event.type === 'plan_request' ||
+       event.type === 'confirm_request';
+@@ -1513,11 +1568,14 @@ async function respondToAgent(id: string
+   // The browser ignores an answer to a card it has moved past, or one that a
+   // navigation outran. Then the card stays as it is; the events that moved
+   // the browser on are what update it.
+-  const taken =
+-      await sendWithPromise<boolean>('racAiAgentRespond', id, decision);
++  // The browser takes it only for the card on show: this conversation, this
++  // card, and the copy of the card drawn last.
++  const taken = await sendWithPromise<boolean>(
++      'racAiAgentRespond', id, decision, shownKey, cardNonces.get(id) ?? '');
+   if (!taken) {
+     return;
+   }
++  cardNonces.delete(id);
+   const message = lastAssistant();
+   if (!message?.task) {
+     return;
+@@ -1530,7 +1588,7 @@ async function respondToAgent(id: string
+ }
+ 
+ function resumeAgent() {
+-  sendToBrowser('racAiAgentResume');
++  sendToBrowser('racAiAgentResume', [shownKey]);
+   const message = lastAssistant();
+   if (message?.task?.state === 'paused') {
+     message.task.state = 'working';
+@@ -1984,6 +2042,7 @@ async function openHistory() {
+         sendToBrowser('racAiHistoryDelete', [id]);
+         if (id === conversationId) {
+           conversationId = crypto.randomUUID();
++          syncView(false);
+         }
+       });
+ }
+@@ -2345,6 +2404,15 @@ function transcript() {
+ function startReply(question: Message) {
+   activeId++;
+   streaming = true;
++  // What the browser draws again, before this reply, if the user leaves the
++  // tab and comes back.
++  const view = {
++    title: chatTitle,
++    titleRequested,
++    messages: storedMessages(),
++    agentId: agentId && !incognito ? agentId : '',
++    agentName: agentId && !incognito ? agentName || agentId : '',
++  };
+   const reply: Message = {role: 'assistant', text: ''};
+   if (agentId && !incognito) {
+     reply.agent = newRun(agentId, agentName || agentId);
+@@ -2358,6 +2426,8 @@ function startReply(question: Message) {
+     question.tabIds ?? [],
+     (question.files ?? []).map(f => ({name: f.name, text: f.text})),
+     conversationId,
++    shownKey,
++    view,
+   ]);
+   render();
+ }
+@@ -2436,11 +2506,21 @@ function stop() {
+     return;
+   }
+   if (task && isActive(task)) {
+-    sendToBrowser('racAiAgentStop');
++    sendToBrowser('racAiAgentStop', [shownKey]);
++  }
++  sendToBrowser('racAiStop', [shownKey]);
++  markStopped();
++  saveConversation();
++  render();
++}
++
++// The reply on show ends where it is: the user stopped it.
++function markStopped() {
++  const task = lastAssistant()?.task;
++  if (task && isActive(task)) {
+     task.state = 'stopped';
+     finish(task);
+   }
+-  sendToBrowser('racAiStop');
+   streaming = false;
+   // The reply it was in the middle of ends as "Cancelled". Leave that
+   // unheard.
+@@ -2455,20 +2535,25 @@ function stop() {
+       messages.pop();
+     }
+   }
+-  saveConversation();
+-  render();
+ }
+ 
+ function resetChat() {
+   if (isActive(lastAssistant()?.task)) {
+-    sendToBrowser('racAiAgentStop');
++    sendToBrowser('racAiAgentStop', [shownKey]);
+   }
+   if (streaming) {
+-    sendToBrowser('racAiStop');
++    sendToBrowser('racAiStop', [shownKey]);
+     streaming = false;
+     saveConversation();
+   }
++  clearThread();
++  syncView(true);
++}
++
++// Empties the page for another conversation, telling the browser nothing.
++function clearThread() {
+   activeId++;
++  streaming = false;
+   messages.forEach(endRun);
+   messages.length = 0;
+   bubbleObserver.disconnect();
+@@ -2482,6 +2567,7 @@ function resetChat() {
+   titleRequested = false;
+   manualMode = null;
+   intent = {mode: 'search', url: false};
++  cardNonces.clear();
+   closeMenus();
+   renderChips();
+ }
+@@ -2496,8 +2582,8 @@ function newChat() {
+ function requestTitle() {
+   const question = messages[0];
+   const answer = messages[1];
+-  if (titleRequested || !question || question.role !== 'user' || !answer ||
+-      !answer.text || answer.error) {
++  if (replaying || titleRequested || !question || question.role !== 'user' ||
++      !answer || !answer.text || answer.error) {
+     return;
+   }
+   titleRequested = true;
+@@ -2508,23 +2594,45 @@ function requestTitle() {
+           chatTitle = title;
+           updateTitle();
+           saveConversation();
++          syncView(false);
+         }
+       });
+   updateTitle();
+ }
+ 
++function storedMessages(): StoredMessage[] {
++  return messages.filter(m => (m.text && !m.error) || m.closed).map(m => {
++    const entry: StoredMessage = {role: m.role, text: m.text};
++    if (m.attached && m.attached.length > 0) {
++      entry.attached = m.attached;
++    }
++    return entry;
++  });
++}
++
++// Tells the browser what the page shows for the conversation, so drawing it
++// again (back from another tab) matches. With the messages when they no
++// longer follow from the browser's log: New chat, or a saved chat opened.
++function syncView(withMessages: boolean) {
++  if (replaying || !shownKey) {
++    return;
++  }
++  const view: Record<string, unknown> = {
++    id: conversationId,
++    title: chatTitle,
++    titleRequested
++  };
++  if (withMessages) {
++    view['messages'] = storedMessages();
++  }
++  sendToBrowser('racAiSyncConversation', [shownKey, view]);
++}
++
+ function saveConversation() {
+-  if (!saveHistory) {
++  if (!saveHistory || replaying) {
+     return;
+   }
+-  const stored: StoredMessage[] =
+-      messages.filter(m => (m.text && !m.error) || m.closed).map(m => {
+-        const entry: StoredMessage = {role: m.role, text: m.text};
+-        if (m.attached && m.attached.length > 0) {
+-          entry.attached = m.attached;
+-        }
+-        return entry;
+-      });
++  const stored = storedMessages();
+   // Closing the assistant ends a run without a word. A reply still being
+   // written is saved as an empty one, which a finished save replaces, so
+   // the chat says what happened if nothing does.
+@@ -2552,13 +2660,124 @@ function openConversation(info: Conversa
+       ...(closed ? {stopped: true, closed: true} : {}),
+     });
+   }
++  syncView(true);
+   render();
+   scrollToEnd();
+   input.focus();
+ }
+ 
++// The browser shows another conversation in this page: the panel moved to
++// another tab. It is drawn from what the browser kept, the messages before
++// its latest reply and then that reply's events, replayed through the same
++// handlers as when they came live.
++function showConversation(shown: ShownConversation) {
++  if (shownKey) {
++    drafts.set(shownKey, input.value);
++  }
++  replaying = true;
++  try {
++    clearThread();
++    shownKey = shown.key;
++    conversationId = shown.id || conversationId;
++    chatTitle = shown.title || '';
++    titleRequested = shown.titleRequested;
++    for (const stored of shown.messages ?? []) {
++      const closed = stored.role === 'assistant' && !stored.text;
++      messages.push({
++        role: stored.role,
++        text: stored.text,
++        attached: stored.attached,
++        ...(closed ? {stopped: true, closed: true} : {}),
++      });
++    }
++    const reply = shown.reply;
++    if (reply) {
++      activeId = reply.sendId;
++      streaming = true;
++      const message: Message = {role: 'assistant', text: ''};
++      if (reply.agentId) {
++        message.agent = newRun(reply.agentId, reply.agentName);
++      }
++      messages.push(message);
++      for (const entry of reply.events ?? []) {
++        replayEntry(entry.name, entry.value);
++      }
++      // It ended without a word the page could replay.
++      if (streaming && !reply.open) {
++        markStopped();
++      }
++      if (streaming && message.agent && !message.agent.heard) {
++        startAgentTimers(message);
++      }
++    }
++  } finally {
++    replaying = false;
++  }
++  input.value = drafts.get(shown.key) ?? '';
++  drafts.delete(shown.key);
++  resizeInput();
++  onTextChanged();
++  updateTitle();
++  render();
++  scrollToEnd();
++  // A reply that ended while its tab was in the background is named now.
++  if (!streaming) {
++    requestTitle();
++  }
++}
++
++function replayEntry(name: string, value: unknown) {
++  switch (name) {
++    case 'rac-ai-update':
++      onUpdate(value as UpdateEvent);
++      break;
++    case 'rac-ai-agent-update':
++      onAgentUpdate(value as AgentUpdateEvent);
++      break;
++    case 'racAiAgentEvent':
++      onAgentEvent(value);
++      break;
++    case 'rac-ai-attach-failed':
++      onAttachFailed(value as AttachFailedEvent);
++      break;
++    case 'rac-ai-stopped':
++      markStopped();
++      break;
++    case 'rac-ai-card-answered': {
++      const answer = value as {id?: unknown, decision?: unknown};
++      const message = lastAssistant();
++      if (message?.task && typeof answer.id === 'string' &&
++          typeof answer.decision === 'string') {
++        applyDecision(message.task, answer.id, answer.decision as Decision);
++        settleTask(message);
++      }
++      break;
++    }
++  }
++}
++
++function onAttachFailed(event: AttachFailedEvent) {
++  const last = messages[messages.length - 1];
++  if (!fromOtherConversation(event) && event.id === activeId && last &&
++      last.role === 'assistant') {
++    const parts: string[] = [];
++    if (event.failed.length > 0) {
++      parts.push(
++          loadTimeData.getString('attachFailed') + ' ' +
++          event.failed.join(', '));
++    }
++    parts.push(...(event.never ?? []).map(neverMessage));
++    // send() may already have said why a tab stayed out.
++    const earlier = last.notice ?? '';
++    last.notice = [
++      earlier, ...parts.filter(p => !earlier.includes(p))
++    ].filter(Boolean).join(' ');
++    queueRender();
++  }
++}
++
+ function onUpdate(event: UpdateEvent) {
+-  if (event.id !== activeId) {
++  if (fromOtherConversation(event) || event.id !== activeId) {
+     return;
+   }
+   const last = lastAssistant();
+@@ -2808,6 +3027,7 @@ function init() {
+   getRequiredElement('newChat').addEventListener('click', newChat);
+   getRequiredElement('setupButton').addEventListener('click', openSettings);
+ 
++  addWebUiListener('rac-ai-show', showConversation);
+   addWebUiListener('rac-ai-update', onUpdate);
+   addWebUiListener('rac-ai-agent-update', onAgentUpdate);
+   addWebUiListener('racAiAgentEvent', onAgentEvent);
+@@ -2818,26 +3038,7 @@ function init() {
+     currentTab = tab;
+     renderChips();
+   });
+-  addWebUiListener(
+-      'rac-ai-attach-failed',
+-      (event: {id: number, failed: string[], never?: string[]}) => {
+-        const last = messages[messages.length - 1];
+-        if (event.id === activeId && last && last.role === 'assistant') {
+-          const parts: string[] = [];
+-          if (event.failed.length > 0) {
+-            parts.push(
+-                loadTimeData.getString('attachFailed') + ' ' +
+-                event.failed.join(', '));
+-          }
+-          parts.push(...(event.never ?? []).map(neverMessage));
+-          // send() may already have said why a tab stayed out.
+-          const earlier = last.notice ?? '';
+-          last.notice = [
+-            earlier, ...parts.filter(p => !earlier.includes(p))
+-          ].filter(Boolean).join(' ');
+-          queueRender();
+-        }
+-      });
++  addWebUiListener('rac-ai-attach-failed', onAttachFailed);
+   addWebUiListener('rac-ai-disabled', () => {
+     streaming = false;
+     configured = false;
+--- /dev/null
++++ b/chrome/browser/rac/ai/chat_send.cc
+@@ -0,0 +1,15 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/chat_send.h"
++
++namespace rac::ai {
++
++std::vector<std::string> PrepareCacheForSend(
++    PagePromptCache& cache,
++    const std::map<std::string, rac::agent::SiteRule>& rules) {
++  return cache.DropNeverSites(rules);
++}
++
++}  // namespace rac::ai
+--- /dev/null
++++ b/chrome/browser/rac/ai/chat_send.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_CHAT_SEND_H_
++#define CHROME_BROWSER_RAC_AI_CHAT_SEND_H_
++
++#include <map>
++#include <string>
++#include <vector>
++
++#include "chrome/browser/rac/ai/chat_prompt.h"
++
++namespace rac::ai {
++
++// Readies one conversation's page cache for its next request. A never rule
++// added since the conversation's last send takes that site's pages out of
++// the cache first, so they never reach the prompt again. Each conversation
++// keeps its own cache, so a window with several tabs' chats drops from each
++// one as it sends. Every send, direct or agent, goes through this before its
++// request is built (PageHandler::StartSession). Returns the hosts it took
++// out, for the note on the reply.
++std::vector<std::string> PrepareCacheForSend(
++    PagePromptCache& cache,
++    const std::map<std::string, rac::agent::SiteRule>& rules);
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_CHAT_SEND_H_
+--- /dev/null
++++ b/chrome/browser/rac/ai/chat_send_unittest.cc
+@@ -0,0 +1,61 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/chat_send.h"
++
++#include <string>
++#include <vector>
++
++#include "base/values.h"
++#include "chrome/browser/rac/agent/action_guard.h"
++#include "chrome/browser/rac/ai/chat_prompt.h"
++#include "chrome/browser/rac/ai/chat_protocol.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::ai {
++namespace {
++
++ChatRequest Ask(std::string text) {
++  ChatRequest request;
++  request.messages = {{ChatMessage::Role::kUser, std::move(text)}};
++  return request;
++}
++
++// Two tabs' conversations in one window, each with its own cache. A never
++// rule added while both are open takes the bank's page out of the one that
++// read it, before that conversation's next request is built.
++TEST(RacAiChatSendTest, ANeverSiteLeavesTheConversationBeforeItsNextSend) {
++  PagePromptCache tab_a;
++  PagePromptCache tab_b;
++  ChatRequest first_a = Ask("What is my balance?");
++  first_a.pages = {{"Bank", "https://bank.example/", "balance 4417"}};
++  tab_a.Apply(first_a);
++  ChatRequest first_b = Ask("Summarize this");
++  first_b.pages = {{"Docs", "https://docs.example/", "manual"}};
++  tab_b.Apply(first_b);
++  ASSERT_NE(first_a.system_prompt.find("balance 4417"), std::string::npos);
++
++  const auto rules = rac::agent::ParseSiteRules(
++      base::DictValue().Set("bank.example", "never"));
++
++  // Tab A sends again: the page goes first, and the reply says which site.
++  EXPECT_EQ(PrepareCacheForSend(tab_a, rules),
++            std::vector<std::string>{"bank.example"});
++  ChatRequest next_a = Ask("And now?");
++  tab_a.Apply(next_a);
++  EXPECT_EQ(next_a.system_prompt.find("balance 4417"), std::string::npos);
++  EXPECT_TRUE(tab_a.Origins().empty());
++
++  // Tab B never read the bank: its page stays.
++  EXPECT_TRUE(PrepareCacheForSend(tab_b, rules).empty());
++  ChatRequest next_b = Ask("More?");
++  tab_b.Apply(next_b);
++  EXPECT_NE(next_b.system_prompt.find("manual"), std::string::npos);
++
++  // Nothing is left to drop on the send after.
++  EXPECT_TRUE(PrepareCacheForSend(tab_a, rules).empty());
++}
++
++}  // namespace
++}  // namespace rac::ai

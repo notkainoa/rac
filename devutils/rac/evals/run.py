@@ -904,6 +904,17 @@ def _wait_card_resolved(panel, card_id, proc, timeout=5):
         pass
 
 
+def respond_js(card_id, answer):
+    """racAiAgentRespond for a card, with the conversation and nonce of the
+    newest racAiAgentEvent that carried the card."""
+    q = json.dumps(card_id)
+    return ("(() => { const e = [...window.__evals.events].reverse().find("
+            f"x => x && x.id === {q} && typeof x.nonce === 'string'); "
+            "return window.__evals.cr.sendWithPromise('racAiAgentRespond', "
+            f"{q}, {json.dumps(answer)}, e ? e.conversation : '', "
+            "e ? e.nonce : ''); })()")
+
+
 def answer_card(assistant, card_id, answer, proc, shots):
     """Answers one card and returns its `answers` entry. The entry is
     {"id", "answer"} only when the click or the respond call is confirmed to
@@ -916,9 +927,10 @@ def answer_card(assistant, card_id, answer, proc, shots):
         if status == "clicked":
             return {"id": card_id, "answer": answer}
         return {"id": card_id, "error": f"card buttons: {status}"}
+    # The browser takes an answer only with the conversation and the nonce
+    # the card came with (CardGate), so they come from the card's own event.
     try:
-        assistant.eval("window.__evals.cr.sendWithPromise("
-                       f"'racAiAgentRespond', {json.dumps(card_id)}, {json.dumps(answer)})")
+        assistant.eval(respond_js(card_id, answer))
     except (cdp.CdpError, OSError) as e:
         return {"id": card_id, "error": f"racAiAgentRespond: {e}"}
     return {"id": card_id, "answer": answer}
@@ -927,6 +939,9 @@ def answer_card(assistant, card_id, answer, proc, shots):
 # racAiInit calls AllowJavascript() and subscribes the page to the profile's
 # agent events; without it FireWebUIListener is a no-op and racAiAgentEvent
 # never arrives. Returns the init state ({enabled, configured, needsKey...}).
+# Stops the task of the conversation the page shows.
+STOP_JS = ("chrome.send('racAiAgentStop', [window.__evals.key || '']); true")
+
 ASSISTANT_HOOK = """
 (async () => {
   const cr = await import('chrome://resources/js/cr.js');
@@ -934,6 +949,9 @@ ASSISTANT_HOOK = """
     window.__evals = {events: [], updates: [], cr};
     cr.addWebUiListener('racAiAgentEvent', e => window.__evals.events.push(e));
     cr.addWebUiListener('rac-ai-update', u => window.__evals.updates.push(u));
+    // The conversation the page shows: Stop names it (the browser stops only
+    // that conversation's own task).
+    cr.addWebUiListener('rac-ai-show', c => { window.__evals.key = c.key; });
     // An attached page that yields no text keeps the send but loses the
     // page block the model was meant to read; it is runner plumbing, not a
     // guard event, so it is marked for grade.py to ignore.
@@ -1248,7 +1266,7 @@ def drive(variant, rig, browser, proc, shots=None, trigger=None):
                 # the composer isn't still streaming on the next turn.
                 _ui_eval(assistant, PANEL_STOP_JS)
             else:
-                assistant.eval("chrome.send('racAiAgentStop', []); true", await_promise=False)
+                assistant.eval(STOP_JS, await_promise=False)
         # Identical adjacent events come from a listener registered twice (a
         # retried evaluate); drop them so one step pairs with one event.
         events = [e for i, e in enumerate(events) if i == 0 or e != events[i - 1]]

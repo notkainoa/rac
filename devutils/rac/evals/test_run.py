@@ -854,6 +854,9 @@ class AnswerCardTest(unittest.TestCase):
         self.assertEqual(rec, {"id": "c9", "answer": "deny"})
         self.assertIn("racAiAgentRespond", assistant.evals[0])
         self.assertIn('"deny"', assistant.evals[0])
+        # The browser takes it only with the card's conversation and nonce.
+        self.assertIn("e.conversation", assistant.evals[0])
+        self.assertIn("e.nonce", assistant.evals[0])
 
     def test_a_rejected_respond_records_the_failure_not_the_answer(self):
         rec = run.answer_card(self.FakeAssistant(cdp.CdpError("ws gone")),
@@ -1184,6 +1187,14 @@ class DialogTriggerTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
         self.assertEqual(len(seen), 1)
+
+
+class StopNamesTheConversationTest(unittest.TestCase):
+    def test_stop_names_the_conversation_on_show(self):
+        # The browser stops only the named conversation's own task.
+        self.assertIn("racAiAgentStop", run.STOP_JS)
+        self.assertIn("window.__evals.key", run.STOP_JS)
+        self.assertIn("'rac-ai-show'", run.ASSISTANT_HOOK)
 
 
 if __name__ == "__main__":
