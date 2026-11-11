@@ -1,8 +1,5 @@
 # What rac connects to
 
-*Draft. The host list below is empty until the first real capture fills it
-in.*
-
 rac's promise is that nothing phones home to rac: no telemetry, no accounts,
 no ads. This page is the proof for launch gate G10 — not a policy statement
 but a recording. The [network capture workflow](../.github/workflows/net-capture.yml)
@@ -16,9 +13,10 @@ drift from what the build really does.
 AI off, Helium services off, a single fresh window left idle:
 
 ```hosts
-# TODO: fill in from the first net-capture run (workflow_dispatch,
-# services: off). One host or *.wildcard per line, # comments for why rac
-# reaches it.
+# None. A fresh profile with defaults contacts no host: three 10-minute
+# captures of the signed 0.1.0 dry-run DMG (2026-11-11; first launch
+# skipped, the tour left open, and the tour closed without consent) saw
+# nothing leave the browser.
 ```
 
 One line per host, or `*.example.com`, which covers `example.com` itself and
@@ -103,19 +101,26 @@ the `net-capture-*` artifact.
   [internals/overview.md](internals/overview.md#branding-and-helium-services)).
   `services: on` seeds `helium.services.enabled` and
   `helium.services.user_consented` into `Default/Preferences` before launch,
-  the same prefs the onboarding toggle sets. TODO: list the service hosts
-  here from a `services: on` capture.
+  the same prefs the onboarding toggle sets. Once you consent, rac reaches
+  Helium's service host. Capture compares count this block only with
+  `services: on`, so it never widens the default list above:
+
+  ```hosts services
+  services.helium.imput.net  # Helium services, after consent (bangs and the rest)
+  ```
 - **AI.** Off by default and costs nothing when off — no provider process,
   no requests (see [internals/ai.md](internals/ai.md#ai-off-costs-nothing)).
   Turned on, rac talks only to the provider you configure: your API key's
   endpoint, a local model, or an installed agent's own CLI. There is no
   rac-hosted AI server.
-- **Updates.** `rac.browser_updates` is on by default, so the Sparkle check
-  may appear even in a default capture: the feed is
+- **Updates.** `rac.browser_updates` is on by default. The feed is
   `github.com/notkainoa/rac/releases/latest/download/appcast-<arch>.xml`,
   and GitHub serves release assets from a CDN host
-  (`objects.githubusercontent.com` — TODO: confirm the exact host from the
-  capture). The check never touches `updates.helium.computer`.
+  (`objects.githubusercontent.com` — TODO: confirm the exact host). The
+  10-minute captures above saw no update check: Sparkle's first scheduled
+  check comes later in a session, so these hosts aren't in the default
+  list yet. TODO: capture a session long enough to include the check and
+  list its hosts. The check never touches `updates.helium.computer`.
 - **Crash reports.** Off. `rac/privacy/disable-crash-uploads.patch` empties
   the upload URL and deletes reports locally, so nothing is ever sent.
 - **Sync.** rac has no sync.

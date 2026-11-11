@@ -390,6 +390,22 @@ class CompareTest(unittest.TestCase):
         self.assertIn('seen but not listed', result.stdout)
         self.assertIn('cdn.example.com', result.stdout)
 
+    def test_named_block_counts_only_with_also(self):
+        # Hosts a setting adds (```hosts services) never widen the default
+        # list: a services-off capture that reached one still fails.
+        self.doc.write_text(
+            doc_with_hosts('*.test.org', 'example.com') +
+            '\n```hosts services\ncdn.example.com  # with consent\n```\n')
+        result = run_helper('compare', str(BASIC), '--list', str(self.doc))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('cdn.example.com', result.stdout)
+        result = run_helper('compare', str(BASIC), '--list', str(self.doc),
+                            '--also', 'services')
+        self.assertEqual(result.returncode, 0, result.stdout)
+        result = run_helper('compare', str(BASIC), '--list', str(self.doc),
+                            '--also', 'other')
+        self.assertEqual(result.returncode, 1)
+
     def test_wildcard_matches_apex_and_subdomain(self):
         self.assertTrue(hostlist.host_listed('test.org', ['*.test.org']))
         self.assertTrue(hostlist.host_listed('a.b.test.org', ['*.test.org']))
