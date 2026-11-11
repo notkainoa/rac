@@ -1001,7 +1001,7 @@
      "metrics_reporting_handler.cc",
 --- /dev/null
 +++ b/chrome/browser/ui/webui/settings/rac_bangs_handler.cc
-@@ -0,0 +1,419 @@
+@@ -0,0 +1,349 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -1009,7 +1009,7 @@
 +#include "chrome/browser/ui/webui/settings/rac_bangs_handler.h"
 +
 +#include <algorithm>
-+#include <memory>
++#include <optional>
 +#include <string>
 +#include <tuple>
 +#include <utility>
@@ -1025,12 +1025,10 @@
 +#include "chrome/browser/search_engines/template_url_service_factory.h"
 +#include "chrome/grit/rac_strings.h"
 +#include "components/prefs/pref_service.h"
++#include "components/search_engines/rac_bangs_edit.h"
 +#include "components/search_engines/rac_deleted_bangs.h"
 +#include "components/search_engines/template_url.h"
 +#include "components/search_engines/template_url_bang_manager.h"
-+#include "components/search_engines/template_url_data.h"
-+#include "components/search_engines/template_url_starter_pack_data.h"
-+#include "components/search_engines/util.h"
 +#include "content/public/browser/web_ui_data_source.h"
 +#include "ui/base/webui/web_ui_util.h"
 +#include "url/gurl.h"
@@ -1041,19 +1039,6 @@
 +// The downloaded list has thousands of bangs. The page shows this many of
 +// the ones that match its search field.
 +constexpr size_t kMaxListRows = 100;
-+
-+// The user's own bangs are site search entries the user added with a "!"
-+// keyword. Prepopulated, starter pack, policy, and extension engines are not
-+// theirs to edit here, and the default search engine can't be deleted.
-+bool IsUserBang(const TemplateURL* turl, const TemplateURLService* service) {
-+  return turl->type() == TemplateURL::NORMAL && turl->bang_id() == 0 &&
-+         turl->prepopulate_id() == 0 &&
-+         turl->starter_pack_id() ==
-+             template_url_starter_pack_data::StarterPackId::kNone &&
-+         turl->policy_origin() == TemplateURLData::PolicyOrigin::kNoPolicy &&
-+         turl != service->GetDefaultSearchProvider() &&
-+         !rac::BangTriggerFromKeyword(turl->keyword()).empty();
-+}
 +
 +// What the page's search field holds, ready for rac::RankBangMatch.
 +std::u16string NormalizeQuery(const std::u16string& query) {
@@ -1209,7 +1194,7 @@
 +  }
 +  for (TemplateURL* turl : service_->GetTemplateURLs()) {
 +    if (turl->id() == id &&
-+        (turl->bang_id() > 0 || IsUserBang(turl, service_))) {
++        (turl->bang_id() > 0 || rac::IsUserBang(*turl, *service_))) {
 +      return turl;
 +    }
 +  }
@@ -1230,7 +1215,7 @@
 +    std::vector<RankedBang> bangs;
 +    for (TemplateURL* turl : service_->GetTemplateURLs()) {
 +      const bool downloaded = turl->bang_id() > 0;
-+      if (!downloaded && !IsUserBang(turl, service_)) {
++      if (!downloaded && !rac::IsUserBang(*turl, *service_)) {
 +        continue;
 +      }
 +      bangs_total += downloaded ? 1 : 0;
@@ -1308,31 +1293,26 @@
 +void RacBangsHandler::HandleValidate(const base::ListValue& args) {
 +  AllowJavascript();
 +  const int id = IdArg(args, 1);
-+  const std::string field = StringArg(args, 2);
-+  const std::string value = StringArg(args, 3);
++  const std::string field_name = StringArg(args, 2);
 +  TemplateURL* existing = FindBang(id);
-+  std::string result = "invalid";
-+  if (service_ && (id < 0 || existing)) {
-+    if (field == "name") {
-+      result = IsSearchEngineNameValidToUse(base::UTF8ToUTF16(value))
-+                   ? ""
-+                   : "invalid";
-+    } else if (field == "trigger") {
-+      const std::u16string trigger =
-+          rac::NormalizeBangTrigger(base::UTF8ToUTF16(value));
-+      if (!trigger.empty()) {
-+        result = IsSearchEngineKeywordValidToUse(
-+                     u"!" + base::i18n::ToLower(trigger), service_, existing)
-+                     ? ""
-+                     : "taken";
-+      }
-+    } else if (field == "url") {
-+      // A bang always searches, so its URL needs the %s.
-+      result = IsSearchEngineURLValidToUse(value, service_, existing,
-+                                           /*is_new_primary=*/true)
-+                   ? ""
-+                   : "invalid";
-+    }
++  rac::BangFieldError error = rac::BangFieldError::kInvalid;
++  std::optional<rac::BangField> field;
++  if (field_name == "name") {
++    field = rac::BangField::kName;
++  } else if (field_name == "trigger") {
++    field = rac::BangField::kTrigger;
++  } else if (field_name == "url") {
++    field = rac::BangField::kUrl;
++  }
++  if (service_ && field && (id < 0 || existing)) {
++    error = rac::ValidateBangField(*service_, existing, *field,
++                                   base::UTF8ToUTF16(StringArg(args, 3)));
++  }
++  const char* result = "";
++  if (error == rac::BangFieldError::kInvalid) {
++    result = "invalid";
++  } else if (error == rac::BangFieldError::kTaken) {
++    result = "taken";
 +  }
 +  ResolveJavascriptCallback(args[0], base::Value(result));
 +}
@@ -1342,65 +1322,21 @@
 +void RacBangsHandler::HandleSave(const base::ListValue& args) {
 +  AllowJavascript();
 +  const int id = IdArg(args, 1);
-+  const std::u16string name_input = base::UTF8ToUTF16(StringArg(args, 2));
-+  const std::u16string name(base::TrimWhitespace(name_input, base::TRIM_ALL));
-+  const std::u16string trigger =
-+      rac::NormalizeBangTrigger(base::UTF8ToUTF16(StringArg(args, 3)));
-+  const std::string url = StringArg(args, 4);
 +  TemplateURL* existing = FindBang(id);
-+  const std::u16string keyword = u"!" + base::i18n::ToLower(trigger);
-+  if (!service_ || (id >= 0 && !existing) || trigger.empty() ||
-+      !IsSearchEngineNameValidToUse(name) ||
-+      !IsSearchEngineKeywordValidToUse(keyword, service_, existing) ||
-+      !IsSearchEngineURLValidToUse(url, service_, existing,
-+                                   /*is_new_primary=*/true)) {
-+    ResolveJavascriptCallback(args[0], base::Value(false));
-+    return;
-+  }
-+
-+  const std::string fixed_url =
-+      GetFixedUpSearchEngineUrl(url, service_->search_terms_data());
-+  if (existing && existing->bang_id() == 0) {
-+    service_->ResetTemplateURL(existing, name, keyword, fixed_url,
-+                               existing->suggestions_url());
-+  } else if (!existing || existing->short_name() != name ||
-+             existing->keyword() != keyword || existing->url() != fixed_url) {
-+    if (existing) {
-+      // Editing a downloaded bang replaces it with the user's own. Deleting
-+      // the original records its trigger, so the next bangs.json doesn't
-+      // add it back next to the user's version.
-+      rac::AddDeletedBang(
-+          profile_->GetPrefs(),
-+          base::UTF16ToUTF8(rac::BangTriggerFromKeyword(existing->keyword())));
-+      service_->Remove(existing);
-+    }
-+    TemplateURLData data;
-+    data.SetShortName(name);
-+    data.SetKeyword(keyword);
-+    data.SetURL(fixed_url);
-+    data.is_active = TemplateURLData::ActiveStatus::kTrue;
-+    service_->Add(std::make_unique<TemplateURL>(data));
-+  }
-+  ResolveJavascriptCallback(args[0], base::Value(true));
++  const bool saved =
++      service_ && (id < 0 || existing) &&
++      rac::SaveBang(*service_, *profile_->GetPrefs(), existing,
++                    base::UTF8ToUTF16(StringArg(args, 2)),
++                    base::UTF8ToUTF16(StringArg(args, 3)), StringArg(args, 4));
++  ResolveJavascriptCallback(args[0], base::Value(saved));
 +}
 +
 +// Args: id.
 +void RacBangsHandler::HandleDelete(const base::ListValue& args) {
-+  TemplateURL* turl = FindBang(IdArg(args, 0));
-+  if (!turl || turl == service_->GetDefaultSearchProvider()) {
-+    return;
-+  }
-+  const bool downloaded = turl->bang_id() > 0;
-+  if (downloaded) {
-+    rac::AddDeletedBang(
-+        profile_->GetPrefs(),
-+        base::UTF16ToUTF8(rac::BangTriggerFromKeyword(turl->keyword())));
-+  }
-+  service_->Remove(turl);
-+  // A downloaded bang the user's own one hid can come back now. This only
-+  // re-applies the list already in memory; it never downloads it.
-+  if (!downloaded && !Bangs::BangManager::GetInstance()->GetBangs().empty()) {
-+    service_->LoadBangs();
++  if (TemplateURL* turl = FindBang(IdArg(args, 0));
++      turl && rac::DeleteBang(*service_, *profile_->GetPrefs(), turl)) {
++    // TemplateURLService doesn't tell observers about downloaded bangs it
++    // adds back, so tell the page here.
 +    ScheduleChanged();
 +  }
 +}
@@ -1410,13 +1346,7 @@
 +  if (!service_) {
 +    return;
 +  }
-+  rac::RemoveDeletedBang(profile_->GetPrefs(), StringArg(args, 0));
-+  // Re-applies the downloaded list, which skips the triggers still deleted.
-+  // TemplateURLService doesn't tell observers about bangs it adds, so tell
-+  // the page here.
-+  if (!Bangs::BangManager::GetInstance()->GetBangs().empty()) {
-+    service_->LoadBangs();
-+  }
++  rac::RestoreBang(*service_, *profile_->GetPrefs(), StringArg(args, 0));
 +  ScheduleChanged();
 +}
 +
@@ -1645,3 +1575,556 @@
 +
  }  // namespace
  }  // namespace rac
+--- a/components/search_engines/BUILD.gn
++++ b/components/search_engines/BUILD.gn
+@@ -31,6 +31,8 @@ static_library("search_engines") {
+     "keyword_table.h",
+     "keyword_web_data_service.cc",
+     "keyword_web_data_service.h",
++    "rac_bangs_edit.cc",
++    "rac_bangs_edit.h",
+     "rac_deleted_bangs.cc",
+     "rac_deleted_bangs.h",
+     "reconciling_template_url_data_holder.cc",
+@@ -346,13 +348,15 @@ component("search_engines_switches") {
+ # separate from components_unittests, which takes hours to build.
+ test("rac_search_engines_unittests") {
+   sources = [
+-    "rac_deleted_bangs.cc",
+-    "rac_deleted_bangs.h",
++    "rac_bangs_edit_unittest.cc",
+     "rac_deleted_bangs_unittest.cc",
+   ]
+   deps = [
++    ":search_engines",
++    ":test_support",
+     "//base",
+     "//base/test:run_all_unittests",
++    "//base/test:test_support",
+     "//components/prefs",
+     "//components/prefs:test_support",
+     "//testing/gtest",
+--- /dev/null
++++ b/components/search_engines/rac_bangs_edit.cc
+@@ -0,0 +1,197 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/search_engines/rac_bangs_edit.h"
++
++#include <memory>
++#include <optional>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback.h"
++#include "base/i18n/case_conversion.h"
++#include "base/location.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "components/search_engines/rac_deleted_bangs.h"
++#include "components/search_engines/template_url.h"
++#include "components/search_engines/template_url_bang_manager.h"
++#include "components/search_engines/template_url_data.h"
++#include "components/search_engines/template_url_service.h"
++#include "components/search_engines/template_url_starter_pack_data.h"
++#include "components/search_engines/util.h"
++
++namespace rac {
++namespace {
++
++struct ListOverride {
++  std::optional<std::string> bangs_json;
++  bool held = false;
++  base::OnceClosure pending_load;
++};
++
++ListOverride& GetListOverride() {
++  static base::NoDestructor<ListOverride> list_override;
++  return *list_override;
++}
++
++std::u16string KeywordFor(std::u16string_view trigger) {
++  return u"!" + base::i18n::ToLower(NormalizeBangTrigger(trigger));
++}
++
++void RecordDeleted(PrefService& prefs, const TemplateURL& turl) {
++  AddDeletedBang(&prefs,
++                 base::UTF16ToUTF8(BangTriggerFromKeyword(turl.keyword())));
++}
++
++}  // namespace
++
++void SetBangsListOverride(std::string bangs_json, bool hold) {
++  ListOverride& list_override = GetListOverride();
++  list_override.bangs_json = std::move(bangs_json);
++  list_override.held = hold;
++}
++
++void ReleaseBangsListOverride() {
++  ListOverride& list_override = GetListOverride();
++  list_override.held = false;
++  if (list_override.pending_load) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, std::move(list_override.pending_load));
++  }
++}
++
++bool PostBangsListOverride(base::OnceCallback<void(std::string)> load) {
++  ListOverride& list_override = GetListOverride();
++  if (!list_override.bangs_json) {
++    return false;
++  }
++  base::OnceClosure task =
++      base::BindOnce(std::move(load), *list_override.bangs_json);
++  if (list_override.held) {
++    list_override.pending_load = std::move(task);
++  } else {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE,
++                                                             std::move(task));
++  }
++  return true;
++}
++
++bool IsUserBang(const TemplateURL& turl, const TemplateURLService& service) {
++  return turl.type() == TemplateURL::NORMAL && turl.bang_id() == 0 &&
++         turl.prepopulate_id() == 0 &&
++         turl.starter_pack_id() ==
++             template_url_starter_pack_data::StarterPackId::kNone &&
++         turl.policy_origin() == TemplateURLData::PolicyOrigin::kNoPolicy &&
++         &turl != service.GetDefaultSearchProvider() &&
++         !BangTriggerFromKeyword(turl.keyword()).empty();
++}
++
++BangFieldError ValidateBangField(const TemplateURLService& service,
++                                 const TemplateURL* existing,
++                                 BangField field,
++                                 std::u16string_view value) {
++  switch (field) {
++    case BangField::kName:
++      return IsSearchEngineNameValidToUse(std::u16string(value))
++                 ? BangFieldError::kNone
++                 : BangFieldError::kInvalid;
++    case BangField::kTrigger:
++      if (NormalizeBangTrigger(value).empty()) {
++        return BangFieldError::kInvalid;
++      }
++      return IsSearchEngineKeywordValidToUse(KeywordFor(value), &service,
++                                             existing)
++                 ? BangFieldError::kNone
++                 : BangFieldError::kTaken;
++    case BangField::kUrl:
++      return IsSearchEngineURLValidToUse(base::UTF16ToUTF8(value), &service,
++                                         existing,
++                                         /*is_new_primary=*/true)
++                 ? BangFieldError::kNone
++                 : BangFieldError::kInvalid;
++  }
++}
++
++bool SaveBang(TemplateURLService& service,
++              PrefService& prefs,
++              TemplateURL* existing,
++              std::u16string_view name,
++              std::u16string_view trigger,
++              const std::string& url) {
++  if (existing && existing == service.GetDefaultSearchProvider()) {
++    // Replacing it would remove the default search engine.
++    return false;
++  }
++  const std::u16string url16 = base::UTF8ToUTF16(url);
++  if (ValidateBangField(service, existing, BangField::kName, name) !=
++          BangFieldError::kNone ||
++      ValidateBangField(service, existing, BangField::kTrigger, trigger) !=
++          BangFieldError::kNone ||
++      ValidateBangField(service, existing, BangField::kUrl, url16) !=
++          BangFieldError::kNone) {
++    return false;
++  }
++
++  const std::u16string title(base::TrimWhitespace(name, base::TRIM_ALL));
++  const std::u16string keyword = KeywordFor(trigger);
++  const std::string fixed_url =
++      GetFixedUpSearchEngineUrl(url, service.search_terms_data());
++  if (existing && existing->bang_id() == 0) {
++    service.ResetTemplateURL(existing, title, keyword, fixed_url,
++                             existing->suggestions_url());
++    return true;
++  }
++  if (existing) {
++    if (existing->short_name() == title && existing->keyword() == keyword &&
++        existing->url() == fixed_url) {
++      return true;
++    }
++    RecordDeleted(prefs, *existing);
++    service.Remove(existing);
++  }
++  TemplateURLData data;
++  data.SetShortName(title);
++  data.SetKeyword(keyword);
++  data.SetURL(fixed_url);
++  data.is_active = TemplateURLData::ActiveStatus::kTrue;
++  service.Add(std::make_unique<TemplateURL>(data));
++  return true;
++}
++
++bool DeleteBang(TemplateURLService& service,
++                PrefService& prefs,
++                const TemplateURL* turl) {
++  if (!turl || turl == service.GetDefaultSearchProvider()) {
++    return false;
++  }
++  const bool downloaded = turl->bang_id() > 0;
++  if (downloaded) {
++    RecordDeleted(prefs, *turl);
++  }
++  service.Remove(turl);
++  if (!downloaded) {
++    ReapplyBangsList(service);
++  }
++  return true;
++}
++
++void RestoreBang(TemplateURLService& service,
++                 PrefService& prefs,
++                 std::string_view trigger) {
++  RemoveDeletedBang(&prefs, trigger);
++  ReapplyBangsList(service);
++}
++
++void ReapplyBangsList(TemplateURLService& service) {
++  // LoadBangs() would download the list if it isn't in memory yet. When it
++  // is, it re-runs TemplateURLService::BangsLoadedCallback right away.
++  if (!Bangs::BangManager::GetInstance()->GetBangs().empty()) {
++    service.LoadBangs();
++  }
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/components/search_engines/rac_bangs_edit.h
+@@ -0,0 +1,89 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef COMPONENTS_SEARCH_ENGINES_RAC_BANGS_EDIT_H_
++#define COMPONENTS_SEARCH_ENGINES_RAC_BANGS_EDIT_H_
++
++#include <string>
++#include <string_view>
++
++#include "base/functional/callback_forward.h"
++
++class PrefService;
++class TemplateURL;
++class TemplateURLService;
++
++// What the Bangs settings page (chrome/browser/ui/webui/settings/
++// rac_bangs_handler.cc) does to bangs, kept out of the handler so it can be
++// tested against a TemplateURLService.
++//
++// The user's own bangs are site search entries with a "!" keyword; the
++// downloaded ones are TemplateURLs with a bang_id. A downloaded bang the user
++// deletes or edits has its trigger recorded in rac.bangs.deleted, which
++// TemplateURLService::BangsLoadedCallback skips when it applies the list.
++namespace rac {
++
++// The list BangManager loads in place of downloading bangs.json, in the same
++// format. Tests set it, and so does --rac-bangs-fixture in dev builds
++// (chrome/browser/rac/power/bangs_fixture.cc). Release builds never do.
++// With |hold|, BangManager waits for ReleaseBangsListOverride() before it
++// loads the list, so the fixture can wait until the profile's engines have
++// loaded, the way a download usually arrives after them.
++void SetBangsListOverride(std::string bangs_json, bool hold = false);
++void ReleaseBangsListOverride();
++
++// When an override is set, has |load| run with it (posted, or once released)
++// and returns true, and BangManager loads it as if it was downloaded.
++// Otherwise returns false.
++bool PostBangsListOverride(base::OnceCallback<void(std::string)> load);
++
++// One of the user's own bangs: a site search entry they added with a "!"
++// keyword. Prepopulated, starter pack, policy, and extension engines are not
++// theirs to change here, and neither is the default search engine.
++bool IsUserBang(const TemplateURL& turl, const TemplateURLService& service);
++
++enum class BangField { kName, kTrigger, kUrl };
++enum class BangFieldError { kNone, kInvalid, kTaken };
++
++// Checks one field of the add or edit dialog. |existing| is the bang being
++// edited, or null when adding one. A trigger is typed without its "!", and
++// kTaken means another engine has it. A bang always searches, so its URL
++// needs the %s.
++BangFieldError ValidateBangField(const TemplateURLService& service,
++                                 const TemplateURL* existing,
++                                 BangField field,
++                                 std::u16string_view value);
++
++// Saves the dialog's fields as one of the user's own bangs. |existing| is the
++// bang being edited, or null to add one. Editing a downloaded bang deletes it
++// (recording its trigger) and adds the user's copy, unless nothing changed.
++// Returns false, changing nothing, when a field isn't valid or |existing| is
++// the default search engine.
++bool SaveBang(TemplateURLService& service,
++              PrefService& prefs,
++              TemplateURL* existing,
++              std::u16string_view name,
++              std::u16string_view trigger,
++              const std::string& url);
++
++// Deletes a bang. A downloaded one's trigger is recorded so later list loads
++// skip it. Deleting the user's own bang lets a downloaded one it hid come
++// back. Returns false, changing nothing, for the default search engine.
++bool DeleteBang(TemplateURLService& service,
++                PrefService& prefs,
++                const TemplateURL* turl);
++
++// Un-marks a deleted trigger (without the "!") and brings the downloaded bang
++// back, unless the user's own bang has its keyword.
++void RestoreBang(TemplateURLService& service,
++                 PrefService& prefs,
++                 std::string_view trigger);
++
++// Re-applies the downloaded list, skipping deleted triggers and keywords
++// already taken. Only when the list is in memory: it never downloads it.
++void ReapplyBangsList(TemplateURLService& service);
++
++}  // namespace rac
++
++#endif  // COMPONENTS_SEARCH_ENGINES_RAC_BANGS_EDIT_H_
+--- /dev/null
++++ b/components/search_engines/rac_bangs_edit_unittest.cc
+@@ -0,0 +1,199 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "components/search_engines/rac_bangs_edit.h"
++
++#include <memory>
++#include <string>
++
++#include "components/search_engines/rac_deleted_bangs.h"
++#include "components/search_engines/template_url.h"
++#include "components/search_engines/template_url_data.h"
++#include "components/search_engines/template_url_service.h"
++#include "components/search_engines/template_url_service_test_util.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++// The bangs.json the tests' BangManager "downloads". BangManager is a
++// process-wide singleton that loads the list once, so every test uses the
++// same list.
++constexpr char kBangsList[] = R"([
++  {"s": "Wikipedia", "ts": ["w"],
++   "u": "https://en.wikipedia.org/w/index.php?search={searchTerms}"},
++  {"s": "YouTube", "ts": ["yt"],
++   "u": "https://www.youtube.com/results?search_query={searchTerms}"},
++  {"s": "GitHub", "ts": ["gh"],
++   "u": "https://github.com/search?q={searchTerms}"}
++])";
++
++class RacBangsEditTest : public TemplateURLServiceUnitTestBase {
++ protected:
++  void SetUp() override {
++    TemplateURLServiceUnitTestBase::SetUp();
++    SetBangsListOverride(kBangsList);
++    LoadWithBangs();
++  }
++
++  // What a browser start does: load the engines, then apply the downloaded
++  // list. This service has no database, so Load() doesn't apply the list
++  // itself.
++  void LoadWithBangs() {
++    template_url_service().Load();
++    template_url_service().LoadBangs();
++    task_environment.RunUntilIdle();
++  }
++
++  TemplateURL* Find(const std::u16string& keyword) {
++    return template_url_service().GetTemplateURLForKeyword(keyword);
++  }
++
++  bool IsDownloaded(const std::u16string& keyword) {
++    TemplateURL* turl = Find(keyword);
++    return turl && turl->bang_id() > 0;
++  }
++
++  bool IsDeleted(std::string_view trigger) {
++    return IsDeletedBang(trigger, ReadDeletedBangs(&pref_service()));
++  }
++
++  TemplateURL* AddUserBang(const std::u16string& keyword) {
++    TemplateURLData data;
++    data.SetShortName(u"Mine");
++    data.SetKeyword(keyword);
++    data.SetURL("https://example.com/?q={searchTerms}");
++    data.is_active = TemplateURLData::ActiveStatus::kTrue;
++    return template_url_service().Add(std::make_unique<TemplateURL>(data));
++  }
++};
++
++TEST_F(RacBangsEditTest, ListLoadAddsDownloadedBangs) {
++  EXPECT_TRUE(IsDownloaded(u"!w"));
++  EXPECT_TRUE(IsDownloaded(u"!yt"));
++  EXPECT_TRUE(IsDownloaded(u"!gh"));
++}
++
++TEST_F(RacBangsEditTest, DeleteHidesTheBangAcrossFreshListLoads) {
++  ASSERT_TRUE(DeleteBang(template_url_service(), pref_service(), Find(u"!w")));
++  EXPECT_FALSE(Find(u"!w"));
++  EXPECT_TRUE(IsDeleted("w"));
++
++  // The list applied again in this session.
++  template_url_service().LoadBangs();
++  EXPECT_FALSE(Find(u"!w"));
++
++  // A new session: a new service, and the list applied from scratch.
++  ResetTemplateURLService();
++  LoadWithBangs();
++  EXPECT_FALSE(Find(u"!w"));
++  EXPECT_TRUE(IsDownloaded(u"!yt"));
++  EXPECT_TRUE(IsDeleted("w"));
++}
++
++TEST_F(RacBangsEditTest, RestoreBringsTheBangBack) {
++  ASSERT_TRUE(DeleteBang(template_url_service(), pref_service(), Find(u"!w")));
++  ASSERT_FALSE(Find(u"!w"));
++
++  RestoreBang(template_url_service(), pref_service(), "w");
++  EXPECT_TRUE(IsDownloaded(u"!w"));
++  EXPECT_FALSE(IsDeleted("w"));
++
++  // And it stays back in a new session.
++  ResetTemplateURLService();
++  LoadWithBangs();
++  EXPECT_TRUE(IsDownloaded(u"!w"));
++}
++
++TEST_F(RacBangsEditTest, EditingADownloadedBangSavesTheUsersCopy) {
++  ASSERT_TRUE(SaveBang(template_url_service(), pref_service(), Find(u"!w"),
++                       u"My wiki", u"w", "https://wiki.example/?q=%s"));
++
++  TemplateURL* mine = Find(u"!w");
++  ASSERT_TRUE(mine);
++  EXPECT_EQ(0, mine->bang_id());
++  EXPECT_TRUE(IsUserBang(*mine, template_url_service()));
++  EXPECT_EQ(u"My wiki", mine->short_name());
++  EXPECT_EQ("https://wiki.example/?q={searchTerms}", mine->url());
++  EXPECT_TRUE(IsDeleted("w"));
++
++  // A fresh list load leaves the user's copy alone.
++  template_url_service().LoadBangs();
++  EXPECT_EQ(mine, Find(u"!w"));
++  EXPECT_EQ(0, Find(u"!w")->bang_id());
++}
++
++TEST_F(RacBangsEditTest,
++       EditingADownloadedBangToANewTriggerKeepsTheOldOneDeleted) {
++  ASSERT_TRUE(SaveBang(template_url_service(), pref_service(), Find(u"!yt"),
++                       u"Videos", u"!vid", "https://videos.example/?q=%s"));
++  EXPECT_TRUE(Find(u"!vid"));
++  EXPECT_FALSE(Find(u"!yt"));
++  EXPECT_TRUE(IsDeleted("yt"));
++}
++
++TEST_F(RacBangsEditTest, SavingADownloadedBangUnchangedKeepsIt) {
++  TemplateURL* wiki = Find(u"!w");
++  ASSERT_TRUE(SaveBang(template_url_service(), pref_service(), wiki,
++                       wiki->short_name(), u"w",
++                       "https://en.wikipedia.org/w/index.php?search=%s"));
++  EXPECT_TRUE(IsDownloaded(u"!w"));
++  EXPECT_FALSE(IsDeleted("w"));
++}
++
++TEST_F(RacBangsEditTest, AddingRefusesATakenTrigger) {
++  EXPECT_EQ(BangFieldError::kTaken,
++            ValidateBangField(template_url_service(), nullptr,
++                              BangField::kTrigger, u"gh"));
++  EXPECT_FALSE(SaveBang(template_url_service(), pref_service(), nullptr,
++                        u"Mine", u"gh", "https://example.com/?q=%s"));
++  EXPECT_TRUE(IsDownloaded(u"!gh"));
++  // The bang being edited may keep its own trigger.
++  EXPECT_EQ(BangFieldError::kNone,
++            ValidateBangField(template_url_service(), Find(u"!gh"),
++                              BangField::kTrigger, u"gh"));
++}
++
++TEST_F(RacBangsEditTest, AddingNeedsAQueryInTheUrl) {
++  EXPECT_EQ(BangFieldError::kInvalid,
++            ValidateBangField(template_url_service(), nullptr, BangField::kUrl,
++                              u"https://example.com/"));
++  EXPECT_FALSE(SaveBang(template_url_service(), pref_service(), nullptr,
++                        u"Mine", u"mine", "https://example.com/"));
++  EXPECT_TRUE(SaveBang(template_url_service(), pref_service(), nullptr, u"Mine",
++                       u"mine", "https://example.com/?q=%s"));
++  EXPECT_TRUE(IsUserBang(*Find(u"!mine"), template_url_service()));
++}
++
++TEST_F(RacBangsEditTest, DeletingTheUsersBangBringsBackTheOneItHid) {
++  // The user's own !gh, added while the downloaded one was deleted, so the
++  // list doesn't add the downloaded one back.
++  ASSERT_TRUE(DeleteBang(template_url_service(), pref_service(), Find(u"!gh")));
++  TemplateURL* mine = AddUserBang(u"!gh");
++  RestoreBang(template_url_service(), pref_service(), "gh");
++  EXPECT_EQ(mine, Find(u"!gh"));
++
++  // The user's bang isn't recorded as deleted, and the downloaded one comes
++  // back right away.
++  ASSERT_TRUE(DeleteBang(template_url_service(), pref_service(), mine));
++  EXPECT_FALSE(IsDeleted("gh"));
++  EXPECT_TRUE(IsDownloaded(u"!gh"));
++}
++
++TEST_F(RacBangsEditTest, TheDefaultSearchEngineIsNeverReplacedOrDeleted) {
++  TemplateURL* mine = AddUserBang(u"!mine");
++  ASSERT_TRUE(template_url_service().CanMakeDefault(mine));
++  template_url_service().SetUserSelectedDefaultSearchProvider(mine);
++  ASSERT_EQ(mine, template_url_service().GetDefaultSearchProvider());
++
++  EXPECT_FALSE(IsUserBang(*mine, template_url_service()));
++  EXPECT_FALSE(SaveBang(template_url_service(), pref_service(), mine,
++                        u"Renamed", u"mine", "https://example.com/?q=%s"));
++  EXPECT_EQ(u"Mine", mine->short_name());
++  EXPECT_FALSE(DeleteBang(template_url_service(), pref_service(), mine));
++  EXPECT_EQ(mine, Find(u"!mine"));
++}
++
++}  // namespace
++}  // namespace rac
+--- a/components/search_engines/template_url_bang_manager.cc
++++ b/components/search_engines/template_url_bang_manager.cc
+@@ -15,6 +15,7 @@
+ #include "base/memory/singleton.h"
+ #include "base/json/json_reader.h"
+ #include "components/helium_services/helium_services_helpers.h"
++#include "components/search_engines/rac_bangs_edit.h"
+ #include "net/base/load_flags.h"
+ #include "net/http/http_status_code.h"
+ #include "services/network/public/cpp/resource_request.h"
+@@ -87,6 +88,19 @@ void BangManager::DoStartFileFetch(
+     scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory,
+     PrefService& prefs
+ ) {
++    // rac: tests and dev builds can hand over the list instead of downloading
++    // it (components/search_engines/rac_bangs_edit.h).
++    if (rac::PostBangsListOverride(base::BindOnce(
++            [](base::WeakPtr<BangManager> self, std::string bangs_json) {
++                if (self) {
++                    self->LoadManifestFromString(bangs_json);
++                    self->load_pending_ = false;
++                }
++            },
++            weak_ptr_factory_.GetWeakPtr()))) {
++        return;
++    }
++
+     auto request = std::make_unique<network::ResourceRequest>();
+     request->url = helium::GetServicesBaseURL(prefs).Resolve(kBangsPrefix);
+ 
