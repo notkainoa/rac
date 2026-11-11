@@ -1212,6 +1212,17 @@ class PushTest(RemoteBuildTest):
         self.assertIn('update_patches.sh merge', calls)
         self.assertIn('worktree.sh sync', calls)
 
+    def test_push_recreates_a_clone_whose_folder_was_deleted(self):
+        # Removing a clone by deleting its folder leaves it registered in
+        # base; a new push of the same branch must still make the clone.
+        self.run_rb('push', self.wt, success=True)
+        clone = self.remote_root / 'wt/feature'
+        shutil.rmtree(clone)
+        self.log.unlink()
+        self.run_rb('push', self.wt, success=True)
+        self.assertEqual(git(clone, 'rev-parse', 'HEAD').stdout.strip(),
+                         git(self.wt, 'rev-parse', 'HEAD').stdout.strip())
+
     def test_push_refuses_an_uncommitted_rac_patch(self):
         (self.wt / 'patches/series').unlink()
         write(self.wt / 'patches/series.merged', 'a.patch\nrac/x/new.patch\n')
