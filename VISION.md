@@ -86,8 +86,9 @@ and improved continuously. Everyone else is welcome, especially:
 
 ### Everything else
 
-- **Command bar:** a quick launcher for tabs, history, and actions. ⌘T and
-  ⌘L open it; one setting gives ⌘T back to the regular new tab page.
+- **Command bar:** a quick launcher for tabs, history, and actions. ⌘L opens
+  it, and one setting makes ⌘T open it too. By default ⌘T opens the regular
+  new tab page.
 - **Boosts:** restyle any website with your own CSS and JavaScript.
 - **Space themes:** gradient color themes, one per space.
 - **Split view:** several tabs side by side (Helium has this today).
