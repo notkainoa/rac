@@ -1073,6 +1073,9 @@ if [ ! -d "$clone" ]; then
   git -C "$base" fetch -q --no-recurse-submodules \
     air "+refs/heads/$2:refs/remotes/air/$2"
   mkdir -p "$HOME/rac-remote/wt"
+  # A clone removed by deleting its folder stays registered in base, and
+  # `worktree add` then refuses its branch ("already used by worktree").
+  git -C "$base" worktree prune
   # -B points the clone's branch at the pushed commit even if base kept a
   # stale branch of that name.
   git -C "$base" worktree add -q -B "$2" "$clone" "$3"
