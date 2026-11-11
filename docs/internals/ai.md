@@ -165,10 +165,11 @@ Two callers apply it differently:
 - What the chat may read (`IsInternalTab`, used to attach a tab) goes by the
   last committed entry, both its address and the one the address bar shows
   (a view-source: entry has the page's own address). A tab that hasn't
-  committed a page yet is internal. The agent's tab list and targets
-  (`TabTools`) keep their own http(s) check of `GetLastCommittedURL()`.
-  That is the committed entry's shown address (`WebContentsImpl` returns
-  its virtual URL), so it rules out the same pages, view-source: included.
+  committed a page yet is internal. The agent asks the same question
+  through `rac::agent::IsTabInAgentReach`: its tab list, every tab it
+  reads or acts on (`TabTools::FindByAlias`), the tabs a turn starts
+  with, and `go_back`'s target. So a blank tab, even one the agent
+  opened, is out of its reach until a web page commits there.
 - The entry points (`IsAssistantBlockedHere`: the Chat button, the edge
   handle, the Assistant command, Find's Ask, the command bar's Ask row via
   `Need::kWebPage`) go by the address bar's address, and a blank tab
