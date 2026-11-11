@@ -854,6 +854,9 @@ class AnswerCardTest(unittest.TestCase):
         self.assertEqual(rec, {"id": "c9", "answer": "deny"})
         self.assertIn("racAiAgentRespond", assistant.evals[0])
         self.assertIn('"deny"', assistant.evals[0])
+        # The browser takes it only with the card's conversation and nonce.
+        self.assertIn("e.conversation", assistant.evals[0])
+        self.assertIn("e.nonce", assistant.evals[0])
 
     def test_a_rejected_respond_records_the_failure_not_the_answer(self):
         rec = run.answer_card(self.FakeAssistant(cdp.CdpError("ws gone")),

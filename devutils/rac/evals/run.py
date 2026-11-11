@@ -904,6 +904,17 @@ def _wait_card_resolved(panel, card_id, proc, timeout=5):
         pass
 
 
+def respond_js(card_id, answer):
+    """racAiAgentRespond for a card, with the conversation and nonce of the
+    newest racAiAgentEvent that carried the card."""
+    q = json.dumps(card_id)
+    return ("(() => { const e = [...window.__evals.events].reverse().find("
+            f"x => x && x.id === {q} && typeof x.nonce === 'string'); "
+            "return window.__evals.cr.sendWithPromise('racAiAgentRespond', "
+            f"{q}, {json.dumps(answer)}, e ? e.conversation : '', "
+            "e ? e.nonce : ''); })()")
+
+
 def answer_card(assistant, card_id, answer, proc, shots):
     """Answers one card and returns its `answers` entry. The entry is
     {"id", "answer"} only when the click or the respond call is confirmed to
@@ -916,9 +927,10 @@ def answer_card(assistant, card_id, answer, proc, shots):
         if status == "clicked":
             return {"id": card_id, "answer": answer}
         return {"id": card_id, "error": f"card buttons: {status}"}
+    # The browser takes an answer only with the conversation and the nonce
+    # the card came with (CardGate), so they come from the card's own event.
     try:
-        assistant.eval("window.__evals.cr.sendWithPromise("
-                       f"'racAiAgentRespond', {json.dumps(card_id)}, {json.dumps(answer)})")
+        assistant.eval(respond_js(card_id, answer))
     except (cdp.CdpError, OSError) as e:
         return {"id": card_id, "error": f"racAiAgentRespond: {e}"}
     return {"id": card_id, "answer": answer}
