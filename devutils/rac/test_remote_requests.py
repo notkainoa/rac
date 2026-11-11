@@ -466,6 +466,28 @@ class RemoteRequestsTest(unittest.TestCase):
              ['dir shots', 'expect shots/f00.png', 'expect shots/f01.png',
               'expect shots/f02.png']))
 
+    def test_bang_suggestions_in_the_focused_address_bar(self):
+        # Power's bangs omnibox proof: focus the address bar, type a bang,
+        # shoot the suggestion dropdown. Never submitted.
+        for line in ('command 39001 ; type cats !w ; after 800 burst shots 2 200',
+                     'command 39001 ; nstype !gh rac ; after 800 burst shots 2 200',
+                     'command 39001 ; type cats ; type !w'):
+            self.ok(line)
+        for line in ('command 39001 ; type cats !w ; key return',
+                     'type !w x ; key return',
+                     'command 39001 ; type cats !w ; click 1 2',
+                     'command 39001 ; type cats !w ; key tab',
+                     # Still no URL characters, '!' or not.
+                     'command 39001 ; type !w http://evil.com',
+                     'command 39001 ; type cats!w.com',
+                     # '!' separates words for the denied-page check.
+                     'command 39001 ; type x!flags',
+                     # Focus is not a settings page's input.
+                     'open-urls chrome://settings/assistant ; command 39001'):
+            self.refused(line)
+        # Plain words still submit as before.
+        self.ok('command 39001 ; type cats ; key return')
+
     def test_typing_refusal_names_the_rule(self):
         try:
             self.rr.check_line('type a ; click 1 2')
