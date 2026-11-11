@@ -936,12 +936,19 @@ def answer_card(assistant, card_id, answer, proc, shots):
     return {"id": card_id, "answer": answer}
 
 
+# Stops the task of the conversation the page shows. The browser stops only
+# the named conversation's own task, so without a key there is nothing to
+# send: 'no-key', which stop_timed_out_task() fails on.
+STOP_JS = ("(() => { const k = window.__evals && window.__evals.key;"
+           " if (typeof k !== 'string' || !k) return 'no-key';"
+           " chrome.send('racAiAgentStop', [k]); return 'sent'; })()")
+
+# Seconds a timed-out turn's agent task has to end after its Stop.
+STOP_WAIT = 15
+
 # racAiInit calls AllowJavascript() and subscribes the page to the profile's
 # agent events; without it FireWebUIListener is a no-op and racAiAgentEvent
 # never arrives. Returns the init state ({enabled, configured, needsKey...}).
-# Stops the task of the conversation the page shows.
-STOP_JS = ("chrome.send('racAiAgentStop', [window.__evals.key || '']); true")
-
 ASSISTANT_HOOK = """
 (async () => {
   const cr = await import('chrome://resources/js/cr.js');
@@ -959,7 +966,14 @@ ASSISTANT_HOOK = """
         e => window.__evals.events.push({type: 'attach_failed', id: e.id,
                                          failed: e.failed, never: e.never}));
   }
-  return await cr.sendWithPromise('racAiInit');
+  const state = await cr.sendWithPromise('racAiInit');
+  // The page's own racAiInit drew its conversation (rac-ai-show) before the
+  // listener above was there, and this one draws nothing new, so the key on
+  // show comes with the state.
+  if (state && typeof state.conversation === 'string' && state.conversation) {
+    window.__evals.key = state.conversation;
+  }
+  return state;
 })()
 """
 
@@ -982,6 +996,31 @@ NOTE_PRESENT = "!!document.querySelector('.message-note')"
 NOTE_TEXTS = ("[...document.querySelectorAll('.message-note')]"
               ".map(e => e.textContent)")
 END_STATES = ("done", "stopped", "error")
+
+
+def task_running(events):
+    """Whether an agent task was still running at the last of `events`: it
+    has a run_state, and the newest isn't an end."""
+    states = [e.get("state") for e in events
+              if isinstance(e, dict) and e.get("type") == "run_state"]
+    return bool(states) and states[-1] not in END_STATES
+
+
+def stop_timed_out_task(assistant, start, proc, timeout=STOP_WAIT):
+    """Stops a timed-out turn's agent task over the wire and waits for it to
+    end. Raises when the Stop can't name the conversation on show, or the
+    task outlives it: the browser refused the Stop, and the task would run
+    on into the next turn. A turn with no task running needs nothing more."""
+    status = assistant.eval(STOP_JS)
+    if status != "sent":
+        raise RuntimeError(f"the timed-out turn's Stop wasn't sent ({status!r}):"
+                           " no conversation key on show to name")
+    try:
+        wait_for(lambda: not task_running(
+                     assistant.eval("window.__evals.events")[start:]),
+                 "the stopped task to end", timeout, proc)
+    except RuntimeError as e:
+        raise RuntimeError(f"the browser refused the timed-out turn's Stop: {e}")
 
 
 def reply_notes(events):
@@ -1266,7 +1305,7 @@ def drive(variant, rig, browser, proc, shots=None, trigger=None):
                 # the composer isn't still streaming on the next turn.
                 _ui_eval(assistant, PANEL_STOP_JS)
             else:
-                assistant.eval(STOP_JS, await_promise=False)
+                stop_timed_out_task(assistant, start, proc)
         # Identical adjacent events come from a listener registered twice (a
         # retried evaluate); drop them so one step pairs with one event.
         events = [e for i, e in enumerate(events) if i == 0 or e != events[i - 1]]

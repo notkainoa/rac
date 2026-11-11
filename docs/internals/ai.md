@@ -271,6 +271,19 @@ window, however many tabs have a chat.
 - **A reply that ends in the background** is saved to history by the
   browser, as the page would have saved it, and named when the user comes
   back to it.
+- **At most eight conversations stay in memory per window**
+  (`kMaxKeptChats`, `PickChatsToDrop`). Past that, the idle one shown
+  longest ago is dropped. Idle means no reply coming, no agent task, no
+  card waiting, not the conversation on show or the one just before it (a
+  send that crossed a tab switch still goes there), and no reply that ended
+  in the background that the user hasn't seen yet: showing the conversation
+  clears that. So with many busy ones, more than eight stay. One conversation holds about 1.6 MB at worst,
+  so eight cost 13 MB at worst, beside the 230 MB page they share. A dropped
+  conversation was already saved to history when its reply ended, by the
+  page or the browser. The drop saves it again only if history lacks it,
+  so a saved one keeps its place in "New chat ▾". Its tab shows a new chat
+  when the user comes back to it. With history off, a dropped conversation
+  is gone, as it is when its chat closes.
 - **Approval cards.** An answer names the conversation, the card's action,
   and the nonce the browser gave the card when it last put it on show
   (`CardGate`). The browser takes it only while the panel is on screen, for
@@ -281,12 +294,13 @@ window, however many tabs have a chat.
   too, and act only on its own task; Resume also needs it on show. A send
   goes only to the conversation on show, or the one just before it.
 - **What ends a conversation.** Closing the panel on its tab, closing the
-  last tab that shows it, or turning AI off. Ending it stops its reply and
-  its agent task, and a card waiting with it. Switching tabs, or another
-  side panel taking the panel, keeps it. A tab moved to another window
-  takes its messages along (`CarryAssistantConversation`); a reply still
-  running stops, and the new window shows what it had, then "Stopped
-  because the tab moved to another window." Chromium keeps the cached view of a tab's open entry, so a view
+  last tab that shows it, turning AI off, or the cap dropping it while it's
+  idle. Ending it stops its reply and its agent task, and a card waiting
+  with it. Switching tabs, or another side panel taking the panel, keeps
+  it. A tab moved to another window takes its messages along
+  (`CarryAssistantConversation`); a reply still running stops, and the new
+  window shows what it had, then "Stopped because the tab moved to another
+  window." Chromium keeps the cached view of a tab's open entry, so a view
   can arrive from the old window; it takes the new window's page
   (`ViewNeedsWindowPage`).
 - **A conversation follows its agent task.** `open_tab` and `switch_tab`
@@ -296,6 +310,13 @@ window, however many tabs have a chat.
   So the cards stay in reach wherever the agent works, and the user's own
   tab switches still follow the tab. A tab with a conversation of its own
   keeps it.
+- **Closing the tab the task started on doesn't stop it** while another
+  tab still shows its conversation: a tab the task followed to, or the
+  other pane of a split. The conversation ends with the last tab that shows
+  it, so the task goes on there, with its cards. The user stops it there,
+  like any task: Stop in that tab's chat, the pill on the tab the agent
+  works in, ⌘., or Esc on a card. Closing that tab's chat, or the tab,
+  also ends the conversation and its task.
 - **Split view.** The panel follows the focused pane. Moving between the
   two panes of a split shares the open conversation with the other pane
   rather than closing it on every click (`ChatMove::kShareWithSplit`); an
@@ -930,9 +951,12 @@ detach is posted.
 - `--rac-agent-debug` enables `racAiAgentDebug` on `chrome://rac-ai`:
   attach a tab, take a snapshot, click, type, select, or navigate by ref or
   URL, without a model. It also enables `racAiAgentDebugEvent`, which fakes
-  agent events so the cards and indicator can be driven by hand. Both are
-  off without the switch. This switch and `--rac-agent-mcp-echo` exist only
-  where `rac_dev_switches` is on (`!is_official_build`). Release builds are
+  agent events so the cards and indicator can be driven by hand. A faked
+  event's `id` is moved into a debug space (`CardGate::DebugActionId`), so
+  it never names one of the agent's cards, and a faked card is refused
+  while the conversation waits on a real one. Both are off without the
+  switch. This switch and `--rac-agent-mcp-echo` exist only where
+  `rac_dev_switches` is on (`!is_official_build`). Release builds are
   official, so their names and code are compiled out.
 - Send each `chrome.send` message from the page that owns it. An unhandled
   message is a `NOTREACHED`, and it takes the browser down. Settings messages
