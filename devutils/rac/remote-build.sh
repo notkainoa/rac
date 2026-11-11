@@ -48,11 +48,18 @@
 #                                     --rac-import-arc-now (import at startup,
 #                                     only with --rac-import-source-root=),
 #                                     --rac-import-arc-undo-now (undo the
-#                                     profile's Arc import at startup),
+#                                     profile's Arc import at startup; bare,
+#                                     alone or with --rac-import-source-root=),
 #                                     --rac-arc-import-fixture=<path> and
 #                                     --rac-import-source-root=<path> (Arc
 #                                     import inputs, relative to the clone,
-#                                     that must exist there),
+#                                     that must exist there; a run without
+#                                     --rac-import-source-root= gets the
+#                                     clone's empty build/empty-import-root
+#                                     as one, so a restored setup?arc tab,
+#                                     the tour or Settings never reads the
+#                                     Pro's real Arc; evals hand it to the
+#                                     runner too),
 #                                     --rac-window-screenshot=<name>.png
 #                                     (first shot; lands in build/shots) and
 #                                     --rac-window-screenshot-delay=<1-4
@@ -60,7 +67,9 @@
 #                                     must be shorter than --timeout),
 #                                     --log-net-log=<name>.json and
 #                                     --rac-frame-log=<name>.log (logs; land
-#                                     in build/logs),
+#                                     in build/logs; a net log run ends with
+#                                     SIGTERM to the browser alone, up to
+#                                     10s, so the log is flushed),
 #                                     --net-log-capture-mode=Default|
 #                                     IncludeSensitive|Everything,
 #                                     --enable-logging=stderr,
@@ -252,6 +261,30 @@ safe_name() {
   case "$1" in
     '' | .* | *[!A-Za-z0-9._-]*) return 1 ;;
   esac
+}
+
+# Prints clone $1's empty Arc import root, making it if needed. A dev build
+# without --rac-import-source-root reads the Pro's real Arc wherever an Arc
+# step opens (a restored setup?arc tab, the tour, Settings, an eval), so
+# every browser this script starts gets a source root: this one when the
+# run names none. It is a plain empty folder in the clone, never a
+# symlink; anything else fails (exit 2 from the caller's `|| exit 2`).
+empty_import_root() {
+  local root="$1/build/empty-import-root" path
+  for path in "$1/build" "$root"; do
+    [ ! -L "$path" ] || { echo "rac remote: refusing: $path is a symlink" >&2; return 2; }
+  done
+  inside_clone "$1" "$root" || { echo "rac remote: refusing: $root leaves the clone" >&2; return 2; }
+  mkdir -p "$root"
+  { [ -d "$root" ] && [ ! -L "$root" ] && inside_clone "$1" "$root"; } || {
+    echo "rac remote: refusing: $root is not a folder in the clone" >&2
+    return 2
+  }
+  [ -z "$(ls -A "$root")" ] || {
+    echo "rac remote: refusing: $root must stay empty; remove what is in it" >&2
+    return 2
+  }
+  printf '%s\n' "$root"
 }
 
 # The toolchain record a tree answers to: a clone's own copy in its
@@ -1390,7 +1423,8 @@ cmd_run() {
       --rac-import-source-root=*) import_input=1; source_root=1 ;;
       --rac-import-arc-now) arc_now=1 ;;
       # Undoes the clone profile's own Arc import record; reads no Arc data,
-      # so it needs no source root, but it is an import run.
+      # so it needs no source root (one may be passed, and the browser then
+      # ignores it), but it is an import run.
       --rac-import-arc-undo-now) undo_now=1 ;;
       --test-type) test_type=1 ;;
     esac
@@ -1422,7 +1456,10 @@ cmd_run() {
     esac
   done
   # chrome://setup is the Arc import screen: without an import input in
-  # the same run it would read the maintainer's real Arc data.
+  # the same run it would read the maintainer's real Arc data. The empty
+  # source root the Pro gives a run with no input doesn't count here: it
+  # only backs up a page the run never asked for, and an import screen
+  # that finds no Arc tests nothing.
   if [ "$setup_page" = 1 ] && [ "$import_input" = 0 ]; then
     refuse "opening chrome://setup needs --rac-arc-import-fixture= or --rac-import-source-root= in the same run, so the import screen reads a fixture, not the Pro's real Arc data"
   fi
@@ -1524,6 +1561,11 @@ args=()
 expected=()
 # Log files the browser is asked to write, mapped under build/logs.
 logfiles=()
+# Whether the run writes a net log, and names an Arc source root of its
+# own (a fixture alone isn't one: Settings and the reader still look for
+# Arc on disk).
+net_log=0
+root_given=0
 for arg in "$@"; do
   case "$arg" in
     --rac-window-screenshot=*)
@@ -1534,11 +1576,13 @@ for arg in "$@"; do
     --log-net-log=* | --rac-frame-log=*)
       log="$clone/build/logs/${arg#*=}"
       arg="${arg%%=*}=$log"
+      case "$arg" in --log-net-log=*) net_log=1 ;; esac
       logfiles+=("$log") ;;
     # Inputs rac reads Arc data from, which need absolute paths: relative
     # to the clone, existing, and still inside it once symlinks resolve.
     # Nothing is created for them.
     --rac-arc-import-fixture=* | --rac-import-source-root=*)
+      case "$arg" in --rac-import-source-root=*) root_given=1 ;; esac
       input=${arg#*=}
       [ -n "$input" ] || { echo "rac remote: refusing: ${arg%%=*} needs a path in the clone" >&2; exit 2; }
       input="$clone/$input"
@@ -1548,6 +1592,17 @@ for arg in "$@"; do
   esac
   args+=("$arg")
 done
+# A run without a source root can still reach an Arc step: a setup?arc tab
+# restored from the clone's saved session, the first-run tour without
+# --no-first-run, or Settings' import card in a fixture run. A dev build
+# without --rac-import-source-root reads the Pro's real Arc there, so the
+# run gets the clone's empty root: Arc is not found and the real Arc is
+# never opened. The Air made its import-run decisions (--test-type, the
+# dead proxy, the refusals) without it, so the run stays what it was.
+if [ "$root_given" = 0 ]; then
+  empty_root=$(empty_import_root "$clone") || exit 2
+  args+=("--rac-import-source-root=$empty_root")
+fi
 if [ -n "$shot" ]; then
   # A symlinked build/shots would write the PNG anywhere on the Pro, and a
   # symlink anywhere on the way escapes just the same; the real path has
@@ -1814,6 +1869,57 @@ our_pids() {
     case "$fam" in *" $p "*) printf ' %s' "$p" ;; esac
   done
 }
+# The clone's own browser binary among this launch's processes (not a
+# helper, whose binary lives elsewhere in the app).
+main_pids() {
+  local fam
+  fam=" $(family_pids) "
+  ps -axo pid=,command= | P="$app_bin" F="$fam" awk '{
+    pid = $1; sub(/^ *[0-9]+ +/, "")
+    if (($0 == ENVIRON["P"] || index($0, ENVIRON["P"] " ") == 1) &&
+        index(ENVIRON["F"], " " pid " ")) print pid
+  }'
+}
+# Every process of this launch that runs from the clone's own app: the
+# main process and its helpers (the network service among them).
+app_pids() {
+  local fam
+  fam=" $(family_pids) "
+  ps -axo pid=,command= | D="${app_bin%MacOS/rac}" F="$fam" awk '{
+    pid = $1; sub(/^ *[0-9]+ +/, "")
+    if (index($0, ENVIRON["D"]) == 1 && index(ENVIRON["F"], " " pid " ")) print pid
+  }'
+}
+# Alive and not a zombie waiting for its parent.
+pid_running() {
+  case "$(ps -o stat= -p "$1" 2>/dev/null)" in '' | *Z*) return 1 ;; esac
+}
+# The network service writes a net log and finishes it only when the
+# browser shuts down cleanly, which Chromium does on SIGTERM. The queue
+# and stop_own signal the whole process group, so the network service
+# dies with the browser and the log keeps only its first moments. A run
+# with a net log first sends SIGTERM to the browser's main process alone
+# and gives the browser 10s to quit: the main process and then its
+# helpers, since the network service finishes the log after the main
+# process is gone. Whatever is left then gets the usual stop. Succeeds
+# when it signalled a browser.
+quit_main() {
+  local mains helpers p i left
+  mains=$(main_pids)
+  [ -n "$mains" ] || return 1
+  # Taken before the SIGTERM: once the main process exits, its helpers
+  # belong to launchd and no longer show up as this launch's processes.
+  helpers=$(app_pids)
+  for p in $mains; do kill -TERM "$p" 2>/dev/null || true; done
+  for i in $(seq 1 40); do
+    left=
+    for p in $mains $helpers; do pid_running "$p" && left="$left $p"; done
+    [ -n "$left" ] || return 0
+    sleep 0.25
+  done
+  echo "rac remote: the browser did not quit within 10s of SIGTERM; the queue stops it next" >&2 || true
+  return 0
+}
 stop_own() {
   local i p left
   for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -1935,6 +2041,7 @@ browser_pids=
 spawned=
 cleanup() {
   if [ -n "$launcher" ]; then
+    [ "$net_log" = 0 ] || quit_main || true
     kill "$launcher" 2>/dev/null || true
     wait "$launcher" 2>/dev/null || true
     launcher=
@@ -2027,6 +2134,9 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 launched=${end:+yes}
 killed=0
+if [ "$net_log" = 1 ] && quit_main; then
+  killed=1
+fi
 if kill -0 "$launcher" 2>/dev/null; then
   killed=1
   kill "$launcher" 2>/dev/null || true
@@ -2222,6 +2332,14 @@ for dir in "$clone/build" "$evals_dir" "$results" "$tmp"; do
   }
 done
 mkdir -p "$results" "$tmp"
+# The runner launches the browser itself, so it has to hand every launch
+# the clone's empty Arc root the way `run` does; a runner that doesn't
+# know RAC_EVALS_IMPORT_SOURCE_ROOT could read the Pro's real Arc.
+grep -q RAC_EVALS_IMPORT_SOURCE_ROOT "$runner/devutils/rac/evals/run.py" || {
+  echo "rac remote: refusing: the runner at $ref doesn't pass RAC_EVALS_IMPORT_SOURCE_ROOT to the browser; run evals from a branch that does" >&2
+  exit 2
+}
+import_root=$(empty_import_root "$clone") || exit 2
 for dir in "$evals_dir" "$results" "$tmp"; do
   inside_clone "$clone" "$dir" || {
     echo "rac remote: refusing: $dir leaves the clone through a symlink" >&2
@@ -2283,7 +2401,7 @@ trap 'cleanup; exit 130' INT TERM HUP
 # process on one line and tree_procs finds it by run.py's path.
 run_main='import os, runpy, sys; sys.argv = sys.argv[1:]; sys.path.insert(0, os.path.dirname(sys.argv[0])); runpy.run_path(sys.argv[0], run_name="__main__")'
 python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-  env RAC_EVALS_NO_QUEUE=1 "TMPDIR=$tmp" \
+  env RAC_EVALS_NO_QUEUE=1 "TMPDIR=$tmp" "RAC_EVALS_IMPORT_SOURCE_ROOT=$import_root" \
   nice -n 10 taskpolicy -c utility devutils/rac/build-queue.sh --run \
   bash -c 'cd "$1" && shift && exec "$@"' rac-evals "$runner" \
   python3 -I -c "$run_main" "$runner/devutils/rac/evals/run.py" \

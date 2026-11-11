@@ -403,6 +403,11 @@ def launch_args(profile, worktree, shots=None):
             "--remote-debugging-port=0",
             "--rac-launch-in-background", "--no-first-run", "--no-default-browser-check",
             "--disable-background-networking", "--disable-component-update"]
+    # remote-build.sh evals hands every launch the clone's empty Arc root,
+    # so no eval can open an Arc step that reads the host's real Arc data.
+    root = os.environ.get("RAC_EVALS_IMPORT_SOURCE_ROOT")
+    if root:
+        argv.append(f"--rac-import-source-root={root}")
     if shots is not None:
         # window_screenshot.mm only polls the requests file when the main
         # screenshot switch is also set, so a boot capture has to come too.

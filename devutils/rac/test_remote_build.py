@@ -218,9 +218,43 @@ for request in open(sys.argv[1]).read().strip().split(' ; '):
 PY
   ) &
 fi
+# A browser with a helper: GRACEFUL_APP names a script (GRACEFUL_BROWSER)
+# to run titled with this app's own path.
+[ -z "${GRACEFUL_APP:-}" ] || \
+  exec -a "$0" bash "$GRACEFUL_APP" "${0%/MacOS/rac}/Frameworks/helper"
 # Stand in for the browser: a sleeper titled with this app's own path so
 # the run command's pgrep finds it and nothing else.
 exec bash -c 'exec -a "$1" sleep 600' _ "$0"
+'''
+# A browser main process with a helper titled as one of the app's own (the
+# network service, in its process group). On SIGTERM it logs whether the
+# helper is still there to flush a net log, the way a clean quit needs,
+# tells the helper to finish, and quits; the helper then takes 1s to
+# finish the log on its own, like the real network service, and logs
+# "helper flushed" unless it is killed first. IGNORE_TERM makes one that
+# never quits on SIGTERM.
+GRACEFUL_BROWSER = '''\
+(exec -a "$1" bash -c 'trap "sleep 1; echo helper flushed >> \\"\\$RAC_FAKE_LOG\\"; exit 0" USR1
+  while :; do sleep 0.2; done') &
+helper=$!
+sleep 600 &
+idle=$!
+quit() {
+  sleep 0.5
+  case "$(ps -o stat= -p "$helper" 2>/dev/null)" in
+    '' | *Z*) echo "app quit helper-gone" >> "$RAC_FAKE_LOG" ;;
+    *) echo "app quit helper-running" >> "$RAC_FAKE_LOG" ;;
+  esac
+  [ -z "${IGNORE_TERM:-}" ] || return 0
+  kill -USR1 "$helper" 2>/dev/null
+  kill "$idle" 2>/dev/null
+  exit 0
+}
+trap quit TERM
+while :; do
+  wait "$idle"
+  kill -0 "$idle" 2>/dev/null || { sleep 600 & idle=$!; }
+done
 '''
 STUB_QUEUE_SH = '''\
 echo "queue $*" >> "$RAC_FAKE_LOG"
@@ -237,6 +271,31 @@ fi
 while [ "${1#-}" != "$1" ]; do
   case "$1" in --full) shift 2 ;; *) shift ;; esac
 done
+# QUEUE_GROUP_KILL: like the real queue, run the command in a session of
+# its own and, when stopped, SIGTERM that whole group, then SIGKILL it if
+# it outlives a 5s grace; once it exits on its own, give the rest of the
+# group 10s to drain before the SIGTERM.
+if [ -n "${QUEUE_GROUP_KILL:-}" ]; then
+  python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
+  child=$!
+  stop() {
+    kill -TERM -- "-$child" 2>/dev/null
+    for _ in $(seq 1 20); do
+      kill -0 -- "-$child" 2>/dev/null || exit 143
+      sleep 0.25
+    done
+    kill -KILL -- "-$child" 2>/dev/null
+    exit 143
+  }
+  trap stop TERM
+  wait "$child" || true
+  for _ in $(seq 1 40); do
+    kill -0 -- "-$child" 2>/dev/null || exit 0
+    sleep 0.25
+  done
+  kill -TERM -- "-$child" 2>/dev/null
+  exit 0
+fi
 exec "$@"
 '''
 STUB_UPDATE_PATCHES = '''\
@@ -354,6 +413,8 @@ if log:
         f.write('run.py env RAC_EVALS_NO_QUEUE=%s TMPDIR=%s\\n' % (
             os.environ.get('RAC_EVALS_NO_QUEUE', ''),
             os.environ.get('TMPDIR', '')))
+        f.write('run.py env RAC_EVALS_IMPORT_SOURCE_ROOT=%s\\n' % (
+            os.environ.get('RAC_EVALS_IMPORT_SOURCE_ROOT', ''),))
 args = sys.argv[1:]
 if '--list' in args:
     sys.exit(0)
@@ -2291,6 +2352,109 @@ class RunTest(RemoteBuildTest):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn('Arc import run', result.stderr)
 
+    def test_run_import_arc_undo_now_takes_a_source_root(self):
+        # Undo reads no Arc data, but it may pair with a source root (such
+        # as one the restored import screen should read); still an import
+        # run.
+        (self.clone / 'build/arc-root').mkdir(parents=True)
+        self.run_rb('run', self.wt, '--timeout', '3', '--', '--no-first-run',
+                    '--rac-import-arc-undo-now',
+                    '--rac-import-source-root=build/arc-root', success=True)
+        clone = os.path.realpath(self.clone)
+        calls = self.calls()
+        self.assertIn('--rac-import-arc-undo-now', calls)
+        self.assertIn(f'--rac-import-source-root={clone}/build/arc-root', calls)
+        self.assertNotIn('empty-import-root', calls)
+        self.assertNotIn('--test-type', calls)
+        self.assertIn('--proxy-bypass-list=<-loopback>', calls)
+
+    def test_run_without_an_import_input_gets_an_empty_source_root(self):
+        # A restored setup?arc tab or the tour's Arc step would read the
+        # Pro's real Arc in a run with no import input, so the Pro hands
+        # such a run an empty source root in the clone. It stays a plain
+        # run: --test-type, no dead proxy.
+        clone = os.path.realpath(self.clone)
+        empty = f'--rac-import-source-root={clone}/build/empty-import-root'
+        self.run_rb('run', self.wt, '--timeout', '3', '--', '--no-first-run',
+                    success=True)
+        calls = self.calls()
+        self.assertIn(empty, calls)
+        self.assertIn('--test-type', calls)
+        self.assertNotIn('--proxy-server', calls)
+        root = self.clone / 'build/empty-import-root'
+        self.assertTrue(root.is_dir())
+        self.assertFalse(root.is_symlink())
+        self.assertEqual(list(root.iterdir()), [])
+        # An import run without an input of its own gets one too.
+        self.log.unlink()
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    '--rac-import-arc-undo-now', success=True)
+        self.assertIn(empty, self.calls())
+        # A fixture alone isn't a source root (Settings and the reader
+        # still look for Arc on disk), so it gets the empty root too...
+        write(self.clone / 'devutils/fixtures/arc/StorableSidebar.json', '{}\n')
+        self.log.unlink()
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    '--rac-arc-import-fixture=devutils/fixtures/arc/StorableSidebar.json',
+                    success=True)
+        self.assertIn(empty, self.calls())
+        # ...and a run that names a source root gets only its own.
+        (self.clone / 'build/arc-root').mkdir(parents=True)
+        self.log.unlink()
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    '--rac-import-source-root=build/arc-root', success=True)
+        self.assertNotIn('empty-import-root', self.calls())
+        # The empty root never makes the import screen safe to open.
+        for arg in ('chrome://setup', 'rac://setup?arc',
+                    'chrome://settings/general'):
+            result = self.run_rb('run', self.wt, '--', arg, success=False)
+            self.assertEqual(result.returncode, 2, arg)
+            self.assertIn('import', result.stderr, arg)
+        # Never through a symlink, and never one that holds anything.
+        outside = self.folder / 'outside-root'
+        outside.mkdir()
+        root.rmdir()
+        root.symlink_to(outside)
+        result = self.run_rb('run', self.wt, '--timeout', '3', success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('symlink', result.stderr)
+        root.unlink()
+        write(root / 'StorableSidebar.json', '{}\n')
+        result = self.run_rb('run', self.wt, '--timeout', '3', success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('must stay empty', result.stderr)
+
+    def test_run_net_log_quits_the_browser_alone_first(self):
+        # A net log is finished by a clean quit, which needs the network
+        # service alive: a run with one SIGTERMs the browser's main process
+        # alone before the queue stops the whole group. One without keeps
+        # the whole-group stop.
+        script = self.folder / 'graceful.sh'
+        write(script, GRACEFUL_BROWSER)
+        app = f'{os.path.realpath(self.clone)}/build/src/out/Default/rac.app/'
+        env = {'GRACEFUL_APP': str(script), 'QUEUE_GROUP_KILL': '1'}
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    '--log-net-log=net.json', success=True, **env)
+        self.assertIn('app quit helper-running', self.calls())
+        # The helper outlives the main process to finish the log, and the
+        # run waits for it instead of stopping the group under it.
+        self.assertIn('helper flushed', self.calls())
+        self.assertEqual(self.procs_starting(app), [])
+        # A frame log alone doesn't need it.
+        self.log.unlink()
+        self.run_rb('run', self.wt, '--timeout', '3', '--',
+                    '--rac-frame-log=frame.log', success=True, **env)
+        self.assertIn('app quit helper-gone', self.calls())
+        self.assertNotIn('helper-running', self.calls())
+        self.assertEqual(self.procs_starting(app), [])
+        # A browser that doesn't quit gets 10s, then the usual stop.
+        self.log.unlink()
+        result = self.run_rb('run', self.wt, '--timeout', '3', '--',
+                             '--log-net-log=net.json', success=True,
+                             IGNORE_TERM='1', **env)
+        self.assertIn('did not quit within 10s', result.stderr)
+        self.assertEqual(self.procs_starting(app), [])
+
     def test_run_import_arc_now_needs_a_source_root(self):
         # Without --rac-import-source-root the dev import reads the Pro's
         # real Arc, and an Arc fixture file is not a source root.
@@ -2872,6 +3036,11 @@ class EvalsTest(RemoteBuildTest):
         # the clone for temp files.
         self.assertIn('run.py env RAC_EVALS_NO_QUEUE=1 '
                       f'TMPDIR={clone}/build/evals/tmp', calls)
+        # ...and the clone's empty Arc root to hand every browser it starts.
+        self.assertIn('run.py env RAC_EVALS_IMPORT_SOURCE_ROOT='
+                      f'{clone}/build/empty-import-root', calls)
+        root = self.clone / 'build/empty-import-root'
+        self.assertTrue(root.is_dir() and not root.is_symlink())
         # Only the runner's own subtree was extracted, into a fresh dir.
         self.assertEqual([p.name for p in runner.iterdir()], ['devutils'])
         self.assertTrue((runner / 'devutils/rac/evals/run.py').exists())
@@ -3029,6 +3198,19 @@ class EvalsTest(RemoteBuildTest):
         result = self.run_evals('--ref', 'no-such-branch', success=False)
         self.assertIn('no-such-branch', result.stderr)
         self.assertNotIn('run.py', self.calls())
+
+    def test_evals_refuses_a_runner_without_the_empty_arc_root(self):
+        # A runner that doesn't hand its browsers RAC_EVALS_IMPORT_SOURCE_ROOT
+        # could open an Arc step that reads the Pro's real Arc: refused
+        # before it runs.
+        git(self.origin, 'checkout', '-q', '-b', 'old-runner')
+        write(self.origin / 'devutils/rac/evals/run.py',
+              STUB_RUN_PY.replace('RAC_EVALS_IMPORT_SOURCE_ROOT', 'OTHER'))
+        git(self.origin, 'commit', '-qam', 'old runner')
+        result = self.run_evals('--ref', 'old-runner', success=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('RAC_EVALS_IMPORT_SOURCE_ROOT', result.stderr)
+        self.assertNotIn('run.py ', self.calls())
 
     def test_evals_exit_status_is_the_runners(self):
         result = self.run_evals(success=False, RUNPY_EXIT='7')
