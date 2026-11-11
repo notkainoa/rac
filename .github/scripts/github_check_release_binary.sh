@@ -8,8 +8,9 @@
 # Usage: github_check_release_binary.sh <path/to/rac.app>
 #
 # RAC_G6_GATE decides what a match does:
-#   warn     (default) print a warning for each match and exit 0
-#   enforce  print an error for each match and exit 1
+#   enforce  (default) print an error for each match and exit 1
+#   warn     print a warning for each match and exit 0, for a dry run that
+#            must get past a match to test the steps after it
 #
 # Exits 2 when it can't do the check at all (no bundle, nothing to scan, no
 # `strings`, unknown RAC_G6_GATE), whatever the mode: a gate that scanned
@@ -28,7 +29,7 @@ _forbidden=(
   rac-launch-in-background
 )
 
-_mode="${RAC_G6_GATE:-warn}"
+_mode="${RAC_G6_GATE:-enforce}"
 case "$_mode" in
   warn) _level=warning ;;
   enforce) _level=error ;;
@@ -107,5 +108,5 @@ if [ "$_mode" = enforce ]; then
   echo "::error::$_summary Release builds must not contain developer switches."
   exit 1
 fi
-echo "::warning::$_summary Not failing because RAC_G6_GATE=warn; set it to enforce once the switches are behind a build flag."
+echo "::warning::$_summary Not failing because RAC_G6_GATE=warn; never release a build that needed it."
 exit 0

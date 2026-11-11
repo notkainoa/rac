@@ -175,9 +175,11 @@ Release builds must not contain rac's developer switches
 file in the app with `strings` and names each binary and match it finds.
 
 The workflow's **Developer switches (G6)** input decides what a match does:
-`warn` (the default) annotates the run and carries on; `enforce` fails the
-build. It stays `warn` until the switches are compiled only into dev builds;
-then change the input's default in `build.yml` to `enforce`.
+`enforce` (the default) fails the build; `warn` annotates the run and
+carries on. The switches are compiled only into dev builds, so a match means
+a dev-only path leaked into the release build: fix it, don't switch to
+`warn`. `warn` exists for a dry run that has to get past a match to test the
+steps after it, and a build that needed it is never released.
 
 ## Testing an update locally
 
