@@ -1,0 +1,710 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3762,6 +3762,7 @@ static_library("ui") {
+     ]
+     deps += [ "//chrome/browser/ui/views/rac:sidebar_overshoot_zone" ]
+     deps += [ "//chrome/browser/ui/views/rac:window_buttons_ratio" ]
++    deps += [ "//chrome/browser/ui/views/rac:page_edge_blend" ]
+ 
+     sources += get_target_outputs(":webui_name_variants")
+ 
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -47,6 +47,7 @@
+ #include "chrome/browser/ui/views/rac/infobar_card.h"
+ #include "chrome/browser/ui/views/rac/rac_look.h"
+ #include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h"
++#include "chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.h"
+ #include "chrome/browser/ui/views/rac/spaces/space_tint_background.h"
+ #include "chrome/browser/ui/views/rac/top_bar.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel.h"
+@@ -1717,6 +1718,10 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+                     is_scrim_visible);
+   }
+ 
++  // rac: the page follows the sidebar while Cmd+S docks or hides it.
++  rac::BlendLayoutForSidebarDock(views().browser_view,
++                                 views().vertical_tab_strip_region_view, layout);
++
+   return layout;
+ }
+ 
+--- a/chrome/browser/ui/views/rac/BUILD.gn
++++ b/chrome/browser/ui/views/rac/BUILD.gn
+@@ -204,14 +204,28 @@ source_set("window_buttons_ratio") {
+   ]
+ }
+ 
++# Where the page goes while Cmd+S docks or hides the sidebar.
++source_set("page_edge_blend") {
++  sources = [
++    "sidebar_reveal/page_edge_blend.cc",
++    "sidebar_reveal/page_edge_blend.h",
++  ]
++  public_deps = [
++    "//base",
++    "//ui/gfx/geometry",
++  ]
++}
++
+ # Build with `autoninja -C out/Default
+ # chrome/browser/ui/views/rac:rac_sidebar_reveal_unittests`.
+ test("rac_sidebar_reveal_unittests") {
+   sources = [
++    "sidebar_reveal/page_edge_blend_unittest.cc",
+     "sidebar_reveal/sidebar_overshoot_zone_unittest.cc",
+     "sidebar_reveal/window_buttons_ratio_unittest.cc",
+   ]
+   deps = [
++    ":page_edge_blend",
+     ":sidebar_overshoot_zone",
+     ":window_buttons_ratio",
+     "//base",
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar_reveal/page_edge_blend.cc
+@@ -0,0 +1,59 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/sidebar_reveal/page_edge_blend.h"
++
++#include <algorithm>
++
++#include "base/numerics/safe_conversions.h"
++
++namespace rac {
++
++namespace {
++
++// `from` moved `t` of the way to `to`, rounded to the nearest DIP. `t` may
++// pass 0 or 1 when a spring overshoots.
++int BlendEdge(int from, int to, double t) {
++  return base::ClampRound(from + (to - from) * t);
++}
++
++}  // namespace
++
++PageEdgeBlend::PageEdgeBlend() = default;
++PageEdgeBlend::~PageEdgeBlend() = default;
++
++gfx::Rect PageEdgeBlend::Blend(const void* view,
++                               const gfx::Rect& rest,
++                               const gfx::Rect& current,
++                               bool docking,
++                               double value) {
++  if (first_pass_ && !moves_.contains(view) && !current.IsEmpty() &&
++      !rest.IsEmpty()) {
++    const gfx::Rect& docked = docking ? rest : current;
++    const gfx::Rect& hidden = docking ? current : rest;
++    moves_.emplace(view, Move{docked.x() - hidden.x(), docked.y() - hidden.y(),
++                              docked.right() - hidden.right(),
++                              docked.bottom() - hidden.bottom()});
++  }
++  const auto move = moves_.find(view);
++  // A view that only shows on one side, or that came in mid-slide, rests.
++  if (move == moves_.end() || rest.IsEmpty()) {
++    return rest;
++  }
++  // How far the slide still has to go, as a share of the move: negative
++  // while docking, from where the slide ends back toward hidden.
++  const double t = value - (docking ? 1 : 0);
++  const Move& m = move->second;
++  const int x = BlendEdge(rest.x(), rest.x() + m.x, t);
++  const int y = BlendEdge(rest.y(), rest.y() + m.y, t);
++  const int right = BlendEdge(rest.right(), rest.right() + m.right, t);
++  const int bottom = BlendEdge(rest.bottom(), rest.bottom() + m.bottom, t);
++  return gfx::Rect(x, y, std::max(0, right - x), std::max(0, bottom - y));
++}
++
++bool PageFollowsSidebar(bool dock, bool reduced_motion, bool fullscreen) {
++  return dock && !reduced_motion && !fullscreen;
++}
++
++}  // namespace rac
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar_reveal/page_edge_blend.h
+@@ -0,0 +1,70 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_PAGE_EDGE_BLEND_H_
++#define CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_PAGE_EDGE_BLEND_H_
++
++#include "base/containers/flat_map.h"
++#include "ui/gfx/geometry/rect.h"
++
++namespace rac {
++
++// Where the browser's views go while Cmd+S docks or hides the sidebar, so
++// the page's edge moves with it (plan 02, S1).
++//
++// The browser's layout knows only where a view rests: beside the docked
++// sidebar, or with the sidebar hidden. Each layout pass during the slide
++// hands every view's rest bounds for the side the slide heads to. The first
++// pass also has where each view was when the slide began, and keeps how far
++// each edge moves between the two sides. Every pass then moves the view back
++// from its rest by that much times how far the slide has to go. So anything
++// else that moves the page in the meantime, such as the chat panel opening on
++// its own clock, still moves it: both add up, frame for frame. A slide that
++// turns around keeps the same distances.
++//
++// `value` is the sidebar's: 0 hidden, 1 docked. Views are only compared by
++// address here, never used.
++class PageEdgeBlend {
++ public:
++  PageEdgeBlend();
++  PageEdgeBlend(const PageEdgeBlend&) = delete;
++  PageEdgeBlend& operator=(const PageEdgeBlend&) = delete;
++  ~PageEdgeBlend();
++
++  // Where `view` goes. `rest` is its bounds in this pass's layout, where the
++  // slide ends: docked when `docking`. `current` is where it is now, which
++  // only a slide's first pass reads.
++  gfx::Rect Blend(const void* view,
++                  const gfx::Rect& rest,
++                  const gfx::Rect& current,
++                  bool docking,
++                  double value);
++
++  // Ends a layout pass. Views first seen after a slide's first pass rest
++  // where the layout puts them.
++  void EndPass() { first_pass_ = false; }
++
++ private:
++  // How far each edge moves from hidden to docked.
++  struct Move {
++    int x = 0;
++    int y = 0;
++    int right = 0;
++    int bottom = 0;
++  };
++
++  base::flat_map<const void*, Move> moves_;
++  bool first_pass_ = true;
++};
++
++// Whether a sidebar slide moves the page with it. Only Cmd+S docking or
++// hiding the sidebar does: edge reveal floats over the page. Under Reduce
++// Motion the page takes its new width at once. In fullscreen the page fills
++// the window (#118, #158) and keeps the layout's bounds, so a window entering
++// fullscreen mid-slide drops the blend.
++bool PageFollowsSidebar(bool dock, bool reduced_motion, bool fullscreen);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_PAGE_EDGE_BLEND_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/rac/sidebar_reveal/page_edge_blend_unittest.cc
+@@ -0,0 +1,116 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/rac/sidebar_reveal/page_edge_blend.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++// A window 1200 wide: docked, the page card starts after a 240 DIP sidebar;
++// hidden, it spans the window less its margins.
++constexpr gfx::Rect kDockedPage(248, 8, 944, 784);
++constexpr gfx::Rect kHiddenPage(8, 8, 1184, 784);
++
++int kPage;
++int kToolbar;
++
++TEST(PageEdgeBlendTest, DockStartsWhereThePageWas) {
++  PageEdgeBlend blend;
++  // Cmd+S docks: the layout already says docked; the page is still where
++  // the hidden sidebar left it.
++  EXPECT_EQ(blend.Blend(&kPage, kDockedPage, kHiddenPage, true, 0),
++            kHiddenPage);
++  blend.EndPass();
++  EXPECT_EQ(blend.Blend(&kPage, kDockedPage, kHiddenPage, true, 0.25).x(), 68);
++  // Halfway, only the leading edge has moved, by half of 240.
++  EXPECT_EQ(blend.Blend(&kPage, kDockedPage, kHiddenPage, true, 0.5),
++            gfx::Rect(128, 8, 1064, 784));
++  // A spring passing its target carries the edge a little past rest.
++  EXPECT_EQ(blend.Blend(&kPage, kDockedPage, kHiddenPage, true, 1.01).x(),
++            250);
++  EXPECT_EQ(blend.Blend(&kPage, kDockedPage, gfx::Rect(), true, 1),
++            kDockedPage);
++}
++
++TEST(PageEdgeBlendTest, HideStartsWhereThePageWas) {
++  PageEdgeBlend blend;
++  EXPECT_EQ(blend.Blend(&kPage, kHiddenPage, kDockedPage, false, 1),
++            kDockedPage);
++  blend.EndPass();
++  EXPECT_EQ(blend.Blend(&kPage, kHiddenPage, kDockedPage, false, 0.5).x(),
++            128);
++  EXPECT_EQ(blend.Blend(&kPage, kHiddenPage, kDockedPage, false, 0),
++            kHiddenPage);
++}
++
++TEST(PageEdgeBlendTest, TurningAroundKeepsBothSides) {
++  PageEdgeBlend blend;
++  // Hiding, then Cmd+S again 40% of the way: the layout flips to docked, and
++  // `current` is wherever the blend had the page, which must not be read.
++  blend.Blend(&kPage, kHiddenPage, kDockedPage, false, 1);
++  blend.EndPass();
++  const gfx::Rect mid = blend.Blend(&kPage, kHiddenPage, kDockedPage, false,
++                                    0.6);
++  EXPECT_EQ(mid.x(), 152);
++  EXPECT_EQ(blend.Blend(&kPage, kDockedPage, gfx::Rect(1, 2, 3, 4), true, 0.6),
++            mid);
++  EXPECT_EQ(blend.Blend(&kPage, kDockedPage, mid, true, 1), kDockedPage);
++}
++
++TEST(PageEdgeBlendTest, ViewsOnOneSideOnlyRest) {
++  PageEdgeBlend blend;
++  // The top bar's view was hidden (empty) before the dock.
++  const gfx::Rect bar(248, 8, 944, 40);
++  EXPECT_EQ(blend.Blend(&kToolbar, bar, gfx::Rect(), true, 0), bar);
++  blend.EndPass();
++  // A view first laid out after the first pass has nothing to blend from.
++  const gfx::Rect late(10, 10, 20, 20);
++  EXPECT_EQ(blend.Blend(&kPage, late, gfx::Rect(), true, 0.5), late);
++}
++
++// The chat panel opens on its own clock during a Cmd+S dock: each pass's
++// rest has the page's trailing edge where the panel has it now. The
++// sidebar's share moves the leading edge; the panel's moves the trailing one.
++TEST(PageEdgeBlendTest, ChatPanelMovingAtTheSameTimeAddsUp) {
++  PageEdgeBlend blend;
++  blend.Blend(&kPage, kDockedPage, kHiddenPage, true, 0);
++  blend.EndPass();
++  // The panel has taken 100 DIPs off the page's trailing edge so far.
++  gfx::Rect rest = kDockedPage;
++  rest.set_width(rest.width() - 100);
++  const gfx::Rect mid = blend.Blend(&kPage, rest, kHiddenPage, true, 0.5);
++  EXPECT_EQ(mid.x(), 128);
++  EXPECT_EQ(mid.right(), rest.right());
++  // Docked, the page is exactly where the layout has it.
++  EXPECT_EQ(blend.Blend(&kPage, rest, kHiddenPage, true, 1), rest);
++}
++
++TEST(PageEdgeBlendTest, OnlyCmdSOutsideFullscreenMovesThePage) {
++  EXPECT_TRUE(PageFollowsSidebar(/*dock=*/true, /*reduced_motion=*/false,
++                                 /*fullscreen=*/false));
++  // Edge reveal floats over the page.
++  EXPECT_FALSE(PageFollowsSidebar(false, false, false));
++  // Reduce Motion: the page takes its new width at once.
++  EXPECT_FALSE(PageFollowsSidebar(true, true, false));
++  // Fullscreen fills the window with the page; it never blends there.
++  EXPECT_FALSE(PageFollowsSidebar(true, false, true));
++}
++
++// A slide ends exactly on the layout's bounds, so the window at rest, in
++// fullscreen or not, is laid out as before.
++TEST(PageEdgeBlendTest, RestIsExactlyTheLayout) {
++  PageEdgeBlend blend;
++  const gfx::Rect fullscreen(0, 0, 1512, 982);
++  blend.Blend(&kPage, fullscreen, kDockedPage, false, 1);
++  blend.EndPass();
++  EXPECT_EQ(blend.Blend(&kPage, fullscreen, kDockedPage, false, 0),
++            fullscreen);
++  EXPECT_EQ(blend.Blend(&kPage, kDockedPage, fullscreen, true, 1),
++            kDockedPage);
++}
++
++}  // namespace
++}  // namespace rac
+--- a/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.h
++++ b/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.h
+@@ -5,6 +5,8 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_SIDEBAR_REVEAL_MOTION_H_
+ #define CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_SIDEBAR_REVEAL_MOTION_H_
+ 
++#include "ui/gfx/geometry/rect.h"
++
+ class BrowserView;
+ 
+ namespace views {
+@@ -22,8 +24,16 @@ namespace rac {
+ // the layer's place and speed. Under Reduce Motion the sidebar fades in over
+ // tokens::kReducedFade and out over tokens::kFade.
+ //
++// Cmd+S also moves the page's edge with the sidebar (S1). The page has to be
++// laid out every frame for that, so a Cmd+S slide runs its spring on the UI
++// thread instead: each frame moves the sidebar's layer and lays the browser
++// out once, with every view blended between where it rests with the sidebar
++// docked and hidden. Sidebar and page share that one value, so they move
++// together frame for frame. Edge reveal floats over the page and stays on
++// the compositor.
++//
+ // Nothing here exists between slides: a slide's state lives on the browser
+-// view only while its layer animation runs.
++// view only while its animation runs.
+ 
+ // The reveal Helium's layout should use. `reveal` is Helium's value, 0 or 1;
+ // while the sidebar slides out it stays laid out at rest, so this is 1.
+@@ -40,6 +50,55 @@ void OnSidebarRevealChanged(BrowserView*
+                             float reveal,
+                             bool pinned);
+ 
++// While Cmd+S docks or hides the sidebar, where `view` goes instead of
++// `rest`, its bounds where the slide ends. `rest` otherwise. `browser_view`
++// is the BrowserView, as the layout holds it.
++gfx::Rect BlendPageBounds(views::View* browser_view,
++                          const views::View* view,
++                          const gfx::Rect& rest);
++
++// Whether layout passes blend the page now. Fullscreen ends the blend.
++bool IsBlendingPage(views::View* browser_view);
++
++// Ends a layout pass that blended the page, and marks the page as animating
++// its bounds for that frame.
++void EndPageBlendPass(views::View* browser_view);
++
++namespace internal {
++
++template <typename Layout>
++void BlendLayoutChildren(views::View* browser_view,
++                         const views::View* sidebar,
++                         Layout& layout) {
++  for (auto& [view, child] : layout.children) {
++    // The sidebar moves by its layer, from where it rests.
++    if (view.get() == sidebar) {
++      continue;
++    }
++    if (child.visibility.value_or(true)) {
++      child.bounds = BlendPageBounds(browser_view, view.get(), child.bounds);
++    }
++    BlendLayoutChildren(browser_view, sidebar, child);
++  }
++}
++
++}  // namespace internal
++
++// The browser view's layout hook: while Cmd+S docks or hides the sidebar,
++// moves each view of `layout` (BrowserViewLayoutImpl::ProposedLayout) along
++// with the sidebar. `browser_view` is the BrowserView. Does nothing between
++// slides.
++template <typename Layout>
++void BlendLayoutForSidebarDock(views::View* browser_view,
++                               const views::View* sidebar,
++                               Layout& layout) {
++  if (!IsBlendingPage(browser_view)) {
++    return;
++  }
++  internal::BlendLayoutChildren(browser_view, sidebar, layout);
++  EndPageBlendPass(browser_view);
++}
++
+ }  // namespace rac
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_RAC_SIDEBAR_REVEAL_SIDEBAR_REVEAL_MOTION_H_
+--- a/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.mm
++++ b/chrome/browser/ui/views/rac/sidebar_reveal/sidebar_reveal_motion.mm
+@@ -7,7 +7,9 @@
+ #import <AppKit/AppKit.h>
+ #import <QuartzCore/QuartzCore.h>
+ 
++#include <cmath>
+ #include <memory>
++#include <optional>
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
+@@ -15,10 +17,12 @@
+ #include "base/memory/weak_ptr.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/multi_contents_view.h"
+ #include "chrome/browser/ui/views/rac/dev/frame_log.h"
+ #include "chrome/browser/ui/views/rac/motion/rac_motion.h"
+ #include "chrome/browser/ui/views/rac/sidebar_address_bar/sidebar_header_view.h"
+ #include "chrome/browser/ui/views/rac/rac_tokens.h"
++#include "chrome/browser/ui/views/rac/sidebar_reveal/page_edge_blend.h"
+ #include "ui/base/class_property.h"
+ #include "ui/compositor/layer.h"
+ #include "ui/compositor/layer_animation_observer.h"
+@@ -26,8 +30,10 @@
+ #include "ui/compositor/layer_animator.h"
+ #include "ui/gfx/geometry/transform.h"
+ #include "ui/gfx/geometry/vector2d_f.h"
++#include "ui/views/animation/animation_delegate_views.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_tracker.h"
++#include "ui/views/view_utils.h"
+ #include "ui/views/widget/widget.h"
+ 
+ namespace rac {
+@@ -99,11 +105,14 @@ void FadeWindowButtons(BrowserView* brow
+ }  // namespace
+ 
+ // One slide of the sidebar, in or out. It lives on the browser view only
+-// while its layer animation runs.
+-class SidebarSlide : public ui::LayerAnimationObserver {
++// while its animation runs.
++class SidebarSlide : public ui::LayerAnimationObserver,
++                     public views::AnimationDelegateViews {
+  public:
+   SidebarSlide(BrowserView* browser_view, views::View* sidebar)
+-      : browser_view_(browser_view), sidebar_view_(sidebar) {}
++      : views::AnimationDelegateViews(browser_view),
++        browser_view_(browser_view),
++        sidebar_view_(sidebar) {}
+   SidebarSlide(const SidebarSlide&) = delete;
+   SidebarSlide& operator=(const SidebarSlide&) = delete;
+   ~SidebarSlide() override { StopObserving(); }
+@@ -116,8 +125,45 @@ class SidebarSlide : public ui::LayerAni
+   // Cmd+S, which moves on tokens::kSpringDock both ways.
+   void Start(bool dock);
+ 
++  // Whether the page moves with this slide. Called before the layout that
++  // puts the page where the slide ends, so that pass starts the blend from
++  // where the page is. A slide that turns around keeps its blend.
++  void FollowPage(bool follow) {
++    if (!follow) {
++      page_.reset();
++    } else if (!page_) {
++      page_.emplace();
++      page_value_ = DockValue();
++    }
++  }
++
++  // PageEdgeBlend::Blend() for this slide's layout passes.
++  gfx::Rect BlendPage(const views::View* view, const gfx::Rect& rest) {
++    if (!page_) {
++      return rest;
++    }
++    return page_->Blend(view, rest,
++                        view->GetVisible() ? view->bounds() : gfx::Rect(),
++                        showing_, page_value_);
++  }
++  bool blending_page() const { return page_.has_value(); }
++  void EndPagePass() {
++    if (page_) {
++      page_->EndPass();
++    }
++  }
++  // Stops the blend; the next layout puts the page where it rests.
++  void DropPage() {
++    if (page_) {
++      page_.reset();
++      browser_view_->InvalidateLayout();
++    }
++  }
++
+   // Stops where everything rests, as when the sidebar is pinned.
+   void Snap() {
++    dock_.reset();
++    page_.reset();
+     StopObserving();
+     if (ui::Layer* layer = SidebarLayer()) {
+       layer->GetAnimator()->AbortAllAnimations();
+@@ -142,11 +188,34 @@ class SidebarSlide : public ui::LayerAni
+   void OnLayerAnimationScheduled(
+       ui::LayerAnimationSequence* sequence) override {}
+ 
++  // views::AnimationDelegateViews, for the UI-thread Cmd+S spring:
++  void AnimationProgressed(const gfx::Animation* animation) override;
++  void AnimationEnded(const gfx::Animation* animation) override {
++    if (animation == dock_.get()) {
++      FinishLater();
++    }
++  }
++
+   ui::Layer* SidebarLayer() {
+     views::View* sidebar = sidebar_view_.view();
+     return sidebar ? sidebar->layer() : nullptr;
+   }
+ 
++  // How docked the sidebar is now: 1 where it rests docked or revealed, 0
++  // fully out of the window.
++  double DockValue() {
++    if (!started_) {
++      return showing_ ? 0 : 1;
++    }
++    if (dock_) {
++      return dock_->GetCurrentValue();
++    }
++    const float hidden_x = HiddenX();
++    ui::Layer* layer = SidebarLayer();
++    return hidden_x == 0 || fading_ ? (showing_ ? 1 : 0)
++                                    : 1.0 - sidebar_.X(layer) / hidden_x;
++  }
++
+   // Where the layer's x has the sidebar fully out of the window.
+   float HiddenX() const {
+     const views::View* sidebar = sidebar_view_.view();
+@@ -201,12 +270,22 @@ class SidebarSlide : public ui::LayerAni
+             SpringTransformElement::Axis::kX));
+   }
+ 
++  // Moves on the UI thread from `x` at `velocity` (layer DIPs and DIPs per
++  // second) to rest, laying the page out with the sidebar every frame.
++  void StartDock(float x, float velocity);
++
+   // At rest. Deletes this. A sidebar that slid out is now laid out hidden.
+   void Finish();
+ 
+   const raw_ptr<BrowserView> browser_view_;
+   views::ViewTracker sidebar_view_;
+   Track sidebar_;
++  // Cmd+S's spring, when the page moves with the sidebar: 1 docked, 0
++  // hidden. It moves the sidebar's layer and the page together.
++  std::unique_ptr<SpringAnimation> dock_;
++  std::optional<PageEdgeBlend> page_;
++  // The value the page is laid out at; the spring's, once it runs.
++  double page_value_ = 1;
+   bool showing_ = false;
+   bool started_ = false;
+   bool fading_ = false;
+@@ -229,6 +308,8 @@ void SidebarSlide::Start(bool dock) {
+   if (!layer) {
+     return;
+   }
++  // A rest posted by the last run no longer applies.
++  weak_factory_.InvalidateWeakPtrs();
+   const bool show = showing_;
+   const bool fade = motion::ReducedMotion();
+   FadeWindowButtons(browser_view_, show, /*fresh=*/!started_);
+@@ -237,6 +318,9 @@ void SidebarSlide::Start(bool dock) {
+   float velocity = 0;
+   if (!started_) {
+     x = show ? HiddenX() : 0;
++  } else if (dock_) {
++    x = (1.0 - dock_->GetCurrentValue()) * HiddenX();
++    velocity = -dock_->GetCurrentVelocity() * HiddenX();
+   } else if (!fading_) {
+     x = sidebar_.X(layer);
+     velocity = sidebar_.Velocity();
+@@ -246,6 +330,14 @@ void SidebarSlide::Start(bool dock) {
+   started_ = true;
+   fading_ = fade;
+ 
++  if (page_ && !fade) {
++    StartDock(x, velocity);
++    return;
++  }
++  // Only a Cmd+S slide moves the page; anything else rests it.
++  dock_.reset();
++  DropPage();
++
+   if (fade) {
+     // Fades where it rests. A fresh fade in starts clear.
+     layer->SetTransform(gfx::Transform());
+@@ -274,6 +366,50 @@ void SidebarSlide::Start(bool dock) {
+   }
+ }
+ 
++void SidebarSlide::StartDock(float x, float velocity) {
++  const float hidden_x = HiddenX();
++  if (hidden_x == 0) {
++    DropPage();
++    FinishLater();
++    return;
++  }
++  // In values: 1 docked at x 0, 0 hidden at `hidden_x`.
++  const double value = 1.0 - x / hidden_x;
++  const double target = showing_ ? 1 : 0;
++  dev::LogAnimationStep(showing_ ? "sidebar.dock.in" : "sidebar.dock.out",
++                        x - (showing_ ? 0 : hidden_x));
++  dev::LogAnimationStep("sidebar.slide.velocity", velocity);
++  if (dock_ && dock_->is_animating()) {
++    // A turn mid-slide keeps the spring's place and speed.
++    dock_->SetTarget(target);
++    return;
++  }
++  dock_ = std::make_unique<SpringAnimation>(this, tokens::kSpringDock,
++                                            std::abs(hidden_x));
++  dock_->Reset(value);
++  dock_->SetTargetWithVelocity(target, -velocity / hidden_x);
++}
++
++void SidebarSlide::AnimationProgressed(const gfx::Animation* animation) {
++  if (animation != dock_.get()) {
++    return;
++  }
++  page_value_ = dock_->GetCurrentValue();
++  const float x = (1.0 - page_value_) * HiddenX();
++  if (ui::Layer* layer = SidebarLayer()) {
++    layer->SetTransform(gfx::Transform::MakeTranslation(x, 0));
++  }
++  dev::LogAnimationStep("sidebar.dock.value", page_value_);
++  if (!page_) {
++    return;
++  }
++  // The page in the same frame as the sidebar.
++  browser_view_->InvalidateLayout();
++  if (views::Widget* widget = browser_view_->GetWidget()) {
++    widget->LayoutRootViewIfNecessary();
++  }
++}
++
+ void SidebarSlide::Finish() {
+   BrowserView* const browser_view = browser_view_;
+   views::View* const sidebar = sidebar_view_.view();
+@@ -307,6 +443,51 @@ float SidebarWindowButtonsRatio(const Br
+   return slide->showing() ? 1.0f : 0.0f;
+ }
+ 
++namespace {
++
++SidebarSlide* SlideFor(views::View* view) {
++  BrowserView* browser_view = views::AsViewClass<BrowserView>(view);
++  return browser_view ? browser_view->GetProperty(kSidebarSlideKey) : nullptr;
++}
++
++}  // namespace
++
++gfx::Rect BlendPageBounds(views::View* browser_view,
++                          const views::View* view,
++                          const gfx::Rect& rest) {
++  SidebarSlide* slide = SlideFor(browser_view);
++  return slide ? slide->BlendPage(view, rest) : rest;
++}
++
++bool IsBlendingPage(views::View* browser_view) {
++  SidebarSlide* slide = SlideFor(browser_view);
++  if (!slide || !slide->blending_page()) {
++    return false;
++  }
++  if (views::AsViewClass<BrowserView>(browser_view)->IsFullscreen()) {
++    slide->DropPage();
++    return false;
++  }
++  return true;
++}
++
++void EndPageBlendPass(views::View* browser_view) {
++  SidebarSlide* slide = SlideFor(browser_view);
++  if (!slide) {
++    return;
++  }
++  slide->EndPagePass();
++  // As Chromium does while the side panel resizes the page: the window draws
++  // each frame by the default deadline rather than waiting long for the
++  // page's frame at its new size. The layout at rest turns it off.
++  if (MultiContentsView* contents =
++          views::AsViewClass<BrowserView>(browser_view)
++              ->multi_contents_view()) {
++    contents->SetIsAnimatingContent(/*is_animating=*/true,
++                                    /*is_origin_changing=*/true);
++  }
++}
++
+ void OnSidebarRevealChanged(BrowserView* browser_view,
+                             views::View* sidebar,
+                             float reveal,
+@@ -339,8 +520,12 @@ void OnSidebarRevealChanged(BrowserView*
+         std::make_unique<SidebarSlide>(browser_view, sidebar));
+   }
+   slide->set_showing(show);
++  // Cmd+S moves the page with the sidebar, from where the page is now.
++  slide->FollowPage(PageFollowsSidebar(dock, motion::ReducedMotion(),
++                                       browser_view->IsFullscreen()));
+   // Lay out once, at rest: the sidebar where it ends up or, sliding out,
+-  // where it is. On Cmd+S the page takes its new width here, once.
++  // where it is. Unless it follows the sidebar, the page takes its new width
++  // here, once.
+   widget->LayoutRootViewIfNecessary();
+   if (!sidebar->GetVisible()) {
+     slide->Snap();
