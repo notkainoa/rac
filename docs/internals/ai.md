@@ -154,6 +154,42 @@ only.
   in the address bar. It navigates only to http(s) and chrome URLs, so a
   typed `javascript:` URL never runs.
 
+### Internal pages
+
+The assistant sits only beside web pages, which are also the only pages it
+can read. `rac::ai::IsInternalPageUrl` says what counts: http and https, and
+nothing else, so rac:// and chrome:// pages, the new tab page, extension
+pages, files, data:, view-source:, and any scheme added later are internal.
+Two callers apply it differently:
+
+- What the chat may read (`IsInternalTab`, used to attach a tab) goes by the
+  last committed entry, both its address and the one the address bar shows
+  (a view-source: entry has the page's own address). A tab that hasn't
+  committed a page yet is internal. The agent's tab list and targets
+  (`TabTools`) keep their own http(s) check of `GetLastCommittedURL()`.
+  That is the committed entry's shown address (`WebContentsImpl` returns
+  its virtual URL), so it rules out the same pages, view-source: included.
+- The entry points (`IsAssistantBlockedHere`: the Chat button, the edge
+  handle, the Assistant command, Find's Ask, the command bar's Ask row via
+  `Need::kWebPage`) go by the address bar's address, and a blank tab
+  doesn't block them. The agent opens its tabs blank first, and a new tab
+  on its way to a web page would otherwise flash the panel shut, mid-task.
+
+A panel opened beside an internal page by a way in that calls
+`SidePanelUI::Show` itself (the agent's tab pill, the side panel action)
+steps aside too: `EntryRegistrar::OnEntryShown` checks every show and posts
+the close, since the side panel is still finishing the show. An open panel
+steps aside when the active tab turns internal and comes back
+when a web page is active again, unless the user closed it or another side
+panel took its place. The side panel deletes the content of an entry it
+closes, so `EntryRegistrar` takes the chat page out first and keeps it
+running: a reply or a task carries on, and the conversation is there on
+return. The kept chat goes when AI turns off or the window closes. The
+assistant's own new tab page is a chat page of its own and is unchanged.
+Per-tab chat (issue #120) should replace the kept chat with a tab-scoped
+entry, whose view Chromium already keeps per tab; an internal tab then
+simply has none.
+
 ## AI off costs nothing
 
 This is the rule that's easiest to break by accident. How it holds:
@@ -168,7 +204,8 @@ This is the rule that's easiest to break by accident. How it holds:
   restart: the top bar host, the side panel entry, the pull handle, the
   Assistant action. They watch a pref and do nothing else. The visible
   parts (Chat button, handle, menu entry, native action) are created only
-  while AI is on, and removed when it turns off.
+  while AI is on, and removed when it turns off. So is each window's watch
+  on its active tab, which keeps the assistant off internal pages.
 - Turning AI off cancels requests, stops the agent process, closes the
   panel, and navigates open assistant tabs to the ordinary new tab page. A
   service or controller that already exists stays in memory but dormant.
