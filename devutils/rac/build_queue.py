@@ -109,6 +109,11 @@ def stop_grace():
     return float(os.environ.get('RAC_BUILD_QUEUE_STOP_GRACE', '15'))
 
 
+def drain_grace():
+    """Seconds the rest of a group gets to exit after its leader did."""
+    return float(os.environ.get('RAC_BUILD_QUEUE_DRAIN_GRACE', '5'))
+
+
 def say(message):
     try:
         print(f'build queue: {message}', file=sys.stderr, flush=True)
@@ -790,6 +795,12 @@ class Queue:
             return
         pgid = child.pid
         if child.poll() is not None and not group_alive(pgid):
+            self.join_reader()
+            return
+        # A child that exited on its own can leave helpers finishing up: a
+        # browser's network service writes the end of a net log after the
+        # main process is gone. Let the group drain before stopping it.
+        if child.poll() is not None and self.wait_gone(pgid, set(), drain_grace()):
             self.join_reader()
             return
         # siso runs its helper and local commands in their own process

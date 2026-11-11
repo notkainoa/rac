@@ -229,9 +229,13 @@ exec bash -c 'exec -a "$1" sleep 600' _ "$0"
 # A browser main process with a helper titled as one of the app's own (the
 # network service, in its process group). On SIGTERM it logs whether the
 # helper is still there to flush a net log, the way a clean quit needs,
-# then quits. IGNORE_TERM makes one that never quits on SIGTERM.
+# tells the helper to finish, and quits; the helper then takes 1s to
+# finish the log on its own, like the real network service, and logs
+# "helper flushed" unless it is killed first. IGNORE_TERM makes one that
+# never quits on SIGTERM.
 GRACEFUL_BROWSER = '''\
-(exec -a "$1" sleep 600) &
+(exec -a "$1" bash -c 'trap "sleep 1; echo helper flushed >> \\"\\$RAC_FAKE_LOG\\"; exit 0" USR1
+  while :; do sleep 0.2; done') &
 helper=$!
 sleep 600 &
 idle=$!
@@ -242,7 +246,8 @@ quit() {
     *) echo "app quit helper-running" >> "$RAC_FAKE_LOG" ;;
   esac
   [ -z "${IGNORE_TERM:-}" ] || return 0
-  kill "$helper" "$idle" 2>/dev/null
+  kill -USR1 "$helper" 2>/dev/null
+  kill "$idle" 2>/dev/null
   exit 0
 }
 trap quit TERM
@@ -267,8 +272,9 @@ while [ "${1#-}" != "$1" ]; do
   case "$1" in --full) shift 2 ;; *) shift ;; esac
 done
 # QUEUE_GROUP_KILL: like the real queue, run the command in a session of
-# its own and, when stopped or once it exits, SIGTERM that whole group,
-# then SIGKILL it if it outlives a 5s grace.
+# its own and, when stopped, SIGTERM that whole group, then SIGKILL it if
+# it outlives a 5s grace; once it exits on its own, give the rest of the
+# group 5s to drain before the SIGTERM.
 if [ -n "${QUEUE_GROUP_KILL:-}" ]; then
   python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
   child=$!
@@ -283,6 +289,10 @@ if [ -n "${QUEUE_GROUP_KILL:-}" ]; then
   }
   trap stop TERM
   wait "$child" || true
+  for _ in $(seq 1 20); do
+    kill -0 -- "-$child" 2>/dev/null || exit 0
+    sleep 0.25
+  done
   kill -TERM -- "-$child" 2>/dev/null
   exit 0
 fi
@@ -2419,6 +2429,9 @@ class RunTest(RemoteBuildTest):
         self.run_rb('run', self.wt, '--timeout', '3', '--',
                     '--log-net-log=net.json', success=True, **env)
         self.assertIn('app quit helper-running', self.calls())
+        # The helper outlives the main process to finish the log, and the
+        # run waits for it instead of stopping the group under it.
+        self.assertIn('helper flushed', self.calls())
         self.assertEqual(self.procs_starting(app), [])
         # A frame log alone doesn't need it.
         self.log.unlink()

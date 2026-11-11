@@ -442,6 +442,31 @@ class QueueTest(unittest.TestCase):
 
     # Ending.
 
+    def test_leader_exit_lets_the_group_drain(self):
+        # A browser's network service finishes a net log after the main
+        # process exits: a helper left in the group gets to exit on its own
+        # before the queue stops the group, and one that lingers past the
+        # drain grace is still stopped.
+        for linger, finished in ((0.5, True), (30, False)):
+            with self.subTest(linger=linger):
+                marker = self.tmp / f'done-{linger}'
+                pid_file = self.tmp / f'pid-{linger}'
+                script = ('import os, subprocess, sys, time\n'
+                          'p = subprocess.Popen([sys.executable, "-c", '
+                          '"import sys, time; time.sleep(float(sys.argv[1])); '
+                          'open(sys.argv[2], \'w\').close()", '
+                          f'"{linger}", "{marker}"], stdout=subprocess.DEVNULL, '
+                          'stderr=subprocess.DEVNULL)\n'
+                          f'open("{pid_file}", "w").write(str(p.pid))\n')
+                env = {'RAC_BUILD_QUEUE_DRAIN_GRACE': '3'}
+                proc = self.popen([str(QUEUE), sys.executable, '-c', script],
+                                  env=env)
+                proc.communicate(timeout=30)
+                self.assertEqual(marker.exists(), finished)
+                helper = int(pid_file.read_text())
+                self.wait_until(lambda: gone(helper), timeout=5)
+                self.assertEqual(self.held(), [])
+
     def test_build_failure_passes_exit_code_and_frees_slot(self):
         proc, release = self.start('fail', code=3)
         release.touch()

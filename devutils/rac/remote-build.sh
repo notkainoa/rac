@@ -1868,6 +1868,16 @@ main_pids() {
         index(ENVIRON["F"], " " pid " ")) print pid
   }'
 }
+# Every process of this launch that runs from the clone's own app: the
+# main process and its helpers (the network service among them).
+app_pids() {
+  local fam
+  fam=" $(family_pids) "
+  ps -axo pid=,command= | D="${app_bin%MacOS/rac}" F="$fam" awk '{
+    pid = $1; sub(/^ *[0-9]+ +/, "")
+    if (index($0, ENVIRON["D"]) == 1 && index(ENVIRON["F"], " " pid " ")) print pid
+  }'
+}
 # Alive and not a zombie waiting for its parent.
 pid_running() {
   case "$(ps -o stat= -p "$1" 2>/dev/null)" in '' | *Z*) return 1 ;; esac
@@ -1877,8 +1887,10 @@ pid_running() {
 # and stop_own signal the whole process group, so the network service
 # dies with the browser and the log keeps only its first moments. A run
 # with a net log first sends SIGTERM to the browser's main process alone
-# and gives it 10s to quit; whatever is left then gets the usual stop.
-# Succeeds when it signalled a browser.
+# and gives the browser 10s to quit: the main process and then its
+# helpers, since the network service finishes the log after the main
+# process is gone. Whatever is left then gets the usual stop. Succeeds
+# when it signalled a browser.
 quit_main() {
   local mains p i left
   mains=$(main_pids)
@@ -1886,7 +1898,7 @@ quit_main() {
   for p in $mains; do kill -TERM "$p" 2>/dev/null || true; done
   for i in $(seq 1 40); do
     left=
-    for p in $mains; do pid_running "$p" && left="$left $p"; done
+    for p in $mains $(app_pids); do pid_running "$p" && left="$left $p"; done
     [ -n "$left" ] || return 0
     sleep 0.25
   done
