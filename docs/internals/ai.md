@@ -166,15 +166,20 @@ Two callers apply it differently:
   last committed entry, both its address and the one the address bar shows
   (a view-source: entry has the page's own address). A tab that hasn't
   committed a page yet is internal. The agent's tab list and targets
-  (`TabTools`) keep their own http(s) check of the shown address, which
-  rules out the same pages.
+  (`TabTools`) keep their own http(s) check of `GetLastCommittedURL()`.
+  That is the committed entry's shown address (`WebContentsImpl` returns
+  its virtual URL), so it rules out the same pages, view-source: included.
 - The entry points (`IsAssistantBlockedHere`: the Chat button, the edge
   handle, the Assistant command, Find's Ask, the command bar's Ask row via
   `Need::kWebPage`) go by the address bar's address, and a blank tab
   doesn't block them. The agent opens its tabs blank first, and a new tab
   on its way to a web page would otherwise flash the panel shut, mid-task.
 
-An open panel steps aside when the active tab turns internal and comes back
+A panel opened beside an internal page by a way in that calls
+`SidePanelUI::Show` itself (the agent's tab pill, the side panel action)
+steps aside too: `EntryRegistrar::OnEntryShown` checks every show and posts
+the close, since the side panel is still finishing the show. An open panel
+steps aside when the active tab turns internal and comes back
 when a web page is active again, unless the user closed it or another side
 panel took its place. The side panel deletes the content of an entry it
 closes, so `EntryRegistrar` takes the chat page out first and keeps it
