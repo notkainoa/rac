@@ -94,6 +94,18 @@ out. A line is checked only when the prefs already name it, so the menu
 never chooses for the user, even when it finds one agent. The page's
 `racAiSelectAgent` takes only an agent the last menu offered.
 
+A run that ends in ACP's auth_required (`-32000` on `session/new` or the
+prompt; no other failure counts) marks its agent as needing sign-in, so
+Settings' row and the menu's line both say "Sign in to use", with the
+agent's steps (in the open row, and in the line's tip). The mark is an
+agent id in `AcpService`'s memory (`AgentSignInMemory`), never the agent's
+words, and it goes when a run of that agent succeeds, on Check again, or
+when the user changes the agent's path or command. A pref would outlive
+the sign-in it describes. The agent stays choosable in both places, and
+both browser checks agree: the user signs in in Terminal, where rac can't
+see it, so a refusing row would have nothing to check, and a wrong choice
+costs one run that says so again.
+
 The model menu asks each set-up provider for its model list when the menu
 opens, and Settings asks only while the Assistant page itself is open (a
 settings search renders the section too, and must not send the key):
