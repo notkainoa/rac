@@ -58,6 +58,16 @@ unpinned containers during a drag. rac does, and that breaks assumptions:
 - **The old views must not show.** After a pin change mid-drag, Chromium
   animates the old view out right under the new one. Its layer is hidden,
   since the animation keeps resetting its opacity.
+- **The "+ New Tab" row isn't a drop slot.** The New Tab button setting
+  puts it either under the divider or after the last open tab
+  (`rac.sidebar.new_tab_row_position`, bottom by default). In both places
+  `HandleTabDrag()` and Chromium's `GetTargetForTabDrag()` skip it, because it
+  has no tab node, so moving it changes no drop geometry: the divider, the pin
+  zone and the favorites band all hang from the top of the open tabs, which is
+  the same place either way. A drop on or below the bottom row is the end of
+  the list, as a drop below the last tab always was. Keep it that way: a row
+  that counted as a slot would make drags near the end of a long list jump
+  across it.
 - **Pinned drops go to the window's active space.** A drop into the pinned
   section adds the tab to `pinned.<space id>` of the space the window shows
   when the drop happens. Tabs of other spaces stay hidden in the tab strip and
@@ -68,7 +78,8 @@ unpinned containers during a drag. rac does, and that breaks assumptions:
 Chromium's animating layout manager moves every row from its last bounds to
 its new ones. A row that's hidden still has bounds, so lay it out where it
 will appear. That's why, with no pinned tabs, the divider waits closed where
-it opens: under the space's name, above "+ New Tab". It opens only when a drag
+it opens: under the space's name, above the first open tab (and above
+"+ New Tab" when that button is at the top). It opens only when a drag
 reaches the top of the open tabs, so other drags don't shift the open tabs
 under the pointer. Waiting anywhere else moves the place a drop pins as soon
 as it opens, and a real drag then flips between pinning and not on every
