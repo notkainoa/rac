@@ -18,9 +18,11 @@ Wikipedia for "cats".
   the user's own `!x`. Applying a list that added bangs tells the
   service's observers once, so an open Bangs page sees a list that arrives
   late.
-- A bang works anywhere in the query: `!w cats`, `ca !w ts`, `cats !w`.
-  Helium's `SplitKeywordFromInput` takes the first `!` token as the
-  keyword.
+- A bang works at the start, middle or end of the query: `!w cats`,
+  `ca !w ts`, `cats !w`. Helium's `SplitKeywordFromInput` looks only at the
+  first `!` in the input, and only when whitespace comes before it, so
+  `wow! cats !w` has no bang (its first token, `wow!`, is the keyword) and
+  in `cats !w !wa` the `!wa` is part of the query.
 
 ## The address bar
 
@@ -44,6 +46,17 @@ Deleted and unknown bangs aren't engines, so they fall through to a plain
 search. Keywords without `!`, keyword mode, and the command bar (which
 allows exact matching) are unchanged. Input with no `!` does no extra
 work.
+
+The classifier is unchanged on purpose. `AutocompleteClassifier` turns
+text into one match for the context menu's "Search <default engine> for",
+paste and go, text dropped on the tab strip, and paste into a new tab. It
+omits asynchronous matches, and the bang suggestion requires that they
+aren't omitted, so those still search the default engine with the text as
+it is. The context menu names the default engine, so it must not open
+another one.
+
+The rules are tested in `rac_omnibox_unittests`
+(`chrome/browser/rac/power`).
 
 ## Edits that survive list updates
 

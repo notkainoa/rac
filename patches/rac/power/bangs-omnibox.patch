@@ -1,54 +1,17 @@
---- a/components/omnibox/browser/BUILD.gn
-+++ b/components/omnibox/browser/BUILD.gn
-@@ -1191,3 +1191,37 @@ if (!is_ios) {
-     ]
-   }
- }
-+
-+# rac: the bang search in KeywordProvider (rac/power/bangs-omnibox.patch).
-+# Separate from components_unittests, which takes hours to build. It
-+# compiles the test helpers it needs itself: ":test_support" and
-+# //components/test:run_all_unittests hold files rac's and Helium's patches
-+# no longer build with.
-+#   autoninja -C out/Default components/omnibox/browser:rac_omnibox_unittests
-+test("rac_omnibox_unittests") {
-+  sources = [
-+    "mock_autocomplete_provider_client.cc",
-+    "mock_autocomplete_provider_client.h",
-+    "mock_tab_matcher.cc",
-+    "mock_tab_matcher.h",
-+    "rac_bang_search_unittest.cc",
-+    "test_scheme_classifier.cc",
-+    "test_scheme_classifier.h",
-+  ]
-+  deps = [
-+    ":browser",
-+    "//base",
-+    "//base/test:run_all_unittests",
-+    "//base/test:test_support",
-+    "//components/history/core/browser",
-+    "//components/saved_tab_groups/test_support",
-+    "//components/search_engines",
-+    "//components/search_engines:test_support",
-+    "//services/network:test_support",
-+    "//testing/gmock",
-+    "//testing/gtest",
-+    "//third_party/metrics_proto",
-+    "//ui/base",
-+    "//url",
-+  ]
-+}
 --- a/components/omnibox/browser/keyword_provider.cc
 +++ b/components/omnibox/browser/keyword_provider.cc
-@@ -275,6 +275,24 @@ void KeywordProvider::Start(const Autoco
+@@ -275,6 +275,27 @@ void KeywordProvider::Start(const Autoco
      // supports replacement and that has extra text following it),
      // then SearchProvider creates the exact (a.k.a. verbatim) match.
      if (!remaining_input.empty() && !is_extension_keyword) {
 +      // rac: SearchProvider does so only when exact keyword matching is on.
-+      // While typing, a bang anywhere in the input ("cats !w") searches its
-+      // engine as the default match. GENERATED, not KEYWORD, so the address
-+      // bar doesn't turn the bang into a keyword chip before "!wa" is typed.
-+      if (!input.allow_exact_keyword_match() && keyword.starts_with(u'!')) {
++      // While typing, a bang in the input ("cats !w") searches its engine as
++      // the default match. The classifier (context menu search, paste and
++      // go) omits asynchronous matches and keeps the default engine.
++      // GENERATED, not KEYWORD, so the address bar doesn't turn the bang
++      // into a keyword chip before "!wa" is typed.
++      if (!input.allow_exact_keyword_match() &&
++          !input.omit_asynchronous_matches() && keyword.starts_with(u'!')) {
 +        const std::u16string query =
 +            base::CollapseWhitespace(remaining_input, false);
 +        if (!query.empty()) {
@@ -65,16 +28,56 @@
        return;
      }
      // TODO(pkasting): We should probably check that if the user explicitly
+--- a/chrome/browser/rac/power/BUILD.gn
++++ b/chrome/browser/rac/power/BUILD.gn
+@@ -66,3 +66,36 @@ test("rac_power_unittests") {
+     "//url",
+   ]
+ }
++
++# The bang search in KeywordProvider (bangs-omnibox.patch). It compiles the
++# omnibox test helpers it needs itself: //components/omnibox/browser's
++# test_support and //components/test:run_all_unittests hold files rac's and
++# Helium's patches no longer build with. Build with `autoninja -C
++# out/Default chrome/browser/rac/power:rac_omnibox_unittests`.
++test("rac_omnibox_unittests") {
++  sources = [
++    "//components/omnibox/browser/mock_autocomplete_provider_client.cc",
++    "//components/omnibox/browser/mock_autocomplete_provider_client.h",
++    "//components/omnibox/browser/mock_tab_matcher.cc",
++    "//components/omnibox/browser/mock_tab_matcher.h",
++    "//components/omnibox/browser/test_scheme_classifier.cc",
++    "//components/omnibox/browser/test_scheme_classifier.h",
++    "bang_search_unittest.cc",
++  ]
++  deps = [
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//components/history/core/browser",
++    "//components/omnibox/browser",
++    "//components/saved_tab_groups/test_support",
++    "//components/search_engines",
++    "//components/search_engines:test_support",
++    "//services/network:test_support",
++    "//testing/gmock",
++    "//testing/gtest",
++    "//third_party/metrics_proto",
++    "//ui/base",
++    "//url",
++  ]
++}
 --- /dev/null
-+++ b/components/omnibox/browser/rac_bang_search_unittest.cc
-@@ -0,0 +1,198 @@
++++ b/chrome/browser/rac/power/bang_search_unittest.cc
+@@ -0,0 +1,241 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +// A bang anywhere in the address bar (rac/power/bangs-omnibox.patch):
 +// KeywordProvider makes the bang's own search the default match while the
-+// user types, which is when exact keyword matching is off.
++// user types, which is when exact keyword matching is off. The classifier
++// (context menu search, paste and go, dropped text) is left as it was.
 +
 +#include <memory>
 +#include <string>
@@ -100,9 +103,11 @@
 +namespace {
 +
 +// The user's own engines: one bang of their own (a site search whose
-+// keyword starts with "!") and a keyword without one.
++// keyword starts with "!"), a "!" shortcut to a page with no place for the
++// query, and a keyword without a "!".
 +const TemplateURLService::Initializer kUserEngines[] = {
 +    {"!mine", "https://mine.example/?q={searchTerms}", "Mine"},
++    {"!home", "https://home.example/", "Home"},
 +    {"w", "https://w.example/?q={searchTerms}", "W"},
 +};
 +
@@ -138,12 +143,18 @@
 +
 +  // Runs the provider the way the address bar does while the user types
 +  // (or pastes): exact keyword matching is off unless keyword mode is on.
++  // AutocompleteClassifier::Classify omits asynchronous matches.
 +  const ACMatches& Run(const std::string& text,
-+                       bool allow_exact_keyword_match = false) {
++                       bool allow_exact_keyword_match = false,
++                       bool classifier = false) {
 +    AutocompleteInput input(base::UTF8ToUTF16(text),
 +                            metrics::OmniboxEventProto::OTHER,
 +                            TestSchemeClassifier());
 +    input.set_allow_exact_keyword_match(allow_exact_keyword_match);
++    if (classifier) {
++      input.set_prevent_inline_autocomplete(true);
++      input.set_omit_asynchronous_matches(true);
++    }
 +    provider_->Start(input, false);
 +    return provider_->matches();
 +  }
@@ -221,6 +232,40 @@
 +TEST_F(RacBangSearchTest, UsersOwnBang) {
 +  ExpectBangSearch("cats !mine", "!mine", "cats",
 +                   "https://mine.example/?q=cats");
++}
++
++TEST_F(RacBangSearchTest, BangIsCaseInsensitive) {
++  ExpectBangSearch("cats !W", "!w", "cats",
++                   "https://en.wikipedia.org/w/index.php?search=cats");
++}
++
++TEST_F(RacBangSearchTest, OnlyTheFirstBangAfterASpaceCounts) {
++  // Helium's SplitKeywordFromInput looks at the first "!" only, and only
++  // when whitespace comes before it. Here that's "wow!", so the first token
++  // is the keyword and "!w" is just text: a plain search, as before.
++  EXPECT_TRUE(Run("wow! cats !w").empty());
++  // A second bang is part of the first one's query.
++  const AutocompleteMatch* match = DefaultableMatch("cats !w !wa");
++  ASSERT_NE(nullptr, match);
++  EXPECT_EQ(u"!w", match->keyword);
++  EXPECT_EQ(u"cats !wa", match->contents);
++}
++
++TEST_F(RacBangSearchTest, BangWithNoPlaceForTheQueryIsUnchanged) {
++  // A "!" keyword whose URL has no {searchTerms} is never offered with a
++  // query: TemplateURLService::AddMatchingKeywords returns only engines
++  // that take one when there is text after the keyword.
++  EXPECT_TRUE(Run("cats !home").empty());
++  EXPECT_TRUE(Run("!home cats").empty());
++}
++
++TEST_F(RacBangSearchTest, ClassifierIsUnchanged) {
++  // The context menu's "Search <default engine> for", paste and go, and
++  // text dropped on the tab strip classify text with exact keyword
++  // matching off, and keep searching the default engine.
++  EXPECT_TRUE(Run("cats !w", false, /*classifier=*/true).empty());
++  EXPECT_TRUE(Run("!w cats", false, /*classifier=*/true).empty());
++  EXPECT_TRUE(Run("ca !w ts", false, /*classifier=*/true).empty());
 +}
 +
 +TEST_F(RacBangSearchTest, DeletedBangFallsThroughToAPlainSearch) {
