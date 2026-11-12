@@ -1,0 +1,738 @@
+--- /dev/null
++++ b/chrome/browser/rac/link_routing/BUILD.gn
+@@ -0,0 +1,35 @@
++# Copyright 2026 The rac Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++# Air Traffic Control's rules and routing decision, without a browser. The
++# browser side is in chrome/browser/ui/views/rac/link_routing/
++# (//chrome/browser/ui).
++source_set("rules") {
++  sources = [
++    "link_rules.cc",
++    "link_rules.h",
++  ]
++  public_deps = [
++    "//base",
++    "//chrome/browser/rac/site_pattern",
++  ]
++  deps = [
++    "//components/prefs",
++    "//url",
++  ]
++}
++
++# Linked into //chrome/browser/rac/power:rac_power_unittests with the
++# SitePattern tests.
++source_set("unit_tests") {
++  testonly = true
++  sources = [ "link_rules_unittest.cc" ]
++  deps = [
++    ":rules",
++    "//base",
++    "//base:i18n",
++    "//testing/gtest",
++    "//url",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/rac/link_routing/link_rules.cc
+@@ -0,0 +1,217 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/link_routing/link_rules.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/strings/string_util.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "url/gurl.h"
++
++namespace rac::link_routing {
++
++namespace {
++
++constexpr char kVersionKey[] = "version";
++constexpr char kRulesKey[] = "rules";
++constexpr char kIdKey[] = "id";
++constexpr char kPatternKey[] = "pattern";
++constexpr char kProfileKey[] = "profile";
++constexpr char kSpaceKey[] = "space";
++
++constexpr std::string_view kSignInHostPrefixes[] = {"accounts.", "login.",
++                                                    "auth.", "sso."};
++constexpr std::string_view kSignInPathWords[] = {"oauth", "authorize",
++                                                 "callback", "saml"};
++
++std::optional<LinkRule> ParseRule(const base::Value& value) {
++  const base::DictValue* dict = value.GetIfDict();
++  if (!dict) {
++    return std::nullopt;
++  }
++  const std::string* id = dict->FindString(kIdKey);
++  const base::DictValue* pattern_dict = dict->FindDict(kPatternKey);
++  const std::string* profile = dict->FindString(kProfileKey);
++  const std::string* space = dict->FindString(kSpaceKey);
++  if (!id || id->empty() || !pattern_dict || !profile || profile->empty() ||
++      !space || space->empty()) {
++    return std::nullopt;
++  }
++  std::optional<SitePattern> pattern = SitePattern::FromValue(*pattern_dict);
++  if (!pattern) {
++    return std::nullopt;
++  }
++  LinkRule rule(*id, std::move(*pattern), *profile, *space);
++  rule.unknown_fields = dict->Clone();
++  for (const char* key : {kIdKey, kPatternKey, kProfileKey, kSpaceKey}) {
++    rule.unknown_fields.Remove(key);
++  }
++  return rule;
++}
++
++std::vector<LinkRule>::iterator FindPatternIterator(LinkRules& rules,
++                                                    const SitePattern& pattern,
++                                                    std::string_view profile) {
++  return std::ranges::find_if(rules.rules, [&](const LinkRule& rule) {
++    return rule.pattern == pattern && rule.profile == profile;
++  });
++}
++
++}  // namespace
++
++LinkRule::LinkRule(std::string id,
++                   SitePattern pattern,
++                   std::string profile,
++                   std::string space)
++    : id(std::move(id)),
++      pattern(std::move(pattern)),
++      profile(std::move(profile)),
++      space(std::move(space)) {}
++LinkRule::LinkRule(LinkRule&&) = default;
++LinkRule& LinkRule::operator=(LinkRule&&) = default;
++LinkRule::~LinkRule() = default;
++
++LinkRules::LinkRules() = default;
++LinkRules::LinkRules(LinkRules&&) = default;
++LinkRules& LinkRules::operator=(LinkRules&&) = default;
++LinkRules::~LinkRules() = default;
++
++void RegisterLocalStatePrefs(PrefRegistrySimple* registry) {
++  registry->RegisterDictionaryPref(kLinkRoutingPref);
++}
++
++bool HasAnyRules(const base::DictValue& pref) {
++  const base::ListValue* rules = pref.FindList(kRulesKey);
++  return rules && !rules->empty();
++}
++
++std::optional<LinkRules> ParseLinkRules(const base::DictValue& pref) {
++  const base::Value* version = pref.Find(kVersionKey);
++  if (version &&
++      (!version->is_int() || version->GetInt() > kLinkRulesVersion)) {
++    return std::nullopt;
++  }
++  LinkRules parsed;
++  parsed.unknown_fields = pref.Clone();
++  parsed.unknown_fields.Remove(kVersionKey);
++  parsed.unknown_fields.Remove(kRulesKey);
++  if (const base::ListValue* rules = pref.FindList(kRulesKey)) {
++    for (const base::Value& value : *rules) {
++      if (std::optional<LinkRule> rule = ParseRule(value)) {
++        parsed.rules.push_back(std::move(*rule));
++      }
++    }
++  }
++  return parsed;
++}
++
++base::DictValue SerializeLinkRules(const LinkRules& rules) {
++  base::DictValue pref = rules.unknown_fields.Clone();
++  pref.Set(kVersionKey, kLinkRulesVersion);
++  base::ListValue list;
++  for (const LinkRule& rule : rules.rules) {
++    base::DictValue dict = rule.unknown_fields.Clone();
++    dict.Set(kIdKey, rule.id);
++    dict.Set(kPatternKey, rule.pattern.ToValue());
++    dict.Set(kProfileKey, rule.profile);
++    dict.Set(kSpaceKey, rule.space);
++    list.Append(std::move(dict));
++  }
++  pref.Set(kRulesKey, std::move(list));
++  return pref;
++}
++
++bool IsSignInUrl(const GURL& url) {
++  // GURL lower-cases the host of http(s) URLs.
++  const std::string_view host = url.host();
++  for (std::string_view prefix : kSignInHostPrefixes) {
++    if (host.starts_with(prefix)) {
++      return true;
++    }
++  }
++  const std::string path = base::ToLowerASCII(url.path());
++  for (std::string_view word : kSignInPathWords) {
++    if (path.find(word) != std::string::npos) {
++      return true;
++    }
++  }
++  return false;
++}
++
++const LinkRule* FindRule(const LinkRules& rules,
++                         const GURL& url,
++                         std::string_view profile) {
++  for (const LinkRule& rule : rules.rules) {
++    if (rule.profile == profile && rule.pattern.Matches(url)) {
++      return &rule;
++    }
++  }
++  return nullptr;
++}
++
++const LinkRule* FindRuleForPattern(const LinkRules& rules,
++                                   const SitePattern& pattern,
++                                   std::string_view profile) {
++  for (const LinkRule& rule : rules.rules) {
++    if (rule.pattern == pattern && rule.profile == profile) {
++      return &rule;
++    }
++  }
++  return nullptr;
++}
++
++void SetRule(LinkRules& rules,
++             const SitePattern& pattern,
++             std::string_view profile,
++             std::string_view space,
++             std::string new_id) {
++  auto it = FindPatternIterator(rules, pattern, profile);
++  if (it != rules.rules.end()) {
++    it->space = std::string(space);
++    return;
++  }
++  rules.rules.emplace_back(std::move(new_id), pattern, std::string(profile),
++                           std::string(space));
++}
++
++bool RemoveRule(LinkRules& rules,
++                const SitePattern& pattern,
++                std::string_view profile) {
++  auto it = FindPatternIterator(rules, pattern, profile);
++  if (it == rules.rules.end()) {
++    return false;
++  }
++  rules.rules.erase(it);
++  return true;
++}
++
++bool RemoveRuleWithId(LinkRules& rules, std::string_view id) {
++  return std::erase_if(rules.rules, [id](const LinkRule& rule) {
++           return rule.id == id;
++         }) > 0;
++}
++
++RouteDecision DecideRoute(const RouteFacts& facts) {
++  if (facts.off_the_record || facts.no_rules || facts.sign_in_url ||
++      !facts.rule_matched) {
++    return RouteDecision::kLittleWindow;
++  }
++  if (!facts.space_exists) {
++    return RouteDecision::kDeleteRuleThenLittleWindow;
++  }
++  if (facts.spaces_not_ready) {
++    return RouteDecision::kLittleWindowWithButton;
++  }
++  if (facts.holder_window) {
++    return RouteDecision::kHolderWindow;
++  }
++  if (facts.target_window) {
++    return RouteDecision::kShowSpaceInTargetWindow;
++  }
++  return RouteDecision::kLittleWindowWithButton;
++}
++
++}  // namespace rac::link_routing
+--- /dev/null
++++ b/chrome/browser/rac/link_routing/link_rules.h
+@@ -0,0 +1,152 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_LINK_ROUTING_LINK_RULES_H_
++#define CHROME_BROWSER_RAC_LINK_ROUTING_LINK_RULES_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/values.h"
++#include "chrome/browser/rac/site_pattern/site_pattern.h"
++
++class GURL;
++class PrefRegistrySimple;
++
++// Air Traffic Control: a link from another app whose site has a rule opens in
++// the rule's space instead of the little window. This is the browser-free
++// half: the rules, how they're stored, and the decision of where a link goes,
++// on plain values so it's tested without a browser. The browser side is
++// chrome/browser/ui/views/rac/link_routing/.
++//
++// The rules live in Local State, not in a profile, so a later step can route
++// a link that arrives in one profile to another profile's space. For now a
++// rule only matches links that arrive in its own profile.
++namespace rac::link_routing {
++
++// Local State:
++//   {"version": 1,
++//    "rules": [{"id": <uuid>, "pattern": <SitePattern::ToValue()>,
++//               "profile": <profile folder name>, "space": <space uuid>}]}
++// Keys this version doesn't know are kept, at both levels.
++inline constexpr char kLinkRoutingPref[] = "rac.link_routing";
++inline constexpr int kLinkRulesVersion = 1;
++
++struct LinkRule {
++  LinkRule(std::string id,
++           SitePattern pattern,
++           std::string profile,
++           std::string space);
++  LinkRule(LinkRule&&);
++  LinkRule& operator=(LinkRule&&);
++  ~LinkRule();
++
++  std::string id;
++  SitePattern pattern;
++  // The profile's folder name, such as "Default" or "Profile 1".
++  std::string profile;
++  // The space's ID, as base::Uuid::AsLowercaseString() writes it.
++  std::string space;
++  base::DictValue unknown_fields;
++};
++
++struct LinkRules {
++  LinkRules();
++  LinkRules(LinkRules&&);
++  LinkRules& operator=(LinkRules&&);
++  ~LinkRules();
++
++  // In order; the first rule that matches a link wins.
++  std::vector<LinkRule> rules;
++  base::DictValue unknown_fields;
++};
++
++void RegisterLocalStatePrefs(PrefRegistrySimple* registry);
++
++// Whether `pref` holds any rule entry at all, without parsing one. Every
++// link from another app asks this first, so with no rules routing costs one
++// lookup in a dictionary already in memory.
++bool HasAnyRules(const base::DictValue& pref);
++
++// Reads the pref. A missing version counts as 1. Entries that aren't a
++// dictionary, or lack an id, a valid pattern, a profile or a space, are
++// skipped. Returns nullopt when a newer rac wrote it (a version above
++// kLinkRulesVersion): then nothing routes and nothing is written back.
++std::optional<LinkRules> ParseLinkRules(const base::DictValue& pref);
++base::DictValue SerializeLinkRules(const LinkRules& rules);
++
++// Sign-in and OAuth pages never route: they belong next to the app that
++// opened them. True when the host starts with `accounts.`, `login.`, `auth.`
++// or `sso.`, or the path contains `oauth`, `authorize`, `callback` or `saml`
++// in any case.
++bool IsSignInUrl(const GURL& url);
++
++// The first rule of `profile` that matches `url`, or null.
++const LinkRule* FindRule(const LinkRules& rules,
++                         const GURL& url,
++                         std::string_view profile);
++
++// The rule of `profile` for exactly `pattern`, or null. There is at most one.
++const LinkRule* FindRuleForPattern(const LinkRules& rules,
++                                   const SitePattern& pattern,
++                                   std::string_view profile);
++
++// Points `profile`'s rule for `pattern` at `space`. An existing rule keeps
++// its id and its place in the list; otherwise a rule with `new_id` is
++// appended.
++void SetRule(LinkRules& rules,
++             const SitePattern& pattern,
++             std::string_view profile,
++             std::string_view space,
++             std::string new_id);
++
++// Removes `profile`'s rule for `pattern`. Returns whether there was one.
++bool RemoveRule(LinkRules& rules,
++                const SitePattern& pattern,
++                std::string_view profile);
++
++// Removes the rule with `id`. Returns whether there was one.
++bool RemoveRuleWithId(LinkRules& rules, std::string_view id);
++
++// What the browser side knows when a link arrives, in decision order.
++struct RouteFacts {
++  // The link arrived in an incognito or guest profile.
++  bool off_the_record = false;
++  // Local State holds no rules (HasAnyRules() is false).
++  bool no_rules = false;
++  bool sign_in_url = false;
++  // A rule of this profile matches the link.
++  bool rule_matched = false;
++  // The rule's space still exists.
++  bool space_exists = false;
++  // The link came with rac's launch, or the spaces store is still loading:
++  // windows can't switch spaces yet.
++  bool spaces_not_ready = false;
++  // A window shows the rule's space.
++  bool holder_window = false;
++  // A normal window of the profile on the current desktop could show it.
++  bool target_window = false;
++};
++
++enum class RouteDecision {
++  // The little window opens, with no "Open in <space>" button.
++  kLittleWindow,
++  // The rule's space is gone: the rule is deleted, and the little window
++  // opens without a button.
++  kDeleteRuleThenLittleWindow,
++  // The little window opens with an "Open in <space>" button.
++  kLittleWindowWithButton,
++  // The link opens as a new tab in the window that shows the space.
++  kHolderWindow,
++  // That window switches to the space, then the link opens there.
++  kShowSpaceInTargetWindow,
++};
++
++RouteDecision DecideRoute(const RouteFacts& facts);
++
++}  // namespace rac::link_routing
++
++#endif  // CHROME_BROWSER_RAC_LINK_ROUTING_LINK_RULES_H_
+--- /dev/null
++++ b/chrome/browser/rac/link_routing/link_rules_unittest.cc
+@@ -0,0 +1,271 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/link_routing/link_rules.h"
++
++#include <optional>
++#include <string>
++
++#include "base/i18n/icu_util.h"
++#include "base/json/json_reader.h"
++#include "base/values.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace rac::link_routing {
++namespace {
++
++constexpr char kSpaceA[] = "0b0a3b67-8d9e-4f1c-9a43-1f4c8d0e2a11";
++constexpr char kSpaceB[] = "5d1e7c20-3f4b-4a6e-8b2d-9c0f1e2d3a44";
++
++// SitePattern needs ICU's data for IDN hosts. base::TestSuite loads it in
++// the real binary; this also covers a plain gtest main.
++void InitializeIcu() {
++  base::i18n::AllowMultipleInitializeCallsForTesting();
++  ASSERT_TRUE(base::i18n::InitializeICU());
++}
++
++SitePattern Domain(std::string_view host) {
++  return *SitePattern::Create(SitePattern::Type::kDomainIs, host);
++}
++
++base::DictValue Json(std::string_view json) {
++  std::optional<base::Value> value =
++      base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  EXPECT_TRUE(value && value->is_dict()) << json;
++  return value ? std::move(value->GetDict()) : base::DictValue();
++}
++
++class LinkRulesTest : public testing::Test {
++ protected:
++  void SetUp() override { InitializeIcu(); }
++};
++
++TEST_F(LinkRulesTest, RoundTripsRulesInOrder) {
++  LinkRules rules;
++  SetRule(rules, Domain("github.com"), "Default", kSpaceA, "r1");
++  SetRule(rules, *SitePattern::Create(SitePattern::Type::kUrlContains, "Docs"),
++          "Profile 1", kSpaceB, "r2");
++
++  std::optional<LinkRules> read = ParseLinkRules(SerializeLinkRules(rules));
++  ASSERT_TRUE(read);
++  ASSERT_EQ(2u, read->rules.size());
++  EXPECT_EQ("r1", read->rules[0].id);
++  EXPECT_EQ(Domain("github.com"), read->rules[0].pattern);
++  EXPECT_EQ("Default", read->rules[0].profile);
++  EXPECT_EQ(kSpaceA, read->rules[0].space);
++  EXPECT_EQ("r2", read->rules[1].id);
++  EXPECT_EQ(SitePattern::Type::kUrlContains, read->rules[1].pattern.type());
++  EXPECT_EQ("docs", read->rules[1].pattern.value());
++  EXPECT_EQ("Profile 1", read->rules[1].profile);
++  EXPECT_EQ(kSpaceB, read->rules[1].space);
++
++  const base::DictValue written = SerializeLinkRules(*read);
++  EXPECT_EQ(kLinkRulesVersion, written.FindInt("version"));
++}
++
++TEST_F(LinkRulesTest, SkipsMalformedEntries) {
++  std::optional<LinkRules> read = ParseLinkRules(Json(R"({
++    "version": 1,
++    "rules": [
++      "not a rule",
++      {"pattern": {"type": "domain", "value": "a.example"},
++       "profile": "Default", "space": "s"},
++      {"id": "", "pattern": {"type": "domain", "value": "a.example"},
++       "profile": "Default", "space": "s"},
++      {"id": "r", "pattern": {"type": "domain", "value": "com"},
++       "profile": "Default", "space": "s"},
++      {"id": "r", "pattern": {"type": "regex", "value": "a"},
++       "profile": "Default", "space": "s"},
++      {"id": "r", "pattern": "a.example", "profile": "Default", "space": "s"},
++      {"id": "r", "pattern": {"type": "domain", "value": "a.example"},
++       "space": "s"},
++      {"id": "r", "pattern": {"type": "domain", "value": "a.example"},
++       "profile": "Default"},
++      {"id": "r", "pattern": {"type": "domain", "value": "a.example"},
++       "profile": "Default", "space": 7},
++      {"id": "good", "pattern": {"type": "domain", "value": "b.example"},
++       "profile": "Default", "space": "s"}
++    ]})"));
++  ASSERT_TRUE(read);
++  ASSERT_EQ(1u, read->rules.size());
++  EXPECT_EQ("good", read->rules[0].id);
++}
++
++TEST_F(LinkRulesTest, KeepsUnknownFields) {
++  std::optional<LinkRules> read = ParseLinkRules(Json(R"({
++    "version": 1,
++    "later": {"x": 1},
++    "rules": [{"id": "r", "pattern": {"type": "domain", "value": "a.example"},
++               "profile": "Default", "space": "s", "cross_profile": true}]})"));
++  ASSERT_TRUE(read);
++  const base::DictValue written = SerializeLinkRules(*read);
++  EXPECT_EQ(1, written.FindIntByDottedPath("later.x"));
++  const base::ListValue* rules = written.FindList("rules");
++  ASSERT_TRUE(rules);
++  ASSERT_EQ(1u, rules->size());
++  EXPECT_EQ(true, (*rules)[0].GetDict().FindBool("cross_profile"));
++  EXPECT_EQ("r", *(*rules)[0].GetDict().FindString("id"));
++}
++
++TEST_F(LinkRulesTest, ReadsVersionsItKnows) {
++  // No version: a rule written before the field.
++  EXPECT_TRUE(ParseLinkRules(Json(R"({"rules": []})")));
++  EXPECT_TRUE(ParseLinkRules(base::DictValue()));
++  EXPECT_TRUE(ParseLinkRules(Json(R"({"version": 1})")));
++  // A newer rac's rules aren't read, so they're never written back over.
++  EXPECT_FALSE(ParseLinkRules(Json(R"({"version": 2, "rules": []})")));
++  EXPECT_FALSE(ParseLinkRules(Json(R"({"version": "1"})")));
++}
++
++TEST_F(LinkRulesTest, EmptyListExitsImmediately) {
++  EXPECT_FALSE(HasAnyRules(base::DictValue()));
++  EXPECT_FALSE(HasAnyRules(Json(R"({"version": 1, "rules": []})")));
++  EXPECT_FALSE(HasAnyRules(Json(R"({"version": 1, "rules": "x"})")));
++  EXPECT_TRUE(HasAnyRules(Json(R"({"version": 1, "rules": [{}]})")));
++
++  EXPECT_EQ(nullptr,
++            FindRule(LinkRules(), GURL("https://github.com/"), "Default"));
++  RouteFacts facts;
++  facts.no_rules = true;
++  facts.rule_matched = true;
++  facts.space_exists = true;
++  facts.holder_window = true;
++  EXPECT_EQ(RouteDecision::kLittleWindow, DecideRoute(facts));
++}
++
++TEST_F(LinkRulesTest, SignInPagesNeverRoute) {
++  for (const char* url : {
++           "https://accounts.google.com/signin",
++           "https://login.microsoftonline.com/common",
++           "https://auth.example.com/",
++           "https://sso.corp.example/start",
++           "https://example.com/oauth2/start",
++           "https://example.com/OAuth/start",
++           "https://github.com/login/oauth/authorize?client_id=x",
++           "https://example.com/connect/Authorize",
++           "https://example.com/auth/callback",
++           "https://example.com/saml/acs",
++           "https://ACCOUNTS.example.com/",
++       }) {
++    EXPECT_TRUE(IsSignInUrl(GURL(url))) << url;
++  }
++  for (const char* url : {
++           "https://myaccounts.example/",
++           "https://example.com/accounts/",
++           "https://github.com/notkainoa/rac",
++           "https://www.example.com/login-help",
++           "https://authentic.example/",
++           "https://example.com/?next=oauth",
++           "https://example.com/#callback",
++       }) {
++    EXPECT_FALSE(IsSignInUrl(GURL(url))) << url;
++  }
++}
++
++TEST_F(LinkRulesTest, FirstMatchWins) {
++  LinkRules rules;
++  SetRule(rules, Domain("github.com"), "Default", kSpaceA, "first");
++  SetRule(rules, Domain("gist.github.com"), "Default", kSpaceB, "second");
++
++  const LinkRule* rule =
++      FindRule(rules, GURL("https://gist.github.com/x"), "Default");
++  ASSERT_TRUE(rule);
++  EXPECT_EQ("first", rule->id);
++  EXPECT_EQ(nullptr, FindRule(rules, GURL("https://example.com/"), "Default"));
++  EXPECT_EQ(nullptr, FindRule(rules, GURL("mailto:a@github.com"), "Default"));
++}
++
++TEST_F(LinkRulesTest, OneRulePerPattern) {
++  LinkRules rules;
++  SetRule(rules, Domain("github.com"), "Default", kSpaceA, "r1");
++  SetRule(rules, Domain("slack.com"), "Default", kSpaceA, "r2");
++  // The same pattern again points the existing rule at the new space and
++  // keeps its id and place.
++  SetRule(rules, Domain("GitHub.com"), "Default", kSpaceB, "r3");
++
++  ASSERT_EQ(2u, rules.rules.size());
++  EXPECT_EQ("r1", rules.rules[0].id);
++  EXPECT_EQ(kSpaceB, rules.rules[0].space);
++  EXPECT_EQ("r2", rules.rules[1].id);
++  // New patterns are appended.
++  SetRule(rules, Domain("linear.app"), "Default", kSpaceB, "r4");
++  ASSERT_EQ(3u, rules.rules.size());
++  EXPECT_EQ("r4", rules.rules[2].id);
++
++  EXPECT_TRUE(RemoveRule(rules, Domain("github.com"), "Default"));
++  EXPECT_FALSE(RemoveRule(rules, Domain("github.com"), "Default"));
++  ASSERT_EQ(2u, rules.rules.size());
++  EXPECT_EQ("r2", rules.rules[0].id);
++
++  EXPECT_TRUE(RemoveRuleWithId(rules, "r4"));
++  EXPECT_FALSE(RemoveRuleWithId(rules, "r4"));
++  ASSERT_EQ(1u, rules.rules.size());
++}
++
++TEST_F(LinkRulesTest, OnlySameProfileRulesMatch) {
++  LinkRules rules;
++  SetRule(rules, Domain("github.com"), "Profile 1", kSpaceA, "theirs");
++  EXPECT_EQ(nullptr, FindRule(rules, GURL("https://github.com/"), "Default"));
++  EXPECT_EQ(nullptr,
++            FindRuleForPattern(rules, Domain("github.com"), "Default"));
++
++  // Each profile keeps its own rule for the same site.
++  SetRule(rules, Domain("github.com"), "Default", kSpaceB, "mine");
++  ASSERT_EQ(2u, rules.rules.size());
++  const LinkRule* rule =
++      FindRule(rules, GURL("https://github.com/"), "Default");
++  ASSERT_TRUE(rule);
++  EXPECT_EQ("mine", rule->id);
++  EXPECT_FALSE(RemoveRule(rules, Domain("slack.com"), "Default"));
++  EXPECT_TRUE(RemoveRule(rules, Domain("github.com"), "Default"));
++  ASSERT_EQ(1u, rules.rules.size());
++  EXPECT_EQ("theirs", rules.rules[0].id);
++}
++
++TEST_F(LinkRulesTest, DecidesWhereALinkGoes) {
++  RouteFacts matched;
++  matched.rule_matched = true;
++  matched.space_exists = true;
++
++  RouteFacts facts = matched;
++  facts.holder_window = true;
++  facts.target_window = true;
++  EXPECT_EQ(RouteDecision::kHolderWindow, DecideRoute(facts));
++
++  facts = matched;
++  facts.target_window = true;
++  EXPECT_EQ(RouteDecision::kShowSpaceInTargetWindow, DecideRoute(facts));
++
++  // No window can show the space.
++  EXPECT_EQ(RouteDecision::kLittleWindowWithButton, DecideRoute(matched));
++
++  facts = matched;
++  facts.holder_window = true;
++  facts.spaces_not_ready = true;
++  EXPECT_EQ(RouteDecision::kLittleWindowWithButton, DecideRoute(facts));
++
++  facts = matched;
++  facts.holder_window = true;
++  facts.space_exists = false;
++  EXPECT_EQ(RouteDecision::kDeleteRuleThenLittleWindow, DecideRoute(facts));
++
++  facts = matched;
++  facts.holder_window = true;
++  facts.off_the_record = true;
++  EXPECT_EQ(RouteDecision::kLittleWindow, DecideRoute(facts));
++
++  facts = matched;
++  facts.holder_window = true;
++  facts.sign_in_url = true;
++  EXPECT_EQ(RouteDecision::kLittleWindow, DecideRoute(facts));
++
++  facts = matched;
++  facts.holder_window = true;
++  facts.rule_matched = false;
++  EXPECT_EQ(RouteDecision::kLittleWindow, DecideRoute(facts));
++}
++
++}  // namespace
++}  // namespace rac::link_routing
+--- a/chrome/browser/rac/power/BUILD.gn
++++ b/chrome/browser/rac/power/BUILD.gn
+@@ -41,8 +41,8 @@ source_set("bangs_fixture") {
+ 
+ # Build with `autoninja -C out/Default
+ # chrome/browser/rac/power:rac_power_unittests`. It also runs the SitePattern
+-# tests, so one binary covers both. It's separate from Chromium's unit_tests,
+-# which takes hours to build.
++# and link routing rule tests, so one binary covers them. It's separate
++# from Chromium's unit_tests, which takes hours to build.
+ test("rac_power_unittests") {
+   sources = [
+     "group_namer_logic_unittest.cc",
+@@ -59,6 +59,7 @@ test("rac_power_unittests") {
+     "//base/test:test_support",
+     "//chrome/app:command_ids",
+     "//chrome/browser/rac/actions:core",
++    "//chrome/browser/rac/link_routing:unit_tests",
+     "//chrome/browser/rac/power/shortcuts",
+     "//chrome/browser/rac/site_pattern:unit_tests",
+     "//testing/gtest",
+--- a/chrome/browser/rac/updates/BUILD.gn
++++ b/chrome/browser/rac/updates/BUILD.gn
+@@ -11,6 +11,7 @@ source_set("updates") {
+   ]
+   deps = [
+     "//base",
++    "//chrome/browser/rac/link_routing:rules",
+     "//components/prefs",
+   ]
+   public_deps = [ "//url" ]
+--- a/chrome/browser/rac/updates/rac_updates.cc
++++ b/chrome/browser/rac/updates/rac_updates.cc
+@@ -9,6 +9,7 @@
+ #include "base/command_line.h"
+ #include "base/logging.h"
+ #include "build/build_config.h"
++#include "chrome/browser/rac/link_routing/link_rules.h"
+ #include "components/prefs/pref_registry_simple.h"
+ #include "components/prefs/pref_service.h"
+ 
+@@ -38,6 +39,9 @@ constexpr char kFeedBaseUrlSwitch[] = "c
+ 
+ void RegisterUpdatePrefs(PrefRegistrySimple* registry) {
+   registry->RegisterBooleanPref(kBrowserUpdatesEnabled, true);
++  // rac's other Local State prefs, so they need no hook of their own in
++  // browser_prefs.cc.
++  link_routing::RegisterLocalStatePrefs(registry);
+ }
+ 
+ bool ShouldCheckForUpdates(const PrefService& local_state) {
