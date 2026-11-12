@@ -18,8 +18,45 @@ Wikipedia for "cats".
   the user's own `!x`. Applying a list that added bangs tells the
   service's observers once, so an open Bangs page sees a list that arrives
   late.
-- A bang works at the start of the query (`!w cats`), and in the middle or
-  at the end (`cats !w`) once a space or Return follows it.
+- A bang works at the start, middle or end of the query: `!w cats`,
+  `ca !w ts`, `cats !w`. Helium's `SplitKeywordFromInput` looks only at the
+  first `!` in the input, and only when whitespace comes before it, so
+  `wow! cats !w` has no bang (its first token, `wow!`, is the keyword) and
+  in `cats !w !wa` the `!wa` is part of the query.
+
+## The address bar
+
+Patch: `rac/power/bangs-omnibox.patch`.
+
+While the user types, Chromium turns exact keyword matching off, so a
+typed `w cats` doesn't jump to the `w` engine. That also meant no
+suggestion searched a bang's engine: `cats !w` showed a search on the
+default engine, with the bang only as a badge.
+
+`KeywordProvider` now makes one extra suggestion when exact matching is off
+and the keyword starts with `!`: the bang's engine searching the rest of
+the input. It ranks above the default engine's search, so it's the top
+row and Enter or a click searches the bang's engine. Its transition is
+`GENERATED`, not `KEYWORD`. A `KEYWORD` default match makes the address
+bar turn the keyword into a chip, and nearly every short bang is the
+start of a longer one, so typing `cats !wa` would have chipped `!w` and
+put the `a` in the query.
+
+Deleted and unknown bangs aren't engines, so they fall through to a plain
+search. Keywords without `!`, keyword mode, and the command bar (which
+allows exact matching) are unchanged. Input with no `!` does no extra
+work.
+
+The classifier is unchanged on purpose. `AutocompleteClassifier` turns
+text into one match for the context menu's "Search <default engine> for",
+paste and go, text dropped on the tab strip, and paste into a new tab. It
+omits asynchronous matches, and the bang suggestion requires that they
+aren't omitted, so those still search the default engine with the text as
+it is. The context menu names the default engine, so it must not open
+another one.
+
+The rules are tested in `rac_omnibox_unittests`
+(`chrome/browser/rac/power`).
 
 ## Edits that survive list updates
 
@@ -77,12 +114,12 @@ each: the user's own bangs from an earlier run stay in the profile.
 
 ## Still open
 
-- **The address bar.** Typing a bang at the end of a query (`cats !w`)
-  still shows a search on the default engine as the top suggestion, plus a
-  badge for the bang. When a bang is there, the search isn't a search on
-  the default engine. The fix isn't just the label: rethink what the
-  address bar shows while typing a bang, at the start versus the end, and
-  for a bang that doesn't exist.
+- **How the bang row looks.** It still carries Helium's keyword hint (the
+  badge) and reads "cats · Wikipedia Search", and the default engine's
+  search stays second with its suggestions. Whether to drop the badge,
+  reword the row, or hide the default row is a design call; dropping the
+  badge also removes Helium's "space after `!w` makes a chip" and "Return
+  accepts the hint" paths.
 - How bangs relate to the command bar (phase 5) and to Chromium's keyword
   search, which also uses the address bar.
 - Matching must not slow typing in the address bar, even with no bangs in
