@@ -15,6 +15,10 @@ unit test green while the rule stops holding. So this reads the two files
 as rac's patches leave them (patched_files.py) and checks each call is still
 there, in the function that owns it, ahead of what it guards.
 
+AskRowWiringTest pins the same kind of wiring for internal pages and the
+command bar's Ask row: the row is offered and run only by AskAssistant()'s
+own check, and that check still refuses an internal page.
+
 Run from the repository root:
     python3 -m unittest discover -s devutils/rac -p 'test_never_site_wiring.py' -v
 """
@@ -147,6 +151,59 @@ class NeverSiteWiringTest(unittest.TestCase):
         self.assert_before(fetched, 'if (RefuseNeverSite(*result)) {',
                            'BuildLinkSummaryRequest(',
                            'a redirect or frame to a never site is summarized')
+
+
+class AskRowWiringTest(unittest.TestCase):
+    ROWS = 'chrome/browser/rac/actions/rac_actions_command_bar.cc'
+    TABLE = 'chrome/browser/rac/actions/rac_actions.cc'
+    CONTEXT = 'chrome/browser/ui/rac/rac_action_handlers.cc'
+    BAR = 'chrome/browser/ui/views/rac/command_bar/command_bar_actions.cc'
+    PANEL = 'chrome/browser/ui/views/rac/ai/assistant_side_panel.cc'
+
+    def function(self, path, opening):
+        return code(patched_files.braced_body(
+            patched_files.final_text(path), opening))
+
+    assert_before = NeverSiteWiringTest.assert_before
+
+    def test_the_ask_row_needs_the_assistant_not_a_web_page(self):
+        rows = code(patched_files.final_text(self.ROWS))
+        start = rows.index('.id = "ask",')
+        row = rows[start:rows.index('.hints', start)]
+        self.assertIn('Need::kAssistant', row)
+        self.assertNotIn('Need::kWebPage', row,
+                         'view-source: shows the row again: its committed '
+                         'page is http(s)')
+        self.assertIn('context.can_ask_assistant',
+                      self.function(self.TABLE, 'bool MeetsNeeds('))
+
+    def test_the_need_is_ask_assistants_own_check(self):
+        body = self.function(self.CONTEXT,
+                             'ActionContext ContextForWindow(')
+        self.assertRegex(
+            body, r'if \(context\.ai_enabled && !context\.incognito\) \{\s*'
+            r'context\.can_ask_assistant = rac::ai::CanAskAssistant\(browser\);',
+            'the Ask row no longer goes by AskAssistant()\'s check, or runs '
+            'AI code with AI off')
+
+    def test_ask_assistant_still_refuses_internal_pages(self):
+        can = self.function(self.PANEL, 'bool CanAskAssistant(')
+        self.assertIn('IsAssistantBlockedHere(browser)', can)
+        ask = self.function(self.PANEL, 'bool AskAssistant(')
+        self.assert_before(ask, '!CanAskAssistant(browser)',
+                           'ShowAssistantForTab(',
+                           'the panel opens before the internal-page check')
+        self.assert_before(ask, '!CanAskAssistant(browser)', 'SetPrompt(',
+                           'the prompt is left before the internal-page check')
+
+    def test_the_bar_checks_again_before_it_runs_a_row(self):
+        body = self.function(self.BAR, 'bool RunAction(')
+        self.assert_before(body, 'ContextForWindow(browser)',
+                           'RunBrowserAction(',
+                           'a row runs without its availability checked again')
+        self.assert_before(body, 'ForSurface(Surface::kCommandBar, context)',
+                           'RunBrowserAction(',
+                           'a row runs without its availability checked again')
 
 
 if __name__ == '__main__':
