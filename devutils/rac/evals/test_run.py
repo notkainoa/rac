@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1190,11 +1191,111 @@ class DialogTriggerTest(unittest.TestCase):
 
 
 class StopNamesTheConversationTest(unittest.TestCase):
-    def test_stop_names_the_conversation_on_show(self):
-        # The browser stops only the named conversation's own task.
-        self.assertIn("racAiAgentStop", run.STOP_JS)
-        self.assertIn("window.__evals.key", run.STOP_JS)
-        self.assertIn("'rac-ai-show'", run.ASSISTANT_HOOK)
+    """A timed-out turn's Stop names the conversation on show (the browser
+    stops only that conversation's own task), and a Stop the browser refused
+    fails the variant instead of letting the task run into the next turn."""
+
+    # Runs ASSISTANT_HOOK and then STOP_JS in node against a stub of cr.js
+    # and chrome.send, and prints what racAiAgentStop was sent.
+    NODE_DRIVER = r"""
+    const listeners = {};
+    const sent = [];
+    const [init, late] = process.argv.slice(-2).map(a => JSON.parse(a));
+    globalThis.window = globalThis;
+    globalThis.chrome = {send: (name, args) => sent.push([name, args])};
+    globalThis.__cr = {
+      addWebUiListener: (name, fn) => { listeners[name] = fn; },
+      sendWithPromise: async (name) => init,
+    };
+    (async () => {
+      await (HOOK);
+      if (late !== null) listeners['rac-ai-show']({key: late});
+      const status = (STOP);
+      console.log(JSON.stringify({status, sent}));
+    })();
+    """
+
+    def drive(self, init, late=None):
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not installed")
+        hook = run.ASSISTANT_HOOK.replace(
+            "await import('chrome://resources/js/cr.js')", "globalThis.__cr")
+        self.assertNotIn("chrome://resources", hook)
+        script = self.NODE_DRIVER.replace("(HOOK)", "(" + hook.strip() + ")") \
+                                 .replace("(STOP)", "(" + run.STOP_JS + ")")
+        out = subprocess.run([node, "-e", script, json.dumps(init), json.dumps(late)],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_the_hook_seeds_the_key_from_init(self):
+        # The page's own init showed the conversation before the hook's
+        # listener was there, and the hook's init shows nothing new.
+        got = self.drive({"enabled": True, "conversation": "k1"})
+        self.assertEqual(got, {"status": "sent", "sent": [["racAiAgentStop", ["k1"]]]})
+
+    def test_a_later_show_names_the_newer_conversation(self):
+        got = self.drive({"enabled": True, "conversation": "k1"}, late="k2")
+        self.assertEqual(got["sent"], [["racAiAgentStop", ["k2"]]])
+
+    def test_no_key_sends_nothing(self):
+        got = self.drive({"enabled": True})
+        self.assertEqual(got, {"status": "no-key", "sent": []})
+        got = self.drive({"enabled": True, "conversation": ""})
+        self.assertEqual(got, {"status": "no-key", "sent": []})
+
+    class FakeAssistant:
+        """STOP_JS answers `status`; the events list grows with `after_stop`
+        once the Stop went out."""
+        def __init__(self, status, events, after_stop=()):
+            self.status, self.events, self.after_stop = status, list(events), after_stop
+            self.stops = 0
+
+        def eval(self, expr, await_promise=True):
+            if expr == run.STOP_JS:
+                self.stops += 1
+                if self.status == "sent":
+                    self.events.extend(self.after_stop)
+                return self.status
+            if expr == "window.__evals.events":
+                return list(self.events)
+            raise AssertionError("unexpected eval: " + expr)
+
+    RUNNING = [{"type": "run_state", "state": "running"}]
+    STOPPED = [{"type": "run_state", "state": "stopped"}]
+
+    def test_a_stop_without_a_key_fails_loudly(self):
+        a = self.FakeAssistant("no-key", self.RUNNING)
+        with self.assertRaisesRegex(RuntimeError, "no conversation key"):
+            run.stop_timed_out_task(a, 0, None, timeout=1)
+
+    def test_a_refused_stop_fails_loudly(self):
+        # Sent, but the task never ends: the browser refused the Stop.
+        a = self.FakeAssistant("sent", self.RUNNING)
+        with self.assertRaisesRegex(RuntimeError, "refused"):
+            run.stop_timed_out_task(a, 0, None, timeout=0.5)
+        self.assertEqual(a.stops, 1)
+
+    def test_a_taken_stop_returns_once_the_task_ends(self):
+        a = self.FakeAssistant("sent", self.RUNNING, after_stop=self.STOPPED)
+        run.stop_timed_out_task(a, 0, None, timeout=5)
+
+    def test_a_turn_with_no_task_needs_only_the_stop(self):
+        # A reply that hung without an agent task: nothing to wait for.
+        run.stop_timed_out_task(self.FakeAssistant("sent", []), 0, None, timeout=0.5)
+        # Only this turn's events count: an earlier turn's task ended.
+        events = self.STOPPED + self.RUNNING + self.STOPPED
+        run.stop_timed_out_task(self.FakeAssistant("sent", events), 2, None, timeout=0.5)
+
+    def test_task_running_reads_the_newest_run_state(self):
+        self.assertFalse(run.task_running([]))
+        self.assertTrue(run.task_running(self.RUNNING))
+        self.assertTrue(run.task_running([{"type": "run_state", "state": "waiting"},
+                                          {"type": "confirm_request"}]))
+        self.assertFalse(run.task_running(self.RUNNING + self.STOPPED))
+        self.assertFalse(run.task_running(self.RUNNING + [{"type": "run_state",
+                                                           "state": "error"}]))
 
 
 if __name__ == "__main__":

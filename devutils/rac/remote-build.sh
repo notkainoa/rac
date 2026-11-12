@@ -53,6 +53,10 @@
 #                                     --rac-import-arc-undo-now (undo the
 #                                     profile's Arc import at startup; bare,
 #                                     alone or with --rac-import-source-root=),
+#                                     --rac-bangs-fixture=<path> (a bangs
+#                                     list for the Bangs settings page,
+#                                     relative to the clone, must exist
+#                                     there; pair it with --fresh-profile),
 #                                     --rac-arc-import-fixture=<path> and
 #                                     --rac-import-source-root=<path> (Arc
 #                                     import inputs, relative to the clone,
@@ -1273,7 +1277,8 @@ check_run_arg() {
       done
       return 0 ;;
     --rac-window-screenshot=?* | --rac-arc-import-fixture=?* | \
-      --rac-import-source-root=?* | --log-net-log=?* | --rac-frame-log=?*)
+      --rac-import-source-root=?* | --log-net-log=?* | --rac-frame-log=?* | \
+      --rac-bangs-fixture=?*)
       value=${arg#*=} ;;
     --rac-window-screenshot | --rac-window-screenshot=)
       refuse "give the screenshot file as --rac-window-screenshot=<name>.png" ;;
@@ -1281,7 +1286,8 @@ check_run_arg() {
       refuse "give the net log as --log-net-log=<name>.json" ;;
     --rac-frame-log | --rac-frame-log=)
       refuse "give the frame log as --rac-frame-log=<name>.log" ;;
-    --rac-arc-import-fixture= | --rac-import-source-root=)
+    --rac-arc-import-fixture= | --rac-import-source-root= | --rac-bangs-fixture | \
+      --rac-bangs-fixture=)
       refuse "${arg%%=*} needs a path in the clone" ;;
     --rac-window-screenshot-delay=*)
       value=${arg#*=}
@@ -1592,10 +1598,11 @@ for arg in "$@"; do
       arg="${arg%%=*}=$log"
       case "$arg" in --log-net-log=*) net_log=1 ;; esac
       logfiles+=("$log") ;;
-    # Inputs rac reads Arc data from, which need absolute paths: relative
-    # to the clone, existing, and still inside it once symlinks resolve.
-    # Nothing is created for them.
-    --rac-arc-import-fixture=* | --rac-import-source-root=*)
+    # Inputs rac reads fixture data from, which need absolute paths:
+    # relative to the clone, existing, and still inside it once symlinks
+    # resolve. Nothing is created for them. Only a source root counts as an
+    # Arc input; the bangs fixture (Power's Bangs page) is just data.
+    --rac-arc-import-fixture=* | --rac-import-source-root=* | --rac-bangs-fixture=*)
       case "$arg" in --rac-import-source-root=*) root_given=1 ;; esac
       input=${arg#*=}
       [ -n "$input" ] || { echo "rac remote: refusing: ${arg%%=*} needs a path in the clone" >&2; exit 2; }
