@@ -1,0 +1,775 @@
+Index: src/chrome/browser/rac/storage/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/rac/storage/BUILD.gn
++++ src/chrome/browser/rac/storage/BUILD.gn
+@@ -4,11 +4,13 @@
+ 
+ import("//testing/test.gni")
+ 
+-# Backups of the profile's sidebar data, and the Local State prefs that guard
+-# the Keychain key. Depends only on base and prefs, so it can be tested without
+-# a browser.
++# Backups of the profile's sidebar data, the Local State prefs that guard the
++# Keychain key, and the crash-restore rule. Depends only on base and prefs, so
++# it can be tested without a browser.
+ source_set("storage") {
+   sources = [
++    "crash_restore_policy.cc",
++    "crash_restore_policy.h",
+     "data_backups.cc",
+     "data_backups.h",
+     "keychain_key_prefs.cc",
+@@ -38,11 +40,28 @@
+   ]
+ }
+ 
++# Restores the session after a crash without the bubble (see crash_restore.h).
++# Used by //chrome/browser/ui/startup:impl.
++source_set("crash_restore") {
++  sources = [
++    "crash_restore.cc",
++    "crash_restore.h",
++  ]
++  deps = [
++    ":storage",
++    "//base",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/sessions",
++    "//components/prefs",
++  ]
++}
++
+ # Build with `autoninja -C out/Default
+ # chrome/browser/rac/storage:rac_storage_unittests`. It's separate from
+ # Chromium's unit_tests, which takes hours to build.
+ test("rac_storage_unittests") {
+   sources = [
++    "crash_restore_policy_unittest.cc",
+     "data_backups_pref_names_unittest.cc",
+     "data_backups_unittest.cc",
+     "restore_plan_unittest.cc",
+Index: src/chrome/browser/rac/storage/crash_restore.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/storage/crash_restore.cc
+@@ -0,0 +1,166 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/storage/crash_restore.h"
++
++#include <memory>
++#include <optional>
++#include <utility>
++
++#include "base/callback_list.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback.h"
++#include "base/location.h"
++#include "base/memory/weak_ptr.h"
++#include "base/supports_user_data.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/storage/crash_restore_policy.h"
++#include "chrome/browser/sessions/exit_type_service.h"
++#include "chrome/browser/sessions/session_restore.h"
++#include "components/prefs/pref_service.h"
++
++namespace rac {
++
++namespace {
++
++const void* const kCrashRestoreStateKey = &kCrashRestoreStateKey;
++
++// Put on the profile when a launch decides to restore silently after a crash,
++// and kept until the profile goes away. Records how the first restore of the
++// profile after that ended, and holds the crash bubble until then.
++class CrashRestoreState : public base::SupportsUserData::Data {
++ public:
++  CrashRestoreState()
++      : restored_subscription_(
++            SessionRestore::RegisterOnSessionRestoredCallback(
++                base::BindRepeating(&CrashRestoreState::OnSessionRestored,
++                                    base::Unretained(this)))) {}
++  CrashRestoreState(const CrashRestoreState&) = delete;
++  CrashRestoreState& operator=(const CrashRestoreState&) = delete;
++  ~CrashRestoreState() override = default;
++
++  static CrashRestoreState* FromProfile(const Profile* profile) {
++    return static_cast<CrashRestoreState*>(
++        profile->GetUserData(kCrashRestoreStateKey));
++  }
++
++  // Tabs the silent restore brought back, or nullopt until it finishes.
++  std::optional<int> tabs_restored() const { return tabs_restored_; }
++
++  void WaitToShowBubble(base::OnceClosure show_bubble) {
++    pending_bubble_ = std::move(show_bubble);
++  }
++
++ private:
++  void OnSessionRestored(Profile* profile, int tabs_restored) {
++    if (FromProfile(profile) != this || tabs_restored_.has_value()) {
++      return;
++    }
++    tabs_restored_ = tabs_restored;
++    base::OnceClosure show_bubble = std::move(pending_bubble_);
++    if (show_bubble && ShouldShowCrashBubbleAfterRestore(tabs_restored)) {
++      // Not from inside the restorer's notification. The closure checks that
++      // its window is still open.
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, std::move(show_bubble));
++    }
++  }
++
++  std::optional<int> tabs_restored_;
++  base::OnceClosure pending_bubble_;
++  base::CallbackListSubscription restored_subscription_;
++};
++
++void ClearGuard(base::WeakPtr<Profile> profile) {
++  if (profile) {
++    profile->GetPrefs()->ClearPref(kCrashRestoreGuardPref);
++  }
++}
++
++// The launch counts as recovered once it has been up this long. Delayed tasks
++// don't count time asleep, so a Mac that sleeps right after the restore still
++// needs the full period awake.
++void ClearGuardOnceStable(Profile* profile) {
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE, base::BindOnce(&ClearGuard, profile->GetWeakPtr()),
++      kCrashRestoreStablePeriod);
++}
++
++}  // namespace
++
++bool ShouldRestoreSessionAfterCrash(Profile* profile,
++                                    bool is_post_crash_launch,
++                                    bool restores_last_session) {
++  if (!profile->IsRegularProfile()) {
++    return false;
++  }
++  // This run already chose to restore. Don't read its own guard as a loop.
++  if (CrashRestoreState::FromProfile(profile)) {
++    return is_post_crash_launch;
++  }
++
++  PrefService* prefs = profile->GetPrefs();
++  base::Time guard = prefs->GetTime(kCrashRestoreGuardPref);
++  const bool last_exit_crashed =
++      ExitTypeService::GetLastSessionExitType(profile) == ExitType::kCrashed;
++  if (ShouldClearCrashRestoreGuard(last_exit_crashed, guard)) {
++    prefs->ClearPref(kCrashRestoreGuardPref);
++    guard = base::Time();
++  }
++
++  const base::Time now = base::Time::Now();
++  switch (DecideCrashRestore(is_post_crash_launch, restores_last_session,
++                             guard, now)) {
++    case CrashRestoreAction::kNone:
++      return false;
++    case CrashRestoreAction::kShowBubble:
++      // Chromium's crash path. If the crash happened while recovering, this
++      // launch now has to stay up before silent restores come back.
++      if (!guard.is_null()) {
++        ClearGuardOnceStable(profile);
++      }
++      return false;
++    case CrashRestoreAction::kRestoreSilently:
++      break;
++  }
++
++  // Set before anything is restored, and its write is scheduled right away so
++  // a crash during the restore usually finds it on the next launch.
++  // CommitPendingWrite() doesn't wait for the disk: a crash within milliseconds
++  // can lose the guard. That costs one extra silent restore, never the session,
++  // which stays unwritten until the restore has finished.
++  prefs->SetTime(kCrashRestoreGuardPref, now);
++  prefs->CommitPendingWrite();
++  ClearGuardOnceStable(profile);
++  profile->SetUserData(kCrashRestoreStateKey,
++                       std::make_unique<CrashRestoreState>());
++  return true;
++}
++
++bool IsSilentCrashRestorePending(Profile* profile) {
++  const CrashRestoreState* state = CrashRestoreState::FromProfile(profile);
++  return state && !state->tabs_restored().has_value();
++}
++
++void ShowCrashBubbleUnlessRestored(Profile* profile,
++                                   base::OnceClosure show_bubble) {
++  CrashRestoreState* state = CrashRestoreState::FromProfile(profile);
++  switch (DecideCrashBubble(
++      /*restoring_silently=*/state != nullptr,
++      SessionRestore::IsRestoring(profile),
++      state ? state->tabs_restored() : std::nullopt)) {
++    case CrashBubbleAction::kShowNow:
++      std::move(show_bubble).Run();
++      return;
++    case CrashBubbleAction::kWaitForRestore:
++      state->WaitToShowBubble(std::move(show_bubble));
++      return;
++    case CrashBubbleAction::kHide:
++      return;
++  }
++}
++
++}  // namespace rac
+Index: src/chrome/browser/rac/storage/crash_restore.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/storage/crash_restore.h
+@@ -0,0 +1,52 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_STORAGE_CRASH_RESTORE_H_
++#define CHROME_BROWSER_RAC_STORAGE_CRASH_RESTORE_H_
++
++#include "base/functional/callback_forward.h"
++
++class Profile;
++
++// Restores the last session after a crash without the "Restore pages?"
++// bubble, when the startup setting continues where the user left off. The
++// rule and the crash-loop guard are in crash_restore_policy.h.
++//
++// rac doesn't restore anything itself. When this says yes, startup takes the
++// path a clean launch takes (SessionRestore::RestoreSession() at process
++// startup, SessionService::RestoreIfNecessary() later), which is also what
++// Chromium does after a crash with --hide-crash-restore-bubble. The crashed
++// session stays safe the way it does when the user presses Restore:
++// ExitTypeService keeps the session service from writing until the restore
++// has finished, so the crashed session file is what gets read, and nothing
++// replaces it first.
++namespace rac {
++
++// Called once per launch of `profile` from
++// StartupBrowserCreatorImpl::DetermineURLsAndLaunch(), before anything is
++// restored. `is_post_crash_launch` is HasPendingUncleanExit(), and
++// `restores_last_session` is SessionStartupPref::ShouldRestoreLastSession() for
++// this launch. Returns true if this launch should restore the last session as
++// if the last run had exited cleanly. Also keeps kCrashRestoreGuardPref up to
++// date. Only regular profiles qualify.
++bool ShouldRestoreSessionAfterCrash(Profile* profile,
++                                    bool is_post_crash_launch,
++                                    bool restores_last_session);
++
++// Whether this launch of `profile` restores silently after a crash and that
++// restore hasn't finished yet. The restore then brings back app windows too,
++// the way the bubble's Restore button does.
++bool IsSilentCrashRestorePending(Profile* profile);
++
++// Called from AddInfoBarsIfNecessary() where Chromium shows the crash bubble.
++// `show_bubble` shows it on the window the infobars were added to. Runs it now
++// unless the silent restore is running or brought tabs back. While the restore
++// runs, keeps it and runs it in a later task only if the restore ends with no
++// tabs restored, so an unreadable or empty session file still gets the bubble.
++void ShowCrashBubbleUnlessRestored(Profile* profile,
++                                   base::OnceClosure show_bubble);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_STORAGE_CRASH_RESTORE_H_
+Index: src/chrome/browser/rac/storage/crash_restore_policy.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/storage/crash_restore_policy.cc
+@@ -0,0 +1,65 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/storage/crash_restore_policy.h"
++
++#include "components/prefs/pref_registry_simple.h"
++
++namespace rac {
++
++CrashRestoreAction DecideCrashRestore(bool is_post_crash_launch,
++                                      bool restores_last_session,
++                                      base::Time guard,
++                                      base::Time now) {
++  if (!is_post_crash_launch) {
++    return CrashRestoreAction::kNone;
++  }
++  // With a new tab page or specific pages, the bubble is the only way back to
++  // the crashed tabs, so it stays.
++  if (!restores_last_session) {
++    return CrashRestoreAction::kShowBubble;
++  }
++  // The crash came from a launch that was still recovering: let the user
++  // decide, so a crashing session doesn't restore itself in a loop.
++  if (IsCrashRestoreGuardActive(guard, now)) {
++    return CrashRestoreAction::kShowBubble;
++  }
++  return CrashRestoreAction::kRestoreSilently;
++}
++
++bool IsCrashRestoreGuardActive(base::Time guard, base::Time now) {
++  return !guard.is_null() &&
++         (now - guard).magnitude() < kCrashRestoreGuardExpiry;
++}
++
++bool ShouldClearCrashRestoreGuard(bool last_exit_crashed, base::Time guard) {
++  return !guard.is_null() && !last_exit_crashed;
++}
++
++CrashBubbleAction DecideCrashBubble(bool restoring_silently,
++                                    bool restore_running,
++                                    std::optional<int> tabs_restored) {
++  if (!restoring_silently) {
++    return CrashBubbleAction::kShowNow;
++  }
++  if (tabs_restored.has_value()) {
++    return ShouldShowCrashBubbleAfterRestore(*tabs_restored)
++               ? CrashBubbleAction::kShowNow
++               : CrashBubbleAction::kHide;
++  }
++  return restore_running ? CrashBubbleAction::kWaitForRestore
++                         : CrashBubbleAction::kShowNow;
++}
++
++bool ShouldShowCrashBubbleAfterRestore(int tabs_restored) {
++  // An unreadable or empty session file restores nothing. The crashed file is
++  // still this run's last session, so the bubble's Restore can try again.
++  return tabs_restored <= 0;
++}
++
++void RegisterCrashRestorePrefs(PrefRegistrySimple* registry) {
++  registry->RegisterTimePref(kCrashRestoreGuardPref, base::Time());
++}
++
++}  // namespace rac
+Index: src/chrome/browser/rac/storage/crash_restore_policy.h
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/storage/crash_restore_policy.h
+@@ -0,0 +1,99 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_STORAGE_CRASH_RESTORE_POLICY_H_
++#define CHROME_BROWSER_RAC_STORAGE_CRASH_RESTORE_POLICY_H_
++
++#include <optional>
++
++#include "base/time/time.h"
++
++class PrefRegistrySimple;
++
++// When a launch after a crash restores the last session without asking.
++// Pure logic over plain values, so it's tested without a browser. The browser
++// side is in crash_restore.h.
++//
++// The rule: a launch that follows a crash restores silently when the startup
++// setting continues where the user left off, unless the crash came from a
++// launch that was still recovering from an earlier crash. A launch is
++// recovering from when rac restored silently until it has run for
++// kCrashRestoreStablePeriod, or until a later launch finds a clean exit.
++// Then the next crash shows Chromium's "Restore pages?" bubble instead, so a
++// session that crashes rac can't crash it again and again on its own.
++namespace rac {
++
++// Profile pref: when this profile last restored silently after a crash. Unset
++// once that launch has run for kCrashRestoreStablePeriod, or when a later
++// launch follows a clean exit.
++inline constexpr char kCrashRestoreGuardPref[] =
++    "rac.session.crash_restore_time";
++
++// How long a silently restored launch must run before its crash counts as a
++// new one. Only the selected tabs load during a restore, so a session that
++// crashes rac does it well within this.
++inline constexpr base::TimeDelta kCrashRestoreStablePeriod = base::Minutes(5);
++
++// A guard this far from now in either direction is ignored, so a guard left
++// behind by a clock change or an unusual exit can't stop silent restores for
++// good. A crash loop relaunches far sooner.
++inline constexpr base::TimeDelta kCrashRestoreGuardExpiry = base::Days(1);
++
++enum class CrashRestoreAction {
++  // The last run didn't crash, or its crash was already handled.
++  kNone,
++  // Restore the last session the way a clean launch does, with no bubble.
++  kRestoreSilently,
++  // Chromium's behavior: open a new window and show the "Restore pages?"
++  // bubble, whose Restore button brings the session back.
++  kShowBubble,
++};
++
++// `is_post_crash_launch` is HasPendingUncleanExit(). `restores_last_session` is
++// true for "Continue where you left off", alone or with specific pages.
++// `guard` is kCrashRestoreGuardPref, null when unset.
++CrashRestoreAction DecideCrashRestore(bool is_post_crash_launch,
++                                      bool restores_last_session,
++                                      base::Time guard,
++                                      base::Time now);
++
++// Whether `guard` is set and within kCrashRestoreGuardExpiry of `now`.
++bool IsCrashRestoreGuardActive(base::Time guard, base::Time now);
++
++// Whether a launch should clear `guard` right away: it's set and the last run
++// didn't crash, so the restored launch reached a clean exit.
++bool ShouldClearCrashRestoreGuard(bool last_exit_crashed, base::Time guard);
++
++enum class CrashBubbleAction {
++  // Show the "Restore pages?" bubble now: no silent restore is in play, or it
++  // brought nothing back.
++  kShowNow,
++  // The silent restore is still running. Show the bubble only if it ends with
++  // no tabs restored.
++  kWaitForRestore,
++  // The silent restore brought tabs back, so the bubble would only duplicate
++  // them.
++  kHide,
++};
++
++// What to do with the crash bubble that Chromium is about to show.
++// `restoring_silently` is whether this launch chose kRestoreSilently.
++// `restore_running` is SessionRestore::IsRestoring(). `tabs_restored` is the
++// count the silent restore reported when it finished, or nullopt before then.
++// A restore that isn't running and hasn't finished never started (no session
++// service, for one), so the bubble shows.
++CrashBubbleAction DecideCrashBubble(bool restoring_silently,
++                                    bool restore_running,
++                                    std::optional<int> tabs_restored);
++
++// Whether a bubble that waited for the silent restore should show once it
++// finished with `tabs_restored`.
++bool ShouldShowCrashBubbleAfterRestore(int tabs_restored);
++
++// Registers kCrashRestoreGuardPref. Called with the profile's registry.
++void RegisterCrashRestorePrefs(PrefRegistrySimple* registry);
++
++}  // namespace rac
++
++#endif  // CHROME_BROWSER_RAC_STORAGE_CRASH_RESTORE_POLICY_H_
+Index: src/chrome/browser/rac/storage/crash_restore_policy_unittest.cc
+===================================================================
+--- /dev/null
++++ src/chrome/browser/rac/storage/crash_restore_policy_unittest.cc
+@@ -0,0 +1,192 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/storage/crash_restore_policy.h"
++
++#include <optional>
++#include <string_view>
++
++#include "base/time/time.h"
++#include "components/prefs/testing_pref_service.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac {
++namespace {
++
++base::Time Now() {
++  base::Time now;
++  EXPECT_TRUE(base::Time::FromUTCString("2026-11-10 12:00:00", &now));
++  return now;
++}
++
++TEST(CrashRestorePolicyTest, NoCrashDoesNothing) {
++  const base::Time now = Now();
++  EXPECT_EQ(DecideCrashRestore(/*is_post_crash_launch=*/false,
++                               /*restores_last_session=*/true, base::Time(),
++                               now),
++            CrashRestoreAction::kNone);
++  EXPECT_EQ(DecideCrashRestore(/*is_post_crash_launch=*/false,
++                               /*restores_last_session=*/false,
++                               now - base::Minutes(1), now),
++            CrashRestoreAction::kNone);
++}
++
++TEST(CrashRestorePolicyTest, CrashWithContinueRestoresSilently) {
++  EXPECT_EQ(DecideCrashRestore(/*is_post_crash_launch=*/true,
++                               /*restores_last_session=*/true, base::Time(),
++                               Now()),
++            CrashRestoreAction::kRestoreSilently);
++}
++
++TEST(CrashRestorePolicyTest, CrashWithoutContinueKeepsTheBubble) {
++  // New tab page or specific pages: the bubble is the only way back.
++  EXPECT_EQ(DecideCrashRestore(/*is_post_crash_launch=*/true,
++                               /*restores_last_session=*/false, base::Time(),
++                               Now()),
++            CrashRestoreAction::kShowBubble);
++}
++
++TEST(CrashRestorePolicyTest, CrashWhileRecoveringShowsTheBubble) {
++  const base::Time now = Now();
++  EXPECT_EQ(DecideCrashRestore(/*is_post_crash_launch=*/true,
++                               /*restores_last_session=*/true,
++                               now - base::Seconds(10), now),
++            CrashRestoreAction::kShowBubble);
++  EXPECT_EQ(DecideCrashRestore(/*is_post_crash_launch=*/true,
++                               /*restores_last_session=*/true,
++                               now - base::Hours(23), now),
++            CrashRestoreAction::kShowBubble);
++}
++
++TEST(CrashRestorePolicyTest, ExpiredGuardIsIgnored) {
++  const base::Time now = Now();
++  EXPECT_EQ(DecideCrashRestore(/*is_post_crash_launch=*/true,
++                               /*restores_last_session=*/true,
++                               now - kCrashRestoreGuardExpiry, now),
++            CrashRestoreAction::kRestoreSilently);
++  EXPECT_EQ(DecideCrashRestore(/*is_post_crash_launch=*/true,
++                               /*restores_last_session=*/true,
++                               now - base::Days(30), now),
++            CrashRestoreAction::kRestoreSilently);
++}
++
++TEST(CrashRestorePolicyTest, GuardFromTheFuture) {
++  const base::Time now = Now();
++  // The clock went back a little: still treated as recovering.
++  EXPECT_TRUE(IsCrashRestoreGuardActive(now + base::Hours(1), now));
++  // Far off: ignored.
++  EXPECT_FALSE(IsCrashRestoreGuardActive(now + base::Days(2), now));
++}
++
++TEST(CrashRestorePolicyTest, UnsetGuardIsNeverActive) {
++  EXPECT_FALSE(IsCrashRestoreGuardActive(base::Time(), Now()));
++}
++
++TEST(CrashRestorePolicyTest, CleanExitClearsTheGuard) {
++  const base::Time guard = Now() - base::Minutes(1);
++  EXPECT_TRUE(ShouldClearCrashRestoreGuard(/*last_exit_crashed=*/false, guard));
++  EXPECT_FALSE(ShouldClearCrashRestoreGuard(/*last_exit_crashed=*/true, guard));
++  EXPECT_FALSE(
++      ShouldClearCrashRestoreGuard(/*last_exit_crashed=*/false, base::Time()));
++}
++
++// Every launch here follows a crash and continues where the user left off.
++CrashRestoreAction DecideAfterCrash(base::Time guard, base::Time now) {
++  return DecideCrashRestore(/*is_post_crash_launch=*/true,
++                            /*restores_last_session=*/true, guard, now);
++}
++
++// Walks the launches of a session that crashes rac every time it's restored,
++// the way crash_restore.cc drives the policy.
++TEST(CrashRestorePolicyTest, CrashLoopFallsBackToTheBubble) {
++  base::Time now = Now();
++  base::Time guard;
++
++  // Launch 1 after a crash: restores silently and sets the guard.
++  ASSERT_EQ(DecideAfterCrash(guard, now),
++            CrashRestoreAction::kRestoreSilently);
++  guard = now;
++
++  // It crashes 20 seconds later. Launch 2 shows the bubble.
++  now += base::Seconds(20);
++  EXPECT_FALSE(ShouldClearCrashRestoreGuard(/*last_exit_crashed=*/true, guard));
++  EXPECT_EQ(DecideAfterCrash(guard, now),
++            CrashRestoreAction::kShowBubble);
++
++  // The user restores from the bubble and it crashes again at once: launch 3
++  // still shows the bubble, because the guard is only cleared by a launch
++  // that ran for kCrashRestoreStablePeriod.
++  now += base::Seconds(20);
++  EXPECT_EQ(DecideAfterCrash(guard, now),
++            CrashRestoreAction::kShowBubble);
++
++  // Launch 3 runs for kCrashRestoreStablePeriod, which clears the guard. A
++  // later crash restores silently again.
++  now += kCrashRestoreStablePeriod;
++  guard = base::Time();
++  now += base::Hours(2);
++  EXPECT_EQ(DecideAfterCrash(guard, now),
++            CrashRestoreAction::kRestoreSilently);
++}
++
++TEST(CrashRestorePolicyTest, BubbleShowsWithoutSilentRestore) {
++  EXPECT_EQ(DecideCrashBubble(/*restoring_silently=*/false,
++                              /*restore_running=*/false, std::nullopt),
++            CrashBubbleAction::kShowNow);
++  // Someone else's restore doesn't hide Chromium's bubble.
++  EXPECT_EQ(DecideCrashBubble(/*restoring_silently=*/false,
++                              /*restore_running=*/true, std::nullopt),
++            CrashBubbleAction::kShowNow);
++}
++
++TEST(CrashRestorePolicyTest, BubbleWaitsForTheSilentRestore) {
++  EXPECT_EQ(DecideCrashBubble(/*restoring_silently=*/true,
++                              /*restore_running=*/true, std::nullopt),
++            CrashBubbleAction::kWaitForRestore);
++}
++
++TEST(CrashRestorePolicyTest, BubbleHiddenOnceTabsCameBack) {
++  EXPECT_EQ(DecideCrashBubble(/*restoring_silently=*/true,
++                              /*restore_running=*/false, 12),
++            CrashBubbleAction::kHide);
++  // The window for the restored tabs can open while the restorer still runs.
++  EXPECT_EQ(DecideCrashBubble(/*restoring_silently=*/true,
++                              /*restore_running=*/true, 1),
++            CrashBubbleAction::kHide);
++}
++
++TEST(CrashRestorePolicyTest, BubbleShowsWhenTheRestoreFoundNothing) {
++  // An unreadable or empty session file: the bubble is the way back.
++  EXPECT_EQ(DecideCrashBubble(/*restoring_silently=*/true,
++                              /*restore_running=*/false, 0),
++            CrashBubbleAction::kShowNow);
++  EXPECT_TRUE(ShouldShowCrashBubbleAfterRestore(0));
++  EXPECT_FALSE(ShouldShowCrashBubbleAfterRestore(1));
++}
++
++TEST(CrashRestorePolicyTest, BubbleShowsWhenTheRestoreNeverStarted) {
++  EXPECT_EQ(DecideCrashBubble(/*restoring_silently=*/true,
++                              /*restore_running=*/false, std::nullopt),
++            CrashBubbleAction::kShowNow);
++}
++
++TEST(CrashRestorePolicyTest, PrefIsRegisteredUnset) {
++  TestingPrefServiceSimple prefs;
++  RegisterCrashRestorePrefs(prefs.registry());
++  EXPECT_TRUE(prefs.GetTime(kCrashRestoreGuardPref).is_null());
++
++  const base::Time now = Now();
++  prefs.SetTime(kCrashRestoreGuardPref, now);
++  EXPECT_EQ(prefs.GetTime(kCrashRestoreGuardPref), now);
++  prefs.ClearPref(kCrashRestoreGuardPref);
++  EXPECT_TRUE(prefs.GetTime(kCrashRestoreGuardPref).is_null());
++}
++
++TEST(CrashRestorePolicyTest, PrefNameIsRacOwned) {
++  EXPECT_TRUE(std::string_view(kCrashRestoreGuardPref).starts_with(
++      "rac.session."));
++}
++
++}  // namespace
++}  // namespace rac
+Index: src/chrome/browser/prefs/browser_prefs.cc
+===================================================================
+--- src.orig/chrome/browser/prefs/browser_prefs.cc
++++ src/chrome/browser/prefs/browser_prefs.cc
+@@ -80,6 +80,7 @@
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/rac/pip/auto_pip_prefs.h"
+ #include "chrome/browser/rac/spaces/spaces_prefs.h"
++#include "chrome/browser/rac/storage/crash_restore_policy.h"
+ #include "chrome/browser/rac/storage/data_backups.h"
+ #include "chrome/browser/rac/storage/keychain_key_prefs.h"
+ #include "chrome/browser/rac/updates/rac_updates.h"
+@@ -1995,6 +1996,7 @@
+   SearchPreloadService::RegisterProfilePrefs(registry);
+   rac::RegisterSpacesProfilePrefs(registry);
+   rac::DataBackups::RegisterProfilePrefs(registry);
++  rac::RegisterCrashRestorePrefs(registry);
+   rac::ai::RegisterProfilePrefs(registry);
+   rac::onboarding::RegisterProfilePrefs(registry);
+   SessionStartupPref::RegisterProfilePrefs(registry);
+Index: src/chrome/browser/ui/startup/BUILD.gn
+===================================================================
+--- src.orig/chrome/browser/ui/startup/BUILD.gn
++++ src/chrome/browser/ui/startup/BUILD.gn
+@@ -238,6 +238,7 @@
+       "//chrome/browser/profiles:misc",
+       "//chrome/browser/profiles:profile_io_data",
+       "//chrome/browser/profiles/keep_alive",
++      "//chrome/browser/rac/storage:crash_restore",
+       "//chrome/browser/search",
+       "//chrome/browser/search_engines",
+       "//chrome/browser/ui:browser_commands",
+Index: src/chrome/browser/ui/startup/infobar_utils.cc
+===================================================================
+--- src.orig/chrome/browser/ui/startup/infobar_utils.cc
++++ src/chrome/browser/ui/startup/infobar_utils.cc
+@@ -21,6 +21,7 @@
+ #include "chrome/browser/infobars/infobar_features.h"
+ #include "chrome/browser/obsolete_system/obsolete_system.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/rac/storage/crash_restore.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/session_crashed_bubble.h"
+ #include "chrome/browser/ui/startup/automation_infobar_delegate.h"
+@@ -220,9 +221,18 @@
+       !is_web_app && HasPendingUncleanExit(browser->GetProfile());
+   base::UmaHistogramBoolean("Startup.CrashBubbleShown", should_display_bubble);
+   if (should_display_bubble) {
+-    SessionCrashedBubble::ShowIfNotOffTheRecordProfile(
+-        browser,
+-        /*skip_tab_checking=*/false);
++    // rac: a silent crash restore holds the bubble until it knows its result.
++    rac::ShowCrashBubbleUnlessRestored(
++        browser->GetProfile(),
++        base::BindOnce(
++            [](base::WeakPtr<BrowserWindowInterface> browser) {
++              if (browser) {
++                SessionCrashedBubble::ShowIfNotOffTheRecordProfile(
++                    browser.get(),
++                    /*skip_tab_checking=*/false);
++              }
++            },
++            browser->GetWeakPtr()));
+   }
+ 
+   // These info bars are not shown when the browser is being controlled by
+Index: src/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+===================================================================
+--- src.orig/chrome/browser/ui/startup/startup_browser_creator_impl.cc
++++ src/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+@@ -31,6 +31,7 @@
+ #include "chrome/browser/profiles/keep_alive/scoped_profile_keep_alive.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/profiles/profile_io_data.h"
++#include "chrome/browser/rac/storage/crash_restore.h"
+ #include "chrome/browser/sessions/session_service.h"
+ #include "chrome/browser/sessions/session_service_factory.h"
+ #include "chrome/browser/signin/account_consistency_mode_manager.h"
+@@ -122,7 +123,8 @@
+   // In ChromeOS, restore apps only when there are apps launched before reboot.
+   return full_restore::HasAppTypeBrowser(profile->GetPath());
+ #else
+-  return is_post_restart;
++  // rac: a silent crash restore brings apps back, like the bubble's Restore.
++  return is_post_restart || rac::IsSilentCrashRestorePending(profile);
+ #endif
+ }
+ 
+@@ -533,6 +535,17 @@
+   StartupInfoBarObserver::ObserveProfile(*profile_,
+                                          std::move(add_infobars_callback));
+ 
++  // rac: after a crash, "Continue where you left off" restores the session
++  // the way a clean launch does. The infobars above still learn of the crash,
++  // and RestoreOrCreateBrowser() still keeps the crashed session's data.
++  const bool had_crash = is_post_crash_launch;
++  if (rac::ShouldRestoreSessionAfterCrash(
++          profile_, is_post_crash_launch,
++          StartupBrowserCreator::GetSessionStartupPref(*command_line_, profile_)
++              .ShouldRestoreLastSession())) {
++    is_post_crash_launch = false;
++  }
++
+   // Presentation of promotional and/or educational tabs may be controlled via
+   // administrative policy.
+   bool promotions_enabled = true;
+@@ -602,14 +615,17 @@
+ #else
+     bool has_create_browser_switch = false;
+ #endif
++    // rac: a silent crash restore that finds nothing falls back to the
++    // startup window below, where the crash bubble keeps the crash pending.
+     restore_options = DetermineSynchronousRestoreOptions(
+-        browser_defaults::kAlwaysCreateTabbedBrowserOnSessionRestore,
++        browser_defaults::kAlwaysCreateTabbedBrowserOnSessionRestore &&
++            !rac::IsSilentCrashRestorePending(profile_),
+         has_create_browser_switch, was_mac_login_or_resume,
+         restore_tabbed_browser);
+   }
+ 
+   BrowserWindowInterface* browser = RestoreOrCreateBrowser(
+-      tabs, behavior, restore_options, process_startup, is_post_crash_launch);
++      tabs, behavior, restore_options, process_startup, had_crash);
+ 
+   tab_groups::MaybeShowSharedTabGroupVersionOutOfDateModal(browser);
+   tab_groups::MaybeShowSharedTabGroupVersionUpToDateToast(browser);
