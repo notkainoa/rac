@@ -140,7 +140,17 @@
  };
 --- a/chrome/browser/rac/ai/acp/acp_service_unittest.cc
 +++ b/chrome/browser/rac/ai/acp/acp_service_unittest.cc
-@@ -326,6 +326,87 @@ TEST_F(AcpServiceTest, AuthRequiredOnThe
+@@ -51,7 +51,8 @@ while IFS= read -r line; do
+     *'"method":"initialize"'*)
+       echo '{"id":1,"jsonrpc":"2.0","result":{"protocolVersion":1}}' ;;
+     *'"method":"session/new"'*)
+-      echo '{"id":2,"jsonrpc":"2.0","result":{"sessionId":"s1"}}' ;;
++      if [ -f "$log/new" ]; then cat "$log/new"; else
++      echo '{"id":2,"jsonrpc":"2.0","result":{"sessionId":"s1"}}'; fi ;;
+     *'"method":"session/prompt"'*)
+       if [ -f "$log/reply" ]; then cat "$log/reply"; else
+       printf '%s%s%s\n' '{"jsonrpc":"2.0","method":"session/update",' \
+@@ -326,6 +327,112 @@ TEST_F(AcpServiceTest, AuthRequiredOnThe
    EXPECT_TRUE(result.error.starts_with("Sign in required")) << result.error;
  }
  
@@ -175,6 +185,31 @@
 +  EXPECT_EQ(result.error, "");
 +  EXPECT_FALSE(service_->NeedsSignIn("custom"));
 +  EXPECT_EQ(changes, 2);
++}
++
++// Most agents say auth_required when the session starts (session/new),
++// before any prompt. That is remembered the same way, and the prompt, with
++// any page text in it, is never sent.
++TEST_F(AcpServiceTest, AuthRequiredOnSessionNewIsRemembered) {
++  int changes = 0;
++  base::CallbackListSubscription watch = service_->AddSignInObserver(
++      base::BindLambdaForTesting([&] { ++changes; }));
++  ASSERT_TRUE(base::WriteFile(
++      log_.AppendASCII("new"),
++      R"({"id":2,"jsonrpc":"2.0","error":{"code":-32000,)"
++      R"("message":"Authentication required"}})"
++      "\n"));
++  Result result;
++  base::RunLoop loop;
++  Prompt("secret page text", &result, nullptr, loop.QuitClosure());
++  loop.Run();
++  EXPECT_TRUE(result.error.starts_with("Sign in required")) << result.error;
++  EXPECT_TRUE(service_->NeedsSignIn("custom"));
++  EXPECT_EQ(changes, 1);
++  const std::string in = ReadLog("in");
++  EXPECT_NE(in.find("session/new"), std::string::npos);
++  EXPECT_EQ(in.find("session/prompt"), std::string::npos);
++  EXPECT_EQ(in.find("secret page text"), std::string::npos);
 +}
 +
 +// Only auth_required counts. An agent that fails some other way, or a run
@@ -228,6 +263,161 @@
  // When a run ends, its MCP server stops listening, its agent exits, and its
  // tools are deleted. Nothing can reach a provider after its run.
  TEST_F(AcpServiceTest, RunEndTakesTheServerAgentAndToolsWithIt) {
+--- a/chrome/browser/rac/ai/acp/agent_settings.cc
++++ b/chrome/browser/rac/ai/acp/agent_settings.cc
+@@ -10,6 +10,9 @@
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
+ #include "base/strings/string_util.h"
++#include "chrome/browser/rac/ai/ai_prefs.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
+ 
+ namespace rac::ai {
+ namespace {
+@@ -90,4 +93,31 @@ bool IsValidCustomAgentCommand(std::stri
+   return !argv.empty() && IsRunnableAbsolutePath(argv[0]);
+ }
+ 
++AgentSettingSave SaveAgentSetting(PrefService* prefs,
++                                  std::string_view agent_id,
++                                  std::string_view value,
++                                  bool valid) {
++  if (!valid) {
++    return AgentSettingSave::kRejected;
++  }
++  if (agent_id == "custom") {
++    if (prefs->GetString(kAgentCustomCommand) == value) {
++      return AgentSettingSave::kUnchanged;
++    }
++    prefs->SetString(kAgentCustomCommand, value);
++    return AgentSettingSave::kChanged;
++  }
++  const std::string* saved = prefs->GetDict(kAgentPaths).FindString(agent_id);
++  if (saved ? *saved == value : value.empty()) {
++    return AgentSettingSave::kUnchanged;
++  }
++  ScopedDictPrefUpdate update(prefs, kAgentPaths);
++  if (value.empty()) {
++    update->Remove(agent_id);
++  } else {
++    update->Set(agent_id, value);
++  }
++  return AgentSettingSave::kChanged;
++}
++
+ }  // namespace rac::ai
+--- a/chrome/browser/rac/ai/acp/agent_settings.h
++++ b/chrome/browser/rac/ai/acp/agent_settings.h
+@@ -8,6 +8,8 @@
+ #include <string_view>
+ #include <vector>
+ 
++class PrefService;
++
+ namespace rac::ai {
+ 
+ inline constexpr size_t kMaxAgentCommandLength = 1024;
+@@ -25,6 +27,25 @@ std::vector<std::string> SplitAgentComma
+ // a runnable absolute path. Control characters are rejected.
+ bool IsValidCustomAgentCommand(std::string_view command);
+ 
++enum class AgentSettingSave {
++  // The value didn't pass its check, so nothing was stored.
++  kRejected,
++  // The same value was stored already: the same program runs.
++  kUnchanged,
++  // Another program runs for the agent now.
++  kChanged,
++};
++
++// Stores what Settings saved for `agent_id`: the custom command for
++// "custom", else the path override (empty clears it). `valid` is the
++// value's check (IsRunnableAbsolutePath or IsValidCustomAgentCommand), and a
++// value that failed it is never stored. Only kChanged means a different
++// program, which may be signed in where the last one wasn't.
++AgentSettingSave SaveAgentSetting(PrefService* prefs,
++                                  std::string_view agent_id,
++                                  std::string_view value,
++                                  bool valid);
++
+ }  // namespace rac::ai
+ 
+ #endif  // CHROME_BROWSER_RAC_AI_ACP_AGENT_SETTINGS_H_
+--- a/chrome/browser/rac/ai/acp/agent_settings_unittest.cc
++++ b/chrome/browser/rac/ai/acp/agent_settings_unittest.cc
+@@ -6,6 +6,8 @@
+ #include <string>
+ #include <vector>
+ 
++#include "chrome/browser/rac/ai/ai_prefs.h"
++#include "components/prefs/testing_pref_service.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+ namespace rac::ai {
+@@ -44,4 +46,62 @@ TEST(AgentSettingsTest, CommandWordsCanH
+   EXPECT_TRUE(SplitAgentCommand("   ").empty());
+ }
+ 
++// Settings forgets an agent's sign-in problem only when another program
++// runs for it (kChanged). A rejected value isn't stored, and saving the
++// same value again is the same program.
++class AgentSettingSaveTest : public testing::Test {
++ protected:
++  AgentSettingSaveTest() { RegisterProfilePrefs(prefs_.registry()); }
++
++  std::string Path(std::string_view agent_id) {
++    const std::string* path =
++        prefs_.GetDict(kAgentPaths).FindString(agent_id);
++    return path ? *path : "<none>";
++  }
++
++  TestingPrefServiceSimple prefs_;
++};
++
++TEST_F(AgentSettingSaveTest, AnInvalidPathIsRejectedAndNotStored) {
++  EXPECT_EQ(SaveAgentSetting(&prefs_, "cursor", "/a/cursor-agent", true),
++            AgentSettingSave::kChanged);
++  EXPECT_EQ(SaveAgentSetting(&prefs_, "cursor", "/nope", false),
++            AgentSettingSave::kRejected);
++  EXPECT_EQ(Path("cursor"), "/a/cursor-agent");
++}
++
++TEST_F(AgentSettingSaveTest, ANewPathChangesTheProgram) {
++  EXPECT_EQ(SaveAgentSetting(&prefs_, "cursor", "/a/cursor-agent", true),
++            AgentSettingSave::kChanged);
++  EXPECT_EQ(SaveAgentSetting(&prefs_, "cursor", "/b/cursor-agent", true),
++            AgentSettingSave::kChanged);
++  EXPECT_EQ(Path("cursor"), "/b/cursor-agent");
++  // Clearing it goes back to the program on PATH.
++  EXPECT_EQ(SaveAgentSetting(&prefs_, "cursor", "", true),
++            AgentSettingSave::kChanged);
++  EXPECT_EQ(Path("cursor"), "<none>");
++}
++
++TEST_F(AgentSettingSaveTest, SavingTheSamePathAgainChangesNothing) {
++  SaveAgentSetting(&prefs_, "cursor", "/a/cursor-agent", true);
++  EXPECT_EQ(SaveAgentSetting(&prefs_, "cursor", "/a/cursor-agent", true),
++            AgentSettingSave::kUnchanged);
++  // Clearing a path that was never set is the same program too.
++  EXPECT_EQ(SaveAgentSetting(&prefs_, "codex", "", true),
++            AgentSettingSave::kUnchanged);
++  EXPECT_EQ(Path("codex"), "<none>");
++}
++
++TEST_F(AgentSettingSaveTest, TheCustomCommandIsItsOwnSetting) {
++  EXPECT_EQ(SaveAgentSetting(&prefs_, "custom", "/a/agent --acp", true),
++            AgentSettingSave::kChanged);
++  EXPECT_EQ(prefs_.GetString(kAgentCustomCommand), "/a/agent --acp");
++  EXPECT_EQ(Path("custom"), "<none>");
++  EXPECT_EQ(SaveAgentSetting(&prefs_, "custom", "/a/agent --acp", true),
++            AgentSettingSave::kUnchanged);
++  EXPECT_EQ(SaveAgentSetting(&prefs_, "custom", "/b/agent", false),
++            AgentSettingSave::kRejected);
++  EXPECT_EQ(prefs_.GetString(kAgentCustomCommand), "/a/agent --acp");
++}
++
+ }  // namespace rac::ai
 --- /dev/null
 +++ b/chrome/browser/rac/ai/acp/agent_sign_in.cc
 @@ -0,0 +1,73 @@
@@ -1000,6 +1190,23 @@
    private statusClass_(item: ListItem): string {
      return `status ${item.status}`;
    }
+--- a/chrome/browser/ui/views/rac/ai/assistant_menu.cc
++++ b/chrome/browser/ui/views/rac/ai/assistant_menu.cc
+@@ -240,9 +240,11 @@ class MenuPanel::Contents::Row : public
+     if (!entry.detail.empty()) {
+       AddChildView(MakeQuietLabel(entry.detail));
+     }
+-    // A plain choice, like a model, shows the check a menu would. Richer lines
+-    // keep the right side for their detail and only go bold.
+-    if (entry.checked && entry.detail.empty() && !entry.removable) {
++    // A choice shows the check a menu would, after its detail when it has
++    // one (an agent that needs signing in). Lines that can be removed, like
++    // saved chats, keep the right side for the remove button and only go
++    // bold.
++    if (entry.checked && !entry.removable) {
+       auto* check = AddChildView(
+           std::make_unique<views::ImageView>(ui::ImageModel::FromVectorIcon(
+               views::kCheckIcon, ui::kColorMenuIcon, kIconSize)));
 --- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
 +++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
 @@ -35,6 +35,7 @@
@@ -1021,7 +1228,19 @@
    // The page's own look for agents has answered, so listing them again is
    // quick and runs no shell.
    bool agents_ready = false;
-@@ -2160,8 +2161,9 @@ void PageHandler::HandleSearch(const bas
+@@ -1669,8 +1670,9 @@ void PageHandler::HandleSelectAgent(cons
+   }
+   const std::string* id = args[1].GetIfString();
+   // Only the agent picked from the menu on show, and only once. The menu
+-  // offered it because it is installed and had no sign-in or fix problem
+-  // this session (model_menu.h). This can't tell who sent the message.
++  // offered it because it is installed and the page didn't fail to start it
++  // this session; one that needs signing in is still offered, with a
++  // warning (model_menu.h). This can't tell who sent the message.
+   const std::string picked = std::exchange(picked_agent_, std::string());
+   const bool chosen = id && AiServiceFactory::GetForProfile(profile_) &&
+                       !profile_->IsOffTheRecord() &&
+@@ -2160,8 +2162,9 @@ void PageHandler::HandleSearch(const bas
                       contents->GetWeakPtr(), url, transition));
  }
  
@@ -1033,7 +1252,7 @@
  // Resolves with the menu's lines (BuildModelMenu).
  void PageHandler::HandleGetModelMenu(const base::ListValue& args) {
    if (args.size() != 3) {
-@@ -2173,13 +2175,8 @@ void PageHandler::HandleGetModelMenu(con
+@@ -2173,13 +2176,8 @@ void PageHandler::HandleGetModelMenu(con
    if (const base::DictValue* issues = args[1].GetIfDict()) {
      for (const auto [id, value] : *issues) {
        const std::string* kind = value.GetIfString();
@@ -1049,7 +1268,7 @@
        }
      }
    }
-@@ -2296,7 +2293,7 @@ void PageHandler::FinishModelQuery(std::
+@@ -2296,7 +2294,7 @@ void PageHandler::FinishModelQuery(std::
      provider.name = entry.name;
      provider.models = std::move(entry.models);
    }
@@ -1058,7 +1277,7 @@
    // Agents are listed only once the page's own look has answered: that look
    // runs the login shell, and it starts only when the menu opens.
    if (service && query->agents_ready && !input.incognito) {
-@@ -2311,6 +2308,8 @@ void PageHandler::FinishModelQuery(std::
+@@ -2311,6 +2309,8 @@ void PageHandler::FinishModelQuery(std::
  void PageHandler::OnMenuAgentsListed(base::Value callback_id,
                                       ModelMenuInput input,
                                       base::ListValue agents) {
@@ -1067,7 +1286,7 @@
    std::vector<ModelMenuAgent> found;
    for (const base::Value& value : agents) {
      const base::DictValue* dict = value.GetIfDict();
-@@ -2324,6 +2323,8 @@ void PageHandler::OnMenuAgentsListed(bas
+@@ -2324,6 +2324,8 @@ void PageHandler::OnMenuAgentsListed(bas
      agent.name = *name;
      agent.installed = dict->FindBool("installed").value_or(false);
      agent.needs_node = dict->FindBool("needsNode").value_or(false);
@@ -1076,7 +1295,7 @@
    }
    SortAgentsForMenu(found);
    input.agents = std::move(found);
-@@ -2364,6 +2365,7 @@ void PageHandler::ResolveModelMenu(const
+@@ -2364,6 +2366,7 @@ void PageHandler::ResolveModelMenu(const
      set_text("label", row.label);
      set_text("detail", row.detail);
      set_text("tooltip", row.tooltip);
@@ -1086,7 +1305,15 @@
        dict.Set("enabled", false);
 --- a/chrome/browser/ui/webui/settings/rac_ai_handler.cc
 +++ b/chrome/browser/ui/webui/settings/rac_ai_handler.cc
-@@ -67,17 +67,41 @@ void RacAiHandler::OnJavascriptAllowed()
+@@ -27,7 +27,6 @@
+ #include "chrome/browser/rac/ai/provider_list.h"
+ #include "chrome/browser/rac/ai/providers.h"
+ #include "components/prefs/pref_service.h"
+-#include "components/prefs/scoped_user_pref_update.h"
+ #include "content/public/browser/web_ui.h"
+ #include "services/network/public/cpp/simple_url_loader.h"
+ #include "url/gurl.h"
+@@ -67,17 +66,41 @@ void RacAiHandler::OnJavascriptAllowed()
  void RacAiHandler::OnJavascriptDisallowed() {
    pref_registrar_.RemoveAll();
    model_loaders_.clear();
@@ -1129,7 +1356,7 @@
        std::exchange(state_update_pending_, true)) {
      return;
    }
-@@ -186,6 +210,12 @@ base::DictValue RacAiHandler::CreateStat
+@@ -186,6 +209,12 @@ base::DictValue RacAiHandler::CreateStat
    }
    if (agents_) {
      list_input.agents = rac::ai::ParseFoundAgents(*agents_);
@@ -1142,7 +1369,7 @@
      state.Set("agents", agents_->Clone());
    }
    state.Set("providerList", rac::ai::ProviderListToValue(
-@@ -250,6 +280,7 @@ void RacAiHandler::OnSelectAgentChecked(
+@@ -250,6 +279,7 @@ void RacAiHandler::OnSelectAgentChecked(
    }
    const bool runnable = rac::ai::IsAgentRunnable(agents, agent_id);
    agents_ = std::move(agents);
@@ -1150,7 +1377,7 @@
    if (!runnable) {
      RejectJavascriptCallback(callback_id, base::Value("not_runnable"));
      return;
-@@ -584,6 +615,7 @@ void RacAiHandler::OnAgentsListed(base::
+@@ -584,6 +614,7 @@ void RacAiHandler::OnAgentsListed(base::
    }
    if (rac::ai::AiServiceFactory::GetForProfile(profile_)) {
      agents_ = std::move(agents);
@@ -1158,19 +1385,40 @@
    }
    ResolveJavascriptCallback(callback_id, CreateState());
  }
-@@ -651,6 +683,12 @@ void RacAiHandler::StoreAgentSetting(bas
-       update->Set(agent_id, value);
-     }
-   }
-+  // Another program now runs for the agent, and it may be signed in.
+@@ -633,23 +664,21 @@ void RacAiHandler::StoreAgentSetting(bas
+                                      std::string agent_id,
+                                      std::string value,
+                                      bool valid) {
+-  if (!IsJavascriptAllowed() ||
+-      !rac::ai::AiServiceFactory::GetForProfile(profile_)) {
 +  rac::ai::AiService* service =
 +      rac::ai::AiServiceFactory::GetForProfile(profile_);
-+  if (rac::ai::AcpService* acp = service->acp_service_if_created()) {
++  if (!IsJavascriptAllowed() || !service) {
+     return;
+   }
+-  if (!valid) {
++  const rac::ai::AgentSettingSave saved =
++      rac::ai::SaveAgentSetting(profile_->GetPrefs(), agent_id, value, valid);
++  if (saved == rac::ai::AgentSettingSave::kRejected) {
+     RejectJavascriptCallback(callback_id, base::Value("invalid_path"));
+     return;
+   }
+-  if (agent_id == "custom") {
+-    profile_->GetPrefs()->SetString(rac::ai::kAgentCustomCommand, value);
+-  } else {
+-    ScopedDictPrefUpdate update(profile_->GetPrefs(), rac::ai::kAgentPaths);
+-    if (value.empty()) {
+-      update->Remove(agent_id);
+-    } else {
+-      update->Set(agent_id, value);
+-    }
++  // Another program now runs for the agent, and it may be signed in.
++  rac::ai::AcpService* acp = service->acp_service_if_created();
++  if (saved == rac::ai::AgentSettingSave::kChanged && acp) {
 +    acp->ForgetSignIn(agent_id);
-+  }
+   }
    ResolveJavascriptCallback(callback_id, base::Value(true));
  }
- 
 --- a/chrome/browser/ui/webui/settings/rac_ai_handler.h
 +++ b/chrome/browser/ui/webui/settings/rac_ai_handler.h
 @@ -11,6 +11,7 @@
