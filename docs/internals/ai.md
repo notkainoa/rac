@@ -96,8 +96,9 @@ already name it, so the menu never chooses for the user, even when it finds
 one agent.
 
 `racAiSelectAgent` takes only the agent just picked from the menu on show,
-once, and only if that menu offered it: installed, with no sign-in or fix
-problem this session (`ChooseOfferedAgent`). The browser can't tell who sent
+once, and only if that menu offered it: installed, and not one the page
+couldn't start this session (`ChooseOfferedAgent`). A sign-in problem only
+warns; see below. The browser can't tell who sent
 the message, so this bounds what a choice can be, not who made it. The page
 shows the agent only after the browser answers that it took it.
 
