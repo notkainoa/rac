@@ -117,10 +117,23 @@ WINDOW_KINDS = {'first', 'normal', 'incognito', 'app', 'popup', 'devtools',
                 'pip', 'browser', 'onboarding', 'child', 'other'}
 KEYS = {'return', 'escape', 'tab', 'backspace', 'up', 'down', 'left', 'right'}
 NSPRESS_KEYS = KEYS | {'space', 'home', 'end', 'pageup', 'pagedown'}
-# Typed text is plain words only: ASCII letters, digits, spaces, '-'
-# and '_'. Without dots, colons or slashes it can't spell a URL, a host
-# name or a path, however the pieces join or whatever submits it.
-TYPED_TEXT = re.compile(r'[A-Za-z0-9 _-]+')
+# The settings page a run may also drive with the keyboard, and the keys:
+# focus moves and choices only (Tab, Shift+Tab, arrows, Home/End, Space,
+# Return, Esc). Never typing, so no API key can be entered; every other
+# settings page stays screenshot-only.
+KEYBOARD_SETTINGS_PAGES = {'settings/assistant'}
+NAV_KEYS = {'tab', 'up', 'down', 'left', 'right', 'home', 'end', 'space',
+            'return', 'escape'}
+# Typed text is plain words only: ASCII letters, digits, spaces, '-',
+# '_' and '!' (a bang, as in `cats !w`). Without dots, colons or slashes
+# it can't spell a URL, a host name or a path, however the pieces join or
+# whatever submits it. Text with a '!' may never be submitted (see
+# check_line), so a bang only ever shows suggestions.
+TYPED_TEXT = re.compile(r'[A-Za-z0-9 _!-]+')
+# IDC_FOCUS_LOCATION: focuses the address bar, the one place a script's
+# typed text should land. A typing script may send it; it moves focus to a
+# known field rather than walking the page.
+FOCUS_LOCATION = 39001
 # Whole words the typed text may never spell: the denied page names,
 # checked against every run of letters and digits in the joined typed
 # text (spaces, '-' and '_' separate words; case is folded). `type my
@@ -262,14 +275,14 @@ def url_allowed(word, serve=False):
 
 
 def check_typed(text):
-    """Typed text is plain words: ASCII letters, digits, spaces, '-' and
-    '_'. With no dot, colon or slash it can't spell a URL, a host name or
+    """Typed text is plain words: ASCII letters, digits, spaces, '-', '_'
+    and '!'. With no dot, colon or slash it can't spell a URL, a host name or
     a path, and with no other characters there is nothing to smuggle one
     in with. (Non-ASCII fails the charset too, so the omnibox's
     full-width look-alike mapping stays out.)"""
     if not TYPED_TEXT.fullmatch(text):
         raise Refused('typed text is plain words only: ASCII letters, '
-                      'digits, spaces, "-" and "_": ' + repr(text))
+                      'digits, spaces, "-", "_" and "!": ' + repr(text))
 
 
 def harness_words(request):
@@ -303,8 +316,13 @@ class Checker:
         # everything else that moves the caret, the pointer or the app.
         # Capture and state verbs record nothing.
         self.events = []
-        # A chrome:/rac: settings page the line opens.
+        # A chrome:/rac: settings page the line opens, and which ones.
         self.settings = False
+        self.settings_pages = set()
+        # Indexes into events that are keyboard navigation (NAV_KEYS,
+        # unmodified or with Shift only), which a run on a
+        # KEYBOARD_SETTINGS_PAGES page may send.
+        self.nav = set()
 
     def path(self, word, kind='file', png=False):
         if word.startswith(('/', '~')) or '\\' in word:
@@ -427,6 +445,7 @@ class Checker:
                     if (page == 'settings' or page.startswith('settings/')
                             or page == 'credits'):
                         self.settings = True
+                        self.settings_pages.add(page.rstrip('/'))
             return words
         simple = {
             # `command ID [SELECTOR]`: SELECTOR is capture-window's.
@@ -467,12 +486,16 @@ class Checker:
                           '(see COMMANDS_ALLOWED); ask Ship to allow it')
         if verb == 'command':
             self.command_ids.append(int(args[0]))
+        nav = False
         if verb == 'key':
             self.events.append('return' if args[0] == 'return' else 'input')
+            nav = args[0] in NAV_KEYS
         elif verb == 'wheel':
             self.events.append('wheel')
         elif verb == 'command' and int(args[0]) in COMMANDS_ZOOM:
             self.events.append('zoom')
+        elif verb == 'command' and int(args[0]) == FOCUS_LOCATION:
+            self.events.append('focus')
         elif verb in ('click', 'move', 'swipe', 'pointer',
                       'pointer-path', 'nskey', 'nsflags', 'command'):
             self.events.append('input')
@@ -496,10 +519,15 @@ class Checker:
                     self.events.append('input')
             else:
                 self.events.append('input')
+                held = (set() if n == 1 or args[1] == 'none'
+                        else set(args[1].split(',')))
+                nav = args[0] in NAV_KEYS and held <= {'shift'}
+        if nav:
+            self.nav.add(len(self.events) - 1)
         return words
 
 
-def check_line(text, serve=False, command_ids=None):
+def check_line(text, serve=False, command_ids=None, nav_only=None):
     """The checked line and the paths it writes, as `file REL`/`dir REL`.
     `serve` says the run passes --serve, so `@SERVE@` URLs may open."""
     # A malformed RAC_REMOTE_ALLOWED_HOSTS refuses every line, not only one
@@ -543,6 +571,11 @@ def check_line(text, serve=False, command_ids=None):
         if events[:last].count('return') or events[last + 1:].count('return') > 1:
             raise Refused('a script that types may press return at most '
                           'once, after its last typed text; ask Ship')
+        # A bang only shows suggestions: submitting it would navigate to
+        # whatever site the bang names.
+        if '!' in checker.typed and 'return' in events:
+            raise Refused('typed text with a "!" (a bang) may not be '
+                          'submitted: no key return')
     # A run that opens a settings page may only take screenshots and
     # scroll: every other recorded event is an input the settings UI could
     # be walked with. `wheel X Y DY` sends an unmodified scroll (the
@@ -550,10 +583,18 @@ def check_line(text, serve=False, command_ids=None):
     # page; nothing can focus a control for it to change.
     # Zoom only changes how the page is drawn, so a settings run may also
     # zoom out to fit a card the window is too short for.
-    if checker.settings and any(e not in ('wheel', 'zoom') for e in events):
+    # Settings › Assistant alone may also take keyboard navigation (a
+    # Provider list keyboard proof): focus moves and choices, never text.
+    keys_ok = checker.settings_pages and checker.settings_pages <= KEYBOARD_SETTINGS_PAGES
+    if checker.settings and any(
+            e not in ('wheel', 'zoom') and not (keys_ok and i in checker.nav)
+            for i, e in enumerate(events)):
         raise Refused('a run that opens a settings page may only take '
                       'screenshots, scroll (wheel) and zoom (command '
-                      '38001-38003); the script may not send other input')
+                      '38001-38003); chrome://settings/assistant may also '
+                      'take keyboard navigation (Tab, Shift+Tab, arrows, '
+                      'Home/End, Space, Return, Esc); the script may not '
+                      'send other input')
     # Every placeholder sits at the start of an open-urls word that
     # passed SERVE_URL; nothing else in the line may hold one.
     if line.count(SERVE) != sum(word.startswith(SERVE) and bool(SERVE_URL.fullmatch(word))
@@ -562,13 +603,19 @@ def check_line(text, serve=False, command_ids=None):
     # The typed words themselves are checked against the denied page
     # names: pieces join in order, and a whole word naming a page the
     # browser may not open edits the open page's URL into it.
-    typed_words = {w for w in re.split(r'[\s_-]+', checker.typed.lower()) if w}
+    typed_words = {w for w in re.split(r'[\s_!-]+', checker.typed.lower()) if w}
     denied = sorted(typed_words & TYPED_PAGE_TOKENS)
     if denied:
         raise Refused('typed text spells a page the browser may not open: '
                       + ', '.join(denied))
     if command_ids is not None:
         command_ids.extend(sorted(set(checker.command_ids)))
+    # For a settings page passed as a run arg, which this line can't see:
+    # whether every input is keyboard navigation.
+    if nav_only is not None:
+        nav_only.append(bool(checker.nav) and all(
+            e in ('wheel', 'zoom') or i in checker.nav
+            for i, e in enumerate(events)))
     return out, checker.outputs, sorted(checker.verbs)
 
 
@@ -593,8 +640,8 @@ def main(argv):
         sys.exit(__doc__)
     try:
         with open(argv[1], encoding='utf-8') as f:
-            ids = []
-            line, outputs, verbs = check_line(f.read(), serve, ids)
+            ids, nav_only = [], []
+            line, outputs, verbs = check_line(f.read(), serve, ids, nav_only)
     except (Refused, UnicodeDecodeError, OSError) as e:
         print(f'rac remote: refusing the requests file: {e}', file=sys.stderr)
         return 2
@@ -606,6 +653,10 @@ def main(argv):
     # may only zoom. The Air strips this line before the Pro sees it.
     if ids:
         print('commands ' + ' '.join(str(i) for i in ids))
+    # Likewise whether every input is keyboard navigation, which such a run
+    # on chrome://settings/assistant may send. The Air strips it too.
+    if nav_only and nav_only[0]:
+        print('keys nav-only')
     for output in outputs:
         print(output)
     return 0

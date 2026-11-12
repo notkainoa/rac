@@ -103,7 +103,12 @@
 #                                     take screenshots, scroll and zoom, so
 #                                     its requests file may send no input
 #                                     but `wheel X Y DY` and the zoom
-#                                     commands 38001-38003. In the requests
+#                                     commands 38001-38003; a run whose only
+#                                     settings page is settings/assistant
+#                                     may also send keyboard navigation
+#                                     (key/nspress Tab, Shift+Tab, arrows,
+#                                     Home/End, Space, Return, Esc), never
+#                                     text. In the requests
 #                                     line, pages and command ids are
 #                                     allowlists (`command 40002`, the PWA
 #                                     install, and `command 34055`, open in
@@ -1357,7 +1362,8 @@ check_run_arg() {
 
 cmd_run() {
   local name=$1 timeout=90 requests='' outputs='' fresh=0 checked req_file=''
-  local req_pages='' req_verbs='' req_needs='' req_commands='' import_input=0 setup_page=0 general_page=0 source_root=0
+  local req_pages='' req_verbs='' req_needs='' req_commands='' req_keys='' import_input=0 setup_page=0 general_page=0 source_root=0
+  local assistant_page=0 other_settings=0
   local arc_now=0 undo_now=0 settings_page=0 test_type=0 layout='' serve='' no_picker=0
   shift
   while [ $# -gt 0 ]; do
@@ -1425,7 +1431,8 @@ cmd_run() {
     req_verbs=$(printf '%s\n' "$outputs" | awk '$1 == "verbs" { $1=""; print }')
     req_needs=$(printf '%s\n' "$outputs" | awk '$1 == "needs" { print $2 }')
     req_commands=$(printf '%s\n' "$outputs" | awk '$1 == "commands" { $1=""; print }')
-    outputs=$(printf '%s\n' "$outputs" | awk '$1 != "pages" && $1 != "needs" && $1 != "commands"')
+    req_keys=$(printf '%s\n' "$outputs" | awk '$1 == "keys" { print $2 }')
+    outputs=$(printf '%s\n' "$outputs" | awk '$1 != "pages" && $1 != "needs" && $1 != "commands" && $1 != "keys"')
   fi
   local arg lower
   for arg in "$@"; do
@@ -1455,10 +1462,13 @@ cmd_run() {
         setup_page=1 ;;
       chrome://settings/general | chrome://settings/general/ | \
         rac://settings/general | rac://settings/general/)
-        settings_page=1 general_page=1 ;;
+        settings_page=1 general_page=1 other_settings=1 ;;
+      chrome://settings/assistant | chrome://settings/assistant/ | \
+        rac://settings/assistant | rac://settings/assistant/)
+        settings_page=1 assistant_page=1 ;;
       chrome://settings | chrome://settings/* | rac://settings | rac://settings/* | \
         chrome://credits | chrome://credits/ | rac://credits | rac://credits/)
-        settings_page=1 ;;
+        settings_page=1 other_settings=1 ;;
     esac
   done
   for arg in $req_pages; do
@@ -1469,10 +1479,13 @@ cmd_run() {
         setup_page=1 ;;
       chrome://settings/general | chrome://settings/general/ | \
         rac://settings/general | rac://settings/general/)
-        settings_page=1 general_page=1 ;;
+        settings_page=1 general_page=1 other_settings=1 ;;
+      chrome://settings/assistant | chrome://settings/assistant/ | \
+        rac://settings/assistant | rac://settings/assistant/)
+        settings_page=1 assistant_page=1 ;;
       chrome://settings | chrome://settings/* | rac://settings | rac://settings/* | \
         chrome://credits | chrome://credits/ | rac://credits | rac://credits/)
-        settings_page=1 ;;
+        settings_page=1 other_settings=1 ;;
     esac
   done
   # chrome://setup is the Arc import screen: without an import input in
@@ -1507,10 +1520,18 @@ cmd_run() {
   # and zoom. A script that opens settings itself was refused by the
   # checker if it carries other input; a settings page passed as a run
   # arg is checked against the requests file's verbs here.
+  # Settings › Assistant alone may also take keyboard navigation (Tab,
+  # Shift+Tab, arrows, Home/End, Space, Return, Esc) for a Provider list
+  # keyboard proof, when the checker found every input to be that.
   if [ "$settings_page" = 1 ]; then
+    local keys_ok=0
+    [ "$assistant_page" = 1 ] && [ "$other_settings" = 0 ] && [ "$req_keys" = nav-only ] && keys_ok=1
     for arg in $req_verbs; do
       case "$arg" in
-        click | key | move | nspress | nsflags | nskey | nstype | \
+        key | nspress)
+          [ "$keys_ok" = 1 ] ||
+            refuse "a run that opens a settings page may only take screenshots, scroll (wheel) and zoom (command 38001-38003); chrome://settings/assistant may also take keyboard navigation (Tab, Shift+Tab, arrows, Home/End, Space, Return, Esc) and nothing else" ;;
+        click | move | nsflags | nskey | nstype | \
         pointer | pointer-path | swipe | type)
           refuse "a run that opens a settings page may only take screenshots, scroll (wheel) and zoom (command 38001-38003); the requests file may not send other input" ;;
       esac
