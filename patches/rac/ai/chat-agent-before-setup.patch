@@ -1,0 +1,1914 @@
+--- a/chrome/browser/rac/ai/BUILD.gn
++++ b/chrome/browser/rac/ai/BUILD.gn
+@@ -87,6 +87,8 @@ source_set("core") {
+     "link_summary.h",
+     "model_catalog.cc",
+     "model_catalog.h",
++    "model_menu.cc",
++    "model_menu.h",
+     "new_tab_page.cc",
+     "new_tab_page.h",
+     "page_text.cc",
+@@ -176,6 +178,7 @@ test("rac_ai_unittests") {
+     "internal_tab_unittest.cc",
+     "link_summary_unittest.cc",
+     "model_catalog_unittest.cc",
++    "model_menu_unittest.cc",
+     "new_tab_page_unittest.cc",
+     "page_text_unittest.cc",
+     "provider_list_unittest.cc",
+@@ -193,6 +196,7 @@ test("rac_ai_unittests") {
+     "//chrome/browser/rac/agent:mcp",
+     "//components/prefs:test_support",
+     "//content/public/common",
++    "//testing/gmock",
+     "//testing/gtest",
+     "//ui/gfx:test_support",
+   ]
+--- /dev/null
++++ b/chrome/browser/rac/ai/model_menu.cc
+@@ -0,0 +1,265 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/model_menu.h"
++
++#include <algorithm>
++#include <iterator>
++#include <string_view>
++#include <utility>
++
++#include "base/strings/strcat.h"
++#include "chrome/browser/rac/ai/active_provider.h"
++
++namespace rac::ai {
++
++namespace {
++
++using Row = ModelMenuRow;
++
++constexpr std::string_view kAgentOrder[] = {
++    "codex", "claude", "cursor", "gemini", "copilot", "opencode", "goose"};
++
++size_t AgentRank(std::string_view id) {
++  const auto* found = std::ranges::find(kAgentOrder, id);
++  return static_cast<size_t>(std::distance(std::begin(kAgentOrder), found));
++}
++
++class Builder {
++ public:
++  explicit Builder(const ModelMenuInput& input) : input_(input) {}
++
++  std::vector<Row> Build() && {
++    bool has_models = false;
++    for (const ModelMenuProvider& provider : input_.providers) {
++      has_models = has_models || !provider.models.empty();
++    }
++    const bool agents_first = !input_.configured || !has_models;
++    if (agents_first) {
++      AddInstalledAgents();
++      AddProviders();
++    } else {
++      AddProviders();
++      AddInstalledAgents();
++    }
++    AddMissingAgents();
++    AddFooter(agents_first);
++    return std::move(rows_);
++  }
++
++ private:
++  bool AgentActive() const {
++    return input_.configured && !input_.incognito && !input_.agent_id.empty();
++  }
++
++  Row& Add(Row::Type type) {
++    Row& row = rows_.emplace_back();
++    row.type = type;
++    return row;
++  }
++
++  void Separate() {
++    if (!rows_.empty() && rows_.back().type != Row::Type::kSeparator) {
++      Add(Row::Type::kSeparator);
++    }
++  }
++
++  void AddNote(std::string text) {
++    Add(Row::Type::kNote).text = std::move(text);
++  }
++
++  void AddProviders() {
++    bool first = true;
++    for (const ModelMenuProvider& provider : input_.providers) {
++      if (provider.models.empty()) {
++        continue;
++      }
++      if (first) {
++        Separate();
++        first = false;
++      }
++      Add(Row::Type::kHeading).label = provider.name;
++      for (const std::string& model : provider.models) {
++        Row& row = Add(Row::Type::kItem);
++        row.action = Row::Action::kChooseModel;
++        row.line_id = ModelMenuLineId(provider.id, model);
++        row.label = model;
++        row.provider_id = provider.id;
++        row.provider_name = provider.name;
++        row.model = model;
++        row.checked = input_.configured && !AgentActive() &&
++                      provider.id == input_.provider_id &&
++                      model == input_.model;
++      }
++    }
++  }
++
++  bool HasInstalledAgent() const {
++    return input_.agents &&
++           std::ranges::any_of(*input_.agents, &ModelMenuAgent::installed);
++  }
++
++  void AddInstalledAgents() {
++    if (input_.incognito) {
++      Separate();
++      AddNote("noAgentsIncognito");
++      return;
++    }
++    if (!input_.agents) {
++      Separate();
++      AddNote("lookingForAgents");
++      return;
++    }
++    if (!HasInstalledAgent()) {
++      return;
++    }
++    Separate();
++    Add(Row::Type::kHeading).text = "agentsHeading";
++    for (const ModelMenuAgent& agent : *input_.agents) {
++      if (!agent.installed) {
++        continue;
++      }
++      Row& row = Add(Row::Type::kItem);
++      row.label = agent.name;
++      row.agent_id = agent.id;
++      const auto issue = input_.issues.find(agent.id);
++      if (issue != input_.issues.end()) {
++        // It didn't work this session: the line leads to what fixes it.
++        row.action = Row::Action::kOpenSettings;
++        row.line_id = base::StrCat({"fix:", agent.id});
++        row.detail = issue->second == AgentIssue::kSignIn ? "signInToUse"
++                                                          : "fixInSettings";
++        row.settings_icon = true;
++        continue;
++      }
++      row.action = Row::Action::kChooseAgent;
++      row.line_id = AgentMenuLineId(agent.id);
++      row.checked = AgentActive() && agent.id == input_.agent_id;
++    }
++    AddNote("modelsLater");
++  }
++
++  void AddMissingAgents() {
++    if (input_.incognito || !input_.agents) {
++      return;
++    }
++    bool first = true;
++    for (const ModelMenuAgent& agent : *input_.agents) {
++      // Custom with no working command has nothing to install; Settings is
++      // where it's set up.
++      if (agent.installed || agent.id == "custom") {
++        continue;
++      }
++      if (first) {
++        Separate();
++        Add(Row::Type::kHeading).text = "notInstalledHeading";
++        first = false;
++      }
++      Row& row = Add(Row::Type::kItem);
++      row.label = agent.name;
++      row.agent_id = agent.id;
++      row.line_id = base::StrCat({"missing:", agent.id});
++      row.enabled = false;
++      row.detail = agent.needs_node ? "needsNodeDetail" : std::string();
++      row.tooltip = agent.needs_node ? "needsNodeTip" : "notInstalledTip";
++    }
++  }
++
++  void AddFooter(bool agents_first) {
++    Separate();
++    // For someone who has only an agent, one quiet line on what still
++    // needs a key or a local model.
++    if (!input_.direct_ready && !input_.incognito &&
++        (AgentActive() || HasInstalledAgent())) {
++      AddNote("needsDirectProvider");
++    }
++    Row& row = Add(Row::Type::kItem);
++    row.action = Row::Action::kOpenSettings;
++    row.line_id = "settings";
++    row.text = agents_first ? "setUpInSettings" : "settings";
++    row.settings_icon = true;
++  }
++
++  const ModelMenuInput& input_;
++  std::vector<Row> rows_;
++};
++
++}  // namespace
++
++ModelMenuInput::ModelMenuInput() = default;
++ModelMenuInput::ModelMenuInput(const ModelMenuInput&) = default;
++ModelMenuInput& ModelMenuInput::operator=(const ModelMenuInput&) = default;
++ModelMenuInput::ModelMenuInput(ModelMenuInput&&) = default;
++ModelMenuInput& ModelMenuInput::operator=(ModelMenuInput&&) = default;
++ModelMenuInput::~ModelMenuInput() = default;
++
++ModelMenuRow::ModelMenuRow() = default;
++ModelMenuRow::ModelMenuRow(const ModelMenuRow&) = default;
++ModelMenuRow& ModelMenuRow::operator=(const ModelMenuRow&) = default;
++ModelMenuRow::ModelMenuRow(ModelMenuRow&&) = default;
++ModelMenuRow& ModelMenuRow::operator=(ModelMenuRow&&) = default;
++ModelMenuRow::~ModelMenuRow() = default;
++
++void SortAgentsForMenu(std::vector<ModelMenuAgent>& agents) {
++  std::ranges::stable_sort(agents, {}, [](const ModelMenuAgent& agent) {
++    return AgentRank(agent.id);
++  });
++}
++
++std::vector<ModelMenuRow> BuildModelMenu(const ModelMenuInput& input) {
++  return Builder(input).Build();
++}
++
++std::set<std::string> OfferedAgentIds(const std::vector<ModelMenuRow>& rows) {
++  std::set<std::string> offered;
++  for (const ModelMenuRow& row : rows) {
++    if (row.action == Row::Action::kChooseAgent && row.enabled &&
++        !row.agent_id.empty()) {
++      offered.insert(row.agent_id);
++    }
++  }
++  return offered;
++}
++
++std::string AgentMenuLineId(std::string_view agent_id) {
++  return base::StrCat({"agent:", agent_id});
++}
++
++std::string ModelMenuLineId(std::string_view provider_id,
++                            std::string_view model) {
++  return base::StrCat({"model:", provider_id, "/", model});
++}
++
++std::set<std::string> AgentsInShownMenu(
++    const std::vector<std::string>& line_ids,
++    const std::set<std::string>& offered) {
++  std::set<std::string> shown;
++  for (const std::string& agent : offered) {
++    if (std::ranges::contains(line_ids, AgentMenuLineId(agent))) {
++      shown.insert(agent);
++    }
++  }
++  return shown;
++}
++
++std::string AgentForPick(std::string_view line_id,
++                         const std::set<std::string>& shown) {
++  for (const std::string& agent : shown) {
++    if (line_id == AgentMenuLineId(agent)) {
++      return agent;
++    }
++  }
++  return std::string();
++}
++
++bool ChooseOfferedAgent(PrefService* prefs,
++                        std::string_view picked,
++                        std::string_view agent_id) {
++  if (picked.empty() || picked != agent_id) {
++    return false;
++  }
++  return SelectAgent(prefs, agent_id);
++}
++
++}  // namespace rac::ai
+--- /dev/null
++++ b/chrome/browser/rac/ai/model_menu.h
+@@ -0,0 +1,165 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_MODEL_MENU_H_
++#define CHROME_BROWSER_RAC_AI_MODEL_MENU_H_
++
++#include <map>
++#include <optional>
++#include <set>
++#include <string>
++#include <string_view>
++#include <vector>
++
++class PrefService;
++
++namespace rac::ai {
++
++// What the chat's model button offers: the lines of its menu, in order. The
++// page draws them with its own strings and acts on the line picked, so the
++// order and what can be chosen live here, where they're tested.
++//
++// Nothing here chooses for the user. A line is checked only when the prefs
++// already name its provider, never because it's the only one found.
++
++struct ModelMenuAgent {
++  std::string id;
++  std::string name;
++  // Found and runnable. Only these can be chosen.
++  bool installed = false;
++  // The adapter's CLI is there but npx isn't.
++  bool needs_node = false;
++};
++
++struct ModelMenuProvider {
++  std::string id;
++  std::string name;
++  std::vector<std::string> models;
++};
++
++// What the chat page learned this session about an agent it couldn't use.
++enum class AgentIssue { kSignIn, kFix };
++
++struct ModelMenuInput {
++  ModelMenuInput();
++  ModelMenuInput(const ModelMenuInput&);
++  ModelMenuInput& operator=(const ModelMenuInput&);
++  ModelMenuInput(ModelMenuInput&&);
++  ModelMenuInput& operator=(ModelMenuInput&&);
++  ~ModelMenuInput();
++
++  // A message can be sent: an agent is chosen, or the direct provider is
++  // ready.
++  bool configured = false;
++  // The direct provider is ready. Link summaries and the safety check need
++  // it even when an agent answers the chat.
++  bool direct_ready = false;
++  bool incognito = false;
++  // The choice the prefs hold.
++  std::string agent_id;
++  std::string provider_id;
++  std::string model;
++  // Direct providers with a key or a server, and the models each offers.
++  std::vector<ModelMenuProvider> providers;
++  // Unset while the search for agents hasn't answered.
++  std::optional<std::vector<ModelMenuAgent>> agents;
++  std::map<std::string, AgentIssue> issues;
++};
++
++struct ModelMenuRow {
++  enum class Type { kHeading, kSeparator, kNote, kItem };
++  enum class Action { kNone, kChooseModel, kChooseAgent, kOpenSettings };
++
++  ModelMenuRow();
++  ModelMenuRow(const ModelMenuRow&);
++  ModelMenuRow& operator=(const ModelMenuRow&);
++  ModelMenuRow(ModelMenuRow&&);
++  ModelMenuRow& operator=(ModelMenuRow&&);
++  ~ModelMenuRow();
++
++  Type type = Type::kItem;
++  Action action = Action::kNone;
++  // The page's string for the line, like "agentsHeading", or empty when
++  // `label` is a name: a provider's, a model's or an agent's.
++  std::string text;
++  std::string label;
++  // The page's strings for the quieter text after the label and the tip.
++  // The tip takes `label` as its $1.
++  std::string detail;
++  std::string tooltip;
++  bool enabled = true;
++  bool checked = false;
++  bool settings_icon = false;
++  // The page's id for a line that can be picked. It names what the line is,
++  // not where it sits, so a redraw that adds lines above it (the agents
++  // arriving) keeps the user's selection on the same choice.
++  std::string line_id;
++  // What a choice line chooses.
++  std::string provider_id;
++  std::string provider_name;
++  std::string model;
++  std::string agent_id;
++};
++
++// The agents in the order the menu lists them: the most used first, then
++// any others in the order given (Custom is last).
++void SortAgentsForMenu(std::vector<ModelMenuAgent>& agents);
++
++// The lines of the model menu.
++//
++// With a direct provider's models to list, they come first, then the
++// installed agents, then the ones not installed, then Assistant settings.
++// Before any setup, or when no direct provider has models (an agent-only
++// user), the installed agents come first, then any direct providers' models,
++// then the ones not installed, and the last line is "Set up in Settings…".
++// An agent that isn't installed is shown greyed out and can't be chosen;
++// Custom without a command isn't listed. Agents never show in Incognito.
++std::vector<ModelMenuRow> BuildModelMenu(const ModelMenuInput& input);
++
++// Choosing an agent from the chat goes through three steps, and the browser
++// checks each one, because the page that sends the choice could send any id:
++//
++// 1. BuildModelMenu offers only installed agents with no sign-in or fix
++//    problem this session: OfferedAgentIds.
++// 2. The page shows a menu. Only offered agents whose line is in it, and can
++//    be picked, stay choosable: AgentsInShownMenu. The set ends when that
++//    menu closes.
++// 3. A pick of one of those lines names the agent: AgentForPick. Only that
++//    agent can then be made active, once: ChooseOfferedAgent.
++//
++// This can't tell who sent the message. It holds a choice to what the menu
++// offered: never an agent that isn't installed, and never one the user
++// wasn't shown.
++
++// The agents `rows` lets the user choose.
++std::set<std::string> OfferedAgentIds(const std::vector<ModelMenuRow>& rows);
++
++// The id of the menu line that chooses `agent_id`.
++std::string AgentMenuLineId(std::string_view agent_id);
++
++// The id of the menu line that chooses `model` from `provider_id`. Provider
++// ids have no "/", so the id is unique whatever the model is called.
++std::string ModelMenuLineId(std::string_view provider_id,
++                            std::string_view model);
++
++// The offered agents a shown menu has a line for. `line_ids` are the ids of
++// the lines that can be picked.
++std::set<std::string> AgentsInShownMenu(
++    const std::vector<std::string>& line_ids,
++    const std::set<std::string>& offered);
++
++// The agent a pick of line `line_id` chooses, or empty when the line isn't
++// one of `shown`'s.
++std::string AgentForPick(std::string_view line_id,
++                         const std::set<std::string>& shown);
++
++// Makes `agent_id` active if it is `picked`, the agent the user just picked
++// in the menu. Returns whether it did; otherwise the prefs are unchanged.
++bool ChooseOfferedAgent(PrefService* prefs,
++                        std::string_view picked,
++                        std::string_view agent_id);
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_MODEL_MENU_H_
+--- /dev/null
++++ b/chrome/browser/rac/ai/model_menu_unittest.cc
+@@ -0,0 +1,516 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/model_menu.h"
++
++#include <set>
++#include <string>
++#include <vector>
++
++#include "chrome/browser/rac/ai/ai_prefs.h"
++#include "components/prefs/testing_pref_service.h"
++#include "testing/gmock/include/gmock/gmock.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::ai {
++namespace {
++
++using testing::ElementsAre;
++using testing::IsEmpty;
++using Row = ModelMenuRow;
++
++ModelMenuAgent Agent(std::string id, bool installed, bool needs_node = false) {
++  ModelMenuAgent agent;
++  agent.name = id + " name";
++  agent.id = std::move(id);
++  agent.installed = installed;
++  agent.needs_node = needs_node;
++  return agent;
++}
++
++// The Pro's set in the proof runs: Claude Code found, Cursor needing Node,
++// the rest missing, Custom without a command.
++std::vector<ModelMenuAgent> SomeAgents() {
++  return {Agent("claude", true), Agent("codex", true),
++          Agent("cursor", false, /*needs_node=*/true), Agent("gemini", false),
++          Agent("custom", false)};
++}
++
++ModelMenuProvider Provider(std::string id, std::vector<std::string> models) {
++  ModelMenuProvider provider;
++  provider.name = id + " name";
++  provider.id = std::move(id);
++  provider.models = std::move(models);
++  return provider;
++}
++
++// One line per row: what it is, what it chooses or says, `*` when checked,
++// `(off)` when it can't be picked, and its detail.
++std::vector<std::string> Lines(const std::vector<Row>& rows) {
++  std::vector<std::string> lines;
++  for (const Row& row : rows) {
++    std::string line;
++    switch (row.type) {
++      case Row::Type::kSeparator:
++        line = "---";
++        break;
++      case Row::Type::kHeading:
++        line = "# " + (row.text.empty() ? row.label : row.text);
++        break;
++      case Row::Type::kNote:
++        line = "note " + row.text;
++        break;
++      case Row::Type::kItem:
++        switch (row.action) {
++          case Row::Action::kChooseModel:
++            line = "model " + row.provider_id + "/" + row.model;
++            break;
++          case Row::Action::kChooseAgent:
++            line = "agent " + row.agent_id;
++            break;
++          case Row::Action::kOpenSettings:
++            line = "settings " + (row.text.empty() ? row.agent_id : row.text);
++            break;
++          case Row::Action::kNone:
++            line = "line " + row.agent_id;
++            break;
++        }
++        break;
++    }
++    if (row.checked) {
++      line += " *";
++    }
++    if (!row.enabled) {
++      line += " (off)";
++    }
++    if (!row.detail.empty()) {
++      line += " [" + row.detail + "]";
++    }
++    lines.push_back(std::move(line));
++  }
++  return lines;
++}
++
++bool AnyChecked(const std::vector<Row>& rows) {
++  for (const Row& row : rows) {
++    if (row.checked) {
++      return true;
++    }
++  }
++  return false;
++}
++
++TEST(RacModelMenuTest, SortsAgentsMostUsedFirstAndCustomLast) {
++  std::vector<ModelMenuAgent> agents = {
++      Agent("custom", true), Agent("goose", true), Agent("claude", true),
++      Agent("opencode", true), Agent("codex", true)};
++  SortAgentsForMenu(agents);
++  std::vector<std::string> ids;
++  for (const ModelMenuAgent& agent : agents) {
++    ids.push_back(agent.id);
++  }
++  EXPECT_THAT(ids, ElementsAre("codex", "claude", "opencode", "goose",
++                               "custom"));
++}
++
++// #124: someone whose only AI is an agent can choose it here, before any
++// setup. Installed agents first, then the ones not installed, then Settings.
++TEST(RacModelMenuTest, BeforeSetupListsInstalledAgentsFirst) {
++  ModelMenuInput input;
++  input.agents = SomeAgents();
++  SortAgentsForMenu(*input.agents);
++
++  EXPECT_THAT(Lines(BuildModelMenu(input)),
++              ElementsAre("# agentsHeading", "agent codex", "agent claude",
++                          "note modelsLater", "---", "# notInstalledHeading",
++                          "line cursor (off) [needsNodeDetail]",
++                          "line gemini (off)", "---",
++                          "note needsDirectProvider",
++                          "settings setUpInSettings"));
++}
++
++TEST(RacModelMenuTest, BeforeSetupDirectProvidersComeAfterAgents) {
++  // A key saved for a provider that isn't the chosen one: its models list,
++  // but nothing is set up yet.
++  ModelMenuInput input;
++  input.provider_id = "openai";
++  input.model = "gpt";
++  input.providers = {Provider("anthropic", {"sonnet", "haiku"})};
++  input.agents = {Agent("claude", true)};
++
++  EXPECT_THAT(Lines(BuildModelMenu(input)),
++              ElementsAre("# agentsHeading", "agent claude",
++                          "note modelsLater", "---", "# anthropic name",
++                          "model anthropic/sonnet", "model anthropic/haiku",
++                          "---", "note needsDirectProvider",
++                          "settings setUpInSettings"));
++}
++
++// Choosing is the consent: one agent found is still not chosen for you.
++TEST(RacModelMenuTest, NeverPreselectsTheOnlyAgent) {
++  ModelMenuInput input;
++  input.agents = {Agent("claude", true)};
++  const std::vector<Row> rows = BuildModelMenu(input);
++  EXPECT_FALSE(AnyChecked(rows));
++
++  // Even if the pref names it, a menu that isn't set up checks nothing.
++  input.agent_id = "claude";
++  EXPECT_FALSE(AnyChecked(BuildModelMenu(input)));
++}
++
++TEST(RacModelMenuTest, NeverPreselectsADirectModelBeforeSetup) {
++  ModelMenuInput input;
++  input.provider_id = "anthropic";
++  input.model = "sonnet";
++  input.providers = {Provider("anthropic", {"sonnet"})};
++  input.agents = {Agent("claude", true)};
++  EXPECT_FALSE(AnyChecked(BuildModelMenu(input)));
++}
++
++TEST(RacModelMenuTest, NotInstalledAgentsCantBeChosen) {
++  ModelMenuInput input;
++  input.agents = {Agent("cursor", false, /*needs_node=*/true),
++                  Agent("gemini", false)};
++  for (const Row& row : BuildModelMenu(input)) {
++    EXPECT_NE(row.action, Row::Action::kChooseAgent) << row.agent_id;
++    if (!row.agent_id.empty()) {
++      EXPECT_FALSE(row.enabled) << row.agent_id;
++      EXPECT_FALSE(row.tooltip.empty()) << row.agent_id;
++    }
++  }
++}
++
++TEST(RacModelMenuTest, CustomWithoutACommandIsNotListed) {
++  ModelMenuInput input;
++  input.agents = {Agent("custom", false)};
++  EXPECT_THAT(Lines(BuildModelMenu(input)),
++              ElementsAre("settings setUpInSettings"));
++
++  input.agents = {Agent("custom", true)};
++  EXPECT_THAT(Lines(BuildModelMenu(input)),
++              ElementsAre("# agentsHeading", "agent custom",
++                          "note modelsLater", "---",
++                          "note needsDirectProvider",
++                          "settings setUpInSettings"));
++}
++
++TEST(RacModelMenuTest, NoAgentsFoundLeavesOnlySettings) {
++  ModelMenuInput input;
++  input.agents = {Agent("claude", false), Agent("codex", false)};
++  EXPECT_THAT(Lines(BuildModelMenu(input)),
++              ElementsAre("# notInstalledHeading", "line claude (off)",
++                          "line codex (off)", "---",
++                          "settings setUpInSettings"));
++}
++
++TEST(RacModelMenuTest, SaysWhileAgentsAreStillBeingLookedFor) {
++  ModelMenuInput input;
++  EXPECT_THAT(Lines(BuildModelMenu(input)),
++              ElementsAre("note lookingForAgents", "---",
++                          "settings setUpInSettings"));
++}
++
++TEST(RacModelMenuTest, IncognitoListsNoAgents) {
++  ModelMenuInput input;
++  input.incognito = true;
++  input.agent_id = "claude";
++  input.agents = SomeAgents();
++  EXPECT_THAT(Lines(BuildModelMenu(input)),
++              ElementsAre("note noAgentsIncognito", "---",
++                          "settings setUpInSettings"));
++}
++
++// With a direct provider set up the menu keeps its shape: models first.
++TEST(RacModelMenuTest, DirectProviderSetUpListsModelsFirst) {
++  ModelMenuInput input;
++  input.configured = true;
++  input.direct_ready = true;
++  input.provider_id = "anthropic";
++  input.model = "haiku";
++  input.providers = {Provider("anthropic", {"sonnet", "haiku"}),
++                     Provider("ollama", {"llama"})};
++  input.agents = {Agent("claude", true), Agent("gemini", false)};
++
++  EXPECT_THAT(Lines(BuildModelMenu(input)),
++              ElementsAre("# anthropic name", "model anthropic/sonnet",
++                          "model anthropic/haiku *", "# ollama name",
++                          "model ollama/llama", "---", "# agentsHeading",
++                          "agent claude", "note modelsLater", "---",
++                          "# notInstalledHeading", "line gemini (off)", "---",
++                          "settings settings"));
++}
++
++TEST(RacModelMenuTest, AnActiveAgentIsCheckedInsteadOfTheModel) {
++  ModelMenuInput input;
++  input.configured = true;
++  input.direct_ready = true;
++  input.agent_id = "claude";
++  input.provider_id = "anthropic";
++  input.model = "sonnet";
++  input.providers = {Provider("anthropic", {"sonnet"})};
++  input.agents = {Agent("claude", true), Agent("codex", true)};
++
++  EXPECT_THAT(Lines(BuildModelMenu(input)),
++              ElementsAre("# anthropic name", "model anthropic/sonnet", "---",
++                          "# agentsHeading", "agent claude *", "agent codex",
++                          "note modelsLater", "---", "settings settings"));
++}
++
++// Chose an agent, no key: agents stay first, with the one quiet line.
++TEST(RacModelMenuTest, AgentOnlyKeepsAgentsFirstWithTheQuietLine) {
++  ModelMenuInput input;
++  input.configured = true;
++  input.agent_id = "claude";
++  input.agents = {Agent("claude", true), Agent("codex", true)};
++
++  EXPECT_THAT(Lines(BuildModelMenu(input)),
++              ElementsAre("# agentsHeading", "agent claude *", "agent codex",
++                          "note modelsLater", "---",
++                          "note needsDirectProvider",
++                          "settings setUpInSettings"));
++}
++
++TEST(RacModelMenuTest, QuietLineOnlyWithoutADirectProvider) {
++  ModelMenuInput input;
++  input.configured = true;
++  input.direct_ready = true;
++  input.agent_id = "claude";
++  input.providers = {Provider("ollama", {"llama"})};
++  input.agents = {Agent("claude", true)};
++  for (const Row& row : BuildModelMenu(input)) {
++    EXPECT_NE(row.text, "needsDirectProvider");
++  }
++}
++
++TEST(RacModelMenuTest, AnAgentThatFailedLeadsToSettings) {
++  ModelMenuInput input;
++  input.configured = true;
++  input.agent_id = "claude";
++  input.agents = {Agent("claude", true), Agent("codex", true)};
++  input.issues["claude"] = AgentIssue::kSignIn;
++  input.issues["codex"] = AgentIssue::kFix;
++
++  EXPECT_THAT(Lines(BuildModelMenu(input)),
++              ElementsAre("# agentsHeading", "settings claude [signInToUse]",
++                          "settings codex [fixInSettings]",
++                          "note modelsLater", "---",
++                          "note needsDirectProvider",
++                          "settings setUpInSettings"));
++}
++
++TEST(RacModelMenuTest, ChoiceLinesCarryWhatTheyChoose) {
++  ModelMenuInput input;
++  input.providers = {Provider("anthropic", {"sonnet"})};
++  input.agents = {Agent("claude", true)};
++  bool saw_model = false;
++  bool saw_agent = false;
++  for (const Row& row : BuildModelMenu(input)) {
++    if (row.action == Row::Action::kChooseModel) {
++      saw_model = true;
++      EXPECT_EQ(row.provider_id, "anthropic");
++      EXPECT_EQ(row.provider_name, "anthropic name");
++      EXPECT_EQ(row.model, "sonnet");
++    }
++    if (row.action == Row::Action::kChooseAgent) {
++      saw_agent = true;
++      EXPECT_EQ(row.agent_id, "claude");
++      EXPECT_EQ(row.label, "claude name");
++    }
++  }
++  EXPECT_TRUE(saw_model);
++  EXPECT_TRUE(saw_agent);
++}
++
++TEST(RacModelMenuTest, ProvidersWithoutModelsAreLeftOut) {
++  ModelMenuInput input;
++  input.configured = true;
++  input.agent_id = "claude";
++  input.providers = {Provider("openai", {})};
++  input.agents = std::vector<ModelMenuAgent>();
++  EXPECT_THAT(Lines(BuildModelMenu(input)),
++              ElementsAre("note needsDirectProvider",
++                          "settings setUpInSettings"));
++}
++
++// The index of the line `line_id` names, or -1. How the menu keeps a
++// selection when it is drawn again (MenuRequest::selected_id).
++int FindLine(const std::vector<Row>& rows, const std::string& line_id) {
++  for (size_t i = 0; i < rows.size(); ++i) {
++    if (rows[i].type == Row::Type::kItem && rows[i].line_id == line_id) {
++      return static_cast<int>(i);
++    }
++  }
++  return -1;
++}
++
++TEST(RacModelMenuTest, EveryLineThatCanBePickedHasItsOwnStableId) {
++  ModelMenuInput input;
++  input.providers = {Provider("anthropic", {"sonnet", "haiku"}),
++                     Provider("ollama", {"llama"})};
++  input.agents = SomeAgents();
++  input.issues["codex"] = AgentIssue::kSignIn;
++  std::set<std::string> ids;
++  for (const Row& row : BuildModelMenu(input)) {
++    if (row.type != Row::Type::kItem) {
++      continue;
++    }
++    EXPECT_FALSE(row.line_id.empty()) << row.label;
++    EXPECT_TRUE(ids.insert(row.line_id).second) << row.line_id;
++  }
++  EXPECT_EQ(ids, (std::set<std::string>{
++                     "agent:claude", "fix:codex", "model:anthropic/sonnet",
++                     "model:anthropic/haiku", "model:ollama/llama",
++                     "missing:cursor", "missing:gemini", "settings"}));
++  EXPECT_EQ(ModelMenuLineId("ollama", "llama"), "model:ollama/llama");
++}
++
++// #205: the agents arrive while a keyboard user sits on a model. They are
++// drawn above it, so a position-based id would move the selection to
++// another model, and Return would choose it.
++TEST(RacModelMenuTest, ARedrawWithAgentsAboveKeepsTheSameModelSelected) {
++  ModelMenuInput input;
++  input.providers = {Provider("anthropic", {"sonnet", "haiku"}),
++                     Provider("ollama", {"llama"})};
++  const std::vector<Row> looking = BuildModelMenu(input);
++  const int before = FindLine(looking, "model:ollama/llama");
++  ASSERT_GE(before, 0);
++
++  input.agents = SomeAgents();
++  const std::vector<Row> found = BuildModelMenu(input);
++  const int after = FindLine(found, looking[before].line_id);
++  ASSERT_GE(after, 0);
++  EXPECT_EQ(found[after].provider_id, "ollama");
++  EXPECT_EQ(found[after].model, "llama");
++  // The lines above it changed, so its position did too.
++  EXPECT_NE(after, before);
++  EXPECT_NE(found[before].model, "llama");
++}
++
++// Choosing an agent from the chat: what the browser lets through.
++
++TEST(RacModelMenuTest, OffersOnlyInstalledAgentsWithoutAProblem) {
++  ModelMenuInput input;
++  input.agents = SomeAgents();
++  EXPECT_EQ(OfferedAgentIds(BuildModelMenu(input)),
++            (std::set<std::string>{"claude", "codex"}));
++
++  // One that failed this session leads to Settings instead.
++  input.issues["codex"] = AgentIssue::kSignIn;
++  EXPECT_EQ(OfferedAgentIds(BuildModelMenu(input)),
++            (std::set<std::string>{"claude"}));
++}
++
++TEST(RacModelMenuTest, OffersNoAgentInIncognitoOrBeforeTheSearchAnswers) {
++  ModelMenuInput input;
++  EXPECT_THAT(OfferedAgentIds(BuildModelMenu(input)), IsEmpty());
++  input.incognito = true;
++  input.agents = SomeAgents();
++  EXPECT_THAT(OfferedAgentIds(BuildModelMenu(input)), IsEmpty());
++}
++
++TEST(RacModelMenuTest, AgentLinesCarryTheirLineId) {
++  ModelMenuInput input;
++  input.agents = {Agent("claude", true), Agent("cursor", false)};
++  for (const Row& row : BuildModelMenu(input)) {
++    if (row.action == Row::Action::kChooseAgent) {
++      EXPECT_EQ(row.line_id, "agent:claude");
++    } else if (!row.agent_id.empty()) {
++      // Only a line that chooses an agent is named "agent:".
++      EXPECT_EQ(row.line_id, "missing:" + row.agent_id);
++    }
++  }
++  EXPECT_EQ(AgentMenuLineId("claude"), "agent:claude");
++}
++
++TEST(RacModelMenuTest, OnlyOfferedAgentsShownInTheMenuStayChoosable) {
++  const std::set<std::string> offered = {"claude", "codex"};
++  EXPECT_EQ(AgentsInShownMenu({"agent:claude", "agent:cursor", "settings"},
++                              offered),
++            (std::set<std::string>{"claude"}));
++  EXPECT_THAT(AgentsInShownMenu({"tab:3", "upload"}, offered), IsEmpty());
++  EXPECT_THAT(AgentsInShownMenu({"agent:claude"}, {}), IsEmpty());
++}
++
++TEST(RacModelMenuTest, APickNamesAnAgentOnlyFromTheShownMenu) {
++  const std::set<std::string> shown = {"claude"};
++  EXPECT_EQ(AgentForPick("agent:claude", shown), "claude");
++  EXPECT_EQ(AgentForPick("agent:cursor", shown), "");
++  EXPECT_EQ(AgentForPick("claude", shown), "");
++  EXPECT_EQ(AgentForPick("model:0", shown), "");
++  EXPECT_EQ(AgentForPick("agent:claude", {}), "");
++}
++
++class RacAgentChoiceTest : public testing::Test {
++ protected:
++  void SetUp() override { RegisterProfilePrefs(prefs_.registry()); }
++
++  std::string AgentPref() const { return prefs_.GetString(kAgentId); }
++
++  // The browser's whole path for a choice from the chat: build the menu,
++  // show it with `shown_lines`, pick `line`, and ask for `agent`.
++  bool Choose(const ModelMenuInput& input,
++              const std::vector<std::string>& shown_lines,
++              const std::string& line,
++              const std::string& agent) {
++    const std::set<std::string> shown = AgentsInShownMenu(
++        shown_lines, OfferedAgentIds(BuildModelMenu(input)));
++    return ChooseOfferedAgent(&prefs_, AgentForPick(line, shown), agent);
++  }
++
++  TestingPrefServiceSimple prefs_;
++};
++
++TEST_F(RacAgentChoiceTest, NothingPickedChangesNothing) {
++  EXPECT_FALSE(ChooseOfferedAgent(&prefs_, "", "claude"));
++  EXPECT_EQ(AgentPref(), "");
++}
++
++TEST_F(RacAgentChoiceTest, AnotherAgentThanThePickedOneChangesNothing) {
++  ASSERT_TRUE(ChooseOfferedAgent(&prefs_, "codex", "codex"));
++  EXPECT_FALSE(ChooseOfferedAgent(&prefs_, "claude", "cursor"));
++  EXPECT_EQ(AgentPref(), "codex");
++}
++
++TEST_F(RacAgentChoiceTest, AnUnknownAgentChangesNothing) {
++  EXPECT_FALSE(ChooseOfferedAgent(&prefs_, "bogus", "bogus"));
++  EXPECT_EQ(AgentPref(), "");
++}
++
++TEST_F(RacAgentChoiceTest, ThePickedAgentIsChosen) {
++  ModelMenuInput input;
++  input.agents = SomeAgents();
++  EXPECT_TRUE(
++      Choose(input, {"agent:codex", "agent:claude"}, "agent:claude", "claude"));
++  EXPECT_EQ(AgentPref(), "claude");
++}
++
++TEST_F(RacAgentChoiceTest, ANotInstalledAgentCantBeChosen) {
++  ModelMenuInput input;
++  input.agents = SomeAgents();
++  // Cursor isn't installed, so even a menu that has its line, and a pick of
++  // it, can't make it active.
++  EXPECT_FALSE(Choose(input, {"agent:claude", "agent:cursor"}, "agent:cursor",
++                      "cursor"));
++  EXPECT_EQ(AgentPref(), "");
++}
++
++TEST_F(RacAgentChoiceTest, AnAgentNeverShownCantBeChosen) {
++  ModelMenuInput input;
++  input.agents = SomeAgents();
++  // Codex is installed and offered, but the menu on screen had no line for
++  // it.
++  EXPECT_FALSE(Choose(input, {"agent:claude"}, "agent:codex", "codex"));
++  EXPECT_EQ(AgentPref(), "");
++}
++
++TEST_F(RacAgentChoiceTest, AnAgentWithAProblemCantBeChosen) {
++  ModelMenuInput input;
++  input.agents = SomeAgents();
++  input.issues["claude"] = AgentIssue::kFix;
++  EXPECT_FALSE(Choose(input, {"agent:claude"}, "agent:claude", "claude"));
++  EXPECT_EQ(AgentPref(), "");
++}
++
++}  // namespace
++}  // namespace rac::ai
+--- a/chrome/browser/resources/rac_ai/app.ts
++++ b/chrome/browser/resources/rac_ai/app.ts
+@@ -36,6 +36,8 @@ interface InitState {
+   providerName?: string;
+   model?: string;
+   agentId?: string;
++  // Before setup: a direct provider chosen in Settings but not set up yet.
++  chosenProvider?: string;
+   incognito?: boolean;
+   saveHistory?: boolean;
+   theme?: Theme|null;
+@@ -117,16 +119,25 @@ interface ConversationInfo {
+   messages?: StoredMessage[];
+ }
+ 
+-interface ModelProvider {
+-  id: string;
+-  name: string;
+-  models: string[];
+-}
+-
+-interface ModelChoices {
+-  provider: string;
+-  model: string;
+-  providers: ModelProvider[];
++// One line of the model menu, as the browser lays it out (model_menu.h).
++interface ModelMenuLine {
++  type: 'heading'|'separator'|'note'|'item';
++  // One of this page's strings; else `label` is a name as it stands.
++  text?: string;
++  label?: string;
++  // Strings of this page's. The tooltip takes the label as $1.
++  detail?: string;
++  tooltip?: string;
++  enabled?: boolean;
++  checked?: boolean;
++  icon?: 'settings';
++  action?: 'model'|'agent'|'settings';
++  // The line's id. It names the choice, so it stays the same across redraws.
++  id?: string;
++  provider?: string;
++  providerName?: string;
++  model?: string;
++  agent?: string;
+ }
+ 
+ // A text file the user picked, already read.
+@@ -225,6 +236,9 @@ const messages: Message[] = [];
+ let activeId = 0;
+ let streaming = false;
+ let configured = false;
++// The assistant is on. The model button shows then, set up or not, so an
++// agent can be chosen before any setup.
++let aiEnabled = false;
+ let renderQueued = false;
+ let attachDefault = true;
+ let initialized = false;
+@@ -486,10 +500,10 @@ function updateControls() {
+   input.disabled = !configured && !pageMode;
+   addTabButton.disabled = !configured;
+   // On the new tab page the model button belongs to the composer, so it
+-  // shows whenever the assistant is set up, in search mode too. In the
+-  // panel it stays with the model name.
++  // shows whenever the assistant is on, in search mode too. In the panel it
++  // stays with the model name, or "Choose a model" before any setup.
+   modelButton.hidden =
+-      !configured || (!pageMode && (!modelName.textContent || searching));
++      !aiEnabled || (!pageMode && (!modelName.textContent || searching));
+   renderIntent();
+   emptyState.hidden = !configured || messages.length > 0;
+   document.body.dataset['chat'] = messages.length > 0 ? 'active' : 'empty';
+@@ -645,9 +659,11 @@ function removeTab(tab: TabInfo) {
+   renderChips();
+ }
+ 
+-function showNote(key: string) {
++function showNote(key: string, ...args: string[]) {
+   clearTimeout(noteTimer);
+-  composerNote.textContent = loadTimeData.getString(key);
++  composerNote.textContent = args.length > 0 ?
++      loadTimeData.getStringF(key, ...args) :
++      loadTimeData.getString(key);
+   composerNote.hidden = false;
+   noteTimer = setTimeout(() => {
+     composerNote.hidden = true;
+@@ -785,10 +801,15 @@ let menuPending = false;
+ // remember which button that was to keep the click from reopening it.
+ let lastClosed: {button: HTMLElement, time: number}|null = null;
+ 
++// With `replace`, a menu still open on `button` is redrawn in its place and
++// keeps the line the user had reached.
+ function showMenu(
+     button: HTMLElement, spec: MenuSpec, actions: Map<string, () => void>,
+-    onRemove?: (id: string) => void) {
+-  closeMenus();
++    onRemove?: (id: string) => void, replace = false) {
++  const keepSelection = replace && openMenu?.button === button;
++  if (!keepSelection) {
++    closeMenus();
++  }
+   const rect = button.getBoundingClientRect();
+   openMenu = {token: ++menuToken, button, actions, onRemove};
+   button.setAttribute('aria-expanded', 'true');
+@@ -796,6 +817,7 @@ function showMenu(
+     openMenu.token,
+     {
+       ...spec,
++      keepSelection,
+       name: button.getAttribute('aria-label') ?? button.title,
+       anchor: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
+     },
+@@ -951,155 +973,97 @@ async function addFiles(picked: File[])
+   input.focus();
+ }
+ 
++// Finding agents asks the login shell for its PATH, which can take seconds.
++// The menu doesn't wait that long: it opens saying it's still looking, and
++// shows the agents once they're found if it's still open.
++const AGENT_WAIT_MS = 600;
++
+ async function openModelMenu() {
+-  if (!configured) {
++  if (!aiEnabled) {
+     return;
+   }
+-  const [choices, agents] = await Promise.all([
+-    sendWithPromise<ModelChoices>('racAiGetModels'),
+-    agentsForMenu(),
+-  ]);
+-  const actions = new Map<string, () => void>();
+-  const entries: MenuEntry[] = [];
+-  const agentSelected = !incognito && agentId !== '';
+-  choices.providers.forEach((provider, i) => {
+-    if (provider.models.length === 0) {
+-      return;
+-    }
+-    entries.push({type: 'heading', label: provider.name});
+-    provider.models.forEach((model, j) => {
+-      const id = `model:${i}:${j}`;
+-      entries.push({
+-        id,
+-        label: model,
+-        checked: !agentSelected && provider.id === choices.provider &&
+-            model === choices.model,
+-      });
+-      actions.set(id, () => selectModel(provider, model));
+-    });
+-  });
+-  if (entries.length === 0) {
+-    // Nothing is set up: one quiet way to start, not a list of providers.
+-    entries.push({
+-      id: 'setup',
+-      label: loadTimeData.getString('addProvider'),
+-      icon: 'settings',
+-    });
+-    actions.set('setup', openSettings);
+-  }
+-  if (incognito) {
+-    entries.push(
+-        {type: 'separator'},
+-        {type: 'note', label: loadTimeData.getString('noAgentsIncognito')});
+-  } else if (agents) {
+-    addAgentEntries(entries, actions, agents);
+-  } else {
+-    if (entries.length > 0) {
+-      entries.push({type: 'separator'});
+-    }
+-    entries.push({type: 'note', label: loadTimeData.getString('lookingForAgents')});
++  // The look for agents starts here, as the menu opens; never at startup.
++  const listing = incognito ? null : listAgents();
++  const ready = listing !== null &&
++      (agentInfos.size > 0 || await Promise.race([
++        listing.then(() => true),
++        new Promise<boolean>(
++            resolve => setTimeout(() => resolve(false), AGENT_WAIT_MS)),
++      ]));
++  const lines = await modelMenuLines(ready);
++  if (!aiEnabled) {
++    return;
+   }
+-  if (entries.length > 0) {
+-    entries.push({type: 'separator'});
++  showModelMenu(lines);
++  if (ready || !listing) {
++    return;
+   }
+-  entries.push({
+-    id: 'settings',
+-    label: loadTimeData.getString('settings'),
+-    icon: 'settings',
+-  });
+-  actions.set('settings', openSettings);
+-  showMenu(
+-      modelButton, {above: true, align: 'end', width: 280, entries}, actions);
+-}
+-
+-// The agents in the picker, one row each: no agent has told rac its models
+-// yet, and a heading with a "Default model" row apiece would make the menu
+-// taller than the window. Installed ones can be picked; the rest are greyed
+-// out with a tip on how to get them. Nothing here starts an agent, so the
+-// models they'll offer aren't known until the first message.
+-function addAgentEntries(
+-    entries: MenuEntry[], actions: Map<string, () => void>,
+-    agents: AgentInfo[]) {
+-  const installed = agents.filter(agent => agent.installed);
+-  const missing =
+-      agents.filter(agent => !agent.installed && agent.id !== 'custom');
+-  if (installed.length > 0) {
+-    if (entries.length > 0) {
+-      entries.push({type: 'separator'});
+-    }
+-    entries.push(
+-        {type: 'heading', label: loadTimeData.getString('agentsHeading')});
+-    for (const agent of installed) {
+-      const id = `agent:${agent.id}`;
+-      const issue = agentIssues.get(agent.id);
+-      if (issue) {
+-        entries.push({
+-          id,
+-          label: agent.name,
+-          detail: loadTimeData.getString(
+-              issue === 'signin' ? 'signInToUse' : 'fixInSettings'),
+-          icon: 'settings',
+-        });
+-        actions.set(id, openSettings);
+-      } else {
+-        entries.push({id, label: agent.name, checked: agent.id === agentId});
+-        actions.set(id, () => selectAgent(agent));
+-      }
++  const token = openMenu?.token;
++  listing.then(async () => {
++    if (openMenu?.token !== token) {
++      return;
+     }
+-    entries.push({type: 'note', label: loadTimeData.getString('modelsLater')});
+-  }
+-  if (missing.length > 0) {
+-    if (entries.length > 0) {
+-      entries.push({type: 'separator'});
+-    }
+-    entries.push({
+-      type: 'heading',
+-      label: loadTimeData.getString('notInstalledHeading')
+-    });
+-    for (const agent of missing) {
+-      entries.push({
+-        id: `missing:${agent.id}`,
+-        label: agent.name,
+-        detail: agent.needsNode ? loadTimeData.getString('needsNodeDetail') :
+-                                  undefined,
+-        enabled: false,
+-        tooltip: loadTimeData.getStringF(
+-            agent.needsNode ? 'needsNodeTip' : 'notInstalledTip', agent.name),
+-      });
++    const found = await modelMenuLines(true);
++    if (openMenu?.token === token && aiEnabled) {
++      showModelMenu(found, /*replace=*/ true);
+     }
+-  }
++  });
+ }
+ 
+-const AGENT_ORDER =
+-    ['codex', 'claude', 'cursor', 'gemini', 'copilot', 'opencode', 'goose'];
+-
+-function agentOrder(id: string): number {
+-  const index = AGENT_ORDER.indexOf(id);
+-  return index < 0 ? AGENT_ORDER.length : index;
++function modelMenuLines(agentsReady: boolean): Promise<ModelMenuLine[]> {
++  return sendWithPromise<ModelMenuLine[]>(
++      'racAiGetModelMenu', Object.fromEntries(agentIssues), agentsReady);
+ }
+ 
+-// Finding agents asks the login shell for its PATH, which can take seconds.
+-// The menu doesn't wait that long for them: provider models show at once, and
+-// the agents appear the next time the menu opens.
+-const AGENT_WAIT_MS = 600;
+-
+-async function agentsForMenu(): Promise<AgentInfo[]|null> {
+-  const listing = listAgents();
+-  if (agentInfos.size > 0) {
+-    return [...agentInfos.values()];
+-  }
+-  return Promise.race([
+-    listing,
+-    new Promise<null>(resolve => setTimeout(() => resolve(null), AGENT_WAIT_MS)),
+-  ]);
++// Draws the browser's lines with this page's strings. Choosing an agent here
++// is the consent to run it; nothing is ever chosen for the user.
++function showModelMenu(lines: ModelMenuLine[], replace = false) {
++  const actions = new Map<string, () => void>();
++  const entries = lines.map((line, i): MenuEntry => {
++    const label =
++        line.text ? loadTimeData.getString(line.text) : line.label ?? '';
++    if (line.type !== 'item') {
++      return line.type === 'separator' ? {type: 'separator'} :
++                                         {type: line.type, label};
++    }
++    const entry: MenuEntry = {label, checked: !!line.checked};
++    if (line.enabled === false) {
++      entry.enabled = false;
++    }
++    if (line.detail) {
++      entry.detail = loadTimeData.getString(line.detail);
++    }
++    if (line.tooltip) {
++      entry.tooltip = loadTimeData.getStringF(line.tooltip, label);
++    }
++    if (line.icon) {
++      entry.icon = line.icon;
++    }
++    // The browser's id names the choice, not the position, so a redraw
++    // keeps the selection on it.
++    const id = line.id ?? `line:${i}`;
++    entry.id = id;
++    const {provider, model, agent} = line;
++    if (line.action === 'model' && provider && model) {
++      const providerName = line.providerName ?? '';
++      actions.set(id, () => selectModel(provider, providerName, model));
++    } else if (line.action === 'agent' && agent) {
++      actions.set(id, () => void selectAgent(agent, label));
++    } else if (line.action === 'settings') {
++      actions.set(id, openSettings);
++    }
++    return entry;
++  });
++  showMenu(
++      modelButton, {above: true, align: 'end', width: 280, entries}, actions,
++      undefined, replace);
+ }
+ 
+ // Looks for installed agents on the PATH (once, then cached) without
+ // starting any of them.
+ async function listAgents(): Promise<AgentInfo[]> {
+-  const agents = (await sendWithPromise<AgentInfo[]>('racAiListAgents')
+-                      .catch(() => [] as AgentInfo[]))
+-                     .sort((a, b) => agentOrder(a.id) - agentOrder(b.id));
++  const agents = await sendWithPromise<AgentInfo[]>('racAiListAgents')
++                     .catch(() => [] as AgentInfo[]);
+   agentInfos = new Map(agents.map(agent => [agent.id, agent]));
+   return agents;
+ }
+@@ -1136,21 +1100,30 @@ function showProvider(label: string, tip
+   modelButton.title = tip;
+ }
+ 
+-function selectModel(provider: ModelProvider, model: string) {
++function selectModel(
++    providerId: string, providerName: string, model: string) {
+   noteSwitch(model);
+-  sendToBrowser('racAiSelectModel', [provider.id, model]);
++  sendToBrowser('racAiSelectModel', [providerId, model]);
+   agentId = '';
+   agentName = '';
+-  showProvider(model, `${provider.name} · ${model}`);
++  showProvider(model, `${providerName} · ${model}`);
+   input.focus();
+ }
+ 
+-function selectAgent(agent: AgentInfo) {
+-  noteSwitch(agent.name);
+-  sendToBrowser('racAiSelectAgent', [agent.id]);
+-  agentId = agent.id;
+-  agentName = agent.name;
+-  showProvider(agent.name, loadTimeData.getStringF('agentTag', agent.name));
++// Only takes effect for the next message: a reply already running keeps
++// the provider it started with. The page shows the agent only once the
++// browser has taken it.
++async function selectAgent(id: string, name: string) {
++  const chosen = await sendWithPromise<boolean>('racAiSelectAgent', id)
++                     .catch(() => false);
++  if (!chosen) {
++    showNote('agentNotChosen', name);
++    return;
++  }
++  noteSwitch(name);
++  agentId = id;
++  agentName = name;
++  showProvider(name, loadTimeData.getStringF('agentTag', name));
+   input.focus();
+ }
+ 
+@@ -2852,6 +2825,7 @@ function applyState(state: InitState) {
+ // profile's, so it doesn't change with the conversation on show. Only the
+ // next message uses it; a reply already running keeps its provider.
+ function applyProvider(state: InitState) {
++  aiEnabled = state.enabled;
+   configured = state.enabled && !!state.configured;
+   incognito = !!state.incognito;
+   agentId = state.agentId ?? '';
+@@ -2861,7 +2835,16 @@ function applyProvider(state: InitState)
+     listAgents();
+   }
+   renderChips();
+-  if (state.enabled && state.providerName) {
++  if (state.enabled && !configured) {
++    // Nothing set up yet. The menu is where to choose, agents first. A
++    // provider chosen in Settings but not set up keeps its name.
++    providerLabel = '';
++    const chosen = state.chosenProvider ?? '';
++    modelName.textContent = chosen || loadTimeData.getString('chooseModel');
++    modelButton.title = chosen ?
++        loadTimeData.getStringF('providerNeedsSetup', chosen) :
++        loadTimeData.getString('chooseModel');
++  } else if (state.enabled && state.providerName) {
+     if (agentId) {
+       showProvider(
+           state.providerName,
+@@ -3052,6 +3035,7 @@ function init() {
+   addWebUiListener('rac-ai-disabled', () => {
+     streaming = false;
+     configured = false;
++    aiEnabled = false;
+     closeMenus();
+     updateControls();
+   });
+--- a/chrome/browser/ui/views/rac/ai/assistant_menu.cc
++++ b/chrome/browser/ui/views/rac/ai/assistant_menu.cc
+@@ -150,6 +150,7 @@ class MenuPanel::Contents : public views
+ 
+   void Select(Row* row);
+   void Pick(Row* row, bool remove);
++  std::string selected_id() const;
+ 
+   // views::TextfieldController:
+   void ContentsChanged(views::Textfield* sender,
+@@ -448,10 +449,22 @@ MenuPanel::Contents::Contents(MenuReques
+   empty_->SetMultiLine(true);
+   empty_->SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(4, kRowInset)));
+   UpdateEmpty();
++  if (!request.selected_id.empty()) {
++    for (Row* row : rows_) {
++      if (row->entry().id == request.selected_id && row->entry().enabled) {
++        Select(row);
++        break;
++      }
++    }
++  }
+ }
+ 
+ MenuPanel::Contents::~Contents() = default;
+ 
++std::string MenuPanel::Contents::selected_id() const {
++  return selected_ ? selected_->entry().id : std::string();
++}
++
+ void MenuPanel::Contents::Select(Row* row) {
+   selected_by_typing_ = false;
+   if (selected_ == row) {
+@@ -654,10 +667,10 @@ MenuPanel::MenuPanel(views::Widget* pare
+   delegate->SetBackgroundColor(ui::kColorMenuBackground);
+   delegate->set_highlight_button_when_shown(false);
+   delegate->set_fixed_width(request.width > 0 ? request.width : kDefaultWidth);
+-  auto* contents = delegate->SetContentsView(std::make_unique<Contents>(
++  contents_ = delegate->SetContentsView(std::make_unique<Contents>(
+       std::move(request),
+       base::BindRepeating(&MenuPanel::OnPicked, weak_factory_.GetWeakPtr())));
+-  delegate->SetInitiallyFocusedView(contents->initial_focus());
++  delegate->SetInitiallyFocusedView(contents_->initial_focus());
+   delegate_ = std::move(delegate);
+   widget_ = views::BubbleDialogDelegate::CreateBubble(
+       delegate_.get(),
+@@ -667,6 +680,10 @@ MenuPanel::MenuPanel(views::Widget* pare
+ 
+ MenuPanel::~MenuPanel() = default;
+ 
++std::string MenuPanel::SelectedId() const {
++  return contents_ ? contents_->selected_id() : std::string();
++}
++
+ void MenuPanel::Close() {
+   if (widget_) {
+     widget_->CloseWithReason(views::Widget::ClosedReason::kUnspecified);
+@@ -685,6 +702,7 @@ void MenuPanel::OnWidgetClosed(views::Wi
+     return;
+   }
+   closing_ = true;
++  contents_ = nullptr;
+   // The widget is still on the stack that reported its closing.
+   base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+       FROM_HERE, base::BindOnce(
+--- a/chrome/browser/ui/views/rac/ai/assistant_menu.h
++++ b/chrome/browser/ui/views/rac/ai/assistant_menu.h
+@@ -10,6 +10,7 @@
+ #include <vector>
+ 
+ #include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "ui/base/models/image_model.h"
+ #include "ui/gfx/geometry/rect.h"
+@@ -78,6 +79,9 @@ struct MenuRequest {
+   // it.
+   std::u16string name;
+   int width = 0;
++  // The line selected when the panel opens: the one a panel this replaces
++  // had selected, so a redraw keeps the user's place.
++  std::string selected_id;
+ };
+ 
+ // A floating menu panel, with an optional search box. Picking a line closes
+@@ -99,6 +103,9 @@ class MenuPanel {
+ 
+   void Close();
+ 
++  // The id of the line selected now, by keyboard or pointer, if any.
++  std::string SelectedId() const;
++
+  private:
+   class Contents;
+ 
+@@ -111,6 +118,9 @@ class MenuPanel {
+   // Outlives `widget_`, which is declared after it.
+   std::unique_ptr<views::BubbleDialogDelegate> delegate_;
+   std::unique_ptr<views::Widget> widget_;
++  // Owned by `widget_`. Declared after it, and cleared as the panel closes,
++  // so it never outlives the view.
++  raw_ptr<Contents> contents_ = nullptr;
+   base::WeakPtrFactory<MenuPanel> weak_factory_{this};
+ };
+ 
+--- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
++++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.cc
+@@ -49,6 +49,8 @@
+ #include "chrome/browser/rac/ai/internal_tab.h"
+ #include "chrome/browser/rac/ai/model_catalog.h"
+ #include "chrome/browser/rac/ai/model_list.h"
++#include "chrome/browser/rac/ai/model_menu.h"
++#include "chrome/browser/rac/ai/provider_list.h"
+ #include "chrome/browser/rac/ai/providers.h"
+ #include "chrome/browser/rac/ai/saved_prompts.h"
+ #include "chrome/browser/rac/dev/buildflags.h"
+@@ -286,6 +288,15 @@ void SetProviderState(Profile* profile,
+   state.Set("incognito", profile->IsOffTheRecord());
+   state.Set("configured", service->HasUsableProvider());
+   state.Set("needsKey", !agent && info && info->requires_key && !has_key);
++  // Before setup, the model button names a direct provider the user chose in
++  // Settings but hasn't finished setting up. The untouched default isn't a
++  // choice (ChosenDirectProvider), so then it just asks for one.
++  const ProviderInfo* chosen =
++      service->HasUsableProvider()
++          ? nullptr
++          : FindProvider(ChosenDirectProvider(
++                *prefs, service->HasUsableDirectProvider()));
++  state.Set("chosenProvider", chosen ? chosen->name : "");
+ }
+ 
+ }  // namespace
+@@ -380,6 +391,11 @@ struct PageHandler::ModelQuery {
+   base::Value callback_id;
+   std::vector<Entry> entries;
+   size_t next = 0;
++  // The agents the page couldn't use this session.
++  std::map<std::string, AgentIssue> issues;
++  // The page's own look for agents has answered, so listing them again is
++  // quick and runs no shell.
++  bool agents_ready = false;
+ };
+ 
+ PageHandler::PageHandler(Profile* profile) : profile_(profile) {}
+@@ -461,8 +477,9 @@ void PageHandler::RegisterMessages() {
+       "racAiClosePanel", base::BindRepeating(&PageHandler::HandleClosePanel,
+                                              base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
+-      "racAiGetModels", base::BindRepeating(&PageHandler::HandleGetModels,
+-                                            base::Unretained(this)));
++      "racAiGetModelMenu",
++      base::BindRepeating(&PageHandler::HandleGetModelMenu,
++                          base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
+       "racAiSelectModel", base::BindRepeating(&PageHandler::HandleSelectModel,
+                                               base::Unretained(this)));
+@@ -515,6 +532,8 @@ void PageHandler::OnJavascriptDisallowed
+   tab_left_subscription_ = {};
+   CloseMenu();
+   model_loaders_.clear();
++  offered_agents_.clear();
++  picked_agent_.clear();
+   title_session_.reset();
+   title_callback_ = base::Value();
+   pref_registrar_.RemoveAll();
+@@ -1636,15 +1655,27 @@ void PageHandler::OnAgentsListed(base::V
+   ResolveJavascriptCallback(callback_id, agents);
+ }
+ 
++// args: [callback id, agent id]. Resolves with whether the agent is now
++// active, so the page shows it only once the browser has taken it.
+ void PageHandler::HandleSelectAgent(const base::ListValue& args) {
+-  CHECK_EQ(args.size(), 1u);
++  if (args.empty()) {
++    return;
++  }
+   AllowJavascript();
+-  const std::string* id = args[0].GetIfString();
+-  if (!id || !AiServiceFactory::GetForProfile(profile_) ||
+-      profile_->IsOffTheRecord()) {
++  // A malformed message is refused, so the page's wait still ends.
++  if (args.size() != 2) {
++    ResolveJavascriptCallback(args[0], base::Value(false));
+     return;
+   }
+-  SelectAgent(profile_->GetPrefs(), *id);
++  const std::string* id = args[1].GetIfString();
++  // Only the agent picked from the menu on show, and only once. The menu
++  // offered it because it is installed and had no sign-in or fix problem
++  // this session (model_menu.h). This can't tell who sent the message.
++  const std::string picked = std::exchange(picked_agent_, std::string());
++  const bool chosen = id && AiServiceFactory::GetForProfile(profile_) &&
++                      !profile_->IsOffTheRecord() &&
++                      ChooseOfferedAgent(profile_->GetPrefs(), picked, *id);
++  ResolveJavascriptCallback(args[0], base::Value(chosen));
+ }
+ 
+ // args: the conversation the user stopped.
+@@ -2129,11 +2160,30 @@ void PageHandler::HandleSearch(const bas
+                      contents->GetWeakPtr(), url, transition));
+ }
+ 
+-void PageHandler::HandleGetModels(const base::ListValue& args) {
+-  CHECK_EQ(args.size(), 1u);
++// args: [callback id, the agents the page couldn't use this session as
++// {id: "signin" or "fix"}, whether the page's look for agents has answered].
++// Resolves with the menu's lines (BuildModelMenu).
++void PageHandler::HandleGetModelMenu(const base::ListValue& args) {
++  if (args.size() != 3) {
++    return;
++  }
+   AllowJavascript();
+   auto query = std::make_unique<ModelQuery>();
+   query->callback_id = args[0].Clone();
++  if (const base::DictValue* issues = args[1].GetIfDict()) {
++    for (const auto [id, value] : *issues) {
++      const std::string* kind = value.GetIfString();
++      if (!kind || !FindAgentRecipe(id)) {
++        continue;
++      }
++      if (*kind == "signin") {
++        query->issues[id] = AgentIssue::kSignIn;
++      } else if (*kind == "fix") {
++        query->issues[id] = AgentIssue::kFix;
++      }
++    }
++  }
++  query->agents_ready = args[2].is_bool() && args[2].GetBool();
+   if (AiService* service = AiServiceFactory::GetForProfile(profile_)) {
+     PrefService* prefs = profile_->GetPrefs();
+     const std::string active = prefs->GetString(kProvider);
+@@ -2227,25 +2277,123 @@ void PageHandler::FinishModelQuery(std::
+   if (!IsJavascriptAllowed()) {
+     return;
+   }
++  AiService* service = AiServiceFactory::GetForProfile(profile_);
+   PrefService* prefs = profile_->GetPrefs();
+-  const std::string active = prefs->GetString(kProvider);
+-  base::ListValue providers;
++  ModelMenuInput input;
++  input.incognito = profile_->IsOffTheRecord();
++  if (service) {
++    input.configured = service->HasUsableProvider();
++    input.direct_ready = service->HasUsableDirectProvider();
++  }
++  if (const AgentRecipe* agent = GetActiveAgent(prefs, input.incognito)) {
++    input.agent_id = agent->id;
++  }
++  input.provider_id = prefs->GetString(kProvider);
++  input.model = GetProviderSettings(prefs, input.provider_id).model;
+   for (ModelQuery::Entry& entry : query->entries) {
+-    base::ListValue models;
+-    for (std::string& model : entry.models) {
+-      models.Append(std::move(model));
+-    }
+-    providers.Append(base::DictValue()
+-                         .Set("id", entry.id)
+-                         .Set("name", entry.name)
+-                         .Set("models", std::move(models)));
+-  }
+-  ResolveJavascriptCallback(
+-      query->callback_id,
+-      base::DictValue()
+-          .Set("provider", active)
+-          .Set("model", GetProviderSettings(prefs, active).model)
+-          .Set("providers", std::move(providers)));
++    ModelMenuProvider& provider = input.providers.emplace_back();
++    provider.id = entry.id;
++    provider.name = entry.name;
++    provider.models = std::move(entry.models);
++  }
++  input.issues = std::move(query->issues);
++  // Agents are listed only once the page's own look has answered: that look
++  // runs the login shell, and it starts only when the menu opens.
++  if (service && query->agents_ready && !input.incognito) {
++    service->acp_service()->ListAgents(base::BindOnce(
++        &PageHandler::OnMenuAgentsListed, weak_factory_.GetWeakPtr(),
++        std::move(query->callback_id), std::move(input)));
++    return;
++  }
++  ResolveModelMenu(query->callback_id, input);
++}
++
++void PageHandler::OnMenuAgentsListed(base::Value callback_id,
++                                     ModelMenuInput input,
++                                     base::ListValue agents) {
++  std::vector<ModelMenuAgent> found;
++  for (const base::Value& value : agents) {
++    const base::DictValue* dict = value.GetIfDict();
++    const std::string* id = dict ? dict->FindString("id") : nullptr;
++    const std::string* name = dict ? dict->FindString("name") : nullptr;
++    if (!id || !name) {
++      continue;
++    }
++    ModelMenuAgent& agent = found.emplace_back();
++    agent.id = *id;
++    agent.name = *name;
++    agent.installed = dict->FindBool("installed").value_or(false);
++    agent.needs_node = dict->FindBool("needsNode").value_or(false);
++  }
++  SortAgentsForMenu(found);
++  input.agents = std::move(found);
++  ResolveModelMenu(callback_id, input);
++}
++
++void PageHandler::ResolveModelMenu(const base::Value& callback_id,
++                                   const ModelMenuInput& input) {
++  if (!IsJavascriptAllowed()) {
++    return;
++  }
++  const std::vector<ModelMenuRow> menu = BuildModelMenu(input);
++  // Kept until the page shows a menu, which narrows it (HandleShowMenu).
++  offered_agents_ = OfferedAgentIds(menu);
++  base::ListValue rows;
++  for (const ModelMenuRow& row : menu) {
++    base::DictValue dict;
++    switch (row.type) {
++      case ModelMenuRow::Type::kHeading:
++        dict.Set("type", "heading");
++        break;
++      case ModelMenuRow::Type::kSeparator:
++        dict.Set("type", "separator");
++        break;
++      case ModelMenuRow::Type::kNote:
++        dict.Set("type", "note");
++        break;
++      case ModelMenuRow::Type::kItem:
++        dict.Set("type", "item");
++        break;
++    }
++    const auto set_text = [&dict](const char* key, const std::string& text) {
++      if (!text.empty()) {
++        dict.Set(key, text);
++      }
++    };
++    set_text("text", row.text);
++    set_text("label", row.label);
++    set_text("detail", row.detail);
++    set_text("tooltip", row.tooltip);
++    set_text("id", row.line_id);
++    if (!row.enabled) {
++      dict.Set("enabled", false);
++    }
++    if (row.checked) {
++      dict.Set("checked", true);
++    }
++    if (row.settings_icon) {
++      dict.Set("icon", "settings");
++    }
++    switch (row.action) {
++      case ModelMenuRow::Action::kNone:
++        break;
++      case ModelMenuRow::Action::kChooseModel:
++        dict.Set("action", "model");
++        dict.Set("provider", row.provider_id);
++        dict.Set("providerName", row.provider_name);
++        dict.Set("model", row.model);
++        break;
++      case ModelMenuRow::Action::kChooseAgent:
++        dict.Set("action", "agent");
++        dict.Set("agent", row.agent_id);
++        break;
++      case ModelMenuRow::Action::kOpenSettings:
++        dict.Set("action", "settings");
++        break;
++    }
++    rows.Append(std::move(dict));
++  }
++  ResolveJavascriptCallback(callback_id, rows);
+ }
+ 
+ void PageHandler::OnModelsListed(int loader_id,
+@@ -2352,7 +2500,9 @@ void PageHandler::FinishTitle(base::Valu
+ // args: a token the page picks, and the menu. Events about the menu carry the
+ // token back in "rac-ai-menu".
+ void PageHandler::HandleShowMenu(const base::ListValue& args) {
+-  CHECK_EQ(args.size(), 2u);
++  if (args.size() != 2) {
++    return;
++  }
+   AllowJavascript();
+   if (!args[0].is_int() || !args[1].is_dict()) {
+     return;
+@@ -2360,8 +2510,28 @@ void PageHandler::HandleShowMenu(const b
+   if (!IsAiEnabled(profile_->GetPrefs())) {
+     return;
+   }
++  // A menu redrawn in place (the agents arrived) keeps the line the user had
++  // reached with the keyboard.
++  std::string keep;
++  if (menu_panel_ &&
++      args[1].GetDict().FindBool("keepSelection").value_or(false)) {
++    keep = menu_panel_->SelectedId();
++  }
+   CloseMenu();
+   std::unique_ptr<MenuRequest> request = ParseMenu(args[1].GetDict());
++  if (request) {
++    request->selected_id = std::move(keep);
++    // Of the agents the last model menu offered, only those with a line in
++    // this menu can be picked, and only while it is open.
++    std::vector<std::string> lines;
++    for (const MenuEntry& entry : request->entries) {
++      if (entry.type == MenuEntry::Type::kItem && entry.enabled) {
++        lines.push_back(entry.id);
++      }
++    }
++    menu_agents_ = AgentsInShownMenu(lines, offered_agents_);
++  }
++  offered_agents_.clear();
+   content::WebContents* contents = web_ui()->GetWebContents();
+   views::Widget* widget =
+       views::Widget::GetTopLevelWidgetForNativeView(contents->GetNativeView());
+@@ -2387,6 +2557,7 @@ void PageHandler::CloseMenu() {
+   menu_factory_.InvalidateWeakPtrs();
+   menu_panel_.reset();
+   menu_token_ = 0;
++  menu_agents_.clear();
+ }
+ 
+ std::unique_ptr<MenuRequest> PageHandler::ParseMenu(
+@@ -2485,6 +2656,8 @@ void PageHandler::OnMenuPicked(int token
+   if (!remove) {
+     web_ui()->GetWebContents()->GetPrimaryMainFrame()->NotifyUserActivation(
+         blink::mojom::UserActivationNotificationType::kInteraction);
++    // The one agent the page may now choose, if the line picked chooses one.
++    picked_agent_ = AgentForPick(id, menu_agents_);
+   }
+   FireWebUIListener("rac-ai-menu", base::DictValue()
+                                        .Set("token", token)
+@@ -2493,6 +2666,7 @@ void PageHandler::OnMenuPicked(int token
+ }
+ 
+ void PageHandler::OnMenuClosed(int token) {
++  menu_agents_.clear();
+   if (token == menu_token_) {
+     menu_token_ = 0;
+     // Deleting the panel from inside its own callback is safe: it runs in a
+--- a/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
++++ b/chrome/browser/ui/webui/rac_ai/rac_ai_page_handler.h
+@@ -8,6 +8,7 @@
+ #include <map>
+ #include <memory>
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <vector>
+ 
+@@ -21,6 +22,7 @@
+ #include "chrome/browser/rac/ai/chat_history.h"
+ #include "chrome/browser/rac/ai/chat_prompt.h"
+ #include "chrome/browser/rac/ai/chat_protocol.h"
++#include "chrome/browser/rac/ai/model_menu.h"
+ #include "chrome/browser/rac/ai/page_context.h"
+ #include "chrome/browser/rac/ai/reply_log.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
+@@ -149,7 +151,7 @@ class PageHandler : public content::WebU
+   void HandlePromptsGet(const base::ListValue& args);
+   void HandlePromptAdd(const base::ListValue& args);
+   void HandlePromptRemove(const base::ListValue& args);
+-  void HandleGetModels(const base::ListValue& args);
++  void HandleGetModelMenu(const base::ListValue& args);
+   void HandleSelectModel(const base::ListValue& args);
+   void HandleListAgents(const base::ListValue& args);
+   void HandleAgentDebug(const base::ListValue& args);
+@@ -166,6 +168,11 @@ class PageHandler : public content::WebU
+   void OnModelKey(std::unique_ptr<ModelQuery> query,
+                   std::optional<std::string> key);
+   void FinishModelQuery(std::unique_ptr<ModelQuery> query);
++  void OnMenuAgentsListed(base::Value callback_id,
++                          ModelMenuInput input,
++                          base::ListValue agents);
++  void ResolveModelMenu(const base::Value& callback_id,
++                        const ModelMenuInput& input);
+   void OnModelsListed(int loader_id,
+                       std::unique_ptr<ModelQuery> query,
+                       std::vector<std::string> models);
+@@ -236,6 +243,13 @@ class PageHandler : public content::WebU
+   // one's reply.
+   std::map<int, std::unique_ptr<network::SimpleURLLoader>> model_loaders_;
+   int next_model_loader_id_ = 0;
++  // Choosing an agent from the chat (model_menu.h): the agents the last
++  // model menu offered, until a menu shows; those of them the open menu has
++  // lines for, until it closes; and the one just picked from it, until the
++  // page asks for it.
++  std::set<std::string> offered_agents_;
++  std::set<std::string> menu_agents_;
++  std::string picked_agent_;
+   // Names a finished chat. Separate from `session_`, so the next message
+   // doesn't cancel it.
+   std::unique_ptr<ChatSession> title_session_;
+--- a/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
++++ b/chrome/browser/ui/webui/rac_ai/rac_ai_ui.cc
+@@ -48,8 +48,8 @@ constexpr Str kStrings[] = {
+     {"retry", "Try again"},
+     {"setupTitle", "Set up the assistant"},
+     {"setupBody",
+-     "Add your own AI provider to start chatting. Your messages go straight "
+-     "to it, never through rac."},
++     "Use an agent you already have, like Claude Code, or your own API key. "
++     "Your messages go straight to it, never through rac."},
+     {"setupButton", "Open settings"},
+     {"disabled", "The assistant is turned off."},
+     {"thinking", "Thinking"},
+@@ -121,7 +121,11 @@ constexpr Str kStrings[] = {
+     {"switchedTo", "Switched to $1"},
+     {"agentSettings", "Agent settings"},
+     {"chooseProvider", "Choose another provider"},
+-    {"addProvider", "Set up a provider"},
++    {"setUpInSettings", "Set up in Settings\u2026"},
++    {"agentNotChosen", "Couldn't switch to $1. Open the menu to try again."},
++    {"providerNeedsSetup", "$1 isn't set up yet"},
++    {"needsDirectProvider",
++     "Link summaries and the safety check need an API key or a local model."},
+     {"agentTag", "$1 (agent)"},
+     {"errStoppedTitle", "$1 stopped unexpectedly."},
+     {"errStoppedDetail", "Your chat is still here."},

@@ -85,6 +85,35 @@ never picked, because choosing an agent is the consent to run it. Gemini,
 Copilot, and Goose rows say they're chat only while browser control is on
 (see [Permission rule](#permission-rule)).
 
+The chat's model button shows whenever AI is on, set up or not, so someone
+whose only AI is an agent can choose it from the chat. Before setup it says
+"Choose a model", or names a direct provider chosen in Settings but not set
+up yet. The browser lays out the menu (`BuildModelMenu`, `model_menu.h`):
+before any setup, or with no direct provider's models to list, the installed
+agents come first and the last line is "Set up in Settings…". Agents that
+aren't installed are greyed out. A line is checked only when the prefs
+already name it, so the menu never chooses for the user, even when it finds
+one agent.
+
+`racAiSelectAgent` takes only the agent just picked from the menu on show,
+once, and only if that menu offered it: installed, and not one the page
+couldn't start this session (`ChooseOfferedAgent`). A sign-in problem only
+warns; see below. The browser can't tell who sent
+the message, so this bounds what a choice can be, not who made it. The page
+shows the agent only after the browser answers that it took it.
+
+A run that ends in ACP's auth_required (`-32000` on `session/new` or the
+prompt; no other failure counts) marks its agent as needing sign-in, so
+Settings' row and the menu's line both say "Sign in to use", with the
+agent's steps (in the open row, and in the line's tip). The mark is an
+agent id in `AcpService`'s memory (`AgentSignInMemory`), never the agent's
+words, and it goes when a run of that agent succeeds, on Check again, or
+when the user changes the agent's path or command. A pref would outlive
+the sign-in it describes. The agent stays choosable in both places, and
+both browser checks agree: the user signs in in Terminal, where rac can't
+see it, so a refusing row would have nothing to check, and a wrong choice
+costs one run that says so again.
+
 The model menu asks each set-up provider for its model list when the menu
 opens, and Settings asks only while the Assistant page itself is open (a
 settings search renders the section too, and must not send the key):
