@@ -197,9 +197,14 @@ Its callers apply it differently:
   the step may go back to a blank page.
 - The entry points (`IsAssistantBlockedHere`: the Chat buttons in the
   top bar and the sidebar, the edge handle, the Assistant command, Find's
-  Ask, the command bar's Ask row via `Need::kWebPage`) go by the address
-  bar's address, and a blank tab doesn't block them. The agent opens its tabs blank first, and a new tab
+  Ask, the command bar's Ask row) go by the address bar's address, and a
+  blank tab doesn't block them. The agent opens its tabs blank first, and a new tab
   on its way to a web page would otherwise flash the panel shut, mid-task.
+  Find's Ask and the Ask row (`Need::kAssistant`) also need a provider
+  that can answer: both go by `CanAskAssistant`, the check `AskAssistant`
+  makes before it does anything, so they show only where choosing them
+  opens the chat with the prompt. Not by the committed page's scheme
+  (`Need::kWebPage`): a view-source: tab has an http(s) page committed.
 - Link summaries (`ShouldOfferLinkSummary`, for Option-hover and
   "Summarize Link") need both: the tab, which holds the page the link is
   on, must not be internal (`IsInternalTab`), and the address bar's
