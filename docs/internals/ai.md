@@ -86,13 +86,20 @@ Copilot, and Goose rows say they're chat only while browser control is on
 (see [Permission rule](#permission-rule)).
 
 The chat's model button shows whenever AI is on, set up or not, so someone
-whose only AI is an agent can choose it from the chat. The browser lays out
-the menu (`BuildModelMenu`, `model_menu.h`): before any setup, or with no
-direct provider's models to list, the installed agents come first and the
-last line is "Set up in Settings…". Agents that aren't installed are greyed
-out. A line is checked only when the prefs already name it, so the menu
-never chooses for the user, even when it finds one agent. The page's
-`racAiSelectAgent` takes only an agent the last menu offered.
+whose only AI is an agent can choose it from the chat. Before setup it says
+"Choose a model", or names a direct provider chosen in Settings but not set
+up yet. The browser lays out the menu (`BuildModelMenu`, `model_menu.h`):
+before any setup, or with no direct provider's models to list, the installed
+agents come first and the last line is "Set up in Settings…". Agents that
+aren't installed are greyed out. A line is checked only when the prefs
+already name it, so the menu never chooses for the user, even when it finds
+one agent.
+
+`racAiSelectAgent` takes only the agent just picked from the menu on show,
+once, and only if that menu offered it: installed, with no sign-in or fix
+problem this session (`ChooseOfferedAgent`). The browser can't tell who sent
+the message, so this bounds what a choice can be, not who made it. The page
+shows the agent only after the browser answers that it took it.
 
 A run that ends in ACP's auth_required (`-32000` on `session/new` or the
 prompt; no other failure counts) marks its agent as needing sign-in, so
