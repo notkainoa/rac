@@ -354,7 +354,12 @@ window, however many tabs have a chat.
 - **Split view.** The panel follows the focused pane. Moving between the
   two panes of a split shares the open conversation with the other pane
   rather than closing it on every click (`ChatMove::kShareWithSplit`); an
-  internal pane gets none.
+  internal pane gets none, so the panel closes beside it and comes back on
+  the web pane. A hidden page needs a new frame before it draws again, and
+  in a split only the panel is new (the panes are already on screen), so the
+  panel would open empty for a moment. While the internal pane is focused,
+  the window's chat page keeps its frames (`KeepsChatPageDrawn`, a hidden
+  capture with no wake lock) until it is visible again.
 
 ## AI off costs nothing
 
@@ -382,6 +387,10 @@ This is the rule that's easiest to break by accident. How it holds:
 - Link hover, the context-menu item, and the find bar's Ask check
   `ShouldOffer…` or `CanAskAssistant` first and return before creating
   anything.
+- `CanAskAssistant` reaches the `AiService`, so with AI on it creates one.
+  Only the command bar asks it for the Ask row (`ContextForCommandBar`).
+  Menu validation and browser commands use `ContextForWindow`, which leaves
+  `can_ask_assistant` false, so a menu check creates nothing.
 - The agent PATH probe is lazy. Opening the model picker, or Settings'
   Assistant page while it's on screen, runs the cached probe once; a
   settings search that shows the section doesn't. It never starts an

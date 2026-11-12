@@ -1,0 +1,664 @@
+--- a/chrome/browser/rac/ai/chat_placement.cc
++++ b/chrome/browser/rac/ai/chat_placement.cc
+@@ -24,6 +24,10 @@ ChatMove DecideChatMove(const ActiveTabS
+                                        : ChatMove::kNone;
+ }
+ 
++bool KeepsChatPageDrawn(const ActiveTabState& state) {
++  return state.blocked && state.split_chat_open;
++}
++
+ bool ReleasesChat(ChatHideReason reason, bool window_closing) {
+   return reason == ChatHideReason::kClosed && !window_closing;
+ }
+--- a/chrome/browser/rac/ai/chat_placement.h
++++ b/chrome/browser/rac/ai/chat_placement.h
+@@ -29,6 +29,10 @@ struct ActiveTabState {
+   // The tab active just before this one shares a split view with it, and
+   // its chat was open when the user left it.
+   bool split_partner_chat_open = false;
++  // The tab shares a split view with another whose chat is open now. Unlike
++  // split_partner_chat_open, this holds however the tab became active, and
++  // for as long as the chat stays open.
++  bool split_chat_open = false;
+ };
+ 
+ enum class ChatMove {
+@@ -43,6 +47,15 @@ enum class ChatMove {
+ 
+ ChatMove DecideChatMove(const ActiveTabState& state);
+ 
++// Whether the window's chat page keeps drawing while the panel is closed. The
++// user moved from a split pane with its chat open to the other pane, which
++// shows an internal page, so the chat closed and comes back on the next click.
++// A hidden page needs a new frame when it shows again, and until it draws one
++// the panel opens empty beside the web pane, so the page keeps its frames
++// until then, however the internal pane changes meanwhile. It reads nothing
++// from the internal pane.
++bool KeepsChatPageDrawn(const ActiveTabState& state);
++
+ // Why a tab's chat left the panel. Mirrors SidePanelEntryHideReason.
+ enum class ChatHideReason {
+   // The panel closed: the user closed it, or something else did.
+--- a/chrome/browser/rac/ai/chat_placement_unittest.cc
++++ b/chrome/browser/rac/ai/chat_placement_unittest.cc
+@@ -64,6 +64,30 @@ TEST(RacAiChatPlacementTest, ASplitPartn
+             ChatMove::kNone);
+ }
+ 
++// The chat page keeps drawing only while the internal pane of a split stands
++// between the user and a chat that comes back on the other pane.
++TEST(RacAiChatPlacementTest, AnInternalSplitPaneKeepsThePartnersChatDrawn) {
++  EXPECT_TRUE(KeepsChatPageDrawn({.blocked = true, .split_chat_open = true}));
++  // Back on the web pane, the chat shows and draws for itself.
++  EXPECT_FALSE(KeepsChatPageDrawn({.split_chat_open = true}));
++  // An internal tab outside a split, or a pane whose partner's chat is
++  // closed, has no chat coming back.
++  EXPECT_FALSE(KeepsChatPageDrawn({.blocked = true}));
++  EXPECT_FALSE(KeepsChatPageDrawn(
++      {.blocked = true, .chat_showing = true, .has_chat = true}));
++}
++
++// Only the move into the pane counts as leaving the partner: the pane
++// navigating on, with the partner's chat still open, keeps the page drawing
++// but moves no chat.
++TEST(RacAiChatPlacementTest, ANavigatingInternalPaneKeepsTheHoldOnly) {
++  const ActiveTabState navigated{.blocked = true, .split_chat_open = true};
++  EXPECT_TRUE(KeepsChatPageDrawn(navigated));
++  EXPECT_EQ(DecideChatMove(navigated), ChatMove::kNone);
++  // The web pane navigating does not share a chat it never left.
++  EXPECT_EQ(DecideChatMove({.split_chat_open = true}), ChatMove::kNone);
++}
++
+ TEST(RacAiChatPlacementTest, OnlyClosingThePanelReleasesTheChat) {
+   EXPECT_TRUE(ReleasesChat(ChatHideReason::kClosed, false));
+   EXPECT_FALSE(ReleasesChat(ChatHideReason::kTabSwitched, false));
+--- a/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
++++ b/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
+@@ -12,6 +12,7 @@
+ 
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/location.h"
+ #include "base/logging.h"
+ #include "base/memory/raw_ptr.h"
+@@ -27,6 +28,7 @@
+ #include "chrome/browser/rac/ai/ai_prefs.h"
+ #include "chrome/browser/rac/ai/ai_service.h"
+ #include "chrome/browser/rac/ai/ai_service_factory.h"
++#include "chrome/browser/rac/ai/chat_draw_hold.h"
+ #include "chrome/browser/rac/ai/chat_placement.h"
+ #include "chrome/browser/rac/ai/internal_page.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
+@@ -40,6 +42,7 @@
+ #include "chrome/browser/ui/side_panel/side_panel_registry.h"
+ #include "chrome/browser/ui/side_panel/side_panel_ui.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/custom_corners_background.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_background_view.h"
+@@ -57,10 +60,12 @@
+ #include "components/prefs/pref_change_registrar.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/split_tabs/split_tab_id.h"
++#include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/file_select_listener.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/visibility.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_delegate.h"
+ #include "content/public/browser/web_contents_observer.h"
+@@ -74,6 +79,7 @@
+ #include "ui/gfx/canvas.h"
+ #include "ui/gfx/color_utils.h"
+ #include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
+ #include "ui/gfx/geometry/skia_conversions.h"
+ #include "ui/gfx/scoped_canvas.h"
+ #include "ui/views/background.h"
+@@ -255,7 +261,8 @@ class AssistantWebView;
+ // when the last one goes: when the user closes the last chat, when the last
+ // tab with one closes or leaves the window, or when AI turns off.
+ class AssistantChat : public base::RefCounted<AssistantChat>,
+-                      public content::WebContentsDelegate {
++                      public content::WebContentsDelegate,
++                      public content::WebContentsObserver {
+  public:
+   // The window's page, made if it has none.
+   static scoped_refptr<AssistantChat> GetOrCreate(
+@@ -289,6 +296,12 @@ class AssistantChat : public base::RefCo
+   // The window whose page this is, or null once it has closed.
+   BrowserWindowInterface* window() const { return browser_.get(); }
+ 
++  // While `keep`, the page goes on drawing with no view showing it (see
++  // KeepsChatPageDrawn()), so it is there in the panel's first frame. Letting
++  // go is ChatDrawHold's: a task later, once the page is visible, and at the
++  // latest at its cap.
++  void KeepDrawn(bool keep) { draw_hold_.Keep(keep); }
++
+   // content::WebContentsDelegate:
+   void RunFileChooser(content::RenderFrameHost* render_frame_host,
+                       scoped_refptr<content::FileSelectListener> listener,
+@@ -317,11 +330,33 @@ class AssistantChat : public base::RefCo
+     content::NavigationController::LoadURLParams params((GURL(kPanelUrl)));
+     params.transition_type = ui::PAGE_TRANSITION_AUTO_TOPLEVEL;
+     page_->GetController().LoadURLWithParams(params);
++    Observe(page_.get());
+     VLOG(1) << "rac assistant: the window's chat page";
+   }
+ 
++  base::ScopedClosureRunner TakeDrawHold() {
++    return page_->IncrementCapturerCount(gfx::Size(), /*stay_hidden=*/true,
++                                         /*stay_awake=*/false,
++                                         /*is_activity=*/false);
++  }
++
++  // A view showing the page counts as visible only once its window says so,
++  // a moment after the side panel shows it.
++  bool AwaitsVisible() const {
++    return IsShowing() &&
++           page_->GetVisibility() != content::Visibility::VISIBLE;
++  }
++
++  // content::WebContentsObserver:
++  void OnVisibilityChanged(content::Visibility visibility) override {
++    if (visibility == content::Visibility::VISIBLE) {
++      draw_hold_.OnVisible();
++    }
++  }
++
+   ~AssistantChat() override {
+     VLOG(1) << "rac assistant: the window's chat page ended";
++    Observe(nullptr);
+     // The window may be gone: its tabs close first and let the page go.
+     if (AssistantPanelState* state =
+             browser_ ? AssistantPanelState::From(browser_.get()) : nullptr;
+@@ -334,6 +369,11 @@ class AssistantChat : public base::RefCo
+ 
+   const base::WeakPtr<BrowserWindowInterface> browser_;
+   std::unique_ptr<content::WebContents> page_;
++  // The hold that keeps the page drawing; it goes before the page does.
++  ChatDrawHold draw_hold_{
++      base::BindRepeating(&AssistantChat::TakeDrawHold, base::Unretained(this)),
++      base::BindRepeating(&AssistantChat::AwaitsVisible,
++                          base::Unretained(this))};
+   // The view showing the page, or the last one to.
+   raw_ptr<AssistantWebView> host_ = nullptr;
+ };
+@@ -916,7 +956,7 @@ void SchedulePaintContainer(BrowserWindo
+ // away from internal pages (IsAssistantBlockedHere()) and moves chats the
+ // way ChatMove says as the active tab and its page change. Turning AI off
+ // ends the window's chats. It deletes itself when its window closes.
+-class WindowAssistant {
++class WindowAssistant : public TabStripModelObserver {
+  public:
+   explicit WindowAssistant(BrowserWindowInterface* browser)
+       : browser_(browser) {
+@@ -933,7 +973,7 @@ class WindowAssistant {
+   WindowAssistant& operator=(const WindowAssistant&) = delete;
+ 
+  private:
+-  ~WindowAssistant() = default;
++  ~WindowAssistant() override = default;
+ 
+   void Update() {
+     const bool enabled = IsAiEnabled(browser_->GetProfile()->GetPrefs());
+@@ -944,10 +984,17 @@ class WindowAssistant {
+       page_watch_ = std::make_unique<ActivePageWatch>(
+           browser_, base::BindRepeating(&WindowAssistant::OnActivePageChanged,
+                                         base::Unretained(this)));
++      if (TabStripModel* tabs = browser_->GetTabStripModel()) {
++        tabs->AddObserver(this);
++      }
+       OnActivePageChanged();
+     } else if (!enabled && page_watch_) {
+       page_watch_.reset();
++      if (TabStripModel* tabs = browser_->GetTabStripModel()) {
++        tabs->RemoveObserver(this);
++      }
+       blocked_ = false;
++      UpdateDrawHold();
+       // Turning AI off ends every chat, as it closes an open one: dropping a
+       // tab's entry closes the panel if it shows it, and the chat goes with
+       // the last tab that held it.
+@@ -960,6 +1007,66 @@ class WindowAssistant {
+     }
+   }
+ 
++  // TabStripModelObserver: the draw hold follows the split the active tab is
++  // in, which changes without the active tab or its page changing: a tab of
++  // the split closes, or the split is undone. They are read a task later,
++  // when the model has settled.
++  void OnTabStripModelChanged(
++      TabStripModel* tab_strip_model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override {
++    if (change.type() == TabStripModelChange::kRemoved) {
++      UpdateDrawHoldLater();
++    }
++  }
++
++  void OnSplitTabChanged(const SplitTabChange& change) override {
++    UpdateDrawHoldLater();
++  }
++
++  void UpdateDrawHoldLater() {
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&WindowAssistant::UpdateDrawHold,
++                                  weak_factory_.GetWeakPtr()));
++  }
++
++  // Whether another tab of `tab`'s split view has its chat open now.
++  bool SplitChatOpen(tabs::TabInterface* tab) {
++    TabStripModel* model = browser_->GetTabStripModel();
++    std::optional<split_tabs::SplitTabId> id = tab->GetSplit();
++    split_tabs::SplitTabData* split =
++        model && id ? model->GetSplitData(*id) : nullptr;
++    if (!split) {
++      return false;
++    }
++    for (tabs::TabInterface* member : split->ListTabs()) {
++      TabChat* chat = member != tab ? TabChat::From(member) : nullptr;
++      if (chat && chat->IsOpen()) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  // The chat page's draw hold, from the window as it is now.
++  void UpdateDrawHold() {
++    AssistantPanelState* panel = AssistantPanelState::From(browser_);
++    AssistantChat* chat = panel ? panel->chat() : nullptr;
++    if (!chat) {
++      return;
++    }
++    tabs::TabInterface* tab = browser_->GetActiveTabInterface();
++    TabStripModel* tabs = browser_->GetTabStripModel();
++    if (!page_watch_ || !tab || (tabs && tabs->closing_all())) {
++      chat->KeepDrawn(false);
++      return;
++    }
++    chat->KeepDrawn(KeepsChatPageDrawn({
++        .blocked = IsAssistantBlockedHere(browser_),
++        .split_chat_open = SplitChatOpen(tab),
++    }));
++  }
++
+   // The active tab changed, or its page did.
+   void OnActivePageChanged() {
+     // A closing window only passes through its tabs on the way out.
+@@ -1009,7 +1116,12 @@ class WindowAssistant {
+         .stepped_aside = tab_chat && tab_chat->stepped_aside(),
+         .has_chat = tab_chat && tab_chat->has_chat(),
+         .split_partner_chat_open = partner && partner->IsOpen(),
++        .split_chat_open = SplitChatOpen(tab),
+     };
++    if (AssistantPanelState* panel = AssistantPanelState::From(browser_);
++        panel && panel->chat()) {
++      panel->chat()->KeepDrawn(KeepsChatPageDrawn(state));
++    }
+     switch (DecideChatMove(state)) {
+       case ChatMove::kNone:
+         break;
+@@ -1039,6 +1151,7 @@ class WindowAssistant {
+   std::unique_ptr<ActivePageWatch> page_watch_;
+   bool blocked_ = false;
+   tabs::TabHandle last_active_;
++  base::WeakPtrFactory<WindowAssistant> weak_factory_{this};
+ };
+ 
+ }  // namespace
+--- a/chrome/browser/rac/ai/BUILD.gn
++++ b/chrome/browser/rac/ai/BUILD.gn
+@@ -77,6 +77,8 @@ source_set("core") {
+     "chat_protocol.h",
+     "chat_history.cc",
+     "chat_history.h",
++    "chat_draw_hold.cc",
++    "chat_draw_hold.h",
+     "chat_keep.cc",
+     "chat_keep.h",
+     "chat_placement.cc",
+@@ -172,6 +174,7 @@ test("rac_ai_unittests") {
+     "ask_query_unittest.cc",
+     "card_gate_unittest.cc",
+     "chat_history_unittest.cc",
++    "chat_draw_hold_unittest.cc",
+     "chat_keep_unittest.cc",
+     "chat_placement_unittest.cc",
+     "chat_send_unittest.cc",
+--- /dev/null
++++ b/chrome/browser/rac/ai/chat_draw_hold.cc
+@@ -0,0 +1,82 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/chat_draw_hold.h"
++
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/logging.h"
++
++namespace rac::ai {
++
++ChatDrawHold::ChatDrawHold(TakeHold take_hold,
++                           AwaitsVisible awaits_visible,
++                           scoped_refptr<base::SequencedTaskRunner> task_runner)
++    : take_hold_(std::move(take_hold)),
++      awaits_visible_(std::move(awaits_visible)),
++      task_runner_(std::move(task_runner)) {
++  cap_timer_.SetTaskRunner(task_runner_);
++}
++
++ChatDrawHold::~ChatDrawHold() {
++  Drop("the page ended");
++}
++
++void ChatDrawHold::Keep(bool keep) {
++  if (keep) {
++    keep_ = true;
++    waiting_ = false;
++    cap_timer_.Stop();
++    if (!hold_) {
++      hold_ = take_hold_.Run();
++      VLOG(1) << "rac assistant: draw hold taken";
++    }
++    return;
++  }
++  if (!keep_) {
++    return;
++  }
++  keep_ = false;
++  if (!hold_) {
++    return;
++  }
++  task_runner_->PostTask(FROM_HERE, base::BindOnce(&ChatDrawHold::Release,
++                                                   weak_factory_.GetWeakPtr()));
++  cap_timer_.Start(
++      FROM_HERE, kChatDrawHoldCap,
++      base::BindOnce(&ChatDrawHold::Drop, base::Unretained(this), "the cap"));
++}
++
++void ChatDrawHold::OnVisible() {
++  if (!waiting_) {
++    return;
++  }
++  waiting_ = false;
++  task_runner_->PostTask(FROM_HERE, base::BindOnce(&ChatDrawHold::Release,
++                                                   weak_factory_.GetWeakPtr()));
++}
++
++void ChatDrawHold::Release() {
++  if (keep_ || !hold_) {
++    return;
++  }
++  if (awaits_visible_.Run()) {
++    waiting_ = true;
++    return;
++  }
++  Drop("the page is visible");
++}
++
++void ChatDrawHold::Drop(const char* why) {
++  cap_timer_.Stop();
++  waiting_ = false;
++  if (hold_) {
++    hold_.RunAndReset();
++    VLOG(1) << "rac assistant: draw hold released (" << why << ")";
++  }
++}
++
++}  // namespace rac::ai
+--- /dev/null
++++ b/chrome/browser/rac/ai/chat_draw_hold.h
+@@ -0,0 +1,76 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_RAC_AI_CHAT_DRAW_HOLD_H_
++#define CHROME_BROWSER_RAC_AI_CHAT_DRAW_HOLD_H_
++
++#include "base/functional/callback.h"
++#include "base/functional/callback_helpers.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
++#include "base/timer/timer.h"
++
++namespace rac::ai {
++
++// The longest a hold outlives its condition. A page that is showing becomes
++// visible within a moment, but never while its window is occluded or
++// minimized, and a hold that waited on that would keep the page drawing for as
++// long as the window stays hidden.
++inline constexpr base::TimeDelta kChatDrawHoldCap = base::Seconds(5);
++
++// Keeps the window's chat page drawing while no view shows it (see
++// KeepsChatPageDrawn()), and lets go in a way that never strands the hold.
++//
++// A returning view shows the page in the same task as the tab switch, but the
++// page counts as visible only a moment later, and letting go before then
++// hides it again and drops the frame it kept. So letting go takes a task, then
++// waits for the page to be visible if it is showing, and a timer ends the wait
++// at the cap. At most one hold is taken at a time, and it is let go when this
++// is destroyed.
++class ChatDrawHold {
++ public:
++  // Takes one hold on the page. The hold ends when the runner is destroyed.
++  using TakeHold = base::RepeatingCallback<base::ScopedClosureRunner()>;
++  // Whether the page is showing in a view but isn't visible yet.
++  using AwaitsVisible = base::RepeatingCallback<bool()>;
++
++  ChatDrawHold(TakeHold take_hold,
++               AwaitsVisible awaits_visible,
++               scoped_refptr<base::SequencedTaskRunner> task_runner =
++                   base::SequencedTaskRunner::GetCurrentDefault());
++  ChatDrawHold(const ChatDrawHold&) = delete;
++  ChatDrawHold& operator=(const ChatDrawHold&) = delete;
++  ~ChatDrawHold();
++
++  // While `keep`, the page has a hold. Keep(false) starts to let go; a later
++  // Keep(true) cancels that.
++  void Keep(bool keep);
++
++  // The page became visible.
++  void OnVisible();
++
++  // Whether the page has a hold now.
++  bool held() const { return !!hold_; }
++
++ private:
++  void Release();
++  void Drop(const char* why);
++
++  const TakeHold take_hold_;
++  const AwaitsVisible awaits_visible_;
++  const scoped_refptr<base::SequencedTaskRunner> task_runner_;
++  base::ScopedClosureRunner hold_;
++  // The last Keep() was true.
++  bool keep_ = false;
++  // Letting go waits for OnVisible().
++  bool waiting_ = false;
++  base::OneShotTimer cap_timer_;
++  base::WeakPtrFactory<ChatDrawHold> weak_factory_{this};
++};
++
++}  // namespace rac::ai
++
++#endif  // CHROME_BROWSER_RAC_AI_CHAT_DRAW_HOLD_H_
+--- /dev/null
++++ b/chrome/browser/rac/ai/chat_draw_hold_unittest.cc
+@@ -0,0 +1,163 @@
++// Copyright 2026 The rac Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/rac/ai/chat_draw_hold.h"
++
++#include <algorithm>
++#include <memory>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/test/task_environment.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace rac::ai {
++namespace {
++
++// A stand-in for the page: counts the holds on it and says whether it is
++// showing in a view without being visible yet.
++class RacAiChatDrawHoldTest : public testing::Test {
++ protected:
++  std::unique_ptr<ChatDrawHold> MakeHold() {
++    return std::make_unique<ChatDrawHold>(
++        base::BindRepeating(&RacAiChatDrawHoldTest::Take,
++                            base::Unretained(this)),
++        base::BindRepeating([](bool* awaiting) { return *awaiting; },
++                            base::Unretained(&awaiting_visible_)));
++  }
++
++  base::ScopedClosureRunner Take() {
++    ++holds_;
++    ++taken_;
++    max_holds_ = std::max(max_holds_, holds_);
++    return base::ScopedClosureRunner(base::BindOnce(
++        [](int* holds) { --*holds; }, base::Unretained(&holds_)));
++  }
++
++  base::test::SingleThreadTaskEnvironment task_environment_{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME};
++  int holds_ = 0;
++  int taken_ = 0;
++  int max_holds_ = 0;
++  bool awaiting_visible_ = false;
++};
++
++TEST_F(RacAiChatDrawHoldTest, KeepTakesOneHoldAndLettingGoTakesATask) {
++  auto hold = MakeHold();
++  hold->Keep(true);
++  hold->Keep(true);
++  EXPECT_EQ(holds_, 1);
++  EXPECT_TRUE(hold->held());
++
++  hold->Keep(false);
++  // The side panel shows the returning view in this same task, so the hold
++  // stays until the next one.
++  EXPECT_EQ(holds_, 1);
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(holds_, 0);
++  EXPECT_FALSE(hold->held());
++}
++
++TEST_F(RacAiChatDrawHoldTest, LettingGoWaitsForAShowingPageToBeVisible) {
++  auto hold = MakeHold();
++  hold->Keep(true);
++  awaiting_visible_ = true;
++  hold->Keep(false);
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(holds_, 1);
++
++  // Not visible yet, nothing happens until it is.
++  task_environment_.FastForwardBy(base::Seconds(1));
++  EXPECT_EQ(holds_, 1);
++
++  awaiting_visible_ = false;
++  hold->OnVisible();
++  EXPECT_EQ(holds_, 1);
++  task_environment_.RunUntilIdle();
++  EXPECT_EQ(holds_, 0);
++}
++
++TEST_F(RacAiChatDrawHoldTest, APageThatNeverShowsLosesTheHoldAtTheCap) {
++  auto hold = MakeHold();
++  hold->Keep(true);
++  awaiting_visible_ = true;
++  hold->Keep(false);
++  task_environment_.RunUntilIdle();
++
++  task_environment_.FastForwardBy(kChatDrawHoldCap - base::Milliseconds(1));
++  EXPECT_EQ(holds_, 1);
++  task_environment_.FastForwardBy(base::Milliseconds(1));
++  EXPECT_EQ(holds_, 0);
++  EXPECT_FALSE(hold->held());
++
++  // A late visibility change has nothing left to do.
++  hold->OnVisible();
++  task_environment_.FastForwardUntilNoTasksRemain();
++  EXPECT_EQ(holds_, 0);
++}
++
++TEST_F(RacAiChatDrawHoldTest, KeepingAgainBeforeTheReleaseRunsKeepsTheHold) {
++  auto hold = MakeHold();
++  hold->Keep(true);
++  hold->Keep(false);
++  hold->Keep(true);
++  task_environment_.FastForwardBy(kChatDrawHoldCap * 2);
++  EXPECT_EQ(holds_, 1);
++  EXPECT_EQ(taken_, 1);
++
++  // And a wait that was under way is over: the cap no longer applies.
++  awaiting_visible_ = true;
++  hold->Keep(false);
++  task_environment_.RunUntilIdle();
++  hold->Keep(true);
++  task_environment_.FastForwardBy(kChatDrawHoldCap * 2);
++  EXPECT_EQ(holds_, 1);
++  EXPECT_EQ(taken_, 1);
++}
++
++TEST_F(RacAiChatDrawHoldTest, DestroyingWhileHeldLetsGo) {
++  auto hold = MakeHold();
++  hold->Keep(true);
++  EXPECT_EQ(holds_, 1);
++  hold.reset();
++  EXPECT_EQ(holds_, 0);
++  // A task or timer it left behind finds nothing to touch.
++  task_environment_.FastForwardUntilNoTasksRemain();
++  EXPECT_EQ(holds_, 0);
++
++  hold = MakeHold();
++  hold->Keep(true);
++  awaiting_visible_ = true;
++  hold->Keep(false);
++  task_environment_.RunUntilIdle();
++  hold.reset();
++  EXPECT_EQ(holds_, 0);
++  task_environment_.FastForwardUntilNoTasksRemain();
++}
++
++TEST_F(RacAiChatDrawHoldTest, RepeatedCyclesNeverStackAndEndAtZero) {
++  auto hold = MakeHold();
++  for (int i = 0; i < 20; ++i) {
++    hold->Keep(true);
++    hold->Keep(true);
++    // Every other round the page is showing and not yet visible.
++    awaiting_visible_ = i % 2 == 1;
++    hold->Keep(false);
++    hold->Keep(false);
++    task_environment_.RunUntilIdle();
++    if (awaiting_visible_) {
++      awaiting_visible_ = false;
++      hold->OnVisible();
++    }
++    task_environment_.RunUntilIdle();
++    EXPECT_EQ(holds_, 0) << i;
++  }
++  EXPECT_EQ(max_holds_, 1);
++  EXPECT_EQ(taken_, 20);
++  task_environment_.FastForwardUntilNoTasksRemain();
++  EXPECT_EQ(holds_, 0);
++}
++
++}  // namespace
++}  // namespace rac::ai
