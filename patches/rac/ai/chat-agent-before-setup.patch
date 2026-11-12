@@ -27,7 +27,7 @@
    ]
 --- /dev/null
 +++ b/chrome/browser/rac/ai/model_menu.cc
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,265 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -113,6 +113,7 @@
 +      for (const std::string& model : provider.models) {
 +        Row& row = Add(Row::Type::kItem);
 +        row.action = Row::Action::kChooseModel;
++        row.line_id = ModelMenuLineId(provider.id, model);
 +        row.label = model;
 +        row.provider_id = provider.id;
 +        row.provider_name = provider.name;
@@ -156,6 +157,7 @@
 +      if (issue != input_.issues.end()) {
 +        // It didn't work this session: the line leads to what fixes it.
 +        row.action = Row::Action::kOpenSettings;
++        row.line_id = base::StrCat({"fix:", agent.id});
 +        row.detail = issue->second == AgentIssue::kSignIn ? "signInToUse"
 +                                                          : "fixInSettings";
 +        row.settings_icon = true;
@@ -187,6 +189,7 @@
 +      Row& row = Add(Row::Type::kItem);
 +      row.label = agent.name;
 +      row.agent_id = agent.id;
++      row.line_id = base::StrCat({"missing:", agent.id});
 +      row.enabled = false;
 +      row.detail = agent.needs_node ? "needsNodeDetail" : std::string();
 +      row.tooltip = agent.needs_node ? "needsNodeTip" : "notInstalledTip";
@@ -203,6 +206,7 @@
 +    }
 +    Row& row = Add(Row::Type::kItem);
 +    row.action = Row::Action::kOpenSettings;
++    row.line_id = "settings";
 +    row.text = agents_first ? "setUpInSettings" : "settings";
 +    row.settings_icon = true;
 +  }
@@ -252,6 +256,11 @@
 +  return base::StrCat({"agent:", agent_id});
 +}
 +
++std::string ModelMenuLineId(std::string_view provider_id,
++                            std::string_view model) {
++  return base::StrCat({"model:", provider_id, "/", model});
++}
++
 +std::set<std::string> AgentsInShownMenu(
 +    const std::vector<std::string>& line_ids,
 +    const std::set<std::string>& offered) {
@@ -286,7 +295,7 @@
 +}  // namespace rac::ai
 --- /dev/null
 +++ b/chrome/browser/rac/ai/model_menu.h
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,165 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -380,7 +389,9 @@
 +  bool enabled = true;
 +  bool checked = false;
 +  bool settings_icon = false;
-+  // The page's id for a line that chooses an agent (AgentMenuLineId).
++  // The page's id for a line that can be picked. It names what the line is,
++  // not where it sits, so a redraw that adds lines above it (the agents
++  // arriving) keeps the user's selection on the same choice.
 +  std::string line_id;
 +  // What a choice line chooses.
 +  std::string provider_id;
@@ -425,6 +436,11 @@
 +// The id of the menu line that chooses `agent_id`.
 +std::string AgentMenuLineId(std::string_view agent_id);
 +
++// The id of the menu line that chooses `model` from `provider_id`. Provider
++// ids have no "/", so the id is unique whatever the model is called.
++std::string ModelMenuLineId(std::string_view provider_id,
++                            std::string_view model);
++
 +// The offered agents a shown menu has a line for. `line_ids` are the ids of
 +// the lines that can be picked.
 +std::set<std::string> AgentsInShownMenu(
@@ -447,7 +463,7 @@
 +#endif  // CHROME_BROWSER_RAC_AI_MODEL_MENU_H_
 --- /dev/null
 +++ b/chrome/browser/rac/ai/model_menu_unittest.cc
-@@ -0,0 +1,461 @@
+@@ -0,0 +1,516 @@
 +// Copyright 2026 The rac Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -783,6 +799,60 @@
 +                          "settings setUpInSettings"));
 +}
 +
++// The index of the line `line_id` names, or -1. How the menu keeps a
++// selection when it is drawn again (MenuRequest::selected_id).
++int FindLine(const std::vector<Row>& rows, const std::string& line_id) {
++  for (size_t i = 0; i < rows.size(); ++i) {
++    if (rows[i].type == Row::Type::kItem && rows[i].line_id == line_id) {
++      return static_cast<int>(i);
++    }
++  }
++  return -1;
++}
++
++TEST(RacModelMenuTest, EveryLineThatCanBePickedHasItsOwnStableId) {
++  ModelMenuInput input;
++  input.providers = {Provider("anthropic", {"sonnet", "haiku"}),
++                     Provider("ollama", {"llama"})};
++  input.agents = SomeAgents();
++  input.issues["codex"] = AgentIssue::kSignIn;
++  std::set<std::string> ids;
++  for (const Row& row : BuildModelMenu(input)) {
++    if (row.type != Row::Type::kItem) {
++      continue;
++    }
++    EXPECT_FALSE(row.line_id.empty()) << row.label;
++    EXPECT_TRUE(ids.insert(row.line_id).second) << row.line_id;
++  }
++  EXPECT_EQ(ids, (std::set<std::string>{
++                     "agent:claude", "fix:codex", "model:anthropic/sonnet",
++                     "model:anthropic/haiku", "model:ollama/llama",
++                     "missing:cursor", "missing:gemini", "settings"}));
++  EXPECT_EQ(ModelMenuLineId("ollama", "llama"), "model:ollama/llama");
++}
++
++// #205: the agents arrive while a keyboard user sits on a model. They are
++// drawn above it, so a position-based id would move the selection to
++// another model, and Return would choose it.
++TEST(RacModelMenuTest, ARedrawWithAgentsAboveKeepsTheSameModelSelected) {
++  ModelMenuInput input;
++  input.providers = {Provider("anthropic", {"sonnet", "haiku"}),
++                     Provider("ollama", {"llama"})};
++  const std::vector<Row> looking = BuildModelMenu(input);
++  const int before = FindLine(looking, "model:ollama/llama");
++  ASSERT_GE(before, 0);
++
++  input.agents = SomeAgents();
++  const std::vector<Row> found = BuildModelMenu(input);
++  const int after = FindLine(found, looking[before].line_id);
++  ASSERT_GE(after, 0);
++  EXPECT_EQ(found[after].provider_id, "ollama");
++  EXPECT_EQ(found[after].model, "llama");
++  // The lines above it changed, so its position did too.
++  EXPECT_NE(after, before);
++  EXPECT_NE(found[before].model, "llama");
++}
++
 +// Choosing an agent from the chat: what the browser lets through.
 +
 +TEST(RacModelMenuTest, OffersOnlyInstalledAgentsWithoutAProblem) {
@@ -811,8 +881,9 @@
 +  for (const Row& row : BuildModelMenu(input)) {
 +    if (row.action == Row::Action::kChooseAgent) {
 +      EXPECT_EQ(row.line_id, "agent:claude");
-+    } else {
-+      EXPECT_EQ(row.line_id, "") << row.agent_id;
++    } else if (!row.agent_id.empty()) {
++      // Only a line that chooses an agent is named "agent:".
++      EXPECT_EQ(row.line_id, "missing:" + row.agent_id);
 +    }
 +  }
 +  EXPECT_EQ(AgentMenuLineId("claude"), "agent:claude");
@@ -947,7 +1018,7 @@
 +  checked?: boolean;
 +  icon?: 'settings';
 +  action?: 'model'|'agent'|'settings';
-+  // The line's id, for a line that chooses an agent.
++  // The line's id. It names the choice, so it stays the same across redraws.
 +  id?: string;
 +  provider?: string;
 +  providerName?: string;
@@ -1020,7 +1091,7 @@
        name: button.getAttribute('aria-label') ?? button.title,
        anchor: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
      },
-@@ -951,155 +973,98 @@ async function addFiles(picked: File[])
+@@ -951,155 +973,97 @@ async function addFiles(picked: File[])
    input.focus();
  }
  
@@ -1220,19 +1291,18 @@
 +    if (line.icon) {
 +      entry.icon = line.icon;
 +    }
++    // The browser's id names the choice, not the position, so a redraw
++    // keeps the selection on it.
++    const id = line.id ?? `line:${i}`;
++    entry.id = id;
 +    const {provider, model, agent} = line;
 +    if (line.action === 'model' && provider && model) {
-+      entry.id = `model:${i}`;
 +      const providerName = line.providerName ?? '';
-+      actions.set(entry.id, () => selectModel(provider, providerName, model));
-+    } else if (line.action === 'agent' && agent && line.id) {
-+      entry.id = line.id;
-+      actions.set(entry.id, () => void selectAgent(agent, label));
++      actions.set(id, () => selectModel(provider, providerName, model));
++    } else if (line.action === 'agent' && agent) {
++      actions.set(id, () => void selectAgent(agent, label));
 +    } else if (line.action === 'settings') {
-+      entry.id = agent ? `fix:${agent}` : 'settings';
-+      actions.set(entry.id, openSettings);
-+    } else {
-+      entry.id = agent ? `missing:${agent}` : `line:${i}`;
++      actions.set(id, openSettings);
 +    }
 +    return entry;
 +  });
@@ -1252,7 +1322,7 @@
    agentInfos = new Map(agents.map(agent => [agent.id, agent]));
    return agents;
  }
-@@ -1136,21 +1101,30 @@ function showProvider(label: string, tip
+@@ -1136,21 +1100,30 @@ function showProvider(label: string, tip
    modelButton.title = tip;
  }
  
@@ -1292,7 +1362,7 @@
    input.focus();
  }
  
-@@ -2852,6 +2826,7 @@ function applyState(state: InitState) {
+@@ -2852,6 +2825,7 @@ function applyState(state: InitState) {
  // profile's, so it doesn't change with the conversation on show. Only the
  // next message uses it; a reply already running keeps its provider.
  function applyProvider(state: InitState) {
@@ -1300,7 +1370,7 @@
    configured = state.enabled && !!state.configured;
    incognito = !!state.incognito;
    agentId = state.agentId ?? '';
-@@ -2861,7 +2836,16 @@ function applyProvider(state: InitState)
+@@ -2861,7 +2835,16 @@ function applyProvider(state: InitState)
      listAgents();
    }
    renderChips();
@@ -1318,7 +1388,7 @@
      if (agentId) {
        showProvider(
            state.providerName,
-@@ -3052,6 +3036,7 @@ function init() {
+@@ -3052,6 +3035,7 @@ function init() {
    addWebUiListener('rac-ai-disabled', () => {
      streaming = false;
      configured = false;
@@ -1491,7 +1561,7 @@
    title_session_.reset();
    title_callback_ = base::Value();
    pref_registrar_.RemoveAll();
-@@ -1636,15 +1655,22 @@ void PageHandler::OnAgentsListed(base::V
+@@ -1636,15 +1655,27 @@ void PageHandler::OnAgentsListed(base::V
    ResolveJavascriptCallback(callback_id, agents);
  }
  
@@ -1499,15 +1569,19 @@
 +// active, so the page shows it only once the browser has taken it.
  void PageHandler::HandleSelectAgent(const base::ListValue& args) {
 -  CHECK_EQ(args.size(), 1u);
--  AllowJavascript();
++  if (args.empty()) {
++    return;
++  }
+   AllowJavascript();
 -  const std::string* id = args[0].GetIfString();
 -  if (!id || !AiServiceFactory::GetForProfile(profile_) ||
 -      profile_->IsOffTheRecord()) {
++  // A malformed message is refused, so the page's wait still ends.
 +  if (args.size() != 2) {
++    ResolveJavascriptCallback(args[0], base::Value(false));
      return;
    }
 -  SelectAgent(profile_->GetPrefs(), *id);
-+  AllowJavascript();
 +  const std::string* id = args[1].GetIfString();
 +  // Only the agent picked from the menu on show, and only once. The menu
 +  // offered it because it is installed and had no sign-in or fix problem
@@ -1520,7 +1594,7 @@
  }
  
  // args: the conversation the user stopped.
-@@ -2129,11 +2155,30 @@ void PageHandler::HandleSearch(const bas
+@@ -2129,11 +2160,30 @@ void PageHandler::HandleSearch(const bas
                       contents->GetWeakPtr(), url, transition));
  }
  
@@ -1553,7 +1627,7 @@
    if (AiService* service = AiServiceFactory::GetForProfile(profile_)) {
      PrefService* prefs = profile_->GetPrefs();
      const std::string active = prefs->GetString(kProvider);
-@@ -2227,25 +2272,123 @@ void PageHandler::FinishModelQuery(std::
+@@ -2227,25 +2277,123 @@ void PageHandler::FinishModelQuery(std::
    if (!IsJavascriptAllowed()) {
      return;
    }
@@ -1694,7 +1768,7 @@
  }
  
  void PageHandler::OnModelsListed(int loader_id,
-@@ -2352,7 +2495,9 @@ void PageHandler::FinishTitle(base::Valu
+@@ -2352,7 +2500,9 @@ void PageHandler::FinishTitle(base::Valu
  // args: a token the page picks, and the menu. Events about the menu carry the
  // token back in "rac-ai-menu".
  void PageHandler::HandleShowMenu(const base::ListValue& args) {
@@ -1705,7 +1779,7 @@
    AllowJavascript();
    if (!args[0].is_int() || !args[1].is_dict()) {
      return;
-@@ -2360,8 +2505,28 @@ void PageHandler::HandleShowMenu(const b
+@@ -2360,8 +2510,28 @@ void PageHandler::HandleShowMenu(const b
    if (!IsAiEnabled(profile_->GetPrefs())) {
      return;
    }
@@ -1734,7 +1808,7 @@
    content::WebContents* contents = web_ui()->GetWebContents();
    views::Widget* widget =
        views::Widget::GetTopLevelWidgetForNativeView(contents->GetNativeView());
-@@ -2387,6 +2552,7 @@ void PageHandler::CloseMenu() {
+@@ -2387,6 +2557,7 @@ void PageHandler::CloseMenu() {
    menu_factory_.InvalidateWeakPtrs();
    menu_panel_.reset();
    menu_token_ = 0;
@@ -1742,7 +1816,7 @@
  }
  
  std::unique_ptr<MenuRequest> PageHandler::ParseMenu(
-@@ -2485,6 +2651,8 @@ void PageHandler::OnMenuPicked(int token
+@@ -2485,6 +2656,8 @@ void PageHandler::OnMenuPicked(int token
    if (!remove) {
      web_ui()->GetWebContents()->GetPrimaryMainFrame()->NotifyUserActivation(
          blink::mojom::UserActivationNotificationType::kInteraction);
@@ -1751,7 +1825,7 @@
    }
    FireWebUIListener("rac-ai-menu", base::DictValue()
                                         .Set("token", token)
-@@ -2493,6 +2661,7 @@ void PageHandler::OnMenuPicked(int token
+@@ -2493,6 +2666,7 @@ void PageHandler::OnMenuPicked(int token
  }
  
  void PageHandler::OnMenuClosed(int token) {

@@ -80,13 +80,27 @@ class AgentChoiceWiringTest(unittest.TestCase):
                           opening)
 
     def test_bad_page_input_never_crashes_the_browser(self):
-        for opening in ('void PageHandler::HandleSelectAgent(',
-                        'void PageHandler::HandleGetModelMenu(',
+        for opening in ('void PageHandler::HandleGetModelMenu(',
                         'void PageHandler::HandleShowMenu('):
             body = self.function(opening)
             self.assertNotIn('CHECK', body, opening)
             self.assertRegex(body, r'if \(args\.size\(\) != \d\) \{ return; \}',
                              opening)
+        # A malformed choice is refused, so the page's wait still ends.
+        body = self.function('void PageHandler::HandleSelectAgent(')
+        self.assertNotIn('CHECK', body)
+        self.assertRegex(
+            body, r'if \(args\.size\(\) != 2\) \{ '
+            r'ResolveJavascriptCallback\(args\[0\], base::Value\(false\)\); '
+            r'return; \}')
+
+    def test_menu_lines_keep_the_browsers_ids(self):
+        # A redraw keeps the selection by id, so the page must use the ids
+        # the browser gives, which name the choice, not its position.
+        body = code(patched_files.braced_body(
+            self.app, 'function showModelMenu('))
+        self.assertIn('const id = line.id ??', body)
+        self.assertNotIn('`model:${i}`', body)
 
     def test_the_page_shows_an_agent_only_once_the_browser_took_it(self):
         body = code(patched_files.braced_body(
