@@ -117,10 +117,16 @@ WINDOW_KINDS = {'first', 'normal', 'incognito', 'app', 'popup', 'devtools',
                 'pip', 'browser', 'onboarding', 'child', 'other'}
 KEYS = {'return', 'escape', 'tab', 'backspace', 'up', 'down', 'left', 'right'}
 NSPRESS_KEYS = KEYS | {'space', 'home', 'end', 'pageup', 'pagedown'}
-# Typed text is plain words only: ASCII letters, digits, spaces, '-'
-# and '_'. Without dots, colons or slashes it can't spell a URL, a host
-# name or a path, however the pieces join or whatever submits it.
-TYPED_TEXT = re.compile(r'[A-Za-z0-9 _-]+')
+# Typed text is plain words only: ASCII letters, digits, spaces, '-',
+# '_' and '!' (a bang, as in `cats !w`). Without dots, colons or slashes
+# it can't spell a URL, a host name or a path, however the pieces join or
+# whatever submits it. Text with a '!' may never be submitted (see
+# check_line), so a bang only ever shows suggestions.
+TYPED_TEXT = re.compile(r'[A-Za-z0-9 _!-]+')
+# IDC_FOCUS_LOCATION: focuses the address bar, the one place a script's
+# typed text should land. A typing script may send it; it moves focus to a
+# known field rather than walking the page.
+FOCUS_LOCATION = 39001
 # Whole words the typed text may never spell: the denied page names,
 # checked against every run of letters and digits in the joined typed
 # text (spaces, '-' and '_' separate words; case is folded). `type my
@@ -262,14 +268,14 @@ def url_allowed(word, serve=False):
 
 
 def check_typed(text):
-    """Typed text is plain words: ASCII letters, digits, spaces, '-' and
-    '_'. With no dot, colon or slash it can't spell a URL, a host name or
+    """Typed text is plain words: ASCII letters, digits, spaces, '-', '_'
+    and '!'. With no dot, colon or slash it can't spell a URL, a host name or
     a path, and with no other characters there is nothing to smuggle one
     in with. (Non-ASCII fails the charset too, so the omnibox's
     full-width look-alike mapping stays out.)"""
     if not TYPED_TEXT.fullmatch(text):
         raise Refused('typed text is plain words only: ASCII letters, '
-                      'digits, spaces, "-" and "_": ' + repr(text))
+                      'digits, spaces, "-", "_" and "!": ' + repr(text))
 
 
 def harness_words(request):
@@ -473,6 +479,8 @@ class Checker:
             self.events.append('wheel')
         elif verb == 'command' and int(args[0]) in COMMANDS_ZOOM:
             self.events.append('zoom')
+        elif verb == 'command' and int(args[0]) == FOCUS_LOCATION:
+            self.events.append('focus')
         elif verb in ('click', 'move', 'swipe', 'pointer',
                       'pointer-path', 'nskey', 'nsflags', 'command'):
             self.events.append('input')
@@ -543,6 +551,11 @@ def check_line(text, serve=False, command_ids=None):
         if events[:last].count('return') or events[last + 1:].count('return') > 1:
             raise Refused('a script that types may press return at most '
                           'once, after its last typed text; ask Ship')
+        # A bang only shows suggestions: submitting it would navigate to
+        # whatever site the bang names.
+        if '!' in checker.typed and 'return' in events:
+            raise Refused('typed text with a "!" (a bang) may not be '
+                          'submitted: no key return')
     # A run that opens a settings page may only take screenshots and
     # scroll: every other recorded event is an input the settings UI could
     # be walked with. `wheel X Y DY` sends an unmodified scroll (the
@@ -562,7 +575,7 @@ def check_line(text, serve=False, command_ids=None):
     # The typed words themselves are checked against the denied page
     # names: pieces join in order, and a whole word naming a page the
     # browser may not open edits the open page's URL into it.
-    typed_words = {w for w in re.split(r'[\s_-]+', checker.typed.lower()) if w}
+    typed_words = {w for w in re.split(r'[\s_!-]+', checker.typed.lower()) if w}
     denied = sorted(typed_words & TYPED_PAGE_TOKENS)
     if denied:
         raise Refused('typed text spells a page the browser may not open: '

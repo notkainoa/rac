@@ -25,8 +25,8 @@ them, and traps that are hard to spot from the source.
   [pinned-tabs-drag.md](internals/pinned-tabs-drag.md)
 - [AI](internals/ai.md): how the assistant and the browser agent work, the
   safety rules, and the traps
-- [Bangs (work in progress)](internals/bangs.md): editable bangs and a
-  better address bar experience; nothing designed yet
+- [Bangs](internals/bangs.md): deleted bangs that stay deleted, the Bangs
+  page, and the dev fixture; the address bar is still open
 
 ## Operations
 

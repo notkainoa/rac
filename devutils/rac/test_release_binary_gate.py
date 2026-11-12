@@ -99,6 +99,13 @@ class ReleaseBinaryGateTest(unittest.TestCase):
         self.assertIn(f'    {rel}: rac-window-screenshot-delay', out)
         self.assertIn('2 forbidden string match(es) in 1 of 4 binaries', out)
 
+    def test_bangs_fixture_switch_is_forbidden(self):
+        # Power's dev-only --rac-bangs-fixture must never reach a release.
+        self.write('Contents/MacOS/rac', fake_binary('rac-bangs-fixture'))
+        code, out = self.run_gate('enforce')
+        self.assertEqual(code, 1, out)
+        self.assertIn("'rac-bangs-fixture' found in Contents/MacOS/rac", out)
+
     def test_symlinked_framework_binary_is_scanned_once(self):
         self.write(f'{FRAMEWORK}/Versions/146.0.0.0/rac Framework', fake_binary('rac-agent-mcp-echo'))
         code, out = self.run_gate('enforce')
