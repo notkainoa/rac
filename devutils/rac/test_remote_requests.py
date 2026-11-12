@@ -466,6 +466,28 @@ class RemoteRequestsTest(unittest.TestCase):
              ['dir shots', 'expect shots/f00.png', 'expect shots/f01.png',
               'expect shots/f02.png']))
 
+    def test_bang_suggestions_in_the_focused_address_bar(self):
+        # Power's bangs omnibox proof: focus the address bar, type a bang,
+        # shoot the suggestion dropdown. Never submitted.
+        for line in ('command 39001 ; type cats !w ; after 800 burst shots 2 200',
+                     'command 39001 ; nstype !gh rac ; after 800 burst shots 2 200',
+                     'command 39001 ; type cats ; type !w'):
+            self.ok(line)
+        for line in ('command 39001 ; type cats !w ; key return',
+                     'type !w x ; key return',
+                     'command 39001 ; type cats !w ; click 1 2',
+                     'command 39001 ; type cats !w ; key tab',
+                     # Still no URL characters, '!' or not.
+                     'command 39001 ; type !w http://evil.com',
+                     'command 39001 ; type cats!w.com',
+                     # '!' separates words for the denied-page check.
+                     'command 39001 ; type x!flags',
+                     # Focus is not a settings page's input.
+                     'open-urls chrome://settings/assistant ; command 39001'):
+            self.refused(line)
+        # Plain words still submit as before.
+        self.ok('command 39001 ; type cats ; key return')
+
     def test_typing_refusal_names_the_rule(self):
         try:
             self.rr.check_line('type a ; click 1 2')
@@ -537,12 +559,47 @@ class RemoteRequestsTest(unittest.TestCase):
                      'command 38003 ; type hello'):
             self.refused(line)
 
+    def test_assistant_page_takes_keyboard_navigation(self):
+        # Settings › Assistant alone may also be driven with focus moves
+        # and choices (a Provider list keyboard proof), never with text.
+        for line in ('open-urls chrome://settings/assistant ; key tab ; '
+                     'nspress tab shift ; key down ; key up ; nspress home ; '
+                     'nspress end ; nspress space ; key return ; key escape ; '
+                     'burst shots 2 100',
+                     'open-urls rac://settings/assistant/ ; key left ; key right ; '
+                     'wheel 10 10 3 ; command 38003'):
+            self.ok(line)
+            nav = []
+            self.rr.check_line(line, nav_only=nav)
+            self.assertEqual(nav, [True], line)
+        for line in ('open-urls chrome://settings/assistant ; type sk',
+                     'open-urls chrome://settings/assistant ; nspress a',
+                     'open-urls chrome://settings/assistant ; nspress a shift',
+                     'open-urls chrome://settings/assistant ; key backspace',
+                     'open-urls chrome://settings/assistant ; nspress tab cmd',
+                     'open-urls chrome://settings/assistant ; nspress tab ctrl',
+                     'open-urls chrome://settings/assistant ; nskey tab down shift',
+                     'open-urls chrome://settings/assistant ; click 1 2',
+                     'open-urls chrome://settings/assistant ; command 34000',
+                     # Another settings page in the same run keeps it
+                     # screenshot-only.
+                     'open-urls chrome://settings/assistant '
+                     'chrome://settings/privacy ; key tab',
+                     'open-urls chrome://settings/appearance ; key tab',
+                     'open-urls chrome://credits ; key tab'):
+            self.refused(line)
+        # A script with other input never reports nav-only.
+        nav = []
+        self.rr.check_line('open-urls http://localhost/ ; key tab ; click 1 2',
+                                   nav_only=nav)
+        self.assertEqual(nav, [False])
+
     def test_settings_pages_take_screenshots_only(self):
         # The three settings pages that may open take shots only: any
         # input verb in the same script refuses, on top of the typing
         # rule's own restrictions.
         for line in ('open-urls chrome://settings/privacy ; click 10 10',
-                     'open-urls chrome://settings/assistant ; key tab',
+                     'open-urls chrome://settings/privacy ; key tab',
                      'open-urls chrome://settings/appearance ; type x',
                      'open-urls chrome://settings/privacy ; nspress a',
                      'open-urls chrome://settings/appearance ; move 1 2',
