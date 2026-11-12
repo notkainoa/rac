@@ -1,0 +1,178 @@
+--- a/chrome/browser/rac/ai/chat_placement.cc
++++ b/chrome/browser/rac/ai/chat_placement.cc
+@@ -24,6 +24,10 @@ ChatMove DecideChatMove(const ActiveTabS
+                                        : ChatMove::kNone;
+ }
+ 
++bool KeepsChatPageDrawn(const ActiveTabState& state) {
++  return state.blocked && state.split_partner_chat_open;
++}
++
+ bool ReleasesChat(ChatHideReason reason, bool window_closing) {
+   return reason == ChatHideReason::kClosed && !window_closing;
+ }
+--- a/chrome/browser/rac/ai/chat_placement.h
++++ b/chrome/browser/rac/ai/chat_placement.h
+@@ -43,6 +43,14 @@ enum class ChatMove {
+ 
+ ChatMove DecideChatMove(const ActiveTabState& state);
+ 
++// Whether the window's chat page keeps drawing while the panel is closed. The
++// user moved from a split pane with its chat open to the other pane, which
++// shows an internal page, so the chat closed and comes back on the next click.
++// A hidden page needs a new frame when it shows again, and until it draws one
++// the panel opens empty beside the web pane, so the page keeps its frames
++// until then. It reads nothing from the internal pane.
++bool KeepsChatPageDrawn(const ActiveTabState& state);
++
+ // Why a tab's chat left the panel. Mirrors SidePanelEntryHideReason.
+ enum class ChatHideReason {
+   // The panel closed: the user closed it, or something else did.
+--- a/chrome/browser/rac/ai/chat_placement_unittest.cc
++++ b/chrome/browser/rac/ai/chat_placement_unittest.cc
+@@ -64,6 +64,20 @@ TEST(RacAiChatPlacementTest, ASplitPartn
+             ChatMove::kNone);
+ }
+ 
++// The chat page keeps drawing only while the internal pane of a split stands
++// between the user and a chat that comes back on the other pane.
++TEST(RacAiChatPlacementTest, AnInternalSplitPaneKeepsThePartnersChatDrawn) {
++  EXPECT_TRUE(
++      KeepsChatPageDrawn({.blocked = true, .split_partner_chat_open = true}));
++  // Back on the web pane, the chat shows and draws for itself.
++  EXPECT_FALSE(KeepsChatPageDrawn({.split_partner_chat_open = true}));
++  // An internal tab outside a split, or a pane whose partner's chat is
++  // closed, has no chat coming back.
++  EXPECT_FALSE(KeepsChatPageDrawn({.blocked = true}));
++  EXPECT_FALSE(KeepsChatPageDrawn(
++      {.blocked = true, .chat_showing = true, .has_chat = true}));
++}
++
+ TEST(RacAiChatPlacementTest, OnlyClosingThePanelReleasesTheChat) {
+   EXPECT_TRUE(ReleasesChat(ChatHideReason::kClosed, false));
+   EXPECT_FALSE(ReleasesChat(ChatHideReason::kTabSwitched, false));
+--- a/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
++++ b/chrome/browser/ui/views/rac/ai/assistant_side_panel.cc
+@@ -12,6 +12,7 @@
+ 
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
++#include "base/functional/callback_helpers.h"
+ #include "base/location.h"
+ #include "base/logging.h"
+ #include "base/memory/raw_ptr.h"
+@@ -61,6 +62,7 @@
+ #include "content/public/browser/file_select_listener.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/visibility.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_delegate.h"
+ #include "content/public/browser/web_contents_observer.h"
+@@ -74,6 +76,7 @@
+ #include "ui/gfx/canvas.h"
+ #include "ui/gfx/color_utils.h"
+ #include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
+ #include "ui/gfx/geometry/skia_conversions.h"
+ #include "ui/gfx/scoped_canvas.h"
+ #include "ui/views/background.h"
+@@ -255,7 +258,8 @@ class AssistantWebView;
+ // when the last one goes: when the user closes the last chat, when the last
+ // tab with one closes or leaves the window, or when AI turns off.
+ class AssistantChat : public base::RefCounted<AssistantChat>,
+-                      public content::WebContentsDelegate {
++                      public content::WebContentsDelegate,
++                      public content::WebContentsObserver {
+  public:
+   // The window's page, made if it has none.
+   static scoped_refptr<AssistantChat> GetOrCreate(
+@@ -289,6 +293,24 @@ class AssistantChat : public base::RefCo
+   // The window whose page this is, or null once it has closed.
+   BrowserWindowInterface* window() const { return browser_.get(); }
+ 
++  // While `keep`, the page goes on drawing with no view showing it (see
++  // KeepsChatPageDrawn()), so it is there in the panel's first frame. The
++  // side panel shows a returning view in the same task as the tab switch, so
++  // the hold is let go a task later, and only once the page is visible.
++  void KeepDrawn(bool keep) {
++    keep_drawn_ = keep;
++    release_when_visible_ = false;
++    if (keep && !drawn_hold_) {
++      drawn_hold_ = page_->IncrementCapturerCount(
++          gfx::Size(), /*stay_hidden=*/true, /*stay_awake=*/false,
++          /*is_activity=*/false);
++    } else if (!keep && drawn_hold_) {
++      base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(&AssistantChat::ReleaseDrawn,
++                                    weak_factory_.GetWeakPtr()));
++    }
++  }
++
+   // content::WebContentsDelegate:
+   void RunFileChooser(content::RenderFrameHost* render_frame_host,
+                       scoped_refptr<content::FileSelectListener> listener,
+@@ -317,11 +339,37 @@ class AssistantChat : public base::RefCo
+     content::NavigationController::LoadURLParams params((GURL(kPanelUrl)));
+     params.transition_type = ui::PAGE_TRANSITION_AUTO_TOPLEVEL;
+     page_->GetController().LoadURLWithParams(params);
++    Observe(page_.get());
+     VLOG(1) << "rac assistant: the window's chat page";
+   }
+ 
++  // A view showing the page counts as visible only once its window says so,
++  // a moment after the side panel shows it. Letting go before then hides the
++  // page again and drops the frame it kept.
++  void ReleaseDrawn() {
++    if (keep_drawn_ || !drawn_hold_) {
++      return;
++    }
++    if (IsShowing() && page_->GetVisibility() != content::Visibility::VISIBLE) {
++      release_when_visible_ = true;
++      return;
++    }
++    drawn_hold_.RunAndReset();
++  }
++
++  // content::WebContentsObserver:
++  void OnVisibilityChanged(content::Visibility visibility) override {
++    if (release_when_visible_ && visibility == content::Visibility::VISIBLE) {
++      release_when_visible_ = false;
++      base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(&AssistantChat::ReleaseDrawn,
++                                    weak_factory_.GetWeakPtr()));
++    }
++  }
++
+   ~AssistantChat() override {
+     VLOG(1) << "rac assistant: the window's chat page ended";
++    Observe(nullptr);
+     // The window may be gone: its tabs close first and let the page go.
+     if (AssistantPanelState* state =
+             browser_ ? AssistantPanelState::From(browser_.get()) : nullptr;
+@@ -334,8 +382,14 @@ class AssistantChat : public base::RefCo
+ 
+   const base::WeakPtr<BrowserWindowInterface> browser_;
+   std::unique_ptr<content::WebContents> page_;
++  // Held while KeepDrawn(), and until the page shows again; it goes before
++  // the page does.
++  base::ScopedClosureRunner drawn_hold_;
++  bool keep_drawn_ = false;
++  bool release_when_visible_ = false;
+   // The view showing the page, or the last one to.
+   raw_ptr<AssistantWebView> host_ = nullptr;
++  base::WeakPtrFactory<AssistantChat> weak_factory_{this};
+ };
+ 
+ // The chat page in the side panel, hosted directly with no header: the page
+@@ -1010,6 +1064,10 @@ class WindowAssistant {
+         .has_chat = tab_chat && tab_chat->has_chat(),
+         .split_partner_chat_open = partner && partner->IsOpen(),
+     };
++    if (AssistantPanelState* panel = AssistantPanelState::From(browser_);
++        panel && panel->chat()) {
++      panel->chat()->KeepDrawn(KeepsChatPageDrawn(state));
++    }
+     switch (DecideChatMove(state)) {
+       case ChatMove::kNone:
+         break;
