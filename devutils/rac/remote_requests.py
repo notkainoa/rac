@@ -473,6 +473,17 @@ class Checker:
             'pointer': (n == 1 and args[0] == 'off') or (n == 2 and nums(*args)),
             'pointer-path': (n == 5 and nums(*args[:4]) and
                              re.fullmatch(r'[0-9]{1,9}', args[4])),
+            # Proof only (wip/ntrow-proof): a real tab drag, and the New Tab
+            # button setting.
+            'tabdrag-start': n == 1 and ints(args[0]),
+            'tabdrag-to': n == 2 and nums(*args),
+            'tabdrag-path': (n == 5 and nums(*args[:4]) and
+                             re.fullmatch(r'[0-9]{1,9}', args[4])),
+            'tabdrag-drop': n == 0,
+            'tabdrag-cancel': n == 0,
+            'tabdrag-select': n == 2 and ints(*args),
+            'tabdrag-window': n == 1 and args[0] in ('incognito', 'normal'),
+            'ntrow-set': n == 1 and args[0] in ('0', '1'),
         }
         if verb not in simple:
             raise Refused(f'unknown request verb {verb!r}')

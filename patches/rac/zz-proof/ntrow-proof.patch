@@ -1,0 +1,398 @@
+--- a/chrome/browser/ui/views/rac/dev/window_state.mm
++++ b/chrome/browser/ui/views/rac/dev/window_state.mm
+@@ -10,6 +10,7 @@
+ #include <algorithm>
+ #include <optional>
+ 
++#include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
+ #include "base/memory/weak_ptr.h"
+@@ -22,9 +23,18 @@
+ #include "base/time/time.h"
+ #include "chrome/browser/rac/spaces/space.h"
+ #include "chrome/browser/rac/spaces/spaces_service.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
++#include "chrome/browser/ui/views/tabs/common/tab_drag_handler.h"
++#include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_view.h"
++#include "chrome/browser/ui/views/tabs/shared/tab_strip_types.h"
+ #include "chrome/browser/ui/views/rac/dev/frame_log.h"
+ #include "ui/events/base_event_utils.h"
+ #include "ui/events/event.h"
+@@ -33,6 +43,9 @@
+ #include "ui/gfx/geometry/point_f.h"
+ #include "ui/gfx/geometry/rect.h"
+ #include "ui/gfx/mac/coordinate_conversion.h"
++#include "ui/base/base_window.h"
++#include "ui/base/models/list_selection_model.h"
++#include "ui/views/view_utils.h"
+ #include "ui/views/widget/widget.h"
+ 
+ namespace rac::dev {
+@@ -226,6 +239,260 @@ void MovePointerAlong(base::WeakPtr<view
+   }
+ }
+ 
++// ---- rac proof (#127), never merged: drives a real tab drag. ----
++// The harness's synthetic mouse drags don't start a tab drag, so these verbs
++// call the sidebar's drag handler the way a tab view does on mouse events.
++
++TabDragHandlerImpl* ProofDragHandler(views::Widget* widget) {
++  BrowserView* browser_view =
++      BrowserView::GetBrowserViewForNativeWindow(widget->GetNativeWindow());
++  if (!browser_view || !browser_view->tab_strip_view()) {
++    return nullptr;
++  }
++  return static_cast<TabDragHandlerImpl*>(
++      browser_view->tab_strip_view()->GetDragContext());
++}
++
++int& ProofDragGeneration() {
++  static int generation = 0;
++  return generation;
++}
++
++void ProofDragTo(views::Widget* widget, gfx::PointF point) {
++  TabDragHandlerImpl* handler = ProofDragHandler(widget);
++  if (!handler) {
++    return;
++  }
++  const gfx::Point location = gfx::ToRoundedPoint(point);
++  ui::MouseEvent drag(ui::EventType::kMouseDragged, location, location,
++                      ui::EventTimeForNow(), ui::EF_LEFT_MOUSE_BUTTON, 0);
++  handler->ContinueDrag(*widget->GetRootView(), drag);
++}
++
++void ProofDragAlong(base::WeakPtr<views::Widget> widget,
++                    gfx::PointF from,
++                    gfx::PointF to,
++                    int step,
++                    int steps,
++                    int generation) {
++  if (!widget || generation != ProofDragGeneration()) {
++    return;
++  }
++  const float t = static_cast<float>(step) / steps;
++  ProofDragTo(widget.get(), gfx::PointF(from.x() + (to.x() - from.x()) * t,
++                                        from.y() + (to.y() - from.y()) * t));
++  if (step < steps) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(&ProofDragAlong, widget, from, to, step + 1, steps,
++                       generation),
++        kPointerStep);
++  }
++}
++
++
++// Hides the space switcher and the space name row, as a launch without the
++// spaces UI would.
++void ProofHideSpaces(views::View* view) {
++  if (view->GetClassName() == "SpaceSwitcherView") {
++    view->SetVisible(false);
++  }
++  if (view->GetClassName() == "UnpinnedTabContainerView") {
++    view->InvalidateLayout();
++  }
++  for (views::View* child : view->children()) {
++    ProofHideSpaces(child);
++  }
++}
++
++TabView* ProofFindTabView(views::View* view, const tabs::TabInterface* tab) {
++  if (auto* tab_view = views::AsViewClass<TabView>(view);
++      tab_view && tab_view->GetTabInterface() == tab) {
++    return tab_view;
++  }
++  for (views::View* child : view->children()) {
++    if (TabView* found = ProofFindTabView(child, tab)) {
++      return found;
++    }
++  }
++  return nullptr;
++}
++
++bool& ProofIncognito() {
++  static bool incognito = false;
++  return incognito;
++}
++
++// The window the proof drags in: the harness's, or with `tabdrag-window
++// incognito` the incognito window.
++views::Widget* ProofWidget(views::Widget* widget) {
++  if (!ProofIncognito()) {
++    return widget;
++  }
++  for (BrowserWindowInterface* browser : GetAllBrowserWindowInterfaces()) {
++    if (browser->GetProfile()->IsOffTheRecord() &&
++        browser->GetType() == BrowserWindowInterface::TYPE_NORMAL) {
++      if (BrowserView* view = BrowserView::GetBrowserViewForNativeWindow(
++              browser->GetWindow()->GetNativeWindow())) {
++        return view->GetWidget();
++      }
++    }
++  }
++  return widget;
++}
++
++bool HandleProofDragRequest(views::Widget* widget,
++                            const std::vector<std::string>& words) {
++  const std::string& verb = words[0];
++  if (verb == "tabdrag-window" && words.size() == 2) {
++    ProofIncognito() = words[1] == "incognito";
++    LOG(WARNING) << "rac proof: drags in the " << words[1] << " window";
++    return true;
++  }
++  widget = ProofWidget(widget);
++  if (verb == "proof-hide-spaces" && words.size() == 1) {
++    base::CommandLine::ForCurrentProcess()->AppendSwitch(
++        "rac-proof-no-spaces");
++    ProofHideSpaces(widget->GetRootView());
++    return true;
++  }
++  TabDragHandlerImpl* handler = ProofDragHandler(widget);
++  BrowserView* browser_view =
++      BrowserView::GetBrowserViewForNativeWindow(widget->GetNativeWindow());
++  int index = 0;
++  if (verb == "tabdrag-start" && words.size() == 2 &&
++      base::StringToInt(words[1], &index) && handler && browser_view) {
++    TabStripModel* model = browser_view->browser()->GetTabStripModel();
++    if (!model->ContainsIndex(index)) {
++      LOG(ERROR) << "rac proof: no tab " << index;
++      return true;
++    }
++    TabView* tab_view =
++        ProofFindTabView(widget->GetRootView(), model->GetTabAtIndex(index));
++    views::View* view = tab_view;
++    if (!tab_view || !tab_view->collection_node()) {
++      LOG(ERROR) << "rac proof: no view for tab " << index;
++      return true;
++    }
++    const gfx::Point in_view(view->width() / 2, view->height() / 2);
++    const gfx::Point in_root = views::View::ConvertPointToTarget(
++        view, widget->GetRootView(), in_view);
++    ui::MouseEvent press(ui::EventType::kMousePressed, in_view, in_root,
++                         ui::EventTimeForNow(), ui::EF_LEFT_MOUSE_BUTTON,
++                         ui::EF_LEFT_MOUSE_BUTTON);
++    // As TabView does on a press: select the tab, then start with the
++    // selection from before.
++    const ui::ListSelectionModel original =
++        model->selection_model().GetListSelectionModel();
++    if (!model->IsTabSelected(index)) {
++      model->ActivateTabAt(index);
++    }
++    base::CommandLine::ForCurrentProcess()->AppendSwitch("rac-proof-drag");
++    handler->InitializeDrag(
++        const_cast<TabCollectionNode&>(*tab_view->collection_node()),
++        original, press);
++    LOG(WARNING) << "rac proof: drag of tab " << index << " from "
++                 << in_root.ToString();
++    return true;
++  }
++  int last = 0;
++  if ((verb == "tabdrag-select" || verb == "tabdrag-group") &&
++      words.size() == 3 && base::StringToInt(words[1], &index) &&
++      base::StringToInt(words[2], &last) && browser_view && index <= last) {
++    TabStripModel* model = browser_view->browser()->GetTabStripModel();
++    if (!model->ContainsIndex(index) || !model->ContainsIndex(last)) {
++      return true;
++    }
++    if (verb == "tabdrag-select") {
++      model->ActivateTabAt(index);
++      model->ExtendSelectionTo(last);
++    } else {
++      std::vector<int> indices;
++      for (int i = index; i <= last; ++i) {
++        indices.push_back(i);
++      }
++      model->AddToNewGroup(indices);
++    }
++    LOG(WARNING) << "rac proof: " << verb << " " << index << ".." << last;
++    return true;
++  }
++  if (verb == "tabdrag-start-group" && words.size() == 2 &&
++      base::StringToInt(words[1], &index) && handler && browser_view) {
++    TabStripModel* model = browser_view->browser()->GetTabStripModel();
++    TabView* tab_view =
++        model->ContainsIndex(index)
++            ? ProofFindTabView(widget->GetRootView(),
++                               model->GetTabAtIndex(index))
++            : nullptr;
++    TabGroupView* group_view = nullptr;
++    for (views::View* v = tab_view; v && !group_view; v = v->parent()) {
++      group_view = views::AsViewClass<TabGroupView>(v);
++    }
++    if (!group_view || !group_view->collection_node() ||
++        !group_view->group_header()) {
++      LOG(ERROR) << "rac proof: no group for tab " << index;
++      return true;
++    }
++    views::View* header = group_view->group_header();
++    const gfx::Point in_group = views::View::ConvertPointToTarget(
++        header, group_view,
++        gfx::Point(header->width() / 2, header->height() / 2));
++    const gfx::Point in_root = views::View::ConvertPointToTarget(
++        header, widget->GetRootView(),
++        gfx::Point(header->width() / 2, header->height() / 2));
++    ui::MouseEvent press(ui::EventType::kMousePressed, in_group, in_root,
++                         ui::EventTimeForNow(), ui::EF_LEFT_MOUSE_BUTTON,
++                         ui::EF_LEFT_MOUSE_BUTTON);
++    base::CommandLine::ForCurrentProcess()->AppendSwitch("rac-proof-drag");
++    handler->InitializeDrag(
++        const_cast<TabCollectionNode&>(*group_view->collection_node()),
++        model->selection_model().GetListSelectionModel(), press);
++    LOG(WARNING) << "rac proof: drag of the group of tab " << index
++                 << " from " << in_root.ToString();
++    return true;
++  }
++  double x = 0;
++  double y = 0;
++  if (verb == "tabdrag-to" && words.size() == 3 &&
++      base::StringToDouble(words[1], &x) &&
++      base::StringToDouble(words[2], &y)) {
++    ++ProofDragGeneration();
++    ProofDragTo(widget, gfx::PointF(x, y));
++    return true;
++  }
++  double x1 = 0;
++  double y1 = 0;
++  int ms = 0;
++  if (verb == "tabdrag-path" && words.size() == 6 &&
++      base::StringToDouble(words[1], &x) &&
++      base::StringToDouble(words[2], &y) &&
++      base::StringToDouble(words[3], &x1) &&
++      base::StringToDouble(words[4], &y1) && base::StringToInt(words[5], &ms) &&
++      ms >= 0) {
++    ProofDragAlong(
++        widget->GetWeakPtr(), gfx::PointF(x, y), gfx::PointF(x1, y1), 0,
++        std::max(1, static_cast<int>(base::Milliseconds(ms) / kPointerStep)),
++        ++ProofDragGeneration());
++    return true;
++  }
++  if ((verb == "tabdrag-drop" || verb == "tabdrag-cancel") &&
++      words.size() == 1 && handler) {
++    ++ProofDragGeneration();
++    handler->EndDrag(verb == "tabdrag-drop" ? EndDragReason::kComplete
++                                            : EndDragReason::kCancel);
++    TabStripModel* model =
++        browser_view ? browser_view->browser()->GetTabStripModel() : nullptr;
++    LOG(WARNING) << "rac proof: " << verb << " windows="
++                 << GetAllBrowserWindowInterfaces().size() << " tabs="
++                 << (model ? model->count() : -1) << " pinned="
++                 << (model ? model->IndexOfFirstNonPinnedTab() : -1)
++                 << " incognito=" << ProofIncognito();
++    return true;
++  }
++  return false;
++}
++// ---- end rac proof ----
++
+ }  // namespace
+ 
+ bool HandleStateRequest(views::Widget* widget,
+@@ -233,6 +500,9 @@ bool HandleStateRequest(views::Widget* w
+   if (words.empty()) {
+     return false;
+   }
++  if (HandleProofDragRequest(widget, words)) {
++    return true;
++  }
+   const std::string& verb = words[0];
+   if (verb == "space-theme" && (words.size() == 2 || words.size() == 3)) {
+     SetSpaceTheme(widget, words);
+--- a/chrome/browser/ui/views/rac/sidebar/drag_haptics.mm
++++ b/chrome/browser/ui/views/rac/sidebar/drag_haptics.mm
+@@ -6,9 +6,12 @@
+ 
+ #import <AppKit/AppKit.h>
+ 
++#include "base/logging.h"
++
+ namespace rac {
+ 
+ void PlayDropTargetHaptic() {
++  LOG(WARNING) << "rac proof: drop target haptic";
+   [NSHapticFeedbackManager.defaultPerformer
+       performFeedbackPattern:NSHapticFeedbackPatternAlignment
+              performanceTime:NSHapticFeedbackPerformanceTimeDefault];
+--- a/chrome/browser/ui/views/rac/sidebar/pinned_section.cc
++++ b/chrome/browser/ui/views/rac/sidebar/pinned_section.cc
+@@ -10,6 +10,7 @@
+ #include <set>
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/timer/timer.h"
+@@ -519,7 +520,9 @@ PinnedSectionLayout PinnedSection::Compu
+   // pinned tabs either.
+   const bool pinned_tabs_collapsed = expanded && items_ && GetList().collapsed;
+   std::vector<raw_ptr<views::View>> pending_rows;
+-  if (space_header_ && expanded) {
++  if (space_header_ && expanded &&
++      !base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "rac-proof-no-spaces")) {
+     pending_rows.push_back(space_header_.get());
+   }
+   base::flat_map<const tabs::TabInterface*, views::View*> tab_views;
+--- a/chrome/browser/ui/views/rac/sidebar/sidebar_drag.cc
++++ b/chrome/browser/ui/views/rac/sidebar/sidebar_drag.cc
+@@ -10,6 +10,7 @@
+ #include <optional>
+ #include <vector>
+ 
++#include "base/logging.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/no_destructor.h"
+ #include "build/build_config.h"
+@@ -177,6 +178,10 @@ void NoteDropTarget(SidebarWindowSync& s
+   if (it == DropTargets().end()) {
+     return;
+   }
++  if (it->second != target) {
++    LOG(WARNING) << "rac proof: drop target " << static_cast<int>(it->second)
++                 << " -> " << static_cast<int>(target);
++  }
+   if (ShouldPlayDropTargetHaptic(it->second, target)) {
+ #if BUILDFLAG(IS_MAC)
+     PlayDropTargetHaptic();
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
+@@ -12,6 +12,7 @@
+ #include <utility>
+ #include <variant>
+ 
++#include "base/command_line.h"
+ #include "base/auto_reset.h"
+ #include "base/check.h"
+ #include "base/feature_list.h"
+@@ -1411,6 +1412,20 @@ TabDragController::GetDragTargetForPoint
+   TRACE_EVENT1("views", "TabDragController::GetTargetTabStripForPoint",
+                "point_in_screen", point_in_screen.ToString());
+ 
++  // rac proof (#127), never merged: the proof's background window is never
++  // the window under the pointer, so resolve the drag in its own window, as
++  // the code below does for the window it finds there.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch("rac-proof-drag") &&
++      attached_context_ && attached_context_->GetWidget()) {
++    if (BrowserView* proof_view = BrowserView::GetBrowserViewForNativeWindow(
++            attached_context_->GetWidget()->GetNativeWindow())) {
++      if (TabDragTarget* candidate =
++              GetTabDragPointResolver()->GetDragTarget(*proof_view,
++                                                       point_in_screen)) {
++        return std::tuple(Liveness::kAlive, nullptr, candidate);
++      }
++    }
++  }
+   gfx::NativeWindow local_window;
+   const Liveness state = GetLocalProcessWindow(
+       point_in_screen, current_state_ == DragState::kDraggingWindow,
