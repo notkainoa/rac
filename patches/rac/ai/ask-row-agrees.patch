@@ -1,0 +1,144 @@
+--- a/chrome/browser/rac/actions/rac_actions.cc
++++ b/chrome/browser/rac/actions/rac_actions.cc
+@@ -32,7 +32,8 @@ bool MeetsNeeds(const Action& action, co
+   return (!need.Has(Need::kTab) || context.has_tab) &&
+          (!need.Has(Need::kWebPage) || context.has_web_page) &&
+          (!need.Has(Need::kNotIncognito) || !context.incognito) &&
+-         (!need.Has(Need::kSpaces) || context.has_spaces);
++         (!need.Has(Need::kSpaces) || context.has_spaces) &&
++         (!need.Has(Need::kAssistant) || context.can_ask_assistant);
+ }
+ 
+ }  // namespace
+--- a/chrome/browser/rac/actions/rac_actions.h
++++ b/chrome/browser/rac/actions/rac_actions.h
+@@ -44,7 +44,12 @@ enum class Need {
+   kWebPage,  // The active tab shows an http(s) page.
+   kNotIncognito,
+   kSpaces,  // A normal profile window, where spaces exist.
+-  kMaxValue = kSpaces,
++  // The assistant can take a prompt here (rac::ai::CanAskAssistant()): a
++  // regular profile's normal window with a usable provider, whose active tab
++  // isn't an internal page by the Chat button's rule
++  // (rac::ai::IsAssistantBlockedHere()).
++  kAssistant,
++  kMaxValue = kAssistant,
+ };
+ using Availability = base::EnumSet<Need, Need::kTab, Need::kMaxValue>;
+ 
+@@ -108,6 +113,8 @@ struct ActionContext {
+   bool has_web_page = false;
+   bool incognito = false;
+   bool has_spaces = false;  // A normal profile window.
++  // Need::kAssistant. Filled only while AI is on.
++  bool can_ask_assistant = false;
+ };
+ 
+ // Maps 1:1 onto AcceleratorMapping.
+--- a/chrome/browser/rac/actions/rac_actions_command_bar.cc
++++ b/chrome/browser/rac/actions/rac_actions_command_bar.cc
+@@ -172,8 +172,9 @@ constexpr Action kCommandBarActions[] =
+         .description = "Ask the assistant about what the user typed.",
+         .args_json =
+             R"json({"additionalProperties":false,"properties":{"prompt":{"type":"string"}},"required":["prompt"],"type":"object"})json",
+-        // It opens the assistant beside the page, which only a web page has.
+-        .availability = {Need::kNotIncognito, Need::kWebPage},
++        // Shown exactly where choosing it works: where the Chat button shows
++        // and a provider can answer. A blank tab counts, view-source: doesn't.
++        .availability = {Need::kNotIncognito, Need::kAssistant},
+         .surfaces = {Surface::kCommandBar},
+         .ai_only = true,
+         .risk = RiskClass::kNone,
+--- a/chrome/browser/rac/actions/rac_actions_unittest.cc
++++ b/chrome/browser/rac/actions/rac_actions_unittest.cc
+@@ -371,6 +371,7 @@ TEST(RacActionsTest, IsAvailableChecksAi
+   full.has_tab = true;
+   full.has_web_page = true;
+   full.has_spaces = true;
++  full.can_ask_assistant = true;
+ 
+   // ai_only follows the AI switch and nothing else.
+   EXPECT_TRUE(IsAvailable(row, full));
+@@ -381,7 +382,7 @@ TEST(RacActionsTest, IsAvailableChecksAi
+   EXPECT_FALSE(IsAvailable(ai_row, ai_off));
+ 
+   const Need needs[] = {Need::kTab, Need::kWebPage, Need::kNotIncognito,
+-                        Need::kSpaces};
++                        Need::kSpaces, Need::kAssistant};
+   for (Need need : needs) {
+     row.availability = {need};
+     EXPECT_TRUE(IsAvailable(row, full));
+@@ -398,11 +399,14 @@ TEST(RacActionsTest, IsAvailableChecksAi
+   incognito.incognito = true;
+   ActionContext no_spaces = full;
+   no_spaces.has_spaces = false;
++  ActionContext no_assistant = full;
++  no_assistant.can_ask_assistant = false;
+   const std::pair<Need, const ActionContext*> cases[] = {
+       {Need::kTab, &no_tab},
+       {Need::kWebPage, &no_web_page},
+       {Need::kNotIncognito, &incognito},
+       {Need::kSpaces, &no_spaces},
++      {Need::kAssistant, &no_assistant},
+   };
+   for (const auto& [missing, context] : cases) {
+     for (Need need : needs) {
+@@ -414,6 +418,36 @@ TEST(RacActionsTest, IsAvailableChecksAi
+   }
+ }
+ 
++// The command bar's Ask row goes by the assistant's own rule, the one the Chat
++// button and AskAssistant() use, not by the committed page's scheme. A
++// view-source: tab has an http(s) page committed but blocks the assistant; a
++// blank tab has none but doesn't.
++TEST(RacActionsTest, AskRowGoesByTheAssistantsRule) {
++  const Action* ask = Find("ask");
++  ASSERT_TRUE(ask);
++  EXPECT_TRUE(ask->availability.Has(Need::kAssistant));
++  EXPECT_FALSE(ask->availability.Has(Need::kWebPage));
++
++  ActionContext web_page;
++  web_page.ai_enabled = true;
++  web_page.has_tab = true;
++  web_page.has_web_page = true;
++  web_page.can_ask_assistant = true;
++  EXPECT_TRUE(IsAvailable(*ask, web_page));
++
++  ActionContext view_source = web_page;
++  view_source.can_ask_assistant = false;
++  EXPECT_FALSE(IsAvailable(*ask, view_source));
++
++  ActionContext blank_tab = web_page;
++  blank_tab.has_web_page = false;
++  EXPECT_TRUE(IsAvailable(*ask, blank_tab));
++
++  ActionContext ai_off = web_page;
++  ai_off.ai_enabled = false;
++  EXPECT_FALSE(IsAvailable(*ask, ai_off));
++}
++
+ TEST(RacActionsTest, NeverActionsHaveNoOutsideSurface) {
+   for (std::string_view id : kNeverForOutsideClients) {
+     const Action* action = Find(id);
+--- a/chrome/browser/ui/rac/rac_action_handlers.cc
++++ b/chrome/browser/ui/rac/rac_action_handlers.cc
+@@ -22,6 +22,7 @@
+ #include "chrome/browser/ui/rac/rac_action_copy_markdown.h"
+ #include "chrome/browser/ui/rac/spaces/spaces_window_manager.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/views/rac/ai/assistant_side_panel.h"
+ #include "chrome/browser/ui/views/rac/command_bar/command_bar_handlers.h"
+ #include "chrome/browser/ui/views/rac/little_window/little_window.h"
+ #include "components/prefs/pref_service.h"
+@@ -131,6 +132,11 @@ ActionContext ContextForWindow(BrowserWi
+           contents->GetLastCommittedURL().SchemeIsHTTPOrHTTPS();
+     }
+   }
++  // The Ask row's rule is AskAssistant()'s own, so the row shows only where
++  // choosing it opens the assistant. With AI off it isn't asked.
++  if (context.ai_enabled && !context.incognito) {
++    context.can_ask_assistant = rac::ai::CanAskAssistant(browser);
++  }
+ 
+   // The manager exists for normal windows of the profile, where spaces do.
+   if (SpacesWindowManager* manager = SpacesWindowManager::From(browser)) {
