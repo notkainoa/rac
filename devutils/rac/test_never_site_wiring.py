@@ -179,12 +179,25 @@ class AskRowWiringTest(unittest.TestCase):
 
     def test_the_need_is_ask_assistants_own_check(self):
         body = self.function(self.CONTEXT,
-                             'ActionContext ContextForWindow(')
+                             'ActionContext ContextForCommandBar(')
+        self.assertIn('ContextForWindow(browser)', body)
         self.assertRegex(
             body, r'if \(context\.ai_enabled && !context\.incognito\) \{\s*'
             r'context\.can_ask_assistant = rac::ai::CanAskAssistant\(browser\);',
             'the Ask row no longer goes by AskAssistant()\'s check, or runs '
             'AI code with AI off')
+
+    def test_menus_and_commands_never_ask_the_assistant(self):
+        # ContextForWindow() serves menu validation, IsBrowserCommandEnabled
+        # and ExecuteBrowserCommand. CanAskAssistant() can create the
+        # profile's AiService, so a menu check would cost AI work.
+        body = self.function(self.CONTEXT,
+                             'ActionContext ContextForWindow(')
+        self.assertNotIn('CanAskAssistant', body)
+        self.assertNotIn('can_ask_assistant', body)
+        context = code(patched_files.final_text(self.CONTEXT))
+        self.assertEqual(context.count('CanAskAssistant('), 1,
+                         'something besides ContextForCommandBar() asks')
 
     def test_ask_assistant_still_refuses_internal_pages(self):
         can = self.function(self.PANEL, 'bool CanAskAssistant(')
@@ -196,9 +209,16 @@ class AskRowWiringTest(unittest.TestCase):
         self.assert_before(ask, '!CanAskAssistant(browser)', 'SetPrompt(',
                            'the prompt is left before the internal-page check')
 
+    def test_the_bar_lists_rows_with_the_bars_context(self):
+        body = self.function(self.BAR, 'std::vector<ActionCandidate> '
+                             'CollectActions(')
+        self.assertIn('ContextForCommandBar(browser)', body)
+        self.assertNotIn('ContextForWindow(', body)
+
     def test_the_bar_checks_again_before_it_runs_a_row(self):
         body = self.function(self.BAR, 'bool RunAction(')
-        self.assert_before(body, 'ContextForWindow(browser)',
+        self.assertNotIn('ContextForWindow(', body)
+        self.assert_before(body, 'ContextForCommandBar(browser)',
                            'RunBrowserAction(',
                            'a row runs without its availability checked again')
         self.assert_before(body, 'ForSurface(Surface::kCommandBar, context)',

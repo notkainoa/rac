@@ -387,6 +387,10 @@ This is the rule that's easiest to break by accident. How it holds:
 - Link hover, the context-menu item, and the find bar's Ask check
   `ShouldOffer…` or `CanAskAssistant` first and return before creating
   anything.
+- `CanAskAssistant` reaches the `AiService`, so with AI on it creates one.
+  Only the command bar asks it for the Ask row (`ContextForCommandBar`).
+  Menu validation and browser commands use `ContextForWindow`, which leaves
+  `can_ask_assistant` false, so a menu check creates nothing.
 - The agent PATH probe is lazy. Opening the model picker, or Settings'
   Assistant page while it's on screen, runs the cached probe once; a
   settings search that shows the section doesn't. It never starts an
