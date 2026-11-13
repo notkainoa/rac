@@ -115,6 +115,15 @@ class LintTest(unittest.TestCase):
         self.assertEqual([r.path for r in self.lint().missing],
                          ['chrome/browser/rac/old.h'])
 
+    def test_a_rename_of_an_upstream_file_creates_its_destination(self):
+        self.add(self.platform, 'rac/x/a.patch',
+                 '--- a/chrome/browser/ui/foo.h\n+++ b/chrome/browser/ui/rac/foo.h\n'
+                 '@@ -1 +1 @@\n-x\n+y\n')
+        self.add(self.platform, 'rac/x/b.patch',
+                 edit('chrome/browser/ui/bar.cc',
+                      added=['#include "chrome/browser/ui/rac/foo.h"']))
+        self.assertEqual(self.missing(), [])
+
     def test_a_rename_carries_its_references(self):
         # The include moves to new.cc with the rename; a later patch that
         # removes it from new.cc cancels it.

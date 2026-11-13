@@ -259,15 +259,16 @@ def lint(helium_patches, platform_patches, resources=None, allowlist=()):
         for old, new, body in file_sections(text):
             name = new or old
             if old is not None and new is not None and old != new:
-                # A rename (--- a/x, +++ b/y) carries the references and the
-                # outputs x declared, and moves x if a patch created it.
+                # A rename (--- a/x, +++ b/y) makes y, removes x, and carries
+                # the references and outputs x held. Quilt never writes
+                # renames, so this is only for a hand-made git diff; paths
+                # resolved against x's directory are not re-resolved.
                 for r in live:
                     if r.file == old:
                         r.file = new
                 generated = {p: (new if f == old else f) for p, f in generated.items()}
-                if old in created:
-                    created.discard(old)
-                    created.add(new)
+                created.discard(old)
+                created.add(new)
             for line in body:
                 content = line[1:]
                 if line[0] == '-':
