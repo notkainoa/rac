@@ -484,6 +484,8 @@ class Checker:
             'tabdrag-select': n == 2 and ints(*args),
             'tabdrag-window': n == 1 and args[0] in ('incognito', 'normal'),
             'ntrow-set': n == 1 and args[0] in ('0', '1'),
+            'ntrow-exec': (n == 2 and re.fullmatch(r'incognito|normal:[0-9]', args[0])
+                           and ints(args[1]) and int(args[1]) in COMMANDS_ALLOWED),
         }
         if verb not in simple:
             raise Refused(f'unknown request verb {verb!r}')
