@@ -115,6 +115,42 @@ class LintTest(unittest.TestCase):
         self.assertEqual([r.path for r in self.lint().missing],
                          ['chrome/browser/rac/old.h'])
 
+    def test_a_rename_carries_its_references(self):
+        # The include moves to new.cc with the rename; a later patch that
+        # removes it from new.cc cancels it.
+        self.add(self.platform, 'rac/x/a.patch',
+                 edit('chrome/browser/ui/old.cc',
+                      added=['#include "chrome/browser/rac/gone.h"']))
+        self.add(self.platform, 'rac/x/b.patch',
+                 '--- a/chrome/browser/ui/old.cc\n+++ b/chrome/browser/ui/new.cc\n'
+                 '@@ -1 +1 @@\n-x\n+y\n')
+        self.add(self.platform, 'rac/x/c.patch',
+                 edit('chrome/browser/ui/new.cc',
+                      removed=['#include "chrome/browser/rac/gone.h"']))
+        self.assertEqual(self.missing(), [])
+
+    def test_a_removed_gen_dir_output_no_longer_counts(self):
+        self.add(self.platform, 'rac/x/a.patch',
+                 create('chrome/browser/ui/views/rac/BUILD.gn',
+                        ['  outputs = [ "$target_gen_dir/spaces/emoji_data.inc" ]']))
+        self.add(self.platform, 'rac/x/b.patch',
+                 edit('chrome/browser/ui/views/rac/BUILD.gn',
+                      removed=['  outputs = [ "$target_gen_dir/spaces/emoji_data.inc" ]']))
+        self.add(self.platform, 'rac/x/c.patch',
+                 edit('chrome/browser/ui/views/rac/spaces/emoji_data.cc',
+                      added=['#include "chrome/browser/ui/views/rac/spaces/emoji_data.inc"']))
+        self.assertEqual([r.path for r in self.lint().missing],
+                         ['chrome/browser/ui/views/rac/spaces/emoji_data.inc'])
+
+    def test_gn_data_directory_is_satisfied_by_a_resource_under_it(self):
+        self.resources.mkdir()
+        (self.resources / 'platform_resources.txt').write_text(
+            'assets/a.json chrome/test/data/rac/fixtures/a.json\n')
+        self.add(self.platform, 'rac/x/a.patch',
+                 create('chrome/browser/rac/BUILD.gn',
+                        ['data = [ "//chrome/test/data/rac/fixtures/" ]']))
+        self.assertEqual(self.missing(), [])
+
     def test_a_line_a_later_patch_removes_cancels_its_reference(self):
         include = '#include "chrome/browser/ui/rac/missing.h"'
         self.add(self.platform, 'rac/x/a.patch',

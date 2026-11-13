@@ -37,7 +37,8 @@ generated: X.mojom.h and its -forward/-shared/-blink/-blink-forward/
 buildflags.h from a BUILD.gn in its directory, and a $target_gen_dir or
 $root_gen_dir output from the patched build files. A path under a grit or gen
 directory is generated and skipped instead. A line a later patch removes
-cancels its reference, as does deleting the file that held it.
+cancels its reference (or its declared output), as does deleting the file
+that held it; a rename carries a file's references and outputs along.
 
 Run from the repository root:
     python3 -I devutils/rac/patch_refs_lint.py
@@ -257,6 +258,16 @@ def lint(helium_patches, platform_patches, resources=None, allowlist=()):
                             # so its own - lines can't cancel its + lines
         for old, new, body in file_sections(text):
             name = new or old
+            if old is not None and new is not None and old != new:
+                # A rename (--- a/x, +++ b/y) carries the references and the
+                # outputs x declared, and moves x if a patch created it.
+                for r in live:
+                    if r.file == old:
+                        r.file = new
+                generated = {p: (new if f == old else f) for p, f in generated.items()}
+                if old in created:
+                    created.discard(old)
+                    created.add(new)
             for line in body:
                 content = line[1:]
                 if line[0] == '-':
@@ -264,6 +275,10 @@ def lint(helium_patches, platform_patches, resources=None, allowlist=()):
                                for kind, _, target in references_in(name, content)}
                     live = [r for r in live
                             if r.file != name or (r.target, r.kind) not in removed]
+                    if is_gn_file(name):
+                        for path in generated_in(name, content):
+                            if generated.get(path) == name:
+                                del generated[path]
                 elif ref.layer == patch_surface.RAC:
                     added += [Reference(ref.name, name, written, target, kind)
                               for kind, written, target in references_in(name, content)]
@@ -276,10 +291,6 @@ def lint(helium_patches, platform_patches, resources=None, allowlist=()):
                 created.discard(old)
                 generated = {p: f for p, f in generated.items() if f != old}
                 live = [r for r in live if r.file != old]
-            elif old != new and old in created:
-                # A rename (--- a/x, +++ b/y) moves a created file.
-                created.discard(old)
-                created.add(new)
         live += added
     resources = read_destinations(resources or [])
     allowlist = set(allowlist)
@@ -292,7 +303,9 @@ def lint(helium_patches, platform_patches, resources=None, allowlist=()):
         elif 'grit' in ref.target.split('/') or 'gen' in ref.target.split('/'):
             result.skipped += 1
         elif ref.kind == 'gn dir':
-            if any(path.startswith(ref.target + '/') for path in created):
+            prefix = ref.target + '/'
+            if any(path.startswith(prefix)
+                   for paths in (created, resources, generated) for path in paths):
                 result.checked += 1
             else:
                 result.missing.append(ref)
